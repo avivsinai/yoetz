@@ -1,0 +1,8 @@
+name: chatgpt
+steps:
+  - action: open
+    args: ["https://chatgpt.com/"]
+  - action: sleep_ms
+    sleep_ms: 1500
+  - action: snapshot
+    args: ["--interactive"]

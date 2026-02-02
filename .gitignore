@@ -1,0 +1,5 @@
+# Agent Message Queue
+.agent-mail/
+.amqrc
+target/
+.DS_Store

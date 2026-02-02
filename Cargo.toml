@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/yoetz-core",
+  "crates/yoetz-cli",
+]
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "1.0"
+ignore = "0.4"
+rand = "0.8"
+time = { version = "0.3", features = ["formatting", "macros"] }
+sha2 = "0.10"
+hex = "0.4"
