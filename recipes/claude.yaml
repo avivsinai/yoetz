@@ -1,7 +1,7 @@
-name: chatgpt
+name: claude
 steps:
   - action: open
-    args: ["https://chatgpt.com/"]
+    args: ["https://claude.ai/new"]
   - action: wait
     args: ["--load", "domcontentloaded"]
   - action: snapshot
@@ -9,7 +9,7 @@ steps:
   - action: find
     args: ["placeholder", "Message", "fill", "{{bundle_text}}"]
   - action: find
-    args: ["testid", "send-button", "click"]
+    args: ["role", "button", "click", "--name", "Send"]
   - action: wait
     args: ["--load", "networkidle"]
   - action: snapshot

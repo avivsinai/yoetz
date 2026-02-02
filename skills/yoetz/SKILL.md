@@ -25,6 +25,16 @@ yoetz ask --prompt "Review this" --files "src/**/*.rs" --format json
 yoetz council --prompt "Review" --models openai/gpt-4o,anthropic/claude-3.5-sonnet --format json
 ```
 
+### Review git diff
+```bash
+yoetz review diff --model openai/gpt-4o --format json
+```
+
+### Review single file
+```bash
+yoetz review file --path src/main.rs --model openai/gpt-4o --format json
+```
+
 ### Bundle only (for manual paste or browser mode)
 ```bash
 yoetz bundle --prompt "Explain this" --files "src/**/*.rs" --format json
@@ -42,9 +52,11 @@ yoetz ask --prompt "Review" --max-cost-usd 1.00 --daily-budget-usd 5.00
 yoetz browser exec -- snapshot --json
 ```
 
-### Browser recipe
+### Browser recipes
 ```bash
 yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle /path/to/bundle.md
+yoetz browser recipe --recipe recipes/claude.yaml --bundle /path/to/bundle.md
+yoetz browser recipe --recipe recipes/gemini.yaml --bundle /path/to/bundle.md
 ```
 
 ### Apply patch

@@ -47,7 +47,7 @@ enum Commands {
     Pricing(PricingArgs),
     Browser(BrowserArgs),
     Council(CouncilArgs),
-    Review,
+    Review(ReviewArgs),
     Apply(ApplyArgs),
 }
 
@@ -201,6 +201,87 @@ struct ApplyArgs {
 }
 
 #[derive(Args)]
+struct ReviewArgs {
+    #[command(subcommand)]
+    command: ReviewCommand,
+}
+
+#[derive(Subcommand)]
+enum ReviewCommand {
+    Diff(ReviewDiffArgs),
+    File(ReviewFileArgs),
+}
+
+#[derive(Args)]
+struct ReviewDiffArgs {
+    #[arg(long)]
+    prompt: Option<String>,
+
+    #[arg(long)]
+    staged: bool,
+
+    #[arg(long)]
+    paths: Vec<String>,
+
+    #[arg(long)]
+    provider: Option<String>,
+
+    #[arg(long)]
+    model: Option<String>,
+
+    #[arg(long, default_value = "0.1")]
+    temperature: f32,
+
+    #[arg(long, default_value = "1024")]
+    max_output_tokens: usize,
+
+    #[arg(long)]
+    dry_run: bool,
+
+    #[arg(long)]
+    max_cost_usd: Option<f64>,
+
+    #[arg(long)]
+    daily_budget_usd: Option<f64>,
+}
+
+#[derive(Args)]
+struct ReviewFileArgs {
+    #[arg(long)]
+    path: PathBuf,
+
+    #[arg(long)]
+    prompt: Option<String>,
+
+    #[arg(long)]
+    provider: Option<String>,
+
+    #[arg(long)]
+    model: Option<String>,
+
+    #[arg(long, default_value = "0.1")]
+    temperature: f32,
+
+    #[arg(long, default_value = "1024")]
+    max_output_tokens: usize,
+
+    #[arg(long)]
+    max_file_bytes: Option<usize>,
+
+    #[arg(long)]
+    max_total_bytes: Option<usize>,
+
+    #[arg(long)]
+    dry_run: bool,
+
+    #[arg(long)]
+    max_cost_usd: Option<f64>,
+
+    #[arg(long)]
+    daily_budget_usd: Option<f64>,
+}
+
+#[derive(Args)]
 struct ModelsArgs {
     #[command(subcommand)]
     command: ModelsCommand,
@@ -273,6 +354,17 @@ struct CallResult {
 }
 
 #[derive(Debug, Serialize)]
+struct ReviewResult {
+    id: String,
+    provider: String,
+    model: String,
+    pricing: PricingEstimate,
+    usage: Usage,
+    content: String,
+    artifacts: ArtifactPaths,
+}
+
+#[derive(Debug, Serialize)]
 struct CouncilResult {
     id: String,
     provider: String,
@@ -319,7 +411,7 @@ async fn main() -> Result<()> {
         Commands::Browser(args) => handle_browser(args, format),
         Commands::Council(args) => handle_council(args, format).await,
         Commands::Apply(args) => handle_apply(args),
-        Commands::Review => Err(anyhow!("command not implemented yet")),
+        Commands::Review(args) => handle_review(args, format).await,
     }
 }
 
@@ -396,6 +488,12 @@ async fn handle_ask(
         )?);
     }
 
+    let model_prompt = if let Some(bundle_ref) = &bundle {
+        render_bundle_md(bundle_ref)
+    } else {
+        prompt.clone()
+    };
+
     let (content, mut usage, response_id, header_cost) = if args.dry_run {
         (
             "(dry-run) no provider call executed".to_string(),
@@ -411,7 +509,7 @@ async fn handle_ask(
             .as_deref()
             .ok_or_else(|| anyhow!("model is required"))?;
         let result = call_openai_compatible(
-            &prompt,
+            &model_prompt,
             &config,
             provider,
             model,
@@ -670,6 +768,11 @@ async fn handle_council(args: CouncilArgs, format: OutputFormat) -> Result<()> {
 
     let mut results = Vec::new();
     let mut total_usage = Usage::default();
+    let model_prompt = if let Some(bundle_ref) = &bundle {
+        render_bundle_md(bundle_ref)
+    } else {
+        prompt.clone()
+    };
 
     if args.dry_run {
         for model in &args.models {
@@ -689,7 +792,7 @@ async fn handle_council(args: CouncilArgs, format: OutputFormat) -> Result<()> {
     } else {
         let mut join_set = tokio::task::JoinSet::new();
         for model in args.models.clone() {
-            let prompt = prompt.clone();
+            let prompt = model_prompt.clone();
             let config = config.clone();
             let provider = provider.clone();
             let temperature = args.temperature;
@@ -827,6 +930,298 @@ fn handle_apply(args: ApplyArgs) -> Result<()> {
         println!("Patch applied");
     }
     Ok(())
+}
+
+async fn handle_review(args: ReviewArgs, format: OutputFormat) -> Result<()> {
+    match args.command {
+        ReviewCommand::Diff(diff_args) => handle_review_diff(diff_args, format).await,
+        ReviewCommand::File(file_args) => handle_review_file(file_args, format).await,
+    }
+}
+
+async fn handle_review_diff(args: ReviewDiffArgs, format: OutputFormat) -> Result<()> {
+    let config = Config::load().unwrap_or_default();
+    let provider = args
+        .provider
+        .clone()
+        .or(config.defaults.provider.clone())
+        .ok_or_else(|| anyhow!("provider is required"))?;
+    let model = args
+        .model
+        .clone()
+        .or(config.defaults.model.clone())
+        .ok_or_else(|| anyhow!("model is required"))?;
+
+    let diff = git_diff(args.staged, &args.paths)?;
+    if diff.trim().is_empty() {
+        return Err(anyhow!("diff is empty"));
+    }
+
+    let review_prompt = build_review_diff_prompt(&diff, args.prompt.as_deref());
+    let input_tokens = estimate_tokens(review_prompt.len());
+    let pricing = registry::estimate_pricing(
+        registry::load_registry_cache().ok().flatten().as_ref(),
+        &model,
+        input_tokens,
+        args.max_output_tokens,
+    )?;
+
+    let mut ledger = None;
+    if args.max_cost_usd.is_some() || args.daily_budget_usd.is_some() {
+        ledger = Some(budget::ensure_budget(
+            pricing.estimate_usd,
+            args.max_cost_usd,
+            args.daily_budget_usd,
+        )?);
+    }
+
+    let session = create_session_dir()?;
+    let artifacts = ArtifactPaths {
+        session_dir: session.path.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let review_input_path = session.path.join("review_input.txt");
+    write_text(&review_input_path, &review_prompt)?;
+
+    let (content, mut usage, response_id, header_cost) = if args.dry_run {
+        (
+            "(dry-run) no provider call executed".to_string(),
+            Usage::default(),
+            None,
+            None,
+        )
+    } else {
+        let result = call_openai_compatible(
+            &review_prompt,
+            &config,
+            &provider,
+            &model,
+            args.temperature,
+            args.max_output_tokens,
+        )
+        .await?;
+        (result.content, result.usage, result.response_id, result.header_cost)
+    };
+
+    if usage.cost_usd.is_none() {
+        usage.cost_usd = header_cost;
+    }
+    if usage.cost_usd.is_none() && provider == "openrouter" {
+        if let Some(id) = response_id.as_deref() {
+            if let Ok(cost) = fetch_openrouter_cost(&config, id).await {
+                usage.cost_usd = cost;
+            }
+        }
+    }
+
+    if let Some(ledger) = ledger {
+        if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
+            let _ = budget::record_spend(ledger, spend);
+        }
+    }
+
+    let mut result = ReviewResult {
+        id: session.id,
+        provider,
+        model,
+        pricing,
+        usage,
+        content,
+        artifacts,
+    };
+
+    let response_json = PathBuf::from(&result.artifacts.session_dir).join("review.json");
+    write_json_file(&response_json, &result)?;
+    result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+
+    match format {
+        OutputFormat::Json => write_json(&result),
+        OutputFormat::Jsonl => write_jsonl_event(&result),
+        OutputFormat::Text => {
+            println!("{}", result.content);
+            Ok(())
+        }
+        OutputFormat::Markdown => {
+            println!("{}", result.content);
+            Ok(())
+        }
+    }
+}
+
+async fn handle_review_file(args: ReviewFileArgs, format: OutputFormat) -> Result<()> {
+    let config = Config::load().unwrap_or_default();
+    let provider = args
+        .provider
+        .clone()
+        .or(config.defaults.provider.clone())
+        .ok_or_else(|| anyhow!("provider is required"))?;
+    let model = args
+        .model
+        .clone()
+        .or(config.defaults.model.clone())
+        .ok_or_else(|| anyhow!("model is required"))?;
+
+    let max_file_bytes = args.max_file_bytes.unwrap_or(200_000);
+    let (content, truncated) = read_text_file(args.path.as_path(), max_file_bytes)?;
+    let review_prompt = build_review_file_prompt(args.path.as_path(), &content, truncated, args.prompt.as_deref());
+    let input_tokens = estimate_tokens(review_prompt.len());
+    let pricing = registry::estimate_pricing(
+        registry::load_registry_cache().ok().flatten().as_ref(),
+        &model,
+        input_tokens,
+        args.max_output_tokens,
+    )?;
+
+    let mut ledger = None;
+    if args.max_cost_usd.is_some() || args.daily_budget_usd.is_some() {
+        ledger = Some(budget::ensure_budget(
+            pricing.estimate_usd,
+            args.max_cost_usd,
+            args.daily_budget_usd,
+        )?);
+    }
+
+    let session = create_session_dir()?;
+    let artifacts = ArtifactPaths {
+        session_dir: session.path.to_string_lossy().to_string(),
+        ..Default::default()
+    };
+    let review_input_path = session.path.join("review_input.txt");
+    write_text(&review_input_path, &review_prompt)?;
+
+    let (output, mut usage, response_id, header_cost) = if args.dry_run {
+        (
+            "(dry-run) no provider call executed".to_string(),
+            Usage::default(),
+            None,
+            None,
+        )
+    } else {
+        let result = call_openai_compatible(
+            &review_prompt,
+            &config,
+            &provider,
+            &model,
+            args.temperature,
+            args.max_output_tokens,
+        )
+        .await?;
+        (result.content, result.usage, result.response_id, result.header_cost)
+    };
+
+    if usage.cost_usd.is_none() {
+        usage.cost_usd = header_cost;
+    }
+    if usage.cost_usd.is_none() && provider == "openrouter" {
+        if let Some(id) = response_id.as_deref() {
+            if let Ok(cost) = fetch_openrouter_cost(&config, id).await {
+                usage.cost_usd = cost;
+            }
+        }
+    }
+
+    if let Some(ledger) = ledger {
+        if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
+            let _ = budget::record_spend(ledger, spend);
+        }
+    }
+
+    let mut result = ReviewResult {
+        id: session.id,
+        provider,
+        model,
+        pricing,
+        usage,
+        content: output,
+        artifacts,
+    };
+
+    let response_json = PathBuf::from(&result.artifacts.session_dir).join("review.json");
+    write_json_file(&response_json, &result)?;
+    result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+
+    match format {
+        OutputFormat::Json => write_json(&result),
+        OutputFormat::Jsonl => write_jsonl_event(&result),
+        OutputFormat::Text => {
+            println!("{}", result.content);
+            Ok(())
+        }
+        OutputFormat::Markdown => {
+            println!("{}", result.content);
+            Ok(())
+        }
+    }
+}
+
+fn build_review_diff_prompt(diff: &str, extra_prompt: Option<&str>) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("You are a senior engineer performing a careful code review. ");
+    prompt.push_str("Return JSON only with fields: summary, findings[], risks, patches.\n");
+    prompt.push_str("Each finding: {severity, file, line, message, suggestion}.\n");
+    prompt.push_str("Include a unified diff in patches if needed.\n");
+    if let Some(extra) = extra_prompt {
+        prompt.push_str("\nAdditional instructions:\n");
+        prompt.push_str(extra);
+        prompt.push('\n');
+    }
+    prompt.push_str("\nDiff:\n```diff\n");
+    prompt.push_str(diff);
+    prompt.push_str("\n```\n");
+    prompt
+}
+
+fn build_review_file_prompt(path: &std::path::Path, content: &str, truncated: bool, extra_prompt: Option<&str>) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("You are a senior engineer reviewing a single file. ");
+    prompt.push_str("Return JSON only with fields: summary, findings[], risks, patches.\n");
+    prompt.push_str("Each finding: {severity, file, line, message, suggestion}.\n");
+    prompt.push_str("Include a unified diff in patches if needed.\n");
+    if let Some(extra) = extra_prompt {
+        prompt.push_str("\nAdditional instructions:\n");
+        prompt.push_str(extra);
+        prompt.push('\n');
+    }
+    prompt.push_str(&format!("\nFile: {}\n", path.display()));
+    prompt.push_str("```text\n");
+    prompt.push_str(content);
+    if truncated {
+        prompt.push_str("\n... [truncated]\n");
+    }
+    prompt.push_str("```\n");
+    prompt
+}
+
+fn git_diff(staged: bool, paths: &[String]) -> Result<String> {
+    let mut cmd = Command::new("git");
+    cmd.arg("diff");
+    cmd.arg("--no-color");
+    if staged {
+        cmd.arg("--staged");
+    }
+    if !paths.is_empty() {
+        cmd.arg("--");
+        for p in paths {
+            cmd.arg(p);
+        }
+    }
+    let output = cmd.output()?;
+    if !output.status.success() {
+        return Err(anyhow!("git diff failed"));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn read_text_file(path: &std::path::Path, max_bytes: usize) -> Result<(String, bool)> {
+    let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    let truncated = data.len() > max_bytes;
+    let slice = if truncated { &data[..max_bytes] } else { &data };
+    if slice.contains(&0) {
+        return Err(anyhow!("file appears to be binary"));
+    }
+    let text = std::str::from_utf8(slice)
+        .map_err(|_| anyhow!("file is not valid UTF-8"))?;
+    Ok((text.to_string(), truncated))
 }
 
 fn add_usage(mut total: Usage, usage: &Usage) -> Usage {

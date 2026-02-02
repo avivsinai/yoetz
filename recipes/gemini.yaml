@@ -1,15 +1,15 @@
-name: chatgpt
+name: gemini
 steps:
   - action: open
-    args: ["https://chatgpt.com/"]
+    args: ["https://gemini.google.com/app"]
   - action: wait
     args: ["--load", "domcontentloaded"]
   - action: snapshot
     args: ["-i", "-c", "--json"]
   - action: find
-    args: ["placeholder", "Message", "fill", "{{bundle_text}}"]
+    args: ["placeholder", "Enter a prompt", "fill", "{{bundle_text}}"]
   - action: find
-    args: ["testid", "send-button", "click"]
+    args: ["role", "button", "click", "--name", "Send"]
   - action: wait
     args: ["--load", "networkidle"]
   - action: snapshot
