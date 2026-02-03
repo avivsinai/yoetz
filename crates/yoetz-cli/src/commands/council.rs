@@ -184,9 +184,11 @@ pub(crate) async fn handle_council(
 
             total_usage = add_usage(total_usage, &usage);
 
+            let registry_id =
+                resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
             let pricing = registry::estimate_pricing(
                 registry_cache.as_ref(),
-                &model,
+                registry_id.as_deref().unwrap_or(&model),
                 input_tokens,
                 output_tokens,
             )?;
