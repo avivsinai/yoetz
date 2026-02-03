@@ -38,3 +38,15 @@ pub fn write_jsonl_event<T: Serialize>(event: &T) -> Result<()> {
     stdout.write_all(b"\n")?;
     Ok(())
 }
+
+#[derive(Serialize)]
+struct JsonlEvent<'a, T> {
+    #[serde(rename = "type")]
+    kind: &'a str,
+    data: &'a T,
+}
+
+pub fn write_jsonl<T: Serialize>(kind: &str, data: &T) -> Result<()> {
+    let event = JsonlEvent { kind, data };
+    write_jsonl_event(&event)
+}

@@ -203,6 +203,12 @@ pub async fn chat_stream(
     if let Some(metadata) = req.metadata {
         body["metadata"] = metadata;
     }
+    if let Some(reasoning_effort) = req.reasoning_effort {
+        body["reasoning_effort"] = reasoning_effort;
+    }
+    if let Some(thinking) = req.thinking {
+        body["thinking"] = thinking;
+    }
 
     let mut builder = client.post(url).json(&body);
     if let Some(key) = key {
