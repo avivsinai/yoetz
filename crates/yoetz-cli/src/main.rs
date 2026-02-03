@@ -672,13 +672,15 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
 
     let model_id = args.model.clone().or(config.defaults.model.clone());
     let provider_id = args.provider.clone().or(config.defaults.provider.clone());
+    let registry_model_id =
+        normalize_registry_model_id(provider_id.as_deref(), model_id.as_deref());
     let registry_cache = registry::load_registry_cache().ok().flatten();
     let input_tokens = bundle
         .as_ref()
         .map(|b| b.stats.estimated_tokens)
         .unwrap_or_else(|| estimate_tokens(prompt.len()));
     let output_tokens = args.max_output_tokens;
-    let mut pricing = if let Some(model_id) = model_id.as_deref() {
+    let mut pricing = if let Some(model_id) = registry_model_id.as_deref() {
         registry::estimate_pricing(
             registry_cache.as_ref(),
             model_id,
@@ -690,7 +692,7 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
     };
     apply_capability_warnings(
         registry_cache.as_ref(),
-        model_id.as_deref(),
+        registry_model_id.as_deref(),
         !image_inputs.is_empty(),
         video_input.is_some(),
         &mut pricing,
@@ -2190,6 +2192,16 @@ use --provider {prefix} or pass an unprefixed model name"
         ));
     }
     Ok(format!("{provider}/{model}"))
+}
+
+fn normalize_registry_model_id(provider: Option<&str>, model_id: Option<&str>) -> Option<String> {
+    let model_id = model_id?;
+    if provider.is_some_and(|p| p.eq_ignore_ascii_case("openrouter"))
+        && model_id.starts_with("openrouter/")
+    {
+        return Some(model_id.trim_start_matches("openrouter/").to_string());
+    }
+    Some(model_id.to_string())
 }
 
 fn usage_from_litellm(usage: litellm_rs::Usage) -> Usage {
