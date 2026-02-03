@@ -69,3 +69,4 @@ yoetz apply --patch-file /tmp/patch.diff
 - Keep outputs machine-readable; read artifacts from `~/.yoetz/sessions/<id>/`.
 - If large bundles, run `yoetz bundle` first and inspect artifacts before `yoetz ask`.
 - Gemini may return empty content if `--max-output-tokens` is too low; increase the limit if warned.
+- Use `--debug` to capture raw Gemini responses during troubleshooting.

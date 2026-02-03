@@ -163,7 +163,7 @@ pub(crate) async fn handle_ask(
                     max_output_tokens,
                 )
                 .await?;
-                if env::var("YOETZ_GEMINI_DEBUG").ok().as_deref() == Some("1") {
+                if ctx.debug || env::var("YOETZ_GEMINI_DEBUG").ok().as_deref() == Some("1") {
                     let raw_path = session.path.join("gemini_response.json");
                     let _ = write_json_file(&raw_path, &result.raw);
                 }

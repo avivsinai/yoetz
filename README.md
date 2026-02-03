@@ -74,6 +74,9 @@ yoetz ask --prompt "Summarize this" --video meeting.mp4 --provider gemini --mode
 
 > Note: Gemini can return empty content if `--max-output-tokens` is too low because tokens are consumed by thoughts. If you see warnings or empty output, increase the limit.
 
+# Debug raw provider responses
+yoetz --debug ask --provider gemini --model gemini-3-flash-preview --prompt "ping"
+
 # Multi-model council
 yoetz council --prompt "Review this PR" --models "openai/gpt-5.2-codex,anthropic/claude-sonnet-4-5-20250929"
 

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::http::send_json;
+use litellm_rs::registry::Registry as EmbeddedRegistry;
 use yoetz_core::config::Config;
 use yoetz_core::registry::{ModelCapability, ModelEntry, ModelPricing, ModelRegistry};
 
@@ -72,6 +73,11 @@ pub async fn fetch_registry(client: &Client, config: &Config) -> Result<Registry
         Err(err) => warnings.push(format!("litellm failed: {err}")),
     }
 
+    match embedded_gemini_registry() {
+        Ok(embedded) => registry.merge(embedded),
+        Err(err) => warnings.push(format!("embedded gemini registry skipped: {err}")),
+    }
+
     registry.updated_at = Some(
         OffsetDateTime::now_utc()
             .format(&Rfc3339)
@@ -82,6 +88,41 @@ pub async fn fetch_registry(client: &Client, config: &Config) -> Result<Registry
     }
 
     Ok(RegistryFetchResult { registry, warnings })
+}
+
+fn embedded_gemini_registry() -> Result<ModelRegistry> {
+    let embedded =
+        EmbeddedRegistry::load_embedded().map_err(|e| anyhow!("load embedded registry: {e}"))?;
+    let mut registry = ModelRegistry::default();
+    for (name, pricing) in embedded.models.into_iter() {
+        let name_lc = name.to_lowercase();
+        let provider_lc = pricing.provider.as_deref().unwrap_or("").to_lowercase();
+        let is_gemini = name_lc.contains("gemini")
+            || name_lc.contains("veo")
+            || provider_lc.contains("gemini")
+            || provider_lc.contains("google");
+        if !is_gemini {
+            continue;
+        }
+
+        let context_length = pricing
+            .max_input_tokens
+            .or(pricing.max_output_tokens)
+            .map(|v| v as usize);
+
+        registry.models.push(ModelEntry {
+            id: name,
+            context_length,
+            pricing: ModelPricing {
+                prompt_per_1k: pricing.input_cost_per_1k,
+                completion_per_1k: pricing.output_cost_per_1k,
+                request: None,
+            },
+            provider: pricing.provider.clone(),
+            capability: None,
+        });
+    }
+    Ok(registry)
 }
 
 async fn fetch_openrouter(client: &Client, config: &Config) -> Result<Option<ModelRegistry>> {

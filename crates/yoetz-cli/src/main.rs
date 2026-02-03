@@ -45,6 +45,9 @@ struct Cli {
     format: Option<String>,
 
     #[arg(long, global = true)]
+    debug: bool,
+
+    #[arg(long, global = true)]
     output_final: Option<PathBuf>,
 
     #[arg(long, global = true)]
@@ -66,6 +69,7 @@ struct AppContext {
     litellm: LiteLLM,
     output_final: Option<PathBuf>,
     output_schema: Option<PathBuf>,
+    debug: bool,
 }
 
 #[derive(Subcommand)]
@@ -537,6 +541,11 @@ struct ModelEstimate {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = resolve_format(cli.format.as_deref())?;
+
+    if cli.debug {
+        env::set_var("YOETZ_GEMINI_DEBUG", "1");
+        env::set_var("LITELLM_GEMINI_DEBUG", "1");
+    }
     let config = Config::load_with_profile(cli.profile.as_deref())?;
     let client = build_client(cli.timeout_secs)?;
     let litellm = build_litellm(&config, client.clone())?;
@@ -546,6 +555,7 @@ async fn main() -> Result<()> {
         litellm,
         output_final: cli.output_final,
         output_schema: cli.output_schema,
+        debug: cli.debug,
     };
 
     match cli.command {
