@@ -95,6 +95,11 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
     Ok(ChatResponse {
         content,
         usage,
+        response_id: parsed
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        header_cost: None,
         raw: None,
     })
 }

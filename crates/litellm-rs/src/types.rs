@@ -193,6 +193,8 @@ impl ChatRequest {
 pub struct ChatResponse {
     pub content: String,
     pub usage: Usage,
+    pub response_id: Option<String>,
+    pub header_cost: Option<f64>,
     pub raw: Option<Value>,
 }
 

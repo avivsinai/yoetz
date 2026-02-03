@@ -40,6 +40,11 @@ impl LiteLLM {
         self
     }
 
+    pub fn with_client(mut self, client: Client) -> Self {
+        self.client = client;
+        self
+    }
+
     pub fn registry(&self) -> &Registry {
         &self.registry
     }

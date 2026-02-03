@@ -1,7 +1,13 @@
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use jsonschema::JSONSchema;
-use serde::{Deserialize, Serialize};
+use litellm_rs::{
+    ChatContentPart, ChatContentPartFile, ChatContentPartImageUrl, ChatContentPartText, ChatFile,
+    ChatImageUrl, ChatMessageContent, ChatRequest, ImageData, ImageRequest, LiteLLM,
+    ProviderConfig as LiteProviderConfig, ProviderKind as LiteProviderKind,
+};
+use serde::Serialize;
 use serde_json::Value;
 use std::env;
 use std::fs;
@@ -59,6 +65,7 @@ struct Cli {
 struct AppContext {
     config: Config,
     client: reqwest::Client,
+    litellm: LiteLLM,
     output_final: Option<PathBuf>,
     output_schema: Option<PathBuf>,
 }
@@ -478,31 +485,6 @@ struct PricingEstimateArgs {
     output_tokens: usize,
 }
 
-#[derive(Debug, Deserialize)]
-struct OpenAIChatResponse {
-    id: Option<String>,
-    choices: Vec<OpenAIChoice>,
-    usage: Option<OpenAIUsage>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIChoice {
-    message: OpenAIMessage,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIMessage {
-    content: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OpenAIUsage {
-    prompt_tokens: Option<usize>,
-    completion_tokens: Option<usize>,
-    total_tokens: Option<usize>,
-    cost: Option<Value>,
-}
-
 struct CallResult {
     content: String,
     usage: Usage,
@@ -559,9 +541,11 @@ async fn main() -> Result<()> {
     let format = resolve_format(cli.format.as_deref())?;
     let config = Config::load_with_profile(cli.profile.as_deref())?;
     let client = build_client(cli.timeout_secs)?;
+    let litellm = build_litellm(&config, client.clone())?;
     let ctx = AppContext {
         config,
         client,
+        litellm,
         output_final: cli.output_final,
         output_schema: cli.output_schema,
     };
@@ -596,6 +580,47 @@ fn build_client(timeout_secs: u64) -> Result<reqwest::Client> {
         .timeout(Duration::from_secs(timeout_secs))
         .connect_timeout(Duration::from_secs(10))
         .build()?)
+}
+
+fn build_litellm(config: &Config, client: reqwest::Client) -> Result<LiteLLM> {
+    let mut litellm = LiteLLM::new()?.with_client(client);
+    if let Some(default_provider) = config.defaults.provider.as_deref() {
+        litellm = litellm.with_default_provider(default_provider);
+    }
+    for (name, provider) in &config.providers {
+        let mut cfg = LiteProviderConfig::default();
+        if let Some(base) = &provider.base_url {
+            cfg = cfg.with_base_url(base.clone());
+        }
+        if let Some(env) = &provider.api_key_env {
+            cfg = cfg.with_api_key_env(env.clone());
+        }
+        let kind = map_provider_kind(provider.kind.as_deref(), name);
+        cfg = cfg.with_kind(kind);
+        litellm = litellm.with_provider(name.clone(), cfg);
+    }
+    Ok(litellm)
+}
+
+fn map_provider_kind(kind: Option<&str>, name: &str) -> LiteProviderKind {
+    let key = kind
+        .map(|s| s.to_lowercase())
+        .unwrap_or_else(|| name.to_lowercase());
+    match key.as_str() {
+        "anthropic" => LiteProviderKind::Anthropic,
+        "gemini" => LiteProviderKind::Gemini,
+        "openai" | "openai_compatible" | "openai-compatible" | "openai-compat" | "openrouter"
+        | "xai" | "litellm" => LiteProviderKind::OpenAICompatible,
+        _ => {
+            if name.eq_ignore_ascii_case("anthropic") {
+                LiteProviderKind::Anthropic
+            } else if name.eq_ignore_ascii_case("gemini") {
+                LiteProviderKind::Gemini
+            } else {
+                LiteProviderKind::OpenAICompatible
+            }
+        }
+    }
 }
 
 async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Result<()> {
@@ -727,9 +752,19 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
                 (result.content, result.usage, None, None)
             }
             _ => {
-                return Err(anyhow!(
-                    "provider {provider} does not support multimodal inputs yet"
-                ))
+                let call = call_litellm(
+                    &ctx.litellm,
+                    Some(provider),
+                    model,
+                    &model_prompt,
+                    args.temperature,
+                    args.max_output_tokens,
+                    response_format.clone(),
+                    &image_inputs,
+                    video_input.as_ref(),
+                )
+                .await?;
+                (call.content, call.usage, call.response_id, call.header_cost)
             }
         }
     } else {
@@ -739,15 +774,16 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
         let model = model_id
             .as_deref()
             .ok_or_else(|| anyhow!("model is required"))?;
-        let result = call_openai_compatible(
-            &model_prompt,
-            &ctx.client,
-            config,
-            provider,
+        let result = call_litellm(
+            &ctx.litellm,
+            Some(provider),
             model,
+            &model_prompt,
             args.temperature,
             args.max_output_tokens,
             response_format.clone(),
+            &[],
+            None,
         )
         .await?;
         (
@@ -1042,24 +1078,24 @@ async fn handle_council(ctx: &AppContext, args: CouncilArgs, format: OutputForma
         let mut join_set = tokio::task::JoinSet::new();
         for (idx, model) in args.models.iter().cloned().enumerate() {
             let prompt = std::sync::Arc::clone(&model_prompt);
-            let config = config.clone();
             let provider = provider.clone();
-            let client = ctx.client.clone();
+            let litellm = ctx.litellm.clone();
             let semaphore = std::sync::Arc::clone(&semaphore);
             let temperature = args.temperature;
             let max_output_tokens = args.max_output_tokens;
             let response_format = response_format.clone();
             join_set.spawn(async move {
                 let _permit = semaphore.acquire_owned().await?;
-                let call = call_openai_compatible(
-                    prompt.as_str(),
-                    &client,
-                    &config,
-                    &provider,
+                let call = call_litellm(
+                    &litellm,
+                    Some(&provider),
                     &model,
+                    prompt.as_str(),
                     temperature,
                     max_output_tokens,
                     response_format,
+                    &[],
+                    None,
                 )
                 .await?;
                 Ok::<_, anyhow::Error>((idx, model, call))
@@ -1262,15 +1298,16 @@ async fn handle_review_diff(
             None,
         )
     } else {
-        let result = call_openai_compatible(
-            &review_prompt,
-            &ctx.client,
-            config,
-            &provider,
+        let result = call_litellm(
+            &ctx.litellm,
+            Some(&provider),
             &model,
+            &review_prompt,
             args.temperature,
             args.max_output_tokens,
             response_format.clone(),
+            &[],
+            None,
         )
         .await?;
         (
@@ -1393,15 +1430,16 @@ async fn handle_review_file(
             None,
         )
     } else {
-        let result = call_openai_compatible(
-            &review_prompt,
-            &ctx.client,
-            config,
-            &provider,
+        let result = call_litellm(
+            &ctx.litellm,
+            Some(&provider),
             &model,
+            &review_prompt,
             args.temperature,
             args.max_output_tokens,
             response_format.clone(),
+            &[],
+            None,
         )
         .await?;
         (
@@ -1502,7 +1540,7 @@ async fn handle_generate_image(
 
     let (outputs, usage) = if args.dry_run {
         (Vec::new(), Usage::default())
-    } else {
+    } else if !images.is_empty() {
         match provider.as_str() {
             "openai" => {
                 let auth = resolve_provider_auth(config, &provider)?;
@@ -1523,10 +1561,25 @@ async fn handle_generate_image(
             }
             _ => {
                 return Err(anyhow!(
-                    "provider {provider} does not support image generation yet"
+                    "provider {provider} does not support image edits yet"
                 ))
             }
         }
+    } else {
+        let model_spec = build_model_spec(Some(&provider), &model);
+        let resp = ctx
+            .litellm
+            .image_generation(ImageRequest {
+                model: model_spec,
+                prompt: prompt.clone(),
+                n: Some(args.n as u32),
+                size: args.size.clone(),
+                quality: args.quality.clone(),
+                background: args.background.clone(),
+            })
+            .await?;
+        let outputs = save_image_outputs(&ctx.client, resp.images, &media_dir, &model).await?;
+        (outputs, usage_from_litellm(resp.usage))
     };
 
     let mut result = MediaGenerationResult {
@@ -2045,57 +2098,129 @@ mod tests {
     }
 }
 
-async fn call_openai_compatible(
-    prompt: &str,
-    client: &reqwest::Client,
-    config: &Config,
-    provider: &str,
+async fn call_litellm(
+    litellm: &LiteLLM,
+    provider: Option<&str>,
     model: &str,
+    prompt: &str,
     temperature: f32,
     max_output_tokens: usize,
     response_format: Option<Value>,
+    images: &[MediaInput],
+    video: Option<&MediaInput>,
 ) -> Result<CallResult> {
-    let auth = resolve_provider_auth(config, provider)?;
-    let url = format!("{}/chat/completions", auth.base_url.trim_end_matches('/'));
-    let mut body = serde_json::json!({
-        "model": model,
-        "messages": [
-            {"role": "user", "content": prompt}
-        ],
-        "temperature": temperature,
-        "max_tokens": max_output_tokens,
-    });
-    if let Some(format) = response_format {
-        body["response_format"] = format;
+    let model_spec = build_model_spec(provider, model);
+    let mut req = ChatRequest::new(model_spec)
+        .temperature(temperature)
+        .max_tokens(max_output_tokens as u32);
+    req.response_format = response_format;
+
+    if images.is_empty() && video.is_none() {
+        req = req.message("user", prompt);
+    } else {
+        let mut parts = Vec::new();
+        parts.push(ChatContentPart::Text(ChatContentPartText {
+            kind: "text".to_string(),
+            text: prompt.to_string(),
+        }));
+        for image in images {
+            parts.push(media_to_image_part(image)?);
+        }
+        if let Some(video) = video {
+            parts.push(media_to_file_part(video)?);
+        }
+        req = req.message_with_content("user", ChatMessageContent::Parts(parts));
     }
 
-    let (parsed, headers) =
-        send_json::<OpenAIChatResponse>(client.post(url).bearer_auth(auth.api_key).json(&body))
-            .await?;
-    let content = parsed
-        .choices
-        .first()
-        .and_then(|c| c.message.content.clone())
-        .unwrap_or_default();
-
-    let usage = parsed.usage.map_or(Usage::default(), |u| Usage {
-        input_tokens: u.prompt_tokens,
-        output_tokens: u.completion_tokens,
-        total_tokens: u.total_tokens,
-        cost_usd: parse_cost(u.cost.as_ref()),
-    });
-
-    let header_cost = headers
-        .get("x-litellm-response-cost")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<f64>().ok());
-
+    let resp = litellm.completion(req).await?;
     Ok(CallResult {
-        content,
-        usage,
-        response_id: parsed.id,
-        header_cost,
+        content: resp.content,
+        usage: usage_from_litellm(resp.usage),
+        response_id: resp.response_id,
+        header_cost: resp.header_cost,
     })
+}
+
+fn build_model_spec(provider: Option<&str>, model: &str) -> String {
+    let Some(provider) = provider else {
+        return model.to_string();
+    };
+    if model.starts_with(&format!("{provider}/")) {
+        return model.to_string();
+    }
+    format!("{provider}/{model}")
+}
+
+fn usage_from_litellm(usage: litellm_rs::Usage) -> Usage {
+    Usage {
+        input_tokens: usage.prompt_tokens.map(|v| v as usize),
+        output_tokens: usage.completion_tokens.map(|v| v as usize),
+        total_tokens: usage.total_tokens.map(|v| v as usize),
+        cost_usd: usage.cost_usd,
+    }
+}
+
+fn media_to_image_part(media: &MediaInput) -> Result<ChatContentPart> {
+    if media.media_type != yoetz_core::media::MediaType::Image {
+        return Err(anyhow!("expected image media input"));
+    }
+    let url = media.as_data_url()?;
+    Ok(ChatContentPart::ImageUrl(ChatContentPartImageUrl {
+        kind: "image_url".to_string(),
+        image_url: ChatImageUrl::Url(url),
+    }))
+}
+
+fn media_to_file_part(media: &MediaInput) -> Result<ChatContentPart> {
+    let url = media.as_data_url()?;
+    Ok(ChatContentPart::File(ChatContentPartFile {
+        kind: "file".to_string(),
+        file: ChatFile {
+            file_id: None,
+            file_data: Some(url),
+            format: Some(media.mime_type.clone()),
+            detail: None,
+            video_metadata: None,
+        },
+    }))
+}
+
+async fn save_image_outputs(
+    client: &reqwest::Client,
+    images: Vec<ImageData>,
+    output_dir: &std::path::Path,
+    model: &str,
+) -> Result<Vec<yoetz_core::media::MediaOutput>> {
+    let mut outputs = Vec::new();
+    for (idx, image) in images.into_iter().enumerate() {
+        let filename = format!("image_{idx}.png");
+        let path = output_dir.join(filename);
+        if let Some(b64) = image.b64_json.as_ref() {
+            let bytes = general_purpose::STANDARD
+                .decode(b64.as_bytes())
+                .context("decode image base64")?;
+            std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+        } else if let Some(url) = image.url.as_ref() {
+            let bytes = client.get(url).send().await?.bytes().await?;
+            std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+        } else {
+            continue;
+        }
+
+        outputs.push(yoetz_core::media::MediaOutput {
+            media_type: yoetz_core::media::MediaType::Image,
+            path,
+            url: image.url,
+            metadata: yoetz_core::media::MediaMetadata {
+                width: None,
+                height: None,
+                duration_secs: None,
+                model: model.to_string(),
+                revised_prompt: image.revised_prompt,
+            },
+        });
+    }
+    Ok(outputs)
 }
 
 async fn fetch_openrouter_cost(

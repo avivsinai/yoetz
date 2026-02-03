@@ -120,16 +120,26 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
         builder = builder.header(k, v);
     }
 
-    let (parsed, _headers) = send_json::<OpenAIChatResponse>(builder).await?;
+    let (parsed, headers) = send_json::<OpenAIChatResponse>(builder).await?;
     let content = parsed
         .choices
         .first()
         .and_then(|c| c.message.content.clone())
         .unwrap_or_default();
+    let header_cost = headers
+        .get("x-litellm-response-cost")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<f64>().ok());
+    let mut usage = map_usage(parsed.usage);
+    if usage.cost_usd.is_none() {
+        usage.cost_usd = header_cost;
+    }
 
     Ok(ChatResponse {
         content,
-        usage: map_usage(parsed.usage),
+        usage,
+        response_id: parsed.id,
+        header_cost,
         raw: None,
     })
 }

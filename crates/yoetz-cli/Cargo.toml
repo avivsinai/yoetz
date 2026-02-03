@@ -20,6 +20,7 @@ workspace = true
 
 [dependencies]
 yoetz-core = { path = "../yoetz-core" }
+litellm-rs = { path = "../litellm-rs" }
 
 anyhow.workspace = true
 serde.workspace = true

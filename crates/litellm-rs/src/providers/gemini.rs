@@ -68,6 +68,8 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
     Ok(ChatResponse {
         content,
         usage,
+        response_id: None,
+        header_cost: None,
         raw: None,
     })
 }
