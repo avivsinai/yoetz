@@ -2111,6 +2111,25 @@ mod tests {
         assert!(fmt.is_some());
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn read_text_file_truncates_utf8_safely() {
+        let text = "hello 🙂 world";
+        let bytes = text.as_bytes();
+        let cut = bytes.iter().position(|b| *b == 0xF0).unwrap_or(bytes.len());
+        let path = std::env::temp_dir().join(format!(
+            "yoetz_read_text_{}.txt",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&path, bytes).unwrap();
+        let (content, truncated) = read_text_file(&path, cut + 1).unwrap();
+        assert!(truncated);
+        assert!(content.starts_with("hello "));
+        let _ = fs::remove_file(path);
+    }
 }
 
 async fn call_litellm(

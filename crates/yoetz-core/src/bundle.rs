@@ -179,3 +179,21 @@ pub fn estimate_tokens(chars: usize) -> usize {
     // Rough heuristic: 4 chars per token.
     chars.div_ceil(4)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::extract_text;
+
+    #[test]
+    fn extract_text_truncates_utf8_safely() {
+        let text = "hello 🙂 world";
+        let bytes = text.as_bytes();
+        let cut = bytes.iter().position(|b| *b == 0xF0).unwrap_or(bytes.len());
+        let data = &bytes[..cut + 1];
+        let (content, truncated, is_binary) = extract_text(data, data.len(), true);
+        assert!(truncated);
+        assert!(!is_binary);
+        let content = content.expect("expected utf-8 content");
+        assert!(content.starts_with("hello "));
+    }
+}

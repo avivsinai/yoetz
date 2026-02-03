@@ -110,7 +110,14 @@ fn guess_mime(path: &Path) -> Result<String> {
 }
 
 fn guess_mime_from_url(url: &str) -> String {
-    let mime = MimeGuess::from_path(url).first_or_octet_stream();
+    let trimmed = url
+        .split_once('?')
+        .map(|(base, _)| base)
+        .unwrap_or(url)
+        .split_once('#')
+        .map(|(base, _)| base)
+        .unwrap_or(url);
+    let mime = MimeGuess::from_path(trimmed).first_or_octet_stream();
     mime.essence_str().to_string()
 }
 
