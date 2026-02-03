@@ -539,6 +539,10 @@ struct ModelEstimate {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load environment files (.env.local takes precedence over .env)
+    dotenvy::from_filename(".env.local").ok();
+    dotenvy::dotenv().ok();
+
     let cli = Cli::parse();
     let format = resolve_format(cli.format.as_deref())?;
 

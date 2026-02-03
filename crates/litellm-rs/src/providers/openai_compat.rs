@@ -38,6 +38,12 @@ struct OpenAIUsage {
     completion_tokens: Option<u32>,
     total_tokens: Option<u32>,
     cost: Option<Value>,
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionTokensDetails {
+    reasoning_tokens: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -458,7 +464,9 @@ fn map_usage(usage: Option<OpenAIUsage>) -> Usage {
     usage.map_or_else(Usage::default, |u| Usage {
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,
-        thoughts_tokens: None,
+        thoughts_tokens: u
+            .completion_tokens_details
+            .and_then(|d| d.reasoning_tokens),
         total_tokens: u.total_tokens,
         cost_usd: parse_cost(u.cost.as_ref()),
     })

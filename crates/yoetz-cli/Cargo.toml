@@ -23,6 +23,7 @@ yoetz-core = { path = "../yoetz-core" }
 litellm-rs = { path = "../litellm-rs" }
 
 anyhow.workspace = true
+dotenvy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
