@@ -16,6 +16,7 @@ serde_yaml = "0.9"
 tempfile = "3.10"
 jsonschema = "0.17"
 fs2 = "0.4"
+base64 = { workspace = true }
 
 [dependencies.yoetz-core]
 path = "../yoetz-core"

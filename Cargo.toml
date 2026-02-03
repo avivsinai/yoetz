@@ -20,3 +20,5 @@ rand = "0.8"
 time = { version = "0.3", features = ["formatting", "macros"] }
 sha2 = "0.10"
 hex = "0.4"
+base64 = "0.22"
+mime_guess = "2.0"
