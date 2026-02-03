@@ -458,6 +458,7 @@ fn map_usage(usage: Option<OpenAIUsage>) -> Usage {
     usage.map_or_else(Usage::default, |u| Usage {
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,
+        thoughts_tokens: None,
         total_tokens: u.total_tokens,
         cost_usd: parse_cost(u.cost.as_ref()),
     })

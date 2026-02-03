@@ -777,6 +777,9 @@ fn add_usage(mut total: Usage, usage: &Usage) -> Usage {
     if let Some(output) = usage.output_tokens {
         total.output_tokens = Some(total.output_tokens.unwrap_or(0) + output);
     }
+    if let Some(thoughts) = usage.thoughts_tokens {
+        total.thoughts_tokens = Some(total.thoughts_tokens.unwrap_or(0) + thoughts);
+    }
     if let Some(total_tokens) = usage.total_tokens {
         total.total_tokens = Some(total.total_tokens.unwrap_or(0) + total_tokens);
     }
@@ -1125,6 +1128,7 @@ fn usage_from_litellm(usage: litellm_rs::Usage) -> Usage {
     Usage {
         input_tokens: usage.prompt_tokens.map(|v| v as usize),
         output_tokens: usage.completion_tokens.map(|v| v as usize),
+        thoughts_tokens: usage.thoughts_tokens.map(|v| v as usize),
         total_tokens: usage.total_tokens.map(|v| v as usize),
         cost_usd: usage.cost_usd,
     }

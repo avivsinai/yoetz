@@ -202,6 +202,7 @@ pub struct ChatResponse {
 pub struct Usage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
+    pub thoughts_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
     pub cost_usd: Option<f64>,
 }

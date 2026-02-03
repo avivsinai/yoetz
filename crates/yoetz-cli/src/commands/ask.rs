@@ -228,6 +228,14 @@ pub(crate) async fn handle_ask(
         }
     }
 
+    if provider_id.as_deref() == Some("gemini") && content.trim().is_empty() {
+        if let Some(thoughts) = usage.thoughts_tokens.filter(|t| *t > 0) {
+            eprintln!(
+                "warning: gemini returned empty content but used {thoughts} thought tokens; try increasing --max-output-tokens"
+            );
+        }
+    }
+
     if let Some(ledger) = ledger {
         if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
             let _ = budget::record_spend(ledger, spend);

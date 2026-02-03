@@ -368,6 +368,10 @@ fn parse_usage(resp: &Value) -> Usage {
             .get("candidatesTokenCount")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        let thoughts_tokens = meta
+            .get("thoughtsTokenCount")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
         let total_tokens = meta
             .get("totalTokenCount")
             .and_then(|v| v.as_u64())
@@ -375,6 +379,7 @@ fn parse_usage(resp: &Value) -> Usage {
         return Usage {
             input_tokens,
             output_tokens,
+            thoughts_tokens,
             total_tokens,
             cost_usd: None,
         };

@@ -453,6 +453,7 @@ fn parse_usage(resp: &Value) -> Usage {
         Usage {
             input_tokens,
             output_tokens,
+            thoughts_tokens: None,
             total_tokens,
             cost_usd,
         }

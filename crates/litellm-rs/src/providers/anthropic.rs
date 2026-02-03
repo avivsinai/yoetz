@@ -333,6 +333,7 @@ fn parse_usage(resp: &Value) -> Usage {
                 .get("output_tokens")
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32),
+            thoughts_tokens: None,
             total_tokens: None,
             cost_usd: None,
         };

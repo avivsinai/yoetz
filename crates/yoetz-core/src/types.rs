@@ -41,6 +41,7 @@ pub struct PricingEstimate {
 pub struct Usage {
     pub input_tokens: Option<usize>,
     pub output_tokens: Option<usize>,
+    pub thoughts_tokens: Option<usize>,
     pub total_tokens: Option<usize>,
     pub cost_usd: Option<f64>,
 }
