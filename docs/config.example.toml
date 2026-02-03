@@ -13,6 +13,11 @@ base_url = "http://localhost:4000/v1"
 api_key_env = "LITELLM_API_KEY"
 kind = "openai-compatible"
 
+[providers.gemini]
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+api_key_env = "GEMINI_API_KEY"
+kind = "gemini"
+
 [registry]
 openrouter_models_url = "https://openrouter.ai/api/v1/models"
 litellm_models_url = "http://localhost:4000/model/info"

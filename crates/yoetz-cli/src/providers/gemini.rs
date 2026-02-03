@@ -11,7 +11,7 @@ use yoetz_core::types::Usage;
 use crate::http::send_json;
 use crate::providers::ProviderAuth;
 
-const INLINE_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
+const INLINE_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct GeminiTextResult {
@@ -280,7 +280,10 @@ async fn upload_file(
     mime_type: &str,
     bytes: Vec<u8>,
 ) -> Result<String> {
-    let base_root = auth.base_url.trim_end_matches("/v1beta");
+    let base_root = auth
+        .base_url
+        .trim_end_matches("/v1beta")
+        .trim_end_matches('/');
     let start_url = format!("{}/upload/v1beta/files?key={}", base_root, auth.api_key);
     let display_name = path
         .file_name()
