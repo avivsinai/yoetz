@@ -2166,6 +2166,12 @@ fn build_model_spec(provider: Option<&str>, model: &str) -> Result<String> {
         }
         if provider_lc == "openrouter" {
             if prefix_lc == "openrouter" {
+                let rest = model.split_once('/').map(|(_, rest)| rest).unwrap_or("");
+                if !rest.contains('/') {
+                    return Err(anyhow!(
+                        "openrouter models must be namespaced (e.g. openai/gpt-4o, anthropic/claude-3-5-sonnet)"
+                    ));
+                }
                 return Ok(model.to_string());
             }
             return Ok(format!("{provider}/{model}"));
