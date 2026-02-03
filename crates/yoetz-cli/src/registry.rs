@@ -134,8 +134,8 @@ async fn fetch_litellm(client: &Client, config: &Config) -> Result<Option<ModelR
         }
     }
 
-    if last_err.is_some() {
-        return Err(last_err.unwrap());
+    if let Some(err) = last_err {
+        return Err(err);
     }
     if api_key.is_none() {
         return Ok(None);

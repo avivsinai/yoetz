@@ -53,6 +53,7 @@ fn acquire_budget_lock() -> Result<std::fs::File> {
         .create(true)
         .read(true)
         .write(true)
+        .truncate(true)
         .open(&lock_path)?;
     file.lock_exclusive()
         .with_context(|| format!("lock budget {}", lock_path.display()))?;
