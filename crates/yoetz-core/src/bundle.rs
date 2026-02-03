@@ -183,6 +183,10 @@ pub fn estimate_tokens(chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::extract_text;
+    use super::{build_bundle, BundleOptions};
+    use sha2::{Digest, Sha256};
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn extract_text_truncates_utf8_safely() {
@@ -195,5 +199,39 @@ mod tests {
         assert!(!is_binary);
         let content = content.expect("expected utf-8 content");
         assert!(content.starts_with("hello "));
+    }
+
+    #[test]
+    fn bundle_files_sorted_and_hash_full_file() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yoetz_bundle_test_{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+
+        let a_path = root.join("a.txt");
+        let b_path = root.join("b.txt");
+        fs::write(&b_path, "bbb").unwrap();
+        fs::write(&a_path, "aaa").unwrap();
+
+        let options = BundleOptions {
+            root: root.clone(),
+            include: vec!["**/*".to_string()],
+            max_file_bytes: 2, // force truncation
+            ..BundleOptions::default()
+        };
+
+        let bundle = build_bundle("prompt", options).unwrap();
+        let paths: Vec<_> = bundle.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.txt", "b.txt"]);
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"aaa");
+        let a_hash = hex::encode(hasher.finalize());
+        let file_a = bundle.files.iter().find(|f| f.path == "a.txt").unwrap();
+        assert_eq!(file_a.sha256, a_hash);
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
