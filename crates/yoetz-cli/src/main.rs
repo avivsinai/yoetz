@@ -37,6 +37,8 @@ use yoetz_core::types::{
 use http::send_json;
 use providers::{gemini, openai, resolve_provider_auth};
 
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 1024;
+
 #[derive(Parser)]
 #[command(
     name = "yoetz",
@@ -115,8 +117,8 @@ struct AskArgs {
     #[arg(long, default_value = "0.1")]
     temperature: f32,
 
-    #[arg(long, default_value = "1024")]
-    max_output_tokens: usize,
+    #[arg(long)]
+    max_output_tokens: Option<usize>,
 
     #[arg(long)]
     dry_run: bool,
@@ -228,8 +230,8 @@ struct CouncilArgs {
     #[arg(long, default_value = "0.1")]
     temperature: f32,
 
-    #[arg(long, default_value = "1024")]
-    max_output_tokens: usize,
+    #[arg(long)]
+    max_output_tokens: Option<usize>,
 
     #[arg(long, default_value = "4")]
     max_parallel: usize,
@@ -384,8 +386,8 @@ struct ReviewDiffArgs {
     #[arg(long, default_value = "0.1")]
     temperature: f32,
 
-    #[arg(long, default_value = "1024")]
-    max_output_tokens: usize,
+    #[arg(long)]
+    max_output_tokens: Option<usize>,
 
     #[arg(long)]
     dry_run: bool,
@@ -423,8 +425,8 @@ struct ReviewFileArgs {
     #[arg(long, default_value = "0.1")]
     temperature: f32,
 
-    #[arg(long, default_value = "1024")]
-    max_output_tokens: usize,
+    #[arg(long)]
+    max_output_tokens: Option<usize>,
 
     #[arg(long)]
     max_file_bytes: Option<usize>,
@@ -675,11 +677,12 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
     let registry_model_id =
         normalize_registry_model_id(provider_id.as_deref(), model_id.as_deref());
     let registry_cache = registry::load_registry_cache().ok().flatten();
+    let max_output_tokens = resolve_max_output_tokens(args.max_output_tokens, config);
     let input_tokens = bundle
         .as_ref()
         .map(|b| b.stats.estimated_tokens)
         .unwrap_or_else(|| estimate_tokens(prompt.len()));
-    let output_tokens = args.max_output_tokens;
+    let output_tokens = max_output_tokens;
     let mut pricing = if let Some(model_id) = registry_model_id.as_deref() {
         registry::estimate_pricing(
             registry_cache.as_ref(),
@@ -746,7 +749,7 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
                     &image_inputs,
                     response_format.clone(),
                     args.temperature,
-                    args.max_output_tokens,
+                    max_output_tokens,
                 )
                 .await?;
                 (result.content, result.usage, result.response_id, None)
@@ -761,7 +764,7 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
                     &image_inputs,
                     video_input.as_ref(),
                     args.temperature,
-                    args.max_output_tokens,
+                    max_output_tokens,
                 )
                 .await?;
                 (result.content, result.usage, None, None)
@@ -773,7 +776,7 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
                     model,
                     &model_prompt,
                     args.temperature,
-                    args.max_output_tokens,
+                    max_output_tokens,
                     response_format.clone(),
                     &image_inputs,
                     video_input.as_ref(),
@@ -795,7 +798,7 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
             model,
             &model_prompt,
             args.temperature,
-            args.max_output_tokens,
+            max_output_tokens,
             response_format.clone(),
             &[],
             None,
@@ -1012,7 +1015,8 @@ async fn handle_council(ctx: &AppContext, args: CouncilArgs, format: OutputForma
         .as_ref()
         .map(|b| b.stats.estimated_tokens)
         .unwrap_or_else(|| estimate_tokens(prompt.len()));
-    let output_tokens = args.max_output_tokens;
+    let max_output_tokens = resolve_max_output_tokens(args.max_output_tokens, config);
+    let output_tokens = max_output_tokens;
 
     let mut per_model = Vec::new();
     let mut estimate_sum = 0.0;
@@ -1097,7 +1101,6 @@ async fn handle_council(ctx: &AppContext, args: CouncilArgs, format: OutputForma
             let litellm = ctx.litellm.clone();
             let semaphore = std::sync::Arc::clone(&semaphore);
             let temperature = args.temperature;
-            let max_output_tokens = args.max_output_tokens;
             let response_format = response_format.clone();
             join_set.spawn(async move {
                 let _permit = semaphore.acquire_owned().await?;
@@ -1273,6 +1276,7 @@ async fn handle_review_diff(
         .clone()
         .or(config.defaults.model.clone())
         .ok_or_else(|| anyhow!("model is required"))?;
+    let max_output_tokens = resolve_max_output_tokens(args.max_output_tokens, config);
 
     let diff = git_diff(args.staged, &args.paths)?;
     if diff.trim().is_empty() {
@@ -1285,7 +1289,7 @@ async fn handle_review_diff(
         registry::load_registry_cache().ok().flatten().as_ref(),
         &model,
         input_tokens,
-        args.max_output_tokens,
+        max_output_tokens,
     )?;
 
     let mut ledger = None;
@@ -1319,7 +1323,7 @@ async fn handle_review_diff(
             &model,
             &review_prompt,
             args.temperature,
-            args.max_output_tokens,
+            max_output_tokens,
             response_format.clone(),
             &[],
             None,
@@ -1401,6 +1405,7 @@ async fn handle_review_file(
         .clone()
         .or(config.defaults.model.clone())
         .ok_or_else(|| anyhow!("model is required"))?;
+    let max_output_tokens = resolve_max_output_tokens(args.max_output_tokens, config);
 
     let max_file_bytes = args.max_file_bytes.unwrap_or(200_000);
     let max_total_bytes = args.max_total_bytes.unwrap_or(max_file_bytes);
@@ -1417,7 +1422,7 @@ async fn handle_review_file(
         registry::load_registry_cache().ok().flatten().as_ref(),
         &model,
         input_tokens,
-        args.max_output_tokens,
+        max_output_tokens,
     )?;
 
     let mut ledger = None;
@@ -1451,7 +1456,7 @@ async fn handle_review_file(
             &model,
             &review_prompt,
             args.temperature,
-            args.max_output_tokens,
+            max_output_tokens,
             response_format.clone(),
             &[],
             None,
@@ -1802,28 +1807,23 @@ fn read_text_file(path: &std::path::Path, max_bytes: usize) -> Result<(String, b
     let mut data = vec![0u8; max_bytes];
     let read = file.read(&mut data)?;
     data.truncate(read);
-    let boundary = if truncated {
-        floor_char_boundary(&data, max_bytes.min(data.len()))
+    let slice = if truncated {
+        &data[..max_bytes.min(data.len())]
     } else {
-        data.len()
+        &data
     };
-    let slice = &data[..boundary];
     if slice.contains(&0) {
         return Err(anyhow!("file appears to be binary"));
     }
-    let text = std::str::from_utf8(slice).map_err(|_| anyhow!("file is not valid UTF-8"))?;
-    Ok((text.to_string(), truncated))
-}
-
-fn floor_char_boundary(data: &[u8], index: usize) -> usize {
-    if index >= data.len() {
-        return data.len();
+    match std::str::from_utf8(slice) {
+        Ok(text) => Ok((text.to_string(), truncated)),
+        Err(e) if truncated && e.valid_up_to() > 0 => {
+            let valid = e.valid_up_to();
+            let text = std::str::from_utf8(&slice[..valid]).unwrap_or("");
+            Ok((text.to_string(), true))
+        }
+        Err(_) => Err(anyhow!("file is not valid UTF-8")),
     }
-    let mut i = index;
-    while i > 0 && (data[i] & 0xC0) == 0x80 {
-        i -= 1;
-    }
-    i
 }
 
 fn add_usage(mut total: Usage, usage: &Usage) -> Usage {
@@ -2202,6 +2202,12 @@ fn normalize_registry_model_id(provider: Option<&str>, model_id: Option<&str>) -
         return Some(model_id.trim_start_matches("openrouter/").to_string());
     }
     Some(model_id.to_string())
+}
+
+fn resolve_max_output_tokens(requested: Option<usize>, config: &Config) -> usize {
+    requested
+        .or(config.defaults.max_output_tokens)
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
 }
 
 fn usage_from_litellm(usage: litellm_rs::Usage) -> Usage {
