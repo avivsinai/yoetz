@@ -6,6 +6,9 @@ use crate::types::{
     ChatContentPartText, ChatFile, ChatImageUrl, ChatInputAudio, ChatMessage, ChatMessageContent,
     ChatRequest, ChatResponse, Usage, VideoRequest, VideoResponse,
 };
+use base64::{engine::general_purpose, Engine as _};
+use mime_guess::MimeGuess;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::Value;
 use tokio::time::{sleep, Duration};
@@ -37,7 +40,7 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
         });
     }
 
-    let contents = gemini_contents_from_messages(messages, &req.model)?;
+    let contents = gemini_contents_from_messages(client, messages, &req.model).await?;
 
     let mut body = serde_json::json!({ "contents": contents });
     if !system_instruction.is_empty() {
@@ -220,23 +223,77 @@ fn extract_system_instruction(messages: &mut Vec<ChatMessage>) -> Result<Vec<Val
     Ok(parts)
 }
 
-fn gemini_contents_from_messages(messages: Vec<ChatMessage>, model: &str) -> Result<Vec<Value>> {
+async fn gemini_contents_from_messages(
+    client: &Client,
+    messages: Vec<ChatMessage>,
+    model: &str,
+) -> Result<Vec<Value>> {
     let mut contents: Vec<Value> = Vec::new();
-    for message in messages {
-        let role = map_gemini_role(&message.role);
-        let parts = gemini_parts_from_content(&message.content, model)?;
-        if parts.is_empty() {
+    let mut msg_i = 0;
+    let mut tool_call_responses: Vec<Value> = Vec::new();
+    let mut last_tool_calls: Vec<ToolCallInfo> = Vec::new();
+
+    while msg_i < messages.len() {
+        let role = messages[msg_i].role.as_str();
+        if role == "user" {
+            let mut parts: Vec<Value> = Vec::new();
+            while msg_i < messages.len() && messages[msg_i].role == "user" {
+                parts.extend(
+                    gemini_parts_from_content(client, &messages[msg_i].content, model).await?,
+                );
+                msg_i += 1;
+            }
+            if !parts.is_empty() {
+                contents.push(serde_json::json!({ "role": "user", "parts": parts }));
+            }
             continue;
         }
-        if let Some(last) = contents.last_mut() {
-            if last.get("role").and_then(|v| v.as_str()) == Some(role.as_str()) {
-                if let Some(existing_parts) = last.get_mut("parts").and_then(|v| v.as_array_mut()) {
-                    existing_parts.extend(parts);
-                    continue;
+
+        if role == "assistant" {
+            let mut parts: Vec<Value> = Vec::new();
+            while msg_i < messages.len() && messages[msg_i].role == "assistant" {
+                let message = &messages[msg_i];
+                parts.extend(gemini_parts_from_content(client, &message.content, model).await?);
+                let (tool_parts, tool_infos) = tool_call_parts_from_message(message)?;
+                if !tool_parts.is_empty() {
+                    parts.extend(tool_parts);
+                    if !tool_infos.is_empty() {
+                        last_tool_calls = tool_infos;
+                    }
                 }
+                msg_i += 1;
             }
+            if !parts.is_empty() {
+                contents.push(serde_json::json!({ "role": "model", "parts": parts }));
+            }
+            continue;
         }
-        contents.push(serde_json::json!({ "role": role, "parts": parts }));
+
+        if role == "tool" || role == "function" {
+            while msg_i < messages.len()
+                && (messages[msg_i].role == "tool" || messages[msg_i].role == "function")
+            {
+                let response_parts =
+                    tool_response_parts(client, &messages[msg_i], &last_tool_calls).await?;
+                tool_call_responses.extend(response_parts);
+                msg_i += 1;
+            }
+            if !tool_call_responses.is_empty() {
+                contents.push(serde_json::json!({ "parts": tool_call_responses }));
+                tool_call_responses = Vec::new();
+            }
+            continue;
+        }
+
+        let parts = gemini_parts_from_content(client, &messages[msg_i].content, model).await?;
+        if !parts.is_empty() {
+            contents.push(serde_json::json!({ "role": "user", "parts": parts }));
+        }
+        msg_i += 1;
+    }
+
+    if !tool_call_responses.is_empty() {
+        contents.push(serde_json::json!({ "parts": tool_call_responses }));
     }
     if contents.is_empty() {
         contents.push(serde_json::json!({
@@ -247,14 +304,11 @@ fn gemini_contents_from_messages(messages: Vec<ChatMessage>, model: &str) -> Res
     Ok(contents)
 }
 
-fn map_gemini_role(role: &str) -> String {
-    match role {
-        "assistant" => "model".to_string(),
-        _ => "user".to_string(),
-    }
-}
-
-fn gemini_parts_from_content(content: &ChatMessageContent, model: &str) -> Result<Vec<Value>> {
+async fn gemini_parts_from_content(
+    _client: &Client,
+    content: &ChatMessageContent,
+    model: &str,
+) -> Result<Vec<Value>> {
     match content {
         ChatMessageContent::Text(text) => Ok(vec![serde_json::json!({ "text": text })]),
         ChatMessageContent::Parts(parts) => {
@@ -292,6 +346,227 @@ fn gemini_parts_from_content(content: &ChatMessageContent, model: &str) -> Resul
             Ok(out)
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct ToolCallInfo {
+    id: Option<String>,
+    name: String,
+}
+
+fn tool_call_parts_from_message(message: &ChatMessage) -> Result<(Vec<Value>, Vec<ToolCallInfo>)> {
+    let mut parts = Vec::new();
+    let mut infos = Vec::new();
+
+    if let Some(tool_calls) = &message.tool_calls {
+        if let Some(array) = tool_calls.as_array() {
+            for tool in array {
+                let function = tool
+                    .get("function")
+                    .ok_or_else(|| LiteLLMError::Config("tool_call missing function".into()))?;
+                let name = function
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| LiteLLMError::Config("tool_call missing name".into()))?;
+                let args_raw = function
+                    .get("arguments")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let args = if args_raw.trim().is_empty() {
+                    Value::Object(serde_json::Map::new())
+                } else {
+                    serde_json::from_str(args_raw)
+                        .map_err(|e| LiteLLMError::Parse(e.to_string()))?
+                };
+                parts.push(serde_json::json!({
+                    "function_call": { "name": name, "args": args }
+                }));
+                let id = tool
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                infos.push(ToolCallInfo {
+                    id,
+                    name: name.to_string(),
+                });
+            }
+            return Ok((parts, infos));
+        }
+    }
+
+    if let Some(function_call) = &message.function_call {
+        let name = function_call
+            .get("name")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| LiteLLMError::Config("function_call missing name".into()))?;
+        let args_raw = function_call
+            .get("arguments")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let args = if args_raw.trim().is_empty() {
+            Value::Object(serde_json::Map::new())
+        } else {
+            serde_json::from_str(args_raw).map_err(|e| LiteLLMError::Parse(e.to_string()))?
+        };
+        parts.push(serde_json::json!({
+            "function_call": { "name": name, "args": args }
+        }));
+        infos.push(ToolCallInfo {
+            id: None,
+            name: name.to_string(),
+        });
+    }
+
+    Ok((parts, infos))
+}
+
+async fn tool_response_parts(
+    client: &Client,
+    message: &ChatMessage,
+    last_tool_calls: &[ToolCallInfo],
+) -> Result<Vec<Value>> {
+    let name = resolve_tool_name(message, last_tool_calls)?;
+    let (content_str, mut inline_parts) = extract_tool_content(client, &message.content).await?;
+    let response = parse_tool_response_data(&content_str);
+    let function_part = serde_json::json!({
+        "function_response": { "name": name, "response": response }
+    });
+    let mut parts = vec![function_part];
+    parts.append(&mut inline_parts);
+    Ok(parts)
+}
+
+fn resolve_tool_name(message: &ChatMessage, last_tool_calls: &[ToolCallInfo]) -> Result<String> {
+    if let Some(name) = &message.name {
+        return Ok(name.clone());
+    }
+    if let Some(tool_call_id) = &message.tool_call_id {
+        if let Some(info) = last_tool_calls
+            .iter()
+            .find(|info| info.id.as_deref() == Some(tool_call_id.as_str()))
+        {
+            return Ok(info.name.clone());
+        }
+    }
+    Err(LiteLLMError::Config(
+        "missing tool name for tool response".into(),
+    ))
+}
+
+async fn extract_tool_content(
+    client: &Client,
+    content: &ChatMessageContent,
+) -> Result<(String, Vec<Value>)> {
+    let mut text = String::new();
+    let mut inline_parts = Vec::new();
+    match content {
+        ChatMessageContent::Text(t) => {
+            text.push_str(t);
+        }
+        ChatMessageContent::Parts(parts) => {
+            for part in parts {
+                match part {
+                    ChatContentPart::Text(ChatContentPartText { text: t, .. }) => {
+                        text.push_str(t);
+                    }
+                    ChatContentPart::ImageUrl(ChatContentPartImageUrl { image_url, .. }) => {
+                        inline_parts.push(inline_data_from_image_url(client, image_url).await?);
+                    }
+                    ChatContentPart::InputAudio(ChatContentPartInputAudio {
+                        input_audio, ..
+                    }) => {
+                        inline_parts.push(inline_data_from_audio(input_audio)?);
+                    }
+                    ChatContentPart::File(ChatContentPartFile { file, .. }) => {
+                        inline_parts.push(inline_data_from_file(client, file).await?);
+                    }
+                    ChatContentPart::Other(_) => {}
+                }
+            }
+        }
+    }
+    Ok((text, inline_parts))
+}
+
+fn parse_tool_response_data(content: &str) -> Value {
+    let trimmed = content.trim();
+    if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        if let Ok(value) = serde_json::from_str(trimmed) {
+            return value;
+        }
+    }
+    serde_json::json!({ "content": content })
+}
+
+async fn inline_data_from_image_url(client: &Client, image_url: &ChatImageUrl) -> Result<Value> {
+    let (url, format) = match image_url {
+        ChatImageUrl::Url(url) => (url.as_str(), None),
+        ChatImageUrl::Object(obj) => (obj.url.as_str(), obj.format.as_deref()),
+    };
+    inline_data_from_url(client, url, format).await
+}
+
+fn inline_data_from_audio(input_audio: &ChatInputAudio) -> Result<Value> {
+    let format = if input_audio.format.starts_with("audio/") {
+        input_audio.format.clone()
+    } else {
+        format!("audio/{}", input_audio.format)
+    };
+    Ok(serde_json::json!({
+        "inline_data": { "mime_type": format, "data": input_audio.data }
+    }))
+}
+
+async fn inline_data_from_file(client: &Client, file: &ChatFile) -> Result<Value> {
+    let passed = file
+        .file_id
+        .as_ref()
+        .or(file.file_data.as_ref())
+        .ok_or_else(|| LiteLLMError::Config("file_id or file_data required".into()))?;
+    inline_data_from_url(client, passed, file.format.as_deref()).await
+}
+
+async fn inline_data_from_url(client: &Client, url: &str, format: Option<&str>) -> Result<Value> {
+    if let Some((mime, data)) = parse_data_url(url, format) {
+        return Ok(serde_json::json!({
+            "inline_data": { "mime_type": mime, "data": data }
+        }));
+    }
+    if url.starts_with("http://") || url.starts_with("https://") {
+        let (mime, data) = fetch_bytes_with_mime(client, url, format).await?;
+        return Ok(serde_json::json!({
+            "inline_data": { "mime_type": mime, "data": data }
+        }));
+    }
+    Err(LiteLLMError::Config("unsupported inline data url".into()))
+}
+
+async fn fetch_bytes_with_mime(
+    client: &Client,
+    url: &str,
+    format: Option<&str>,
+) -> Result<(String, String)> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+    let headers = resp.headers().clone();
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+    let header_mime = headers
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.split(';').next().unwrap_or(v).trim().to_string());
+    let mime = format
+        .map(|v| v.to_string())
+        .or(header_mime)
+        .or_else(|| mime_type_from_url(url))
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let data = general_purpose::STANDARD.encode(bytes);
+    Ok((mime, data))
 }
 
 fn process_gemini_audio(input_audio: &ChatInputAudio) -> Result<Value> {
@@ -411,18 +686,9 @@ fn parse_data_url(url: &str, override_format: Option<&str>) -> Option<(String, S
 
 fn mime_type_from_url(url: &str) -> Option<String> {
     let path = url.split('?').next().unwrap_or(url);
-    let ext = path.rsplit('.').next()?.to_lowercase();
-    let mime = match ext.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        "gif" => "image/gif",
-        "mp4" => "video/mp4",
-        "mp3" => "audio/mpeg",
-        "wav" => "audio/wav",
-        _ => return None,
-    };
-    Some(mime.to_string())
+    MimeGuess::from_path(path)
+        .first_raw()
+        .map(|m| m.to_string())
 }
 
 fn extract_video_uri(resp: &Value) -> Option<String> {

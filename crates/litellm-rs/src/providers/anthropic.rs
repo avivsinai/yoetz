@@ -6,6 +6,8 @@ use crate::types::{
     ChatMessageContent, ChatRequest, ChatResponse, Usage,
 };
 use base64::{engine::general_purpose, Engine as _};
+use mime_guess::MimeGuess;
+use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::Value;
 
@@ -451,21 +453,38 @@ async fn anthropic_image_source(
         });
     }
     if url.starts_with("http://") {
-        let bytes = client
+        let resp = client
             .get(url)
             .send()
             .await
-            .map_err(|e| LiteLLMError::Http(e.to_string()))?
+            .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+        let headers = resp.headers().clone();
+        let bytes = resp
             .bytes()
             .await
             .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+        let header_mime = headers
+            .get(CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.split(';').next().unwrap_or(v).trim().to_string());
+        let media_type = format
+            .map(|v| v.to_string())
+            .or(header_mime)
+            .or_else(|| infer_mime_from_url(url))
+            .unwrap_or_else(|| "application/octet-stream".to_string());
         let data = general_purpose::STANDARD.encode(bytes);
-        let media_type = format.unwrap_or("application/octet-stream").to_string();
         return Ok(AnthropicImageSource::Base64 { media_type, data });
     }
 
     let (media_type, data) = parse_data_url(url, format)?;
     Ok(AnthropicImageSource::Base64 { media_type, data })
+}
+
+fn infer_mime_from_url(url: &str) -> Option<String> {
+    let path = url.split('?').next().unwrap_or(url);
+    MimeGuess::from_path(path)
+        .first_raw()
+        .map(|m| m.to_string())
 }
 
 fn parse_data_url(url: &str, override_format: Option<&str>) -> Result<(String, String)> {
