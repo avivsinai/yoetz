@@ -72,6 +72,45 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
     if let Some(fmt) = req.response_format {
         body["response_format"] = fmt;
     }
+    if let Some(max_completion_tokens) = req.max_completion_tokens {
+        body["max_completion_tokens"] = serde_json::json!(max_completion_tokens);
+    }
+    if let Some(tools) = req.tools {
+        body["tools"] = tools;
+    }
+    if let Some(tool_choice) = req.tool_choice {
+        body["tool_choice"] = tool_choice;
+    }
+    if let Some(parallel) = req.parallel_tool_calls {
+        body["parallel_tool_calls"] = serde_json::json!(parallel);
+    }
+    if let Some(stop) = req.stop {
+        body["stop"] = stop;
+    }
+    if let Some(top_p) = req.top_p {
+        body["top_p"] = serde_json::json!(top_p);
+    }
+    if let Some(presence) = req.presence_penalty {
+        body["presence_penalty"] = serde_json::json!(presence);
+    }
+    if let Some(frequency) = req.frequency_penalty {
+        body["frequency_penalty"] = serde_json::json!(frequency);
+    }
+    if let Some(seed) = req.seed {
+        body["seed"] = serde_json::json!(seed);
+    }
+    if let Some(user) = req.user {
+        body["user"] = serde_json::json!(user);
+    }
+    if let Some(metadata) = req.metadata {
+        body["metadata"] = metadata;
+    }
+    if let Some(reasoning_effort) = req.reasoning_effort {
+        body["reasoning_effort"] = reasoning_effort;
+    }
+    if let Some(thinking) = req.thinking {
+        body["thinking"] = thinking;
+    }
 
     let mut builder = client.post(url).json(&body);
     if let Some(key) = key {
@@ -120,6 +159,39 @@ pub async fn chat_stream(
     }
     if let Some(fmt) = req.response_format {
         body["response_format"] = fmt;
+    }
+    if let Some(max_completion_tokens) = req.max_completion_tokens {
+        body["max_completion_tokens"] = serde_json::json!(max_completion_tokens);
+    }
+    if let Some(tools) = req.tools {
+        body["tools"] = tools;
+    }
+    if let Some(tool_choice) = req.tool_choice {
+        body["tool_choice"] = tool_choice;
+    }
+    if let Some(parallel) = req.parallel_tool_calls {
+        body["parallel_tool_calls"] = serde_json::json!(parallel);
+    }
+    if let Some(stop) = req.stop {
+        body["stop"] = stop;
+    }
+    if let Some(top_p) = req.top_p {
+        body["top_p"] = serde_json::json!(top_p);
+    }
+    if let Some(presence) = req.presence_penalty {
+        body["presence_penalty"] = serde_json::json!(presence);
+    }
+    if let Some(frequency) = req.frequency_penalty {
+        body["frequency_penalty"] = serde_json::json!(frequency);
+    }
+    if let Some(seed) = req.seed {
+        body["seed"] = serde_json::json!(seed);
+    }
+    if let Some(user) = req.user {
+        body["user"] = serde_json::json!(user);
+    }
+    if let Some(metadata) = req.metadata {
+        body["metadata"] = metadata;
     }
 
     let mut builder = client.post(url).json(&body);

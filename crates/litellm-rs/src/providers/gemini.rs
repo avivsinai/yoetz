@@ -29,6 +29,11 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
         messages.push(ChatMessage {
             role: "user".to_string(),
             content: ChatMessageContent::Text(" ".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            function_call: None,
+            provider_specific_fields: None,
         });
     }
 

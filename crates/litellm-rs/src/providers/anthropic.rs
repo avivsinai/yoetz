@@ -30,13 +30,51 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
     let mut body = serde_json::json!({
         "model": req.model,
         "messages": anthropic_messages,
-        "max_tokens": req.max_tokens.unwrap_or(1024),
+        "max_tokens": req
+            .max_tokens
+            .or(req.max_completion_tokens)
+            .unwrap_or(1024),
     });
     if !system_blocks.is_empty() {
         body["system"] = serde_json::json!(system_blocks);
     }
     if let Some(temp) = req.temperature {
         body["temperature"] = serde_json::json!(temp);
+    }
+    if let Some(top_p) = req.top_p {
+        body["top_p"] = serde_json::json!(top_p);
+    }
+    if let Some(stop_sequences) = map_stop_sequences(req.stop) {
+        body["stop_sequences"] = serde_json::json!(stop_sequences);
+    }
+
+    let mut tools = req.tools;
+    let mut tool_choice = req.tool_choice;
+    let output_format =
+        map_response_format_to_output_format(&req.model, req.response_format.as_ref());
+    if let Some(output_format) = output_format {
+        body["output_format"] = output_format;
+    } else if let Some(response_tool) = map_response_format_to_tool(req.response_format.as_ref()) {
+        tools = merge_tools(tools, response_tool);
+        if tool_choice.is_none() {
+            tool_choice = Some(serde_json::json!({
+                "type": "tool",
+                "name": RESPONSE_FORMAT_TOOL_NAME,
+            }));
+        }
+    }
+
+    if let Some(tools_value) = tools {
+        body["tools"] = tools_value;
+    }
+    if let Some(tool_choice_value) = tool_choice {
+        body["tool_choice"] = tool_choice_value;
+    }
+
+    if let Some(metadata) = req.metadata {
+        body["metadata"] = metadata;
+    } else if let Some(user) = req.user {
+        body["metadata"] = serde_json::json!({ "user_id": user });
     }
 
     let mut builder = client
@@ -57,6 +95,205 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
         usage,
         raw: None,
     })
+}
+
+pub async fn chat_stream(
+    client: &Client,
+    cfg: &ProviderConfig,
+    req: ChatRequest,
+) -> Result<crate::stream::ChatStream> {
+    let base = cfg
+        .base_url
+        .clone()
+        .ok_or_else(|| LiteLLMError::Config("base_url required".into()))?;
+    let url = format!("{}/v1/messages", base.trim_end_matches('/'));
+    let key = resolve_api_key(cfg)?;
+    let key = key.ok_or_else(|| LiteLLMError::MissingApiKey("ANTHROPIC_API_KEY".into()))?;
+
+    let mut messages = req.messages;
+    let system_blocks = extract_system_blocks(client, &mut messages).await?;
+    let mut anthropic_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        anthropic_messages.push(anthropic_message_from_chat(client, message).await?);
+    }
+
+    let mut body = serde_json::json!({
+        "model": req.model,
+        "messages": anthropic_messages,
+        "max_tokens": req
+            .max_tokens
+            .or(req.max_completion_tokens)
+            .unwrap_or(1024),
+        "stream": true,
+    });
+    if !system_blocks.is_empty() {
+        body["system"] = serde_json::json!(system_blocks);
+    }
+    if let Some(temp) = req.temperature {
+        body["temperature"] = serde_json::json!(temp);
+    }
+    if let Some(top_p) = req.top_p {
+        body["top_p"] = serde_json::json!(top_p);
+    }
+    if let Some(stop_sequences) = map_stop_sequences(req.stop) {
+        body["stop_sequences"] = serde_json::json!(stop_sequences);
+    }
+
+    let mut tools = req.tools;
+    let mut tool_choice = req.tool_choice;
+    let output_format =
+        map_response_format_to_output_format(&req.model, req.response_format.as_ref());
+    if let Some(output_format) = output_format {
+        body["output_format"] = output_format;
+    } else if let Some(response_tool) = map_response_format_to_tool(req.response_format.as_ref()) {
+        tools = merge_tools(tools, response_tool);
+        if tool_choice.is_none() {
+            tool_choice = Some(serde_json::json!({
+                "type": "tool",
+                "name": RESPONSE_FORMAT_TOOL_NAME,
+            }));
+        }
+    }
+
+    if let Some(tools_value) = tools {
+        body["tools"] = tools_value;
+    }
+    if let Some(tool_choice_value) = tool_choice {
+        body["tool_choice"] = tool_choice_value;
+    }
+
+    if let Some(metadata) = req.metadata {
+        body["metadata"] = metadata;
+    } else if let Some(user) = req.user {
+        body["metadata"] = serde_json::json!({ "user_id": user });
+    }
+
+    let mut builder = client
+        .post(url)
+        .header("x-api-key", key)
+        .header("anthropic-version", DEFAULT_VERSION)
+        .header("accept", "text/event-stream")
+        .json(&body);
+    for (k, v) in &cfg.extra_headers {
+        builder = builder.header(k, v);
+    }
+
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+        return Err(LiteLLMError::Http(format!(
+            "http {}: {}",
+            status.as_u16(),
+            text
+        )));
+    }
+
+    Ok(crate::stream::parse_anthropic_sse_stream(
+        resp.bytes_stream(),
+    ))
+}
+
+const RESPONSE_FORMAT_TOOL_NAME: &str = "response_format";
+
+fn map_stop_sequences(value: Option<Value>) -> Option<Vec<String>> {
+    let value = value?;
+    if let Some(s) = value.as_str() {
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(vec![trimmed.to_string()]);
+    }
+    if let Some(arr) = value.as_array() {
+        let mut out = Vec::new();
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    out.push(trimmed.to_string());
+                }
+            }
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    } else {
+        None
+    }
+}
+
+fn map_response_format_to_output_format(model: &str, value: Option<&Value>) -> Option<Value> {
+    let value = value?;
+    let type_value = value.get("type")?.as_str()?;
+    if type_value == "text" {
+        return None;
+    }
+    if !model_supports_output_format(model) {
+        return None;
+    }
+    let schema = extract_json_schema(value)?;
+    Some(serde_json::json!({
+        "type": "json_schema",
+        "schema": schema,
+    }))
+}
+
+fn map_response_format_to_tool(value: Option<&Value>) -> Option<Value> {
+    let value = value?;
+    let type_value = value.get("type")?.as_str()?;
+    if type_value == "text" {
+        return None;
+    }
+    let schema = extract_json_schema(value)?;
+    Some(serde_json::json!({
+        "name": RESPONSE_FORMAT_TOOL_NAME,
+        "input_schema": schema,
+    }))
+}
+
+fn extract_json_schema(value: &Value) -> Option<Value> {
+    if let Some(schema) = value.get("response_schema") {
+        return Some(schema.clone());
+    }
+    if let Some(schema) = value.get("json_schema").and_then(|v| v.get("schema")) {
+        return Some(schema.clone());
+    }
+    if value.get("type").and_then(|v| v.as_str()) == Some("json_object") {
+        return Some(serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": true,
+        }));
+    }
+    None
+}
+
+fn model_supports_output_format(model: &str) -> bool {
+    let lower = model.to_lowercase();
+    lower.contains("sonnet-4.5")
+        || lower.contains("sonnet-4-5")
+        || lower.contains("opus-4.1")
+        || lower.contains("opus-4-1")
+}
+
+fn merge_tools(tools: Option<Value>, new_tool: Value) -> Option<Value> {
+    match tools {
+        None => Some(Value::Array(vec![new_tool])),
+        Some(Value::Array(mut arr)) => {
+            arr.push(new_tool);
+            Some(Value::Array(arr))
+        }
+        Some(other) => Some(Value::Array(vec![other, new_tool])),
+    }
 }
 
 fn extract_text(resp: &Value) -> String {

@@ -85,6 +85,16 @@ pub struct ChatFile {
 pub struct ChatMessage {
     pub role: String,
     pub content: ChatMessageContent,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider_specific_fields: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +104,19 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     pub max_tokens: Option<u32>,
     pub response_format: Option<Value>,
+    pub max_completion_tokens: Option<u32>,
+    pub tools: Option<Value>,
+    pub tool_choice: Option<Value>,
+    pub parallel_tool_calls: Option<bool>,
+    pub stop: Option<Value>,
+    pub top_p: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub seed: Option<u64>,
+    pub user: Option<String>,
+    pub metadata: Option<Value>,
+    pub reasoning_effort: Option<Value>,
+    pub thinking: Option<Value>,
 }
 
 impl ChatRequest {
@@ -104,6 +127,19 @@ impl ChatRequest {
             temperature: None,
             max_tokens: None,
             response_format: None,
+            max_completion_tokens: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            stop: None,
+            top_p: None,
+            presence_penalty: None,
+            frequency_penalty: None,
+            seed: None,
+            user: None,
+            metadata: None,
+            reasoning_effort: None,
+            thinking: None,
         }
     }
 
@@ -111,6 +147,11 @@ impl ChatRequest {
         self.messages.push(ChatMessage {
             role: role.into(),
             content: ChatMessageContent::Text(content.into()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            function_call: None,
+            provider_specific_fields: None,
         });
         self
     }
@@ -123,6 +164,11 @@ impl ChatRequest {
         self.messages.push(ChatMessage {
             role: role.into(),
             content,
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+            function_call: None,
+            provider_specific_fields: None,
         });
         self
     }

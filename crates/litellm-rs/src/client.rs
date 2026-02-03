@@ -57,6 +57,9 @@ impl LiteLLM {
             ProviderKind::OpenAICompatible => {
                 openai_compat::chat_stream(&self.client, &resolved.config, req).await
             }
+            ProviderKind::Anthropic => {
+                anthropic::chat_stream(&self.client, &resolved.config, req).await
+            }
             _ => Err(LiteLLMError::Unsupported(
                 "streaming not supported for provider".into(),
             )),
