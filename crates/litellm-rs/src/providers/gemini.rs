@@ -11,6 +11,7 @@ use mime_guess::MimeGuess;
 use reqwest::header::CONTENT_TYPE;
 use reqwest::Client;
 use serde_json::Value;
+use std::env;
 use tokio::time::{sleep, Duration};
 
 pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Result<ChatResponse> {
@@ -65,13 +66,20 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
     let (resp, _headers) = send_json::<Value>(builder).await?;
     let content = extract_text(&resp);
     let usage = parse_usage(&resp);
+    let debug = env::var("LITELLM_GEMINI_DEBUG").ok().as_deref() == Some("1")
+        || env::var("YOETZ_GEMINI_DEBUG").ok().as_deref() == Some("1");
+    if debug {
+        if let Ok(pretty) = serde_json::to_string_pretty(&resp) {
+            eprintln!("litellm-rs gemini raw response:\n{pretty}");
+        }
+    }
 
     Ok(ChatResponse {
         content,
         usage,
         response_id: None,
         header_cost: None,
-        raw: None,
+        raw: if debug { Some(resp) } else { None },
     })
 }
 

@@ -17,6 +17,7 @@ const INLINE_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 pub struct GeminiTextResult {
     pub content: String,
     pub usage: Usage,
+    pub raw: Value,
 }
 
 pub async fn generate_content(
@@ -64,6 +65,7 @@ pub async fn generate_content(
     Ok(GeminiTextResult {
         content: extract_text(&resp),
         usage: parse_usage(&resp),
+        raw: resp,
     })
 }
 
