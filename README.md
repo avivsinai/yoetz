@@ -113,6 +113,7 @@ yoetz/
 │   │   ├── config.rs     # TOML config loading + profiles
 │   │   ├── media.rs      # Media types for multimodal
 │   │   └── types.rs      # Shared types
+│   ├── litellm-rs/       # LiteLLM-style SDK (library only)
 │   └── yoetz-cli/        # CLI binary
 │       ├── main.rs       # Command handlers
 │       ├── providers/    # OpenAI, Gemini implementations
