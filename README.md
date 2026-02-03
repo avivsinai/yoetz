@@ -64,7 +64,7 @@ yoetz bundle --prompt "Review this code" --files "src/**/*.rs"
 yoetz ask --prompt "Explain this function" --files "src/main.rs"
 
 # Ask with structured JSON output (OpenAI-compatible)
-yoetz ask --prompt "Return JSON only" --provider openai --model gpt-4.1 --response_format json
+yoetz ask --prompt "Return JSON only" --provider openai --model gpt-4.1 --response-format json
 
 # Ask with an image (vision)
 yoetz ask --prompt "Describe this diagram" --image diagram.png --provider gemini --model gemini-2.0-flash
