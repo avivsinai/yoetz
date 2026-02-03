@@ -26,6 +26,7 @@ use yoetz_core::bundle::{build_bundle, estimate_tokens, BundleOptions};
 use yoetz_core::config::Config;
 use yoetz_core::media::MediaInput;
 use yoetz_core::output::{write_json, write_jsonl_event, OutputFormat};
+use yoetz_core::registry::ModelRegistry;
 use yoetz_core::session::{
     create_session_dir, list_sessions, write_json as write_json_file, write_text,
 };
@@ -677,7 +678,7 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
         .map(|b| b.stats.estimated_tokens)
         .unwrap_or_else(|| estimate_tokens(prompt.len()));
     let output_tokens = args.max_output_tokens;
-    let pricing = if let Some(model_id) = model_id.as_deref() {
+    let mut pricing = if let Some(model_id) = model_id.as_deref() {
         registry::estimate_pricing(
             registry_cache.as_ref(),
             model_id,
@@ -687,6 +688,13 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
     } else {
         PricingEstimate::default()
     };
+    apply_capability_warnings(
+        registry_cache.as_ref(),
+        model_id.as_deref(),
+        !image_inputs.is_empty(),
+        video_input.is_some(),
+        &mut pricing,
+    )?;
 
     let mut ledger = None;
     if args.max_cost_usd.is_some() || args.daily_budget_usd.is_some() {
@@ -1571,7 +1579,7 @@ async fn handle_generate_image(
             }
         }
     } else {
-        let model_spec = build_model_spec(Some(&provider), &model);
+        let model_spec = build_model_spec(Some(&provider), &model)?;
         let resp = ctx
             .litellm
             .image_generation(ImageRequest {
@@ -2114,7 +2122,7 @@ async fn call_litellm(
     images: &[MediaInput],
     video: Option<&MediaInput>,
 ) -> Result<CallResult> {
-    let model_spec = build_model_spec(provider, model);
+    let model_spec = build_model_spec(provider, model)?;
     let mut req = ChatRequest::new(model_spec)
         .temperature(temperature)
         .max_tokens(max_output_tokens as u32);
@@ -2146,14 +2154,36 @@ async fn call_litellm(
     })
 }
 
-fn build_model_spec(provider: Option<&str>, model: &str) -> String {
+fn build_model_spec(provider: Option<&str>, model: &str) -> Result<String> {
     let Some(provider) = provider else {
-        return model.to_string();
+        return Ok(model.to_string());
     };
-    if model.starts_with(&format!("{provider}/")) {
-        return model.to_string();
+    let provider_lc = provider.to_lowercase();
+    if let Some((prefix, _rest)) = model.split_once('/') {
+        let prefix_lc = prefix.to_lowercase();
+        if provider_lc == "gemini" && prefix_lc == "models" {
+            return Ok(format!("{provider}/{model}"));
+        }
+        if provider_lc == "openrouter" {
+            if prefix_lc == "openrouter" {
+                return Ok(model.to_string());
+            }
+            return Ok(format!("{provider}/{model}"));
+        }
+        if prefix_lc == provider_lc {
+            return Ok(model.to_string());
+        }
+        return Err(anyhow!(
+            "model prefix '{prefix}' conflicts with provider '{provider}'. \
+use --provider {prefix} or pass an unprefixed model name"
+        ));
     }
-    format!("{provider}/{model}")
+    if provider_lc == "openrouter" {
+        return Err(anyhow!(
+            "openrouter models must be namespaced (e.g. openai/gpt-4o, anthropic/claude-3-5-sonnet)"
+        ));
+    }
+    Ok(format!("{provider}/{model}"))
 }
 
 fn usage_from_litellm(usage: litellm_rs::Usage) -> Usage {
@@ -2163,6 +2193,54 @@ fn usage_from_litellm(usage: litellm_rs::Usage) -> Usage {
         total_tokens: usage.total_tokens.map(|v| v as usize),
         cost_usd: usage.cost_usd,
     }
+}
+
+fn apply_capability_warnings(
+    registry: Option<&ModelRegistry>,
+    model_id: Option<&str>,
+    has_images: bool,
+    has_video: bool,
+    pricing: &mut PricingEstimate,
+) -> Result<()> {
+    if !has_images && !has_video {
+        return Ok(());
+    }
+    let Some(model_id) = model_id else {
+        return Ok(());
+    };
+    let Some(registry) = registry else {
+        pricing.warnings.push(
+            "registry unavailable; cannot validate model capabilities (run `yoetz models sync`)"
+                .to_string(),
+        );
+        return Ok(());
+    };
+    let Some(entry) = registry.find(model_id) else {
+        pricing.warnings.push(format!(
+            "model capabilities unknown; {model_id} not in registry (run `yoetz models sync`)"
+        ));
+        return Ok(());
+    };
+
+    if has_images {
+        match entry.capability.as_ref().and_then(|cap| cap.vision) {
+            Some(true) => {}
+            Some(false) => {
+                return Err(anyhow!("model {model_id} does not support image inputs"));
+            }
+            None => pricing.warnings.push(format!(
+                "model capability unknown for {model_id}; cannot validate vision inputs"
+            )),
+        }
+    }
+
+    if has_video {
+        pricing.warnings.push(
+            "video support is not tracked in registry; provider gemini is required".to_string(),
+        );
+    }
+
+    Ok(())
 }
 
 fn media_to_image_part(media: &MediaInput) -> Result<ChatContentPart> {

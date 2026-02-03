@@ -8,7 +8,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::http::send_json;
 use yoetz_core::config::Config;
-use yoetz_core::registry::{ModelEntry, ModelPricing, ModelRegistry};
+use yoetz_core::registry::{ModelCapability, ModelEntry, ModelPricing, ModelRegistry};
 
 pub struct RegistryFetchResult {
     pub registry: ModelRegistry,
@@ -171,12 +171,13 @@ fn parse_openrouter_models(value: &Value) -> ModelRegistry {
             request: pricing_obj.and_then(|p| parse_price(p.get("request"))),
         };
 
+        let capability = parse_openrouter_capability(&item);
         registry.models.push(ModelEntry {
             id: id.to_string(),
             context_length,
             pricing,
             provider: Some("openrouter".to_string()),
-            capability: None,
+            capability,
         });
     }
 
@@ -270,10 +271,54 @@ pub fn estimate_pricing(
         estimate.pricing_source = entry.provider.clone();
         estimate.estimate_usd = entry.pricing.estimate(input_tokens, output_tokens);
     } else {
-        estimate
-            .warnings
-            .push(format!("model not found in registry: {model_id}"));
+        estimate.warnings.push(format!(
+            "model not found in registry: {model_id}; run `yoetz models sync` to refresh"
+        ));
     }
 
     Ok(estimate)
+}
+
+fn parse_openrouter_capability(item: &Value) -> Option<ModelCapability> {
+    let mut cap = ModelCapability::default();
+
+    if let Some(modalities) = item
+        .get("architecture")
+        .and_then(|v| v.get("input_modalities"))
+        .and_then(|v| v.as_array())
+    {
+        let has_image = modalities
+            .iter()
+            .any(|m| m.as_str().is_some_and(|s| s.eq_ignore_ascii_case("image")));
+        cap.vision = Some(has_image);
+    }
+
+    if let Some(params) = item.get("supported_parameters").and_then(|v| v.as_array()) {
+        let has_reasoning = params.iter().any(|p| {
+            p.as_str().is_some_and(|s| {
+                s.eq_ignore_ascii_case("reasoning")
+                    || s.eq_ignore_ascii_case("reasoning_effort")
+                    || s.eq_ignore_ascii_case("include_reasoning")
+                    || s.eq_ignore_ascii_case("thinking")
+            })
+        });
+        if has_reasoning {
+            cap.reasoning = Some(true);
+        }
+    }
+
+    let web_search = item
+        .get("pricing")
+        .and_then(|v| v.get("web_search"))
+        .and_then(|v| if v.is_null() { None } else { Some(v) })
+        .is_some();
+    if web_search {
+        cap.web_search = Some(true);
+    }
+
+    if cap.vision.is_none() && cap.reasoning.is_none() && cap.web_search.is_none() {
+        None
+    } else {
+        Some(cap)
+    }
 }
