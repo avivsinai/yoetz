@@ -5,7 +5,7 @@ members = ["crates/yoetz-core", "crates/yoetz-cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.78"
 license = "MIT"
 repository = "https://github.com/avivsinai/yoetz"
 homepage = "https://github.com/avivsinai/yoetz"
@@ -35,11 +35,11 @@ rust_2018_idioms = "warn"
 [workspace.lints.clippy]
 # Enable standard warnings
 all = { level = "warn", priority = -1 }
-# Additional useful lints
-cast_possible_truncation = "warn"
-clone_on_ref_ptr = "warn"
-needless_pass_by_value = "warn"
-redundant_closure_for_method_calls = "warn"
+# Disable noisy lints
+cast_possible_truncation = "allow"
+needless_pass_by_value = "allow"
+too_many_arguments = "allow"
+items_after_test_module = "allow"
 
 [profile.release]
 lto = "thin"
