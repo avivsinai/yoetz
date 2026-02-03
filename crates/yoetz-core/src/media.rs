@@ -75,7 +75,10 @@ impl MediaInput {
             MediaSource::Base64 { data, mime } => (data.clone(), mime.clone()),
             MediaSource::File(path) => {
                 let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-                (general_purpose::STANDARD.encode(bytes), self.mime_type.clone())
+                (
+                    general_purpose::STANDARD.encode(bytes),
+                    self.mime_type.clone(),
+                )
             }
             MediaSource::Url(url) => return Ok(url.clone()),
             MediaSource::FileApiId { id, .. } => {
@@ -90,11 +93,9 @@ impl MediaInput {
             MediaSource::File(path) => {
                 fs::read(path).with_context(|| format!("read {}", path.display()))
             }
-            MediaSource::Base64 { data, .. } => {
-                general_purpose::STANDARD
-                    .decode(data)
-                    .context("decode base64 media")
-            }
+            MediaSource::Base64 { data, .. } => general_purpose::STANDARD
+                .decode(data)
+                .context("decode base64 media"),
             MediaSource::Url(url) => Err(anyhow!("cannot read bytes from url: {url}")),
             MediaSource::FileApiId { id, .. } => {
                 Err(anyhow!("cannot read bytes from file API id: {id}"))

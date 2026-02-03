@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use crate::media::MediaOutput;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bundle {
     pub prompt: String,
@@ -61,6 +63,18 @@ pub struct ArtifactPaths {
     pub bundle_json: Option<String>,
     pub bundle_md: Option<String>,
     pub response_json: Option<String>,
+    pub media_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MediaGenerationResult {
+    pub id: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub prompt: String,
+    pub usage: Usage,
+    pub artifacts: ArtifactPaths,
+    pub outputs: Vec<MediaOutput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

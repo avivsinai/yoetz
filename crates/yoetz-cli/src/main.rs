@@ -13,17 +13,22 @@ use std::time::Duration;
 mod browser;
 mod budget;
 mod http;
+mod providers;
 mod registry;
 
 use yoetz_core::bundle::{build_bundle, estimate_tokens, BundleOptions};
 use yoetz_core::config::Config;
+use yoetz_core::media::MediaInput;
 use yoetz_core::output::{write_json, write_jsonl_event, OutputFormat};
 use yoetz_core::session::{
     create_session_dir, list_sessions, write_json as write_json_file, write_text,
 };
-use yoetz_core::types::{ArtifactPaths, BundleResult, PricingEstimate, RunResult, Usage};
+use yoetz_core::types::{
+    ArtifactPaths, BundleResult, MediaGenerationResult, PricingEstimate, RunResult, Usage,
+};
 
 use http::send_json;
+use providers::{gemini, openai, resolve_provider_auth};
 
 #[derive(Parser)]
 #[command(
@@ -70,6 +75,7 @@ enum Commands {
     Council(CouncilArgs),
     Review(ReviewArgs),
     Apply(ApplyArgs),
+    Generate(GenerateArgs),
 }
 
 #[derive(Args)]
@@ -112,6 +118,12 @@ struct AskArgs {
 
     #[arg(long)]
     daily_budget_usd: Option<f64>,
+
+    #[arg(long, value_name = "PATH_OR_URL")]
+    image: Vec<String>,
+
+    #[arg(long, value_name = "PATH_OR_URL")]
+    video: Option<String>,
 }
 
 #[derive(Args)]
@@ -237,6 +249,93 @@ struct ReviewArgs {
 enum ReviewCommand {
     Diff(ReviewDiffArgs),
     File(ReviewFileArgs),
+}
+
+#[derive(Args)]
+struct GenerateArgs {
+    #[command(subcommand)]
+    command: GenerateCommand,
+}
+
+#[derive(Subcommand)]
+enum GenerateCommand {
+    Image(GenerateImageArgs),
+    Video(GenerateVideoArgs),
+}
+
+#[derive(Args)]
+struct GenerateImageArgs {
+    #[arg(short, long)]
+    prompt: Option<String>,
+
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+
+    #[arg(long)]
+    provider: Option<String>,
+
+    #[arg(long)]
+    model: Option<String>,
+
+    #[arg(long, value_name = "PATH_OR_URL")]
+    image: Vec<String>,
+
+    #[arg(long)]
+    size: Option<String>,
+
+    #[arg(long)]
+    quality: Option<String>,
+
+    #[arg(long)]
+    background: Option<String>,
+
+    #[arg(long, default_value = "1")]
+    n: usize,
+
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    dry_run: bool,
+}
+
+#[derive(Args)]
+struct GenerateVideoArgs {
+    #[arg(short, long)]
+    prompt: Option<String>,
+
+    #[arg(long)]
+    prompt_file: Option<PathBuf>,
+
+    #[arg(long)]
+    provider: Option<String>,
+
+    #[arg(long)]
+    model: Option<String>,
+
+    #[arg(long, value_name = "PATH_OR_URL")]
+    image: Vec<String>,
+
+    #[arg(long)]
+    duration_secs: Option<u32>,
+
+    #[arg(long)]
+    aspect_ratio: Option<String>,
+
+    #[arg(long)]
+    resolution: Option<String>,
+
+    #[arg(long)]
+    size: Option<String>,
+
+    #[arg(long)]
+    negative_prompt: Option<String>,
+
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(Args)]
@@ -442,6 +541,7 @@ async fn main() -> Result<()> {
         Commands::Council(args) => handle_council(&ctx, args, format).await,
         Commands::Apply(args) => handle_apply(args),
         Commands::Review(args) => handle_review(&ctx, args, format).await,
+        Commands::Generate(args) => handle_generate(&ctx, args, format).await,
     }
 }
 
@@ -465,6 +565,12 @@ fn build_client(timeout_secs: u64) -> Result<reqwest::Client> {
 async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Result<()> {
     let prompt = resolve_prompt(args.prompt.clone(), args.prompt_file.clone())?;
     let config = &ctx.config;
+
+    let image_inputs = parse_media_inputs(&args.image)?;
+    let video_input = match args.video.as_deref() {
+        Some(value) => Some(parse_media_input(value)?),
+        None => None,
+    };
 
     let include_files = args.files.clone();
     let exclude_files = args.exclude.clone();
@@ -538,6 +644,52 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
             None,
             None,
         )
+    } else if !image_inputs.is_empty() || video_input.is_some() {
+        let provider = provider_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("provider is required"))?;
+        let model = model_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("model is required"))?;
+        match provider {
+            "openai" => {
+                if video_input.is_some() {
+                    return Err(anyhow!("openai provider does not support video inputs"));
+                }
+                let auth = resolve_provider_auth(config, provider)?;
+                let result = openai::call_responses_vision(
+                    &ctx.client,
+                    &auth,
+                    &model_prompt,
+                    model,
+                    &image_inputs,
+                    args.temperature,
+                    args.max_output_tokens,
+                )
+                .await?;
+                (result.content, result.usage, result.response_id, None)
+            }
+            "gemini" => {
+                let auth = resolve_provider_auth(config, provider)?;
+                let result = gemini::generate_content(
+                    &ctx.client,
+                    &auth,
+                    &model_prompt,
+                    model,
+                    &image_inputs,
+                    video_input.as_ref(),
+                    args.temperature,
+                    args.max_output_tokens,
+                )
+                .await?;
+                (result.content, result.usage, None, None)
+            }
+            _ => {
+                return Err(anyhow!(
+                    "provider {provider} does not support multimodal inputs yet"
+                ))
+            }
+        }
     } else {
         let provider = provider_id
             .as_deref()
@@ -646,6 +798,7 @@ fn handle_bundle(ctx: &AppContext, args: BundleArgs, format: OutputFormat) -> Re
             bundle_json: Some(bundle_json.to_string_lossy().to_string()),
             bundle_md: Some(bundle_md.to_string_lossy().to_string()),
             response_json: None,
+            media_dir: None,
         },
     };
 
@@ -1244,6 +1397,211 @@ async fn handle_review_file(
     }
 }
 
+async fn handle_generate(ctx: &AppContext, args: GenerateArgs, format: OutputFormat) -> Result<()> {
+    match args.command {
+        GenerateCommand::Image(args) => handle_generate_image(ctx, args, format).await,
+        GenerateCommand::Video(args) => handle_generate_video(ctx, args, format).await,
+    }
+}
+
+async fn handle_generate_image(
+    ctx: &AppContext,
+    args: GenerateImageArgs,
+    format: OutputFormat,
+) -> Result<()> {
+    let prompt = resolve_prompt(args.prompt, args.prompt_file)?;
+    let config = &ctx.config;
+
+    let provider = args
+        .provider
+        .clone()
+        .or(config.defaults.provider.clone())
+        .ok_or_else(|| anyhow!("provider is required"))?;
+    let model = args
+        .model
+        .clone()
+        .or(config.defaults.model.clone())
+        .ok_or_else(|| anyhow!("model is required"))?;
+
+    let images = parse_media_inputs(&args.image)?;
+
+    let session = create_session_dir()?;
+    let media_dir = args
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| session.path.join("media"));
+    fs::create_dir_all(&media_dir).with_context(|| format!("create {}", media_dir.display()))?;
+
+    let artifacts = ArtifactPaths {
+        session_dir: session.path.to_string_lossy().to_string(),
+        media_dir: Some(media_dir.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+
+    let (outputs, usage) = if args.dry_run {
+        (Vec::new(), Usage::default())
+    } else {
+        match provider.as_str() {
+            "openai" => {
+                let auth = resolve_provider_auth(config, &provider)?;
+                let result = openai::generate_images(
+                    &ctx.client,
+                    &auth,
+                    &prompt,
+                    &model,
+                    &images,
+                    args.size.as_deref(),
+                    args.quality.as_deref(),
+                    args.background.as_deref(),
+                    args.n,
+                    &media_dir,
+                )
+                .await?;
+                (result.outputs, result.usage)
+            }
+            _ => {
+                return Err(anyhow!(
+                    "provider {provider} does not support image generation yet"
+                ))
+            }
+        }
+    };
+
+    let mut result = MediaGenerationResult {
+        id: session.id,
+        provider: Some(provider),
+        model: Some(model),
+        prompt,
+        usage,
+        artifacts: artifacts.clone(),
+        outputs,
+    };
+
+    let response_json = PathBuf::from(&artifacts.session_dir).join("response.json");
+    write_json_file(&response_json, &result)?;
+    result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+
+    maybe_write_output(ctx, &result)?;
+
+    match format {
+        OutputFormat::Json => write_json(&result),
+        OutputFormat::Jsonl => write_jsonl("generate.image", &result),
+        OutputFormat::Text | OutputFormat::Markdown => {
+            for output in &result.outputs {
+                println!("{}", output.path.display());
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn handle_generate_video(
+    ctx: &AppContext,
+    args: GenerateVideoArgs,
+    format: OutputFormat,
+) -> Result<()> {
+    let prompt = resolve_prompt(args.prompt, args.prompt_file)?;
+    let config = &ctx.config;
+
+    let provider = args
+        .provider
+        .clone()
+        .or(config.defaults.provider.clone())
+        .ok_or_else(|| anyhow!("provider is required"))?;
+    let model = args
+        .model
+        .clone()
+        .or(config.defaults.model.clone())
+        .ok_or_else(|| anyhow!("model is required"))?;
+
+    let images = parse_media_inputs(&args.image)?;
+
+    let session = create_session_dir()?;
+    let media_dir = args
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| session.path.join("media"));
+    fs::create_dir_all(&media_dir).with_context(|| format!("create {}", media_dir.display()))?;
+
+    let artifacts = ArtifactPaths {
+        session_dir: session.path.to_string_lossy().to_string(),
+        media_dir: Some(media_dir.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+
+    let output_path = media_dir.join("video.mp4");
+
+    let outputs = if args.dry_run {
+        Vec::new()
+    } else {
+        let output = match provider.as_str() {
+            "openai" => {
+                let auth = resolve_provider_auth(config, &provider)?;
+                openai::generate_video_sora(
+                    &ctx.client,
+                    &auth,
+                    &prompt,
+                    &model,
+                    args.duration_secs,
+                    args.size.as_deref(),
+                    images.first(),
+                    &output_path,
+                )
+                .await?
+            }
+            "gemini" => {
+                let auth = resolve_provider_auth(config, &provider)?;
+                gemini::generate_video_veo(
+                    &ctx.client,
+                    &auth,
+                    &prompt,
+                    &model,
+                    &images,
+                    args.duration_secs,
+                    args.aspect_ratio.as_deref(),
+                    args.resolution.as_deref(),
+                    args.negative_prompt.as_deref(),
+                    &output_path,
+                )
+                .await?
+            }
+            _ => {
+                return Err(anyhow!(
+                    "provider {provider} does not support video generation yet"
+                ))
+            }
+        };
+        vec![output]
+    };
+
+    let mut result = MediaGenerationResult {
+        id: session.id,
+        provider: Some(provider),
+        model: Some(model),
+        prompt,
+        usage: Usage::default(),
+        artifacts: artifacts.clone(),
+        outputs,
+    };
+
+    let response_json = PathBuf::from(&artifacts.session_dir).join("response.json");
+    write_json_file(&response_json, &result)?;
+    result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+
+    maybe_write_output(ctx, &result)?;
+
+    match format {
+        OutputFormat::Json => write_json(&result),
+        OutputFormat::Jsonl => write_jsonl("generate.video", &result),
+        OutputFormat::Text | OutputFormat::Markdown => {
+            for output in &result.outputs {
+                println!("{}", output.path.display());
+            }
+            Ok(())
+        }
+    }
+}
+
 fn build_review_diff_prompt(diff: &str, extra_prompt: Option<&str>) -> String {
     let mut prompt = String::new();
     prompt.push_str("You are a senior engineer performing a careful code review. ");
@@ -1487,6 +1845,21 @@ fn resolve_prompt(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Resul
     ))
 }
 
+fn parse_media_inputs(values: &[String]) -> Result<Vec<MediaInput>> {
+    let mut out = Vec::new();
+    for value in values {
+        out.push(parse_media_input(value)?);
+    }
+    Ok(out)
+}
+
+fn parse_media_input(value: &str) -> Result<MediaInput> {
+    if value.starts_with("http://") || value.starts_with("https://") {
+        return MediaInput::from_url(value, None);
+    }
+    MediaInput::from_path(PathBuf::from(value).as_path())
+}
+
 fn render_bundle_md(bundle: &yoetz_core::types::Bundle) -> String {
     let mut out = String::new();
     out.push_str("# Yoetz Bundle\n\n");
@@ -1540,27 +1913,8 @@ async fn call_openai_compatible(
     temperature: f32,
     max_output_tokens: usize,
 ) -> Result<CallResult> {
-    let provider_cfg = config.providers.get(provider);
-
-    let base_url = provider_cfg
-        .and_then(|p| p.base_url.clone())
-        .or_else(|| default_base_url(provider))
-        .ok_or_else(|| anyhow!("base_url not found for provider {provider}"))?;
-
-    let api_key_env = provider_cfg
-        .and_then(|p| p.api_key_env.clone())
-        .unwrap_or_else(|| default_api_key_env(provider).unwrap_or_default());
-
-    if api_key_env.is_empty() {
-        return Err(anyhow!(
-            "api_key_env not configured for provider {provider}"
-        ));
-    }
-
-    let api_key =
-        env::var(&api_key_env).with_context(|| format!("missing env var {api_key_env}"))?;
-
-    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+    let auth = resolve_provider_auth(config, provider)?;
+    let url = format!("{}/chat/completions", auth.base_url.trim_end_matches('/'));
     let body = serde_json::json!({
         "model": model,
         "messages": [
@@ -1571,7 +1925,8 @@ async fn call_openai_compatible(
     });
 
     let (parsed, headers) =
-        send_json::<OpenAIChatResponse>(client.post(url).bearer_auth(api_key).json(&body)).await?;
+        send_json::<OpenAIChatResponse>(client.post(url).bearer_auth(auth.api_key).json(&body))
+            .await?;
     let content = parsed
         .choices
         .first()
@@ -1606,11 +1961,12 @@ async fn fetch_openrouter_cost(
     let provider_cfg = config.providers.get("openrouter");
     let base_url = provider_cfg
         .and_then(|p| p.base_url.clone())
-        .or_else(|| default_base_url("openrouter"))
+        .or_else(|| providers::default_base_url("openrouter"))
         .ok_or_else(|| anyhow!("base_url not found for openrouter"))?;
 
     let api_key_env = provider_cfg
         .and_then(|p| p.api_key_env.clone())
+        .or_else(|| providers::default_api_key_env("openrouter"))
         .unwrap_or_else(|| "OPENROUTER_API_KEY".to_string());
 
     let api_key = match env::var(&api_key_env) {
@@ -1642,19 +1998,4 @@ fn parse_cost(value: Option<&Value>) -> Option<f64> {
     None
 }
 
-fn default_base_url(provider: &str) -> Option<String> {
-    match provider {
-        "openrouter" => Some("https://openrouter.ai/api/v1".to_string()),
-        "openai" => Some("https://api.openai.com/v1".to_string()),
-        _ => None,
-    }
-}
-
-fn default_api_key_env(provider: &str) -> Option<String> {
-    match provider {
-        "openrouter" => Some("OPENROUTER_API_KEY".to_string()),
-        "openai" => Some("OPENAI_API_KEY".to_string()),
-        "litellm" => Some("LITELLM_API_KEY".to_string()),
-        _ => None,
-    }
-}
+// defaults moved to providers module

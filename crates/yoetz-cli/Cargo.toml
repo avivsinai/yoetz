@@ -9,8 +9,8 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
-tokio = { version = "1.36", features = ["rt-multi-thread", "macros"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"] }
+tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "time"] }
 time = { workspace = true }
 serde_yaml = "0.9"
 tempfile = "3.10"
