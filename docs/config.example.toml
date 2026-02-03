@@ -1,6 +1,6 @@
 [defaults]
 provider = "openrouter"
-model = "anthropic/claude-3.5-sonnet"
+model = "anthropic/claude-sonnet-4-5-20250929"
 max_output_tokens = 1024
 
 [providers.openrouter]

@@ -1055,7 +1055,7 @@ fn build_model_spec(provider: Option<&str>, model: &str) -> Result<String> {
                 let rest = model.split_once('/').map(|(_, rest)| rest).unwrap_or("");
                 if !rest.contains('/') {
                     return Err(anyhow!(
-                        "openrouter models must be namespaced (e.g. openai/gpt-4o, anthropic/claude-3-5-sonnet)"
+                        "openrouter models must be namespaced (e.g. openai/gpt-5.2, anthropic/claude-sonnet-4-5)"
                     ));
                 }
                 return Ok(model.to_string());
@@ -1072,7 +1072,7 @@ use --provider {prefix} or pass an unprefixed model name"
     }
     if provider_lc == "openrouter" {
         return Err(anyhow!(
-            "openrouter models must be namespaced (e.g. openai/gpt-4o, anthropic/claude-3-5-sonnet)"
+            "openrouter models must be namespaced (e.g. openai/gpt-5.2, anthropic/claude-sonnet-4-5)"
         ));
     }
     Ok(format!("{provider}/{model}"))

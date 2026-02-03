@@ -22,17 +22,17 @@ yoetz ask --prompt "Review this" --files "src/**/*.rs" --format json
 
 ### Council (multi-model)
 ```bash
-yoetz council --prompt "Review" --models openai/gpt-4o,anthropic/claude-3.5-sonnet --format json
+yoetz council --prompt "Review" --models openai/gpt-5.2-codex,anthropic/claude-sonnet-4-5-20250929 --format json
 ```
 
 ### Review git diff
 ```bash
-yoetz review diff --model openai/gpt-4o --format json
+yoetz review diff --model openai/gpt-5.2-codex --format json
 ```
 
 ### Review single file
 ```bash
-yoetz review file --path src/main.rs --model openai/gpt-4o --format json
+yoetz review file --path src/main.rs --model openai/gpt-5.2-codex --format json
 ```
 
 ### Bundle only (for manual paste or browser mode)
@@ -42,7 +42,7 @@ yoetz bundle --prompt "Explain this" --files "src/**/*.rs" --format json
 
 ### Pricing / budgets
 ```bash
-yoetz pricing estimate --model openai/gpt-4o --input-tokens 12000 --output-tokens 800
+yoetz pricing estimate --model openai/gpt-5.2 --input-tokens 12000 --output-tokens 800
 
 yoetz ask --prompt "Review" --max-cost-usd 1.00 --daily-budget-usd 5.00
 ```

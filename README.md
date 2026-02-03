@@ -42,7 +42,7 @@ Create `~/.yoetz/config.toml`:
 ```toml
 [defaults]
 provider = "openrouter"
-model = "anthropic/claude-3.5-sonnet"
+model = "anthropic/claude-sonnet-4-5-20250929"
 
 [providers.openrouter]
 api_key_env = "OPENROUTER_API_KEY"
@@ -64,33 +64,33 @@ yoetz bundle --prompt "Review this code" --files "src/**/*.rs"
 yoetz ask --prompt "Explain this function" --files "src/main.rs"
 
 # Ask with structured JSON output (OpenAI-compatible)
-yoetz ask --prompt "Return JSON only" --provider openai --model gpt-4.1 --response-format json
+yoetz ask --prompt "Return JSON only" --provider openai --model gpt-5.2 --response-format json
 
 # Ask with an image (vision)
-yoetz ask --prompt "Describe this diagram" --image diagram.png --provider gemini --model gemini-2.0-flash
+yoetz ask --prompt "Describe this diagram" --image diagram.png --provider gemini --model gemini-3-flash-preview
 
 # Ask about a video
-yoetz ask --prompt "Summarize this" --video meeting.mp4 --provider gemini --model gemini-2.0-flash
+yoetz ask --prompt "Summarize this" --video meeting.mp4 --provider gemini --model gemini-3-flash-preview
 
 # Multi-model council
-yoetz council --prompt "Review this PR" --models "openai/gpt-4o,anthropic/claude-3.5-sonnet"
+yoetz council --prompt "Review this PR" --models "openai/gpt-5.2-codex,anthropic/claude-sonnet-4-5-20250929"
 
 # Code review
-yoetz review diff --model openai/gpt-4o
-yoetz review file --path src/lib.rs --model anthropic/claude-3.5-sonnet
+yoetz review diff --model openai/gpt-5.2-codex
+yoetz review file --path src/lib.rs --model anthropic/claude-sonnet-4-5-20250929
 ```
 
 ### Generation
 
 ```bash
 # Generate images
-yoetz generate image --prompt "A cozy cabin in snow" --provider openai --model gpt-4.1
+yoetz generate image --prompt "A cozy cabin in snow" --provider openai --model gpt-image-1.5
 
 # Generate video (Sora)
 yoetz generate video --prompt "Drone flyover" --provider openai --model sora-2-pro
 
 # Generate video (Veo)
-yoetz generate video --prompt "Ocean waves" --provider gemini --model veo-3.1
+yoetz generate video --prompt "Ocean waves" --provider gemini --model veo-3.1-generate-preview
 ```
 
 ### Browser Fallback

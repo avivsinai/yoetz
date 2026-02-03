@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
         );
 
     let resp = client
-        .completion(ChatRequest::new("openai/gpt-4.1").message("user", "hello"))
+        .completion(ChatRequest::new("openai/gpt-5.2").message("user", "hello"))
         .await?;
     println!("{}", resp.content);
 
@@ -48,7 +48,7 @@ async fn main() -> anyhow::Result<()> {
 
     let images = client
         .image_generation(ImageRequest {
-            model: "openai/gpt-image-1".to_string(),
+            model: "openai/gpt-image-1.5".to_string(),
             prompt: "A cozy cabin in snow".to_string(),
             n: Some(1),
             size: None,
@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
 
     let video = client
         .video_generation(VideoRequest {
-            model: "openai/sora-2".to_string(),
+            model: "openai/sora-2-pro".to_string(),
             prompt: "Drone flyover".to_string(),
             seconds: Some(5),
             size: None,
@@ -81,7 +81,7 @@ use litellm_rs::{LiteLLM, ChatRequest};
 # async fn run() -> anyhow::Result<()> {
 let client = LiteLLM::new()?;
 let mut stream = client
-    .stream_completion(ChatRequest::new("openai/gpt-4.1").message("user", "hello"))
+    .stream_completion(ChatRequest::new("openai/gpt-5.2").message("user", "hello"))
     .await?;
 while let Some(chunk) = stream.next().await {
     let chunk = chunk?;
