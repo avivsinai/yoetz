@@ -2,9 +2,89 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatMessageContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+impl ChatMessageContent {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self::Text(text.into())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatContentPart {
+    Text(ChatContentPartText),
+    ImageUrl(ChatContentPartImageUrl),
+    InputAudio(ChatContentPartInputAudio),
+    File(ChatContentPartFile),
+    Other(Value),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatContentPartText {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatContentPartImageUrl {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub image_url: ChatImageUrl,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ChatImageUrl {
+    Url(String),
+    Object(ChatImageUrlObject),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatImageUrlObject {
+    pub url: String,
+    pub detail: Option<String>,
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatContentPartInputAudio {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub input_audio: ChatInputAudio,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatInputAudio {
+    pub data: String,
+    pub format: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatContentPartFile {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub file: ChatFile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatFile {
+    pub file_id: Option<String>,
+    pub file_data: Option<String>,
+    pub format: Option<String>,
+    pub detail: Option<String>,
+    pub video_metadata: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: ChatMessageContent,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -30,7 +110,19 @@ impl ChatRequest {
     pub fn message(mut self, role: impl Into<String>, content: impl Into<String>) -> Self {
         self.messages.push(ChatMessage {
             role: role.into(),
-            content: content.into(),
+            content: ChatMessageContent::Text(content.into()),
+        });
+        self
+    }
+
+    pub fn message_with_content(
+        mut self,
+        role: impl Into<String>,
+        content: ChatMessageContent,
+    ) -> Self {
+        self.messages.push(ChatMessage {
+            role: role.into(),
+            content,
         });
         self
     }

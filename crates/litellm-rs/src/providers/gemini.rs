@@ -1,7 +1,11 @@
 use crate::config::ProviderConfig;
 use crate::error::{LiteLLMError, Result};
 use crate::providers::resolve_api_key;
-use crate::types::{ChatRequest, ChatResponse, Usage, VideoRequest, VideoResponse};
+use crate::types::{
+    ChatContentPart, ChatContentPartFile, ChatContentPartImageUrl, ChatContentPartInputAudio,
+    ChatContentPartText, ChatFile, ChatImageUrl, ChatInputAudio, ChatMessage, ChatMessageContent,
+    ChatRequest, ChatResponse, Usage, VideoRequest, VideoResponse,
+};
 use reqwest::Client;
 use serde_json::Value;
 use tokio::time::{sleep, Duration};
@@ -19,20 +23,21 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
         req.model
     );
 
-    let contents = req
-        .messages
-        .into_iter()
-        .map(|m| {
-            serde_json::json!({
-                "role": m.role,
-                "parts": [{ "text": m.content }]
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut messages = req.messages;
+    let system_instruction = extract_system_instruction(&mut messages)?;
+    if messages.is_empty() && !system_instruction.is_empty() {
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: ChatMessageContent::Text(" ".to_string()),
+        });
+    }
 
-    let mut body = serde_json::json!({
-        "contents": contents,
-    });
+    let contents = gemini_contents_from_messages(messages, &req.model)?;
+
+    let mut body = serde_json::json!({ "contents": contents });
+    if !system_instruction.is_empty() {
+        body["system_instruction"] = serde_json::json!({ "parts": system_instruction });
+    }
     if let Some(temp) = req.temperature {
         body["generationConfig"] = serde_json::json!({ "temperature": temp });
     }
@@ -176,6 +181,243 @@ fn parse_usage(resp: &Value) -> Usage {
         };
     }
     Usage::default()
+}
+
+fn extract_system_instruction(messages: &mut Vec<ChatMessage>) -> Result<Vec<Value>> {
+    let mut parts = Vec::new();
+    let mut indices = Vec::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        if msg.role == "system" {
+            match &msg.content {
+                ChatMessageContent::Text(text) => {
+                    if !text.is_empty() {
+                        parts.push(serde_json::json!({ "text": text }));
+                    }
+                }
+                ChatMessageContent::Parts(content_parts) => {
+                    let mut system_text = String::new();
+                    for part in content_parts {
+                        if let ChatContentPart::Text(ChatContentPartText { text, .. }) = part {
+                            system_text.push_str(text);
+                        }
+                    }
+                    if !system_text.is_empty() {
+                        parts.push(serde_json::json!({ "text": system_text }));
+                    }
+                }
+            }
+            indices.push(idx);
+        }
+    }
+    for idx in indices.into_iter().rev() {
+        messages.remove(idx);
+    }
+    Ok(parts)
+}
+
+fn gemini_contents_from_messages(messages: Vec<ChatMessage>, model: &str) -> Result<Vec<Value>> {
+    let mut contents: Vec<Value> = Vec::new();
+    for message in messages {
+        let role = map_gemini_role(&message.role);
+        let parts = gemini_parts_from_content(&message.content, model)?;
+        if parts.is_empty() {
+            continue;
+        }
+        if let Some(last) = contents.last_mut() {
+            if last.get("role").and_then(|v| v.as_str()) == Some(role.as_str()) {
+                if let Some(existing_parts) = last.get_mut("parts").and_then(|v| v.as_array_mut()) {
+                    existing_parts.extend(parts);
+                    continue;
+                }
+            }
+        }
+        contents.push(serde_json::json!({ "role": role, "parts": parts }));
+    }
+    if contents.is_empty() {
+        contents.push(serde_json::json!({
+            "role": "user",
+            "parts": [{ "text": " " }]
+        }));
+    }
+    Ok(contents)
+}
+
+fn map_gemini_role(role: &str) -> String {
+    match role {
+        "assistant" => "model".to_string(),
+        _ => "user".to_string(),
+    }
+}
+
+fn gemini_parts_from_content(content: &ChatMessageContent, model: &str) -> Result<Vec<Value>> {
+    match content {
+        ChatMessageContent::Text(text) => Ok(vec![serde_json::json!({ "text": text })]),
+        ChatMessageContent::Parts(parts) => {
+            let mut out = Vec::new();
+            for part in parts {
+                match part {
+                    ChatContentPart::Text(ChatContentPartText { text, .. }) => {
+                        if !text.is_empty() {
+                            out.push(serde_json::json!({ "text": text }));
+                        }
+                    }
+                    ChatContentPart::ImageUrl(ChatContentPartImageUrl { image_url, .. }) => {
+                        let detail = match image_url {
+                            ChatImageUrl::Object(obj) => obj.detail.as_deref(),
+                            ChatImageUrl::Url(_) => None,
+                        };
+                        out.push(process_gemini_media(image_url, detail, None, None, model)?);
+                    }
+                    ChatContentPart::InputAudio(ChatContentPartInputAudio {
+                        input_audio, ..
+                    }) => {
+                        out.push(process_gemini_audio(input_audio)?);
+                    }
+                    ChatContentPart::File(ChatContentPartFile { file, .. }) => {
+                        out.push(process_gemini_file(file, model)?);
+                    }
+                    ChatContentPart::Other(value) => {
+                        return Err(LiteLLMError::Config(format!(
+                            "unsupported gemini content part: {}",
+                            value
+                        )));
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+fn process_gemini_audio(input_audio: &ChatInputAudio) -> Result<Value> {
+    let format = if input_audio.format.starts_with("audio/") {
+        input_audio.format.clone()
+    } else {
+        format!("audio/{}", input_audio.format)
+    };
+    Ok(serde_json::json!({
+        "inline_data": {
+            "mime_type": format,
+            "data": input_audio.data
+        }
+    }))
+}
+
+fn process_gemini_file(file: &ChatFile, model: &str) -> Result<Value> {
+    let passed = file
+        .file_id
+        .as_ref()
+        .or(file.file_data.as_ref())
+        .ok_or_else(|| LiteLLMError::Config("file_id or file_data required".into()))?;
+    process_gemini_media_url(
+        passed,
+        file.format.as_deref(),
+        file.detail.as_deref(),
+        file.video_metadata.as_ref(),
+        model,
+    )
+}
+
+fn process_gemini_media(
+    image_url: &ChatImageUrl,
+    detail: Option<&str>,
+    video_metadata: Option<&Value>,
+    format: Option<&str>,
+    model: &str,
+) -> Result<Value> {
+    let (url, format) = match image_url {
+        ChatImageUrl::Url(url) => (url.as_str(), format),
+        ChatImageUrl::Object(obj) => (obj.url.as_str(), obj.format.as_deref().or(format)),
+    };
+    process_gemini_media_url(url, format, detail, video_metadata, model)
+}
+
+fn process_gemini_media_url(
+    url: &str,
+    format: Option<&str>,
+    detail: Option<&str>,
+    video_metadata: Option<&Value>,
+    _model: &str,
+) -> Result<Value> {
+    if url.starts_with("gs://") || url.starts_with("https://") || url.starts_with("http://") {
+        let mime_type = format
+            .map(|v| v.to_string())
+            .or_else(|| mime_type_from_url(url))
+            .ok_or_else(|| LiteLLMError::Config("missing media mime type".into()))?;
+        let mut part = serde_json::json!({
+            "file_data": { "mime_type": mime_type, "file_uri": url }
+        });
+        apply_gemini_metadata(&mut part, detail, video_metadata);
+        return Ok(part);
+    }
+
+    if let Some((media_type, data)) = parse_data_url(url, format) {
+        let mut part = serde_json::json!({
+            "inline_data": { "mime_type": media_type, "data": data }
+        });
+        apply_gemini_metadata(&mut part, detail, video_metadata);
+        return Ok(part);
+    }
+
+    Err(LiteLLMError::Config("unsupported gemini media url".into()))
+}
+
+fn apply_gemini_metadata(part: &mut Value, detail: Option<&str>, video_metadata: Option<&Value>) {
+    if let Some(detail) = detail {
+        if let Some(level) = detail_to_media_resolution(detail) {
+            if let Some(obj) = part.as_object_mut() {
+                obj.insert(
+                    "media_resolution".to_string(),
+                    serde_json::json!({ "level": level }),
+                );
+            }
+        }
+    }
+    if let Some(video_metadata) = video_metadata {
+        if let Some(obj) = part.as_object_mut() {
+            obj.insert("video_metadata".to_string(), video_metadata.clone());
+        }
+    }
+}
+
+fn detail_to_media_resolution(detail: &str) -> Option<&'static str> {
+    match detail {
+        "low" => Some("MEDIA_RESOLUTION_LOW"),
+        "medium" => Some("MEDIA_RESOLUTION_MEDIUM"),
+        "high" => Some("MEDIA_RESOLUTION_HIGH"),
+        "ultra_high" => Some("MEDIA_RESOLUTION_ULTRA_HIGH"),
+        _ => None,
+    }
+}
+
+fn parse_data_url(url: &str, override_format: Option<&str>) -> Option<(String, String)> {
+    if url.starts_with("data:") {
+        let stripped = url.strip_prefix("data:").unwrap_or(url);
+        if let Some((meta, data)) = stripped.split_once(",") {
+            let mut media_type = meta.split(';').next().unwrap_or("application/octet-stream");
+            if let Some(fmt) = override_format {
+                media_type = fmt;
+            }
+            return Some((media_type.to_string(), data.to_string()));
+        }
+    }
+    None
+}
+
+fn mime_type_from_url(url: &str) -> Option<String> {
+    let path = url.split('?').next().unwrap_or(url);
+    let ext = path.rsplit('.').next()?.to_lowercase();
+    let mime = match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "mp4" => "video/mp4",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        _ => return None,
+    };
+    Some(mime.to_string())
 }
 
 fn extract_video_uri(resp: &Value) -> Option<String> {

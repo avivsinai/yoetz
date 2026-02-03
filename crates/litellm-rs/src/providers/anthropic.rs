@@ -1,7 +1,11 @@
 use crate::config::ProviderConfig;
 use crate::error::{LiteLLMError, Result};
 use crate::providers::resolve_api_key;
-use crate::types::{ChatRequest, ChatResponse, Usage};
+use crate::types::{
+    ChatContentPart, ChatContentPartImageUrl, ChatContentPartText, ChatImageUrl, ChatMessage,
+    ChatMessageContent, ChatRequest, ChatResponse, Usage,
+};
+use base64::{engine::general_purpose, Engine as _};
 use reqwest::Client;
 use serde_json::Value;
 
@@ -16,11 +20,21 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
     let key = resolve_api_key(cfg)?;
     let key = key.ok_or_else(|| LiteLLMError::MissingApiKey("ANTHROPIC_API_KEY".into()))?;
 
+    let mut messages = req.messages;
+    let system_blocks = extract_system_blocks(client, &mut messages).await?;
+    let mut anthropic_messages = Vec::with_capacity(messages.len());
+    for message in messages {
+        anthropic_messages.push(anthropic_message_from_chat(client, message).await?);
+    }
+
     let mut body = serde_json::json!({
         "model": req.model,
-        "messages": req.messages,
+        "messages": anthropic_messages,
         "max_tokens": req.max_tokens.unwrap_or(1024),
     });
+    if !system_blocks.is_empty() {
+        body["system"] = serde_json::json!(system_blocks);
+    }
     if let Some(temp) = req.temperature {
         body["temperature"] = serde_json::json!(temp);
     }
@@ -80,6 +94,163 @@ fn parse_usage(resp: &Value) -> Usage {
         };
     }
     Usage::default()
+}
+
+#[derive(Debug, serde::Serialize)]
+struct AnthropicMessage {
+    role: String,
+    content: Vec<AnthropicContentBlock>,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "type")]
+enum AnthropicContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: AnthropicImageSource },
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "type")]
+enum AnthropicImageSource {
+    #[serde(rename = "base64")]
+    Base64 { media_type: String, data: String },
+    #[serde(rename = "url")]
+    Url { url: String },
+}
+
+async fn extract_system_blocks(
+    client: &Client,
+    messages: &mut Vec<ChatMessage>,
+) -> Result<Vec<AnthropicContentBlock>> {
+    let mut blocks = Vec::new();
+    let mut indices = Vec::new();
+    for (idx, msg) in messages.iter().enumerate() {
+        if msg.role == "system" {
+            let mut msg_blocks = anthropic_blocks_from_content(client, &msg.content).await?;
+            if msg_blocks.is_empty() {
+                continue;
+            }
+            blocks.append(&mut msg_blocks);
+            indices.push(idx);
+        }
+    }
+    for idx in indices.into_iter().rev() {
+        messages.remove(idx);
+    }
+    Ok(blocks)
+}
+
+async fn anthropic_message_from_chat(
+    client: &Client,
+    message: ChatMessage,
+) -> Result<AnthropicMessage> {
+    let role = match message.role.as_str() {
+        "user" | "assistant" => message.role,
+        other => {
+            return Err(LiteLLMError::Config(format!(
+                "unsupported anthropic role: {}",
+                other
+            )))
+        }
+    };
+    let content = anthropic_blocks_from_content(client, &message.content).await?;
+    Ok(AnthropicMessage { role, content })
+}
+
+async fn anthropic_blocks_from_content(
+    client: &Client,
+    content: &ChatMessageContent,
+) -> Result<Vec<AnthropicContentBlock>> {
+    match content {
+        ChatMessageContent::Text(text) => Ok(vec![AnthropicContentBlock::Text {
+            text: text.to_string(),
+        }]),
+        ChatMessageContent::Parts(parts) => {
+            let mut out = Vec::new();
+            for part in parts {
+                match part {
+                    ChatContentPart::Text(ChatContentPartText { text, .. }) => {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        out.push(AnthropicContentBlock::Text { text: text.clone() });
+                    }
+                    ChatContentPart::ImageUrl(ChatContentPartImageUrl { image_url, .. }) => {
+                        let source = anthropic_image_source(client, image_url).await?;
+                        out.push(AnthropicContentBlock::Image { source });
+                    }
+                    ChatContentPart::InputAudio(_) | ChatContentPart::File(_) => {
+                        return Err(LiteLLMError::Config(
+                            "anthropic does not support input_audio/file parts".into(),
+                        ));
+                    }
+                    ChatContentPart::Other(value) => {
+                        return Err(LiteLLMError::Config(format!(
+                            "unsupported anthropic content part: {}",
+                            value
+                        )));
+                    }
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
+async fn anthropic_image_source(
+    client: &Client,
+    image_url: &ChatImageUrl,
+) -> Result<AnthropicImageSource> {
+    let (url, format) = match image_url {
+        ChatImageUrl::Url(url) => (url.as_str(), None),
+        ChatImageUrl::Object(obj) => (obj.url.as_str(), obj.format.as_deref()),
+    };
+
+    if url.starts_with("https://") {
+        return Ok(AnthropicImageSource::Url {
+            url: url.to_string(),
+        });
+    }
+    if url.starts_with("http://") {
+        let bytes = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| LiteLLMError::Http(e.to_string()))?
+            .bytes()
+            .await
+            .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+        let data = general_purpose::STANDARD.encode(bytes);
+        let media_type = format.unwrap_or("application/octet-stream").to_string();
+        return Ok(AnthropicImageSource::Base64 { media_type, data });
+    }
+
+    let (media_type, data) = parse_data_url(url, format)?;
+    Ok(AnthropicImageSource::Base64 { media_type, data })
+}
+
+fn parse_data_url(url: &str, override_format: Option<&str>) -> Result<(String, String)> {
+    if url.starts_with("data:") {
+        let stripped = url.strip_prefix("data:").unwrap_or(url);
+        if let Some((meta, data)) = stripped.split_once(",") {
+            let mut media_type = meta.split(';').next().unwrap_or("application/octet-stream");
+            if let Some(fmt) = override_format {
+                media_type = fmt;
+            }
+            let data = data.to_string();
+            return Ok((media_type.to_string(), data));
+        }
+    }
+
+    if let Some(fmt) = override_format {
+        return Ok((fmt.to_string(), url.to_string()));
+    }
+
+    Err(LiteLLMError::Config(
+        "expected data URL for anthropic image; provide data:...;base64,... or format".into(),
+    ))
 }
 
 async fn send_json<T: serde::de::DeserializeOwned>(

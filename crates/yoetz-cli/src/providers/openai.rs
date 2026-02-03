@@ -88,9 +88,10 @@ pub async fn generate_images(
     output_dir: &Path,
 ) -> Result<OpenAIMediaResult> {
     if model.contains("gpt-image") {
-        return Err(anyhow!(
-            "openai image models are selected via image_generation tool; pass a text model"
-        ));
+        return generate_images_via_images_api(
+            client, auth, prompt, model, images, size, quality, background, n, output_dir,
+        )
+        .await;
     }
     let url = format!("{}/responses", auth.base_url.trim_end_matches('/'));
 
@@ -145,6 +146,125 @@ pub async fn generate_images(
         if let Some(b64) = payload.b64_json {
             let bytes = general_purpose::STANDARD
                 .decode(b64)
+                .context("decode image base64")?;
+            std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+        } else if let Some(url) = &payload.url {
+            let bytes = client
+                .get(url)
+                .bearer_auth(&auth.api_key)
+                .send()
+                .await?
+                .bytes()
+                .await?;
+            std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+        } else {
+            continue;
+        }
+
+        outputs.push(MediaOutput {
+            media_type: MediaType::Image,
+            path,
+            url: payload.url,
+            metadata: MediaMetadata {
+                width: None,
+                height: None,
+                duration_secs: None,
+                model: model.to_string(),
+                revised_prompt: payload.revised_prompt,
+            },
+        });
+    }
+
+    Ok(OpenAIMediaResult {
+        outputs,
+        usage: parse_usage(&resp),
+    })
+}
+
+async fn generate_images_via_images_api(
+    client: &Client,
+    auth: &ProviderAuth,
+    prompt: &str,
+    model: &str,
+    images: &[MediaInput],
+    size: Option<&str>,
+    quality: Option<&str>,
+    background: Option<&str>,
+    n: usize,
+    output_dir: &Path,
+) -> Result<OpenAIMediaResult> {
+    let base = auth.base_url.trim_end_matches('/');
+    let (resp, _headers) = if images.is_empty() {
+        let mut body = serde_json::json!({
+            "model": model,
+            "prompt": prompt,
+            "n": n,
+        });
+        if let Some(size) = size {
+            body["size"] = Value::String(size.to_string());
+        }
+        if let Some(quality) = quality {
+            body["quality"] = Value::String(quality.to_string());
+        }
+        if let Some(background) = background {
+            body["background"] = Value::String(background.to_string());
+        }
+        send_json::<Value>(
+            client
+                .post(format!("{}/images/generations", base))
+                .bearer_auth(&auth.api_key)
+                .json(&body),
+        )
+        .await?
+    } else {
+        let mut form = Form::new()
+            .text("model", model.to_string())
+            .text("prompt", prompt.to_string())
+            .text("n", n.to_string());
+        if let Some(size) = size {
+            form = form.text("size", size.to_string());
+        }
+        if let Some(quality) = quality {
+            form = form.text("quality", quality.to_string());
+        }
+        if let Some(background) = background {
+            form = form.text("background", background.to_string());
+        }
+        let field_name = if images.len() > 1 { "image[]" } else { "image" };
+        for image in images {
+            let bytes = image.read_bytes()?;
+            let filename = match &image.source {
+                yoetz_core::media::MediaSource::File(path) => path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("input.png"),
+                _ => "input.png",
+            };
+            let part = Part::bytes(bytes).file_name(filename.to_string());
+            form = form.part(field_name, part);
+        }
+        send_json::<Value>(
+            client
+                .post(format!("{}/images/edits", base))
+                .bearer_auth(&auth.api_key)
+                .multipart(form),
+        )
+        .await?
+    };
+
+    let images = extract_image_payloads(&resp);
+    if images.is_empty() {
+        return Err(anyhow!("no images returned"));
+    }
+
+    let mut outputs = Vec::with_capacity(images.len());
+    for (idx, payload) in images.into_iter().enumerate() {
+        let filename = format!("image_{idx}.png");
+        let path = output_dir.join(filename);
+
+        if let Some(b64) = payload.b64_json.as_ref() {
+            let bytes = general_purpose::STANDARD
+                .decode(b64.as_bytes())
                 .context("decode image base64")?;
             std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
         } else if let Some(url) = &payload.url {
@@ -349,6 +469,28 @@ struct ImagePayload {
 
 fn extract_image_payloads(resp: &Value) -> Vec<ImagePayload> {
     let mut images = Vec::new();
+
+    if let Some(data) = resp.get("data").and_then(|v| v.as_array()) {
+        for item in data {
+            images.push(ImagePayload {
+                b64_json: item
+                    .get("b64_json")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                url: item
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+                revised_prompt: item
+                    .get("revised_prompt")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string()),
+            });
+        }
+        if !images.is_empty() {
+            return images;
+        }
+    }
 
     if let Some(output) = resp.get("output").and_then(|v| v.as_array()) {
         for item in output {
