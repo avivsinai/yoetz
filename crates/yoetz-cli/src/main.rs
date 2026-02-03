@@ -717,6 +717,11 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
         let model = model_id
             .as_deref()
             .ok_or_else(|| anyhow!("model is required"))?;
+        if video_input.is_some() && provider != "gemini" {
+            return Err(anyhow!(
+                "video inputs are only supported for provider gemini"
+            ));
+        }
         match provider {
             "openai" => {
                 if video_input.is_some() {
@@ -828,8 +833,8 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
     };
 
     let response_json = PathBuf::from(&result.artifacts.session_dir).join("response.json");
-    write_json_file(&response_json, &result)?;
     result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+    write_json_file(&response_json, &result)?;
 
     maybe_write_output(ctx, &result)?;
 
@@ -1167,8 +1172,8 @@ async fn handle_council(ctx: &AppContext, args: CouncilArgs, format: OutputForma
     };
 
     let response_json = PathBuf::from(&council.artifacts.session_dir).join("council.json");
-    write_json_file(&response_json, &council)?;
     council.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+    write_json_file(&response_json, &council)?;
 
     maybe_write_output(ctx, &council)?;
 
@@ -1346,8 +1351,8 @@ async fn handle_review_diff(
     };
 
     let response_json = PathBuf::from(&result.artifacts.session_dir).join("review.json");
-    write_json_file(&response_json, &result)?;
     result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+    write_json_file(&response_json, &result)?;
 
     maybe_write_output(ctx, &result)?;
 
@@ -1478,8 +1483,8 @@ async fn handle_review_file(
     };
 
     let response_json = PathBuf::from(&result.artifacts.session_dir).join("review.json");
-    write_json_file(&response_json, &result)?;
     result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+    write_json_file(&response_json, &result)?;
 
     maybe_write_output(ctx, &result)?;
 
@@ -1593,8 +1598,8 @@ async fn handle_generate_image(
     };
 
     let response_json = PathBuf::from(&artifacts.session_dir).join("response.json");
-    write_json_file(&response_json, &result)?;
     result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+    write_json_file(&response_json, &result)?;
 
     maybe_write_output(ctx, &result)?;
 
@@ -1700,8 +1705,8 @@ async fn handle_generate_video(
     };
 
     let response_json = PathBuf::from(&artifacts.session_dir).join("response.json");
-    write_json_file(&response_json, &result)?;
     result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+    write_json_file(&response_json, &result)?;
 
     maybe_write_output(ctx, &result)?;
 

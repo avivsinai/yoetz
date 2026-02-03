@@ -20,10 +20,11 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
         .ok_or_else(|| LiteLLMError::Config("base_url required".into()))?;
     let key = resolve_api_key(cfg)?
         .ok_or_else(|| LiteLLMError::MissingApiKey("GEMINI_API_KEY".into()))?;
+    let model = req.model.trim_start_matches("models/");
     let url = format!(
         "{}/models/{}:generateContent",
         base.trim_end_matches('/'),
-        req.model
+        model
     );
 
     let mut messages = req.messages;
@@ -40,7 +41,7 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
         });
     }
 
-    let contents = gemini_contents_from_messages(client, messages, &req.model).await?;
+    let contents = gemini_contents_from_messages(client, messages, model).await?;
 
     let mut body = serde_json::json!({ "contents": contents });
     if !system_instruction.is_empty() {
@@ -85,11 +86,12 @@ pub async fn video_generation(
         .ok_or_else(|| LiteLLMError::Config("base_url required".into()))?;
     let key = resolve_api_key(cfg)?
         .ok_or_else(|| LiteLLMError::MissingApiKey("GEMINI_API_KEY".into()))?;
+    let model = req.model.trim_start_matches("models/");
 
     let url = format!(
         "{}/models/{}:predictLongRunning",
         base.trim_end_matches('/'),
-        req.model
+        model
     );
     let mut parameters = serde_json::json!({});
     if let Some(seconds) = req.seconds {
