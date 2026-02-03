@@ -30,13 +30,11 @@ expression = "MIT AND ISC AND OpenSSL"
 license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
 
 [bans]
-version = 2
 multiple-versions = "warn"
 wildcards = "allow"
 highlight = "all"
 
 [sources]
-version = 2
 unknown-registry = "deny"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
