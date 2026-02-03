@@ -116,7 +116,12 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
 
 fn extract_text(data: &[u8], max_bytes: usize) -> (Option<String>, bool, bool) {
     let truncated = data.len() > max_bytes;
-    let slice = if truncated { &data[..max_bytes] } else { data };
+    let boundary = if truncated {
+        floor_char_boundary(data, max_bytes)
+    } else {
+        data.len()
+    };
+    let slice = &data[..boundary];
 
     if slice.contains(&0) {
         return (None, truncated, true);
@@ -126,6 +131,17 @@ fn extract_text(data: &[u8], max_bytes: usize) -> (Option<String>, bool, bool) {
         Ok(s) => (Some(s.to_string()), truncated, false),
         Err(_) => (None, truncated, true),
     }
+}
+
+fn floor_char_boundary(data: &[u8], index: usize) -> usize {
+    if index >= data.len() {
+        return data.len();
+    }
+    let mut i = index;
+    while i > 0 && (data[i] & 0xC0) == 0x80 {
+        i -= 1;
+    }
+    i
 }
 
 fn sha256_hex(data: &[u8]) -> String {

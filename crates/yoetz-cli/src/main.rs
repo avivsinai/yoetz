@@ -1215,13 +1215,29 @@ fn git_diff(staged: bool, paths: &[String]) -> Result<String> {
 fn read_text_file(path: &std::path::Path, max_bytes: usize) -> Result<(String, bool)> {
     let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
     let truncated = data.len() > max_bytes;
-    let slice = if truncated { &data[..max_bytes] } else { &data };
+    let boundary = if truncated {
+        floor_char_boundary(&data, max_bytes)
+    } else {
+        data.len()
+    };
+    let slice = &data[..boundary];
     if slice.contains(&0) {
         return Err(anyhow!("file appears to be binary"));
     }
     let text = std::str::from_utf8(slice)
         .map_err(|_| anyhow!("file is not valid UTF-8"))?;
     Ok((text.to_string(), truncated))
+}
+
+fn floor_char_boundary(data: &[u8], index: usize) -> usize {
+    if index >= data.len() {
+        return data.len();
+    }
+    let mut i = index;
+    while i > 0 && (data[i] & 0xC0) == 0x80 {
+        i -= 1;
+    }
+    i
 }
 
 fn add_usage(mut total: Usage, usage: &Usage) -> Usage {
