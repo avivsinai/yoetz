@@ -6,9 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime};
 
-static TS_FORMAT: &[FormatItem<'static>] = format_description!(
-    "[year][month][day]_[hour][minute][second]"
-);
+static TS_FORMAT: &[FormatItem<'static>] =
+    format_description!("[year][month][day]_[hour][minute][second]");
 
 pub fn create_session_dir() -> Result<SessionInfo> {
     let base = session_base_dir();

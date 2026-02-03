@@ -1,25 +1,36 @@
 use anyhow::{anyhow, Context, Result};
 use clap::{Args, Parser, Subcommand};
+use jsonschema::JSONSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::env;
 use std::fs;
-use std::io::{self, Read, IsTerminal};
+use std::io::{self, IsTerminal, Read};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Duration;
 
 mod browser;
 mod budget;
+mod http;
 mod registry;
 
 use yoetz_core::bundle::{build_bundle, estimate_tokens, BundleOptions};
 use yoetz_core::config::Config;
 use yoetz_core::output::{write_json, write_jsonl_event, OutputFormat};
-use yoetz_core::session::{create_session_dir, list_sessions, write_json as write_json_file, write_text};
+use yoetz_core::session::{
+    create_session_dir, list_sessions, write_json as write_json_file, write_text,
+};
 use yoetz_core::types::{ArtifactPaths, BundleResult, PricingEstimate, RunResult, Usage};
 
+use http::send_json;
+
 #[derive(Parser)]
-#[command(name = "yoetz", version, about = "Fast, agent-friendly LLM council tool")]
+#[command(
+    name = "yoetz",
+    version,
+    about = "Fast, agent-friendly LLM council tool"
+)]
 struct Cli {
     #[arg(long, global = true)]
     format: Option<String>,
@@ -33,8 +44,18 @@ struct Cli {
     #[arg(long, global = true)]
     profile: Option<String>,
 
+    #[arg(long, global = true, default_value = "60")]
+    timeout_secs: u64,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+struct AppContext {
+    config: Config,
+    client: reqwest::Client,
+    output_final: Option<PathBuf>,
+    output_schema: Option<PathBuf>,
 }
 
 #[derive(Subcommand)]
@@ -112,6 +133,9 @@ struct BundleArgs {
 
     #[arg(long, default_value = "5000000")]
     max_total_bytes: usize,
+
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -177,6 +201,9 @@ struct CouncilArgs {
 
     #[arg(long, default_value = "1024")]
     max_output_tokens: usize,
+
+    #[arg(long, default_value = "4")]
+    max_parallel: usize,
 
     #[arg(long)]
     dry_run: bool,
@@ -338,12 +365,7 @@ struct OpenAIUsage {
     prompt_tokens: Option<usize>,
     completion_tokens: Option<usize>,
     total_tokens: Option<usize>,
-}
-
-#[derive(Debug, Serialize)]
-struct JsonlFinal<'a> {
-    r#type: &'a str,
-    data: &'a RunResult,
+    cost: Option<Value>,
 }
 
 struct CallResult {
@@ -400,18 +422,26 @@ struct ModelEstimate {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let format = resolve_format(cli.format.as_deref())?;
+    let config = Config::load_with_profile(cli.profile.as_deref())?;
+    let client = build_client(cli.timeout_secs)?;
+    let ctx = AppContext {
+        config,
+        client,
+        output_final: cli.output_final,
+        output_schema: cli.output_schema,
+    };
 
     match cli.command {
-        Commands::Ask(args) => handle_ask(args, format, cli.output_final, cli.output_schema).await,
-        Commands::Bundle(args) => handle_bundle(args, format),
-        Commands::Status => handle_status(format),
-        Commands::Session(args) => handle_session(args, format),
-        Commands::Models(args) => handle_models(args, format).await,
-        Commands::Pricing(args) => handle_pricing(args, format).await,
+        Commands::Ask(args) => handle_ask(&ctx, args, format).await,
+        Commands::Bundle(args) => handle_bundle(&ctx, args, format),
+        Commands::Status => handle_status(&ctx, format),
+        Commands::Session(args) => handle_session(&ctx, args, format),
+        Commands::Models(args) => handle_models(&ctx, args, format).await,
+        Commands::Pricing(args) => handle_pricing(&ctx, args, format).await,
         Commands::Browser(args) => handle_browser(args, format),
-        Commands::Council(args) => handle_council(args, format).await,
+        Commands::Council(args) => handle_council(&ctx, args, format).await,
         Commands::Apply(args) => handle_apply(args),
-        Commands::Review(args) => handle_review(args, format).await,
+        Commands::Review(args) => handle_review(&ctx, args, format).await,
     }
 }
 
@@ -425,14 +455,16 @@ fn resolve_format(flag: Option<&str>) -> Result<OutputFormat> {
     Ok(OutputFormat::Text)
 }
 
-async fn handle_ask(
-    args: AskArgs,
-    format: OutputFormat,
-    output_final: Option<PathBuf>,
-    _output_schema: Option<PathBuf>,
-) -> Result<()> {
+fn build_client(timeout_secs: u64) -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(Duration::from_secs(10))
+        .build()?)
+}
+
+async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Result<()> {
     let prompt = resolve_prompt(args.prompt.clone(), args.prompt_file.clone())?;
-    let config = Config::load().unwrap_or_default();
+    let config = &ctx.config;
 
     let include_files = args.files.clone();
     let exclude_files = args.exclude.clone();
@@ -474,7 +506,12 @@ async fn handle_ask(
         .unwrap_or_else(|| estimate_tokens(prompt.len()));
     let output_tokens = args.max_output_tokens;
     let pricing = if let Some(model_id) = model_id.as_deref() {
-        registry::estimate_pricing(registry_cache.as_ref(), model_id, input_tokens, output_tokens)?
+        registry::estimate_pricing(
+            registry_cache.as_ref(),
+            model_id,
+            input_tokens,
+            output_tokens,
+        )?
     } else {
         PricingEstimate::default()
     };
@@ -510,14 +547,20 @@ async fn handle_ask(
             .ok_or_else(|| anyhow!("model is required"))?;
         let result = call_openai_compatible(
             &model_prompt,
-            &config,
+            &ctx.client,
+            config,
             provider,
             model,
             args.temperature,
             args.max_output_tokens,
         )
         .await?;
-        (result.content, result.usage, result.response_id, result.header_cost)
+        (
+            result.content,
+            result.usage,
+            result.response_id,
+            result.header_cost,
+        )
     };
 
     if usage.cost_usd.is_none() {
@@ -528,7 +571,7 @@ async fn handle_ask(
         if let Some(provider) = provider_id.as_deref() {
             if provider == "openrouter" {
                 if let Some(id) = response_id.as_deref() {
-                    if let Ok(cost) = fetch_openrouter_cost(&config, id).await {
+                    if let Ok(cost) = fetch_openrouter_cost(&ctx.client, config, id).await {
                         usage.cost_usd = cost;
                     }
                 }
@@ -542,7 +585,7 @@ async fn handle_ask(
         }
     }
 
-    let result = RunResult {
+    let mut result = RunResult {
         id: session.id,
         model: model_id,
         provider: provider_id,
@@ -555,17 +598,13 @@ async fn handle_ask(
 
     let response_json = PathBuf::from(&result.artifacts.session_dir).join("response.json");
     write_json_file(&response_json, &result)?;
+    result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
 
-    if let Some(path) = output_final {
-        write_json_file(&path, &result)?;
-    }
+    maybe_write_output(ctx, &result)?;
 
     match format {
         OutputFormat::Json => write_json(&result),
-        OutputFormat::Jsonl => {
-            let event = JsonlFinal { r#type: "final", data: &result };
-            write_jsonl_event(&event)
-        }
+        OutputFormat::Jsonl => write_jsonl("ask", &result),
         OutputFormat::Text => {
             println!("{}", result.content);
             Ok(())
@@ -577,8 +616,11 @@ async fn handle_ask(
     }
 }
 
-fn handle_bundle(args: BundleArgs, format: OutputFormat) -> Result<()> {
+fn handle_bundle(ctx: &AppContext, args: BundleArgs, format: OutputFormat) -> Result<()> {
     let prompt = resolve_prompt(args.prompt, args.prompt_file)?;
+    if args.files.is_empty() && !args.all {
+        return Err(anyhow!("--files is required unless --all is set"));
+    }
     let options = BundleOptions {
         include: args.files,
         exclude: args.exclude,
@@ -607,9 +649,11 @@ fn handle_bundle(args: BundleArgs, format: OutputFormat) -> Result<()> {
         },
     };
 
+    maybe_write_output(ctx, &result)?;
+
     match format {
         OutputFormat::Json => write_json(&result),
-        OutputFormat::Jsonl => write_jsonl_event(&result),
+        OutputFormat::Jsonl => write_jsonl("bundle", &result),
         OutputFormat::Text => {
             println!("Bundle created at {}", result.artifacts.session_dir);
             Ok(())
@@ -621,10 +665,12 @@ fn handle_bundle(args: BundleArgs, format: OutputFormat) -> Result<()> {
     }
 }
 
-fn handle_status(format: OutputFormat) -> Result<()> {
+fn handle_status(ctx: &AppContext, format: OutputFormat) -> Result<()> {
     let sessions = list_sessions()?;
+    maybe_write_output(ctx, &sessions)?;
     match format {
-        OutputFormat::Json | OutputFormat::Jsonl => write_json(&sessions),
+        OutputFormat::Json => write_json(&sessions),
+        OutputFormat::Jsonl => write_jsonl("status", &sessions),
         OutputFormat::Text | OutputFormat::Markdown => {
             for s in sessions {
                 println!("{}\t{}", s.id, s.path.display());
@@ -634,14 +680,16 @@ fn handle_status(format: OutputFormat) -> Result<()> {
     }
 }
 
-fn handle_session(args: SessionArgs, format: OutputFormat) -> Result<()> {
+fn handle_session(ctx: &AppContext, args: SessionArgs, format: OutputFormat) -> Result<()> {
     let base = yoetz_core::session::session_base_dir();
     let path = base.join(&args.id);
     if !path.exists() {
         return Err(anyhow!("session not found: {}", args.id));
     }
+    maybe_write_output(ctx, &path)?;
     match format {
-        OutputFormat::Json | OutputFormat::Jsonl => write_json(&path),
+        OutputFormat::Json => write_json(&path),
+        OutputFormat::Jsonl => write_jsonl("session", &path),
         OutputFormat::Text | OutputFormat::Markdown => {
             println!("{}", path.display());
             Ok(())
@@ -668,9 +716,7 @@ fn handle_browser(args: BrowserArgs, format: OutputFormat) -> Result<()> {
             };
 
             let ctx = browser::RecipeContext {
-                bundle_path: recipe_args
-                    .bundle
-                    .map(|p| p.to_string_lossy().to_string()),
+                bundle_path: recipe_args.bundle.map(|p| p.to_string_lossy().to_string()),
                 bundle_text,
             };
 
@@ -679,9 +725,9 @@ fn handle_browser(args: BrowserArgs, format: OutputFormat) -> Result<()> {
     }
 }
 
-async fn handle_council(args: CouncilArgs, format: OutputFormat) -> Result<()> {
+async fn handle_council(ctx: &AppContext, args: CouncilArgs, format: OutputFormat) -> Result<()> {
     let prompt = resolve_prompt(args.prompt.clone(), args.prompt_file.clone())?;
-    let config = Config::load().unwrap_or_default();
+    let config = &ctx.config;
 
     if args.models.is_empty() {
         return Err(anyhow!("at least one model is required"));
@@ -768,11 +814,11 @@ async fn handle_council(args: CouncilArgs, format: OutputFormat) -> Result<()> {
 
     let mut results = Vec::new();
     let mut total_usage = Usage::default();
-    let model_prompt = if let Some(bundle_ref) = &bundle {
+    let model_prompt = std::sync::Arc::new(if let Some(bundle_ref) = &bundle {
         render_bundle_md(bundle_ref)
     } else {
         prompt.clone()
-    };
+    });
 
     if args.dry_run {
         for model in &args.models {
@@ -790,16 +836,22 @@ async fn handle_council(args: CouncilArgs, format: OutputFormat) -> Result<()> {
             });
         }
     } else {
+        let max_parallel = args.max_parallel.max(1);
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel));
         let mut join_set = tokio::task::JoinSet::new();
-        for model in args.models.clone() {
-            let prompt = model_prompt.clone();
+        for (idx, model) in args.models.iter().cloned().enumerate() {
+            let prompt = std::sync::Arc::clone(&model_prompt);
             let config = config.clone();
             let provider = provider.clone();
+            let client = ctx.client.clone();
+            let semaphore = std::sync::Arc::clone(&semaphore);
             let temperature = args.temperature;
             let max_output_tokens = args.max_output_tokens;
             join_set.spawn(async move {
+                let _permit = semaphore.acquire_owned().await?;
                 let call = call_openai_compatible(
-                    &prompt,
+                    prompt.as_str(),
+                    &client,
                     &config,
                     &provider,
                     &model,
@@ -807,19 +859,21 @@ async fn handle_council(args: CouncilArgs, format: OutputFormat) -> Result<()> {
                     max_output_tokens,
                 )
                 .await?;
-                Ok::<_, anyhow::Error>((model, call))
+                Ok::<_, anyhow::Error>((idx, model, call))
             });
         }
 
+        let mut ordered: Vec<Option<CouncilModelResult>> =
+            (0..args.models.len()).map(|_| None).collect();
         while let Some(res) = join_set.join_next().await {
-            let (model, call) = res??;
+            let (idx, model, call) = res??;
             let mut usage = call.usage;
             if usage.cost_usd.is_none() {
                 usage.cost_usd = call.header_cost;
             }
             if usage.cost_usd.is_none() && provider == "openrouter" {
                 if let Some(id) = call.response_id.as_deref() {
-                    if let Ok(cost) = fetch_openrouter_cost(&config, id).await {
+                    if let Ok(cost) = fetch_openrouter_cost(&ctx.client, config, id).await {
                         usage.cost_usd = cost;
                     }
                 }
@@ -834,7 +888,7 @@ async fn handle_council(args: CouncilArgs, format: OutputFormat) -> Result<()> {
                 output_tokens,
             )?;
 
-            results.push(CouncilModelResult {
+            ordered[idx] = Some(CouncilModelResult {
                 model,
                 content: call.content,
                 usage,
@@ -842,6 +896,8 @@ async fn handle_council(args: CouncilArgs, format: OutputFormat) -> Result<()> {
                 response_id: call.response_id,
             });
         }
+
+        results = ordered.into_iter().flatten().collect();
     }
 
     if let Some(ledger) = ledger {
@@ -858,7 +914,7 @@ async fn handle_council(args: CouncilArgs, format: OutputFormat) -> Result<()> {
         }
     }
 
-    let council = CouncilResult {
+    let mut council = CouncilResult {
         id: session.id,
         provider,
         bundle,
@@ -873,10 +929,13 @@ async fn handle_council(args: CouncilArgs, format: OutputFormat) -> Result<()> {
 
     let response_json = PathBuf::from(&council.artifacts.session_dir).join("council.json");
     write_json_file(&response_json, &council)?;
+    council.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+
+    maybe_write_output(ctx, &council)?;
 
     match format {
         OutputFormat::Json => write_json(&council),
-        OutputFormat::Jsonl => write_jsonl_event(&council),
+        OutputFormat::Jsonl => write_jsonl("council", &council),
         OutputFormat::Text => {
             for r in &council.results {
                 println!("## {}\n{}\n", r.model, r.content);
@@ -932,15 +991,19 @@ fn handle_apply(args: ApplyArgs) -> Result<()> {
     Ok(())
 }
 
-async fn handle_review(args: ReviewArgs, format: OutputFormat) -> Result<()> {
+async fn handle_review(ctx: &AppContext, args: ReviewArgs, format: OutputFormat) -> Result<()> {
     match args.command {
-        ReviewCommand::Diff(diff_args) => handle_review_diff(diff_args, format).await,
-        ReviewCommand::File(file_args) => handle_review_file(file_args, format).await,
+        ReviewCommand::Diff(diff_args) => handle_review_diff(ctx, diff_args, format).await,
+        ReviewCommand::File(file_args) => handle_review_file(ctx, file_args, format).await,
     }
 }
 
-async fn handle_review_diff(args: ReviewDiffArgs, format: OutputFormat) -> Result<()> {
-    let config = Config::load().unwrap_or_default();
+async fn handle_review_diff(
+    ctx: &AppContext,
+    args: ReviewDiffArgs,
+    format: OutputFormat,
+) -> Result<()> {
+    let config = &ctx.config;
     let provider = args
         .provider
         .clone()
@@ -993,14 +1056,20 @@ async fn handle_review_diff(args: ReviewDiffArgs, format: OutputFormat) -> Resul
     } else {
         let result = call_openai_compatible(
             &review_prompt,
-            &config,
+            &ctx.client,
+            config,
             &provider,
             &model,
             args.temperature,
             args.max_output_tokens,
         )
         .await?;
-        (result.content, result.usage, result.response_id, result.header_cost)
+        (
+            result.content,
+            result.usage,
+            result.response_id,
+            result.header_cost,
+        )
     };
 
     if usage.cost_usd.is_none() {
@@ -1008,7 +1077,7 @@ async fn handle_review_diff(args: ReviewDiffArgs, format: OutputFormat) -> Resul
     }
     if usage.cost_usd.is_none() && provider == "openrouter" {
         if let Some(id) = response_id.as_deref() {
-            if let Ok(cost) = fetch_openrouter_cost(&config, id).await {
+            if let Ok(cost) = fetch_openrouter_cost(&ctx.client, config, id).await {
                 usage.cost_usd = cost;
             }
         }
@@ -1034,9 +1103,11 @@ async fn handle_review_diff(args: ReviewDiffArgs, format: OutputFormat) -> Resul
     write_json_file(&response_json, &result)?;
     result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
 
+    maybe_write_output(ctx, &result)?;
+
     match format {
         OutputFormat::Json => write_json(&result),
-        OutputFormat::Jsonl => write_jsonl_event(&result),
+        OutputFormat::Jsonl => write_jsonl("review", &result),
         OutputFormat::Text => {
             println!("{}", result.content);
             Ok(())
@@ -1048,8 +1119,12 @@ async fn handle_review_diff(args: ReviewDiffArgs, format: OutputFormat) -> Resul
     }
 }
 
-async fn handle_review_file(args: ReviewFileArgs, format: OutputFormat) -> Result<()> {
-    let config = Config::load().unwrap_or_default();
+async fn handle_review_file(
+    ctx: &AppContext,
+    args: ReviewFileArgs,
+    format: OutputFormat,
+) -> Result<()> {
+    let config = &ctx.config;
     let provider = args
         .provider
         .clone()
@@ -1062,8 +1137,15 @@ async fn handle_review_file(args: ReviewFileArgs, format: OutputFormat) -> Resul
         .ok_or_else(|| anyhow!("model is required"))?;
 
     let max_file_bytes = args.max_file_bytes.unwrap_or(200_000);
-    let (content, truncated) = read_text_file(args.path.as_path(), max_file_bytes)?;
-    let review_prompt = build_review_file_prompt(args.path.as_path(), &content, truncated, args.prompt.as_deref());
+    let max_total_bytes = args.max_total_bytes.unwrap_or(max_file_bytes);
+    let max_bytes = max_file_bytes.min(max_total_bytes);
+    let (content, truncated) = read_text_file(args.path.as_path(), max_bytes)?;
+    let review_prompt = build_review_file_prompt(
+        args.path.as_path(),
+        &content,
+        truncated,
+        args.prompt.as_deref(),
+    );
     let input_tokens = estimate_tokens(review_prompt.len());
     let pricing = registry::estimate_pricing(
         registry::load_registry_cache().ok().flatten().as_ref(),
@@ -1099,14 +1181,20 @@ async fn handle_review_file(args: ReviewFileArgs, format: OutputFormat) -> Resul
     } else {
         let result = call_openai_compatible(
             &review_prompt,
-            &config,
+            &ctx.client,
+            config,
             &provider,
             &model,
             args.temperature,
             args.max_output_tokens,
         )
         .await?;
-        (result.content, result.usage, result.response_id, result.header_cost)
+        (
+            result.content,
+            result.usage,
+            result.response_id,
+            result.header_cost,
+        )
     };
 
     if usage.cost_usd.is_none() {
@@ -1114,7 +1202,7 @@ async fn handle_review_file(args: ReviewFileArgs, format: OutputFormat) -> Resul
     }
     if usage.cost_usd.is_none() && provider == "openrouter" {
         if let Some(id) = response_id.as_deref() {
-            if let Ok(cost) = fetch_openrouter_cost(&config, id).await {
+            if let Ok(cost) = fetch_openrouter_cost(&ctx.client, config, id).await {
                 usage.cost_usd = cost;
             }
         }
@@ -1140,9 +1228,11 @@ async fn handle_review_file(args: ReviewFileArgs, format: OutputFormat) -> Resul
     write_json_file(&response_json, &result)?;
     result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
 
+    maybe_write_output(ctx, &result)?;
+
     match format {
         OutputFormat::Json => write_json(&result),
-        OutputFormat::Jsonl => write_jsonl_event(&result),
+        OutputFormat::Jsonl => write_jsonl("review", &result),
         OutputFormat::Text => {
             println!("{}", result.content);
             Ok(())
@@ -1171,7 +1261,12 @@ fn build_review_diff_prompt(diff: &str, extra_prompt: Option<&str>) -> String {
     prompt
 }
 
-fn build_review_file_prompt(path: &std::path::Path, content: &str, truncated: bool, extra_prompt: Option<&str>) -> String {
+fn build_review_file_prompt(
+    path: &std::path::Path,
+    content: &str,
+    truncated: bool,
+    extra_prompt: Option<&str>,
+) -> String {
     let mut prompt = String::new();
     prompt.push_str("You are a senior engineer reviewing a single file. ");
     prompt.push_str("Return JSON only with fields: summary, findings[], risks, patches.\n");
@@ -1213,10 +1308,14 @@ fn git_diff(staged: bool, paths: &[String]) -> Result<String> {
 }
 
 fn read_text_file(path: &std::path::Path, max_bytes: usize) -> Result<(String, bool)> {
-    let data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let truncated = data.len() > max_bytes;
+    let metadata = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
+    let truncated = metadata.len() as usize > max_bytes;
+    let mut file = fs::File::open(path).with_context(|| format!("read {}", path.display()))?;
+    let mut data = vec![0u8; max_bytes];
+    let read = file.read(&mut data)?;
+    data.truncate(read);
     let boundary = if truncated {
-        floor_char_boundary(&data, max_bytes)
+        floor_char_boundary(&data, max_bytes.min(data.len()))
     } else {
         data.len()
     };
@@ -1224,8 +1323,7 @@ fn read_text_file(path: &std::path::Path, max_bytes: usize) -> Result<(String, b
     if slice.contains(&0) {
         return Err(anyhow!("file appears to be binary"));
     }
-    let text = std::str::from_utf8(slice)
-        .map_err(|_| anyhow!("file is not valid UTF-8"))?;
+    let text = std::str::from_utf8(slice).map_err(|_| anyhow!("file is not valid UTF-8"))?;
     Ok((text.to_string(), truncated))
 }
 
@@ -1256,12 +1354,14 @@ fn add_usage(mut total: Usage, usage: &Usage) -> Usage {
     total
 }
 
-async fn handle_models(args: ModelsArgs, format: OutputFormat) -> Result<()> {
+async fn handle_models(ctx: &AppContext, args: ModelsArgs, format: OutputFormat) -> Result<()> {
     match args.command {
         ModelsCommand::List => {
             let registry = registry::load_registry_cache()?.unwrap_or_default();
+            maybe_write_output(ctx, &registry)?;
             match format {
-                OutputFormat::Json | OutputFormat::Jsonl => write_json(&registry),
+                OutputFormat::Json => write_json(&registry),
+                OutputFormat::Jsonl => write_jsonl("models_list", &registry),
                 OutputFormat::Text | OutputFormat::Markdown => {
                     for model in registry.models {
                         println!("{}", model.id);
@@ -1271,21 +1371,29 @@ async fn handle_models(args: ModelsArgs, format: OutputFormat) -> Result<()> {
             }
         }
         ModelsCommand::Sync => {
-            let config = Config::load().unwrap_or_default();
-            let registry = registry::fetch_registry(&config).await?;
-            let path = registry::save_registry_cache(&registry)?;
+            let fetch = registry::fetch_registry(&ctx.client, &ctx.config).await?;
+            let path = registry::save_registry_cache(&fetch.registry)?;
             let payload = serde_json::json!({
                 "saved_to": path,
-                "model_count": registry.models.len(),
+                "model_count": fetch.registry.models.len(),
+                "warnings": fetch.warnings,
             });
+            maybe_write_output(ctx, &payload)?;
             match format {
-                OutputFormat::Json | OutputFormat::Jsonl => write_json(&payload),
+                OutputFormat::Json => write_json(&payload),
+                OutputFormat::Jsonl => write_jsonl("models_sync", &payload),
                 OutputFormat::Text | OutputFormat::Markdown => {
                     println!(
                         "Saved {} models to {}",
-                        registry.models.len(),
+                        fetch.registry.models.len(),
                         path.display()
                     );
+                    if !fetch.warnings.is_empty() {
+                        eprintln!("Warnings:");
+                        for warning in &fetch.warnings {
+                            eprintln!("- {warning}");
+                        }
+                    }
                     Ok(())
                 }
             }
@@ -1293,7 +1401,7 @@ async fn handle_models(args: ModelsArgs, format: OutputFormat) -> Result<()> {
     }
 }
 
-async fn handle_pricing(args: PricingArgs, format: OutputFormat) -> Result<()> {
+async fn handle_pricing(ctx: &AppContext, args: PricingArgs, format: OutputFormat) -> Result<()> {
     match args.command {
         PricingCommand::Estimate(e) => {
             let registry = registry::load_registry_cache()?.unwrap_or_default();
@@ -1303,8 +1411,10 @@ async fn handle_pricing(args: PricingArgs, format: OutputFormat) -> Result<()> {
                 e.input_tokens,
                 e.output_tokens,
             )?;
+            maybe_write_output(ctx, &estimate)?;
             match format {
-                OutputFormat::Json | OutputFormat::Jsonl => write_json(&estimate),
+                OutputFormat::Json => write_json(&estimate),
+                OutputFormat::Jsonl => write_jsonl("pricing_estimate", &estimate),
                 OutputFormat::Text | OutputFormat::Markdown => {
                     if let Some(cost) = estimate.estimate_usd {
                         println!("Estimated cost: ${:.6}", cost);
@@ -1316,6 +1426,45 @@ async fn handle_pricing(args: PricingArgs, format: OutputFormat) -> Result<()> {
             }
         }
     }
+}
+
+fn maybe_write_output<T: Serialize>(ctx: &AppContext, value: &T) -> Result<()> {
+    if ctx.output_final.is_none() && ctx.output_schema.is_none() {
+        return Ok(());
+    }
+    let json = serde_json::to_value(value)?;
+    if let Some(schema_path) = ctx.output_schema.as_ref() {
+        validate_output_schema(schema_path, &json)?;
+    }
+    if let Some(path) = ctx.output_final.as_ref() {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        write_json_file(path, &json)?;
+    }
+    Ok(())
+}
+
+fn write_jsonl<T: Serialize>(kind: &str, data: &T) -> Result<()> {
+    let event = serde_json::json!({ "type": kind, "data": data });
+    write_jsonl_event(&event)
+}
+
+fn validate_output_schema(path: &std::path::Path, value: &Value) -> Result<()> {
+    let schema_text =
+        fs::read_to_string(path).with_context(|| format!("read schema {}", path.display()))?;
+    let schema_json: Value = serde_json::from_str(&schema_text)?;
+    let compiled = JSONSchema::compile(&schema_json)
+        .map_err(|e| anyhow!("invalid schema {}: {e}", path.display()))?;
+    if let Err(errors) = compiled.validate(value) {
+        let messages = errors.map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+        return Err(anyhow!(
+            "output does not match schema {}: {}",
+            path.display(),
+            messages
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_prompt(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Result<String> {
@@ -1333,7 +1482,9 @@ fn resolve_prompt(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Resul
             return Ok(buf);
         }
     }
-    Err(anyhow!("prompt is required (--prompt, --prompt-file, or stdin)"))
+    Err(anyhow!(
+        "prompt is required (--prompt, --prompt-file, or stdin)"
+    ))
 }
 
 fn render_bundle_md(bundle: &yoetz_core::types::Bundle) -> String {
@@ -1345,21 +1496,44 @@ fn render_bundle_md(bundle: &yoetz_core::types::Bundle) -> String {
     for file in &bundle.files {
         out.push_str(&format!("### {}\n\n", file.path));
         if let Some(content) = &file.content {
-            out.push_str("```\n");
+            let fence = markdown_fence(content);
+            out.push_str(&fence);
+            out.push('\n');
             out.push_str(content);
             if file.truncated {
                 out.push_str("\n... [truncated]\n");
             }
-            out.push_str("```\n\n");
+            out.push_str(&fence);
+            out.push_str("\n\n");
         } else if file.is_binary {
             out.push_str("(binary file omitted)\n\n");
+        } else if file.truncated {
+            out.push_str("(content omitted)\n\n");
         }
     }
     out
 }
 
+fn markdown_fence(content: &str) -> String {
+    let mut max_run = 0usize;
+    let mut current = 0usize;
+    for ch in content.chars() {
+        if ch == '`' {
+            current += 1;
+            if current > max_run {
+                max_run = current;
+            }
+        } else {
+            current = 0;
+        }
+    }
+    let len = std::cmp::max(3, max_run + 1);
+    "`".repeat(len)
+}
+
 async fn call_openai_compatible(
     prompt: &str,
+    client: &reqwest::Client,
     config: &Config,
     provider: &str,
     model: &str,
@@ -1378,11 +1552,13 @@ async fn call_openai_compatible(
         .unwrap_or_else(|| default_api_key_env(provider).unwrap_or_default());
 
     if api_key_env.is_empty() {
-        return Err(anyhow!("api_key_env not configured for provider {provider}"));
+        return Err(anyhow!(
+            "api_key_env not configured for provider {provider}"
+        ));
     }
 
-    let api_key = env::var(&api_key_env)
-        .with_context(|| format!("missing env var {api_key_env}"))?;
+    let api_key =
+        env::var(&api_key_env).with_context(|| format!("missing env var {api_key_env}"))?;
 
     let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let body = serde_json::json!({
@@ -1394,17 +1570,8 @@ async fn call_openai_compatible(
         "max_tokens": max_output_tokens,
     });
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(url)
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?;
-
-    let headers = resp.headers().clone();
-    let parsed: OpenAIChatResponse = resp.json().await?;
+    let (parsed, headers) =
+        send_json::<OpenAIChatResponse>(client.post(url).bearer_auth(api_key).json(&body)).await?;
     let content = parsed
         .choices
         .first()
@@ -1415,7 +1582,7 @@ async fn call_openai_compatible(
         input_tokens: u.prompt_tokens,
         output_tokens: u.completion_tokens,
         total_tokens: u.total_tokens,
-        cost_usd: None,
+        cost_usd: parse_cost(u.cost.as_ref()),
     });
 
     let header_cost = headers
@@ -1431,7 +1598,11 @@ async fn call_openai_compatible(
     })
 }
 
-async fn fetch_openrouter_cost(config: &Config, response_id: &str) -> Result<Option<f64>> {
+async fn fetch_openrouter_cost(
+    client: &reqwest::Client,
+    config: &Config,
+    response_id: &str,
+) -> Result<Option<f64>> {
     let provider_cfg = config.providers.get("openrouter");
     let base_url = provider_cfg
         .and_then(|p| p.base_url.clone())
@@ -1453,15 +1624,7 @@ async fn fetch_openrouter_cost(config: &Config, response_id: &str) -> Result<Opt
         response_id
     );
 
-    let client = reqwest::Client::new();
-    let resp = client
-        .get(url)
-        .bearer_auth(api_key)
-        .send()
-        .await?
-        .error_for_status()?;
-
-    let payload: Value = resp.json().await?;
+    let (payload, _) = send_json::<Value>(client.get(url).bearer_auth(api_key)).await?;
     let data = payload.get("data").unwrap_or(&Value::Null);
     Ok(parse_cost(data.get("total_cost"))
         .or_else(|| parse_cost(data.get("total_cost_usd")))

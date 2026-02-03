@@ -9,7 +9,9 @@ pub struct ModelPricing {
 
 impl ModelPricing {
     pub fn estimate(&self, input_tokens: usize, output_tokens: usize) -> Option<f64> {
-        let prompt_cost = self.prompt_per_1k.map(|p| p * input_tokens as f64 / 1000.0)?;
+        let prompt_cost = self
+            .prompt_per_1k
+            .map(|p| p * input_tokens as f64 / 1000.0)?;
         let completion_cost = self
             .completion_per_1k
             .map(|c| c * output_tokens as f64 / 1000.0)?;

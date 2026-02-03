@@ -3,7 +3,8 @@ use anyhow::{Context, Result};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
-use std::fs;
+use std::fs::{self, File};
+use std::io::Read;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -33,6 +34,7 @@ impl Default for BundleOptions {
 
 pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
     let mut override_builder = OverrideBuilder::new(&options.root);
+    // OverrideBuilder uses whitelist semantics for positive patterns.
     for pattern in &options.include {
         override_builder.add(pattern)?;
     }
@@ -67,32 +69,40 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
             .to_string_lossy()
             .to_string();
 
-        let data = fs::read(path).with_context(|| format!("read file {rel_path}"))?;
-        if total_bytes + data.len() > options.max_total_bytes {
-            break;
-        }
+        let metadata = fs::metadata(path).with_context(|| format!("stat file {rel_path}"))?;
+        let file_size = metadata.len() as usize;
+        let truncated_by_size = file_size > options.max_file_bytes;
 
-        let (content, truncated, is_binary) = extract_text(&data, options.max_file_bytes);
+        let data = read_prefix(path, options.max_file_bytes)
+            .with_context(|| format!("read file {rel_path}"))?;
+        let (mut content, mut truncated, is_binary) =
+            extract_text(&data, options.max_file_bytes, truncated_by_size);
+
         if is_binary && !options.include_binary {
             files.push(BundleFile {
                 path: rel_path,
-                bytes: data.len(),
+                bytes: file_size,
                 sha256: sha256_hex(&data),
-                truncated: false,
+                truncated,
                 is_binary,
                 content: None,
             });
-            total_bytes += data.len();
             continue;
         }
 
-        let content_len = content.as_ref().map(|c| c.len()).unwrap_or(0);
+        let mut content_len = content.as_ref().map(|c| c.len()).unwrap_or(0);
+        if content_len > 0 && total_bytes + content_len > options.max_total_bytes {
+            content = Some("[omitted: exceeds max_total_bytes]".to_string());
+            truncated = true;
+            content_len = content.as_ref().map(|c| c.len()).unwrap_or(0);
+        }
+
         total_chars += content_len;
-        total_bytes += data.len();
+        total_bytes += content_len;
 
         files.push(BundleFile {
             path: rel_path,
-            bytes: data.len(),
+            bytes: file_size,
             sha256: sha256_hex(&data),
             truncated,
             is_binary,
@@ -114,9 +124,12 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
     })
 }
 
-fn extract_text(data: &[u8], max_bytes: usize) -> (Option<String>, bool, bool) {
-    let truncated = data.len() > max_bytes;
-    let boundary = if truncated {
+fn extract_text(
+    data: &[u8],
+    max_bytes: usize,
+    truncated_by_size: bool,
+) -> (Option<String>, bool, bool) {
+    let boundary = if truncated_by_size {
         floor_char_boundary(data, max_bytes)
     } else {
         data.len()
@@ -124,12 +137,12 @@ fn extract_text(data: &[u8], max_bytes: usize) -> (Option<String>, bool, bool) {
     let slice = &data[..boundary];
 
     if slice.contains(&0) {
-        return (None, truncated, true);
+        return (None, truncated_by_size, true);
     }
 
     match std::str::from_utf8(slice) {
-        Ok(s) => (Some(s.to_string()), truncated, false),
-        Err(_) => (None, truncated, true),
+        Ok(s) => (Some(s.to_string()), truncated_by_size, false),
+        Err(_) => (None, truncated_by_size, true),
     }
 }
 
@@ -142,6 +155,14 @@ fn floor_char_boundary(data: &[u8], index: usize) -> usize {
         i -= 1;
     }
     i
+}
+
+fn read_prefix(path: &std::path::Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; max_bytes];
+    let read = file.read(&mut buf)?;
+    buf.truncate(read);
+    Ok(buf)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
