@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MediaType {
     Image,
     Video,
@@ -121,5 +121,41 @@ fn media_type_from_mime(mime: &str) -> Result<MediaType> {
         Ok(MediaType::Video)
     } else {
         Err(anyhow!("unsupported media mime type: {mime}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_path(ext: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("yoetz_media_test_{nanos}.{ext}"))
+    }
+
+    #[test]
+    fn media_input_from_path_image() {
+        let path = temp_path("png");
+        fs::write(&path, [0u8, 1, 2, 3]).unwrap();
+        let input = MediaInput::from_path(&path).unwrap();
+        assert_eq!(input.media_type, MediaType::Image);
+        assert!(input.mime_type.starts_with("image/"));
+        let data_url = input.as_data_url().unwrap();
+        assert!(data_url.starts_with("data:image/"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn media_input_from_path_video() {
+        let path = temp_path("mp4");
+        fs::write(&path, [0u8, 1, 2, 3]).unwrap();
+        let input = MediaInput::from_path(&path).unwrap();
+        assert_eq!(input.media_type, MediaType::Video);
+        assert!(input.mime_type.starts_with("video/"));
+        let _ = fs::remove_file(&path);
     }
 }

@@ -124,6 +124,15 @@ struct AskArgs {
 
     #[arg(long, value_name = "PATH_OR_URL")]
     video: Option<String>,
+
+    #[arg(long, value_name = "json|text")]
+    response_format: Option<String>,
+
+    #[arg(long)]
+    response_schema: Option<PathBuf>,
+
+    #[arg(long)]
+    response_schema_name: Option<String>,
 }
 
 #[derive(Args)]
@@ -225,6 +234,15 @@ struct CouncilArgs {
 
     #[arg(long)]
     daily_budget_usd: Option<f64>,
+
+    #[arg(long, value_name = "json|text")]
+    response_format: Option<String>,
+
+    #[arg(long)]
+    response_schema: Option<PathBuf>,
+
+    #[arg(long)]
+    response_schema_name: Option<String>,
 }
 
 #[derive(Args)]
@@ -369,6 +387,15 @@ struct ReviewDiffArgs {
 
     #[arg(long)]
     daily_budget_usd: Option<f64>,
+
+    #[arg(long, value_name = "json|text")]
+    response_format: Option<String>,
+
+    #[arg(long)]
+    response_schema: Option<PathBuf>,
+
+    #[arg(long)]
+    response_schema_name: Option<String>,
 }
 
 #[derive(Args)]
@@ -405,6 +432,15 @@ struct ReviewFileArgs {
 
     #[arg(long)]
     daily_budget_usd: Option<f64>,
+
+    #[arg(long, value_name = "json|text")]
+    response_format: Option<String>,
+
+    #[arg(long)]
+    response_schema: Option<PathBuf>,
+
+    #[arg(long)]
+    response_schema_name: Option<String>,
 }
 
 #[derive(Args)]
@@ -565,6 +601,11 @@ fn build_client(timeout_secs: u64) -> Result<reqwest::Client> {
 async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Result<()> {
     let prompt = resolve_prompt(args.prompt.clone(), args.prompt_file.clone())?;
     let config = &ctx.config;
+    let response_format = resolve_response_format(
+        args.response_format.clone(),
+        args.response_schema.clone(),
+        args.response_schema_name.clone(),
+    )?;
 
     let image_inputs = parse_media_inputs(&args.image)?;
     let video_input = match args.video.as_deref() {
@@ -663,6 +704,7 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
                     &model_prompt,
                     model,
                     &image_inputs,
+                    response_format.clone(),
                     args.temperature,
                     args.max_output_tokens,
                 )
@@ -705,6 +747,7 @@ async fn handle_ask(ctx: &AppContext, args: AskArgs, format: OutputFormat) -> Re
             model,
             args.temperature,
             args.max_output_tokens,
+            response_format.clone(),
         )
         .await?;
         (
@@ -891,6 +934,11 @@ async fn handle_council(ctx: &AppContext, args: CouncilArgs, format: OutputForma
         .clone()
         .or(config.defaults.provider.clone())
         .ok_or_else(|| anyhow!("provider is required"))?;
+    let response_format = resolve_response_format(
+        args.response_format.clone(),
+        args.response_schema.clone(),
+        args.response_schema_name.clone(),
+    )?;
 
     let include_files = args.files.clone();
     let exclude_files = args.exclude.clone();
@@ -1000,6 +1048,7 @@ async fn handle_council(ctx: &AppContext, args: CouncilArgs, format: OutputForma
             let semaphore = std::sync::Arc::clone(&semaphore);
             let temperature = args.temperature;
             let max_output_tokens = args.max_output_tokens;
+            let response_format = response_format.clone();
             join_set.spawn(async move {
                 let _permit = semaphore.acquire_owned().await?;
                 let call = call_openai_compatible(
@@ -1010,6 +1059,7 @@ async fn handle_council(ctx: &AppContext, args: CouncilArgs, format: OutputForma
                     &model,
                     temperature,
                     max_output_tokens,
+                    response_format,
                 )
                 .await?;
                 Ok::<_, anyhow::Error>((idx, model, call))
@@ -1157,6 +1207,11 @@ async fn handle_review_diff(
     format: OutputFormat,
 ) -> Result<()> {
     let config = &ctx.config;
+    let response_format = resolve_response_format(
+        args.response_format.clone(),
+        args.response_schema.clone(),
+        args.response_schema_name.clone(),
+    )?;
     let provider = args
         .provider
         .clone()
@@ -1215,6 +1270,7 @@ async fn handle_review_diff(
             &model,
             args.temperature,
             args.max_output_tokens,
+            response_format.clone(),
         )
         .await?;
         (
@@ -1278,6 +1334,11 @@ async fn handle_review_file(
     format: OutputFormat,
 ) -> Result<()> {
     let config = &ctx.config;
+    let response_format = resolve_response_format(
+        args.response_format.clone(),
+        args.response_schema.clone(),
+        args.response_schema_name.clone(),
+    )?;
     let provider = args
         .provider
         .clone()
@@ -1340,6 +1401,7 @@ async fn handle_review_file(
             &model,
             args.temperature,
             args.max_output_tokens,
+            response_format.clone(),
         )
         .await?;
         (
@@ -1845,6 +1907,52 @@ fn resolve_prompt(prompt: Option<String>, prompt_file: Option<PathBuf>) -> Resul
     ))
 }
 
+fn resolve_response_format(
+    format: Option<String>,
+    schema_path: Option<PathBuf>,
+    schema_name: Option<String>,
+) -> Result<Option<Value>> {
+    if let Some(path) = schema_path {
+        let schema_text =
+            fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let schema_json: Value = serde_json::from_str(&schema_text)
+            .with_context(|| format!("parse schema {}", path.display()))?;
+        if !schema_json.is_object() {
+            return Err(anyhow!(
+                "response schema must be a JSON object: {}",
+                path.display()
+            ));
+        }
+        let name = schema_name.unwrap_or_else(|| "yoetz_response".to_string());
+        if let Some(fmt) = format.as_deref() {
+            if fmt.eq_ignore_ascii_case("text") {
+                return Err(anyhow!(
+                    "--response_format=text is incompatible with --response_schema"
+                ));
+            }
+        }
+        return Ok(Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": name,
+                "schema": schema_json,
+                "strict": true,
+            }
+        })));
+    }
+
+    let format = match format.as_deref() {
+        Some("json") | Some("json_object") => Some(serde_json::json!({ "type": "json_object" })),
+        Some("text") | None => None,
+        Some(other) => {
+            return Err(anyhow!(
+                "unsupported response_format: {other} (use json or text)"
+            ))
+        }
+    };
+    Ok(format)
+}
+
 fn parse_media_inputs(values: &[String]) -> Result<Vec<MediaInput>> {
     let mut out = Vec::new();
     for value in values {
@@ -1904,6 +2012,39 @@ fn markdown_fence(content: &str) -> String {
     "`".repeat(len)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_schema_path() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("yoetz_schema_{nanos}.json"))
+    }
+
+    #[test]
+    fn response_format_json_object() {
+        let fmt = resolve_response_format(Some("json".to_string()), None, None).unwrap();
+        assert!(fmt.is_some());
+    }
+
+    #[test]
+    fn response_format_schema_file() {
+        let path = temp_schema_path();
+        fs::write(
+            &path,
+            r#"{"type":"object","properties":{"ok":{"type":"boolean"}}}"#,
+        )
+        .unwrap();
+        let fmt = resolve_response_format(None, Some(path.clone()), None).unwrap();
+        assert!(fmt.is_some());
+        let _ = fs::remove_file(path);
+    }
+}
+
 async fn call_openai_compatible(
     prompt: &str,
     client: &reqwest::Client,
@@ -1912,10 +2053,11 @@ async fn call_openai_compatible(
     model: &str,
     temperature: f32,
     max_output_tokens: usize,
+    response_format: Option<Value>,
 ) -> Result<CallResult> {
     let auth = resolve_provider_auth(config, provider)?;
     let url = format!("{}/chat/completions", auth.base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "messages": [
             {"role": "user", "content": prompt}
@@ -1923,6 +2065,9 @@ async fn call_openai_compatible(
         "temperature": temperature,
         "max_tokens": max_output_tokens,
     });
+    if let Some(format) = response_format {
+        body["response_format"] = format;
+    }
 
     let (parsed, headers) =
         send_json::<OpenAIChatResponse>(client.post(url).bearer_auth(auth.api_key).json(&body))

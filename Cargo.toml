@@ -1,13 +1,18 @@
 [workspace]
 resolver = "2"
-members = [
-  "crates/yoetz-core",
-  "crates/yoetz-cli",
-]
+members = ["crates/yoetz-core", "crates/yoetz-cli"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+rust-version = "1.75"
+license = "MIT"
+repository = "https://github.com/avivsinai/yoetz"
+homepage = "https://github.com/avivsinai/yoetz"
+description = "Fast CLI-first LLM council, bundler, and multimodal gateway for coding agents"
+keywords = ["llm", "cli", "ai", "multimodal", "code-review"]
+categories = ["command-line-utilities", "development-tools"]
+authors = ["Aviv Sinai"]
 
 [workspace.dependencies]
 anyhow = "1.0"
@@ -22,3 +27,28 @@ sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"
 mime_guess = "2.0"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+rust_2018_idioms = "warn"
+
+[workspace.lints.clippy]
+# Enable standard warnings
+all = { level = "warn", priority = -1 }
+# Additional useful lints
+cast_possible_truncation = "warn"
+clone_on_ref_ptr = "warn"
+needless_pass_by_value = "warn"
+redundant_closure_for_method_calls = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 3

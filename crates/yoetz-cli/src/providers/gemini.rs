@@ -403,3 +403,36 @@ fn extract_video_uri(resp: &Value) -> Option<String> {
 
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_text_from_candidates() {
+        let resp = json!({
+            "candidates": [
+                {"content": {"parts": [{"text": "hi"}, {"text": " there"}]}}
+            ]
+        });
+        assert_eq!(extract_text(&resp), "hi there");
+    }
+
+    #[test]
+    fn extract_video_uri_prefers_generate_video_response() {
+        let resp = json!({
+            "response": {
+                "generateVideoResponse": {
+                    "generatedSamples": [
+                        {"video": {"uri": "gs://bucket/video.mp4"}}
+                    ]
+                }
+            }
+        });
+        assert_eq!(
+            extract_video_uri(&resp),
+            Some("gs://bucket/video.mp4".to_string())
+        );
+    }
+}

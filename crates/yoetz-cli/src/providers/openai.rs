@@ -31,6 +31,7 @@ pub async fn call_responses_vision(
     prompt: &str,
     model: &str,
     images: &[MediaInput],
+    response_format: Option<Value>,
     temperature: f32,
     max_output_tokens: usize,
 ) -> Result<OpenAITextResult> {
@@ -51,12 +52,15 @@ pub async fn call_responses_vision(
         }));
     }
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "input": [{ "role": "user", "content": content }],
         "temperature": temperature,
         "max_output_tokens": max_output_tokens,
     });
+    if let Some(format) = response_format {
+        body["response_format"] = format;
+    }
 
     let (resp, _headers) =
         send_json::<Value>(client.post(url).bearer_auth(&auth.api_key).json(&body)).await?;
@@ -405,4 +409,37 @@ fn extract_image_payloads(resp: &Value) -> Vec<ImagePayload> {
     }
 
     images
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn extract_output_text_reads_message_parts() {
+        let resp = json!({
+            "output": [
+                {"type": "message", "content": [{"type": "output_text", "text": "hello"}]}
+            ]
+        });
+        assert_eq!(extract_output_text(&resp), "hello");
+    }
+
+    #[test]
+    fn extract_image_payloads_from_generation_call() {
+        let resp = json!({
+            "output": [
+                {
+                    "type": "image_generation_call",
+                    "revised_prompt": "test",
+                    "result": {"b64_json": "dGVzdA=="}
+                }
+            ]
+        });
+        let images = extract_image_payloads(&resp);
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].b64_json.as_deref(), Some("dGVzdA=="));
+        assert_eq!(images[0].revised_prompt.as_deref(), Some("test"));
+    }
 }

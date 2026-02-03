@@ -1,22 +1,40 @@
 [package]
 name = "yoetz"
-version = "0.1.0"
-edition = { workspace = true }
-license = { workspace = true }
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "yoetz"
+path = "src/main.rs"
+
+[lints]
+workspace = true
 
 [dependencies]
-anyhow = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+yoetz-core = { path = "../yoetz-core" }
+
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+time.workspace = true
+
 clap = { version = "4.5", features = ["derive"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "multipart",
+] }
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "time"] }
-time = { workspace = true }
 serde_yaml = "0.9"
 tempfile = "3.10"
 jsonschema = "0.17"
 fs2 = "0.4"
-base64 = { workspace = true }
-
-[dependencies.yoetz-core]
-path = "../yoetz-core"

@@ -1,5 +1,41 @@
-# Agent Message Queue
+# Build artifacts
+/target/
+debug/
+release/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+logs/
+
+# Test artifacts
+*.profraw
+*.profdata
+coverage/
+tarpaulin-report.html
+
+# Local config (keep examples)
+yoetz.toml
+!docs/config.example.toml
+
+# Agent coordination (local)
 .agent-mail/
 .amqrc
-target/
-.DS_Store
+
+# Session data
+sessions/
+
+# OS files
+Thumbs.db
