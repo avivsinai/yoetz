@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::path::Path;
 use tokio::time::{sleep, Duration};
 
-use yoetz_core::media::{MediaInput, MediaMetadata, MediaOutput, MediaType};
+use yoetz_core::media::{MediaInput, MediaMetadata, MediaOutput, MediaSource, MediaType};
 use yoetz_core::types::Usage;
 
 use crate::http::send_json;
@@ -181,6 +181,22 @@ pub async fn generate_images(
     })
 }
 
+async fn load_media_bytes(client: &Client, media: &MediaInput) -> Result<Vec<u8>> {
+    match &media.source {
+        MediaSource::Url(url) => {
+            let resp = client
+                .get(url)
+                .send()
+                .await?
+                .error_for_status()
+                .with_context(|| format!("download {}", url))?;
+            let bytes = resp.bytes().await?;
+            Ok(bytes.to_vec())
+        }
+        _ => media.read_bytes(),
+    }
+}
+
 async fn generate_images_via_images_api(
     client: &Client,
     auth: &ProviderAuth,
@@ -232,7 +248,7 @@ async fn generate_images_via_images_api(
         }
         let field_name = if images.len() > 1 { "image[]" } else { "image" };
         for image in images {
-            let bytes = image.read_bytes()?;
+            let bytes = load_media_bytes(client, image).await?;
             let filename = match &image.source {
                 yoetz_core::media::MediaSource::File(path) => path
                     .file_name()
@@ -324,7 +340,7 @@ pub async fn generate_video_sora(
     }
 
     if let Some(reference) = input_reference {
-        let bytes = reference.read_bytes()?;
+        let bytes = load_media_bytes(client, reference).await?;
         let filename = match &reference.source {
             yoetz_core::media::MediaSource::File(path) => path
                 .file_name()
@@ -434,27 +450,15 @@ fn extract_output_text(resp: &Value) -> String {
 fn parse_usage(resp: &Value) -> Usage {
     let usage = resp.get("usage").and_then(|v| v.as_object());
     if let Some(usage) = usage {
-        let input_tokens = usage
-            .get("input_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        let output_tokens = usage
-            .get("output_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        let total_tokens = usage
-            .get("total_tokens")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
         let cost_usd = usage
             .get("cost")
             .and_then(|v| v.as_f64())
             .or_else(|| usage.get("cost").and_then(|v| v.as_str())?.parse().ok());
         Usage {
-            input_tokens,
-            output_tokens,
+            input_tokens: usage.get("input_tokens").and_then(|v| v.as_u64()),
+            output_tokens: usage.get("output_tokens").and_then(|v| v.as_u64()),
             thoughts_tokens: None,
-            total_tokens,
+            total_tokens: usage.get("total_tokens").and_then(|v| v.as_u64()),
             cost_usd,
         }
     } else {

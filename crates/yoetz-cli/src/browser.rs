@@ -6,7 +6,7 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
-use yoetz_core::output::{write_jsonl_event, OutputFormat};
+use yoetz_core::output::{write_json, write_jsonl_event, OutputFormat};
 
 #[derive(Debug, Deserialize)]
 pub struct Recipe {
@@ -53,7 +53,11 @@ pub fn run_agent_browser(args: Vec<String>, format: OutputFormat) -> Result<Stri
 }
 
 pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> Result<()> {
-    if matches!(format, OutputFormat::Jsonl) {
+    let wants_json = matches!(format, OutputFormat::Json);
+    let wants_jsonl = matches!(format, OutputFormat::Jsonl);
+    let mut events: Vec<Value> = Vec::new();
+
+    if wants_jsonl {
         if let Some(name) = recipe.name.as_deref() {
             let event = json!({
                 "type": "recipe_start",
@@ -78,12 +82,9 @@ pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> R
         for args in commands {
             let stdout = run_agent_browser(args.clone(), format)?;
 
-            if matches!(format, OutputFormat::Jsonl) {
-                let stdout_value = if matches!(format, OutputFormat::Json | OutputFormat::Jsonl) {
-                    parse_stdout_json(&stdout).unwrap_or(Value::String(stdout.clone()))
-                } else {
-                    Value::String(stdout.clone())
-                };
+            if wants_json || wants_jsonl {
+                let stdout_value =
+                    parse_stdout_json(&stdout).unwrap_or(Value::String(stdout.clone()));
                 let event = json!({
                     "type": "browser_step",
                     "index": idx,
@@ -91,11 +92,23 @@ pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> R
                     "args": step.args,
                     "stdout": stdout_value,
                 });
-                write_jsonl_event(&event)?;
+                if wants_jsonl {
+                    write_jsonl_event(&event)?;
+                } else {
+                    events.push(event);
+                }
             } else {
                 print!("{stdout}");
             }
         }
+    }
+
+    if wants_json {
+        let payload = json!({
+            "name": recipe.name,
+            "steps": events,
+        });
+        write_json(&payload)?;
     }
 
     Ok(())
@@ -150,13 +163,19 @@ fn expand_bundle_text_step(
         }
         let locator = interpolate(&args[0], ctx, None);
         let value = interpolate(&args[1], ctx, None);
+        let first_action = interpolate(&args[2], ctx, None);
+        let follow_action = if first_action == "fill" {
+            "type".to_string()
+        } else {
+            first_action.clone()
+        };
         let mut commands = Vec::new();
 
         let first = vec![
             action.to_string(),
             locator.clone(),
             value.clone(),
-            "fill".to_string(),
+            first_action,
             chunks[0].clone(),
         ];
         commands.push(first);
@@ -166,7 +185,7 @@ fn expand_bundle_text_step(
                 action.to_string(),
                 locator.clone(),
                 value.clone(),
-                "type".to_string(),
+                follow_action.clone(),
                 chunk.clone(),
             ]);
         }

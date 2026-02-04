@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelPricing {
@@ -41,20 +42,39 @@ pub struct ModelRegistry {
     pub version: u32,
     pub updated_at: Option<String>,
     pub models: Vec<ModelEntry>,
+    #[serde(skip, default)]
+    index: HashMap<String, usize>,
 }
 
 impl ModelRegistry {
     pub fn find(&self, id: &str) -> Option<&ModelEntry> {
+        if let Some(idx) = self.index.get(id) {
+            return self.models.get(*idx);
+        }
         self.models.iter().find(|m| m.id == id)
     }
 
     pub fn merge(&mut self, other: ModelRegistry) {
+        if self.index.is_empty() && !self.models.is_empty() {
+            self.rebuild_index();
+        }
         for m in other.models {
-            if let Some(existing) = self.models.iter_mut().find(|x| x.id == m.id) {
-                *existing = m;
+            if let Some(idx) = self.index.get(&m.id).copied() {
+                if let Some(existing) = self.models.get_mut(idx) {
+                    *existing = m;
+                }
             } else {
                 self.models.push(m);
+                let idx = self.models.len() - 1;
+                self.index.insert(self.models[idx].id.clone(), idx);
             }
+        }
+    }
+
+    pub fn rebuild_index(&mut self) {
+        self.index.clear();
+        for (idx, model) in self.models.iter().enumerate() {
+            self.index.insert(model.id.clone(), idx);
         }
     }
 }

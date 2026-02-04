@@ -22,7 +22,7 @@ toml = "0.8"
 thiserror = "1.0"
 ignore = "0.4"
 rand = "0.8"
-time = { version = "0.3", features = ["formatting", "macros"] }
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 sha2 = "0.10"
 hex = "0.4"
 base64 = "0.22"

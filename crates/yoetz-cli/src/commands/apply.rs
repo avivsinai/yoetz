@@ -20,6 +20,7 @@ pub(crate) fn handle_apply(args: ApplyArgs) -> Result<()> {
     let mut tmp = tempfile::NamedTempFile::new()?;
     use std::io::Write;
     tmp.write_all(patch.as_bytes())?;
+    let tmp_path = tmp.into_temp_path();
 
     let mut cmd = Command::new("git");
     cmd.arg("apply");
@@ -29,11 +30,12 @@ pub(crate) fn handle_apply(args: ApplyArgs) -> Result<()> {
     if args.reverse {
         cmd.arg("--reverse");
     }
-    cmd.arg(tmp.path());
+    cmd.arg(tmp_path.as_ref() as &std::path::Path);
 
-    let status = cmd.status()?;
-    if !status.success() {
-        return Err(anyhow!("git apply failed"));
+    let output = cmd.output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!("git apply failed: {stderr}"));
     }
 
     if args.check {

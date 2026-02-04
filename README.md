@@ -69,8 +69,14 @@ yoetz ask --prompt "Return JSON only" --provider openai --model gpt-5.2 --respon
 # Ask with an image (vision)
 yoetz ask --prompt "Describe this diagram" --image diagram.png --provider gemini --model gemini-3-flash-preview
 
+# Override MIME type for signed/extensionless URLs
+yoetz ask --prompt "Describe this" --image https://example.com/signed --image-mime image/png
+
 # Ask about a video
 yoetz ask --prompt "Summarize this" --video meeting.mp4 --provider gemini --model gemini-3-flash-preview
+
+# Override video MIME type for signed/extensionless URLs
+yoetz ask --prompt "Summarize this" --video https://example.com/signed --video-mime video/mp4
 
 > Note: Gemini can return empty content if `--max-output-tokens` is too low because tokens are consumed by thoughts. If you see warnings or empty output, increase the limit.
 
@@ -106,6 +112,9 @@ yoetz browser exec -- open https://chatgpt.com/
 
 # Use a recipe
 yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle bundle.md
+
+# JSON output aggregates steps
+yoetz --format json browser recipe --recipe recipes/chatgpt.yaml --bundle bundle.md
 ```
 
 ## Architecture

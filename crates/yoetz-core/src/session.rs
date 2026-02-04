@@ -1,3 +1,4 @@
+use crate::paths::home_dir;
 use crate::types::SessionInfo;
 use anyhow::{Context, Result};
 use rand::{distributions::Alphanumeric, Rng};
@@ -32,8 +33,8 @@ pub fn session_base_dir() -> PathBuf {
     if let Ok(dir) = env::var("YOETZ_DIR") {
         return PathBuf::from(dir).join("sessions");
     }
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home).join(".yoetz/sessions");
+    if let Some(home) = home_dir() {
+        return home.join(".yoetz/sessions");
     }
     PathBuf::from(".yoetz/sessions")
 }

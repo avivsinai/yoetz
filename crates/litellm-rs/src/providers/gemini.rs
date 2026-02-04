@@ -1,5 +1,6 @@
 use crate::config::ProviderConfig;
 use crate::error::{LiteLLMError, Result};
+use crate::http::send_json;
 use crate::providers::resolve_api_key;
 use crate::types::{
     ChatContentPart, ChatContentPartFile, ChatContentPartImageUrl, ChatContentPartInputAudio,
@@ -13,6 +14,11 @@ use reqwest::Client;
 use serde_json::Value;
 use std::env;
 use tokio::time::{sleep, Duration};
+
+/// Default maximum polling attempts for video generation (240 * 5s = 20 minutes)
+pub const DEFAULT_VIDEO_MAX_POLL_ATTEMPTS: u32 = 240;
+/// Default polling interval for video generation status checks
+pub const DEFAULT_VIDEO_POLL_INTERVAL_SECS: u64 = 5;
 
 pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Result<ChatResponse> {
     let base = cfg
@@ -48,14 +54,17 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
     if !system_instruction.is_empty() {
         body["system_instruction"] = serde_json::json!({ "parts": system_instruction });
     }
+
+    // Build generationConfig safely without unwrap
+    let mut generation_config = serde_json::Map::new();
     if let Some(temp) = req.temperature {
-        body["generationConfig"] = serde_json::json!({ "temperature": temp });
+        generation_config.insert("temperature".to_string(), serde_json::json!(temp));
     }
     if let Some(max_tokens) = req.max_tokens {
-        body["generationConfig"]
-            .as_object_mut()
-            .unwrap()
-            .insert("maxOutputTokens".into(), serde_json::json!(max_tokens));
+        generation_config.insert("maxOutputTokens".to_string(), serde_json::json!(max_tokens));
+    }
+    if !generation_config.is_empty() {
+        body["generationConfig"] = Value::Object(generation_config);
     }
 
     let mut builder = client.post(url).header("x-goog-api-key", key).json(&body);
@@ -83,10 +92,37 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
     })
 }
 
+/// Video generation options for configurable timeouts.
+#[derive(Debug, Clone)]
+pub struct VideoGenerationOptions {
+    /// Maximum number of polling attempts
+    pub max_poll_attempts: u32,
+    /// Interval between polling attempts in seconds
+    pub poll_interval_secs: u64,
+}
+
+impl Default for VideoGenerationOptions {
+    fn default() -> Self {
+        Self {
+            max_poll_attempts: DEFAULT_VIDEO_MAX_POLL_ATTEMPTS,
+            poll_interval_secs: DEFAULT_VIDEO_POLL_INTERVAL_SECS,
+        }
+    }
+}
+
 pub async fn video_generation(
     client: &Client,
     cfg: &ProviderConfig,
     req: VideoRequest,
+) -> Result<VideoResponse> {
+    video_generation_with_options(client, cfg, req, VideoGenerationOptions::default()).await
+}
+
+pub async fn video_generation_with_options(
+    client: &Client,
+    cfg: &ProviderConfig,
+    req: VideoRequest,
+    options: VideoGenerationOptions,
 ) -> Result<VideoResponse> {
     let base = cfg
         .base_url
@@ -101,17 +137,18 @@ pub async fn video_generation(
         base.trim_end_matches('/'),
         model
     );
-    let mut parameters = serde_json::json!({});
+
+    let mut parameters = serde_json::Map::new();
     if let Some(seconds) = req.seconds {
-        parameters["durationSeconds"] = serde_json::json!(seconds);
+        parameters.insert("durationSeconds".to_string(), serde_json::json!(seconds));
     }
     if let Some(size) = req.size {
-        parameters["resolution"] = serde_json::json!(size);
+        parameters.insert("resolution".to_string(), serde_json::json!(size));
     }
 
     let body = serde_json::json!({
         "instances": [{ "prompt": req.prompt }],
-        "parameters": parameters,
+        "parameters": Value::Object(parameters),
     });
 
     let mut builder = client.post(url).header("x-goog-api-key", &key).json(&body);
@@ -131,34 +168,39 @@ pub async fn video_generation(
         format!("{}/{}", base.trim_end_matches('/'), op_name)
     };
 
-    let mut attempts = 0u32;
-    let response = loop {
+    let poll_interval = Duration::from_secs(options.poll_interval_secs);
+
+    for attempt in 0..options.max_poll_attempts {
         let mut poll = client.get(&op_url).header("x-goog-api-key", &key);
         for (k, v) in &cfg.extra_headers {
             poll = poll.header(k, v);
         }
         let (op_resp, _headers) = send_json::<Value>(poll).await?;
-        if op_resp.get("done").and_then(|v| v.as_bool()) == Some(true) {
-            break op_resp;
-        }
-        attempts += 1;
-        if attempts > 240 {
-            return Err(LiteLLMError::Http("video generation timed out".into()));
-        }
-        sleep(Duration::from_secs(5)).await;
-    };
 
-    if response.get("error").is_some() {
-        return Err(LiteLLMError::Http("video generation failed".into()));
+        if op_resp.get("done").and_then(|v| v.as_bool()) == Some(true) {
+            if op_resp.get("error").is_some() {
+        return Err(LiteLLMError::http("video generation failed"));
+            }
+
+            let uri = extract_video_uri(&op_resp)
+                .ok_or_else(|| LiteLLMError::Parse("missing video uri".into()))?;
+
+            return Ok(VideoResponse {
+                video_url: Some(uri),
+                raw: None,
+            });
+        }
+
+        if attempt + 1 >= options.max_poll_attempts {
+            return Err(LiteLLMError::http(format!(
+                "video generation timed out after {} attempts",
+                options.max_poll_attempts
+            )));
+        }
+        sleep(poll_interval).await;
     }
 
-    let uri = extract_video_uri(&response)
-        .ok_or_else(|| LiteLLMError::Parse("missing video uri".into()))?;
-
-    Ok(VideoResponse {
-        video_url: Some(uri),
-        raw: None,
-    })
+    Err(LiteLLMError::http("video generation timed out"))
 }
 
 fn extract_text(resp: &Value) -> String {
@@ -187,20 +229,16 @@ fn parse_usage(resp: &Value) -> Usage {
         return Usage {
             prompt_tokens: meta
                 .get("promptTokenCount")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32),
+                .and_then(|v| v.as_u64()),
             completion_tokens: meta
                 .get("candidatesTokenCount")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32),
+                .and_then(|v| v.as_u64()),
             thoughts_tokens: meta
                 .get("thoughtsTokenCount")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32),
+                .and_then(|v| v.as_u64()),
             total_tokens: meta
                 .get("totalTokenCount")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32),
+                .and_then(|v| v.as_u64()),
             cost_usd: None,
         };
     }
@@ -566,12 +604,9 @@ async fn fetch_bytes_with_mime(
         .get(url)
         .send()
         .await
-        .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+        .map_err(LiteLLMError::from)?;
     let headers = resp.headers().clone();
-    let bytes = resp
-        .bytes()
-        .await
-        .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+    let bytes = resp.bytes().await.map_err(LiteLLMError::from)?;
     let header_mime = headers
         .get(CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -689,7 +724,7 @@ fn detail_to_media_resolution(detail: &str) -> Option<&'static str> {
 fn parse_data_url(url: &str, override_format: Option<&str>) -> Option<(String, String)> {
     if url.starts_with("data:") {
         let stripped = url.strip_prefix("data:").unwrap_or(url);
-        if let Some((meta, data)) = stripped.split_once(",") {
+        if let Some((meta, data)) = stripped.split_once(',') {
             let mut media_type = meta.split(';').next().unwrap_or("application/octet-stream");
             if let Some(fmt) = override_format {
                 media_type = fmt;
@@ -725,29 +760,4 @@ fn extract_video_uri(resp: &Value) -> Option<String> {
         return Some(uri.to_string());
     }
     None
-}
-
-async fn send_json<T: serde::de::DeserializeOwned>(
-    req: reqwest::RequestBuilder,
-) -> Result<(T, reqwest::header::HeaderMap)> {
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| LiteLLMError::Http(e.to_string()))?;
-    let status = resp.status();
-    let headers = resp.headers().clone();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| LiteLLMError::Http(e.to_string()))?;
-    if !status.is_success() {
-        let trimmed = text.lines().take(20).collect::<Vec<_>>().join("\n");
-        return Err(LiteLLMError::Http(format!(
-            "http {}: {}",
-            status.as_u16(),
-            trimmed
-        )));
-    }
-    let parsed = serde_json::from_str(&text).map_err(|e| LiteLLMError::Parse(e.to_string()))?;
-    Ok((parsed, headers))
 }

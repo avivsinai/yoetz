@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -27,14 +28,14 @@ pub enum ChatContentPart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatContentPartText {
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: Cow<'static, str>,
     pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatContentPartImageUrl {
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: Cow<'static, str>,
     pub image_url: ChatImageUrl,
 }
 
@@ -55,7 +56,7 @@ pub struct ChatImageUrlObject {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatContentPartInputAudio {
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: Cow<'static, str>,
     pub input_audio: ChatInputAudio,
 }
 
@@ -68,7 +69,7 @@ pub struct ChatInputAudio {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatContentPartFile {
     #[serde(rename = "type")]
-    pub kind: String,
+    pub kind: Cow<'static, str>,
     pub file: ChatFile,
 }
 
@@ -198,12 +199,16 @@ pub struct ChatResponse {
     pub raw: Option<Value>,
 }
 
+/// Token usage statistics from an LLM API response.
+///
+/// Uses `u64` for token counts to handle large values consistently
+/// across different platforms and avoid truncation.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
-    pub prompt_tokens: Option<u32>,
-    pub completion_tokens: Option<u32>,
-    pub thoughts_tokens: Option<u32>,
-    pub total_tokens: Option<u32>,
+    pub prompt_tokens: Option<u64>,
+    pub completion_tokens: Option<u64>,
+    pub thoughts_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
 }
 

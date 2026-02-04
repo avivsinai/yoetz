@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -69,12 +69,9 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
             .to_string_lossy()
             .to_string();
 
-        let metadata = fs::metadata(path).with_context(|| format!("stat file {rel_path}"))?;
-        let file_size = metadata.len() as usize;
-        let truncated_by_size = file_size > options.max_file_bytes;
-
-        let data = read_prefix(path, options.max_file_bytes)
+        let (data, sha256, file_size) = read_prefix_and_hash(path, options.max_file_bytes)
             .with_context(|| format!("read file {rel_path}"))?;
+        let truncated_by_size = file_size > options.max_file_bytes;
         let (mut content, mut truncated, is_binary) =
             extract_text(&data, options.max_file_bytes, truncated_by_size);
 
@@ -82,7 +79,7 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
             files.push(BundleFile {
                 path: rel_path,
                 bytes: file_size,
-                sha256: sha256_hex_file(path)?,
+                sha256,
                 truncated,
                 is_binary,
                 content: None,
@@ -103,7 +100,7 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
         files.push(BundleFile {
             path: rel_path,
             bytes: file_size,
-            sha256: sha256_hex_file(path)?,
+            sha256,
             truncated,
             is_binary,
             content,
@@ -152,27 +149,30 @@ fn extract_text(
     }
 }
 
-fn read_prefix(path: &std::path::Path, max_bytes: usize) -> anyhow::Result<Vec<u8>> {
-    let mut file = File::open(path)?;
-    let mut buf = vec![0u8; max_bytes];
-    let read = file.read(&mut buf)?;
-    buf.truncate(read);
-    Ok(buf)
-}
-
-fn sha256_hex_file(path: &std::path::Path) -> anyhow::Result<String> {
+fn read_prefix_and_hash(
+    path: &std::path::Path,
+    max_bytes: usize,
+) -> anyhow::Result<(Vec<u8>, String, usize)> {
     let mut file = File::open(path)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 8192];
+    let mut prefix = Vec::with_capacity(std::cmp::min(max_bytes, buf.len()));
+    let mut total = 0usize;
     loop {
         let read = file.read(&mut buf)?;
         if read == 0 {
             break;
         }
+        total += read;
         hasher.update(&buf[..read]);
+        if prefix.len() < max_bytes {
+            let remaining = max_bytes - prefix.len();
+            let take = remaining.min(read);
+            prefix.extend_from_slice(&buf[..take]);
+        }
     }
     let digest = hasher.finalize();
-    Ok(hex::encode(digest))
+    Ok((prefix, hex::encode(digest), total))
 }
 
 pub fn estimate_tokens(chars: usize) -> usize {

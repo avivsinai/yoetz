@@ -8,6 +8,7 @@ use crate::{
     AppContext, GenerateArgs, GenerateCommand, GenerateImageArgs, GenerateVideoArgs,
 };
 use litellm_rs::ImageRequest;
+use yoetz_core::media::MediaType;
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::session::{create_session_dir, write_json as write_json_file};
 use yoetz_core::types::{ArtifactPaths, MediaGenerationResult, Usage};
@@ -42,7 +43,7 @@ async fn handle_generate_image(
         .or(config.defaults.model.clone())
         .ok_or_else(|| anyhow!("model is required"))?;
 
-    let images = parse_media_inputs(&args.image)?;
+    let images = parse_media_inputs(&args.image, &args.image_mime, MediaType::Image)?;
 
     let session = create_session_dir()?;
     let media_dir = args
@@ -149,7 +150,7 @@ async fn handle_generate_video(
         .or(config.defaults.model.clone())
         .ok_or_else(|| anyhow!("model is required"))?;
 
-    let images = parse_media_inputs(&args.image)?;
+    let images = parse_media_inputs(&args.image, &args.image_mime, MediaType::Image)?;
 
     let session = create_session_dir()?;
     let media_dir = args

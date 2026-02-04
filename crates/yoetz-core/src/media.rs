@@ -46,7 +46,15 @@ pub struct MediaMetadata {
 
 impl MediaInput {
     pub fn from_path(path: &Path) -> Result<Self> {
-        let mime = guess_mime(path)?;
+        Self::from_path_with_mime(path, None)
+    }
+
+    pub fn from_path_with_mime(path: &Path, mime_override: Option<&str>) -> Result<Self> {
+        let mime = if let Some(mime) = mime_override {
+            mime.to_string()
+        } else {
+            guess_mime(path)?
+        };
         let media_type = media_type_from_mime(&mime)?;
         let size_bytes = fs::metadata(path).ok().map(|m| m.len());
         Ok(Self {
@@ -65,6 +73,31 @@ impl MediaInput {
         Ok(Self {
             source: MediaSource::Url(url.to_string()),
             media_type,
+            mime_type: mime,
+            size_bytes: None,
+        })
+    }
+
+    pub fn from_url_with_type(
+        url: &str,
+        expected_type: MediaType,
+        mime_type: Option<&str>,
+    ) -> Result<Self> {
+        let mime = mime_type
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| guess_mime_from_url(url));
+        match media_type_from_mime(&mime) {
+            Ok(detected) if detected != expected_type => {
+                return Err(anyhow!(
+                    "expected {expected_type:?} url but got mime {mime}; pass an explicit mime override to force it"
+                ));
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+        Ok(Self {
+            source: MediaSource::Url(url.to_string()),
+            media_type: expected_type,
             mime_type: mime,
             size_bytes: None,
         })
@@ -164,5 +197,24 @@ mod tests {
         assert_eq!(input.media_type, MediaType::Video);
         assert!(input.mime_type.starts_with("video/"));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn media_input_from_path_with_mime_override() {
+        let path = temp_path("bin");
+        fs::write(&path, [0u8, 1, 2, 3]).unwrap();
+        let input = MediaInput::from_path_with_mime(&path, Some("image/png")).unwrap();
+        assert_eq!(input.media_type, MediaType::Image);
+        assert_eq!(input.mime_type, "image/png");
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn media_input_from_url_with_type_unknown_mime() {
+        let input =
+            MediaInput::from_url_with_type("https://example.com/blob", MediaType::Image, None)
+                .unwrap();
+        assert_eq!(input.media_type, MediaType::Image);
+        assert_eq!(input.mime_type, "application/octet-stream");
     }
 }

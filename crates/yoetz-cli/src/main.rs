@@ -24,7 +24,7 @@ mod providers;
 mod registry;
 
 use yoetz_core::config::Config;
-use yoetz_core::media::MediaInput;
+use yoetz_core::media::{MediaInput, MediaType};
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::registry::ModelRegistry;
 use yoetz_core::session::{list_sessions, write_json as write_json_file};
@@ -66,7 +66,7 @@ struct Cli {
 struct AppContext {
     config: Config,
     client: reqwest::Client,
-    litellm: LiteLLM,
+    litellm: std::sync::Arc<LiteLLM>,
     output_final: Option<PathBuf>,
     output_schema: Option<PathBuf>,
     debug: bool,
@@ -131,8 +131,14 @@ struct AskArgs {
     #[arg(long, value_name = "PATH_OR_URL")]
     image: Vec<String>,
 
+    #[arg(long, value_name = "MIME", help = "Override MIME type for --image inputs (1 value or 1 per image)")]
+    image_mime: Vec<String>,
+
     #[arg(long, value_name = "PATH_OR_URL")]
     video: Option<String>,
+
+    #[arg(long, value_name = "MIME", help = "Override MIME type for --video input")]
+    video_mime: Option<String>,
 
     #[arg(long, value_name = "json|text")]
     response_format: Option<String>,
@@ -307,6 +313,9 @@ struct GenerateImageArgs {
     #[arg(long, value_name = "PATH_OR_URL")]
     image: Vec<String>,
 
+    #[arg(long, value_name = "MIME", help = "Override MIME type for --image inputs (1 value or 1 per image)")]
+    image_mime: Vec<String>,
+
     #[arg(long)]
     size: Option<String>,
 
@@ -342,6 +351,9 @@ struct GenerateVideoArgs {
 
     #[arg(long, value_name = "PATH_OR_URL")]
     image: Vec<String>,
+
+    #[arg(long, value_name = "MIME", help = "Override MIME type for --image inputs (1 value or 1 per image)")]
+    image_mime: Vec<String>,
 
     #[arg(long)]
     duration_secs: Option<u32>,
@@ -552,7 +564,7 @@ async fn main() -> Result<()> {
     }
     let config = Config::load_with_profile(cli.profile.as_deref())?;
     let client = build_client(cli.timeout_secs)?;
-    let litellm = build_litellm(&config, client.clone())?;
+    let litellm = std::sync::Arc::new(build_litellm(&config, client.clone())?);
     let ctx = AppContext {
         config,
         client,
@@ -784,22 +796,9 @@ fn read_text_file(path: &std::path::Path, max_bytes: usize) -> Result<(String, b
     }
 }
 
+/// Add usage statistics together.
 fn add_usage(mut total: Usage, usage: &Usage) -> Usage {
-    if let Some(input) = usage.input_tokens {
-        total.input_tokens = Some(total.input_tokens.unwrap_or(0) + input);
-    }
-    if let Some(output) = usage.output_tokens {
-        total.output_tokens = Some(total.output_tokens.unwrap_or(0) + output);
-    }
-    if let Some(thoughts) = usage.thoughts_tokens {
-        total.thoughts_tokens = Some(total.thoughts_tokens.unwrap_or(0) + thoughts);
-    }
-    if let Some(total_tokens) = usage.total_tokens {
-        total.total_tokens = Some(total.total_tokens.unwrap_or(0) + total_tokens);
-    }
-    if let Some(cost) = usage.cost_usd {
-        total.cost_usd = Some(total.cost_usd.unwrap_or(0.0) + cost);
-    }
+    total.add(usage);
     total
 }
 
@@ -903,19 +902,64 @@ fn resolve_response_format(
     Ok(format)
 }
 
-fn parse_media_inputs(values: &[String]) -> Result<Vec<MediaInput>> {
-    let mut out = Vec::new();
-    for value in values {
-        out.push(parse_media_input(value)?);
+fn parse_media_inputs(
+    values: &[String],
+    mimes: &[String],
+    kind: MediaType,
+) -> Result<Vec<MediaInput>> {
+    let kind_label = media_type_label(&kind);
+    let overrides = normalize_mime_overrides(values.len(), mimes, kind_label)?;
+    let mut out = Vec::with_capacity(values.len());
+    for (value, mime) in values.iter().zip(overrides.into_iter()) {
+        out.push(parse_media_input(value, mime.as_deref(), kind.clone())?);
     }
     Ok(out)
 }
 
-fn parse_media_input(value: &str) -> Result<MediaInput> {
-    if value.starts_with("http://") || value.starts_with("https://") {
-        return MediaInput::from_url(value, None);
+fn normalize_mime_overrides(
+    values_len: usize,
+    mimes: &[String],
+    kind: &str,
+) -> Result<Vec<Option<String>>> {
+    if mimes.is_empty() {
+        return Ok(vec![None; values_len]);
     }
-    MediaInput::from_path(PathBuf::from(value).as_path())
+    if values_len == 0 {
+        return Err(anyhow!("{kind} mime provided but no {kind} inputs"));
+    }
+    if mimes.len() == 1 && values_len > 1 {
+        return Ok(vec![Some(mimes[0].clone()); values_len]);
+    }
+    if mimes.len() == values_len {
+        return Ok(mimes.iter().cloned().map(Some).collect());
+    }
+    Err(anyhow!(
+        "expected 1 or {values_len} {kind} mime values, got {}",
+        mimes.len()
+    ))
+}
+
+fn parse_media_input(value: &str, mime: Option<&str>, kind: MediaType) -> Result<MediaInput> {
+    if value.starts_with("http://") || value.starts_with("https://") || value.starts_with("gs://")
+    {
+        return MediaInput::from_url_with_type(value, kind, mime);
+    }
+    let input = MediaInput::from_path_with_mime(PathBuf::from(value).as_path(), mime)?;
+    if input.media_type != kind {
+        return Err(anyhow!(
+            "expected {label} input but got {mime} (use a mime override to force it)",
+            label = media_type_label(&kind),
+            mime = input.mime_type
+        ));
+    }
+    Ok(input)
+}
+
+fn media_type_label(kind: &MediaType) -> &'static str {
+    match kind {
+        MediaType::Image => "image",
+        MediaType::Video => "video",
+    }
 }
 
 fn render_bundle_md(bundle: &yoetz_core::types::Bundle) -> String {
@@ -931,6 +975,9 @@ fn render_bundle_md(bundle: &yoetz_core::types::Bundle) -> String {
             out.push_str(&fence);
             out.push('\n');
             out.push_str(content);
+            if !content.ends_with('\n') {
+                out.push('\n');
+            }
             if file.truncated {
                 out.push_str("\n... [truncated]\n");
             }
@@ -1036,7 +1083,7 @@ async fn call_litellm(
     } else {
         let mut parts = Vec::new();
         parts.push(ChatContentPart::Text(ChatContentPartText {
-            kind: "text".to_string(),
+            kind: std::borrow::Cow::Borrowed("text"),
             text: prompt.to_string(),
         }));
         for image in images {
@@ -1138,12 +1185,15 @@ fn resolve_registry_model_id(
     candidates.into_iter().next()
 }
 
+/// Convert litellm_rs::Usage to yoetz_core::types::Usage.
+///
+/// Both types now use u64 for token counts, so this is a straightforward mapping.
 fn usage_from_litellm(usage: litellm_rs::Usage) -> Usage {
     Usage {
-        input_tokens: usage.prompt_tokens.map(|v| v as usize),
-        output_tokens: usage.completion_tokens.map(|v| v as usize),
-        thoughts_tokens: usage.thoughts_tokens.map(|v| v as usize),
-        total_tokens: usage.total_tokens.map(|v| v as usize),
+        input_tokens: usage.prompt_tokens,
+        output_tokens: usage.completion_tokens,
+        thoughts_tokens: usage.thoughts_tokens,
+        total_tokens: usage.total_tokens,
         cost_usd: usage.cost_usd,
     }
 }
@@ -1202,7 +1252,7 @@ fn media_to_image_part(media: &MediaInput) -> Result<ChatContentPart> {
     }
     let url = media.as_data_url()?;
     Ok(ChatContentPart::ImageUrl(ChatContentPartImageUrl {
-        kind: "image_url".to_string(),
+        kind: std::borrow::Cow::Borrowed("image_url"),
         image_url: ChatImageUrl::Url(url),
     }))
 }
@@ -1210,7 +1260,7 @@ fn media_to_image_part(media: &MediaInput) -> Result<ChatContentPart> {
 fn media_to_file_part(media: &MediaInput) -> Result<ChatContentPart> {
     let url = media.as_data_url()?;
     Ok(ChatContentPart::File(ChatContentPartFile {
-        kind: "file".to_string(),
+        kind: std::borrow::Cow::Borrowed("file"),
         file: ChatFile {
             file_id: None,
             file_data: Some(url),

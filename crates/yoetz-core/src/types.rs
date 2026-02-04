@@ -37,13 +37,43 @@ pub struct PricingEstimate {
     pub warnings: Vec<String>,
 }
 
+/// Token usage statistics from an LLM call.
+///
+/// Uses `u64` for token counts to match API response types and avoid
+/// truncation issues across different platforms.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Usage {
-    pub input_tokens: Option<usize>,
-    pub output_tokens: Option<usize>,
-    pub thoughts_tokens: Option<usize>,
-    pub total_tokens: Option<usize>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub thoughts_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
     pub cost_usd: Option<f64>,
+}
+
+impl Usage {
+    /// Create a new Usage with all fields set to None.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add another Usage to this one, summing all token counts and costs.
+    pub fn add(&mut self, other: &Usage) {
+        if let Some(input) = other.input_tokens {
+            self.input_tokens = Some(self.input_tokens.unwrap_or(0) + input);
+        }
+        if let Some(output) = other.output_tokens {
+            self.output_tokens = Some(self.output_tokens.unwrap_or(0) + output);
+        }
+        if let Some(thoughts) = other.thoughts_tokens {
+            self.thoughts_tokens = Some(self.thoughts_tokens.unwrap_or(0) + thoughts);
+        }
+        if let Some(total) = other.total_tokens {
+            self.total_tokens = Some(self.total_tokens.unwrap_or(0) + total);
+        }
+        if let Some(cost) = other.cost_usd {
+            self.cost_usd = Some(self.cost_usd.unwrap_or(0.0) + cost);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

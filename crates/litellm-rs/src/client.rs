@@ -25,7 +25,7 @@ impl LiteLLM {
             client: Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
                 .build()
-                .map_err(|e| LiteLLMError::Http(e.to_string()))?,
+                .map_err(LiteLLMError::from)?,
             registry,
         })
     }

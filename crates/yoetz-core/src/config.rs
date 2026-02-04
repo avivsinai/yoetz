@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::paths::home_dir;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub defaults: Defaults,
@@ -95,6 +96,10 @@ fn default_config_paths(profile: Option<&str>) -> Vec<PathBuf> {
     }
     paths.push(PathBuf::from("./yoetz.toml"));
 
+    if let Ok(custom) = env::var("YOETZ_CONFIG_PATH") {
+        paths.push(PathBuf::from(custom));
+    }
+
     if let Some(name) = profile {
         if let Some(home) = home_dir() {
             paths.push(home.join(".yoetz/profiles").join(format!("{name}.toml")));
@@ -113,10 +118,6 @@ fn default_config_paths(profile: Option<&str>) -> Vec<PathBuf> {
         paths.push(PathBuf::from(format!("./yoetz.{name}.toml")));
     }
     paths
-}
-
-fn home_dir() -> Option<PathBuf> {
-    env::var("HOME").map(PathBuf::from).ok()
 }
 
 fn merge_defaults(target: &mut Defaults, other: Defaults) {

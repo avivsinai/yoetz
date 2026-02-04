@@ -10,6 +10,7 @@ use crate::{budget, providers, registry};
 use std::env;
 use std::path::PathBuf;
 use yoetz_core::bundle::{build_bundle, estimate_tokens, BundleOptions};
+use yoetz_core::media::MediaType;
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::session::{create_session_dir, write_json as write_json_file, write_text};
 use yoetz_core::types::{ArtifactPaths, PricingEstimate, RunResult, Usage};
@@ -27,9 +28,16 @@ pub(crate) async fn handle_ask(
         args.response_schema_name.clone(),
     )?;
 
-    let image_inputs = parse_media_inputs(&args.image)?;
+    let image_inputs = parse_media_inputs(&args.image, &args.image_mime, MediaType::Image)?;
+    if args.video.is_none() && args.video_mime.is_some() {
+        return Err(anyhow!("--video-mime requires --video"));
+    }
     let video_input = match args.video.as_deref() {
-        Some(value) => Some(parse_media_input(value)?),
+        Some(value) => Some(parse_media_input(
+            value,
+            args.video_mime.as_deref(),
+            MediaType::Video,
+        )?),
         None => None,
     };
 
@@ -97,14 +105,16 @@ pub(crate) async fn handle_ask(
         &mut pricing,
     )?;
 
-    let mut ledger = None;
-    if args.max_cost_usd.is_some() || args.daily_budget_usd.is_some() {
-        ledger = Some(budget::ensure_budget(
+    let budget_enabled = args.max_cost_usd.is_some() || args.daily_budget_usd.is_some();
+    let budget_reservation = if budget_enabled {
+        budget::ensure_budget(
             pricing.estimate_usd,
             args.max_cost_usd,
             args.daily_budget_usd,
-        )?);
-    }
+        )?
+    } else {
+        None
+    };
 
     let model_prompt = if let Some(bundle_ref) = &bundle {
         crate::render_bundle_md(bundle_ref)
@@ -236,9 +246,13 @@ pub(crate) async fn handle_ask(
         }
     }
 
-    if let Some(ledger) = ledger {
+    if budget_enabled {
         if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
-            let _ = budget::record_spend(ledger, spend);
+            if let Some(reservation) = budget_reservation {
+                let _ = reservation.commit(spend);
+            } else {
+                let _ = budget::record_spend_standalone(spend);
+            }
         }
     }
 

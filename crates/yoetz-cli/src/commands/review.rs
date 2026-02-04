@@ -64,14 +64,16 @@ async fn handle_review_diff(
         max_output_tokens,
     )?;
 
-    let mut ledger = None;
-    if args.max_cost_usd.is_some() || args.daily_budget_usd.is_some() {
-        ledger = Some(budget::ensure_budget(
+    let budget_enabled = args.max_cost_usd.is_some() || args.daily_budget_usd.is_some();
+    let budget_reservation = if budget_enabled {
+        budget::ensure_budget(
             pricing.estimate_usd,
             args.max_cost_usd,
             args.daily_budget_usd,
-        )?);
-    }
+        )?
+    } else {
+        None
+    };
 
     let session = create_session_dir()?;
     let artifacts = ArtifactPaths {
@@ -120,9 +122,13 @@ async fn handle_review_diff(
         }
     }
 
-    if let Some(ledger) = ledger {
+    if budget_enabled {
         if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
-            let _ = budget::record_spend(ledger, spend);
+            if let Some(reservation) = budget_reservation {
+                let _ = reservation.commit(spend);
+            } else {
+                let _ = budget::record_spend_standalone(spend);
+            }
         }
     }
 
@@ -200,14 +206,16 @@ async fn handle_review_file(
         max_output_tokens,
     )?;
 
-    let mut ledger = None;
-    if args.max_cost_usd.is_some() || args.daily_budget_usd.is_some() {
-        ledger = Some(budget::ensure_budget(
+    let budget_enabled = args.max_cost_usd.is_some() || args.daily_budget_usd.is_some();
+    let budget_reservation = if budget_enabled {
+        budget::ensure_budget(
             pricing.estimate_usd,
             args.max_cost_usd,
             args.daily_budget_usd,
-        )?);
-    }
+        )?
+    } else {
+        None
+    };
 
     let session = create_session_dir()?;
     let artifacts = ArtifactPaths {
@@ -256,9 +264,13 @@ async fn handle_review_file(
         }
     }
 
-    if let Some(ledger) = ledger {
+    if budget_enabled {
         if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
-            let _ = budget::record_spend(ledger, spend);
+            if let Some(reservation) = budget_reservation {
+                let _ = reservation.commit(spend);
+            } else {
+                let _ = budget::record_spend_standalone(spend);
+            }
         }
     }
 

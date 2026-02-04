@@ -1,5 +1,6 @@
 use crate::config::ProviderConfig;
 use crate::error::{LiteLLMError, Result};
+use crate::http::send_json;
 use crate::providers::resolve_api_key;
 use crate::types::{
     ChatContentPart, ChatContentPartImageUrl, ChatContentPartText, ChatImageUrl, ChatMessage,
@@ -22,62 +23,14 @@ pub async fn chat(client: &Client, cfg: &ProviderConfig, req: ChatRequest) -> Re
     let key = resolve_api_key(cfg)?;
     let key = key.ok_or_else(|| LiteLLMError::MissingApiKey("ANTHROPIC_API_KEY".into()))?;
 
-    let mut messages = req.messages;
+    let mut messages = req.messages.clone();
     let system_blocks = extract_system_blocks(client, &mut messages).await?;
     let mut anthropic_messages = Vec::with_capacity(messages.len());
     for message in messages {
         anthropic_messages.push(anthropic_message_from_chat(client, message).await?);
     }
 
-    let mut body = serde_json::json!({
-        "model": req.model,
-        "messages": anthropic_messages,
-        "max_tokens": req
-            .max_tokens
-            .or(req.max_completion_tokens)
-            .unwrap_or(1024),
-    });
-    if !system_blocks.is_empty() {
-        body["system"] = serde_json::json!(system_blocks);
-    }
-    if let Some(temp) = req.temperature {
-        body["temperature"] = serde_json::json!(temp);
-    }
-    if let Some(top_p) = req.top_p {
-        body["top_p"] = serde_json::json!(top_p);
-    }
-    if let Some(stop_sequences) = map_stop_sequences(req.stop) {
-        body["stop_sequences"] = serde_json::json!(stop_sequences);
-    }
-
-    let mut tools = req.tools;
-    let mut tool_choice = req.tool_choice;
-    let output_format =
-        map_response_format_to_output_format(&req.model, req.response_format.as_ref());
-    if let Some(output_format) = output_format {
-        body["output_format"] = output_format;
-    } else if let Some(response_tool) = map_response_format_to_tool(req.response_format.as_ref()) {
-        tools = merge_tools(tools, response_tool);
-        if tool_choice.is_none() {
-            tool_choice = Some(serde_json::json!({
-                "type": "tool",
-                "name": RESPONSE_FORMAT_TOOL_NAME,
-            }));
-        }
-    }
-
-    if let Some(tools_value) = tools {
-        body["tools"] = tools_value;
-    }
-    if let Some(tool_choice_value) = tool_choice {
-        body["tool_choice"] = tool_choice_value;
-    }
-
-    if let Some(metadata) = req.metadata {
-        body["metadata"] = metadata;
-    } else if let Some(user) = req.user {
-        body["metadata"] = serde_json::json!({ "user_id": user });
-    }
+    let body = build_anthropic_body(&req, anthropic_messages, system_blocks, false)?;
 
     let mut builder = client
         .post(url)
@@ -117,22 +70,66 @@ pub async fn chat_stream(
     let key = resolve_api_key(cfg)?;
     let key = key.ok_or_else(|| LiteLLMError::MissingApiKey("ANTHROPIC_API_KEY".into()))?;
 
-    let mut messages = req.messages;
+    let mut messages = req.messages.clone();
     let system_blocks = extract_system_blocks(client, &mut messages).await?;
     let mut anthropic_messages = Vec::with_capacity(messages.len());
     for message in messages {
         anthropic_messages.push(anthropic_message_from_chat(client, message).await?);
     }
 
+    let body = build_anthropic_body(&req, anthropic_messages, system_blocks, true)?;
+
+    let mut builder = client
+        .post(url)
+        .header("x-api-key", key)
+        .header("anthropic-version", DEFAULT_VERSION)
+        .header("accept", "text/event-stream")
+        .json(&body);
+    for (k, v) in &cfg.extra_headers {
+        builder = builder.header(k, v);
+    }
+
+    let resp = builder
+        .send()
+        .await
+        .map_err(LiteLLMError::from)?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.map_err(LiteLLMError::from)?;
+        return Err(LiteLLMError::http(format!(
+            "http {}: {}",
+            status.as_u16(),
+            text
+        )));
+    }
+
+    Ok(crate::stream::parse_anthropic_sse_stream(
+        resp.bytes_stream(),
+    ))
+}
+
+const RESPONSE_FORMAT_TOOL_NAME: &str = "response_format";
+
+/// Build the Anthropic request body from a ChatRequest.
+fn build_anthropic_body(
+    req: &ChatRequest,
+    messages: Vec<AnthropicMessage>,
+    system_blocks: Vec<AnthropicContentBlock>,
+    stream: bool,
+) -> Result<Value> {
     let mut body = serde_json::json!({
         "model": req.model,
-        "messages": anthropic_messages,
+        "messages": messages,
         "max_tokens": req
             .max_tokens
             .or(req.max_completion_tokens)
             .unwrap_or(1024),
-        "stream": true,
     });
+
+    if stream {
+        body["stream"] = serde_json::json!(true);
+    }
+
     if !system_blocks.is_empty() {
         body["system"] = serde_json::json!(system_blocks);
     }
@@ -142,12 +139,12 @@ pub async fn chat_stream(
     if let Some(top_p) = req.top_p {
         body["top_p"] = serde_json::json!(top_p);
     }
-    if let Some(stop_sequences) = map_stop_sequences(req.stop) {
+    if let Some(stop_sequences) = map_stop_sequences(req.stop.clone()) {
         body["stop_sequences"] = serde_json::json!(stop_sequences);
     }
 
-    let mut tools = req.tools;
-    let mut tool_choice = req.tool_choice;
+    let mut tools = req.tools.clone();
+    let mut tool_choice = req.tool_choice.clone();
     let output_format =
         map_response_format_to_output_format(&req.model, req.response_format.as_ref());
     if let Some(output_format) = output_format {
@@ -169,45 +166,14 @@ pub async fn chat_stream(
         body["tool_choice"] = tool_choice_value;
     }
 
-    if let Some(metadata) = req.metadata {
-        body["metadata"] = metadata;
-    } else if let Some(user) = req.user {
+    if let Some(ref metadata) = req.metadata {
+        body["metadata"] = metadata.clone();
+    } else if let Some(ref user) = req.user {
         body["metadata"] = serde_json::json!({ "user_id": user });
     }
 
-    let mut builder = client
-        .post(url)
-        .header("x-api-key", key)
-        .header("anthropic-version", DEFAULT_VERSION)
-        .header("accept", "text/event-stream")
-        .json(&body);
-    for (k, v) in &cfg.extra_headers {
-        builder = builder.header(k, v);
-    }
-
-    let resp = builder
-        .send()
-        .await
-        .map_err(|e| LiteLLMError::Http(e.to_string()))?;
-    let status = resp.status();
-    if !status.is_success() {
-        let text = resp
-            .text()
-            .await
-            .map_err(|e| LiteLLMError::Http(e.to_string()))?;
-        return Err(LiteLLMError::Http(format!(
-            "http {}: {}",
-            status.as_u16(),
-            text
-        )));
-    }
-
-    Ok(crate::stream::parse_anthropic_sse_stream(
-        resp.bytes_stream(),
-    ))
+    Ok(body)
 }
-
-const RESPONSE_FORMAT_TOOL_NAME: &str = "response_format";
 
 fn map_stop_sequences(value: Option<Value>) -> Option<Vec<String>> {
     let value = value?;
@@ -327,12 +293,10 @@ fn parse_usage(resp: &Value) -> Usage {
         return Usage {
             prompt_tokens: u
                 .get("input_tokens")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32),
+                .and_then(|v| v.as_u64()),
             completion_tokens: u
                 .get("output_tokens")
-                .and_then(|v| v.as_u64())
-                .map(|v| v as u32),
+                .and_then(|v| v.as_u64()),
             thoughts_tokens: None,
             total_tokens: None,
             cost_usd: None,
@@ -459,16 +423,9 @@ async fn anthropic_image_source(
         });
     }
     if url.starts_with("http://") {
-        let resp = client
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+        let resp = client.get(url).send().await.map_err(LiteLLMError::from)?;
         let headers = resp.headers().clone();
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| LiteLLMError::Http(e.to_string()))?;
+        let bytes = resp.bytes().await.map_err(LiteLLMError::from)?;
         let header_mime = headers
             .get(CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
@@ -496,7 +453,7 @@ fn infer_mime_from_url(url: &str) -> Option<String> {
 fn parse_data_url(url: &str, override_format: Option<&str>) -> Result<(String, String)> {
     if url.starts_with("data:") {
         let stripped = url.strip_prefix("data:").unwrap_or(url);
-        if let Some((meta, data)) = stripped.split_once(",") {
+        if let Some((meta, data)) = stripped.split_once(',') {
             let mut media_type = meta.split(';').next().unwrap_or("application/octet-stream");
             if let Some(fmt) = override_format {
                 media_type = fmt;
@@ -513,29 +470,4 @@ fn parse_data_url(url: &str, override_format: Option<&str>) -> Result<(String, S
     Err(LiteLLMError::Config(
         "expected data URL for anthropic image; provide data:...;base64,... or format".into(),
     ))
-}
-
-async fn send_json<T: serde::de::DeserializeOwned>(
-    req: reqwest::RequestBuilder,
-) -> Result<(T, reqwest::header::HeaderMap)> {
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| LiteLLMError::Http(e.to_string()))?;
-    let status = resp.status();
-    let headers = resp.headers().clone();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| LiteLLMError::Http(e.to_string()))?;
-    if !status.is_success() {
-        let trimmed = text.lines().take(20).collect::<Vec<_>>().join("\n");
-        return Err(LiteLLMError::Http(format!(
-            "http {}: {}",
-            status.as_u16(),
-            trimmed
-        )));
-    }
-    let parsed = serde_json::from_str(&text).map_err(|e| LiteLLMError::Parse(e.to_string()))?;
-    Ok((parsed, headers))
 }

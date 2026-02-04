@@ -88,14 +88,16 @@ pub(crate) async fn handle_council(
         None
     };
 
-    let mut ledger = None;
-    if args.max_cost_usd.is_some() || args.daily_budget_usd.is_some() {
-        ledger = Some(budget::ensure_budget(
+    let budget_enabled = args.max_cost_usd.is_some() || args.daily_budget_usd.is_some();
+    let budget_reservation = if budget_enabled {
+        budget::ensure_budget(
             total_estimate,
             args.max_cost_usd,
             args.daily_budget_usd,
-        )?);
-    }
+        )?
+    } else {
+        None
+    };
 
     let session = create_session_dir()?;
     let mut artifacts = ArtifactPaths {
@@ -205,7 +207,7 @@ pub(crate) async fn handle_council(
         results = ordered.into_iter().flatten().collect();
     }
 
-    if let Some(ledger) = ledger {
+    if budget_enabled {
         let mut spend = 0.0;
         let mut has_spend = false;
         for r in &results {
@@ -215,7 +217,11 @@ pub(crate) async fn handle_council(
             }
         }
         if has_spend {
-            let _ = budget::record_spend(ledger, spend);
+            if let Some(reservation) = budget_reservation {
+                let _ = reservation.commit(spend);
+            } else {
+                let _ = budget::record_spend_standalone(spend);
+            }
         }
     }
 

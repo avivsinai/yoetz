@@ -3,12 +3,15 @@ use reqwest::Client;
 use serde_json::Value;
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::http::send_json;
 use litellm_rs::registry::Registry as EmbeddedRegistry;
 use yoetz_core::config::Config;
+use yoetz_core::paths::home_dir;
 use yoetz_core::registry::{ModelCapability, ModelEntry, ModelPricing, ModelRegistry};
 
 pub struct RegistryFetchResult {
@@ -20,8 +23,8 @@ pub fn registry_cache_path() -> PathBuf {
     if let Ok(path) = env::var("YOETZ_REGISTRY_PATH") {
         return PathBuf::from(path);
     }
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home).join(".yoetz/registry.json");
+    if let Some(home) = home_dir() {
+        return home.join(".yoetz/registry.json");
     }
     PathBuf::from(".yoetz/registry.json")
 }
@@ -33,7 +36,8 @@ pub fn load_registry_cache() -> Result<Option<ModelRegistry>> {
     }
     let content =
         fs::read_to_string(&path).with_context(|| format!("read registry {}", path.display()))?;
-    let registry: ModelRegistry = serde_json::from_str(&content)?;
+    let mut registry: ModelRegistry = serde_json::from_str(&content)?;
+    registry.rebuild_index();
     Ok(Some(registry))
 }
 
@@ -43,7 +47,11 @@ pub fn save_registry_cache(registry: &ModelRegistry) -> Result<PathBuf> {
         fs::create_dir_all(parent)?;
     }
     let data = serde_json::to_string_pretty(registry)?;
-    fs::write(&path, data).with_context(|| format!("write registry {}", path.display()))?;
+    let mut tmp =
+        NamedTempFile::new_in(path.parent().unwrap_or_else(|| std::path::Path::new(".")))?;
+    tmp.write_all(data.as_bytes())?;
+    tmp.persist(&path)
+        .map_err(|e| anyhow!("write registry {}: {}", path.display(), e))?;
     Ok(path)
 }
 
@@ -86,6 +94,7 @@ pub async fn fetch_registry(client: &Client, config: &Config) -> Result<Registry
     if registry.version == 0 {
         registry.version = 1;
     }
+    registry.rebuild_index();
 
     Ok(RegistryFetchResult { registry, warnings })
 }
@@ -122,6 +131,7 @@ fn embedded_gemini_registry() -> Result<ModelRegistry> {
             capability: None,
         });
     }
+    registry.rebuild_index();
     Ok(registry)
 }
 
@@ -202,6 +212,7 @@ fn parse_openrouter_models(value: &Value) -> ModelRegistry {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
         let pricing_obj = item.get("pricing");
+        // OpenRouter pricing is USD per token; convert to USD per 1k tokens.
         let pricing = ModelPricing {
             prompt_per_1k: pricing_obj
                 .and_then(|p| parse_price(p.get("prompt")))
@@ -222,6 +233,7 @@ fn parse_openrouter_models(value: &Value) -> ModelRegistry {
         });
     }
 
+    registry.rebuild_index();
     registry
 }
 
@@ -275,6 +287,7 @@ fn parse_litellm_models(value: &Value) -> ModelRegistry {
         });
     }
 
+    registry.rebuild_index();
     registry
 }
 

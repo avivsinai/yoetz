@@ -155,6 +155,11 @@ pub async fn generate_video_veo(
 
     let uri =
         extract_video_uri(&response).ok_or_else(|| anyhow!("missing video uri in response"))?;
+    if uri.starts_with("gs://") {
+        return Err(anyhow!(
+            "video is stored in GCS at {uri}; yoetz cannot download gs:// URIs without GCS credentials. Download with gsutil or gcloud and retry"
+        ));
+    }
 
     let bytes = match client
         .get(&uri)
@@ -284,8 +289,8 @@ async fn upload_file(
 ) -> Result<String> {
     let base_root = auth
         .base_url
-        .trim_end_matches("/v1beta")
-        .trim_end_matches('/');
+        .trim_end_matches('/')
+        .trim_end_matches("/v1beta");
     let start_url = format!("{}/upload/v1beta/files?key={}", base_root, auth.api_key);
     let display_name = path
         .file_name()
@@ -360,27 +365,11 @@ fn extract_text(resp: &Value) -> String {
 
 fn parse_usage(resp: &Value) -> Usage {
     if let Some(meta) = resp.get("usageMetadata").and_then(|v| v.as_object()) {
-        let input_tokens = meta
-            .get("promptTokenCount")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        let output_tokens = meta
-            .get("candidatesTokenCount")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        let thoughts_tokens = meta
-            .get("thoughtsTokenCount")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
-        let total_tokens = meta
-            .get("totalTokenCount")
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize);
         return Usage {
-            input_tokens,
-            output_tokens,
-            thoughts_tokens,
-            total_tokens,
+            input_tokens: meta.get("promptTokenCount").and_then(|v| v.as_u64()),
+            output_tokens: meta.get("candidatesTokenCount").and_then(|v| v.as_u64()),
+            thoughts_tokens: meta.get("thoughtsTokenCount").and_then(|v| v.as_u64()),
+            total_tokens: meta.get("totalTokenCount").and_then(|v| v.as_u64()),
             cost_usd: None,
         };
     }

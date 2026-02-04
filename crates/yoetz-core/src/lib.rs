@@ -4,6 +4,7 @@ pub mod bundle;
 pub mod config;
 pub mod media;
 pub mod output;
+pub mod paths;
 pub mod registry;
 pub mod session;
 pub mod types;
