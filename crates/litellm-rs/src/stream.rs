@@ -30,9 +30,7 @@ where
     S: Stream<Item = std::result::Result<Bytes, reqwest::Error>> + Send + Unpin + 'static,
 {
     let s = async_stream::try_stream! {
-        let stream = stream.map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        });
+        let stream = stream.map_err(std::io::Error::other);
         let reader = StreamReader::new(stream);
         let mut lines = BufReader::new(reader).lines();
 
