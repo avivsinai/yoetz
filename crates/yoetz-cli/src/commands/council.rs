@@ -7,6 +7,7 @@ use crate::{
     CouncilModelResult, CouncilPricing, ModelEstimate,
 };
 use crate::{budget, registry};
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use yoetz_core::bundle::{build_bundle, estimate_tokens, BundleOptions};
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
@@ -25,11 +26,27 @@ pub(crate) async fn handle_council(
         return Err(anyhow!("at least one model is required"));
     }
 
-    let provider = args
+    let default_provider = args
         .provider
         .clone()
         .or(config.defaults.provider.clone())
-        .ok_or_else(|| anyhow!("provider is required"))?;
+        .map(|provider| provider.to_lowercase());
+    let mut resolved_models = Vec::new();
+    let mut provider_keys = BTreeSet::new();
+    for model in &args.models {
+        let provider = resolve_council_provider(model, default_provider.as_deref())?;
+        provider_keys.insert(provider.clone());
+        resolved_models.push((model.clone(), provider));
+    }
+    let council_provider = if provider_keys.len() == 1 {
+        provider_keys
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "mixed".to_string())
+    } else {
+        "mixed".to_string()
+    };
     let response_format = resolve_response_format(
         args.response_format.clone(),
         args.response_schema.clone(),
@@ -63,9 +80,9 @@ pub(crate) async fn handle_council(
     let mut per_model = Vec::new();
     let mut estimate_sum = 0.0;
     let mut estimate_complete = true;
-    for model in &args.models {
+    for (model, provider) in &resolved_models {
         let registry_id =
-            resolve_registry_model_id(Some(&provider), Some(model), registry_cache.as_ref());
+            resolve_registry_model_id(Some(provider), Some(model), registry_cache.as_ref());
         let estimate = registry::estimate_pricing(
             registry_cache.as_ref(),
             registry_id.as_deref().unwrap_or(model),
@@ -119,9 +136,9 @@ pub(crate) async fn handle_council(
     });
 
     if args.dry_run {
-        for model in &args.models {
+        for (model, provider) in &resolved_models {
             let registry_id =
-                resolve_registry_model_id(Some(&provider), Some(model), registry_cache.as_ref());
+                resolve_registry_model_id(Some(provider), Some(model), registry_cache.as_ref());
             results.push(CouncilModelResult {
                 model: model.clone(),
                 content: "(dry-run) no provider call executed".to_string(),
@@ -139,7 +156,7 @@ pub(crate) async fn handle_council(
         let max_parallel = args.max_parallel.max(1);
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(max_parallel));
         let mut join_set = tokio::task::JoinSet::new();
-        for (idx, model) in args.models.iter().cloned().enumerate() {
+        for (idx, (model, provider)) in resolved_models.iter().cloned().enumerate() {
             let prompt = std::sync::Arc::clone(&model_prompt);
             let provider = provider.clone();
             let litellm = ctx.litellm.clone();
@@ -160,14 +177,14 @@ pub(crate) async fn handle_council(
                     None,
                 )
                 .await?;
-                Ok::<_, anyhow::Error>((idx, model, call))
+                Ok::<_, anyhow::Error>((idx, model, provider, call))
             });
         }
 
         let mut ordered: Vec<Option<CouncilModelResult>> =
             (0..args.models.len()).map(|_| None).collect();
         while let Some(res) = join_set.join_next().await {
-            let (idx, model, call) = res??;
+            let (idx, model, provider, call) = res??;
             let mut usage = call.usage;
             if usage.cost_usd.is_none() {
                 usage.cost_usd = call.header_cost;
@@ -223,7 +240,7 @@ pub(crate) async fn handle_council(
 
     let mut council = CouncilResult {
         id: session.id,
-        provider,
+        provider: council_provider,
         bundle,
         results,
         pricing: CouncilPricing {
@@ -256,4 +273,24 @@ pub(crate) async fn handle_council(
             Ok(())
         }
     }
+}
+
+fn resolve_council_provider(model: &str, default_provider: Option<&str>) -> Result<String> {
+    if let Some(provider) = prefixed_council_provider(model) {
+        return Ok(provider);
+    }
+    if let Some(provider) = default_provider {
+        return Ok(provider.to_string());
+    }
+    Err(anyhow!(
+        "provider is required for model '{model}'. Use --provider or prefix the model (e.g. openai/{model})"
+    ))
+}
+
+fn prefixed_council_provider(model: &str) -> Option<String> {
+    let (prefix, _rest) = model.split_once('/')?;
+    if prefix.eq_ignore_ascii_case("models") {
+        return None;
+    }
+    Some(prefix.to_lowercase())
 }
