@@ -40,8 +40,8 @@ impl Default for RetryConfig {
 impl RetryConfig {
     /// Calculate backoff duration for a given attempt number
     fn backoff_duration(&self, attempt: u32) -> Duration {
-        let backoff_ms = (self.initial_backoff_ms as f64)
-            * self.backoff_multiplier.powi(attempt as i32);
+        let backoff_ms =
+            (self.initial_backoff_ms as f64) * self.backoff_multiplier.powi(attempt as i32);
         let clamped_ms = backoff_ms.min(self.max_backoff_ms as f64) as u64;
         Duration::from_millis(clamped_ms)
     }
@@ -88,10 +88,7 @@ pub async fn send_json_with_retry<T: serde::de::DeserializeOwned>(
 pub async fn send_json_once<T: serde::de::DeserializeOwned>(
     req: reqwest::RequestBuilder,
 ) -> Result<(T, HeaderMap)> {
-    let resp = req
-        .send()
-        .await
-        .map_err(LiteLLMError::from)?;
+    let resp = req.send().await.map_err(LiteLLMError::from)?;
 
     let status = resp.status();
     let headers = resp.headers().clone();
@@ -144,10 +141,7 @@ where
                     return Ok((parsed, headers));
                 }
 
-                let text = response
-                    .text()
-                    .await
-                    .map_err(LiteLLMError::from)?;
+                let text = response.text().await.map_err(LiteLLMError::from)?;
 
                 // Check if this is a retryable error
                 if is_retryable_status(status) && attempt < retry_config.max_retries {

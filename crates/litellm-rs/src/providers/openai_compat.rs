@@ -191,10 +191,7 @@ pub async fn chat_stream(
         builder = builder.header(k, v);
     }
 
-    let resp = builder
-        .send()
-        .await
-        .map_err(LiteLLMError::from)?;
+    let resp = builder.send().await.map_err(LiteLLMError::from)?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.map_err(LiteLLMError::from)?;
@@ -445,9 +442,7 @@ fn map_usage(usage: Option<OpenAIUsage>) -> Usage {
     usage.map_or_else(Usage::default, |u| Usage {
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,
-        thoughts_tokens: u
-            .completion_tokens_details
-            .and_then(|d| d.reasoning_tokens),
+        thoughts_tokens: u.completion_tokens_details.and_then(|d| d.reasoning_tokens),
         total_tokens: u.total_tokens,
         cost_usd: parse_cost(u.cost.as_ref()),
     })

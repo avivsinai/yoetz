@@ -179,7 +179,7 @@ pub async fn video_generation_with_options(
 
         if op_resp.get("done").and_then(|v| v.as_bool()) == Some(true) {
             if op_resp.get("error").is_some() {
-        return Err(LiteLLMError::http("video generation failed"));
+                return Err(LiteLLMError::http("video generation failed"));
             }
 
             let uri = extract_video_uri(&op_resp)
@@ -227,18 +227,10 @@ fn extract_text(resp: &Value) -> String {
 fn parse_usage(resp: &Value) -> Usage {
     if let Some(meta) = resp.get("usageMetadata").and_then(|v| v.as_object()) {
         return Usage {
-            prompt_tokens: meta
-                .get("promptTokenCount")
-                .and_then(|v| v.as_u64()),
-            completion_tokens: meta
-                .get("candidatesTokenCount")
-                .and_then(|v| v.as_u64()),
-            thoughts_tokens: meta
-                .get("thoughtsTokenCount")
-                .and_then(|v| v.as_u64()),
-            total_tokens: meta
-                .get("totalTokenCount")
-                .and_then(|v| v.as_u64()),
+            prompt_tokens: meta.get("promptTokenCount").and_then(|v| v.as_u64()),
+            completion_tokens: meta.get("candidatesTokenCount").and_then(|v| v.as_u64()),
+            thoughts_tokens: meta.get("thoughtsTokenCount").and_then(|v| v.as_u64()),
+            total_tokens: meta.get("totalTokenCount").and_then(|v| v.as_u64()),
             cost_usd: None,
         };
     }
@@ -600,11 +592,7 @@ async fn fetch_bytes_with_mime(
     url: &str,
     format: Option<&str>,
 ) -> Result<(String, String)> {
-    let resp = client
-        .get(url)
-        .send()
-        .await
-        .map_err(LiteLLMError::from)?;
+    let resp = client.get(url).send().await.map_err(LiteLLMError::from)?;
     let headers = resp.headers().clone();
     let bytes = resp.bytes().await.map_err(LiteLLMError::from)?;
     let header_mime = headers

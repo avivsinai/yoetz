@@ -73,7 +73,9 @@ mod openai_compat_tests {
         };
 
         let req = simple_chat_request("gpt-4");
-        let resp = openai_compat::chat(&make_client(), &cfg, req).await.unwrap();
+        let resp = openai_compat::chat(&make_client(), &cfg, req)
+            .await
+            .unwrap();
 
         assert_eq!(resp.content, "Hello! How can I help you?");
         assert_eq!(resp.usage.prompt_tokens, Some(10));
@@ -113,7 +115,9 @@ mod openai_compat_tests {
         };
 
         let req = simple_chat_request("o1-preview");
-        let resp = openai_compat::chat(&make_client(), &cfg, req).await.unwrap();
+        let resp = openai_compat::chat(&make_client(), &cfg, req)
+            .await
+            .unwrap();
 
         assert_eq!(resp.usage.thoughts_tokens, Some(400));
     }
@@ -144,7 +148,9 @@ mod openai_compat_tests {
         };
 
         let req = simple_chat_request("gpt-4");
-        let resp = openai_compat::chat(&make_client(), &cfg, req).await.unwrap();
+        let resp = openai_compat::chat(&make_client(), &cfg, req)
+            .await
+            .unwrap();
 
         assert_eq!(resp.header_cost, Some(0.00123));
         assert_eq!(resp.usage.cost_usd, Some(0.00123));
@@ -178,7 +184,11 @@ mod openai_compat_tests {
             .unwrap_err();
 
         let err_str = err.to_string();
-        assert!(err_str.contains("401"), "Expected 401 in error: {}", err_str);
+        assert!(
+            err_str.contains("401"),
+            "Expected 401 in error: {}",
+            err_str
+        );
     }
 
     /// Verifies HTTP 429 rate limit error is surfaced correctly.
@@ -209,7 +219,11 @@ mod openai_compat_tests {
             .unwrap_err();
 
         let err_str = err.to_string();
-        assert!(err_str.contains("429"), "Expected 429 in error: {}", err_str);
+        assert!(
+            err_str.contains("429"),
+            "Expected 429 in error: {}",
+            err_str
+        );
         assert!(
             err_str.contains("Rate limit"),
             "Expected rate limit message: {}",
@@ -240,7 +254,11 @@ mod openai_compat_tests {
             .unwrap_err();
 
         let err_str = err.to_string();
-        assert!(err_str.contains("500"), "Expected 500 in error: {}", err_str);
+        assert!(
+            err_str.contains("500"),
+            "Expected 500 in error: {}",
+            err_str
+        );
     }
 
     /// Verifies missing base_url returns config error.
@@ -287,7 +305,9 @@ mod openai_compat_tests {
         };
 
         let req = simple_chat_request("gpt-4");
-        let resp = openai_compat::chat(&make_client(), &cfg, req).await.unwrap();
+        let resp = openai_compat::chat(&make_client(), &cfg, req)
+            .await
+            .unwrap();
 
         assert_eq!(resp.content, "");
     }
@@ -318,7 +338,9 @@ mod openai_compat_tests {
             .temperature(0.7)
             .max_tokens(100);
 
-        let resp = openai_compat::chat(&make_client(), &cfg, req).await.unwrap();
+        let resp = openai_compat::chat(&make_client(), &cfg, req)
+            .await
+            .unwrap();
         assert_eq!(resp.content, "response");
     }
 
@@ -349,7 +371,9 @@ mod openai_compat_tests {
         };
 
         let req = simple_chat_request("gpt-4");
-        let resp = openai_compat::chat(&make_client(), &cfg, req).await.unwrap();
+        let resp = openai_compat::chat(&make_client(), &cfg, req)
+            .await
+            .unwrap();
 
         assert_eq!(resp.content, "");
     }
@@ -464,7 +488,9 @@ mod anthropic_tests {
         };
 
         let req = simple_chat_request("claude-3-5-sonnet-20241022");
-        let err = anthropic::chat(&make_client(), &cfg, req).await.unwrap_err();
+        let err = anthropic::chat(&make_client(), &cfg, req)
+            .await
+            .unwrap_err();
 
         let err_str = err.to_string();
         assert!(
@@ -498,10 +524,16 @@ mod anthropic_tests {
         };
 
         let req = simple_chat_request("claude-3-5-sonnet-20241022");
-        let err = anthropic::chat(&make_client(), &cfg, req).await.unwrap_err();
+        let err = anthropic::chat(&make_client(), &cfg, req)
+            .await
+            .unwrap_err();
 
         let err_str = err.to_string();
-        assert!(err_str.contains("400"), "Expected 400 in error: {}", err_str);
+        assert!(
+            err_str.contains("400"),
+            "Expected 400 in error: {}",
+            err_str
+        );
     }
 
     /// Verifies unsupported role returns config error.
@@ -536,7 +568,9 @@ mod anthropic_tests {
             thinking: None,
         };
 
-        let err = anthropic::chat(&make_client(), &cfg, req).await.unwrap_err();
+        let err = anthropic::chat(&make_client(), &cfg, req)
+            .await
+            .unwrap_err();
 
         let err_str = err.to_string();
         assert!(
@@ -600,10 +634,16 @@ mod anthropic_tests {
         };
 
         let req = simple_chat_request("claude-3-5-sonnet-20241022");
-        let err = anthropic::chat(&make_client(), &cfg, req).await.unwrap_err();
+        let err = anthropic::chat(&make_client(), &cfg, req)
+            .await
+            .unwrap_err();
 
         let err_str = err.to_string();
-        assert!(err_str.contains("503"), "Expected 503 in error: {}", err_str);
+        assert!(
+            err_str.contains("503"),
+            "Expected 503 in error: {}",
+            err_str
+        );
     }
 }
 
@@ -863,7 +903,10 @@ mod video_generation_tests {
         // Should have polled at least twice (processing, then completed)
         assert!(poll_count.load(Ordering::SeqCst) >= 2);
         assert!(resp.video_url.is_some());
-        assert!(resp.video_url.unwrap().starts_with("data:video/mp4;base64,"));
+        assert!(resp
+            .video_url
+            .unwrap()
+            .starts_with("data:video/mp4;base64,"));
     }
 
     /// Verifies video generation fails after max poll attempts.

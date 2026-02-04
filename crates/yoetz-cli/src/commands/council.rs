@@ -90,11 +90,7 @@ pub(crate) async fn handle_council(
 
     let budget_enabled = args.max_cost_usd.is_some() || args.daily_budget_usd.is_some();
     let budget_reservation = if budget_enabled {
-        budget::ensure_budget(
-            total_estimate,
-            args.max_cost_usd,
-            args.daily_budget_usd,
-        )?
+        budget::ensure_budget(total_estimate, args.max_cost_usd, args.daily_budget_usd)?
     } else {
         None
     };

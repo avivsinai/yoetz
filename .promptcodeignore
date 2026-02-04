@@ -1,0 +1,27 @@
+# Generated prompts
+prompt.md
+prompt.txt
+
+# Lock files
+Cargo.lock
+package-lock.json
+yarn.lock
+
+# Large data files
+*.json
+!*.schema.json
+
+# Build artifacts
+/target/
+debug/
+release/
+
+# IDE
+.idea/
+.vscode/
+
+# Environment
+.env*
+
+# Logs
+*.log

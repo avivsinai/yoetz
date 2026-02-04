@@ -224,10 +224,7 @@ mod tests {
         // Simulate data coming in multiple network chunks
         let chunk1 = "data: {\"choices\":[{\"delta\":{\"con";
         let chunk2 = "tent\":\"Split\"}}]}\n\ndata: [DONE]\n\n";
-        let bytes_stream = stream::iter(vec![
-            Ok(Bytes::from(chunk1)),
-            Ok(Bytes::from(chunk2)),
-        ]);
+        let bytes_stream = stream::iter(vec![Ok(Bytes::from(chunk1)), Ok(Bytes::from(chunk2))]);
         let mut chat_stream = parse_sse_stream(bytes_stream);
 
         let chunk = chat_stream.next().await.unwrap().unwrap();

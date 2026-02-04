@@ -413,11 +413,12 @@ mod tests {
 
         let result = ensure_budget(Some(5.0), None, Some(10.0));
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("daily budget exceeded"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("daily budget exceeded"));
 
-        let reservation = ensure_budget(Some(1.0), None, Some(10.0))
-            .unwrap()
-            .unwrap();
+        let reservation = ensure_budget(Some(1.0), None, Some(10.0)).unwrap().unwrap();
         reservation.commit(1.0).unwrap();
 
         let ledger = load_ledger().unwrap();
@@ -437,9 +438,7 @@ mod tests {
         let budget_file = test_dir.join("budget.json");
         env::set_var("YOETZ_BUDGET_PATH", &budget_file);
 
-        let reservation = ensure_budget(Some(2.0), None, Some(10.0))
-            .unwrap()
-            .unwrap();
+        let reservation = ensure_budget(Some(2.0), None, Some(10.0)).unwrap().unwrap();
         drop(reservation);
 
         let ledger = load_ledger().unwrap();

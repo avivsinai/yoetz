@@ -131,13 +131,21 @@ struct AskArgs {
     #[arg(long, value_name = "PATH_OR_URL")]
     image: Vec<String>,
 
-    #[arg(long, value_name = "MIME", help = "Override MIME type for --image inputs (1 value or 1 per image)")]
+    #[arg(
+        long,
+        value_name = "MIME",
+        help = "Override MIME type for --image inputs (1 value or 1 per image)"
+    )]
     image_mime: Vec<String>,
 
     #[arg(long, value_name = "PATH_OR_URL")]
     video: Option<String>,
 
-    #[arg(long, value_name = "MIME", help = "Override MIME type for --video input")]
+    #[arg(
+        long,
+        value_name = "MIME",
+        help = "Override MIME type for --video input"
+    )]
     video_mime: Option<String>,
 
     #[arg(long, value_name = "json|text")]
@@ -313,7 +321,11 @@ struct GenerateImageArgs {
     #[arg(long, value_name = "PATH_OR_URL")]
     image: Vec<String>,
 
-    #[arg(long, value_name = "MIME", help = "Override MIME type for --image inputs (1 value or 1 per image)")]
+    #[arg(
+        long,
+        value_name = "MIME",
+        help = "Override MIME type for --image inputs (1 value or 1 per image)"
+    )]
     image_mime: Vec<String>,
 
     #[arg(long)]
@@ -352,7 +364,11 @@ struct GenerateVideoArgs {
     #[arg(long, value_name = "PATH_OR_URL")]
     image: Vec<String>,
 
-    #[arg(long, value_name = "MIME", help = "Override MIME type for --image inputs (1 value or 1 per image)")]
+    #[arg(
+        long,
+        value_name = "MIME",
+        help = "Override MIME type for --image inputs (1 value or 1 per image)"
+    )]
     image_mime: Vec<String>,
 
     #[arg(long)]
@@ -940,8 +956,7 @@ fn normalize_mime_overrides(
 }
 
 fn parse_media_input(value: &str, mime: Option<&str>, kind: MediaType) -> Result<MediaInput> {
-    if value.starts_with("http://") || value.starts_with("https://") || value.starts_with("gs://")
-    {
+    if value.starts_with("http://") || value.starts_with("https://") || value.starts_with("gs://") {
         return MediaInput::from_url_with_type(value, kind, mime);
     }
     let input = MediaInput::from_path_with_mime(PathBuf::from(value).as_path(), mime)?;

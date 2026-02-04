@@ -89,10 +89,7 @@ pub async fn chat_stream(
         builder = builder.header(k, v);
     }
 
-    let resp = builder
-        .send()
-        .await
-        .map_err(LiteLLMError::from)?;
+    let resp = builder.send().await.map_err(LiteLLMError::from)?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.map_err(LiteLLMError::from)?;
@@ -291,12 +288,8 @@ fn parse_usage(resp: &Value) -> Usage {
     let usage = resp.get("usage").and_then(|v| v.as_object());
     if let Some(u) = usage {
         return Usage {
-            prompt_tokens: u
-                .get("input_tokens")
-                .and_then(|v| v.as_u64()),
-            completion_tokens: u
-                .get("output_tokens")
-                .and_then(|v| v.as_u64()),
+            prompt_tokens: u.get("input_tokens").and_then(|v| v.as_u64()),
+            completion_tokens: u.get("output_tokens").and_then(|v| v.as_u64()),
             thoughts_tokens: None,
             total_tokens: None,
             cost_usd: None,
