@@ -44,6 +44,9 @@ Fast, agent-friendly LLM council tool for multi-model consensus, code review, an
 | Bundle files | `yoetz bundle -p "context" -f src/**/*.rs --format json` |
 | Generate image | `yoetz generate image -p "description" --provider openai --model gpt-image-1 --format json` |
 | Estimate cost | `yoetz pricing estimate --model gpt-5.2 --input-tokens 1000 --output-tokens 500` |
+| Browser login | `yoetz browser login` |
+| Browser check | `yoetz browser check` |
+| Browser cookie sync | `yoetz browser sync-cookies` |
 
 ## Council (Multi-Model Consensus)
 
@@ -119,7 +122,7 @@ yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle "$BUNDLE"
 
 ## Browser Fallback (Experimental)
 
-For web-only models like ChatGPT Pro that lack API access.
+For web-only models like ChatGPT Pro that lack API access. Uses Oracle-style cookie extraction from real Chrome to bypass Cloudflare challenges.
 
 ### Prerequisites
 
@@ -127,27 +130,52 @@ For web-only models like ChatGPT Pro that lack API access.
 # Install agent-browser globally
 npm install -g agent-browser
 
-# Or set path to local install
-export YOETZ_AGENT_BROWSER_BIN=/path/to/agent-browser
+# Install sweet-cookie for cookie extraction (Node >=22)
+npm install -g @steipete/sweet-cookie
 ```
 
-### First-time setup (one-time manual login)
+### Profile location
 
+Default profile dir: `~/.config/yoetz/browser-profile/`
+
+Override per machine:
 ```bash
-./scripts/setup-chatgpt-profile.sh
+export YOETZ_BROWSER_PROFILE=/path/to/profile
 ```
 
-Or manually:
+### First-time setup
+
+**Step 1: Log into ChatGPT in real Chrome**
+1. Open Chrome (the real browser, not Playwright)
+2. Navigate to https://chatgpt.com/
+3. Log in with your account
+4. Close Chrome completely
+
+**Step 2: Sync cookies to agent-browser**
 ```bash
-agent-browser --profile ~/.chatgpt-profile --headed open "https://chatgpt.com/"
-# Log in, then close browser
+yoetz browser sync-cookies
+```
+
+This extracts your authenticated cookies from Chrome and saves them for agent-browser.
+State file is stored at `~/.config/yoetz/browser-profile/state.json` (or your overridden profile path).
+
+**Step 3: Verify authentication**
+```bash
+yoetz browser check
+```
+
+### Re-sync when sessions expire
+
+If you see Cloudflare challenges or login prompts, re-sync:
+```bash
+# Log into ChatGPT in real Chrome, close Chrome, then:
+yoetz browser sync-cookies
+yoetz browser check
 ```
 
 ### Use ChatGPT Pro via recipe
 
 ```bash
-export AGENT_BROWSER_PROFILE=~/.chatgpt-profile
-
 # Create bundle and get bundle.md path
 BUNDLE=$(yoetz bundle -p "Review this code" -f src/*.rs --format json | jq -r .artifacts.bundle_md)
 
@@ -166,6 +194,14 @@ yoetz council -p "Review" -f src/*.rs \
 BUNDLE=$(yoetz bundle -p "Review" -f src/*.rs --format json | jq -r .artifacts.bundle_md)
 yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle "$BUNDLE"
 ```
+
+### How it works
+
+The browser module uses stealth techniques to avoid Cloudflare detection:
+- Extracts real cookies from Chrome's encrypted cookie store
+- Injects them into Playwright via `--state`
+- Uses realistic User-Agent headers
+- Disables automation detection flags (`--disable-blink-features=AutomationControlled`)
 
 ## Provider Configuration
 

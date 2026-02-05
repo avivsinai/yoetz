@@ -1,17 +1,36 @@
 name: chatgpt
-# Requires: AGENT_BROWSER_PROFILE=~/.chatgpt-profile (logged-in session)
-# First-time setup: agent-browser --profile ~/.chatgpt-profile --headed open https://chatgpt.com
-#                   Then log in manually and close the browser
+# Requires: yoetz browser sync-cookies (extracts cookies from Chrome)
+# Verifies auth with: yoetz browser check
+#
+# Uses Oracle-style cookie injection + stealth flags to bypass Cloudflare.
+# Model selection ensures we use GPT-5.2 Pro regardless of last-used model.
+
 steps:
+  # Open ChatGPT
   - action: open
     args: ["https://chatgpt.com/"]
   - sleep_ms: 3000
-  - action: snapshot
-    args: ["-i", "-c", "--json"]
+
+  # Select Pro model (don't rely on last-used model)
   - action: find
-    args: ["placeholder", "Ask anything", "fill", "{{bundle_text}}"]
+    args: ["label", "Model selector", "click"]
+  - sleep_ms: 1000
   - action: find
-    args: ["testid", "send-button", "click"]
-  - sleep_ms: 10000
+    args: ["testid", "model-switcher-gpt-5-2-pro", "click"]
+  - sleep_ms: 500
+
+  # Fill the prompt using ProseMirror editor selector
+  - action: fill
+    args: ["#prompt-textarea", "{{bundle_text}}"]
+  - sleep_ms: 500
+
+  # Send the message
+  - action: find
+    args: ["label", "Send prompt", "click"]
+
+  # Wait for response (extended thinking can take 30-60s)
+  - sleep_ms: 30000
+
+  # Capture final state
   - action: snapshot
-    args: ["-i", "-c", "--json"]
+    args: ["-c", "--json"]

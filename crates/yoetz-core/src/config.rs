@@ -19,6 +19,7 @@ pub struct Defaults {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub max_output_tokens: Option<usize>,
+    pub browser_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -132,6 +133,9 @@ fn merge_defaults(target: &mut Defaults, other: Defaults) {
     }
     if other.max_output_tokens.is_some() {
         target.max_output_tokens = other.max_output_tokens;
+    }
+    if other.browser_profile.is_some() {
+        target.browser_profile = other.browser_profile;
     }
 }
 

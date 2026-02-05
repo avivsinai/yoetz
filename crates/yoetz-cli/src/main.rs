@@ -8,7 +8,7 @@ use litellm_rs::{
     ProviderConfig as LiteProviderConfig, ProviderKind as LiteProviderKind,
 };
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
@@ -197,6 +197,10 @@ struct BrowserArgs {
 enum BrowserCommand {
     Exec(BrowserExecArgs),
     Recipe(BrowserRecipeArgs),
+    Login(BrowserLoginArgs),
+    Check(BrowserCheckArgs),
+    /// Sync cookies from Chrome to agent-browser (bypasses Cloudflare)
+    SyncCookies(BrowserSyncCookiesArgs),
 }
 
 #[derive(Args)]
@@ -212,6 +216,27 @@ struct BrowserRecipeArgs {
 
     #[arg(long)]
     bundle: Option<PathBuf>,
+
+    #[arg(long)]
+    profile: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct BrowserLoginArgs {
+    #[arg(long)]
+    profile: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct BrowserCheckArgs {
+    #[arg(long)]
+    profile: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct BrowserSyncCookiesArgs {
+    #[arg(long)]
+    profile: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -597,7 +622,7 @@ async fn main() -> Result<()> {
         Commands::Session(args) => handle_session(&ctx, args, format),
         Commands::Models(args) => commands::models::handle_models(&ctx, args, format).await,
         Commands::Pricing(args) => commands::pricing::handle_pricing(&ctx, args, format).await,
-        Commands::Browser(args) => handle_browser(args, format),
+        Commands::Browser(args) => handle_browser(&ctx, args, format),
         Commands::Council(args) => commands::council::handle_council(&ctx, args, format).await,
         Commands::Apply(args) => commands::apply::handle_apply(args),
         Commands::Review(args) => commands::review::handle_review(&ctx, args, format).await,
@@ -695,17 +720,142 @@ fn handle_session(ctx: &AppContext, args: SessionArgs, format: OutputFormat) -> 
     }
 }
 
-fn handle_browser(args: BrowserArgs, format: OutputFormat) -> Result<()> {
+fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> Result<()> {
     match args.command {
         BrowserCommand::Exec(exec) => {
-            let stdout = browser::run_agent_browser(exec.args, format)?;
+            let stdout = browser::run_agent_browser(exec.args, format, None)?;
             print!("{stdout}");
             Ok(())
+        }
+        BrowserCommand::Login(login_args) => {
+            let profile_dir =
+                browser::resolve_profile_dir(&ctx.config, login_args.profile.as_ref())?;
+            let mut used_cookie_sync = false;
+            let mut cookie_warnings = Vec::new();
+            let mut cookie_sync_error: Option<String> = None;
+            match browser::sync_cookies(&profile_dir) {
+                Ok((count, warnings)) => {
+                    used_cookie_sync = true;
+                    cookie_warnings = warnings;
+                    let _ = browser::maybe_load_state(&profile_dir, true);
+                    if browser::check_auth(&profile_dir).is_ok() {
+                        let payload = json!({
+                            "status": "ok",
+                            "profile": profile_dir.to_string_lossy(),
+                            "cookies_synced": true,
+                            "cookie_count": count,
+                            "warnings": cookie_warnings,
+                            "next": "Run `yoetz browser check` to verify authentication."
+                        });
+                        return match format {
+                            OutputFormat::Json => write_json(&payload),
+                            OutputFormat::Jsonl => write_jsonl("browser.login", &payload),
+                            OutputFormat::Text | OutputFormat::Markdown => {
+                                println!("Cookies synced from Chrome ({} cookies).", count);
+                                println!("Profile: {}", profile_dir.display());
+                                if !cookie_warnings.is_empty() {
+                                    eprintln!("Warnings: {}", cookie_warnings.join("; "));
+                                }
+                                println!("Next: yoetz browser check");
+                                Ok(())
+                            }
+                        };
+                    }
+                }
+                Err(err) => {
+                    cookie_sync_error = Some(err.to_string());
+                }
+            }
+
+            if used_cookie_sync {
+                eprintln!(
+                    "Cookie sync succeeded but auth check failed. Falling back to manual login."
+                );
+            } else if let Some(err) = cookie_sync_error.as_ref() {
+                eprintln!("Cookie sync failed: {err}");
+                eprintln!("Falling back to manual login.");
+            }
+            browser::login(&profile_dir)?;
+            let payload = json!({
+                "status": "ok",
+                "profile": profile_dir.to_string_lossy(),
+                "cookies_synced": used_cookie_sync,
+                "warnings": cookie_warnings,
+                "cookie_sync_error": cookie_sync_error,
+                "next": "Run `yoetz browser check` to verify authentication."
+            });
+            match format {
+                OutputFormat::Json => write_json(&payload),
+                OutputFormat::Jsonl => write_jsonl("browser.login", &payload),
+                OutputFormat::Text | OutputFormat::Markdown => {
+                    println!("Login complete. Profile saved at {}", profile_dir.display());
+                    println!("Next: yoetz browser check");
+                    Ok(())
+                }
+            }
+        }
+        BrowserCommand::Check(check_args) => {
+            let profile_dir =
+                browser::resolve_profile_dir(&ctx.config, check_args.profile.as_ref())?;
+            browser::check_auth(&profile_dir)?;
+            let payload = json!({
+                "status": "ok",
+                "profile": profile_dir.to_string_lossy(),
+            });
+            match format {
+                OutputFormat::Json => write_json(&payload),
+                OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
+                OutputFormat::Text | OutputFormat::Markdown => {
+                    println!("Browser profile authenticated: {}", profile_dir.display());
+                    Ok(())
+                }
+            }
+        }
+        BrowserCommand::SyncCookies(sync_args) => {
+            let profile_dir =
+                browser::resolve_profile_dir(&ctx.config, sync_args.profile.as_ref())?;
+            let (cookie_count, warnings) = browser::sync_cookies(&profile_dir)?;
+            let state_file = browser::state_file(&profile_dir);
+            let payload = json!({
+                "status": "ok",
+                "profile": profile_dir.to_string_lossy(),
+                "state_file": state_file.to_string_lossy(),
+                "cookie_count": cookie_count,
+                "warnings": warnings,
+            });
+            match format {
+                OutputFormat::Json => write_json(&payload),
+                OutputFormat::Jsonl => write_jsonl("browser.sync_cookies", &payload),
+                OutputFormat::Text | OutputFormat::Markdown => {
+                    println!(
+                        "Cookies synced ({} cookies) to: {}",
+                        cookie_count,
+                        state_file.display()
+                    );
+                    if !warnings.is_empty() {
+                        eprintln!("Warnings: {}", warnings.join("; "));
+                    }
+                    println!("Next: yoetz browser check");
+                    Ok(())
+                }
+            }
         }
         BrowserCommand::Recipe(recipe_args) => {
             let content = fs::read_to_string(&recipe_args.recipe)
                 .with_context(|| format!("read recipe {}", recipe_args.recipe.display()))?;
             let recipe: browser::Recipe = serde_yaml::from_str(&content)?;
+            let profile_dir =
+                browser::resolve_profile_dir(&ctx.config, recipe_args.profile.as_ref())?;
+            let recipe_name = recipe.name.as_deref().unwrap_or("");
+            let needs_auth = recipe_name.eq_ignore_ascii_case("chatgpt")
+                || recipe_args
+                    .recipe
+                    .to_string_lossy()
+                    .to_lowercase()
+                    .contains("chatgpt");
+            if needs_auth {
+                browser::check_auth(&profile_dir)?;
+            }
 
             let bundle_text = if let Some(path) = recipe_args.bundle.as_ref() {
                 Some(fs::read_to_string(path)?)
@@ -716,6 +866,8 @@ fn handle_browser(args: BrowserArgs, format: OutputFormat) -> Result<()> {
             let ctx = browser::RecipeContext {
                 bundle_path: recipe_args.bundle.map(|p| p.to_string_lossy().to_string()),
                 bundle_text,
+                profile_dir: Some(profile_dir),
+                use_stealth: needs_auth,
             };
 
             browser::run_recipe(recipe, ctx, format)
