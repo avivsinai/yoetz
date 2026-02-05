@@ -1,0 +1,8 @@
+#!/bin/bash
+# Portable wrapper for agent-browser
+# Prefers agent-browser in PATH, falls back to npm global install
+if command -v agent-browser &>/dev/null; then
+    exec agent-browser "$@"
+else
+    exec node "$(npm root -g)/agent-browser/bin/agent-browser.js" "$@"
+fi

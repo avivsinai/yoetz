@@ -1,16 +1,17 @@
 name: chatgpt
+# Requires: AGENT_BROWSER_PROFILE=~/.chatgpt-profile (logged-in session)
+# First-time setup: agent-browser --profile ~/.chatgpt-profile --headed open https://chatgpt.com
+#                   Then log in manually and close the browser
 steps:
   - action: open
     args: ["https://chatgpt.com/"]
-  - action: wait
-    args: ["--load", "domcontentloaded"]
+  - sleep_ms: 3000
   - action: snapshot
     args: ["-i", "-c", "--json"]
   - action: find
-    args: ["placeholder", "Message", "fill", "{{bundle_text}}"]
+    args: ["placeholder", "Ask anything", "fill", "{{bundle_text}}"]
   - action: find
     args: ["testid", "send-button", "click"]
-  - action: wait
-    args: ["--load", "networkidle"]
+  - sleep_ms: 10000
   - action: snapshot
     args: ["-i", "-c", "--json"]
