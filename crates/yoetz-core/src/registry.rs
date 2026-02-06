@@ -37,6 +37,7 @@ pub struct ModelCapability {
     pub web_search: Option<bool>,
 }
 
+/// In-memory model registry with pricing and capability data.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelRegistry {
     pub version: u32,

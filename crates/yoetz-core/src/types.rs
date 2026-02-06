@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use crate::media::MediaOutput;
 
+/// A collection of files bundled with a prompt for LLM context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bundle {
     pub prompt: String,
@@ -76,6 +77,7 @@ impl Usage {
     }
 }
 
+/// Result of a single LLM run (ask, council member, review).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunResult {
     pub id: String,

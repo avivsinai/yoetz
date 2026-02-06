@@ -6,6 +6,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::paths::home_dir;
+
+/// Top-level yoetz configuration loaded from TOML files.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
     pub defaults: Defaults,
@@ -13,6 +15,7 @@ pub struct Config {
     pub registry: RegistryConfig,
 }
 
+/// Default values for provider, model, and output settings.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Defaults {
     pub profile: Option<String>,
@@ -22,6 +25,7 @@ pub struct Defaults {
     pub browser_profile: Option<String>,
 }
 
+/// Configuration for a single LLM provider (base URL, API key, kind).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProviderConfig {
     pub base_url: Option<String>,
@@ -29,6 +33,7 @@ pub struct ProviderConfig {
     pub kind: Option<String>,
 }
 
+/// URLs and paths for model registry sources (OpenRouter, LiteLLM, org).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RegistryConfig {
     pub openrouter_models_url: Option<String>,
@@ -44,10 +49,12 @@ struct ConfigFile {
 }
 
 impl Config {
+    /// Load configuration by merging all config files in precedence order.
     pub fn load() -> Result<Self> {
         Self::load_with_profile(None)
     }
 
+    /// Load configuration with an optional profile overlay.
     pub fn load_with_profile(profile: Option<&str>) -> Result<Self> {
         let mut config = Config::default();
         for path in default_config_paths(profile) {

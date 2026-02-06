@@ -10,6 +10,7 @@ use time::{format_description::FormatItem, macros::format_description, OffsetDat
 static TS_FORMAT: &[FormatItem<'static>] =
     format_description!("[year][month][day]_[hour][minute][second]");
 
+/// Create a new timestamped session directory under `~/.yoetz/sessions/`.
 pub fn create_session_dir() -> Result<SessionInfo> {
     let base = session_base_dir();
     fs::create_dir_all(&base).with_context(|| format!("create sessions dir {}", base.display()))?;
