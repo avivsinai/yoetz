@@ -25,17 +25,22 @@ steps:
     args: ["document.querySelector('button[aria-label*=\"remove\"][aria-label*=\"Extended thinking\"]')?.click()"]
   - sleep_ms: 500
 
-  # Fill the prompt using ProseMirror editor selector
+  # Attach the bundle as a file (handles large codebases that exceed paste limits)
+  - action: upload
+    args: ["input[type=file]:not([id])", "{{bundle_path}}"]
+  - sleep_ms: 2000
+
+  # Add a short prompt referencing the attachment
   - action: fill
-    args: ["#prompt-textarea", "{{bundle_text}}"]
+    args: ["#prompt-textarea", "Review the attached file and provide your analysis."]
   - sleep_ms: 500
 
   # Send the message
   - action: find
     args: ["label", "Send prompt", "click"]
 
-  # Wait for response (without extended thinking, should be faster)
-  - sleep_ms: 45000
+  # Wait for response (file analysis may take longer with extended thinking)
+  - sleep_ms: 60000
 
   # Capture final state
   - action: snapshot

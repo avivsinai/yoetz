@@ -516,6 +516,9 @@ fn expand_step(
             .ok_or_else(|| anyhow!("bundle text requested but no bundle provided"))?;
         return expand_bundle_text_step(action, args, text, ctx);
     }
+    if args.iter().any(|s| s.contains("{{bundle_path}}")) && ctx.bundle_path.is_none() {
+        return Err(anyhow!("bundle path requested but no bundle provided"));
+    }
 
     let mut command = vec![action.to_string()];
     for arg in args {
