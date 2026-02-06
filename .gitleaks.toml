@@ -1,0 +1,95 @@
+# Gitleaks configuration for yoetz
+# Focus: AI provider API keys, OAuth tokens, browser state secrets
+#
+# Run with: gitleaks detect --config .gitleaks.toml
+# CI uses --baseline-path to avoid re-flagging known history.
+
+title = "yoetz gitleaks config"
+
+# -- AI Provider API Keys --
+
+[[rules]]
+id = "openai-api-key"
+description = "OpenAI API Key (project/service/admin)"
+regex = '''(?i)\b(sk-(?:proj-|svcacct-|admin-)[A-Za-z0-9_-]{20,})\b'''
+keywords = ["sk-proj-", "sk-svcacct-", "sk-admin-"]
+tags = ["ai", "openai"]
+
+[[rules]]
+id = "openai-api-key-legacy"
+description = "OpenAI API Key (legacy sk- format with T3BlbkFJ marker)"
+regex = '''\b(sk-[A-Za-z0-9]{20,}T3BlbkFJ[A-Za-z0-9]{20,})\b'''
+keywords = ["T3BlbkFJ"]
+tags = ["ai", "openai"]
+
+[[rules]]
+id = "anthropic-api-key"
+description = "Anthropic API Key"
+regex = '''\b(sk-ant-(?:api03|admin)-[A-Za-z0-9_-]{20,})\b'''
+keywords = ["sk-ant-"]
+tags = ["ai", "anthropic"]
+
+[[rules]]
+id = "gemini-api-key"
+description = "Google Gemini / AI Studio API Key"
+regex = '''\b(AIzaSy[A-Za-z0-9_-]{33,})\b'''
+keywords = ["AIzaSy"]
+tags = ["ai", "google", "gemini"]
+
+[[rules]]
+id = "openrouter-api-key"
+description = "OpenRouter API Key"
+regex = '''\b(sk-or-v1-[A-Za-z0-9]{20,})\b'''
+keywords = ["sk-or-"]
+tags = ["ai", "openrouter"]
+
+[[rules]]
+id = "xai-api-key"
+description = "xAI / Grok API Key"
+regex = '''\b(xai-[A-Za-z0-9_-]{20,})\b'''
+keywords = ["xai-"]
+tags = ["ai", "xai"]
+
+# -- OAuth / Session Tokens --
+
+[[rules]]
+id = "bearer-token-hardcoded"
+description = "Hardcoded bearer token in source"
+regex = '''(?i)(?:bearer|authorization)['":\s]+([A-Za-z0-9_-]{40,})'''
+keywords = ["bearer", "authorization"]
+tags = ["oauth", "token"]
+entropy = 3.5
+
+[[rules]]
+id = "chatgpt-session-token"
+description = "ChatGPT session or access token"
+regex = '''(?i)(?:access_token|session_token|__Secure-next-auth\.session-token)\s*[:=]\s*["']?([A-Za-z0-9._-]{40,})'''
+keywords = ["access_token", "session_token", "next-auth"]
+tags = ["chatgpt", "token"]
+
+# -- Browser State Files --
+
+[[rules]]
+id = "playwright-state-cookies"
+description = "Playwright storageState containing auth cookies"
+path = '''state\.json$'''
+regex = '''(?i)"value"\s*:\s*"([A-Za-z0-9%_/.+=-]{40,})"'''
+tags = ["browser", "cookies"]
+
+# -- Global Allowlist --
+
+[allowlist]
+description = "Files that reference key names but never contain real values"
+paths = [
+    '''\.lock$''',
+    '''Cargo\.lock$''',
+    '''target/''',
+    '''\.git/''',
+    # Docs reference env var names, not real keys
+    '''README\.md$''',
+    '''CLAUDE\.md$''',
+    '''SKILL\.md$''',
+    '''\.example\.''',
+    '''config\.example\.toml$''',
+    '''prompt\.md$''',
+]

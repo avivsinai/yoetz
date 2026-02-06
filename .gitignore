@@ -37,5 +37,9 @@ yoetz.toml
 # Session data
 sessions/
 
+# Browser state (contains auth cookies/tokens)
+state.json
+browser-profile/
+
 # OS files
 Thumbs.db
