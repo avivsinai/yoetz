@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/yoetz-core", "crates/yoetz-cli", "crates/litellm-rs"]
+members = ["crates/yoetz-core", "crates/yoetz-cli"]
 
 [workspace.package]
 version = "0.1.0"

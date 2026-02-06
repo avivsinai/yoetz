@@ -4,10 +4,11 @@ Fast CLI-first LLM council, bundler, and multimodal gateway for coding agents.
 
 ## Project Structure
 
-Rust workspace with three crates:
+Rust workspace with two crates:
 - `crates/yoetz-cli` - CLI binary (`yoetz`)
 - `crates/yoetz-core` - Core types, bundling, session management
-- `crates/litellm-rs` - Multi-provider LLM SDK (OpenAI, Anthropic, Gemini, OpenRouter, xAI)
+
+External dependency: [litellm-rs](https://github.com/avivsinai/litellm-rs) - Multi-provider LLM SDK
 
 ## Development
 
@@ -35,9 +36,9 @@ API keys via environment variables:
 
 Config file: `~/.config/yoetz/config.toml` (optional)
 
-## litellm-rs
+## litellm-rs (external)
 
-The `litellm-rs` crate provides unified access to multiple LLM providers:
+The [`litellm-rs`](https://github.com/avivsinai/litellm-rs) crate (separate repo) provides unified access to multiple LLM providers:
 - `LiteLLM::completion()` - Chat completions
 - `LiteLLM::embedding()` - Text embeddings
 - `LiteLLM::image_generation()` - Image generation

@@ -20,7 +20,7 @@ workspace = true
 
 [dependencies]
 yoetz-core = { path = "../yoetz-core" }
-litellm-rs = { path = "../litellm-rs" }
+litellm-rs = { git = "https://github.com/avivsinai/litellm-rs", branch = "main" }
 
 anyhow.workspace = true
 dotenvy.workspace = true
