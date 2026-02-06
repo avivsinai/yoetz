@@ -39,8 +39,27 @@ pub struct RecipeContext {
     pub headed: bool,
 }
 
-pub fn agent_browser_bin() -> String {
-    env::var("YOETZ_AGENT_BROWSER_BIN").unwrap_or_else(|_| "agent-browser".to_string())
+/// Returns (program, extra_prefix_args) for launching agent-browser.
+/// Checks YOETZ_AGENT_BROWSER_BIN env, then PATH, then falls back to npx.
+fn resolve_agent_browser() -> (String, Vec<String>) {
+    if let Ok(bin) = env::var("YOETZ_AGENT_BROWSER_BIN") {
+        return (bin, vec![]);
+    }
+    // Check if agent-browser is in PATH
+    if Command::new("agent-browser")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok()
+    {
+        return ("agent-browser".to_string(), vec![]);
+    }
+    // Fall back to npx (handles npm cache / npx-installed packages)
+    (
+        "npx".to_string(),
+        vec!["--yes".to_string(), "agent-browser".to_string()],
+    )
 }
 
 pub fn run_agent_browser(
@@ -48,7 +67,13 @@ pub fn run_agent_browser(
     format: OutputFormat,
     profile_dir: Option<&Path>,
 ) -> Result<String> {
-    run_agent_browser_with_options(args, format, profile_dir, /* use_stealth */ true, /* headed */ false)
+    run_agent_browser_with_options(
+        args,
+        format,
+        profile_dir,
+        /* use_stealth */ true,
+        /* headed */ false,
+    )
 }
 
 /// Run agent-browser with optional stealth mode and headed display
@@ -59,7 +84,8 @@ pub fn run_agent_browser_with_options(
     use_stealth: bool,
     headed: bool,
 ) -> Result<String> {
-    let mut cmd = Command::new(agent_browser_bin());
+    let (bin, prefix_args) = resolve_agent_browser();
+    let mut cmd = Command::new(&bin);
     let mut final_args = args;
 
     if headed && !final_args.iter().any(|a| a == "--headed") {
@@ -112,14 +138,25 @@ pub fn run_agent_browser_with_options(
         final_args.push("--json".to_string());
     }
 
+    let mut all_args = prefix_args;
+    all_args.extend(final_args);
+
     let output = cmd
-        .args(&final_args)
+        .args(&all_args)
         .output()
-        .with_context(|| "failed to run agent-browser")?;
+        .with_context(|| format!("failed to run agent-browser (via {bin})"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(anyhow!("agent-browser failed: {stderr}"));
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.is_empty() {
+            stderr.to_string()
+        } else if !stdout.is_empty() {
+            stdout.to_string()
+        } else {
+            format!("exit code {:?}", output.status.code())
+        };
+        return Err(anyhow!("agent-browser failed: {detail}"));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
@@ -237,17 +274,22 @@ pub fn login(profile_dir: &Path) -> Result<()> {
     fs::create_dir_all(profile_dir).with_context(|| format!("create {}", profile_dir.display()))?;
     // Close any existing daemon to ensure fresh options
     let _ = close_browser();
-    let args = vec![
-        "open".to_string(),
-        "https://chatgpt.com/".to_string(),
-    ];
-    let _ = run_agent_browser_with_options(args, OutputFormat::Text, Some(profile_dir), /* use_stealth */ true, /* headed */ true)?;
+    let args = vec!["open".to_string(), "https://chatgpt.com/".to_string()];
+    let _ = run_agent_browser_with_options(
+        args,
+        OutputFormat::Text,
+        Some(profile_dir),
+        /* use_stealth */ true,
+        /* headed */ true,
+    )?;
     Ok(())
 }
 
 /// Close the agent-browser daemon to ensure fresh options on next launch.
 pub fn close_browser() -> Result<()> {
-    let mut cmd = Command::new(agent_browser_bin());
+    let (bin, prefix_args) = resolve_agent_browser();
+    let mut cmd = Command::new(bin);
+    cmd.args(prefix_args);
     let _ = cmd.arg("close").output();
     // Give the daemon time to fully shutdown before starting new commands
     thread::sleep(Duration::from_millis(1000));

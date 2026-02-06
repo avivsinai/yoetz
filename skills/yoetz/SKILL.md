@@ -127,10 +127,8 @@ For web-only models like ChatGPT Pro that lack API access. Uses Oracle-style coo
 ### Prerequisites
 
 ```bash
-# Install agent-browser globally
-npm install -g agent-browser
-
-# Install sweet-cookie for cookie extraction (Node >=22)
+# Node >=22 required. agent-browser is auto-resolved via npx if not in PATH.
+# Install sweet-cookie for cookie extraction
 npm install -g @steipete/sweet-cookie
 ```
 
