@@ -1,8 +1,7 @@
 # Gitleaks configuration for yoetz
 # Focus: AI provider API keys, OAuth tokens, browser state secrets
 #
-# Run with: gitleaks detect --config .gitleaks.toml
-# CI uses --baseline-path to avoid re-flagging known history.
+# Run locally: gitleaks detect --config .gitleaks.toml
 
 title = "yoetz gitleaks config"
 

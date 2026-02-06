@@ -5,6 +5,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
 
@@ -39,27 +40,34 @@ pub struct RecipeContext {
     pub headed: bool,
 }
 
+/// Cached agent-browser resolution. Probed once per process, reused for all calls.
+static AGENT_BROWSER: OnceLock<(String, Vec<String>)> = OnceLock::new();
+
 /// Returns (program, extra_prefix_args) for launching agent-browser.
 /// Checks YOETZ_AGENT_BROWSER_BIN env, then PATH, then falls back to npx.
+/// Result is cached for the lifetime of the process.
 fn resolve_agent_browser() -> (String, Vec<String>) {
-    if let Ok(bin) = env::var("YOETZ_AGENT_BROWSER_BIN") {
-        return (bin, vec![]);
-    }
-    // Check if agent-browser is in PATH
-    if Command::new("agent-browser")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
-    {
-        return ("agent-browser".to_string(), vec![]);
-    }
-    // Fall back to npx (handles npm cache / npx-installed packages)
-    (
-        "npx".to_string(),
-        vec!["--yes".to_string(), "agent-browser".to_string()],
-    )
+    let cached = AGENT_BROWSER.get_or_init(|| {
+        if let Ok(bin) = env::var("YOETZ_AGENT_BROWSER_BIN") {
+            return (bin, vec![]);
+        }
+        // Check if agent-browser is in PATH
+        if Command::new("agent-browser")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+        {
+            return ("agent-browser".to_string(), vec![]);
+        }
+        // Fall back to npx (handles npm cache / npx-installed packages)
+        (
+            "npx".to_string(),
+            vec!["--yes".to_string(), "agent-browser".to_string()],
+        )
+    });
+    cached.clone()
 }
 
 pub fn run_agent_browser(

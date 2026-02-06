@@ -857,10 +857,17 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 browser::check_auth(&profile_dir, /* headed */ true)?;
             }
 
-            let bundle_text = if let Some(path) = recipe_args.bundle.as_ref() {
-                Some(fs::read_to_string(path)?)
-            } else {
-                None
+            // Only read bundle text if the recipe actually references it. Some recipes
+            // (e.g. ChatGPT file-upload flows) only need {{bundle_path}}.
+            let needs_bundle_text = recipe.steps.iter().any(|step| {
+                step.args
+                    .as_ref()
+                    .map(|args| args.iter().any(|a| a.contains("{{bundle_text}}")))
+                    .unwrap_or(false)
+            });
+            let bundle_text = match (needs_bundle_text, recipe_args.bundle.as_ref()) {
+                (true, Some(path)) => Some(fs::read_to_string(path)?),
+                _ => None,
             };
 
             let ctx = browser::RecipeContext {
