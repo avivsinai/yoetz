@@ -1,11 +1,17 @@
 # Gitleaks configuration for yoetz
-# Focus: AI provider API keys, OAuth tokens, browser state secrets
+# Extends the default gitleaks ruleset (AWS, GCP, private keys, JWTs, etc.)
+# and adds LLM provider-specific patterns on top.
 #
 # Run locally: gitleaks detect --config .gitleaks.toml
 
 title = "yoetz gitleaks config"
 
-# -- AI Provider API Keys --
+# Inherit all default rules (200+ patterns for generic secrets, cloud
+# provider keys, private keys, database connection strings, etc.)
+[extend]
+useDefault = true
+
+# -- LLM Provider API Keys (not in default ruleset) --
 
 [[rules]]
 id = "openai-api-key"
@@ -49,15 +55,7 @@ regex = '''\b(xai-[A-Za-z0-9_-]{20,})\b'''
 keywords = ["xai-"]
 tags = ["ai", "xai"]
 
-# -- OAuth / Session Tokens --
-
-[[rules]]
-id = "bearer-token-hardcoded"
-description = "Hardcoded bearer token in source"
-regex = '''(?i)(?:bearer|authorization)['":\s]+([A-Za-z0-9_-]{40,})'''
-keywords = ["bearer", "authorization"]
-tags = ["oauth", "token"]
-entropy = 3.5
+# -- Browser / Session Tokens --
 
 [[rules]]
 id = "chatgpt-session-token"
@@ -65,8 +63,6 @@ description = "ChatGPT session or access token"
 regex = '''(?i)(?:access_token|session_token|__Secure-next-auth\.session-token)\s*[:=]\s*["']?([A-Za-z0-9._-]{40,})'''
 keywords = ["access_token", "session_token", "next-auth"]
 tags = ["chatgpt", "token"]
-
-# -- Browser State Files --
 
 [[rules]]
 id = "playwright-state-cookies"
@@ -84,7 +80,6 @@ paths = [
     '''Cargo\.lock$''',
     '''target/''',
     '''\.git/''',
-    # Docs reference env var names, not real keys
     '''README\.md$''',
     '''CLAUDE\.md$''',
     '''SKILL\.md$''',
