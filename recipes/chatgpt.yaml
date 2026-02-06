@@ -19,6 +19,12 @@ steps:
     args: ["testid", "model-switcher-gpt-5-2-pro", "click"]
   - sleep_ms: 500
 
+  # Disable extended thinking for faster responses
+  # Only click if extended thinking is currently enabled (aria-label contains "remove")
+  - action: eval
+    args: ["document.querySelector('button[aria-label*=\"remove\"][aria-label*=\"Extended thinking\"]')?.click()"]
+  - sleep_ms: 500
+
   # Fill the prompt using ProseMirror editor selector
   - action: fill
     args: ["#prompt-textarea", "{{bundle_text}}"]
@@ -28,8 +34,8 @@ steps:
   - action: find
     args: ["label", "Send prompt", "click"]
 
-  # Wait for response (extended thinking can take 30-60s)
-  - sleep_ms: 30000
+  # Wait for response (without extended thinking, should be faster)
+  - sleep_ms: 45000
 
   # Capture final state
   - action: snapshot

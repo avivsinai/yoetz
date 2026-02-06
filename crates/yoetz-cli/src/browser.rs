@@ -36,6 +36,7 @@ pub struct RecipeContext {
     pub bundle_text: Option<String>,
     pub profile_dir: Option<PathBuf>,
     pub use_stealth: bool,
+    pub headed: bool,
 }
 
 pub fn agent_browser_bin() -> String {
@@ -47,18 +48,23 @@ pub fn run_agent_browser(
     format: OutputFormat,
     profile_dir: Option<&Path>,
 ) -> Result<String> {
-    run_agent_browser_with_options(args, format, profile_dir, true)
+    run_agent_browser_with_options(args, format, profile_dir, /* use_stealth */ true, /* headed */ false)
 }
 
-/// Run agent-browser with optional stealth mode
+/// Run agent-browser with optional stealth mode and headed display
 pub fn run_agent_browser_with_options(
     args: Vec<String>,
     format: OutputFormat,
     profile_dir: Option<&Path>,
     use_stealth: bool,
+    headed: bool,
 ) -> Result<String> {
     let mut cmd = Command::new(agent_browser_bin());
     let mut final_args = args;
+
+    if headed && !final_args.iter().any(|a| a == "--headed") {
+        final_args.insert(0, "--headed".to_string());
+    }
 
     if let Some(profile_dir) = profile_dir {
         let state_path = state_file(profile_dir);
@@ -155,6 +161,7 @@ pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> R
                 format,
                 ctx.profile_dir.as_deref(),
                 ctx.use_stealth,
+                ctx.headed,
             )?;
 
             if wants_json || wants_jsonl {
@@ -231,11 +238,10 @@ pub fn login(profile_dir: &Path) -> Result<()> {
     // Close any existing daemon to ensure fresh options
     let _ = close_browser();
     let args = vec![
-        "--headed".to_string(),
         "open".to_string(),
         "https://chatgpt.com/".to_string(),
     ];
-    let _ = run_agent_browser_with_options(args, OutputFormat::Text, Some(profile_dir), true)?;
+    let _ = run_agent_browser_with_options(args, OutputFormat::Text, Some(profile_dir), /* use_stealth */ true, /* headed */ true)?;
     Ok(())
 }
 
@@ -266,6 +272,7 @@ pub fn maybe_load_state(profile_dir: &Path, use_stealth: bool) -> Result<bool> {
         OutputFormat::Text,
         Some(profile_dir),
         use_stealth,
+        /* headed */ false,
     )?;
     Ok(true)
 }
@@ -371,7 +378,7 @@ fn find_extract_script() -> Result<PathBuf> {
     ))
 }
 
-pub fn check_auth(profile_dir: &Path) -> Result<()> {
+pub fn check_auth(profile_dir: &Path, headed: bool) -> Result<()> {
     if !profile_dir.exists() {
         return Err(anyhow!(
             "browser profile not found at {}. Run `yoetz browser login` to authenticate.",
@@ -385,7 +392,8 @@ pub fn check_auth(profile_dir: &Path) -> Result<()> {
         vec!["open".to_string(), "https://chatgpt.com/".to_string()],
         OutputFormat::Text,
         Some(profile_dir),
-        true,
+        /* use_stealth */ true,
+        headed,
     )?;
     thread::sleep(Duration::from_millis(2500));
     let snapshot = run_agent_browser_with_options(
@@ -397,7 +405,8 @@ pub fn check_auth(profile_dir: &Path) -> Result<()> {
         ],
         OutputFormat::Json,
         Some(profile_dir),
-        true,
+        /* use_stealth */ true,
+        headed,
     )?;
 
     if let Some(issue) = detect_auth_issue(&snapshot) {

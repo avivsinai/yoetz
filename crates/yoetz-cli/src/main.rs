@@ -738,7 +738,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     used_cookie_sync = true;
                     cookie_warnings = warnings;
                     let _ = browser::maybe_load_state(&profile_dir, true);
-                    if browser::check_auth(&profile_dir).is_ok() {
+                    if browser::check_auth(&profile_dir, /* headed */ false).is_ok() {
                         let payload = json!({
                             "status": "ok",
                             "profile": profile_dir.to_string_lossy(),
@@ -797,7 +797,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
         BrowserCommand::Check(check_args) => {
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.config, check_args.profile.as_ref())?;
-            browser::check_auth(&profile_dir)?;
+            browser::check_auth(&profile_dir, /* headed */ false)?;
             let payload = json!({
                 "status": "ok",
                 "profile": profile_dir.to_string_lossy(),
@@ -854,7 +854,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     .to_lowercase()
                     .contains("chatgpt");
             if needs_auth {
-                browser::check_auth(&profile_dir)?;
+                browser::check_auth(&profile_dir, /* headed */ true)?;
             }
 
             let bundle_text = if let Some(path) = recipe_args.bundle.as_ref() {
@@ -868,6 +868,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 bundle_text,
                 profile_dir: Some(profile_dir),
                 use_stealth: needs_auth,
+                headed: needs_auth,
             };
 
             browser::run_recipe(recipe, ctx, format)
