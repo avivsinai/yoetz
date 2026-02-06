@@ -79,6 +79,20 @@ async fn handle_generate_image(
                 .await?;
                 (result.outputs, result.usage)
             }
+            "gemini" => {
+                let auth = resolve_provider_auth(config, &provider)?;
+                let result = gemini::generate_images(
+                    &ctx.client,
+                    &auth,
+                    &prompt,
+                    &model,
+                    &images,
+                    args.n,
+                    &media_dir,
+                )
+                .await?;
+                (result.outputs, result.usage)
+            }
             _ => {
                 return Err(anyhow!(
                     "provider {provider} does not support image edits yet"
