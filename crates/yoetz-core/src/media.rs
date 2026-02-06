@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// Image or video media type.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum MediaType {
     Image,
@@ -19,6 +20,7 @@ pub enum MediaSource {
     FileApiId { id: String, provider: String },
 }
 
+/// A media file or URL to send to an LLM provider.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaInput {
     pub source: MediaSource,

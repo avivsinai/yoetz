@@ -6,7 +6,7 @@ Thank you for your interest in contributing to yoetz!
 
 ### Prerequisites
 
-- Rust 1.75+ (check with `rustc --version`)
+- Rust 1.88+ (check with `rustc --version`)
 - Git
 
 ### Getting Started

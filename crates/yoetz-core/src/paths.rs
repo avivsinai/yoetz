@@ -1,6 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
+/// Resolve the user's home directory (cross-platform).
 pub fn home_dir() -> Option<PathBuf> {
     if let Ok(home) = env::var("HOME") {
         return Some(PathBuf::from(home));

@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::io::{self, Write};
 use std::str::FromStr;
 
+/// Supported output formats for CLI results.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputFormat {
     Json,

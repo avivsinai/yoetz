@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::PathBuf;
 
+/// Options for building a file bundle for LLM context.
 #[derive(Debug, Clone)]
 pub struct BundleOptions {
     pub root: PathBuf,
@@ -32,6 +33,9 @@ impl Default for BundleOptions {
     }
 }
 
+/// Walk the filesystem and collect files into a [`Bundle`] for LLM context.
+///
+/// Respects `.gitignore`, include/exclude globs, and size limits.
 pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
     let mut override_builder = OverrideBuilder::new(&options.root);
     // OverrideBuilder uses whitelist semantics for positive patterns.
@@ -175,6 +179,7 @@ fn read_prefix_and_hash(
     Ok((prefix, hex::encode(digest), total))
 }
 
+/// Rough token count estimate (~4 chars per token).
 pub fn estimate_tokens(chars: usize) -> usize {
     // Rough heuristic: 4 chars per token.
     chars.div_ceil(4)
