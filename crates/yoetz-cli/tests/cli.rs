@@ -64,34 +64,22 @@ fn council_help() {
 
 #[test]
 fn review_help() {
-    yoetz()
-        .args(["review", "--help"])
-        .assert()
-        .success();
+    yoetz().args(["review", "--help"]).assert().success();
 }
 
 #[test]
 fn generate_help() {
-    yoetz()
-        .args(["generate", "--help"])
-        .assert()
-        .success();
+    yoetz().args(["generate", "--help"]).assert().success();
 }
 
 #[test]
 fn pricing_help() {
-    yoetz()
-        .args(["pricing", "--help"])
-        .assert()
-        .success();
+    yoetz().args(["pricing", "--help"]).assert().success();
 }
 
 #[test]
 fn status_runs() {
-    yoetz()
-        .arg("status")
-        .assert()
-        .success();
+    yoetz().arg("status").assert().success();
 }
 
 #[test]
