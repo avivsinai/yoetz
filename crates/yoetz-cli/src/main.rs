@@ -1454,7 +1454,12 @@ async fn save_image_outputs(
 ) -> Result<Vec<yoetz_core::media::MediaOutput>> {
     let mut outputs = Vec::new();
     for (idx, image) in images.into_iter().enumerate() {
-        let filename = format!("image_{idx}.png");
+        let ext = match image.mime_type.as_deref() {
+            Some("image/jpeg") => "jpg",
+            Some("image/webp") => "webp",
+            _ => "png",
+        };
+        let filename = format!("image_{idx}.{ext}");
         let path = output_dir.join(filename);
         if let Some(b64) = image.b64_json.as_ref() {
             let bytes = general_purpose::STANDARD

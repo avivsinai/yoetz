@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use base64::Engine as _;
 use std::fs;
 use std::path::PathBuf;
 
@@ -7,8 +8,8 @@ use crate::{
     build_model_spec, maybe_write_output, parse_media_inputs, resolve_prompt, usage_from_litellm,
     AppContext, GenerateArgs, GenerateCommand, GenerateImageArgs, GenerateVideoArgs,
 };
-use litellm_rs::ImageRequest;
-use yoetz_core::media::MediaType;
+use litellm_rs::{ImageEditRequest, ImageInputData, ImageRequest};
+use yoetz_core::media::{MediaSource, MediaType};
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::session::{create_session_dir, write_json as write_json_file};
 use yoetz_core::types::{ArtifactPaths, MediaGenerationResult, Usage};
@@ -80,18 +81,24 @@ async fn handle_generate_image(
                 (result.outputs, result.usage)
             }
             "gemini" => {
-                let auth = resolve_provider_auth(config, &provider)?;
-                let result = gemini::generate_images(
-                    &ctx.client,
-                    &auth,
-                    &prompt,
-                    &model,
-                    &images,
-                    args.n,
-                    &media_dir,
-                )
-                .await?;
-                (result.outputs, result.usage)
+                let model_spec = build_model_spec(Some(&provider), &model)?;
+                let input_images = images
+                    .iter()
+                    .map(media_input_to_image_input_data)
+                    .collect::<Result<Vec<_>>>()?;
+                let resp = ctx
+                    .litellm
+                    .image_editing(ImageEditRequest {
+                        model: model_spec,
+                        prompt: prompt.clone(),
+                        images: input_images,
+                        n: Some(args.n as u32),
+                        size: args.size.clone(),
+                    })
+                    .await?;
+                let outputs =
+                    crate::save_image_outputs(&ctx.client, resp.images, &media_dir, &model).await?;
+                (outputs, usage_from_litellm(resp.usage))
             }
             _ => {
                 return Err(anyhow!(
@@ -142,6 +149,37 @@ async fn handle_generate_image(
             }
             Ok(())
         }
+    }
+}
+
+fn media_input_to_image_input_data(
+    media: &yoetz_core::media::MediaInput,
+) -> Result<ImageInputData> {
+    match &media.source {
+        MediaSource::Base64 { data, mime } => Ok(ImageInputData {
+            b64_json: Some(data.clone()),
+            url: None,
+            mime_type: Some(mime.clone()),
+        }),
+        MediaSource::Url(url) => Ok(ImageInputData {
+            b64_json: None,
+            url: Some(url.clone()),
+            mime_type: Some(media.mime_type.clone()),
+        }),
+        MediaSource::File(path) => {
+            let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
+            let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+            Ok(ImageInputData {
+                b64_json: Some(b64),
+                url: None,
+                mime_type: Some(media.mime_type.clone()),
+            })
+        }
+        MediaSource::FileApiId { id, .. } => Ok(ImageInputData {
+            b64_json: None,
+            url: Some(id.clone()),
+            mime_type: Some(media.mime_type.clone()),
+        }),
     }
 }
 

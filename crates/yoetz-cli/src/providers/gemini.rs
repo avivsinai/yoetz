@@ -11,11 +11,6 @@ use yoetz_core::types::Usage;
 use crate::http::send_json;
 use crate::providers::ProviderAuth;
 
-pub struct ImageEditResult {
-    pub outputs: Vec<MediaOutput>,
-    pub usage: Usage,
-}
-
 const INLINE_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
@@ -72,99 +67,6 @@ pub async fn generate_content(
         usage: parse_usage(&resp),
         raw: resp,
     })
-}
-
-pub async fn generate_images(
-    client: &Client,
-    auth: &ProviderAuth,
-    prompt: &str,
-    model: &str,
-    images: &[MediaInput],
-    _n: usize,
-    output_dir: &Path,
-) -> Result<ImageEditResult> {
-    let model = model.trim_start_matches("models/");
-    let mut parts = Vec::with_capacity(images.len() + 1);
-    parts.push(serde_json::json!({ "text": prompt }));
-    for image in images {
-        parts.push(media_part(client, auth, image).await?);
-    }
-
-    let body = serde_json::json!({
-        "contents": [{ "role": "user", "parts": parts }],
-        "generationConfig": {
-            "response_modalities": ["IMAGE", "TEXT"],
-        }
-    });
-
-    let url = format!(
-        "{}/models/{}:generateContent",
-        auth.base_url.trim_end_matches('/'),
-        model
-    );
-
-    let (resp, _headers) = send_json::<Value>(
-        client
-            .post(url)
-            .header("x-goog-api-key", &auth.api_key)
-            .json(&body),
-    )
-    .await?;
-
-    let usage = parse_usage(&resp);
-    let mut outputs = Vec::new();
-
-    if let Some(candidates) = resp.get("candidates").and_then(|v| v.as_array()) {
-        let mut idx = 0usize;
-        for candidate in candidates {
-            if let Some(parts) = candidate
-                .get("content")
-                .and_then(|v| v.get("parts"))
-                .and_then(|v| v.as_array())
-            {
-                for part in parts {
-                    if let Some(data) = part
-                        .get("inlineData")
-                        .and_then(|v| v.get("data"))
-                        .and_then(|v| v.as_str())
-                    {
-                        let mime = part
-                            .get("inlineData")
-                            .and_then(|v| v.get("mimeType"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("image/png");
-                        let ext = match mime {
-                            "image/jpeg" => "jpg",
-                            "image/webp" => "webp",
-                            _ => "png",
-                        };
-                        let filename = format!("image_{idx}.{ext}");
-                        let path = output_dir.join(&filename);
-                        let bytes = general_purpose::STANDARD
-                            .decode(data.as_bytes())
-                            .context("decode image base64")?;
-                        std::fs::write(&path, bytes)
-                            .with_context(|| format!("write {}", path.display()))?;
-                        outputs.push(MediaOutput {
-                            media_type: MediaType::Image,
-                            path,
-                            url: None,
-                            metadata: MediaMetadata {
-                                width: None,
-                                height: None,
-                                duration_secs: None,
-                                model: model.to_string(),
-                                revised_prompt: None,
-                            },
-                        });
-                        idx += 1;
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(ImageEditResult { outputs, usage })
 }
 
 pub async fn generate_video_veo(
