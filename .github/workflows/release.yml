@@ -27,7 +27,7 @@ jobs:
             artifact: yoetz
             cross: true
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-13
             artifact: yoetz
           - target: aarch64-apple-darwin
             os: macos-14
@@ -102,3 +102,136 @@ jobs:
             artifacts/SHA256SUMS.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-homebrew:
+    name: Update Homebrew Formula
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Update formula
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
+
+          SHA_X86_MAC=$(sha256sum artifacts/yoetz-x86_64-apple-darwin.tar.gz | awk '{print $1}')
+          SHA_ARM_MAC=$(sha256sum artifacts/yoetz-aarch64-apple-darwin.tar.gz | awk '{print $1}')
+          SHA_X86_LINUX=$(sha256sum artifacts/yoetz-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')
+          SHA_ARM_LINUX=$(sha256sum artifacts/yoetz-aarch64-unknown-linux-gnu.tar.gz | awk '{print $1}')
+
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/avivsinai/homebrew-tap.git" tap
+
+          cat > tap/Formula/yoetz.rb <<RUBY
+          # typed: false
+          # frozen_string_literal: true
+
+          class Yoetz < Formula
+            desc "Fast CLI-first LLM council, bundler, and multimodal gateway for coding agents"
+            homepage "https://github.com/avivsinai/yoetz"
+            version "${VERSION}"
+            license "MIT"
+
+            on_macos do
+              if Hardware::CPU.intel?
+                url "https://github.com/avivsinai/yoetz/releases/download/${TAG}/yoetz-x86_64-apple-darwin.tar.gz"
+                sha256 "${SHA_X86_MAC}"
+
+                def install
+                  bin.install "yoetz"
+                end
+              end
+              if Hardware::CPU.arm?
+                url "https://github.com/avivsinai/yoetz/releases/download/${TAG}/yoetz-aarch64-apple-darwin.tar.gz"
+                sha256 "${SHA_ARM_MAC}"
+
+                def install
+                  bin.install "yoetz"
+                end
+              end
+            end
+
+            on_linux do
+              if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
+                url "https://github.com/avivsinai/yoetz/releases/download/${TAG}/yoetz-x86_64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_X86_LINUX}"
+
+                def install
+                  bin.install "yoetz"
+                end
+              end
+              if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
+                url "https://github.com/avivsinai/yoetz/releases/download/${TAG}/yoetz-aarch64-unknown-linux-gnu.tar.gz"
+                sha256 "${SHA_ARM_LINUX}"
+
+                def install
+                  bin.install "yoetz"
+                end
+              end
+            end
+
+            test do
+              system "#{bin}/yoetz", "--version"
+            end
+          end
+          RUBY
+
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/yoetz.rb
+          git commit -m "yoetz ${TAG}"
+          git push
+
+  update-scoop:
+    name: Update Scoop Manifest
+    needs: release
+    runs-on: ubuntu-latest
+    if: ${{ !contains(github.ref_name, '-') }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Update manifest
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          TAG="${GITHUB_REF_NAME}"
+
+          SHA_WIN=$(sha256sum artifacts/yoetz-x86_64-pc-windows-msvc.zip | awk '{print $1}')
+
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/avivsinai/scoop-bucket.git" bucket
+
+          cat > bucket/bucket/yoetz.json <<EOF
+          {
+              "version": "${VERSION}",
+              "architecture": {
+                  "64bit": {
+                      "url": "https://github.com/avivsinai/yoetz/releases/download/${TAG}/yoetz-x86_64-pc-windows-msvc.zip",
+                      "bin": [
+                          "yoetz.exe"
+                      ],
+                      "hash": "${SHA_WIN}"
+                  }
+              },
+              "homepage": "https://github.com/avivsinai/yoetz",
+              "license": "MIT",
+              "description": "Fast CLI-first LLM council, bundler, and multimodal gateway for coding agents"
+          }
+          EOF
+
+          cd bucket
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add bucket/yoetz.json
+          git commit -m "yoetz ${TAG}"
+          git push
