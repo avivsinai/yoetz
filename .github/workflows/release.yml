@@ -116,7 +116,7 @@ jobs:
 
       - name: Update formula
         env:
-          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           TAG="${GITHUB_REF_NAME}"
@@ -126,7 +126,7 @@ jobs:
           SHA_X86_LINUX=$(sha256sum artifacts/yoetz-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')
           SHA_ARM_LINUX=$(sha256sum artifacts/yoetz-aarch64-unknown-linux-gnu.tar.gz | awk '{print $1}')
 
-          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/avivsinai/homebrew-tap.git" tap
+          git clone "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/avivsinai/homebrew-tap.git" tap
 
           cat > tap/Formula/yoetz.rb <<RUBY
           # typed: false
@@ -202,14 +202,14 @@ jobs:
 
       - name: Update manifest
         env:
-          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           TAG="${GITHUB_REF_NAME}"
 
           SHA_WIN=$(sha256sum artifacts/yoetz-x86_64-pc-windows-msvc.zip | awk '{print $1}')
 
-          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/avivsinai/scoop-bucket.git" bucket
+          git clone "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/avivsinai/scoop-bucket.git" bucket
 
           cat > bucket/bucket/yoetz.json <<EOF
           {
