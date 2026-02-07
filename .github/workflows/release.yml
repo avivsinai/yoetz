@@ -4,9 +4,19 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release (e.g., v0.2.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,6 +25,7 @@ jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +48,9 @@ jobs:
             artifact: yoetz.exe
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -71,7 +84,7 @@ jobs:
         run: |
           Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -DestinationPath "yoetz-${{ matrix.target }}.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: yoetz-${{ matrix.target }}
           path: yoetz-${{ matrix.target }}.*
@@ -80,10 +93,11 @@ jobs:
     name: Create Release
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           path: artifacts
           merge-multiple: true
@@ -107,9 +121,10 @@ jobs:
     name: Update Homebrew Formula
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: ${{ !contains(github.ref_name, '-') }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           path: artifacts
           merge-multiple: true
@@ -193,9 +208,10 @@ jobs:
     name: Update Scoop Manifest
     needs: release
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: ${{ !contains(github.ref_name, '-') }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v6
         with:
           path: artifacts
           merge-multiple: true
