@@ -1,7 +1,7 @@
 <file_tree>
 yoetz/
 ├── crates/
-│   ├── litellm-rs/
+│   ├── litellm-rust/
 │   │   ├── src/
 │   │   │   ├── client.rs
 │   │   │   ├── lib.rs
@@ -49,7 +49,7 @@ File: Cargo.toml (424 tokens)
 ```
 [workspace]
 resolver = "2"
-members = ["crates/yoetz-core", "crates/yoetz-cli", "crates/litellm-rs"]
+members = ["crates/yoetz-core", "crates/yoetz-cli", "crates/litellm-rust"]
 
 [workspace.package]
 version = "0.1.0"
@@ -105,10 +105,10 @@ opt-level = 3
 
 ```
 
-File: crates/litellm-rs/Cargo.toml (188 tokens)
+File: crates/litellm-rust/Cargo.toml (188 tokens)
 ```
 [package]
-name = "litellm-rs"
+name = "litellm-rust"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
@@ -132,7 +132,7 @@ serde_json = { workspace = true }
 
 ```
 
-File: crates/litellm-rs/src/client.rs (1047 tokens)
+File: crates/litellm-rust/src/client.rs (1047 tokens)
 ```
 use crate::config::{Config, ProviderConfig, ProviderKind};
 use crate::error::{LiteLLMError, Result};
@@ -269,7 +269,7 @@ async fn dispatch_chat(
 
 ```
 
-File: crates/litellm-rs/src/lib.rs (78 tokens)
+File: crates/litellm-rust/src/lib.rs (78 tokens)
 ```
 pub mod client;
 pub mod config;
@@ -288,7 +288,7 @@ pub use types::*;
 
 ```
 
-File: crates/litellm-rs/src/stream.rs (861 tokens)
+File: crates/litellm-rust/src/stream.rs (861 tokens)
 ```
 use crate::error::{LiteLLMError, Result};
 use bytes::Bytes;
@@ -405,7 +405,7 @@ where
 
 ```
 
-File: crates/litellm-rs/src/types.rs (1538 tokens)
+File: crates/litellm-rust/src/types.rs (1538 tokens)
 ```
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -693,7 +693,7 @@ workspace = true
 
 [dependencies]
 yoetz-core = { path = "../yoetz-core" }
-litellm-rs = { path = "../litellm-rs" }
+litellm-rust = { path = "../litellm-rust" }
 
 anyhow.workspace = true
 dotenvy.workspace = true
@@ -1771,7 +1771,7 @@ use crate::{
     build_model_spec, maybe_write_output, parse_media_inputs, resolve_prompt, usage_from_litellm,
     AppContext, GenerateArgs, GenerateCommand, GenerateImageArgs, GenerateVideoArgs,
 };
-use litellm_rs::ImageRequest;
+use litellm_rust::ImageRequest;
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::session::{create_session_dir, write_json as write_json_file};
 use yoetz_core::types::{ArtifactPaths, MediaGenerationResult, Usage};
@@ -2445,7 +2445,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use jsonschema::JSONSchema;
-use litellm_rs::{
+use litellm_rust::{
     ChatContentPart, ChatContentPartFile, ChatContentPartImageUrl, ChatContentPartText, ChatFile,
     ChatImageUrl, ChatMessageContent, ChatRequest, ImageData, LiteLLM,
     ProviderConfig as LiteProviderConfig, ProviderKind as LiteProviderKind,
@@ -3581,7 +3581,7 @@ fn resolve_registry_model_id(
     candidates.into_iter().next()
 }
 
-fn usage_from_litellm(usage: litellm_rs::Usage) -> Usage {
+fn usage_from_litellm(usage: litellm_rust::Usage) -> Usage {
     Usage {
         input_tokens: usage.prompt_tokens.map(|v| v as usize),
         output_tokens: usage.completion_tokens.map(|v| v as usize),
@@ -4861,7 +4861,7 @@ use std::path::{Path, PathBuf};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::http::send_json;
-use litellm_rs::registry::Registry as EmbeddedRegistry;
+use litellm_rust::registry::Registry as EmbeddedRegistry;
 use yoetz_core::config::Config;
 use yoetz_core::registry::{ModelCapability, ModelEntry, ModelPricing, ModelRegistry};
 
@@ -6261,7 +6261,7 @@ yoetz/
 │   │   ├── config.rs     # TOML config loading + profiles
 │   │   ├── media.rs      # Media types for multimodal
 │   │   └── types.rs      # Shared types
-│   ├── litellm-rs/       # LiteLLM-style SDK (library only)
+│   ├── litellm-rust/       # LiteLLM-style SDK (library only)
 │   └── yoetz-cli/        # CLI binary
 │       ├── main.rs       # Command handlers
 │       ├── providers/    # OpenAI, Gemini implementations

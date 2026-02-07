@@ -50,9 +50,9 @@ yoetz/
 
 ### Provider Abstraction
 
-Rather than a trait-based provider abstraction, yoetz uses [litellm-rs](https://github.com/avivsinai/litellm-rs) as its unified LLM SDK. litellm-rs handles provider-specific API differences (auth, endpoints, request/response formats) behind a single `LiteLLM::completion()` interface.
+Rather than a trait-based provider abstraction, yoetz uses [litellm-rust](https://github.com/avivsinai/litellm-rust) as its unified LLM SDK. litellm-rust handles provider-specific API differences (auth, endpoints, request/response formats) behind a single `LiteLLM::completion()` interface.
 
-Provider-specific code in `providers/` exists only for features not yet in litellm-rs (e.g., Gemini video generation, OpenAI image generation with specific parameters).
+Provider-specific code in `providers/` exists only for features not yet in litellm-rust (e.g., Gemini video generation, OpenAI image generation with specific parameters).
 
 ### Model Routing
 
@@ -88,7 +88,7 @@ User Input (prompt + files)
     │
     ├─ budget.rs: estimate cost, check daily budget
     │
-    ├─ litellm-rs: send request to provider API
+    ├─ litellm-rust: send request to provider API
     │   ├─ OpenAI / OpenRouter
     │   ├─ Gemini
     │   └─ LiteLLM proxy

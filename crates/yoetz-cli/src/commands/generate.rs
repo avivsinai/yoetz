@@ -8,7 +8,7 @@ use crate::{
     build_model_spec, maybe_write_output, parse_media_inputs, resolve_prompt, usage_from_litellm,
     AppContext, GenerateArgs, GenerateCommand, GenerateImageArgs, GenerateVideoArgs,
 };
-use litellm_rs::{ImageEditRequest, ImageInputData, ImageRequest};
+use litellm_rust::{ImageEditRequest, ImageInputData, ImageRequest};
 use yoetz_core::media::{MediaSource, MediaType};
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::session::{create_session_dir, write_json as write_json_file};

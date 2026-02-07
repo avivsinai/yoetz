@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand};
 use jsonschema::JSONSchema;
-use litellm_rs::{
+use litellm_rust::{
     ChatContentPart, ChatContentPartFile, ChatContentPartImageUrl, ChatContentPartText, ChatFile,
     ChatImageUrl, ChatMessageContent, ChatRequest, ImageData, LiteLLM,
     ProviderConfig as LiteProviderConfig, ProviderKind as LiteProviderKind,
@@ -1360,10 +1360,10 @@ fn resolve_registry_model_id(
     candidates.into_iter().next()
 }
 
-/// Convert litellm_rs::Usage to yoetz_core::types::Usage.
+/// Convert litellm_rust::Usage to yoetz_core::types::Usage.
 ///
 /// Both types now use u64 for token counts, so this is a straightforward mapping.
-fn usage_from_litellm(usage: litellm_rs::Usage) -> Usage {
+fn usage_from_litellm(usage: litellm_rust::Usage) -> Usage {
     Usage {
         input_tokens: usage.prompt_tokens,
         output_tokens: usage.completion_tokens,

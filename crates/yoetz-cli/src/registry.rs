@@ -9,7 +9,7 @@ use tempfile::NamedTempFile;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::http::send_json;
-use litellm_rs::registry::Registry as EmbeddedRegistry;
+use litellm_rust::registry::Registry as EmbeddedRegistry;
 use yoetz_core::config::Config;
 use yoetz_core::paths::home_dir;
 use yoetz_core::registry::{ModelCapability, ModelEntry, ModelPricing, ModelRegistry};

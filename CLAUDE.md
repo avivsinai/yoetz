@@ -8,7 +8,7 @@ Rust workspace with two crates:
 - `crates/yoetz-cli` - CLI binary (`yoetz`)
 - `crates/yoetz-core` - Core types, bundling, session management
 
-External dependency: [litellm-rs](https://github.com/avivsinai/litellm-rs) - Multi-provider LLM SDK
+External dependency: [litellm-rust](https://github.com/avivsinai/litellm-rust) - Multi-provider LLM SDK
 
 ## Development
 
@@ -36,9 +36,9 @@ API keys via environment variables:
 
 Config file: `~/.config/yoetz/config.toml` (optional)
 
-## litellm-rs (external)
+## litellm-rust (external)
 
-The [`litellm-rs`](https://github.com/avivsinai/litellm-rs) crate (separate repo) provides unified access to multiple LLM providers:
+The [`litellm-rust`](https://github.com/avivsinai/litellm-rust) crate (separate repo) provides unified access to multiple LLM providers:
 - `LiteLLM::completion()` - Chat completions
 - `LiteLLM::embedding()` - Text embeddings
 - `LiteLLM::image_generation()` - Image generation

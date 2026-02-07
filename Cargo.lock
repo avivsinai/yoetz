@@ -1015,8 +1015,8 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 
 [[package]]
 name = "litellm-rust"
-version = "0.1.0"
-source = "git+https://github.com/avivsinai/litellm-rust?branch=main#a61bd9ffb635fa3792b7c9d9616226eb52e6bca8"
+version = "0.1.1"
+source = "git+https://github.com/avivsinai/litellm-rust?branch=main#c6c7553afc30cc30d9c8aa051edc9bfd14e689f7"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2403,7 +2403,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
