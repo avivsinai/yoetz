@@ -19,6 +19,19 @@ Fast, CLI-first LLM council + bundler + multimodal gateway for coding agents.
 
 ## Installation
 
+### Homebrew (macOS / Linux)
+
+```bash
+brew install avivsinai/tap/yoetz
+```
+
+### Scoop (Windows)
+
+```powershell
+scoop bucket add avivsinai https://github.com/avivsinai/scoop-bucket
+scoop install yoetz
+```
+
 ### Pre-built Binaries
 
 Download the latest release from [GitHub Releases](https://github.com/avivsinai/yoetz/releases).
