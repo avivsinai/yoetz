@@ -19,6 +19,32 @@ Fast, CLI-first LLM council + bundler + multimodal gateway for coding agents.
 
 ## Installation
 
+### Pre-built Binaries
+
+Download the latest release from [GitHub Releases](https://github.com/avivsinai/yoetz/releases).
+
+```bash
+# macOS (Apple Silicon)
+curl -LO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-aarch64-apple-darwin.tar.gz
+tar xzf yoetz-aarch64-apple-darwin.tar.gz
+sudo mv yoetz /usr/local/bin/
+
+# macOS (Intel)
+curl -LO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-x86_64-apple-darwin.tar.gz
+tar xzf yoetz-x86_64-apple-darwin.tar.gz
+sudo mv yoetz /usr/local/bin/
+
+# Linux (x86_64)
+curl -LO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-x86_64-unknown-linux-gnu.tar.gz
+tar xzf yoetz-x86_64-unknown-linux-gnu.tar.gz
+sudo mv yoetz /usr/local/bin/
+
+# Linux (ARM64)
+curl -LO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-aarch64-unknown-linux-gnu.tar.gz
+tar xzf yoetz-aarch64-unknown-linux-gnu.tar.gz
+sudo mv yoetz /usr/local/bin/
+```
+
 ### From Source
 
 ```bash
@@ -31,6 +57,20 @@ cargo install --git https://github.com/avivsinai/yoetz
 git clone https://github.com/avivsinai/yoetz.git
 cd yoetz
 cargo build --release
+```
+
+### Agent Skill (Claude Code / Codex CLI)
+
+```bash
+# Via skills marketplace
+/plugin marketplace add avivsinai/skills-marketplace
+/plugin install yoetz@avivsinai-marketplace
+
+# Via skills.sh
+npx skills add avivsinai/yoetz
+
+# Via skild.sh
+npx skild install @avivsinai/yoetz
 ```
 
 ## Quick Start
@@ -119,6 +159,8 @@ yoetz --format json browser recipe --recipe recipes/chatgpt.yaml --bundle bundle
 
 ## Architecture
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for design details.
+
 ```
 yoetz/
 ├── crates/
@@ -140,10 +182,10 @@ yoetz/
 
 | Provider | Text | Vision | Image Gen | Video Gen | Video Understanding |
 |----------|------|--------|-----------|-----------|---------------------|
-| OpenRouter | ✅ | via model | - | - | - |
-| OpenAI | ✅ | ✅ | ✅ | ✅ (Sora) | - |
-| Gemini | ✅ | ✅ | - | ✅ (Veo) | ✅ |
-| LiteLLM | ✅ | via model | - | - | - |
+| OpenRouter | Yes | via model | - | - | - |
+| OpenAI | Yes | Yes | Yes | Yes (Sora) | - |
+| Gemini | Yes | Yes | - | Yes (Veo) | Yes |
+| LiteLLM | Yes | via model | - | - | - |
 
 ## Environment Variables
 
@@ -155,9 +197,28 @@ yoetz/
 | `LITELLM_API_KEY` | LiteLLM proxy key |
 | `YOETZ_CONFIG_PATH` | Custom config path |
 
+## MSRV Policy
+
+The minimum supported Rust version is **1.88**. MSRV is tested in CI and bumped only with minor releases.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+
+## Verifying Downloads
+
+After downloading a release binary, verify its checksum:
+
+```bash
+# Download the checksums file
+curl -LO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
+
+# Verify (macOS)
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
+
+# Verify (Linux)
+sha256sum -c SHA256SUMS.txt --ignore-missing
+```
 
 ## License
 

@@ -1,0 +1,97 @@
+---
+name: yoetz
+version: 1.0.0
+description: >
+  Fast CLI-first LLM council, bundler, and multimodal gateway. Use ONLY when user
+  explicitly mentions "yoetz", "yoetz ask", "yoetz council", "yoetz review",
+  "yoetz generate", "yoetz bundle", "yoetz browser". NOT triggered by generic
+  "second opinion" or "ask another model" requests.
+metadata:
+  short-description: LLM council and multimodal gateway CLI
+  compatibility: claude-code, codex-cli
+---
+
+# Yoetz Skill
+
+Fast, agent-friendly LLM council tool for multi-model consensus, code review, and bundling.
+
+## When to Use
+
+**Explicit triggers only:**
+- "yoetz ask" / "yoetz council" / "yoetz review"
+- "yoetz bundle" / "yoetz generate" / "yoetz browser"
+- "use yoetz to..."
+
+**NOT triggered by:**
+- "second opinion" / "ask another model" (could be amq-cli)
+- "council" alone / "review" alone (other skills may apply)
+
+## Agent Contract
+
+- Always use `--format json` for parsing
+- Set `YOETZ_AGENT=1` environment variable
+- Parse JSON results and present summary to user
+- For large bundles, run `yoetz bundle` first to inspect size
+
+## Quick Reference
+
+| Task | Command |
+|------|---------|
+| Ask single model | `yoetz ask -p "question" -f src/*.rs --provider openai --model gpt-5.2 --format json` |
+| Council vote | `yoetz council -p "question" --models openai/gpt-5.2,gemini/gemini-pro-3,openrouter/xai/grok-4.1 --format json` |
+| Review staged diff | `yoetz review diff --staged --format json` |
+| Review file | `yoetz review file --path src/main.rs --format json` |
+| Bundle files | `yoetz bundle -p "context" -f src/**/*.rs --format json` |
+| Generate image | `yoetz generate image -p "description" --provider openai --model gpt-image-1 --format json` |
+| Estimate cost | `yoetz pricing estimate --model gpt-5.2 --input-tokens 1000 --output-tokens 500` |
+
+## Council (Multi-Model Consensus)
+
+Get opinions from multiple LLMs in parallel. **`--models` is required.**
+
+```bash
+yoetz council \
+  -p "Should we use async traits or callbacks for this API?" \
+  -f src/lib.rs -f src/api/*.rs \
+  --models openai/gpt-5.2,gemini/gemini-pro-3,openrouter/xai/grok-4.1 \
+  --format json
+```
+
+## Ask (Single Model)
+
+```bash
+yoetz ask \
+  -p "What's the bug in this error handling?" \
+  -f src/error.rs \
+  --provider openai --model gpt-5.2 \
+  --format json
+```
+
+## Review
+
+```bash
+yoetz review diff --staged --format json
+yoetz review file --path src/main.rs --format json
+```
+
+## Bundle
+
+```bash
+yoetz bundle -p "context" -f src/**/*.rs --format json
+```
+
+## Provider Configuration
+
+**Built-in providers** (work with just env var):
+- `openai` - `OPENAI_API_KEY`
+- `gemini` - `GEMINI_API_KEY`
+- `openrouter` - `OPENROUTER_API_KEY`
+
+**Model format:** `provider/model` (e.g., `openai/gpt-5.2`, `openrouter/anthropic/claude-sonnet-4`)
+
+## Cost Control
+
+```bash
+yoetz pricing estimate --model gpt-5.2 --input-tokens 12000 --output-tokens 800
+yoetz ask -p "Review" --max-cost-usd 1.00 --daily-budget-usd 5.00 --format json
+```

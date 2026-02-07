@@ -43,3 +43,5 @@ fs2 = "0.4"
 
 [dev-dependencies]
 serial_test = "3.0"
+assert_cmd = "2.0"
+predicates = "3.1"

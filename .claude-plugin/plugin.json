@@ -1,0 +1,12 @@
+{
+  "name": "yoetz",
+  "description": "LLM council, bundler, and multimodal gateway - multi-model consensus, code review, image/video generation, and browser fallback for coding agents",
+  "author": {
+    "name": "Aviv Sinai",
+    "url": "https://github.com/avivsinai"
+  },
+  "repository": "https://github.com/avivsinai/yoetz",
+  "license": "MIT",
+  "skills": "./skills/",
+  "keywords": ["llm", "council", "multimodal", "code-review", "bundler", "ai", "cli", "agents"]
+}
