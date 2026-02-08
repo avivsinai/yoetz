@@ -26,6 +26,21 @@ Fast, agent-friendly LLM council tool for multi-model consensus, code review, an
 - "second opinion" / "ask another model" (could be amq-cli)
 - "council" alone / "review" alone (other skills may apply)
 
+## Installation (auto-bootstrap)
+
+Before running any `yoetz` command, ensure the CLI is installed.
+If `command -v yoetz` fails, install via one of the following:
+
+| Platform | Command |
+|----------|---------|
+| macOS (Homebrew) | `brew install avivsinai/homebrew-tap/yoetz` |
+| Linux (Homebrew if available) | `brew install avivsinai/homebrew-tap/yoetz` |
+| From source (Rust 1.88+) | `cargo install --git https://github.com/avivsinai/yoetz` |
+| Windows (Scoop) | `scoop bucket add yoetz https://github.com/avivsinai/scoop-bucket && scoop install yoetz` |
+| Pre-built binary | Download from [GitHub Releases](https://github.com/avivsinai/yoetz/releases) and place in PATH |
+
+Prefer Homebrew when available — pre-built binaries, fastest install.
+
 ## Agent Contract
 
 - Always use `--format json` for parsing
