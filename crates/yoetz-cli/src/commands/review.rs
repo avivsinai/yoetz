@@ -4,8 +4,8 @@ use crate::ReviewResult;
 use crate::{budget, registry};
 use crate::{
     build_review_diff_prompt, build_review_file_prompt, call_litellm, git_diff, maybe_write_output,
-    read_text_file, resolve_max_output_tokens, resolve_registry_model_id, resolve_response_format,
-    AppContext, ReviewArgs, ReviewCommand, ReviewDiffArgs, ReviewFileArgs,
+    normalize_model_name, read_text_file, resolve_max_output_tokens, resolve_registry_model_id,
+    resolve_response_format, AppContext, ReviewArgs, ReviewCommand, ReviewDiffArgs, ReviewFileArgs,
 };
 use std::path::PathBuf;
 use yoetz_core::bundle::estimate_tokens;
@@ -40,12 +40,22 @@ async fn handle_review_diff(
         .clone()
         .or(config.defaults.provider.clone())
         .ok_or_else(|| anyhow!("provider is required"))?;
-    let model = args
-        .model
-        .clone()
-        .or(config.defaults.model.clone())
-        .ok_or_else(|| anyhow!("model is required"))?;
-    let max_output_tokens = resolve_max_output_tokens(args.max_output_tokens, config);
+    let model = normalize_model_name(
+        &args
+            .model
+            .clone()
+            .or(config.defaults.model.clone())
+            .ok_or_else(|| anyhow!("model is required"))?,
+    );
+    let registry_cache = registry::load_registry_cache().ok().flatten();
+    let registry_id =
+        resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
+    let max_output_tokens = resolve_max_output_tokens(
+        args.max_output_tokens,
+        config,
+        registry_cache.as_ref(),
+        registry_id.as_deref(),
+    );
 
     let diff = git_diff(args.staged, &args.paths)?;
     if diff.trim().is_empty() {
@@ -54,9 +64,6 @@ async fn handle_review_diff(
 
     let review_prompt = build_review_diff_prompt(&diff, args.prompt.as_deref());
     let input_tokens = estimate_tokens(review_prompt.len());
-    let registry_cache = registry::load_registry_cache().ok().flatten();
-    let registry_id =
-        resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
     let pricing = registry::estimate_pricing(
         registry_cache.as_ref(),
         registry_id.as_deref().unwrap_or(&model),
@@ -178,12 +185,22 @@ async fn handle_review_file(
         .clone()
         .or(config.defaults.provider.clone())
         .ok_or_else(|| anyhow!("provider is required"))?;
-    let model = args
-        .model
-        .clone()
-        .or(config.defaults.model.clone())
-        .ok_or_else(|| anyhow!("model is required"))?;
-    let max_output_tokens = resolve_max_output_tokens(args.max_output_tokens, config);
+    let model = normalize_model_name(
+        &args
+            .model
+            .clone()
+            .or(config.defaults.model.clone())
+            .ok_or_else(|| anyhow!("model is required"))?,
+    );
+    let registry_cache = registry::load_registry_cache().ok().flatten();
+    let registry_id =
+        resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
+    let max_output_tokens = resolve_max_output_tokens(
+        args.max_output_tokens,
+        config,
+        registry_cache.as_ref(),
+        registry_id.as_deref(),
+    );
 
     let max_file_bytes = args.max_file_bytes.unwrap_or(200_000);
     let max_total_bytes = args.max_total_bytes.unwrap_or(max_file_bytes);
@@ -196,9 +213,6 @@ async fn handle_review_file(
         args.prompt.as_deref(),
     );
     let input_tokens = estimate_tokens(review_prompt.len());
-    let registry_cache = registry::load_registry_cache().ok().flatten();
-    let registry_id =
-        resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
     let pricing = registry::estimate_pricing(
         registry_cache.as_ref(),
         registry_id.as_deref().unwrap_or(&model),

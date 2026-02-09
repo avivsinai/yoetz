@@ -83,6 +83,7 @@ pub struct RunResult {
     pub id: String,
     pub model: Option<String>,
     pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bundle: Option<Bundle>,
     pub pricing: PricingEstimate,
     pub usage: Usage,

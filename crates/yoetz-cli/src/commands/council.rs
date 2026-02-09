@@ -2,9 +2,9 @@ use anyhow::{anyhow, Result};
 
 use crate::CouncilResult;
 use crate::{
-    add_usage, call_litellm, maybe_write_output, render_bundle_md, resolve_max_output_tokens,
-    resolve_prompt, resolve_registry_model_id, resolve_response_format, AppContext, CouncilArgs,
-    CouncilModelResult, CouncilPricing, ModelEstimate,
+    add_usage, call_litellm, maybe_write_output, normalize_model_name, render_bundle_md,
+    resolve_max_output_tokens, resolve_prompt, resolve_registry_model_id, resolve_response_format,
+    AppContext, CouncilArgs, CouncilModelResult, CouncilPricing, ModelEstimate,
 };
 use crate::{budget, registry};
 use std::collections::BTreeSet;
@@ -34,9 +34,10 @@ pub(crate) async fn handle_council(
     let mut resolved_models = Vec::new();
     let mut provider_keys = BTreeSet::new();
     for model in &args.models {
-        let provider = resolve_council_provider(model, default_provider.as_deref())?;
+        let normalized = normalize_model_name(model);
+        let provider = resolve_council_provider(&normalized, default_provider.as_deref())?;
         provider_keys.insert(provider.clone());
-        resolved_models.push((model.clone(), provider));
+        resolved_models.push((normalized, provider));
     }
     let council_provider = if provider_keys.len() == 1 {
         provider_keys
@@ -74,15 +75,29 @@ pub(crate) async fn handle_council(
         .as_ref()
         .map(|b| b.stats.estimated_tokens)
         .unwrap_or_else(|| estimate_tokens(prompt.len()));
-    let max_output_tokens = resolve_max_output_tokens(args.max_output_tokens, config);
+    // Resolve registry IDs up front so we can derive model-aware max_output_tokens
+    let resolved_registry_ids: Vec<Option<String>> = resolved_models
+        .iter()
+        .map(|(model, provider)| {
+            resolve_registry_model_id(Some(provider), Some(model), registry_cache.as_ref())
+        })
+        .collect();
+    // Use the first model's registry ID as the hint for resolve_max_output_tokens;
+    // for mixed councils the user should set --max-output-tokens explicitly.
+    let first_registry_id = resolved_registry_ids.iter().find_map(|id| id.as_deref());
+    let max_output_tokens = resolve_max_output_tokens(
+        args.max_output_tokens,
+        config,
+        registry_cache.as_ref(),
+        first_registry_id,
+    );
     let output_tokens = max_output_tokens;
 
     let mut per_model = Vec::new();
     let mut estimate_sum = 0.0;
     let mut estimate_complete = true;
-    for (model, provider) in &resolved_models {
-        let registry_id =
-            resolve_registry_model_id(Some(provider), Some(model), registry_cache.as_ref());
+    for (idx, (model, _provider)) in resolved_models.iter().enumerate() {
+        let registry_id = &resolved_registry_ids[idx];
         let estimate = registry::estimate_pricing(
             registry_cache.as_ref(),
             registry_id.as_deref().unwrap_or(model),
@@ -256,6 +271,9 @@ pub(crate) async fn handle_council(
     write_json_file(&response_json, &council)?;
 
     maybe_write_output(ctx, &council)?;
+
+    // Omit bundle from stdout to keep JSON output compact (full result is in session file)
+    council.bundle = None;
 
     match format {
         OutputFormat::Json => write_json(&council),

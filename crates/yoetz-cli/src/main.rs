@@ -33,6 +33,10 @@ use yoetz_core::types::{ArtifactPaths, PricingEstimate, Usage};
 use http::send_json;
 
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 1024;
+/// Cap for registry-derived max_output_tokens. Generous enough for reasoning models
+/// (which consume thinking tokens from the budget) but prevents runaway costs on
+/// simple queries when no explicit --max-output-tokens is provided.
+const REGISTRY_OUTPUT_TOKENS_CAP: usize = 16384;
 
 #[derive(Parser)]
 #[command(
@@ -562,6 +566,7 @@ struct ReviewResult {
 struct CouncilResult {
     id: String,
     provider: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     bundle: Option<yoetz_core::types::Bundle>,
     results: Vec<CouncilModelResult>,
     pricing: CouncilPricing,
@@ -1217,6 +1222,138 @@ mod tests {
     }
 
     #[test]
+    fn normalize_model_name_bare_aliases() {
+        assert_eq!(normalize_model_name("gemini-pro-3"), "gemini-3-pro-preview");
+        assert_eq!(
+            normalize_model_name("gemini-flash-3"),
+            "gemini-3-flash-preview"
+        );
+    }
+
+    #[test]
+    fn normalize_model_name_prefixed_aliases() {
+        assert_eq!(
+            normalize_model_name("gemini/gemini-pro-3"),
+            "gemini/gemini-3-pro-preview"
+        );
+        assert_eq!(
+            normalize_model_name("gemini/gemini-flash-3"),
+            "gemini/gemini-3-flash-preview"
+        );
+        assert_eq!(
+            normalize_model_name("openrouter/google/gemini-pro-3"),
+            "openrouter/google/gemini-3-pro-preview"
+        );
+        assert_eq!(
+            normalize_model_name("openrouter/google/gemini-flash-3"),
+            "openrouter/google/gemini-3-flash-preview"
+        );
+    }
+
+    #[test]
+    fn normalize_model_name_case_insensitive() {
+        assert_eq!(normalize_model_name("Gemini-Pro-3"), "gemini-3-pro-preview");
+        assert_eq!(
+            normalize_model_name("GEMINI/GEMINI-FLASH-3"),
+            "gemini/gemini-3-flash-preview"
+        );
+    }
+
+    #[test]
+    fn normalize_model_name_google_prefix() {
+        assert_eq!(
+            normalize_model_name("google/gemini-pro-3"),
+            "google/gemini-3-pro-preview"
+        );
+    }
+
+    #[test]
+    fn normalize_model_name_with_suffix() {
+        assert_eq!(
+            normalize_model_name("openrouter/google/gemini-pro-3:free"),
+            "openrouter/google/gemini-3-pro-preview:free"
+        );
+        assert_eq!(
+            normalize_model_name("gemini-flash-3:extended"),
+            "gemini-3-flash-preview:extended"
+        );
+    }
+
+    #[test]
+    fn normalize_model_name_passthrough() {
+        assert_eq!(
+            normalize_model_name("gemini-3-pro-preview"),
+            "gemini-3-pro-preview"
+        );
+        assert_eq!(normalize_model_name("gpt-5.2"), "gpt-5.2");
+        // Preserve suffix on non-matching models
+        assert_eq!(normalize_model_name("gpt-5.2:free"), "gpt-5.2:free");
+    }
+
+    #[test]
+    fn resolve_max_output_tokens_explicit() {
+        let config = Config::default();
+        assert_eq!(
+            resolve_max_output_tokens(Some(4096), &config, None, None),
+            4096
+        );
+    }
+
+    #[test]
+    fn resolve_max_output_tokens_fallback() {
+        let config = Config::default();
+        assert_eq!(
+            resolve_max_output_tokens(None, &config, None, None),
+            DEFAULT_MAX_OUTPUT_TOKENS
+        );
+    }
+
+    #[test]
+    fn resolve_max_output_tokens_from_registry() {
+        let config = Config::default();
+        let mut registry = ModelRegistry::default();
+        registry.models.push(yoetz_core::registry::ModelEntry {
+            id: "gemini/gemini-3-pro-preview".to_string(),
+            context_length: None,
+            max_output_tokens: Some(65535),
+            pricing: Default::default(),
+            provider: None,
+            capability: None,
+        });
+        registry.rebuild_index();
+        // Should cap at 16384
+        assert_eq!(
+            resolve_max_output_tokens(
+                None,
+                &config,
+                Some(&registry),
+                Some("gemini/gemini-3-pro-preview"),
+            ),
+            16384
+        );
+    }
+
+    #[test]
+    fn resolve_max_output_tokens_registry_small_model() {
+        let config = Config::default();
+        let mut registry = ModelRegistry::default();
+        registry.models.push(yoetz_core::registry::ModelEntry {
+            id: "test/small-model".to_string(),
+            context_length: None,
+            max_output_tokens: Some(4096),
+            pricing: Default::default(),
+            provider: None,
+            capability: None,
+        });
+        registry.rebuild_index();
+        // Model max (4096) is less than cap (16384), so use model max
+        assert_eq!(
+            resolve_max_output_tokens(None, &config, Some(&registry), Some("test/small-model")),
+            4096
+        );
+    }
+
+    #[test]
     fn read_text_file_truncates_utf8_safely() {
         let text = "hello 🙂 world";
         let bytes = text.as_bytes();
@@ -1317,10 +1454,73 @@ use --provider {prefix} or pass an unprefixed model name"
     Ok(format!("{provider}/{model}"))
 }
 
-fn resolve_max_output_tokens(requested: Option<usize>, config: &Config) -> usize {
-    requested
-        .or(config.defaults.max_output_tokens)
-        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+fn normalize_model_name(model: &str) -> String {
+    let lower = model.to_lowercase();
+    // Strip OpenRouter suffixes like :free, :extended before matching
+    let (lower_base, suffix) = lower
+        .rsplit_once(':')
+        .map(|(b, s)| (b, format!(":{s}")))
+        .unwrap_or((lower.as_str(), String::new()));
+
+    let replacement = match lower_base {
+        "gemini-pro-3" => Some("gemini-3-pro-preview".to_string()),
+        "gemini-flash-3" => Some("gemini-3-flash-preview".to_string()),
+        _ => None,
+    }
+    .or_else(|| {
+        lower_base
+            .strip_prefix("gemini/")
+            .and_then(|rest| match rest {
+                "gemini-pro-3" => Some("gemini/gemini-3-pro-preview".to_string()),
+                "gemini-flash-3" => Some("gemini/gemini-3-flash-preview".to_string()),
+                _ => None,
+            })
+    })
+    .or_else(|| {
+        lower_base
+            .strip_prefix("google/")
+            .and_then(|rest| match rest {
+                "gemini-pro-3" => Some("google/gemini-3-pro-preview".to_string()),
+                "gemini-flash-3" => Some("google/gemini-3-flash-preview".to_string()),
+                _ => None,
+            })
+    })
+    .or_else(|| {
+        lower_base
+            .strip_prefix("openrouter/google/")
+            .and_then(|rest| match rest {
+                "gemini-pro-3" => Some("openrouter/google/gemini-3-pro-preview".to_string()),
+                "gemini-flash-3" => Some("openrouter/google/gemini-3-flash-preview".to_string()),
+                _ => None,
+            })
+    });
+
+    match replacement {
+        Some(r) => format!("{r}{suffix}"),
+        None => model.to_string(),
+    }
+}
+
+fn resolve_max_output_tokens(
+    requested: Option<usize>,
+    config: &Config,
+    registry: Option<&ModelRegistry>,
+    model_id: Option<&str>,
+) -> usize {
+    if let Some(v) = requested {
+        return v;
+    }
+    if let Some(v) = config.defaults.max_output_tokens {
+        return v;
+    }
+    if let (Some(reg), Some(id)) = (registry, model_id) {
+        if let Some(entry) = reg.find(id) {
+            if let Some(model_max) = entry.max_output_tokens {
+                return model_max.min(REGISTRY_OUTPUT_TOKENS_CAP);
+            }
+        }
+    }
+    DEFAULT_MAX_OUTPUT_TOKENS
 }
 
 fn resolve_registry_model_id(

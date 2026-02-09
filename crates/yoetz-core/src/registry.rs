@@ -25,6 +25,7 @@ impl ModelPricing {
 pub struct ModelEntry {
     pub id: String,
     pub context_length: Option<usize>,
+    pub max_output_tokens: Option<usize>,
     pub pricing: ModelPricing,
     pub provider: Option<String>,
     pub capability: Option<ModelCapability>,

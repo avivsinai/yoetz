@@ -53,7 +53,7 @@ Prefer Homebrew when available — pre-built binaries, fastest install.
 | Task | Command |
 |------|---------|
 | Ask single model | `yoetz ask -p "question" -f src/*.rs --provider openai --model gpt-5.2 --format json` |
-| Council vote | `yoetz council -p "question" --models openai/gpt-5.2,gemini/gemini-pro-3,openrouter/xai/grok-4.1 --format json` |
+| Council vote | `yoetz council -p "question" --models openai/gpt-5.2,gemini/gemini-3-pro-preview,openrouter/xai/grok-4.1 --format json` |
 | Review staged diff | `yoetz review diff --staged --format json` |
 | Review file | `yoetz review file --path src/main.rs --format json` |
 | Bundle files | `yoetz bundle -p "context" -f src/**/*.rs --format json` |
@@ -73,13 +73,13 @@ Get opinions from multiple LLMs in parallel. **`--models` is required.**
 yoetz council \
   -p "Should we use async traits or callbacks for this API?" \
   -f src/lib.rs -f src/api/*.rs \
-  --models openai/gpt-5.2,gemini/gemini-pro-3,openrouter/xai/grok-4.1 \
+  --models openai/gpt-5.2,gemini/gemini-3-pro-preview,openrouter/xai/grok-4.1 \
   --format json
 ```
 
 **Example council sets:**
-- Cross-provider: `openai/gpt-5.2,gemini/gemini-pro-3,openrouter/xai/grok-4.1`
-- Via OpenRouter only: `openrouter/openai/gpt-5.2,openrouter/anthropic/claude-sonnet-4,openrouter/google/gemini-pro-3`
+- Cross-provider: `openai/gpt-5.2,gemini/gemini-3-pro-preview,openrouter/xai/grok-4.1`
+- Via OpenRouter only: `openrouter/openai/gpt-5.2,openrouter/anthropic/claude-sonnet-4,openrouter/google/gemini-3-pro-preview`
 
 ## Ask (Single Model)
 
@@ -203,7 +203,7 @@ yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle "$BUNDLE"
 ```bash
 # Get fast API results first
 yoetz council -p "Review" -f src/*.rs \
-  --models openai/gpt-5.2,gemini/gemini-pro-3 --format json > api.json
+  --models openai/gpt-5.2,gemini/gemini-3-pro-preview --format json > api.json
 
 # Then get ChatGPT Pro opinion
 BUNDLE=$(yoetz bundle -p "Review" -f src/*.rs --format json | jq -r .artifacts.bundle_md)
@@ -231,7 +231,7 @@ The browser module uses stealth techniques to avoid Cloudflare detection:
 
 **Model format:** `provider/model`
 - `openai/gpt-5.2`
-- `gemini/gemini-pro-3`
+- `gemini/gemini-3-pro-preview`
 - `openrouter/anthropic/claude-sonnet-4` (nested for OpenRouter)
 
 ## Cost Control

@@ -118,10 +118,12 @@ fn embedded_gemini_registry() -> Result<ModelRegistry> {
             .max_input_tokens
             .or(pricing.max_output_tokens)
             .map(|v| v as usize);
+        let max_output_tokens = pricing.max_output_tokens.map(|v| v as usize);
 
         registry.models.push(ModelEntry {
             id: name,
             context_length,
+            max_output_tokens,
             pricing: ModelPricing {
                 prompt_per_1k: pricing.input_cost_per_1k,
                 completion_per_1k: pricing.output_cost_per_1k,
@@ -223,10 +225,17 @@ fn parse_openrouter_models(value: &Value) -> ModelRegistry {
             request: pricing_obj.and_then(|p| parse_price(p.get("request"))),
         };
 
+        let max_output_tokens = item
+            .get("top_provider")
+            .and_then(|v| v.get("max_completion_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
         let capability = parse_openrouter_capability(&item);
         registry.models.push(ModelEntry {
             id: id.to_string(),
             context_length,
+            max_output_tokens,
             pricing,
             provider: Some("openrouter".to_string()),
             capability,
@@ -273,10 +282,15 @@ fn parse_litellm_models(value: &Value) -> ModelRegistry {
             .or_else(|| model_info.get("max_tokens"))
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
+        let max_output_tokens = model_info
+            .get("max_output_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         registry.models.push(ModelEntry {
             id,
             context_length: max_tokens,
+            max_output_tokens,
             pricing: ModelPricing {
                 prompt_per_1k: input_cost.map(|v| v * 1000.0),
                 completion_per_1k: output_cost.map(|v| v * 1000.0),

@@ -2,9 +2,9 @@ use anyhow::{anyhow, Result};
 
 use crate::providers::{gemini, openai};
 use crate::{
-    apply_capability_warnings, call_litellm, maybe_write_output, parse_media_input,
-    parse_media_inputs, resolve_max_output_tokens, resolve_prompt, resolve_registry_model_id,
-    resolve_response_format, AppContext, AskArgs,
+    apply_capability_warnings, call_litellm, maybe_write_output, normalize_model_name,
+    parse_media_input, parse_media_inputs, resolve_max_output_tokens, resolve_prompt,
+    resolve_registry_model_id, resolve_response_format, AppContext, AskArgs,
 };
 use crate::{budget, providers, registry};
 use std::env;
@@ -72,7 +72,11 @@ pub(crate) async fn handle_ask(
         artifacts.bundle_md = Some(bundle_md.to_string_lossy().to_string());
     }
 
-    let model_id = args.model.clone().or(config.defaults.model.clone());
+    let model_id = args
+        .model
+        .clone()
+        .or(config.defaults.model.clone())
+        .map(|m| normalize_model_name(&m));
     let provider_id = args.provider.clone().or(config.defaults.provider.clone());
     let registry_cache = registry::load_registry_cache().ok().flatten();
     let registry_model_id = resolve_registry_model_id(
@@ -80,7 +84,12 @@ pub(crate) async fn handle_ask(
         model_id.as_deref(),
         registry_cache.as_ref(),
     );
-    let max_output_tokens = resolve_max_output_tokens(args.max_output_tokens, config);
+    let max_output_tokens = resolve_max_output_tokens(
+        args.max_output_tokens,
+        config,
+        registry_cache.as_ref(),
+        registry_model_id.as_deref(),
+    );
     let input_tokens = bundle
         .as_ref()
         .map(|b| b.stats.estimated_tokens)
@@ -240,8 +249,15 @@ pub(crate) async fn handle_ask(
 
     if provider_id.as_deref() == Some("gemini") && content.trim().is_empty() {
         if let Some(thoughts) = usage.thoughts_tokens.filter(|t| *t > 0) {
+            let model_max_hint = registry_model_id
+                .as_deref()
+                .and_then(|id| registry_cache.as_ref()?.find(id))
+                .and_then(|e| e.max_output_tokens)
+                .map(|m| format!(" (model supports up to {m})"))
+                .unwrap_or_default();
             eprintln!(
-                "warning: gemini returned empty content but used {thoughts} thought tokens; try increasing --max-output-tokens"
+                "warning: gemini returned empty content but used {thoughts} thought tokens; \
+                 try increasing --max-output-tokens (current: {max_output_tokens}){model_max_hint}"
             );
         }
     }
@@ -272,6 +288,9 @@ pub(crate) async fn handle_ask(
     write_json_file(&response_json, &result)?;
 
     maybe_write_output(ctx, &result)?;
+
+    // Omit bundle from stdout to keep JSON output compact (full result is in session file)
+    result.bundle = None;
 
     match format {
         OutputFormat::Json => write_json(&result),

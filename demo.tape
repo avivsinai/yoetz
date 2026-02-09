@@ -21,7 +21,7 @@ Sleep 4s
 
 Type "# Multi-model council - get consensus from 3 providers"
 Enter
-Type "yoetz council -p 'Should we use channels or shared state?' --models openai/gpt-5.2,gemini/gemini-pro-3,openrouter/xai/grok-4.1 --format json"
+Type "yoetz council -p 'Should we use channels or shared state?' --models openai/gpt-5.2,gemini/gemini-3-pro-preview,openrouter/xai/grok-4.1 --format json"
 Enter
 Sleep 5s
 
