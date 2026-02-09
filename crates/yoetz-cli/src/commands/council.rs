@@ -82,16 +82,22 @@ pub(crate) async fn handle_council(
             resolve_registry_model_id(Some(provider), Some(model), registry_cache.as_ref())
         })
         .collect();
-    // Use the first model's registry ID as the hint for resolve_max_output_tokens;
-    // for mixed councils the user should set --max-output-tokens explicitly.
-    let first_registry_id = resolved_registry_ids.iter().find_map(|id| id.as_deref());
-    let max_output_tokens = resolve_max_output_tokens(
-        args.max_output_tokens,
-        config,
-        registry_cache.as_ref(),
-        first_registry_id,
-    );
-    let output_tokens = max_output_tokens;
+    // Resolve per-model and take the maximum so no model gets starved in mixed councils.
+    let max_output_tokens: Option<usize> = {
+        let mut best: Option<usize> = None;
+        for reg_id in &resolved_registry_ids {
+            if let Some(val) = resolve_max_output_tokens(
+                args.max_output_tokens,
+                config,
+                registry_cache.as_ref(),
+                reg_id.as_deref(),
+            ) {
+                best = Some(best.map_or(val, |b: usize| b.max(val)));
+            }
+        }
+        best
+    };
+    let output_tokens = max_output_tokens.unwrap_or(4096);
 
     let mut per_model = Vec::new();
     let mut estimate_sum = 0.0;

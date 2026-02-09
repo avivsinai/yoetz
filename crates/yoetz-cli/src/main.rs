@@ -32,7 +32,6 @@ use yoetz_core::types::{ArtifactPaths, PricingEstimate, Usage};
 
 use http::send_json;
 
-const DEFAULT_MAX_OUTPUT_TOKENS: usize = 1024;
 /// Cap for registry-derived max_output_tokens. Generous enough for reasoning models
 /// (which consume thinking tokens from the budget) but prevents runaway costs on
 /// simple queries when no explicit --max-output-tokens is provided.
@@ -1295,17 +1294,14 @@ mod tests {
         let config = Config::default();
         assert_eq!(
             resolve_max_output_tokens(Some(4096), &config, None, None),
-            4096
+            Some(4096)
         );
     }
 
     #[test]
     fn resolve_max_output_tokens_fallback() {
         let config = Config::default();
-        assert_eq!(
-            resolve_max_output_tokens(None, &config, None, None),
-            DEFAULT_MAX_OUTPUT_TOKENS
-        );
+        assert_eq!(resolve_max_output_tokens(None, &config, None, None), None);
     }
 
     #[test]
@@ -1329,7 +1325,7 @@ mod tests {
                 Some(&registry),
                 Some("gemini/gemini-3-pro-preview"),
             ),
-            16384
+            Some(16384)
         );
     }
 
@@ -1349,7 +1345,7 @@ mod tests {
         // Model max (4096) is less than cap (16384), so use model max
         assert_eq!(
             resolve_max_output_tokens(None, &config, Some(&registry), Some("test/small-model")),
-            4096
+            Some(4096)
         );
     }
 
@@ -1379,15 +1375,16 @@ async fn call_litellm(
     model: &str,
     prompt: &str,
     temperature: f32,
-    max_output_tokens: usize,
+    max_output_tokens: Option<usize>,
     response_format: Option<Value>,
     images: &[MediaInput],
     video: Option<&MediaInput>,
 ) -> Result<CallResult> {
     let model_spec = build_model_spec(provider, model)?;
-    let mut req = ChatRequest::new(model_spec)
-        .temperature(temperature)
-        .max_tokens(max_output_tokens as u32);
+    let mut req = ChatRequest::new(model_spec).temperature(temperature);
+    if let Some(max) = max_output_tokens {
+        req = req.max_tokens(max as u32);
+    }
     req.response_format = response_format;
 
     if images.is_empty() && video.is_none() {
@@ -1501,26 +1498,28 @@ fn normalize_model_name(model: &str) -> String {
     }
 }
 
+/// Resolve max output tokens. Returns `None` when no explicit limit is set,
+/// letting each provider use its own model-default maximum.
 fn resolve_max_output_tokens(
     requested: Option<usize>,
     config: &Config,
     registry: Option<&ModelRegistry>,
     model_id: Option<&str>,
-) -> usize {
+) -> Option<usize> {
     if let Some(v) = requested {
-        return v;
+        return Some(v);
     }
     if let Some(v) = config.defaults.max_output_tokens {
-        return v;
+        return Some(v);
     }
     if let (Some(reg), Some(id)) = (registry, model_id) {
         if let Some(entry) = reg.find(id) {
             if let Some(model_max) = entry.max_output_tokens {
-                return model_max.min(REGISTRY_OUTPUT_TOKENS_CAP);
+                return Some(model_max.min(REGISTRY_OUTPUT_TOKENS_CAP));
             }
         }
     }
-    DEFAULT_MAX_OUTPUT_TOKENS
+    None
 }
 
 fn resolve_registry_model_id(
