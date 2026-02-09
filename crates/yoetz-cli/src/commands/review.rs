@@ -64,11 +64,12 @@ async fn handle_review_diff(
 
     let review_prompt = build_review_diff_prompt(&diff, args.prompt.as_deref());
     let input_tokens = estimate_tokens(review_prompt.len());
+    let output_tokens = max_output_tokens.unwrap_or(4096);
     let pricing = registry::estimate_pricing(
         registry_cache.as_ref(),
         registry_id.as_deref().unwrap_or(&model),
         input_tokens,
-        max_output_tokens,
+        output_tokens,
     )?;
 
     let budget_enabled = args.max_cost_usd.is_some() || args.daily_budget_usd.is_some();
@@ -213,11 +214,12 @@ async fn handle_review_file(
         args.prompt.as_deref(),
     );
     let input_tokens = estimate_tokens(review_prompt.len());
+    let output_tokens = max_output_tokens.unwrap_or(4096);
     let pricing = registry::estimate_pricing(
         registry_cache.as_ref(),
         registry_id.as_deref().unwrap_or(&model),
         input_tokens,
-        max_output_tokens,
+        output_tokens,
     )?;
 
     let budget_enabled = args.max_cost_usd.is_some() || args.daily_budget_usd.is_some();

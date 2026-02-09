@@ -94,7 +94,7 @@ pub(crate) async fn handle_ask(
         .as_ref()
         .map(|b| b.stats.estimated_tokens)
         .unwrap_or_else(|| estimate_tokens(prompt.len()));
-    let output_tokens = max_output_tokens;
+    let output_tokens = max_output_tokens.unwrap_or(4096);
     let mut pricing = if let Some(model_id) = registry_model_id.as_deref() {
         registry::estimate_pricing(
             registry_cache.as_ref(),
@@ -255,9 +255,12 @@ pub(crate) async fn handle_ask(
                 .and_then(|e| e.max_output_tokens)
                 .map(|m| format!(" (model supports up to {m})"))
                 .unwrap_or_default();
+            let current_display = max_output_tokens
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "default".to_string());
             eprintln!(
                 "warning: gemini returned empty content but used {thoughts} thought tokens; \
-                 try increasing --max-output-tokens (current: {max_output_tokens}){model_max_hint}"
+                 try increasing --max-output-tokens (current: {current_display}){model_max_hint}"
             );
         }
     }

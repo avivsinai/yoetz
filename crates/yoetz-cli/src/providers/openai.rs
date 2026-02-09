@@ -33,7 +33,7 @@ pub async fn call_responses_vision(
     images: &[MediaInput],
     response_format: Option<Value>,
     temperature: f32,
-    max_output_tokens: usize,
+    max_output_tokens: Option<usize>,
 ) -> Result<OpenAITextResult> {
     if model.contains("gpt-image") {
         return Err(anyhow!(
@@ -56,8 +56,10 @@ pub async fn call_responses_vision(
         "model": model,
         "input": [{ "role": "user", "content": content }],
         "temperature": temperature,
-        "max_output_tokens": max_output_tokens,
     });
+    if let Some(max) = max_output_tokens {
+        body["max_output_tokens"] = serde_json::json!(max);
+    }
     if let Some(format) = response_format {
         body["response_format"] = format;
     }

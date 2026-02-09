@@ -28,7 +28,7 @@ pub async fn generate_content(
     images: &[MediaInput],
     video: Option<&MediaInput>,
     temperature: f32,
-    max_output_tokens: usize,
+    max_output_tokens: Option<usize>,
 ) -> Result<GeminiTextResult> {
     let mut parts = Vec::with_capacity(images.len() + 2);
     parts.push(serde_json::json!({ "text": prompt }));
@@ -40,12 +40,13 @@ pub async fn generate_content(
         parts.push(media_part(client, auth, video).await?);
     }
 
+    let mut gen_config = serde_json::json!({ "temperature": temperature });
+    if let Some(max) = max_output_tokens {
+        gen_config["maxOutputTokens"] = serde_json::json!(max);
+    }
     let body = serde_json::json!({
         "contents": [{ "role": "user", "parts": parts }],
-        "generationConfig": {
-            "temperature": temperature,
-            "maxOutputTokens": max_output_tokens,
-        }
+        "generationConfig": gen_config
     });
 
     let url = format!(
