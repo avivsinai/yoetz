@@ -1,7 +1,7 @@
 use crate::paths::home_dir;
 use crate::types::SessionInfo;
 use anyhow::{Context, Result};
-use rand::{distributions::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, Rng};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,8 +18,8 @@ pub fn create_session_dir() -> Result<SessionInfo> {
     let ts = OffsetDateTime::now_utc()
         .format(TS_FORMAT)
         .unwrap_or_else(|_| "unknown".to_string());
-    let rand: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
+    let rand: String = rand::rng()
+        .sample_iter(Alphanumeric)
         .take(6)
         .map(char::from)
         .collect();
