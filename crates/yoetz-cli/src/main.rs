@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand};
-use jsonschema::JSONSchema;
+use jsonschema::Validator;
 use litellm_rust::{
     ChatContentPart, ChatContentPartFile, ChatContentPartImageUrl, ChatContentPartText, ChatFile,
     ChatImageUrl, ChatMessageContent, ChatRequest, ImageData, LiteLLM,
@@ -1003,14 +1003,14 @@ fn validate_output_schema(path: &std::path::Path, value: &Value) -> Result<()> {
     let schema_text =
         fs::read_to_string(path).with_context(|| format!("read schema {}", path.display()))?;
     let schema_json: Value = serde_json::from_str(&schema_text)?;
-    let compiled = JSONSchema::compile(&schema_json)
+    let compiled = Validator::new(&schema_json)
         .map_err(|e| anyhow!("invalid schema {}: {e}", path.display()))?;
-    if let Err(errors) = compiled.validate(value) {
-        let messages = errors.map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+    let result = compiled.validate(value);
+    if let Err(err) = result {
         return Err(anyhow!(
             "output does not match schema {}: {}",
             path.display(),
-            messages
+            err
         ));
     }
     Ok(())

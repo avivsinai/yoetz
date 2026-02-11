@@ -38,7 +38,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "time"] }
 serde_yaml = "0.9"
 tempfile = "3.10"
-jsonschema = "0.17"
+jsonschema = "0.41"
 fs2 = "0.4"
 
 [dev-dependencies]
