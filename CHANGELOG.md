@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [0.2.3] - 2026-02-12
 
 ### Bug Fixes
 
@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **deps**: Bump rand from 0.8.5 to 0.9.2
 - **deps**: Bump jsonschema from 0.17.1 to 0.41.0
 - Allow MIT-0 license (borrow-or-share dependency of jsonschema 0.41)
-- OSS polish — GitHub topics, changelog, README, CI enforcement
+- OSS polish — topics, changelog, README, CI (#10)
 
 ## [0.2.2] - 2026-02-09
 
