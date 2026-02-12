@@ -116,12 +116,16 @@ jobs:
           fetch-depth: 0
       - name: Install git-cliff
         uses: taiki-e/install-action@git-cliff
-      - name: Verify CHANGELOG is up-to-date
+      - name: Verify tagged releases in CHANGELOG
         run: |
           git-cliff --output CHANGELOG.check.md
-          if ! diff -q CHANGELOG.md CHANGELOG.check.md >/dev/null 2>&1; then
-            echo "::error::CHANGELOG.md is stale. Run 'git-cliff -o CHANGELOG.md' and commit."
-            diff CHANGELOG.md CHANGELOG.check.md || true
+          # Compare only tagged release sections — the [Unreleased] section
+          # naturally drifts on PR branches (includes the PR's own commits).
+          ACTUAL=$(sed -n '/^## \[[0-9]/,$p' CHANGELOG.md)
+          EXPECTED=$(sed -n '/^## \[[0-9]/,$p' CHANGELOG.check.md)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::CHANGELOG.md tagged releases are stale. Run 'git-cliff -o CHANGELOG.md' and commit."
+            diff <(echo "$ACTUAL") <(echo "$EXPECTED") || true
             exit 1
           fi
 

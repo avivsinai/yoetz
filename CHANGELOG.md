@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **deps**: Bump rand from 0.8.5 to 0.9.2
 - **deps**: Bump jsonschema from 0.17.1 to 0.41.0
 - Allow MIT-0 license (borrow-or-share dependency of jsonschema 0.41)
+- OSS polish — GitHub topics, changelog, README, CI enforcement
 
 ## [0.2.2] - 2026-02-09
 
@@ -38,11 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Add auto-bootstrap install section to skill definitions
 
-### Miscellaneous
-
-- Bump version to 0.2.1
-- Update Cargo.lock for v0.2.1
-
 ## [0.2.0] - 2026-02-07
 
 ### Bug Fixes
@@ -56,7 +52,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Miscellaneous
 
-- Bump version to 0.2.0
 - Update workflows to SOTA patterns
 
 ### Styling

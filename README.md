@@ -29,6 +29,7 @@ Most LLM CLI tools focus on a single provider or a single workflow. yoetz is dif
 - [Environment Variables](#environment-variables)
 - [MSRV Policy](#msrv-policy)
 - [Contributing](#contributing)
+- [Verifying Downloads](#verifying-downloads)
 - [License](#license)
 
 ## Features
