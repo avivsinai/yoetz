@@ -8,6 +8,29 @@ Fast, CLI-first LLM council + bundler + multimodal gateway for coding agents.
 
 > **Note**: This project is under active development. APIs may change.
 
+## Why yoetz?
+
+Most LLM CLI tools focus on a single provider or a single workflow. yoetz is different:
+
+- **Multi-model council** — get consensus from multiple LLMs in one command, not sequential copy-paste between tabs
+- **Multimodal native** — text, images, and video as first-class inputs across providers
+- **Agent-first design** — structured JSON output, budget tracking, and agent skill integration out of the box
+- **Zero lock-in** — one config, any provider (OpenRouter, OpenAI, Gemini, LiteLLM), switch with a flag
+- **Bundle-aware** — package your codebase with gitignore-awareness for maximum LLM context
+
+## Table of Contents
+
+- [Why yoetz?](#why-yoetz)
+- [Features](#features)
+- [Installation](#installation)
+- [Quick Start](#quick-start)
+- [Architecture](#architecture)
+- [Supported Providers](#supported-providers)
+- [Environment Variables](#environment-variables)
+- [MSRV Policy](#msrv-policy)
+- [Contributing](#contributing)
+- [License](#license)
+
 ## Features
 
 - **Bundle**: Package code files with gitignore-awareness for LLM context

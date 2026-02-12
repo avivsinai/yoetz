@@ -106,6 +106,25 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
 
+  changelog:
+    name: Changelog
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install git-cliff
+        uses: taiki-e/install-action@git-cliff
+      - name: Verify CHANGELOG is up-to-date
+        run: |
+          git-cliff --output CHANGELOG.check.md
+          if ! diff -q CHANGELOG.md CHANGELOG.check.md >/dev/null 2>&1; then
+            echo "::error::CHANGELOG.md is stale. Run 'git-cliff -o CHANGELOG.md' and commit."
+            diff CHANGELOG.md CHANGELOG.check.md || true
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
