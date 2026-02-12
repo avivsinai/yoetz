@@ -106,6 +106,29 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
 
+  changelog:
+    name: Changelog
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Install git-cliff
+        uses: taiki-e/install-action@git-cliff
+      - name: Verify tagged releases in CHANGELOG
+        run: |
+          git-cliff --output CHANGELOG.check.md
+          # Compare only tagged release sections — the [Unreleased] section
+          # naturally drifts on PR branches (includes the PR's own commits).
+          ACTUAL=$(sed -n '/^## \[[0-9]/,$p' CHANGELOG.md)
+          EXPECTED=$(sed -n '/^## \[[0-9]/,$p' CHANGELOG.check.md)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::CHANGELOG.md tagged releases are stale. Run 'git-cliff -o CHANGELOG.md' and commit."
+            diff <(echo "$ACTUAL") <(echo "$EXPECTED") || true
+            exit 1
+          fi
+
   build:
     name: Build (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
