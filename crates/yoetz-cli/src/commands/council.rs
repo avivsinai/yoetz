@@ -3,8 +3,9 @@ use anyhow::{anyhow, Result};
 use crate::CouncilResult;
 use crate::{
     add_usage, call_litellm, maybe_write_output, normalize_model_name, render_bundle_md,
-    resolve_max_output_tokens, resolve_prompt, resolve_registry_model_id, resolve_response_format,
-    AppContext, CouncilArgs, CouncilModelResult, CouncilPricing, ModelEstimate,
+    resolve_max_output_tokens, resolve_prompt, resolve_provider_from_registry,
+    resolve_registry_model_id, resolve_response_format, AppContext, CouncilArgs,
+    CouncilModelResult, CouncilPricing, ModelEstimate,
 };
 use crate::{budget, registry};
 use std::collections::BTreeSet;
@@ -31,11 +32,17 @@ pub(crate) async fn handle_council(
         .clone()
         .or(config.defaults.provider.clone())
         .map(|provider| provider.to_lowercase());
+    // Load registry early so council can auto-resolve providers (e.g. x-ai/grok-4 → openrouter)
+    let registry_cache = registry::load_registry_cache().ok().flatten();
     let mut resolved_models = Vec::new();
     let mut provider_keys = BTreeSet::new();
     for model in &args.models {
         let normalized = normalize_model_name(model);
-        let provider = resolve_council_provider(&normalized, default_provider.as_deref())?;
+        let provider = resolve_council_provider(
+            &normalized,
+            default_provider.as_deref(),
+            registry_cache.as_ref(),
+        )?;
         provider_keys.insert(provider.clone());
         resolved_models.push((normalized, provider));
     }
@@ -70,7 +77,6 @@ pub(crate) async fn handle_council(
         Some(build_bundle(&prompt, options)?)
     };
 
-    let registry_cache = registry::load_registry_cache().ok().flatten();
     let input_tokens = bundle
         .as_ref()
         .map(|b| b.stats.estimated_tokens)
@@ -299,7 +305,17 @@ pub(crate) async fn handle_council(
     }
 }
 
-fn resolve_council_provider(model: &str, default_provider: Option<&str>) -> Result<String> {
+fn resolve_council_provider(
+    model: &str,
+    default_provider: Option<&str>,
+    registry: Option<&yoetz_core::registry::ModelRegistry>,
+) -> Result<String> {
+    // Prefer registry lookup — it knows that x-ai/grok-4 is openrouter
+    if let Some(reg) = registry {
+        if let Some(provider) = resolve_provider_from_registry(model, reg) {
+            return Ok(provider);
+        }
+    }
     if let Some(provider) = prefixed_council_provider(model) {
         return Ok(provider);
     }

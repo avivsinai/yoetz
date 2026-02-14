@@ -4,7 +4,8 @@ use crate::providers::{gemini, openai};
 use crate::{
     apply_capability_warnings, call_litellm, maybe_write_output, normalize_model_name,
     parse_media_input, parse_media_inputs, resolve_max_output_tokens, resolve_prompt,
-    resolve_registry_model_id, resolve_response_format, AppContext, AskArgs,
+    resolve_provider_from_registry, resolve_registry_model_id, resolve_response_format, AppContext,
+    AskArgs,
 };
 use crate::{budget, providers, registry};
 use std::env;
@@ -79,6 +80,12 @@ pub(crate) async fn handle_ask(
         .map(|m| normalize_model_name(&m));
     let provider_id = args.provider.clone().or(config.defaults.provider.clone());
     let registry_cache = registry::load_registry_cache().ok().flatten();
+    // Auto-resolve provider from registry (e.g. x-ai/grok-4 → openrouter)
+    let provider_id = provider_id.or_else(|| {
+        let model = model_id.as_deref()?;
+        let reg = registry_cache.as_ref()?;
+        resolve_provider_from_registry(model, reg)
+    });
     let registry_model_id = resolve_registry_model_id(
         provider_id.as_deref(),
         model_id.as_deref(),

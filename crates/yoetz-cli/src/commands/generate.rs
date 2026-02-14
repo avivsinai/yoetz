@@ -84,7 +84,7 @@ async fn handle_generate_image(
                 (result.outputs, result.usage)
             }
             "gemini" => {
-                let model_spec = build_model_spec(Some(&provider), &model)?;
+                let model_spec = build_model_spec(Some(&provider), &model, None)?;
                 let input_images = images
                     .iter()
                     .map(media_input_to_image_input_data)
@@ -110,7 +110,7 @@ async fn handle_generate_image(
             }
         }
     } else {
-        let model_spec = build_model_spec(Some(&provider), &model)?;
+        let model_spec = build_model_spec(Some(&provider), &model, None)?;
         let resp = ctx
             .litellm
             .image_generation(ImageRequest {

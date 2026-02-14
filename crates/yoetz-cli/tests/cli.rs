@@ -90,3 +90,55 @@ fn invalid_subcommand() {
         .failure()
         .stderr(predicate::str::contains("unrecognized subcommand"));
 }
+
+#[test]
+fn ask_em_dash_in_prompt_parses() {
+    // Verifies that em-dashes in --prompt don't cause argument parsing errors.
+    // The command will fail later (no API key / dry-run still needs provider),
+    // but it must NOT fail with "unexpected argument '' found".
+    let result = yoetz()
+        .args([
+            "ask",
+            "--prompt",
+            "summarize this \u{2014} and that",
+            "--dry-run",
+        ])
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("XAI_API_KEY")
+        .assert();
+    // Must not contain clap's argument parsing error
+    result.stderr(predicate::str::contains("unexpected argument").not());
+}
+
+#[test]
+fn bundle_em_dash_in_prompt_parses() {
+    // Bundle with em-dash should parse without argument errors.
+    // --all is required to avoid "files required" error.
+    let result = yoetz()
+        .args(["bundle", "--prompt", "review \u{2014} all code", "--all"])
+        .assert();
+    result.stderr(predicate::str::contains("unexpected argument").not());
+}
+
+#[test]
+fn council_em_dash_in_prompt_parses() {
+    let result = yoetz()
+        .args([
+            "council",
+            "--prompt",
+            "compare \u{2014} contrast",
+            "--dry-run",
+            "--models",
+            "test/model",
+        ])
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("XAI_API_KEY")
+        .assert();
+    result.stderr(predicate::str::contains("unexpected argument").not());
+}
