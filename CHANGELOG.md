@@ -5,18 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.2.3] - 2026-02-14
+## [0.2.4] - 2026-02-14
 
 ### Bug Fixes
 
-- Em-dash parsing (#13, #14) and model discovery (#12)
-- Wire auto-prefix through provider resolution (Codex review)
+- Em-dash parsing and model discovery (#12, #13, #14) (#15)
 
-### Miscellaneous
-
-- Regenerate CHANGELOG.md for CI
-
-## [0.2.3] - 2026-02-14
+## [0.2.3] - 2026-02-12
 
 ### Bug Fixes
 
