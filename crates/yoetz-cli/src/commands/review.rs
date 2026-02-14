@@ -4,8 +4,9 @@ use crate::ReviewResult;
 use crate::{budget, registry};
 use crate::{
     build_review_diff_prompt, build_review_file_prompt, call_litellm, git_diff, maybe_write_output,
-    normalize_model_name, read_text_file, resolve_max_output_tokens, resolve_registry_model_id,
-    resolve_response_format, AppContext, ReviewArgs, ReviewCommand, ReviewDiffArgs, ReviewFileArgs,
+    normalize_model_name, read_text_file, resolve_max_output_tokens,
+    resolve_provider_from_registry, resolve_registry_model_id, resolve_response_format, AppContext,
+    ReviewArgs, ReviewCommand, ReviewDiffArgs, ReviewFileArgs,
 };
 use std::path::PathBuf;
 use yoetz_core::bundle::estimate_tokens;
@@ -35,11 +36,6 @@ async fn handle_review_diff(
         args.response_schema.clone(),
         args.response_schema_name.clone(),
     )?;
-    let provider = args
-        .provider
-        .clone()
-        .or(config.defaults.provider.clone())
-        .ok_or_else(|| anyhow!("provider is required"))?;
     let model = normalize_model_name(
         &args
             .model
@@ -48,6 +44,16 @@ async fn handle_review_diff(
             .ok_or_else(|| anyhow!("model is required"))?,
     );
     let registry_cache = registry::load_registry_cache().ok().flatten();
+    // Auto-resolve provider from registry (e.g. x-ai/grok-4 → openrouter)
+    let provider = args
+        .provider
+        .clone()
+        .or(config.defaults.provider.clone())
+        .or_else(|| {
+            let reg = registry_cache.as_ref()?;
+            resolve_provider_from_registry(&model, reg)
+        })
+        .ok_or_else(|| anyhow!("provider is required"))?;
     let registry_id =
         resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
     let max_output_tokens = resolve_max_output_tokens(
@@ -181,11 +187,6 @@ async fn handle_review_file(
         args.response_schema.clone(),
         args.response_schema_name.clone(),
     )?;
-    let provider = args
-        .provider
-        .clone()
-        .or(config.defaults.provider.clone())
-        .ok_or_else(|| anyhow!("provider is required"))?;
     let model = normalize_model_name(
         &args
             .model
@@ -194,6 +195,16 @@ async fn handle_review_file(
             .ok_or_else(|| anyhow!("model is required"))?,
     );
     let registry_cache = registry::load_registry_cache().ok().flatten();
+    // Auto-resolve provider from registry (e.g. x-ai/grok-4 → openrouter)
+    let provider = args
+        .provider
+        .clone()
+        .or(config.defaults.provider.clone())
+        .or_else(|| {
+            let reg = registry_cache.as_ref()?;
+            resolve_provider_from_registry(&model, reg)
+        })
+        .ok_or_else(|| anyhow!("provider is required"))?;
     let registry_id =
         resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
     let max_output_tokens = resolve_max_output_tokens(

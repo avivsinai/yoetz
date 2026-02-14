@@ -1503,6 +1503,19 @@ async fn call_litellm(
     })
 }
 
+/// Look up a model in the registry and return its provider if the model
+/// contains a `/` (i.e. looks like `vendor/model`).
+pub(crate) fn resolve_provider_from_registry(
+    model: &str,
+    registry: &ModelRegistry,
+) -> Option<String> {
+    if !model.contains('/') {
+        return None;
+    }
+    let entry = registry.find(model)?;
+    entry.provider.clone()
+}
+
 fn build_model_spec(
     provider: Option<&str>,
     model: &str,
