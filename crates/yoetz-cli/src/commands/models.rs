@@ -1,7 +1,8 @@
 use anyhow::Result;
 
-use crate::{maybe_write_output, registry, AppContext, ModelsArgs, ModelsCommand};
+use crate::{maybe_write_output, registry, AppContext, ModelsArgs, ModelsCommand, ModelsListArgs};
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
+use yoetz_core::registry::ModelRegistry;
 
 pub(crate) async fn handle_models(
     ctx: &AppContext,
@@ -9,15 +10,17 @@ pub(crate) async fn handle_models(
     format: OutputFormat,
 ) -> Result<()> {
     match args.command {
-        ModelsCommand::List => {
+        ModelsCommand::List(list_args) => {
             let registry = registry::load_registry_cache()?.unwrap_or_default();
-            maybe_write_output(ctx, &registry)?;
+            let filtered = filter_registry(&registry, &list_args);
+            maybe_write_output(ctx, &filtered)?;
             match format {
-                OutputFormat::Json => write_json(&registry),
-                OutputFormat::Jsonl => write_jsonl("models_list", &registry),
+                OutputFormat::Json => write_json(&filtered),
+                OutputFormat::Jsonl => write_jsonl("models_list", &filtered),
                 OutputFormat::Text | OutputFormat::Markdown => {
-                    for model in registry.models {
-                        println!("{}", model.id);
+                    for model in &filtered.models {
+                        let provider = model.provider.as_deref().unwrap_or("-");
+                        println!("{:<14}{}", provider, model.id);
                     }
                     Ok(())
                 }
@@ -52,4 +55,38 @@ pub(crate) async fn handle_models(
             }
         }
     }
+}
+
+fn filter_registry(registry: &ModelRegistry, args: &ModelsListArgs) -> ModelRegistry {
+    let has_filter = args.search.is_some() || args.provider.is_some();
+    if !has_filter {
+        return registry.clone();
+    }
+    let search_lower = args.search.as_deref().map(|s| s.to_lowercase());
+    let provider_lower = args.provider.as_deref().map(|p| p.to_lowercase());
+    let models: Vec<_> = registry
+        .models
+        .iter()
+        .filter(|m| {
+            if let Some(ref search) = search_lower {
+                if !m.id.to_lowercase().contains(search.as_str()) {
+                    return false;
+                }
+            }
+            if let Some(ref prov) = provider_lower {
+                match m.provider.as_deref() {
+                    Some(p) if p.to_lowercase() == *prov => {}
+                    _ => return false,
+                }
+            }
+            true
+        })
+        .cloned()
+        .collect();
+    let mut filtered = ModelRegistry::default();
+    filtered.version = registry.version;
+    filtered.updated_at = registry.updated_at.clone();
+    filtered.models = models;
+    filtered.rebuild_index();
+    filtered
 }

@@ -92,7 +92,7 @@ enum Commands {
 
 #[derive(Args)]
 struct AskArgs {
-    #[arg(short, long)]
+    #[arg(short, long, allow_hyphen_values = true)]
     prompt: Option<String>,
 
     #[arg(long)]
@@ -163,7 +163,7 @@ struct AskArgs {
 
 #[derive(Args)]
 struct BundleArgs {
-    #[arg(short, long)]
+    #[arg(short, long, allow_hyphen_values = true)]
     prompt: Option<String>,
 
     #[arg(long)]
@@ -244,7 +244,7 @@ struct BrowserSyncCookiesArgs {
 
 #[derive(Args)]
 struct CouncilArgs {
-    #[arg(short, long)]
+    #[arg(short, long, allow_hyphen_values = true)]
     prompt: Option<String>,
 
     #[arg(long)]
@@ -334,7 +334,7 @@ enum GenerateCommand {
 
 #[derive(Args)]
 struct GenerateImageArgs {
-    #[arg(short, long)]
+    #[arg(short, long, allow_hyphen_values = true)]
     prompt: Option<String>,
 
     #[arg(long)]
@@ -377,7 +377,7 @@ struct GenerateImageArgs {
 
 #[derive(Args)]
 struct GenerateVideoArgs {
-    #[arg(short, long)]
+    #[arg(short, long, allow_hyphen_values = true)]
     prompt: Option<String>,
 
     #[arg(long)]
@@ -423,7 +423,7 @@ struct GenerateVideoArgs {
 
 #[derive(Args)]
 struct ReviewDiffArgs {
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     prompt: Option<String>,
 
     #[arg(long)]
@@ -468,7 +468,7 @@ struct ReviewFileArgs {
     #[arg(long)]
     path: PathBuf,
 
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     prompt: Option<String>,
 
     #[arg(long)]
@@ -516,8 +516,19 @@ struct ModelsArgs {
 
 #[derive(Subcommand)]
 enum ModelsCommand {
-    List,
+    List(ModelsListArgs),
     Sync,
+}
+
+#[derive(Args)]
+struct ModelsListArgs {
+    /// Filter models by substring match on ID
+    #[arg(long, short = 's')]
+    search: Option<String>,
+
+    /// Filter by provider name
+    #[arg(long)]
+    provider: Option<String>,
 }
 
 #[derive(Args)]
@@ -1350,6 +1361,85 @@ mod tests {
     }
 
     #[test]
+    fn resolve_prompt_preserves_em_dash() {
+        let input = "Summarize this — and that".to_string();
+        let result = resolve_prompt(Some(input.clone()), None).unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn resolve_prompt_preserves_unicode_dashes() {
+        // em-dash U+2014, en-dash U+2013, horizontal bar U+2015, minus sign U+2212
+        let input = "a\u{2014}b \u{2013} c \u{2015} d \u{2212} e".to_string();
+        let result = resolve_prompt(Some(input.clone()), None).unwrap();
+        assert_eq!(result, input);
+    }
+
+    #[test]
+    fn build_model_spec_auto_prefix_openrouter() {
+        let mut registry = ModelRegistry::default();
+        registry.models.push(yoetz_core::registry::ModelEntry {
+            id: "x-ai/grok-4".to_string(),
+            context_length: None,
+            max_output_tokens: None,
+            pricing: Default::default(),
+            provider: Some("openrouter".to_string()),
+            capability: None,
+        });
+        registry.rebuild_index();
+        let result = build_model_spec(None, "x-ai/grok-4", Some(&registry)).unwrap();
+        assert_eq!(result, "openrouter/x-ai/grok-4");
+    }
+
+    #[test]
+    fn build_model_spec_no_registry_passthrough() {
+        let result = build_model_spec(None, "x-ai/grok-4", None).unwrap();
+        assert_eq!(result, "x-ai/grok-4");
+    }
+
+    #[test]
+    fn build_model_spec_not_in_registry_passthrough() {
+        let registry = ModelRegistry::default();
+        let result = build_model_spec(None, "unknown/model", Some(&registry)).unwrap();
+        assert_eq!(result, "unknown/model");
+    }
+
+    #[test]
+    fn build_model_spec_non_openrouter_no_prefix() {
+        let mut registry = ModelRegistry::default();
+        registry.models.push(yoetz_core::registry::ModelEntry {
+            id: "gemini/gemini-3-pro-preview".to_string(),
+            context_length: None,
+            max_output_tokens: None,
+            pricing: Default::default(),
+            provider: Some("gemini".to_string()),
+            capability: None,
+        });
+        registry.rebuild_index();
+        // Model with non-openrouter provider should NOT be auto-prefixed
+        let result =
+            build_model_spec(None, "gemini/gemini-3-pro-preview", Some(&registry)).unwrap();
+        assert_eq!(result, "gemini/gemini-3-pro-preview");
+    }
+
+    #[test]
+    fn build_model_spec_no_slash_no_prefix() {
+        let mut registry = ModelRegistry::default();
+        registry.models.push(yoetz_core::registry::ModelEntry {
+            id: "gpt-5.2".to_string(),
+            context_length: None,
+            max_output_tokens: None,
+            pricing: Default::default(),
+            provider: Some("openrouter".to_string()),
+            capability: None,
+        });
+        registry.rebuild_index();
+        // Model without slash should NOT be auto-prefixed even if in registry
+        let result = build_model_spec(None, "gpt-5.2", Some(&registry)).unwrap();
+        assert_eq!(result, "gpt-5.2");
+    }
+
+    #[test]
     fn read_text_file_truncates_utf8_safely() {
         let text = "hello 🙂 world";
         let bytes = text.as_bytes();
@@ -1380,7 +1470,7 @@ async fn call_litellm(
     images: &[MediaInput],
     video: Option<&MediaInput>,
 ) -> Result<CallResult> {
-    let model_spec = build_model_spec(provider, model)?;
+    let model_spec = build_model_spec(provider, model, None)?;
     let mut req = ChatRequest::new(model_spec).temperature(temperature);
     if let Some(max) = max_output_tokens {
         req = req.max_tokens(max as u32);
@@ -1413,8 +1503,22 @@ async fn call_litellm(
     })
 }
 
-fn build_model_spec(provider: Option<&str>, model: &str) -> Result<String> {
+fn build_model_spec(
+    provider: Option<&str>,
+    model: &str,
+    registry: Option<&ModelRegistry>,
+) -> Result<String> {
     let Some(provider) = provider else {
+        // If model has a slash and exists in registry as an openrouter model, auto-prefix
+        if model.contains('/') {
+            if let Some(reg) = registry {
+                if let Some(entry) = reg.find(model) {
+                    if entry.provider.as_deref() == Some("openrouter") {
+                        return Ok(format!("openrouter/{model}"));
+                    }
+                }
+            }
+        }
         return Ok(model.to_string());
     };
     let provider_lc = provider.to_lowercase();
