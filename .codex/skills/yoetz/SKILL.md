@@ -47,6 +47,30 @@ Prefer Homebrew when available — pre-built binaries, fastest install.
 - Set `YOETZ_AGENT=1` environment variable
 - Parse JSON results and present summary to user
 - For large bundles, run `yoetz bundle` first to inspect size
+- Always resolve uncertain model IDs with `yoetz models resolve` before calling
+
+## Model Discovery
+
+Before using an unfamiliar model ID, resolve it against the synced registry:
+
+```bash
+yoetz models resolve "grok-4.1" --format json
+```
+
+Example output:
+```json
+[{"id":"x-ai/grok-4","score":800,"provider":"openrouter","context_length":131072,"max_output_tokens":16384}]
+```
+
+If the registry is stale or empty, sync first:
+```bash
+yoetz models sync
+```
+
+Search for models by keyword:
+```bash
+yoetz models list -s claude --format json
+```
 
 ## Quick Reference
 
@@ -58,6 +82,8 @@ Prefer Homebrew when available — pre-built binaries, fastest install.
 | Review file | `yoetz review file --path src/main.rs --format json` |
 | Bundle files | `yoetz bundle -p "context" -f src/**/*.rs --format json` |
 | Generate image | `yoetz generate image -p "description" --provider openai --model gpt-image-1 --format json` |
+| Resolve model ID | `yoetz models resolve "grok-4.1" --format json` |
+| Search models | `yoetz models list -s claude --format json` |
 | Estimate cost | `yoetz pricing estimate --model gpt-5.2 --input-tokens 1000 --output-tokens 500` |
 
 ## Council (Multi-Model Consensus)
