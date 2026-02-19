@@ -91,6 +91,9 @@ pub(crate) async fn handle_ask(
         model_id.as_deref(),
         registry_cache.as_ref(),
     );
+    if let Some(ref reg_id) = registry_model_id {
+        crate::validate_model_or_suggest(reg_id, registry_cache.as_ref())?;
+    }
     let max_output_tokens = resolve_max_output_tokens(
         args.max_output_tokens,
         config,

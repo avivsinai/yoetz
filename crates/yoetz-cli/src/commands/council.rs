@@ -81,6 +81,14 @@ pub(crate) async fn handle_council(
         .as_ref()
         .map(|b| b.stats.estimated_tokens)
         .unwrap_or_else(|| estimate_tokens(prompt.len()));
+    // Validate each model against registry
+    for (model, _provider) in &resolved_models {
+        let reg_id =
+            resolve_registry_model_id(Some(_provider), Some(model), registry_cache.as_ref());
+        if let Some(ref id) = reg_id {
+            crate::validate_model_or_suggest(id, registry_cache.as_ref())?;
+        }
+    }
     // Resolve registry IDs up front so we can derive model-aware max_output_tokens
     let resolved_registry_ids: Vec<Option<String>> = resolved_models
         .iter()

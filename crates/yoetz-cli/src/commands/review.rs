@@ -56,6 +56,9 @@ async fn handle_review_diff(
         .ok_or_else(|| anyhow!("provider is required"))?;
     let registry_id =
         resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
+    if let Some(ref reg_id) = registry_id {
+        crate::validate_model_or_suggest(reg_id, registry_cache.as_ref())?;
+    }
     let max_output_tokens = resolve_max_output_tokens(
         args.max_output_tokens,
         config,
@@ -207,6 +210,9 @@ async fn handle_review_file(
         .ok_or_else(|| anyhow!("provider is required"))?;
     let registry_id =
         resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
+    if let Some(ref reg_id) = registry_id {
+        crate::validate_model_or_suggest(reg_id, registry_cache.as_ref())?;
+    }
     let max_output_tokens = resolve_max_output_tokens(
         args.max_output_tokens,
         config,

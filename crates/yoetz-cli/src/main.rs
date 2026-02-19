@@ -19,6 +19,7 @@ use std::time::Duration;
 mod browser;
 mod budget;
 mod commands;
+mod fuzzy;
 mod http;
 mod providers;
 mod registry;
@@ -518,17 +519,29 @@ struct ModelsArgs {
 enum ModelsCommand {
     List(ModelsListArgs),
     Sync,
+    /// Fuzzy-resolve a model ID query against the registry
+    Resolve(ModelsResolveArgs),
 }
 
 #[derive(Args)]
 struct ModelsListArgs {
-    /// Filter models by substring match on ID
+    /// Fuzzy-search models by ID (ranked by relevance)
     #[arg(long, short = 's')]
     search: Option<String>,
 
     /// Filter by provider name
     #[arg(long)]
     provider: Option<String>,
+}
+
+#[derive(Args)]
+struct ModelsResolveArgs {
+    /// The model ID query to resolve (e.g. "grok-4.1", "claude-sonnet")
+    query: String,
+
+    /// Maximum number of results to return
+    #[arg(long, short = 'n', default_value = "5")]
+    max_results: usize,
 }
 
 #[derive(Args)]
@@ -1457,6 +1470,35 @@ mod tests {
         assert!(content.starts_with("hello "));
         let _ = fs::remove_file(path);
     }
+}
+
+/// Validate a model ID against the registry, returning an error with suggestions
+/// if the model is not found but close matches exist.
+pub(crate) fn validate_model_or_suggest(
+    model_id: &str,
+    registry: Option<&yoetz_core::registry::ModelRegistry>,
+) -> Result<()> {
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    // Exact match found — all good
+    if registry.find(model_id).is_some() {
+        return Ok(());
+    }
+    // Try fuzzy search
+    let matches = fuzzy::fuzzy_search(registry, model_id, 3);
+    if matches.is_empty() {
+        // No matches at all — don't block; the model might just not be synced
+        return Ok(());
+    }
+    let suggestions: Vec<String> = matches.iter().map(|m| m.id.clone()).collect();
+    Err(anyhow!(
+        "model '{}' not found in registry. Did you mean: {}?\n\
+         Hint: run `yoetz models resolve {}` to search, or `yoetz models sync` to update the registry.",
+        model_id,
+        suggestions.join(", "),
+        model_id,
+    ))
 }
 
 async fn call_litellm(
