@@ -160,7 +160,7 @@ cat "$BUNDLE"
 **For browser workflows**, pass the bundle.md path:
 ```bash
 BUNDLE=$(yoetz bundle -p "Review" -f src/*.rs --format json | jq -r .artifacts.bundle_md)
-yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle "$BUNDLE"
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 ```
 
 ## Browser Fallback (Experimental)
@@ -221,7 +221,7 @@ yoetz browser check
 BUNDLE=$(yoetz bundle -p "Review this code" -f src/*.rs --format json | jq -r .artifacts.bundle_md)
 
 # Send to ChatGPT
-yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle "$BUNDLE"
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 ```
 
 ### Combined workflow: API + Browser
@@ -233,8 +233,49 @@ yoetz council -p "Review" -f src/*.rs \
 
 # Then get ChatGPT Pro opinion
 BUNDLE=$(yoetz bundle -p "Review" -f src/*.rs --format json | jq -r .artifacts.bundle_md)
-yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle "$BUNDLE"
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 ```
+
+### Recipe name resolution
+
+Recipes can be specified by name (resolved from installed locations) or by path:
+
+```bash
+# By name (searches Homebrew share, XDG, etc.)
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
+
+# By explicit path
+yoetz browser recipe --recipe ./my-recipes/custom.yaml --bundle "$BUNDLE"
+```
+
+Built-in recipes: `chatgpt`, `claude`, `gemini`.
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `extract-cookies.mjs not found` | Run `npm install -g @steipete/sweet-cookie` and `brew reinstall yoetz` (v0.2.6+) |
+| `cookie extraction failed` | Ensure Node >= 22, log into ChatGPT in real Chrome, close Chrome, retry |
+| `cloudflare challenge detected` | Re-sync: log into ChatGPT in Chrome, close Chrome, `yoetz browser sync-cookies` |
+| `chatgpt login required` | Run `yoetz browser login` for manual auth, or sync cookies |
+| `agent-browser failed` | Ensure `npx agent-browser --version` works, or `npm install -g agent-browser` |
+| Recipe not found | Use `--recipe chatgpt` (name) or full path. Check `brew --prefix`/share/yoetz/recipes/ |
+
+### Claude-in-Chrome MCP Fallback
+
+When `yoetz browser` pipeline fails (agent-browser issues, cookie extraction errors), use Claude-in-Chrome MCP tools directly:
+
+1. **Create bundle**: `yoetz bundle -p "Review" -f src/**/*.ts --format json`
+2. **Copy to clipboard as file**: Use macOS `osascript` to put the bundle.md on clipboard:
+   ```bash
+   osascript -e 'set the clipboard to POSIX file "/path/to/bundle.md"'
+   ```
+3. **Navigate to ChatGPT**: Use `mcp__claude-in-chrome__navigate` to open chatgpt.com
+4. **Paste file**: Click the input area, then Cmd+V to paste the file from clipboard
+5. **Type prompt**: Use `mcp__claude-in-chrome__form_input` or `computer` tool to type the review prompt
+6. **Wait and extract**: Use `mcp__claude-in-chrome__get_page_text` to extract the response
+
+This bypasses agent-browser entirely and works with any browser-based LLM the user is logged into.
 
 ### How it works
 

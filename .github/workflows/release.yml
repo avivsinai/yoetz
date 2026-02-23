@@ -75,8 +75,12 @@ jobs:
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../yoetz-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
+          cp -r scripts staging/scripts
+          cp -r recipes staging/recipes
+          cd staging
+          tar czf ../yoetz-${{ matrix.target }}.tar.gz ${{ matrix.artifact }} scripts recipes
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -157,18 +161,10 @@ jobs:
               if Hardware::CPU.intel?
                 url "https://github.com/avivsinai/yoetz/releases/download/${TAG}/yoetz-x86_64-apple-darwin.tar.gz"
                 sha256 "${SHA_X86_MAC}"
-
-                def install
-                  bin.install "yoetz"
-                end
               end
               if Hardware::CPU.arm?
                 url "https://github.com/avivsinai/yoetz/releases/download/${TAG}/yoetz-aarch64-apple-darwin.tar.gz"
                 sha256 "${SHA_ARM_MAC}"
-
-                def install
-                  bin.install "yoetz"
-                end
               end
             end
 
@@ -176,19 +172,17 @@ jobs:
               if Hardware::CPU.intel? && Hardware::CPU.is_64_bit?
                 url "https://github.com/avivsinai/yoetz/releases/download/${TAG}/yoetz-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "${SHA_X86_LINUX}"
-
-                def install
-                  bin.install "yoetz"
-                end
               end
               if Hardware::CPU.arm? && Hardware::CPU.is_64_bit?
                 url "https://github.com/avivsinai/yoetz/releases/download/${TAG}/yoetz-aarch64-unknown-linux-gnu.tar.gz"
                 sha256 "${SHA_ARM_LINUX}"
-
-                def install
-                  bin.install "yoetz"
-                end
               end
+            end
+
+            def install
+              bin.install "yoetz"
+              (share/"yoetz/scripts").install Dir["scripts/*"]
+              (share/"yoetz/recipes").install Dir["recipes/*"]
             end
 
             test do

@@ -372,60 +372,97 @@ pub fn sync_cookies(profile_dir: &Path) -> Result<(usize, Vec<String>)> {
     Ok((cookie_count, warnings))
 }
 
-fn find_extract_script() -> Result<PathBuf> {
-    // Check YOETZ_SCRIPTS_DIR env var
-    if let Ok(dir) = env::var("YOETZ_SCRIPTS_DIR") {
-        let path = PathBuf::from(dir).join("extract-cookies.mjs");
-        if path.exists() {
-            return Ok(path);
+/// Search for a yoetz data file (script or recipe) across standard locations.
+/// Order: YOETZ_SCRIPTS_DIR env, relative to exe, Homebrew share, XDG, ~/.local/share.
+fn find_data_file(subdir: &str, filename: &str) -> Result<PathBuf> {
+    // Check YOETZ_SCRIPTS_DIR env var (legacy, works for scripts)
+    if subdir == "scripts" {
+        if let Ok(dir) = env::var("YOETZ_SCRIPTS_DIR") {
+            let path = PathBuf::from(dir).join(filename);
+            if path.exists() {
+                return Ok(path);
+            }
         }
     }
 
-    // Check relative to current exe
+    // Check relative to current exe (development builds)
     if let Ok(exe) = env::current_exe() {
-        // Try ../../../scripts/ (for development: target/debug/yoetz -> scripts/)
         if let Some(parent) = exe.parent() {
             for ancestor in [
-                parent.join("scripts"),
-                parent.join("../scripts"),
-                parent.join("../../scripts"),
-                parent.join("../../../scripts"),
+                parent.join(subdir),
+                parent.join(format!("../{subdir}")),
+                parent.join(format!("../../{subdir}")),
+                parent.join(format!("../../../{subdir}")),
             ] {
-                let path = ancestor.join("extract-cookies.mjs");
+                let path = ancestor.join(filename);
                 if path.exists() {
                     return Ok(path.canonicalize()?);
                 }
             }
+
+            // Check Homebrew share dir (relative to exe: ../share/yoetz/)
+            let brew_share = parent.join("../share/yoetz").join(subdir).join(filename);
+            if brew_share.exists() {
+                return Ok(brew_share.canonicalize()?);
+            }
+        }
+    }
+
+    // Check well-known Homebrew prefixes
+    for prefix in ["/opt/homebrew/share/yoetz", "/usr/local/share/yoetz"] {
+        let path = PathBuf::from(prefix).join(subdir).join(filename);
+        if path.exists() {
+            return Ok(path);
         }
     }
 
     // Check in XDG data dir
     if let Ok(xdg) = env::var("XDG_DATA_HOME") {
-        let path = PathBuf::from(xdg)
-            .join("yoetz")
-            .join("scripts")
-            .join("extract-cookies.mjs");
+        let path = PathBuf::from(xdg).join("yoetz").join(subdir).join(filename);
         if path.exists() {
             return Ok(path);
         }
     }
 
-    // Check ~/.local/share/yoetz/scripts/
+    // Check ~/.local/share/yoetz/
     if let Some(home) = home_dir() {
         let path = home
             .join(".local")
             .join("share")
             .join("yoetz")
-            .join("scripts")
-            .join("extract-cookies.mjs");
+            .join(subdir)
+            .join(filename);
         if path.exists() {
             return Ok(path);
         }
     }
 
     Err(anyhow!(
-        "extract-cookies.mjs not found. Set YOETZ_SCRIPTS_DIR or install yoetz properly."
+        "{filename} not found in {subdir}/. Set YOETZ_SCRIPTS_DIR or reinstall yoetz (brew reinstall yoetz)."
     ))
+}
+
+fn find_extract_script() -> Result<PathBuf> {
+    find_data_file("scripts", "extract-cookies.mjs")
+}
+
+/// Resolve a recipe path. If the path exists as-is, use it. Otherwise treat it
+/// as a recipe name and search in standard locations (e.g. "chatgpt" -> "chatgpt.yaml").
+pub fn resolve_recipe(path: &Path) -> Result<PathBuf> {
+    // Absolute or relative path that exists — use directly
+    if path.exists() {
+        return Ok(path.to_path_buf());
+    }
+
+    // Treat as a recipe name: try with .yaml extension
+    let name = path.to_string_lossy();
+    let filename = if name.ends_with(".yaml") || name.ends_with(".yml") {
+        name.to_string()
+    } else {
+        format!("{name}.yaml")
+    };
+
+    find_data_file("recipes", &filename)
 }
 
 pub fn check_auth(profile_dir: &Path, headed: bool) -> Result<()> {
