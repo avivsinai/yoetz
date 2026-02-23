@@ -5,7 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.2.5] - 2026-02-19
+## [0.2.5] - 2026-02-23
+
+### Bug Fixes
+
+- **browser**: Ship scripts/recipes in Homebrew and resolve by name
+
+### Documentation
+
+- **changelog**: Add unreleased entry for Homebrew scripts/recipes fix
+
+## [0.2.5] - 2026-02-23
 
 ### Features
 
