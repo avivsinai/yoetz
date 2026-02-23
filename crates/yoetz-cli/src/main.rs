@@ -869,15 +869,16 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             }
         }
         BrowserCommand::Recipe(recipe_args) => {
-            let content = fs::read_to_string(&recipe_args.recipe)
-                .with_context(|| format!("read recipe {}", recipe_args.recipe.display()))?;
+            let recipe_path = browser::resolve_recipe(&recipe_args.recipe)
+                .with_context(|| format!("resolve recipe {:?}", recipe_args.recipe))?;
+            let content = fs::read_to_string(&recipe_path)
+                .with_context(|| format!("read recipe {}", recipe_path.display()))?;
             let recipe: browser::Recipe = serde_yaml::from_str(&content)?;
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.config, recipe_args.profile.as_ref())?;
             let recipe_name = recipe.name.as_deref().unwrap_or("");
             let needs_auth = recipe_name.eq_ignore_ascii_case("chatgpt")
-                || recipe_args
-                    .recipe
+                || recipe_path
                     .to_string_lossy()
                     .to_lowercase()
                     .contains("chatgpt");
