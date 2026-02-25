@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Miscellaneous
 
 - **deps**: Bump litellm-rust from `c6c7553` to `178e728`
+- **deps**: Bump the minor-and-patch group with 5 updates
 
 ## [0.2.6] - 2026-02-25
 
@@ -128,4 +129,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Hardening
 
 - Gemini inline limit and config
-
