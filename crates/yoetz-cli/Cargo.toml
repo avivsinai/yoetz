@@ -36,13 +36,13 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "multipart",
 ] }
-tokio = { version = "1.36", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time"] }
 serde_yaml = "0.9"
-tempfile = "3.10"
+tempfile = "3.26"
 jsonschema = "0.44"
 fs2 = "0.4"
 
 [dev-dependencies]
-serial_test = "3.0"
+serial_test = "3.4"
 assert_cmd = "2.0"
 predicates = "3.1"
