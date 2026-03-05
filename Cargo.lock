@@ -1023,7 +1023,7 @@ checksum = "df1d3c3b53da64cf5760482273a98e575c651a67eec7f77df96b5b642de8f039"
 [[package]]
 name = "litellm-rust"
 version = "0.1.1"
-source = "git+https://github.com/avivsinai/litellm-rust?branch=main#c6c7553afc30cc30d9c8aa051edc9bfd14e689f7"
+source = "git+https://github.com/avivsinai/litellm-rust?branch=main#178e728196623868a719fb583e2137e15af60170"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1035,7 +1035,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-util",
 ]
