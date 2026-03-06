@@ -43,6 +43,7 @@ commit_parsers = [
     { message = "^chore\\(release\\)", skip = true },
     { message = "^chore: bump version", skip = true },
     { message = "^chore: update Cargo\\.lock", skip = true },
+    { message = "^chore: regenerate CHANGELOG", skip = true },
     { message = "^chore", group = "Miscellaneous" },
 ]
 protect_breaking_commits = false
