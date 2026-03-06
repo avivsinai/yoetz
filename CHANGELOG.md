@@ -5,13 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.2.6] - 2026-02-25
+## [0.2.6] - 2026-03-05
+
+### CI/CD
+
+- Decouple MSRV rust-toolchain action ref from Rust version
 
 ### Miscellaneous
 
 - **deps**: Bump litellm-rust from `c6c7553` to `178e728`
+- **deps**: Bump jsonschema from 0.41.0 to 0.42.1
+- **deps**: Bump toml from 0.9.11+spec-1.1.0 to 1.0.3+spec-1.1.0
+- **deps**: Bump the minor-and-patch group across 1 directory with 6 updates
 
-## [0.2.6] - 2026-02-25
+## [0.2.6] - 2026-03-05
 
 ### Bug Fixes
 
