@@ -38,11 +38,11 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros", "time"] }
 serde_yaml = "0.9"
-tempfile = "3.26"
+tempfile = "3.27"
 jsonschema = "0.44"
 fs2 = "0.4"
 
 [dev-dependencies]
 serial_test = "3.4"
-assert_cmd = "2.0"
+assert_cmd = "2.2"
 predicates = "3.1"
