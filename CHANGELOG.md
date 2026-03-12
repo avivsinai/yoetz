@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.2.6] - 2026-03-06
+## [0.2.7] - 2026-03-12
+
+### Bug Fixes
+
+- Harden browser cookie sync and recipe defaults
 
 ### CI/CD
 
@@ -18,7 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **deps**: Bump toml from 0.9.11+spec-1.1.0 to 1.0.3+spec-1.1.0
 - **deps**: Bump the minor-and-patch group across 1 directory with 6 updates
 
-## [0.2.6] - 2026-03-06
+## [0.2.6] - 2026-02-23
 
 ### Bug Fixes
 
