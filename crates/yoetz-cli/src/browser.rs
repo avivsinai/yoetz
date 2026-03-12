@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,10 +19,26 @@ const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7
 
 /// Browser launch args to disable automation detection
 const STEALTH_ARGS: &str = "--disable-blink-features=AutomationControlled";
+const COOKIE_SYNC_TIMEOUT_MS: &str = "30000";
+const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
+    major: 24,
+    minor: 4,
+    patch: 0,
+};
+const MACOS_KEYCHAIN_GUIDANCE: &str =
+    "If macOS shows a Keychain prompt for Chrome Safe Storage, click Always Allow.";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct NodeVersion {
+    major: u32,
+    minor: u32,
+    patch: u32,
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Recipe {
     pub name: Option<String>,
+    pub defaults: Option<BTreeMap<String, String>>,
     pub steps: Vec<RecipeStep>,
 }
 
@@ -38,6 +55,7 @@ pub struct RecipeContext {
     pub profile_dir: Option<PathBuf>,
     pub use_stealth: bool,
     pub headed: bool,
+    pub vars: BTreeMap<String, String>,
 }
 
 /// Cached agent-browser resolution. Probed once per process, reused for all calls.
@@ -332,16 +350,16 @@ pub fn maybe_load_state(profile_dir: &Path, use_stealth: bool) -> Result<bool> {
 /// in Playwright storageState format for agent-browser to use.
 pub fn sync_cookies(profile_dir: &Path) -> Result<(usize, Vec<String>)> {
     fs::create_dir_all(profile_dir).with_context(|| format!("create {}", profile_dir.display()))?;
+    ensure_supported_node_for_cookie_sync()?;
 
     let state_file = state_file(profile_dir);
 
     // Find the extract script relative to the yoetz binary or in known locations
     let script_path = find_extract_script()?;
 
+    let args = cookie_sync_script_args(&script_path, &state_file);
     let output = Command::new("node")
-        .arg(&script_path)
-        .arg("--output")
-        .arg(&state_file)
+        .args(&args)
         .output()
         .with_context(|| "failed to run extract-cookies.mjs")?;
 
@@ -369,7 +387,32 @@ pub fn sync_cookies(profile_dir: &Path) -> Result<(usize, Vec<String>)> {
         .map(|arr| arr.len())
         .unwrap_or(0);
 
+    if let Err(err) = validate_cookie_sync_result(cookie_count, &warnings) {
+        let _ = fs::remove_file(&state_file);
+        return Err(err);
+    }
+
     Ok((cookie_count, warnings))
+}
+
+pub fn cookie_sync_guidance() -> Option<&'static str> {
+    if cfg!(target_os = "macos") {
+        Some(MACOS_KEYCHAIN_GUIDANCE)
+    } else {
+        None
+    }
+}
+
+pub fn build_recipe_vars(
+    defaults: Option<&BTreeMap<String, String>>,
+    entries: &[String],
+) -> Result<BTreeMap<String, String>> {
+    let mut vars = defaults.cloned().unwrap_or_default();
+    for entry in entries {
+        let (key, value) = parse_recipe_var(entry)?;
+        vars.insert(key, value);
+    }
+    Ok(vars)
 }
 
 /// Search for a yoetz data file (script or recipe) across standard locations.
@@ -444,6 +487,85 @@ fn find_data_file(subdir: &str, filename: &str) -> Result<PathBuf> {
 
 fn find_extract_script() -> Result<PathBuf> {
     find_data_file("scripts", "extract-cookies.mjs")
+}
+
+fn cookie_sync_script_args(script_path: &Path, state_file: &Path) -> Vec<String> {
+    vec![
+        script_path.to_string_lossy().to_string(),
+        "--output".to_string(),
+        state_file.to_string_lossy().to_string(),
+        "--timeout-ms".to_string(),
+        COOKIE_SYNC_TIMEOUT_MS.to_string(),
+        "--browsers".to_string(),
+        "chrome".to_string(),
+    ]
+}
+
+fn ensure_supported_node_for_cookie_sync() -> Result<()> {
+    let output = Command::new("node")
+        .arg("--version")
+        .output()
+        .with_context(|| {
+            "failed to run `node --version` (browser cookie sync requires Node 24.4+)"
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "browser cookie sync requires Node 24.4+, but `node --version` failed: {}",
+            stderr.trim()
+        ));
+    }
+
+    let version = parse_node_version(String::from_utf8_lossy(&output.stdout).trim())
+        .ok_or_else(|| anyhow!("could not parse Node version from `node --version` output"))?;
+
+    if node_version_supported(version) {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "browser cookie sync requires Node 24.4+ because Chrome cookie timestamps overflow older node:sqlite builds. Detected Node {}.{}.{}.\n\nUpgrade Node and retry.",
+        version.major,
+        version.minor,
+        version.patch
+    ))
+}
+
+fn parse_node_version(raw: &str) -> Option<NodeVersion> {
+    let trimmed = raw.trim().trim_start_matches('v');
+    let mut parts = trimmed.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().ok()?;
+    let patch = parts.next().unwrap_or("0").parse().ok()?;
+    Some(NodeVersion {
+        major,
+        minor,
+        patch,
+    })
+}
+
+fn node_version_supported(version: NodeVersion) -> bool {
+    version >= COOKIE_SYNC_NODE_MIN_VERSION
+}
+
+fn validate_cookie_sync_result(cookie_count: usize, warnings: &[String]) -> Result<()> {
+    if cookie_count > 0 {
+        return Ok(());
+    }
+
+    let mut message =
+        "Chrome cookie sync found 0 cookies. Make sure ChatGPT is logged into Chrome, then fully quit Chrome and try again.".to_string();
+    if let Some(guidance) = cookie_sync_guidance() {
+        message.push_str("\n\n");
+        message.push_str(guidance);
+    }
+    if !warnings.is_empty() {
+        message.push_str("\n\nWarnings: ");
+        message.push_str(&warnings.join("; "));
+    }
+
+    Err(anyhow!(message))
 }
 
 /// Resolve a recipe path. If the path exists as-is, use it. Otherwise treat it
@@ -567,7 +689,7 @@ fn expand_step(
 
     let mut command = vec![action.to_string()];
     for arg in args {
-        command.push(interpolate(arg, ctx, None));
+        command.push(interpolate(arg, ctx, None)?);
     }
     Ok(vec![command])
 }
@@ -590,9 +712,9 @@ fn expand_bundle_text_step(
                 "find step requires locator, value, action, and text"
             ));
         }
-        let locator = interpolate(&args[0], ctx, None);
-        let value = interpolate(&args[1], ctx, None);
-        let first_action = interpolate(&args[2], ctx, None);
+        let locator = interpolate(&args[0], ctx, None)?;
+        let value = interpolate(&args[1], ctx, None)?;
+        let first_action = interpolate(&args[2], ctx, None)?;
         let follow_action = if first_action == "fill" {
             "type".to_string()
         } else {
@@ -626,7 +748,7 @@ fn expand_bundle_text_step(
         if args.len() < 2 {
             return Err(anyhow!("{action} step requires selector and text"));
         }
-        let selector = interpolate(&args[0], ctx, None);
+        let selector = interpolate(&args[0], ctx, None)?;
         let mut commands = Vec::new();
         commands.push(vec![
             action.to_string(),
@@ -641,7 +763,7 @@ fn expand_bundle_text_step(
 
     let mut command = vec![action.to_string()];
     for arg in args {
-        command.push(interpolate(arg, ctx, Some(text)));
+        command.push(interpolate(arg, ctx, Some(text))?);
     }
     Ok(vec![command])
 }
@@ -666,7 +788,7 @@ fn chunk_text(text: &str, max_bytes: usize) -> Vec<String> {
     chunks
 }
 
-fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> String {
+fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> Result<String> {
     let mut out = value.to_string();
     if let Some(path) = &ctx.bundle_path {
         out = out.replace("{{bundle_path}}", path);
@@ -674,5 +796,138 @@ fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> S
     if let Some(text) = bundle_text {
         out = out.replace("{{bundle_text}}", text);
     }
-    out
+    for (key, value) in &ctx.vars {
+        let needle = format!("{{{{{key}}}}}");
+        out = out.replace(&needle, value);
+    }
+    if let Some(var) = first_unresolved_placeholder(&out) {
+        return Err(anyhow!(
+            "recipe variable {{{{{var}}}}} not provided. Pass `--var {var}=...` or add it under `defaults:` in the recipe."
+        ));
+    }
+    Ok(out)
+}
+
+fn parse_recipe_var(entry: &str) -> Result<(String, String)> {
+    let (key, value) = entry
+        .split_once('=')
+        .ok_or_else(|| anyhow!("invalid --var `{entry}` (expected KEY=VALUE)"))?;
+    let key = key.trim();
+    if key.is_empty() {
+        return Err(anyhow!("invalid --var `{entry}` (key cannot be empty)"));
+    }
+    Ok((key.to_string(), value.to_string()))
+}
+
+fn first_unresolved_placeholder(value: &str) -> Option<&str> {
+    let start = value.find("{{")?;
+    let rest = &value[start + 2..];
+    let end = rest.find("}}")?;
+    let placeholder = rest[..end].trim();
+    if placeholder.is_empty() {
+        None
+    } else {
+        Some(placeholder)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn recipe_context() -> RecipeContext {
+        RecipeContext {
+            bundle_path: Some("/tmp/bundle.md".to_string()),
+            bundle_text: Some("hello world".to_string()),
+            profile_dir: None,
+            use_stealth: true,
+            headed: false,
+            vars: BTreeMap::from([("model".to_string(), "gpt-5-4-pro".to_string())]),
+        }
+    }
+
+    #[test]
+    fn cookie_sync_script_args_include_timeout_and_chrome_only() {
+        let args = cookie_sync_script_args(
+            Path::new("/tmp/extract-cookies.mjs"),
+            Path::new("/tmp/state.json"),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "/tmp/extract-cookies.mjs",
+                "--output",
+                "/tmp/state.json",
+                "--timeout-ms",
+                "30000",
+                "--browsers",
+                "chrome",
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_node_version_accepts_v_prefix() {
+        let version = parse_node_version("v24.14.0").unwrap();
+        assert_eq!(
+            version,
+            NodeVersion {
+                major: 24,
+                minor: 14,
+                patch: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn node_version_supported_requires_24_4_or_newer() {
+        assert!(!node_version_supported(NodeVersion {
+            major: 24,
+            minor: 3,
+            patch: 0,
+        }));
+        assert!(node_version_supported(NodeVersion {
+            major: 24,
+            minor: 4,
+            patch: 0,
+        }));
+    }
+
+    #[test]
+    fn zero_cookie_sync_is_an_error() {
+        let warnings = vec!["timed out".to_string()];
+        let err = validate_cookie_sync_result(0, &warnings).unwrap_err();
+        assert!(err.to_string().contains("0 cookies"));
+        assert!(err.to_string().contains("timed out"));
+    }
+
+    #[test]
+    fn build_recipe_vars_merges_defaults_and_cli_overrides() {
+        let defaults = BTreeMap::from([
+            ("model".to_string(), "gpt-5-4-pro".to_string()),
+            ("theme".to_string(), "light".to_string()),
+        ]);
+        let vars = build_recipe_vars(
+            Some(&defaults),
+            &["model=gpt-5-2-pro".to_string(), "mode=fast".to_string()],
+        )
+        .unwrap();
+        assert_eq!(vars.get("model").map(String::as_str), Some("gpt-5-2-pro"));
+        assert_eq!(vars.get("theme").map(String::as_str), Some("light"));
+        assert_eq!(vars.get("mode").map(String::as_str), Some("fast"));
+    }
+
+    #[test]
+    fn interpolate_replaces_bundle_and_recipe_vars() {
+        let ctx = recipe_context();
+        let value = interpolate("open {{bundle_path}} {{model}}", &ctx, Some("ignored")).unwrap();
+        assert_eq!(value, "open /tmp/bundle.md gpt-5-4-pro");
+    }
+
+    #[test]
+    fn interpolate_errors_on_missing_recipe_var() {
+        let ctx = recipe_context();
+        let err = interpolate("{{missing}}", &ctx, None).unwrap_err();
+        assert!(err.to_string().contains("--var missing="));
+    }
 }

@@ -78,6 +78,15 @@ fn pricing_help() {
 }
 
 #[test]
+fn browser_recipe_help_mentions_var() {
+    yoetz()
+        .args(["browser", "recipe", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--var"));
+}
+
+#[test]
 fn status_runs() {
     yoetz().arg("status").assert().success();
 }

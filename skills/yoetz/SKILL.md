@@ -168,7 +168,7 @@ For web-only models like ChatGPT Pro that lack API access. Uses Oracle-style coo
 ### Prerequisites
 
 ```bash
-# Node >=22 required. agent-browser is auto-resolved via npx if not in PATH.
+# Node >=24.4 required for Chrome cookie sync. agent-browser is auto-resolved via npx if not in PATH.
 # Install sweet-cookie for cookie extraction
 npm install -g @steipete/sweet-cookie
 ```
@@ -197,6 +197,7 @@ yoetz browser sync-cookies
 
 This extracts your authenticated cookies from Chrome and saves them for agent-browser.
 State file is stored at `~/.config/yoetz/browser-profile/state.json` (or your overridden profile path).
+If macOS shows a Keychain prompt for `Chrome Safe Storage`, click `Always Allow`.
 
 **Step 3: Verify authentication**
 ```bash
@@ -220,6 +221,9 @@ BUNDLE=$(yoetz bundle -p "Review this code" -f src/*.rs --format json | jq -r .a
 
 # Send to ChatGPT
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
+
+# Override the built-in model selection if needed
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var model=gpt-5-2-pro
 ```
 
 ### Combined workflow: API + Browser
@@ -253,7 +257,7 @@ Built-in recipes: `chatgpt`, `claude`, `gemini`.
 | Symptom | Fix |
 |---------|-----|
 | `extract-cookies.mjs not found` | Run `npm install -g @steipete/sweet-cookie` and `brew reinstall yoetz` (v0.2.6+) |
-| `cookie extraction failed` | Ensure Node >= 22, log into ChatGPT in real Chrome, close Chrome, retry |
+| `cookie extraction failed` | Ensure Node >= 24.4, log into ChatGPT in real Chrome, close Chrome, and if macOS shows a `Chrome Safe Storage` prompt click `Always Allow` |
 | `cloudflare challenge detected` | Re-sync: log into ChatGPT in Chrome, close Chrome, `yoetz browser sync-cookies` |
 | `chatgpt login required` | Run `yoetz browser login` for manual auth, or sync cookies |
 | `agent-browser failed` | Ensure `npx agent-browser --version` works, or `npm install -g agent-browser` |

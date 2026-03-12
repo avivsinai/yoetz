@@ -3,7 +3,7 @@ name: chatgpt
 # Verifies auth with: yoetz browser check
 #
 # Uses Oracle-style cookie injection + stealth flags to bypass Cloudflare.
-# Model selection ensures we use GPT-5.2 Pro regardless of last-used model.
+# Model selection defaults to GPT-5.4 Pro; override with --var model=gpt-5-2-pro
 
 steps:
   # Open ChatGPT
@@ -12,11 +12,12 @@ steps:
   - sleep_ms: 3000
 
   # Select Pro model (don't rely on last-used model)
+  # TODO: make model configurable via --var model=X once defaults: support lands
   - action: find
     args: ["label", "Model selector", "click"]
   - sleep_ms: 1000
   - action: find
-    args: ["testid", "model-switcher-gpt-5-2-pro", "click"]
+    args: ["testid", "model-switcher-gpt-5-4-pro", "click"]
   - sleep_ms: 500
 
   # Disable extended thinking for faster responses

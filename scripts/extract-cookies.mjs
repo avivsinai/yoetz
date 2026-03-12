@@ -40,10 +40,13 @@ const names = options.get('names')
       .filter(Boolean)
   : undefined;
 
+const timeoutMs = Number(options.get('timeout-ms')) || 30_000;
+
 const { cookies, warnings } = await getCookies({
   url,
   browsers,
   names,
+  timeoutMs,
 });
 
 const storageState = {

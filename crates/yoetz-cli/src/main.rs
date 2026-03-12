@@ -223,6 +223,9 @@ struct BrowserRecipeArgs {
 
     #[arg(long)]
     profile: Option<PathBuf>,
+
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    vars: Vec<String>,
 }
 
 #[derive(Args)]
@@ -761,6 +764,11 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             let mut used_cookie_sync = false;
             let mut cookie_warnings = Vec::new();
             let mut cookie_sync_error: Option<String> = None;
+            if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+                if let Some(guidance) = browser::cookie_sync_guidance() {
+                    eprintln!("{guidance}");
+                }
+            }
             match browser::sync_cookies(&profile_dir) {
                 Ok((count, warnings)) => {
                     used_cookie_sync = true;
@@ -842,6 +850,11 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
         BrowserCommand::SyncCookies(sync_args) => {
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.config, sync_args.profile.as_ref())?;
+            if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+                if let Some(guidance) = browser::cookie_sync_guidance() {
+                    eprintln!("{guidance}");
+                }
+            }
             let (cookie_count, warnings) = browser::sync_cookies(&profile_dir)?;
             let state_file = browser::state_file(&profile_dir);
             let payload = json!({
@@ -874,6 +887,8 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             let content = fs::read_to_string(&recipe_path)
                 .with_context(|| format!("read recipe {}", recipe_path.display()))?;
             let recipe: browser::Recipe = serde_yaml::from_str(&content)?;
+            let recipe_vars =
+                browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)?;
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.config, recipe_args.profile.as_ref())?;
             let recipe_name = recipe.name.as_deref().unwrap_or("");
@@ -905,6 +920,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 profile_dir: Some(profile_dir),
                 use_stealth: needs_auth,
                 headed: needs_auth,
+                vars: recipe_vars,
             };
 
             browser::run_recipe(recipe, ctx, format)
