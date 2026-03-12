@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.8] - 2026-03-12
+
+### Miscellaneous
+
+- **deps**: Bump the minor-and-patch group across 1 directory with 3 updates (#37)
+- **deps**: Bump litellm-rust from `178e728` to `241c57b` (#36)
+- **deps**: Bump the actions group with 2 updates (#34)
+
 ## [0.2.7] - 2026-03-12
 
 ### Bug Fixes
