@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -193,6 +194,7 @@ pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> R
     let wants_json = matches!(format, OutputFormat::Json);
     let wants_jsonl = matches!(format, OutputFormat::Jsonl);
     let mut events: Vec<Value> = Vec::new();
+    let mut headed = ctx.headed;
 
     if wants_jsonl {
         if let Some(name) = recipe.name.as_deref() {
@@ -217,14 +219,36 @@ pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> R
         let commands = expand_step(action, step.args.as_deref(), &ctx)?;
 
         for args in commands {
-            let stdout = run_agent_browser_with_options(
+            let stdout = match run_agent_browser_with_options(
                 args.clone(),
                 format,
                 ctx.profile_dir.as_deref(),
                 ctx.use_stealth,
-                ctx.headed,
+                headed,
                 ctx.profile_mode,
-            )?;
+            ) {
+                Ok(stdout) => stdout,
+                Err(err) => {
+                    if maybe_pause_for_captcha_challenge(
+                        ctx.profile_dir.as_deref(),
+                        ctx.use_stealth,
+                        ctx.profile_mode,
+                        headed,
+                    )? {
+                        headed = true;
+                        run_agent_browser_with_options(
+                            args.clone(),
+                            format,
+                            ctx.profile_dir.as_deref(),
+                            ctx.use_stealth,
+                            headed,
+                            ctx.profile_mode,
+                        )?
+                    } else {
+                        return Err(err);
+                    }
+                }
+            };
 
             if wants_json || wants_jsonl {
                 let stdout_value =
@@ -607,12 +631,13 @@ fn check_auth_with_mode(
 ) -> Result<()> {
     // Close daemon to ensure stealth options are applied fresh
     let _ = close_browser();
+    let mut current_headed = headed;
     let _ = run_agent_browser_with_options(
         vec!["open".to_string(), "https://chatgpt.com/".to_string()],
         OutputFormat::Text,
         Some(profile_dir),
         /* use_stealth */ true,
-        headed,
+        current_headed,
         profile_mode,
     )?;
     let deadline = Instant::now() + Duration::from_millis(AUTH_CHECK_TIMEOUT_MS);
@@ -627,9 +652,21 @@ fn check_auth_with_mode(
             OutputFormat::Json,
             Some(profile_dir),
             /* use_stealth */ true,
-            headed,
+            current_headed,
             profile_mode,
         )?;
+
+        if is_challenge_page(&snapshot)
+            && maybe_pause_for_captcha_challenge(
+                Some(profile_dir),
+                /* use_stealth */ true,
+                profile_mode,
+                current_headed,
+            )?
+        {
+            current_headed = true;
+            continue;
+        }
 
         last_issue = detect_auth_issue(&snapshot);
 
@@ -690,6 +727,77 @@ fn looks_authenticated(snapshot: &str) -> bool {
     contains_any(&haystack, &positive_markers)
 }
 
+fn maybe_pause_for_captcha_challenge(
+    profile_dir: Option<&Path>,
+    use_stealth: bool,
+    profile_mode: BrowserProfileMode,
+    headed: bool,
+) -> Result<bool> {
+    let Some(profile_dir) = profile_dir else {
+        return Ok(false);
+    };
+
+    if headed {
+        return Ok(false);
+    }
+
+    let snapshot = match run_agent_browser_with_options(
+        vec![
+            "snapshot".to_string(),
+            "-c".to_string(),
+            "--json".to_string(),
+        ],
+        OutputFormat::Json,
+        Some(profile_dir),
+        use_stealth,
+        headed,
+        profile_mode,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return Ok(false),
+    };
+
+    if !is_challenge_page(&snapshot) {
+        return Ok(false);
+    }
+
+    if !io::stdin().is_terminal() {
+        return Err(anyhow!(
+            "captcha detected, but stdin is not interactive. Re-run this command in a terminal so you can solve the challenge."
+        ));
+    }
+
+    let _ = close_browser();
+    run_agent_browser_with_options(
+        vec!["open".to_string(), "https://chatgpt.com/".to_string()],
+        OutputFormat::Text,
+        Some(profile_dir),
+        use_stealth,
+        /* headed */ true,
+        profile_mode,
+    )?;
+    eprintln!(
+        "Captcha detected — please solve it in the browser window, then press Enter to continue"
+    );
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(true)
+}
+
+fn is_challenge_page(snapshot: &str) -> bool {
+    let haystack = snapshot.to_lowercase();
+    let challenge_markers = [
+        "cloudflare",
+        "checking your browser",
+        "attention required",
+        "security check",
+        "just a moment",
+        "verify you are human",
+        "cf-chl",
+    ];
+    contains_any(&haystack, &challenge_markers)
+}
+
 fn detect_auth_issue(snapshot: &str) -> Option<&'static str> {
     let haystack = snapshot.to_lowercase();
     let login_markers = [
@@ -702,17 +810,8 @@ fn detect_auth_issue(snapshot: &str) -> Option<&'static str> {
         "continue with microsoft",
         "continue with apple",
     ];
-    let challenge_markers = [
-        "cloudflare",
-        "checking your browser",
-        "attention required",
-        "security check",
-        "just a moment",
-        "verify you are human",
-        "cf-chl",
-    ];
 
-    if contains_any(&haystack, &challenge_markers) {
+    if is_challenge_page(snapshot) {
         return Some(
             "cloudflare challenge detected. Run `yoetz browser sync-cookies` or `yoetz browser login` and try again.",
         );
@@ -1060,5 +1159,14 @@ mod tests {
         assert!(looks_authenticated(r#"{"text": "Send a message"}"#));
         assert!(!looks_authenticated(r#"{"text": "Loading..."}"#));
         assert!(!looks_authenticated(""));
+    }
+
+    #[test]
+    fn is_challenge_page_detects_cloudflare_markers() {
+        assert!(is_challenge_page(r#"{"text": "Verify you are human"}"#));
+        assert!(is_challenge_page(
+            r#"{"text": "Cloudflare security check"}"#
+        ));
+        assert!(!is_challenge_page(r#"{"text": "ChatGPT - New chat"}"#));
     }
 }
