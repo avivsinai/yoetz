@@ -7,13 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.2.10] - 2026-03-14
 
-### Bug Fixes
-
-- Global cookie fallback uses deep import for ESM-only package, CI asserts exports
-
 ### Features
 
-- Bundle browser cookie extractor, improve auth polling, and package scripts in releases
+- Bundle browser cookie extractor and improve auth polling (#42)
 
 ## [0.2.9] - 2026-03-14
 

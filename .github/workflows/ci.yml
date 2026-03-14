@@ -162,9 +162,9 @@ jobs:
           fi
 
           echo "diff_range=$RANGE" >> "$GITHUB_OUTPUT"
-          # Only trigger changelog validation when version-related files change.
-          # Exclude CHANGELOG.md itself to avoid circular validation loops.
-          CHANGED="$(git diff --name-only "$RANGE" -- Cargo.toml Cargo.lock cliff.toml .github/workflows/release.yml)"
+          # Only trigger changelog validation when version/changelog config changes.
+          # Exclude CHANGELOG.md (circular) and release.yml (triggers on non-release PRs).
+          CHANGED="$(git diff --name-only "$RANGE" -- Cargo.toml Cargo.lock cliff.toml)"
           if [ -n "$CHANGED" ]; then
             echo "should_validate=true" >> "$GITHUB_OUTPUT"
             printf 'Release metadata changed in %s:\n%s\n' "$RANGE" "$CHANGED"
