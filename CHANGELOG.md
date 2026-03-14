@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Features
+
+- Dynamic model registry with auto-sync, config aliases, and degraded-fetch guard
+
 ## [0.2.8] - 2026-03-12
 
 ### Miscellaneous
