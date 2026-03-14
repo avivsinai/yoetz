@@ -272,6 +272,9 @@ fn run_agent_browser_with_connection(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Run agent-browser in CDP mode with the given connection.
+/// Stealth and headed are disabled — we're using the user's real Chrome.
+#[allow(dead_code)] // Will be used when RecipeContext migrates to BrowserConnection
 pub fn run_agent_browser_cdp(
     args: Vec<String>,
     format: OutputFormat,
@@ -842,23 +845,14 @@ pub fn check_auth(profile_dir: &Path, headed: bool) -> Result<()> {
     check_auth_with_connection(&connection, headed, CHATGPT_URL)
 }
 
+/// Check auth using a specific connection (public API for handlers).
+#[allow(dead_code)] // Will be used when Check handler fully migrates
 pub fn check_auth_connection(
     connection: &BrowserConnection,
     headed: bool,
     target_url: &str,
 ) -> Result<()> {
     check_auth_with_connection(connection, headed, target_url)
-}
-
-fn check_auth_with_mode(
-    profile_dir: &Path,
-    headed: bool,
-    profile_mode: BrowserProfileMode,
-) -> Result<()> {
-    let connection =
-        legacy_connection(Some(profile_dir), profile_mode, /* use_stealth */ true)
-            .ok_or_else(|| anyhow!("browser profile not configured"))?;
-    check_auth_with_connection(&connection, headed, CHATGPT_URL)
 }
 
 fn check_auth_with_connection(
@@ -930,36 +924,6 @@ fn check_auth_with_connection(
         "auth check timed out without confirming authentication. \
          The page may still be loading. Try again or run `yoetz browser login`."
     ))
-}
-
-fn add_profile_args(
-    final_args: &mut Vec<String>,
-    profile_dir: &Path,
-    use_stealth: bool,
-    profile_mode: BrowserProfileMode,
-    state_exists: bool,
-) {
-    let wants_state =
-        matches!(profile_mode, BrowserProfileMode::PreferState) && use_stealth && state_exists;
-
-    if wants_state {
-        if !final_args
-            .iter()
-            .any(|a| a == "--state" || a.starts_with("--state="))
-        {
-            final_args.insert(0, state_file(profile_dir).to_string_lossy().to_string());
-            final_args.insert(0, "--state".to_string());
-        }
-        return;
-    }
-
-    if !final_args
-        .iter()
-        .any(|a| a == "--profile" || a.starts_with("--profile="))
-    {
-        final_args.insert(0, profile_dir.to_string_lossy().to_string());
-        final_args.insert(0, "--profile".to_string());
-    }
 }
 
 /// Positive confirmation that the page is authenticated (ChatGPT loaded successfully).
@@ -1036,10 +1000,6 @@ fn is_challenge_page(snapshot: &str) -> bool {
         "cf-chl",
     ];
     contains_any(&haystack, &challenge_markers)
-}
-
-fn detect_auth_issue(snapshot: &str) -> Option<&'static str> {
-    detect_auth_issue_for_connection(snapshot, None)
 }
 
 fn detect_auth_issue_for_connection(
@@ -1363,6 +1323,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
     fn resolve_cdp_endpoint_prefers_flag_then_env_then_config() {
         let _guard = env_lock().lock().unwrap();
         unsafe {
@@ -1396,63 +1357,6 @@ mod tests {
         let ctx = recipe_context();
         let err = interpolate("{{missing}}", &ctx, None).unwrap_err();
         assert!(err.to_string().contains("--var missing="));
-    }
-
-    #[test]
-    fn profile_only_mode_uses_persistent_profile_even_if_state_exists() {
-        let mut args = vec!["open".to_string(), "https://chatgpt.com/".to_string()];
-        add_profile_args(
-            &mut args,
-            Path::new("/tmp/browser-profile"),
-            true,
-            BrowserProfileMode::ProfileOnly,
-            true,
-        );
-        assert_eq!(args[0], "--profile");
-        assert_eq!(args[1], "/tmp/browser-profile");
-        assert!(!args.iter().any(|arg| arg == "--state"));
-    }
-
-    #[test]
-    fn prefer_state_mode_keeps_cookie_sync_snapshot_path() {
-        let mut args = vec!["open".to_string(), "https://chatgpt.com/".to_string()];
-        add_profile_args(
-            &mut args,
-            Path::new("/tmp/browser-profile"),
-            true,
-            BrowserProfileMode::PreferState,
-            true,
-        );
-        assert_eq!(args[0], "--state");
-        assert_eq!(args[1], "/tmp/browser-profile/state.json");
-    }
-
-    #[test]
-    fn prefer_state_no_stealth_falls_back_to_profile() {
-        let mut args = vec!["open".to_string()];
-        add_profile_args(
-            &mut args,
-            Path::new("/tmp/bp"),
-            false,
-            BrowserProfileMode::PreferState,
-            true,
-        );
-        assert_eq!(args[0], "--profile");
-        assert!(!args.iter().any(|arg| arg == "--state"));
-    }
-
-    #[test]
-    fn prefer_state_no_state_file_falls_back_to_profile() {
-        let mut args = vec!["open".to_string()];
-        add_profile_args(
-            &mut args,
-            Path::new("/tmp/bp"),
-            true,
-            BrowserProfileMode::PreferState,
-            false,
-        );
-        assert_eq!(args[0], "--profile");
-        assert!(!args.iter().any(|arg| arg == "--state"));
     }
 
     #[test]
