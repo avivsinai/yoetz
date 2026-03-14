@@ -47,6 +47,10 @@ const DEFAULT_AUTO_SYNC_SECS: u64 = 86400;
 /// Returns true if the cached registry is stale (older than `auto_sync_secs`).
 /// Returns true if no cache exists at all.
 pub fn is_registry_stale(config: &Config) -> bool {
+    is_cache_stale(&registry_cache_path(), config)
+}
+
+fn is_cache_stale(path: &Path, config: &Config) -> bool {
     let interval = config
         .registry
         .auto_sync_secs
@@ -54,11 +58,10 @@ pub fn is_registry_stale(config: &Config) -> bool {
     if interval == 0 {
         return false; // auto-sync disabled
     }
-    let path = registry_cache_path();
     if !path.exists() {
         return true;
     }
-    let Ok(meta) = fs::metadata(&path) else {
+    let Ok(meta) = fs::metadata(path) else {
         return true;
     };
     let Ok(modified) = meta.modified() else {
@@ -495,38 +498,32 @@ mod tests {
     #[test]
     fn stale_disabled_returns_false() {
         let config = config_with_sync(0);
-        assert!(!is_registry_stale(&config));
+        let path = PathBuf::from("/nonexistent");
+        assert!(!is_cache_stale(&path, &config));
     }
 
     #[test]
     fn stale_missing_file_returns_true() {
         let config = config_with_sync(86400);
-        // Point at a non-existent path
-        env::set_var("YOETZ_REGISTRY_PATH", "/tmp/yoetz_test_nonexistent.json");
-        assert!(is_registry_stale(&config));
-        env::remove_var("YOETZ_REGISTRY_PATH");
+        let path = PathBuf::from("/tmp/yoetz_test_nonexistent_path.json");
+        assert!(is_cache_stale(&path, &config));
     }
 
     #[test]
     fn stale_fresh_file_returns_false() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp.as_file(), b"{}").unwrap();
-        env::set_var("YOETZ_REGISTRY_PATH", tmp.path().to_str().unwrap());
         let config = config_with_sync(86400);
-        assert!(!is_registry_stale(&config));
-        env::remove_var("YOETZ_REGISTRY_PATH");
+        assert!(!is_cache_stale(tmp.path(), &config));
     }
 
     #[test]
     fn stale_old_file_returns_true() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::io::Write::write_all(&mut tmp.as_file(), b"{}").unwrap();
-        // Set mtime to 2 days ago
         let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
         tmp.as_file().set_modified(two_days_ago).unwrap();
-        env::set_var("YOETZ_REGISTRY_PATH", tmp.path().to_str().unwrap());
         let config = config_with_sync(86400);
-        assert!(is_registry_stale(&config));
-        env::remove_var("YOETZ_REGISTRY_PATH");
+        assert!(is_cache_stale(tmp.path(), &config));
     }
 }

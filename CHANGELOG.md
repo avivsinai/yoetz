@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.2.9] - 2026-03-14
 
+### Bug Fixes
+
+- Make registry staleness tests thread-safe
+
+## [0.2.9] - 2026-03-14
+
 ### Features
 
 - Dynamic model registry with auto-sync and config aliases (#39)
