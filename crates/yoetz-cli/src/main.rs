@@ -773,7 +773,6 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 Ok((count, warnings)) => {
                     used_cookie_sync = true;
                     cookie_warnings = warnings;
-                    let _ = browser::maybe_load_state(&profile_dir, true);
                     if browser::check_auth(&profile_dir, /* headed */ false).is_ok() {
                         let payload = json!({
                             "status": "ok",
@@ -813,19 +812,19 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             }
             browser::login(&profile_dir)?;
             let payload = json!({
-                "status": "ok",
+                "status": "pending_login",
                 "profile": profile_dir.to_string_lossy(),
                 "cookies_synced": used_cookie_sync,
                 "warnings": cookie_warnings,
                 "cookie_sync_error": cookie_sync_error,
-                "next": "Run `yoetz browser check` to verify authentication."
+                "next": "Complete login in the opened browser, then run `yoetz browser check` to verify authentication."
             });
             match format {
                 OutputFormat::Json => write_json(&payload),
                 OutputFormat::Jsonl => write_jsonl("browser.login", &payload),
                 OutputFormat::Text | OutputFormat::Markdown => {
-                    println!("Login complete. Profile saved at {}", profile_dir.display());
-                    println!("Next: yoetz browser check");
+                    println!("Browser opened for manual login: {}", profile_dir.display());
+                    println!("Complete login in the opened browser, then run: yoetz browser check");
                     Ok(())
                 }
             }
@@ -897,9 +896,11 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     .to_string_lossy()
                     .to_lowercase()
                     .contains("chatgpt");
-            if needs_auth {
-                browser::check_auth(&profile_dir, /* headed */ true)?;
-            }
+            let profile_mode = if needs_auth {
+                browser::resolve_auth_mode(&profile_dir, /* headed */ false)?
+            } else {
+                browser::BrowserProfileMode::ProfileOnly
+            };
 
             // Only read bundle text if the recipe actually references it. Some recipes
             // (e.g. ChatGPT file-upload flows) only need {{bundle_path}}.
@@ -918,6 +919,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 bundle_path: recipe_args.bundle.map(|p| p.to_string_lossy().to_string()),
                 bundle_text,
                 profile_dir: Some(profile_dir),
+                profile_mode,
                 use_stealth: needs_auth,
                 headed: needs_auth,
                 vars: recipe_vars,

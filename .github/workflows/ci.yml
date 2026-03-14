@@ -16,6 +16,26 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  browser-scripts:
+    name: Browser Scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --prefix scripts --omit=dev --ignore-scripts
+      - name: Verify sweet-cookie exports
+        working-directory: scripts
+        run: |
+          node --input-type=module -e "
+            import { getCookies, toCookieHeader } from '@steipete/sweet-cookie';
+            if (typeof getCookies !== 'function') throw new Error('getCookies is not a function');
+            if (typeof toCookieHeader !== 'function') throw new Error('toCookieHeader is not a function');
+            console.log('sweet-cookie exports verified');
+          "
+
   check:
     name: Check
     runs-on: ubuntu-latest

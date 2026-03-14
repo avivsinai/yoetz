@@ -2,19 +2,28 @@
 import fs from 'node:fs/promises';
 import { execSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import path from 'node:path';
 
-// Import from global node_modules if local import fails
+const require = createRequire(import.meta.url);
+
+// Prefer the bundled dependency shipped with releases/Homebrew. Fall back to a
+// global install for source checkouts or older local setups.
+// The package is ESM-only, so fallbacks use dynamic import or deep CJS require.
 let getCookies, toCookieHeader;
 try {
-  const mod = await import('@steipete/sweet-cookie');
-  getCookies = mod.getCookies;
-  toCookieHeader = mod.toCookieHeader;
+  ({ getCookies, toCookieHeader } = normalizeCookieModule(await import('@steipete/sweet-cookie')));
 } catch {
-  const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
-  const require = createRequire(import.meta.url);
-  const mod = require(`${globalRoot}/@steipete/sweet-cookie/dist/index.js`);
-  getCookies = mod.getCookies;
-  toCookieHeader = mod.toCookieHeader;
+  try {
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
+    ({ getCookies, toCookieHeader } = normalizeCookieModule(
+      await import(path.join(globalRoot, '@steipete/sweet-cookie', 'dist', 'index.js'))
+    ));
+  } catch {
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
+    ({ getCookies, toCookieHeader } = normalizeCookieModule(
+      require(path.join(globalRoot, '@steipete/sweet-cookie', 'dist', 'index.js'))
+    ));
+  }
 }
 
 const args = process.argv.slice(2);
@@ -69,6 +78,14 @@ if (outputPath) {
 }
 
 process.stdout.write(JSON.stringify(payload, null, 2));
+
+function normalizeCookieModule(mod) {
+  const resolved = mod?.default && !mod.getCookies ? mod.default : mod;
+  if (typeof resolved?.getCookies !== 'function' || typeof resolved?.toCookieHeader !== 'function') {
+    throw new Error('invalid @steipete/sweet-cookie module export shape');
+  }
+  return resolved;
+}
 
 function toPlaywrightCookie(cookie) {
   if (!cookie || !cookie.name || cookie.value === undefined) return null;

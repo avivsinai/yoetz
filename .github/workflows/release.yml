@@ -52,6 +52,10 @@ jobs:
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -79,6 +83,7 @@ jobs:
           cp target/${{ matrix.target }}/release/${{ matrix.artifact }} staging/
           cp -r scripts staging/scripts
           cp -r recipes staging/recipes
+          npm ci --prefix staging/scripts --omit=dev --ignore-scripts
           cd staging
           tar czf ../yoetz-${{ matrix.target }}.tar.gz ${{ matrix.artifact }} scripts recipes
 
@@ -86,7 +91,12 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact }}" -DestinationPath "yoetz-${{ matrix.target }}.zip"
+          New-Item -ItemType Directory -Path staging | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/${{ matrix.artifact }}" "staging/"
+          Copy-Item "scripts" "staging/scripts" -Recurse
+          Copy-Item "recipes" "staging/recipes" -Recurse
+          npm ci --prefix staging/scripts --omit=dev --ignore-scripts
+          Compress-Archive -Path "staging/*" -DestinationPath "yoetz-${{ matrix.target }}.zip"
 
       - uses: actions/upload-artifact@v7
         with:
@@ -156,6 +166,7 @@ jobs:
             homepage "https://github.com/avivsinai/yoetz"
             version "${VERSION}"
             license "MIT"
+            depends_on "node"
 
             on_macos do
               if Hardware::CPU.intel?
@@ -181,8 +192,7 @@ jobs:
 
             def install
               bin.install "yoetz"
-              (share/"yoetz/scripts").install Dir["scripts/*"]
-              (share/"yoetz/recipes").install Dir["recipes/*"]
+              (share/"yoetz").install "scripts", "recipes"
             end
 
             test do
