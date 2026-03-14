@@ -5,11 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [0.2.9] - 2026-03-14
+## [0.2.10] - 2026-03-14
 
 ### Bug Fixes
 
-- Make registry staleness tests thread-safe
+- Global cookie fallback uses deep import for ESM-only package, CI asserts exports
+
+### Features
+
+- Bundle browser cookie extractor, improve auth polling, and package scripts in releases
 
 ## [0.2.9] - 2026-03-14
 

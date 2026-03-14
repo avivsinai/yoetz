@@ -647,8 +647,10 @@ fn check_auth_with_mode(
     if let Some(issue) = last_issue {
         return Err(anyhow!("{issue}"));
     }
-    // Timed out without positive confirmation but no negative markers either
-    Ok(())
+    Err(anyhow!(
+        "auth check timed out without confirming authentication. \
+         The page may still be loading. Try again or run `yoetz browser login`."
+    ))
 }
 
 fn add_profile_args(
