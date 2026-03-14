@@ -8,16 +8,20 @@ const require = createRequire(import.meta.url);
 
 // Prefer the bundled dependency shipped with releases/Homebrew. Fall back to a
 // global install for source checkouts or older local setups.
+// The package is ESM-only, so fallbacks use dynamic import or deep CJS require.
 let getCookies, toCookieHeader;
 try {
   ({ getCookies, toCookieHeader } = normalizeCookieModule(await import('@steipete/sweet-cookie')));
 } catch {
   try {
-    ({ getCookies, toCookieHeader } = normalizeCookieModule(require('@steipete/sweet-cookie')));
+    const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
+    ({ getCookies, toCookieHeader } = normalizeCookieModule(
+      await import(path.join(globalRoot, '@steipete/sweet-cookie', 'dist', 'index.js'))
+    ));
   } catch {
     const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
     ({ getCookies, toCookieHeader } = normalizeCookieModule(
-      require(path.join(globalRoot, '@steipete/sweet-cookie'))
+      require(path.join(globalRoot, '@steipete/sweet-cookie', 'dist', 'index.js'))
     ));
   }
 }
