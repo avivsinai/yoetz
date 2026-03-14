@@ -77,7 +77,7 @@ yoetz models list -s claude --format json
 | Task | Command |
 |------|---------|
 | Ask single model | `yoetz ask -p "question" -f src/*.rs --provider openai --model gpt-5.4 --format json` |
-| Council vote | `yoetz council -p "question" --models openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4 --format json` |
+| Council vote | `yoetz council -p "question" --models openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4.20-multi-agent-beta --format json` |
 | Review staged diff | `yoetz review diff --staged --format json` |
 | Review file | `yoetz review file --path src/main.rs --format json` |
 | Bundle files | `yoetz bundle -p "context" -f src/**/*.rs --format json` |
@@ -97,12 +97,12 @@ Get opinions from multiple LLMs in parallel. **`--models` is required.**
 yoetz council \
   -p "Should we use async traits or callbacks for this API?" \
   -f src/lib.rs -f src/api/*.rs \
-  --models openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4 \
+  --models openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4.20-multi-agent-beta \
   --format json
 ```
 
 **Example council sets:**
-- Cross-provider: `openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4`
+- Cross-provider: `openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4.20-multi-agent-beta`
 - Via OpenRouter only: `openrouter/openai/gpt-5.4,openrouter/anthropic/claude-sonnet-4.6,openrouter/google/gemini-3.1-pro-preview`
 
 ## Ask (Single Model)
@@ -297,7 +297,7 @@ The browser module uses stealth techniques to avoid Cloudflare detection:
 
 **Via OpenRouter** (recommended for Anthropic/XAI - no extra config):
 - `openrouter/anthropic/claude-sonnet-4.6`
-- `openrouter/xai/grok-4`
+- `openrouter/xai/grok-4.20-multi-agent-beta`
 
 **Model format:** `provider/model`
 - `openai/gpt-5.4`
