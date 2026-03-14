@@ -23,6 +23,8 @@ const STEALTH_ARGS: &str = "--disable-blink-features=AutomationControlled";
 const COOKIE_SYNC_TIMEOUT_MS: &str = "30000";
 const AUTH_CHECK_TIMEOUT_MS: u64 = 8_000;
 const AUTH_CHECK_POLL_MS: u64 = 500;
+const CDP_SESSION_NAME: &str = "yoetz-cdp";
+const CHATGPT_URL: &str = "https://chatgpt.com/";
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
     major: 24,
     minor: 4,
@@ -66,6 +68,26 @@ pub struct RecipeContext {
 pub enum BrowserProfileMode {
     PreferState,
     ProfileOnly,
+}
+
+/// How yoetz connects to a browser for authenticated sessions.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum BrowserConnection {
+    /// Connected to a live Chrome instance via CDP with explicit endpoint.
+    Cdp { endpoint: String },
+    /// Connected via agent-browser auto-discovery to a live Chrome instance.
+    AutoConnect,
+    /// Cookie-extracted Playwright storageState file.
+    CookieState { state_file: PathBuf },
+    /// Persistent browser profile directory managed by yoetz.
+    Profile { profile_dir: PathBuf },
+}
+
+impl BrowserConnection {
+    /// Whether this connection attaches to the user's live Chrome session.
+    pub fn is_live_attach(&self) -> bool {
+        matches!(self, Self::Cdp { .. } | Self::AutoConnect)
+    }
 }
 
 /// Cached agent-browser resolution. Probed once per process, reused for all calls.
@@ -113,56 +135,119 @@ pub fn run_agent_browser(
     )
 }
 
-/// Run agent-browser with optional stealth mode and headed display
-fn run_agent_browser_with_options(
-    args: Vec<String>,
-    format: OutputFormat,
+fn legacy_connection(
     profile_dir: Option<&Path>,
+    profile_mode: BrowserProfileMode,
+    use_stealth: bool,
+) -> Option<BrowserConnection> {
+    let profile_dir = profile_dir?;
+    let state_path = state_file(profile_dir);
+    if matches!(profile_mode, BrowserProfileMode::PreferState) && use_stealth && state_path.exists()
+    {
+        return Some(BrowserConnection::CookieState {
+            state_file: state_path,
+        });
+    }
+    Some(BrowserConnection::Profile {
+        profile_dir: profile_dir.to_path_buf(),
+    })
+}
+
+fn build_agent_browser_args(
+    mut args: Vec<String>,
+    format: OutputFormat,
+    connection: Option<&BrowserConnection>,
     use_stealth: bool,
     headed: bool,
-    profile_mode: BrowserProfileMode,
-) -> Result<String> {
-    let (bin, prefix_args) = resolve_agent_browser();
-    let mut cmd = Command::new(&bin);
-    let mut final_args = args;
+) -> Vec<String> {
+    let live_attach = connection.is_some_and(BrowserConnection::is_live_attach);
 
-    if headed && !final_args.iter().any(|a| a == "--headed") {
-        final_args.insert(0, "--headed".to_string());
+    if headed && !live_attach && !args.iter().any(|a| a == "--headed") {
+        args.insert(0, "--headed".to_string());
     }
 
-    if let Some(profile_dir) = profile_dir {
-        add_profile_args(
-            &mut final_args,
-            profile_dir,
-            use_stealth,
-            profile_mode,
-            state_file(profile_dir).exists(),
-        );
+    match connection {
+        Some(BrowserConnection::Cdp { endpoint }) => {
+            if !args
+                .iter()
+                .any(|a| a == "--session" || a.starts_with("--session="))
+            {
+                args.insert(0, CDP_SESSION_NAME.to_string());
+                args.insert(0, "--session".to_string());
+            }
+            if !args.iter().any(|a| a == "--cdp" || a.starts_with("--cdp=")) {
+                args.insert(0, endpoint.clone());
+                args.insert(0, "--cdp".to_string());
+            }
+        }
+        Some(BrowserConnection::AutoConnect) => {
+            if !args
+                .iter()
+                .any(|a| a == "--session" || a.starts_with("--session="))
+            {
+                args.insert(0, CDP_SESSION_NAME.to_string());
+                args.insert(0, "--session".to_string());
+            }
+            if !args.iter().any(|a| a == "--auto-connect") {
+                args.insert(0, "--auto-connect".to_string());
+            }
+        }
+        Some(BrowserConnection::CookieState { state_file }) => {
+            if !args
+                .iter()
+                .any(|a| a == "--state" || a.starts_with("--state="))
+            {
+                args.insert(0, state_file.to_string_lossy().to_string());
+                args.insert(0, "--state".to_string());
+            }
+        }
+        Some(BrowserConnection::Profile { profile_dir }) => {
+            if !args
+                .iter()
+                .any(|a| a == "--profile" || a.starts_with("--profile="))
+            {
+                args.insert(0, profile_dir.to_string_lossy().to_string());
+                args.insert(0, "--profile".to_string());
+            }
+        }
+        None => {}
     }
 
-    // Apply stealth options to avoid automation detection
-    if use_stealth {
-        if !final_args
+    if use_stealth && !live_attach {
+        if !args
             .iter()
             .any(|a| a == "--user-agent" || a.starts_with("--user-agent="))
         {
-            final_args.insert(0, STEALTH_USER_AGENT.to_string());
-            final_args.insert(0, "--user-agent".to_string());
+            args.insert(0, STEALTH_USER_AGENT.to_string());
+            args.insert(0, "--user-agent".to_string());
         }
-        if !final_args
+        if !args
             .iter()
             .any(|a| a == "--args" || a.starts_with("--args="))
         {
-            final_args.insert(0, STEALTH_ARGS.to_string());
-            final_args.insert(0, "--args".to_string());
+            args.insert(0, STEALTH_ARGS.to_string());
+            args.insert(0, "--args".to_string());
         }
     }
 
     let wants_json = matches!(format, OutputFormat::Json | OutputFormat::Jsonl);
-    if wants_json && !final_args.iter().any(|a| a == "--json") {
-        final_args.push("--json".to_string());
+    if wants_json && !args.iter().any(|a| a == "--json") {
+        args.push("--json".to_string());
     }
 
+    args
+}
+
+fn run_agent_browser_with_connection(
+    args: Vec<String>,
+    format: OutputFormat,
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<String> {
+    let (bin, prefix_args) = resolve_agent_browser();
+    let mut cmd = Command::new(&bin);
+    let final_args = build_agent_browser_args(args, format, connection, use_stealth, headed);
     let mut all_args = prefix_args;
     all_args.extend(final_args);
 
@@ -187,9 +272,56 @@ fn run_agent_browser_with_options(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Run agent-browser in CDP mode with the given connection.
+/// Stealth and headed are disabled — we're using the user's real Chrome.
+#[allow(dead_code)] // Will be used when RecipeContext migrates to BrowserConnection
+pub fn run_agent_browser_cdp(
+    args: Vec<String>,
+    format: OutputFormat,
+    connection: &BrowserConnection,
+) -> Result<String> {
+    run_agent_browser_with_connection(
+        args,
+        format,
+        Some(connection),
+        /* use_stealth */ false,
+        /* headed */ false,
+    )
+}
+
+/// Run agent-browser with optional stealth mode and headed display
+fn run_agent_browser_with_options(
+    args: Vec<String>,
+    format: OutputFormat,
+    profile_dir: Option<&Path>,
+    use_stealth: bool,
+    headed: bool,
+    profile_mode: BrowserProfileMode,
+) -> Result<String> {
+    let connection = legacy_connection(profile_dir, profile_mode, use_stealth);
+    run_agent_browser_with_connection(args, format, connection.as_ref(), use_stealth, headed)
+}
+
 pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> Result<()> {
-    // Close daemon to ensure stealth options are applied fresh
-    let _ = close_browser();
+    let connection = legacy_connection(
+        ctx.profile_dir.as_deref(),
+        ctx.profile_mode,
+        ctx.use_stealth,
+    );
+    run_recipe_with_connection(recipe, ctx, connection.as_ref(), format)
+}
+
+fn run_recipe_with_connection(
+    recipe: Recipe,
+    ctx: RecipeContext,
+    connection: Option<&BrowserConnection>,
+    format: OutputFormat,
+) -> Result<()> {
+    if let Some(connection) = connection {
+        let _ = close_browser_for_connection(connection);
+    } else {
+        let _ = close_browser();
+    }
 
     let wants_json = matches!(format, OutputFormat::Json);
     let wants_jsonl = matches!(format, OutputFormat::Jsonl);
@@ -219,30 +351,23 @@ pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> R
         let commands = expand_step(action, step.args.as_deref(), &ctx)?;
 
         for args in commands {
-            let stdout = match run_agent_browser_with_options(
+            let stdout = match run_agent_browser_with_connection(
                 args.clone(),
                 format,
-                ctx.profile_dir.as_deref(),
+                connection,
                 ctx.use_stealth,
                 headed,
-                ctx.profile_mode,
             ) {
                 Ok(stdout) => stdout,
                 Err(err) => {
-                    if maybe_pause_for_captcha_challenge(
-                        ctx.profile_dir.as_deref(),
-                        ctx.use_stealth,
-                        ctx.profile_mode,
-                        headed,
-                    )? {
+                    if maybe_pause_for_captcha_challenge(connection, CHATGPT_URL, headed, None)? {
                         headed = true;
-                        run_agent_browser_with_options(
+                        run_agent_browser_with_connection(
                             args.clone(),
                             format,
-                            ctx.profile_dir.as_deref(),
+                            connection,
                             ctx.use_stealth,
                             headed,
-                            ctx.profile_mode,
                         )?
                     } else {
                         return Err(err);
@@ -324,7 +449,7 @@ pub fn login(profile_dir: &Path) -> Result<()> {
     clear_state_file(profile_dir)?;
     // Close any existing daemon to ensure fresh options
     let _ = close_browser();
-    let args = vec!["open".to_string(), "https://chatgpt.com/".to_string()];
+    let args = vec!["open".to_string(), CHATGPT_URL.to_string()];
     let _ = run_agent_browser_with_options(
         args,
         OutputFormat::Text,
@@ -338,6 +463,21 @@ pub fn login(profile_dir: &Path) -> Result<()> {
 
 /// Close the agent-browser daemon to ensure fresh options on next launch.
 pub fn close_browser() -> Result<()> {
+    close_browser_daemon()
+}
+
+pub fn close_browser_for_connection(connection: &BrowserConnection) -> Result<()> {
+    if connection.is_live_attach() {
+        let (bin, prefix_args) = resolve_agent_browser();
+        let mut cmd = Command::new(bin);
+        cmd.args(prefix_args);
+        let _ = cmd.args(["--session", CDP_SESSION_NAME, "close"]).output();
+        return Ok(());
+    }
+    close_browser_daemon()
+}
+
+fn close_browser_daemon() -> Result<()> {
     let (bin, prefix_args) = resolve_agent_browser();
     let mut cmd = Command::new(bin);
     cmd.args(prefix_args);
@@ -603,72 +743,168 @@ pub fn resolve_recipe(path: &Path) -> Result<PathBuf> {
     find_data_file("recipes", &filename)
 }
 
-pub fn resolve_auth_mode(profile_dir: &Path, headed: bool) -> Result<BrowserProfileMode> {
+/// Resolve CDP endpoint from flag → env → config (first non-empty wins).
+pub fn resolve_cdp_endpoint(cdp_override: Option<&str>, config: &Config) -> Option<String> {
+    cdp_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| env::var("YOETZ_BROWSER_CDP").ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .or_else(|| config.defaults.browser_cdp.clone())
+        .filter(|value| !value.is_empty())
+}
+
+fn resolve_browser_connection_fallback(
+    profile_dir: &Path,
+    headed: bool,
+    target_url: &str,
+) -> Result<BrowserConnection> {
     if !profile_dir.exists() {
         return Err(anyhow!(
             "browser profile not found at {}. Run `yoetz browser login` to authenticate.",
             profile_dir.display()
         ));
     }
-    if state_file(profile_dir).exists()
-        && check_auth_with_mode(profile_dir, headed, BrowserProfileMode::PreferState).is_ok()
+
+    let cookie_state = BrowserConnection::CookieState {
+        state_file: state_file(profile_dir),
+    };
+    if matches!(
+        &cookie_state,
+        BrowserConnection::CookieState { state_file } if state_file.exists()
+    ) && check_auth_with_connection(&cookie_state, headed, target_url).is_ok()
     {
-        return Ok(BrowserProfileMode::PreferState);
+        return Ok(cookie_state);
     }
-    check_auth_with_mode(profile_dir, headed, BrowserProfileMode::ProfileOnly)?;
-    Ok(BrowserProfileMode::ProfileOnly)
+
+    let profile = BrowserConnection::Profile {
+        profile_dir: profile_dir.to_path_buf(),
+    };
+    check_auth_with_connection(&profile, headed, target_url)?;
+    Ok(profile)
+}
+
+pub fn resolve_browser_connection(
+    config: &Config,
+    cdp_override: Option<&str>,
+    profile_dir: &Path,
+    target_url: &str,
+) -> Result<BrowserConnection> {
+    if let Some(endpoint) = resolve_cdp_endpoint(cdp_override, config) {
+        if try_cdp_attach(&endpoint, target_url).is_ok() {
+            return Ok(BrowserConnection::Cdp { endpoint });
+        }
+    }
+
+    if try_auto_connect(target_url).is_ok() {
+        return Ok(BrowserConnection::AutoConnect);
+    }
+
+    resolve_browser_connection_fallback(profile_dir, /* headed */ false, target_url)
+}
+
+pub fn try_cdp_attach(endpoint: &str, target_url: &str) -> Result<()> {
+    let connection = BrowserConnection::Cdp {
+        endpoint: endpoint.to_string(),
+    };
+    verify_auth_cdp(target_url, &connection)
+}
+
+pub fn try_auto_connect(target_url: &str) -> Result<()> {
+    let connection = BrowserConnection::AutoConnect;
+    verify_auth_cdp(target_url, &connection)
+}
+
+pub fn verify_auth_cdp(target_url: &str, connection: &BrowserConnection) -> Result<()> {
+    if !connection.is_live_attach() {
+        return Err(anyhow!(
+            "verify_auth_cdp requires a live browser connection"
+        ));
+    }
+    check_auth_with_connection(connection, /* headed */ false, target_url)
+}
+
+pub fn resolve_auth(profile_dir: &Path, headed: bool) -> Result<BrowserConnection> {
+    resolve_browser_connection_fallback(profile_dir, headed, CHATGPT_URL)
+}
+
+pub fn resolve_auth_mode(profile_dir: &Path, headed: bool) -> Result<BrowserProfileMode> {
+    match resolve_auth(profile_dir, headed)? {
+        BrowserConnection::CookieState { .. } => Ok(BrowserProfileMode::PreferState),
+        BrowserConnection::Profile { .. } => Ok(BrowserProfileMode::ProfileOnly),
+        BrowserConnection::Cdp { .. } | BrowserConnection::AutoConnect => Err(anyhow!(
+            "legacy auth mode cannot map a live browser connection"
+        )),
+    }
 }
 
 pub fn check_auth(profile_dir: &Path, headed: bool) -> Result<()> {
-    let _ = resolve_auth_mode(profile_dir, headed)?;
-    Ok(())
+    let connection = resolve_auth(profile_dir, headed)?;
+    check_auth_with_connection(&connection, headed, CHATGPT_URL)
 }
 
-fn check_auth_with_mode(
-    profile_dir: &Path,
+/// Check auth using a specific connection (public API for handlers).
+#[allow(dead_code)] // Will be used when Check handler fully migrates
+pub fn check_auth_connection(
+    connection: &BrowserConnection,
     headed: bool,
-    profile_mode: BrowserProfileMode,
+    target_url: &str,
 ) -> Result<()> {
-    // Close daemon to ensure stealth options are applied fresh
-    let _ = close_browser();
+    check_auth_with_connection(connection, headed, target_url)
+}
+
+fn check_auth_with_connection(
+    connection: &BrowserConnection,
+    headed: bool,
+    target_url: &str,
+) -> Result<()> {
+    let _ = close_browser_for_connection(connection);
     let mut current_headed = headed;
-    let _ = run_agent_browser_with_options(
-        vec!["open".to_string(), "https://chatgpt.com/".to_string()],
+    let use_stealth = !connection.is_live_attach();
+    let open_args = if connection.is_live_attach() {
+        vec!["tab".to_string(), "new".to_string(), target_url.to_string()]
+    } else {
+        vec!["open".to_string(), target_url.to_string()]
+    };
+    let _ = run_agent_browser_with_connection(
+        open_args,
         OutputFormat::Text,
-        Some(profile_dir),
-        /* use_stealth */ true,
+        Some(connection),
+        use_stealth,
         current_headed,
-        profile_mode,
     )?;
     let deadline = Instant::now() + Duration::from_millis(AUTH_CHECK_TIMEOUT_MS);
     let mut last_issue: Option<&'static str>;
     loop {
-        let snapshot = run_agent_browser_with_options(
+        let snapshot = run_agent_browser_with_connection(
             vec![
                 "snapshot".to_string(),
                 "-c".to_string(),
                 "--json".to_string(),
             ],
             OutputFormat::Json,
-            Some(profile_dir),
-            /* use_stealth */ true,
+            Some(connection),
+            use_stealth,
             current_headed,
-            profile_mode,
         )?;
 
         if is_challenge_page(&snapshot)
             && maybe_pause_for_captcha_challenge(
-                Some(profile_dir),
-                /* use_stealth */ true,
-                profile_mode,
+                Some(connection),
+                target_url,
                 current_headed,
+                Some(&snapshot),
             )?
         {
-            current_headed = true;
+            if !connection.is_live_attach() {
+                current_headed = true;
+            }
             continue;
         }
 
-        last_issue = detect_auth_issue(&snapshot);
+        last_issue = detect_auth_issue_for_connection(&snapshot, Some(connection));
 
         // Positive confirmation: page loaded and no auth issues detected
         if last_issue.is_none() && looks_authenticated(&snapshot) {
@@ -690,36 +926,6 @@ fn check_auth_with_mode(
     ))
 }
 
-fn add_profile_args(
-    final_args: &mut Vec<String>,
-    profile_dir: &Path,
-    use_stealth: bool,
-    profile_mode: BrowserProfileMode,
-    state_exists: bool,
-) {
-    let wants_state =
-        matches!(profile_mode, BrowserProfileMode::PreferState) && use_stealth && state_exists;
-
-    if wants_state {
-        if !final_args
-            .iter()
-            .any(|a| a == "--state" || a.starts_with("--state="))
-        {
-            final_args.insert(0, state_file(profile_dir).to_string_lossy().to_string());
-            final_args.insert(0, "--state".to_string());
-        }
-        return;
-    }
-
-    if !final_args
-        .iter()
-        .any(|a| a == "--profile" || a.starts_with("--profile="))
-    {
-        final_args.insert(0, profile_dir.to_string_lossy().to_string());
-        final_args.insert(0, "--profile".to_string());
-    }
-}
-
 /// Positive confirmation that the page is authenticated (ChatGPT loaded successfully).
 fn looks_authenticated(snapshot: &str) -> bool {
     let haystack = snapshot.to_lowercase();
@@ -728,36 +934,35 @@ fn looks_authenticated(snapshot: &str) -> bool {
 }
 
 fn maybe_pause_for_captcha_challenge(
-    profile_dir: Option<&Path>,
-    use_stealth: bool,
-    profile_mode: BrowserProfileMode,
+    connection: Option<&BrowserConnection>,
+    target_url: &str,
     headed: bool,
+    snapshot: Option<&str>,
 ) -> Result<bool> {
-    let Some(profile_dir) = profile_dir else {
+    let Some(connection) = connection else {
         return Ok(false);
     };
 
-    if headed {
+    let snapshot = snapshot.unwrap_or_default();
+    if !is_challenge_page(snapshot) {
         return Ok(false);
     }
 
-    let snapshot = match run_agent_browser_with_options(
-        vec![
-            "snapshot".to_string(),
-            "-c".to_string(),
-            "--json".to_string(),
-        ],
-        OutputFormat::Json,
-        Some(profile_dir),
-        use_stealth,
-        headed,
-        profile_mode,
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(_) => return Ok(false),
-    };
+    if connection.is_live_attach() {
+        if !io::stdin().is_terminal() {
+            return Err(anyhow!(
+                "captcha detected in the attached Chrome session, but stdin is not interactive. Re-run this command in a terminal so you can solve the challenge."
+            ));
+        }
+        eprintln!(
+            "Captcha detected — please solve it in your Chrome window, then press Enter to continue"
+        );
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        return Ok(true);
+    }
 
-    if !is_challenge_page(&snapshot) {
+    if headed {
         return Ok(false);
     }
 
@@ -767,14 +972,13 @@ fn maybe_pause_for_captcha_challenge(
         ));
     }
 
-    let _ = close_browser();
-    run_agent_browser_with_options(
-        vec!["open".to_string(), "https://chatgpt.com/".to_string()],
+    let _ = close_browser_for_connection(connection);
+    run_agent_browser_with_connection(
+        vec!["open".to_string(), target_url.to_string()],
         OutputFormat::Text,
-        Some(profile_dir),
-        use_stealth,
+        Some(connection),
+        /* use_stealth */ true,
         /* headed */ true,
-        profile_mode,
     )?;
     eprintln!(
         "Captcha detected — please solve it in the browser window, then press Enter to continue"
@@ -798,7 +1002,10 @@ fn is_challenge_page(snapshot: &str) -> bool {
     contains_any(&haystack, &challenge_markers)
 }
 
-fn detect_auth_issue(snapshot: &str) -> Option<&'static str> {
+fn detect_auth_issue_for_connection(
+    snapshot: &str,
+    connection: Option<&BrowserConnection>,
+) -> Option<&'static str> {
     let haystack = snapshot.to_lowercase();
     let login_markers = [
         "log in",
@@ -812,11 +1019,21 @@ fn detect_auth_issue(snapshot: &str) -> Option<&'static str> {
     ];
 
     if is_challenge_page(snapshot) {
+        if connection.is_some_and(BrowserConnection::is_live_attach) {
+            return Some(
+                "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again.",
+            );
+        }
         return Some(
             "cloudflare challenge detected. Run `yoetz browser sync-cookies` or `yoetz browser login` and try again.",
         );
     }
     if contains_any(&haystack, &login_markers) {
+        if connection.is_some_and(BrowserConnection::is_live_attach) {
+            return Some(
+                "chatgpt login required in the attached Chrome session. Log in there and try again.",
+            );
+        }
         return Some("chatgpt login required. Run `yoetz browser login` and try again.");
     }
     None
@@ -998,6 +1215,12 @@ fn first_unresolved_placeholder(value: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock as TestOnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     fn recipe_context() -> RecipeContext {
         RecipeContext {
@@ -1083,6 +1306,46 @@ mod tests {
     }
 
     #[test]
+    fn browser_connection_live_attach_detection() {
+        assert!(BrowserConnection::Cdp {
+            endpoint: "http://127.0.0.1:9222".to_string(),
+        }
+        .is_live_attach());
+        assert!(BrowserConnection::AutoConnect.is_live_attach());
+        assert!(!BrowserConnection::CookieState {
+            state_file: PathBuf::from("/tmp/state.json"),
+        }
+        .is_live_attach());
+        assert!(!BrowserConnection::Profile {
+            profile_dir: PathBuf::from("/tmp/profile"),
+        }
+        .is_live_attach());
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn resolve_cdp_endpoint_prefers_flag_then_env_then_config() {
+        let _guard = env_lock().lock().unwrap();
+        unsafe {
+            env::set_var("YOETZ_BROWSER_CDP", "http://127.0.0.1:9000");
+        }
+        let mut config = Config::default();
+        config.defaults.browser_cdp = Some("http://127.0.0.1:9222".to_string());
+
+        let from_flag = resolve_cdp_endpoint(Some("http://127.0.0.1:9333"), &config);
+        assert_eq!(from_flag.as_deref(), Some("http://127.0.0.1:9333"));
+
+        let from_env = resolve_cdp_endpoint(None, &config);
+        assert_eq!(from_env.as_deref(), Some("http://127.0.0.1:9000"));
+
+        unsafe {
+            env::remove_var("YOETZ_BROWSER_CDP");
+        }
+        let from_config = resolve_cdp_endpoint(None, &config);
+        assert_eq!(from_config.as_deref(), Some("http://127.0.0.1:9222"));
+    }
+
+    #[test]
     fn interpolate_replaces_bundle_and_recipe_vars() {
         let ctx = recipe_context();
         let value = interpolate("open {{bundle_path}} {{model}}", &ctx, Some("ignored")).unwrap();
@@ -1097,60 +1360,36 @@ mod tests {
     }
 
     #[test]
-    fn profile_only_mode_uses_persistent_profile_even_if_state_exists() {
-        let mut args = vec!["open".to_string(), "https://chatgpt.com/".to_string()];
-        add_profile_args(
-            &mut args,
-            Path::new("/tmp/browser-profile"),
-            true,
-            BrowserProfileMode::ProfileOnly,
-            true,
+    fn build_agent_browser_args_adds_cdp_session_flags() {
+        let args = build_agent_browser_args(
+            vec!["snapshot".to_string()],
+            OutputFormat::Json,
+            Some(&BrowserConnection::Cdp {
+                endpoint: "http://127.0.0.1:9222".to_string(),
+            }),
+            /* use_stealth */ true,
+            /* headed */ true,
         );
-        assert_eq!(args[0], "--profile");
-        assert_eq!(args[1], "/tmp/browser-profile");
-        assert!(!args.iter().any(|arg| arg == "--state"));
+        assert!(args.iter().any(|arg| arg == "--session"));
+        assert!(args.iter().any(|arg| arg == CDP_SESSION_NAME));
+        assert!(args.iter().any(|arg| arg == "--cdp"));
+        assert!(args.iter().any(|arg| arg == "http://127.0.0.1:9222"));
+        assert!(!args.iter().any(|arg| arg == "--headed"));
+        assert!(!args.iter().any(|arg| arg == "--user-agent"));
     }
 
     #[test]
-    fn prefer_state_mode_keeps_cookie_sync_snapshot_path() {
-        let mut args = vec!["open".to_string(), "https://chatgpt.com/".to_string()];
-        add_profile_args(
-            &mut args,
-            Path::new("/tmp/browser-profile"),
-            true,
-            BrowserProfileMode::PreferState,
-            true,
+    fn build_agent_browser_args_adds_auto_connect_session_flags() {
+        let args = build_agent_browser_args(
+            vec!["open".to_string(), CHATGPT_URL.to_string()],
+            OutputFormat::Text,
+            Some(&BrowserConnection::AutoConnect),
+            /* use_stealth */ false,
+            /* headed */ false,
         );
-        assert_eq!(args[0], "--state");
-        assert_eq!(args[1], "/tmp/browser-profile/state.json");
-    }
-
-    #[test]
-    fn prefer_state_no_stealth_falls_back_to_profile() {
-        let mut args = vec!["open".to_string()];
-        add_profile_args(
-            &mut args,
-            Path::new("/tmp/bp"),
-            false,
-            BrowserProfileMode::PreferState,
-            true,
-        );
-        assert_eq!(args[0], "--profile");
-        assert!(!args.iter().any(|arg| arg == "--state"));
-    }
-
-    #[test]
-    fn prefer_state_no_state_file_falls_back_to_profile() {
-        let mut args = vec!["open".to_string()];
-        add_profile_args(
-            &mut args,
-            Path::new("/tmp/bp"),
-            true,
-            BrowserProfileMode::PreferState,
-            false,
-        );
-        assert_eq!(args[0], "--profile");
-        assert!(!args.iter().any(|arg| arg == "--state"));
+        assert!(args.iter().any(|arg| arg == "--auto-connect"));
+        assert!(args.iter().any(|arg| arg == "--session"));
+        assert!(args.iter().any(|arg| arg == CDP_SESSION_NAME));
     }
 
     #[test]
@@ -1168,5 +1407,17 @@ mod tests {
             r#"{"text": "Cloudflare security check"}"#
         ));
         assert!(!is_challenge_page(r#"{"text": "ChatGPT - New chat"}"#));
+    }
+
+    #[test]
+    fn detect_auth_issue_for_live_attach_uses_live_guidance() {
+        let issue = detect_auth_issue_for_connection(
+            r#"{"text":"Please log in"}"#,
+            Some(&BrowserConnection::AutoConnect),
+        );
+        assert_eq!(
+            issue,
+            Some("chatgpt login required in the attached Chrome session. Log in there and try again.")
+        );
     }
 }
