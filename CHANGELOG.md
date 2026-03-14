@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.11] - 2026-03-14
+
+### Bug Fixes
+
+- Pause for manual captcha solve in browser flows (#46)
+
+### Features
+
+- CDP browser attach — replace cookie sync with direct Chrome session access (#47)
+
+### Miscellaneous
+
+- Update SKILL.md model references to current versions (#44)
+- Use grok-4.20-multi-agent-beta in SKILL.md examples (#45)
+
 ## [0.2.10] - 2026-03-14
 
 ### Features
