@@ -1,0 +1,7 @@
+{
+  "name": "yoetz-browser-scripts",
+  "private": true,
+  "dependencies": {
+    "@steipete/sweet-cookie": "0.2.0"
+  }
+}

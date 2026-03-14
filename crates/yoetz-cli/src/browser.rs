@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use yoetz_core::config::Config;
 use yoetz_core::output::{write_json, write_jsonl_event, OutputFormat};
@@ -20,6 +20,8 @@ const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7
 /// Browser launch args to disable automation detection
 const STEALTH_ARGS: &str = "--disable-blink-features=AutomationControlled";
 const COOKIE_SYNC_TIMEOUT_MS: &str = "30000";
+const AUTH_CHECK_TIMEOUT_MS: u64 = 8_000;
+const AUTH_CHECK_POLL_MS: u64 = 500;
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
     major: 24,
     minor: 4,
@@ -53,9 +55,16 @@ pub struct RecipeContext {
     pub bundle_path: Option<String>,
     pub bundle_text: Option<String>,
     pub profile_dir: Option<PathBuf>,
+    pub profile_mode: BrowserProfileMode,
     pub use_stealth: bool,
     pub headed: bool,
     pub vars: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BrowserProfileMode {
+    PreferState,
+    ProfileOnly,
 }
 
 /// Cached agent-browser resolution. Probed once per process, reused for all calls.
@@ -99,16 +108,18 @@ pub fn run_agent_browser(
         profile_dir,
         /* use_stealth */ true,
         /* headed */ false,
+        BrowserProfileMode::PreferState,
     )
 }
 
 /// Run agent-browser with optional stealth mode and headed display
-pub fn run_agent_browser_with_options(
+fn run_agent_browser_with_options(
     args: Vec<String>,
     format: OutputFormat,
     profile_dir: Option<&Path>,
     use_stealth: bool,
     headed: bool,
+    profile_mode: BrowserProfileMode,
 ) -> Result<String> {
     let (bin, prefix_args) = resolve_agent_browser();
     let mut cmd = Command::new(&bin);
@@ -119,26 +130,13 @@ pub fn run_agent_browser_with_options(
     }
 
     if let Some(profile_dir) = profile_dir {
-        let state_path = state_file(profile_dir);
-
-        // Use --state if state.json exists and stealth is enabled (for cookie injection)
-        // Otherwise use --profile (for persistent browser data)
-        // Note: --state and --profile are mutually exclusive in agent-browser
-        if use_stealth && state_path.exists() {
-            if !final_args
-                .iter()
-                .any(|a| a == "--state" || a.starts_with("--state="))
-            {
-                final_args.insert(0, state_path.to_string_lossy().to_string());
-                final_args.insert(0, "--state".to_string());
-            }
-        } else if !final_args
-            .iter()
-            .any(|a| a == "--profile" || a.starts_with("--profile="))
-        {
-            final_args.insert(0, profile_dir.to_string_lossy().to_string());
-            final_args.insert(0, "--profile".to_string());
-        }
+        add_profile_args(
+            &mut final_args,
+            profile_dir,
+            use_stealth,
+            profile_mode,
+            state_file(profile_dir).exists(),
+        );
     }
 
     // Apply stealth options to avoid automation detection
@@ -225,6 +223,7 @@ pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> R
                 ctx.profile_dir.as_deref(),
                 ctx.use_stealth,
                 ctx.headed,
+                ctx.profile_mode,
             )?;
 
             if wants_json || wants_jsonl {
@@ -298,6 +297,7 @@ fn expand_tilde(path: &Path) -> Result<PathBuf> {
 
 pub fn login(profile_dir: &Path) -> Result<()> {
     fs::create_dir_all(profile_dir).with_context(|| format!("create {}", profile_dir.display()))?;
+    clear_state_file(profile_dir)?;
     // Close any existing daemon to ensure fresh options
     let _ = close_browser();
     let args = vec!["open".to_string(), "https://chatgpt.com/".to_string()];
@@ -307,6 +307,7 @@ pub fn login(profile_dir: &Path) -> Result<()> {
         Some(profile_dir),
         /* use_stealth */ true,
         /* headed */ true,
+        BrowserProfileMode::ProfileOnly,
     )?;
     Ok(())
 }
@@ -326,23 +327,14 @@ pub fn state_file(profile_dir: &Path) -> PathBuf {
     profile_dir.join("state.json")
 }
 
-pub fn maybe_load_state(profile_dir: &Path, use_stealth: bool) -> Result<bool> {
+pub fn clear_state_file(profile_dir: &Path) -> Result<()> {
     let state_path = state_file(profile_dir);
     if !state_path.exists() {
-        return Ok(false);
+        return Ok(());
     }
-    let _ = run_agent_browser_with_options(
-        vec![
-            "state".to_string(),
-            "load".to_string(),
-            state_path.to_string_lossy().to_string(),
-        ],
-        OutputFormat::Text,
-        Some(profile_dir),
-        use_stealth,
-        /* headed */ false,
-    )?;
-    Ok(true)
+    fs::remove_file(&state_path)
+        .with_context(|| format!("remove stale {}", state_path.display()))?;
+    Ok(())
 }
 
 /// Sync cookies from real Chrome to agent-browser state file.
@@ -366,7 +358,7 @@ pub fn sync_cookies(profile_dir: &Path) -> Result<(usize, Vec<String>)> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(anyhow!(
-            "cookie extraction failed: {stderr}\n\nMake sure Node >=22 is installed and `npm install -g @steipete/sweet-cookie`. Then log into ChatGPT in Chrome and try again."
+            "cookie extraction failed: {stderr}\n\nMake sure Node >=24.4 is installed. Release/Homebrew installs bundle the cookie extractor dependency; if you're running from a source checkout, run `npm ci --prefix scripts`. Then log into ChatGPT in Chrome and try again."
         ));
     }
 
@@ -587,42 +579,113 @@ pub fn resolve_recipe(path: &Path) -> Result<PathBuf> {
     find_data_file("recipes", &filename)
 }
 
-pub fn check_auth(profile_dir: &Path, headed: bool) -> Result<()> {
+pub fn resolve_auth_mode(profile_dir: &Path, headed: bool) -> Result<BrowserProfileMode> {
     if !profile_dir.exists() {
         return Err(anyhow!(
             "browser profile not found at {}. Run `yoetz browser login` to authenticate.",
             profile_dir.display()
         ));
     }
+    if state_file(profile_dir).exists()
+        && check_auth_with_mode(profile_dir, headed, BrowserProfileMode::PreferState).is_ok()
+    {
+        return Ok(BrowserProfileMode::PreferState);
+    }
+    check_auth_with_mode(profile_dir, headed, BrowserProfileMode::ProfileOnly)?;
+    Ok(BrowserProfileMode::ProfileOnly)
+}
+
+pub fn check_auth(profile_dir: &Path, headed: bool) -> Result<()> {
+    let _ = resolve_auth_mode(profile_dir, headed)?;
+    Ok(())
+}
+
+fn check_auth_with_mode(
+    profile_dir: &Path,
+    headed: bool,
+    profile_mode: BrowserProfileMode,
+) -> Result<()> {
     // Close daemon to ensure stealth options are applied fresh
     let _ = close_browser();
-    // State is now loaded via --state flag in run_agent_browser_with_options
     let _ = run_agent_browser_with_options(
         vec!["open".to_string(), "https://chatgpt.com/".to_string()],
         OutputFormat::Text,
         Some(profile_dir),
         /* use_stealth */ true,
         headed,
+        profile_mode,
     )?;
-    thread::sleep(Duration::from_millis(2500));
-    let snapshot = run_agent_browser_with_options(
-        vec![
-            "snapshot".to_string(),
-            "-i".to_string(),
-            "-c".to_string(),
-            "--json".to_string(),
-        ],
-        OutputFormat::Json,
-        Some(profile_dir),
-        /* use_stealth */ true,
-        headed,
-    )?;
+    let deadline = Instant::now() + Duration::from_millis(AUTH_CHECK_TIMEOUT_MS);
+    let mut last_issue: Option<&'static str>;
+    loop {
+        let snapshot = run_agent_browser_with_options(
+            vec![
+                "snapshot".to_string(),
+                "-c".to_string(),
+                "--json".to_string(),
+            ],
+            OutputFormat::Json,
+            Some(profile_dir),
+            /* use_stealth */ true,
+            headed,
+            profile_mode,
+        )?;
 
-    if let Some(issue) = detect_auth_issue(&snapshot) {
-        return Err(anyhow!("{issue}"));
+        last_issue = detect_auth_issue(&snapshot);
+
+        // Positive confirmation: page loaded and no auth issues detected
+        if last_issue.is_none() && looks_authenticated(&snapshot) {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(AUTH_CHECK_POLL_MS));
     }
 
+    if let Some(issue) = last_issue {
+        return Err(anyhow!("{issue}"));
+    }
+    // Timed out without positive confirmation but no negative markers either
     Ok(())
+}
+
+fn add_profile_args(
+    final_args: &mut Vec<String>,
+    profile_dir: &Path,
+    use_stealth: bool,
+    profile_mode: BrowserProfileMode,
+    state_exists: bool,
+) {
+    let wants_state =
+        matches!(profile_mode, BrowserProfileMode::PreferState) && use_stealth && state_exists;
+
+    if wants_state {
+        if !final_args
+            .iter()
+            .any(|a| a == "--state" || a.starts_with("--state="))
+        {
+            final_args.insert(0, state_file(profile_dir).to_string_lossy().to_string());
+            final_args.insert(0, "--state".to_string());
+        }
+        return;
+    }
+
+    if !final_args
+        .iter()
+        .any(|a| a == "--profile" || a.starts_with("--profile="))
+    {
+        final_args.insert(0, profile_dir.to_string_lossy().to_string());
+        final_args.insert(0, "--profile".to_string());
+    }
+}
+
+/// Positive confirmation that the page is authenticated (ChatGPT loaded successfully).
+fn looks_authenticated(snapshot: &str) -> bool {
+    let haystack = snapshot.to_lowercase();
+    let positive_markers = ["chatgpt", "new chat", "send a message", "message chatgpt"];
+    contains_any(&haystack, &positive_markers)
 }
 
 fn detect_auth_issue(snapshot: &str) -> Option<&'static str> {
@@ -840,6 +903,7 @@ mod tests {
             bundle_path: Some("/tmp/bundle.md".to_string()),
             bundle_text: Some("hello world".to_string()),
             profile_dir: None,
+            profile_mode: BrowserProfileMode::ProfileOnly,
             use_stealth: true,
             headed: false,
             vars: BTreeMap::from([("model".to_string(), "gpt-5-4-pro".to_string())]),
@@ -929,5 +993,70 @@ mod tests {
         let ctx = recipe_context();
         let err = interpolate("{{missing}}", &ctx, None).unwrap_err();
         assert!(err.to_string().contains("--var missing="));
+    }
+
+    #[test]
+    fn profile_only_mode_uses_persistent_profile_even_if_state_exists() {
+        let mut args = vec!["open".to_string(), "https://chatgpt.com/".to_string()];
+        add_profile_args(
+            &mut args,
+            Path::new("/tmp/browser-profile"),
+            true,
+            BrowserProfileMode::ProfileOnly,
+            true,
+        );
+        assert_eq!(args[0], "--profile");
+        assert_eq!(args[1], "/tmp/browser-profile");
+        assert!(!args.iter().any(|arg| arg == "--state"));
+    }
+
+    #[test]
+    fn prefer_state_mode_keeps_cookie_sync_snapshot_path() {
+        let mut args = vec!["open".to_string(), "https://chatgpt.com/".to_string()];
+        add_profile_args(
+            &mut args,
+            Path::new("/tmp/browser-profile"),
+            true,
+            BrowserProfileMode::PreferState,
+            true,
+        );
+        assert_eq!(args[0], "--state");
+        assert_eq!(args[1], "/tmp/browser-profile/state.json");
+    }
+
+    #[test]
+    fn prefer_state_no_stealth_falls_back_to_profile() {
+        let mut args = vec!["open".to_string()];
+        add_profile_args(
+            &mut args,
+            Path::new("/tmp/bp"),
+            false,
+            BrowserProfileMode::PreferState,
+            true,
+        );
+        assert_eq!(args[0], "--profile");
+        assert!(!args.iter().any(|arg| arg == "--state"));
+    }
+
+    #[test]
+    fn prefer_state_no_state_file_falls_back_to_profile() {
+        let mut args = vec!["open".to_string()];
+        add_profile_args(
+            &mut args,
+            Path::new("/tmp/bp"),
+            true,
+            BrowserProfileMode::PreferState,
+            false,
+        );
+        assert_eq!(args[0], "--profile");
+        assert!(!args.iter().any(|arg| arg == "--state"));
+    }
+
+    #[test]
+    fn looks_authenticated_detects_chatgpt() {
+        assert!(looks_authenticated(r#"{"text": "ChatGPT - New chat"}"#));
+        assert!(looks_authenticated(r#"{"text": "Send a message"}"#));
+        assert!(!looks_authenticated(r#"{"text": "Loading..."}"#));
+        assert!(!looks_authenticated(""));
     }
 }

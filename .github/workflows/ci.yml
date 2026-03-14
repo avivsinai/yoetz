@@ -16,6 +16,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  browser-scripts:
+    name: Browser Scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm ci --prefix scripts --omit=dev --ignore-scripts
+      - run: node --input-type=module -e "import { getCookies, toCookieHeader } from '@steipete/sweet-cookie'; console.log('getCookies:', typeof getCookies, 'toCookieHeader:', typeof toCookieHeader)"
+        working-directory: scripts
+
   check:
     name: Check
     runs-on: ubuntu-latest
