@@ -58,6 +58,19 @@ yoetz/
 6. Push to your fork
 7. Open a Pull Request
 
+## Release Process
+
+- Keep feature PRs feature-only. Do not edit `Cargo.toml`, `Cargo.lock`, or `CHANGELOG.md`
+  in ordinary feature branches.
+- Prepare releases in a dedicated `release/vX.Y.Z` branch or PR from `main`.
+- In the release PR:
+  - bump the workspace version in `Cargo.toml`
+  - update `Cargo.lock`
+  - regenerate `CHANGELOG.md` with `git-cliff --tag vX.Y.Z -o CHANGELOG.md`
+- Merge the release PR, then tag that merge commit as `vX.Y.Z` to trigger the release workflow.
+- CI only validates the changelog when release metadata changes, so feature PRs are not
+  blocked on release prep.
+
 ## Commit Messages
 
 Use clear, descriptive commit messages:
