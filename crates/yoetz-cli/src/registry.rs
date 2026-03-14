@@ -41,6 +41,90 @@ pub fn load_registry_cache() -> Result<Option<ModelRegistry>> {
     Ok(Some(registry))
 }
 
+/// Default auto-sync interval: 24 hours.
+const DEFAULT_AUTO_SYNC_SECS: u64 = 86400;
+
+/// Returns true if the cached registry is stale (older than `auto_sync_secs`).
+/// Returns true if no cache exists at all.
+pub fn is_registry_stale(config: &Config) -> bool {
+    let interval = config
+        .registry
+        .auto_sync_secs
+        .unwrap_or(DEFAULT_AUTO_SYNC_SECS);
+    if interval == 0 {
+        return false; // auto-sync disabled
+    }
+    let path = registry_cache_path();
+    if !path.exists() {
+        return true;
+    }
+    let Ok(meta) = fs::metadata(&path) else {
+        return true;
+    };
+    let Ok(modified) = meta.modified() else {
+        return true;
+    };
+    let age = modified.elapsed().unwrap_or_default();
+    age.as_secs() >= interval
+}
+
+/// Load registry, auto-syncing if stale or corrupt.
+/// Only overwrites the cache if the new registry is at least as large as the old one,
+/// preventing degraded data from replacing a healthy cache.
+pub async fn load_registry_with_auto_sync(
+    client: &Client,
+    config: &Config,
+) -> Result<Option<ModelRegistry>> {
+    let cached = load_registry_cache();
+    let cache_corrupt = cached.is_err();
+    let cached = cached.ok().flatten();
+
+    let needs_sync = cache_corrupt || is_registry_stale(config);
+    if needs_sync {
+        match fetch_registry(client, config).await {
+            Ok(fetch) => {
+                let new_count = fetch.registry.models.len();
+                let old_count = cached.as_ref().map_or(0, |r| r.models.len());
+
+                if new_count >= old_count || cached.is_none() || cache_corrupt {
+                    if let Err(e) = save_registry_cache(&fetch.registry) {
+                        eprintln!("auto-sync: failed to save registry: {e}");
+                    } else {
+                        eprintln!("auto-sync: registry refreshed ({new_count} models)");
+                    }
+                    return Ok(Some(fetch.registry));
+                } else {
+                    // New registry is smaller (degraded fetch) — keep old cache, log warning.
+                    // Touch mtime so we don't re-fetch on every subsequent invocation.
+                    touch_registry_cache();
+                    eprintln!(
+                        "auto-sync: fetched {new_count} models (had {old_count}); \
+                         keeping cached registry (run `yoetz models sync` to force)"
+                    );
+                    for w in &fetch.warnings {
+                        eprintln!("auto-sync: {w}");
+                    }
+                    return Ok(cached);
+                }
+            }
+            Err(e) => {
+                // Touch mtime to avoid re-fetching on every invocation during outages.
+                touch_registry_cache();
+                eprintln!("auto-sync: refresh failed ({e}), using cached registry");
+            }
+        }
+    }
+    Ok(cached)
+}
+
+/// Touch the registry cache file's mtime to reset the staleness timer.
+fn touch_registry_cache() {
+    let path = registry_cache_path();
+    if let Ok(file) = fs::OpenOptions::new().write(true).open(&path) {
+        let _ = file.set_modified(std::time::SystemTime::now());
+    }
+}
+
 pub fn save_registry_cache(registry: &ModelRegistry) -> Result<PathBuf> {
     let path = registry_cache_path();
     if let Some(parent) = path.parent() {
@@ -58,6 +142,13 @@ pub fn save_registry_cache(registry: &ModelRegistry) -> Result<PathBuf> {
 pub async fn fetch_registry(client: &Client, config: &Config) -> Result<RegistryFetchResult> {
     let mut registry = ModelRegistry::default();
     let mut warnings = Vec::new();
+
+    // Embedded Gemini registry merged first as a low-priority fallback.
+    // Dynamic sources (OpenRouter, LiteLLM) merged after and override these entries.
+    match embedded_gemini_registry() {
+        Ok(embedded) => registry.merge(embedded),
+        Err(err) => warnings.push(format!("embedded gemini registry skipped: {err}")),
+    }
 
     if let Some(org_path) = config.registry.org_registry_path.as_deref() {
         if Path::new(org_path).exists() {
@@ -79,11 +170,6 @@ pub async fn fetch_registry(client: &Client, config: &Config) -> Result<Registry
         Ok(Some(litellm)) => registry.merge(litellm),
         Ok(None) => warnings.push("litellm skipped: missing API key".to_string()),
         Err(err) => warnings.push(format!("litellm failed: {err}")),
-    }
-
-    match embedded_gemini_registry() {
-        Ok(embedded) => registry.merge(embedded),
-        Err(err) => warnings.push(format!("embedded gemini registry skipped: {err}")),
     }
 
     registry.updated_at = Some(
@@ -388,5 +474,59 @@ fn parse_openrouter_capability(item: &Value) -> Option<ModelCapability> {
         None
     } else {
         Some(cap)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yoetz_core::config::RegistryConfig;
+
+    fn config_with_sync(secs: u64) -> Config {
+        Config {
+            registry: RegistryConfig {
+                auto_sync_secs: Some(secs),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn stale_disabled_returns_false() {
+        let config = config_with_sync(0);
+        assert!(!is_registry_stale(&config));
+    }
+
+    #[test]
+    fn stale_missing_file_returns_true() {
+        let config = config_with_sync(86400);
+        // Point at a non-existent path
+        env::set_var("YOETZ_REGISTRY_PATH", "/tmp/yoetz_test_nonexistent.json");
+        assert!(is_registry_stale(&config));
+        env::remove_var("YOETZ_REGISTRY_PATH");
+    }
+
+    #[test]
+    fn stale_fresh_file_returns_false() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp.as_file(), b"{}").unwrap();
+        env::set_var("YOETZ_REGISTRY_PATH", tmp.path().to_str().unwrap());
+        let config = config_with_sync(86400);
+        assert!(!is_registry_stale(&config));
+        env::remove_var("YOETZ_REGISTRY_PATH");
+    }
+
+    #[test]
+    fn stale_old_file_returns_true() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut tmp.as_file(), b"{}").unwrap();
+        // Set mtime to 2 days ago
+        let two_days_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(2 * 86400);
+        tmp.as_file().set_modified(two_days_ago).unwrap();
+        env::set_var("YOETZ_REGISTRY_PATH", tmp.path().to_str().unwrap());
+        let config = config_with_sync(86400);
+        assert!(is_registry_stale(&config));
+        env::remove_var("YOETZ_REGISTRY_PATH");
     }
 }

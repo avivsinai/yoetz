@@ -2,8 +2,8 @@ use anyhow::{anyhow, Result};
 
 use crate::CouncilResult;
 use crate::{
-    add_usage, call_litellm, maybe_write_output, normalize_model_name, render_bundle_md,
-    resolve_max_output_tokens, resolve_prompt, resolve_provider_from_registry,
+    add_usage, call_litellm, maybe_write_output, normalize_model_name_with_aliases,
+    render_bundle_md, resolve_max_output_tokens, resolve_prompt, resolve_provider_from_registry,
     resolve_registry_model_id, resolve_response_format, AppContext, CouncilArgs,
     CouncilModelResult, CouncilPricing, ModelEstimate,
 };
@@ -33,11 +33,14 @@ pub(crate) async fn handle_council(
         .or(config.defaults.provider.clone())
         .map(|provider| provider.to_lowercase());
     // Load registry early so council can auto-resolve providers (e.g. x-ai/grok-4 → openrouter)
-    let registry_cache = registry::load_registry_cache().ok().flatten();
+    let registry_cache = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
+        .await
+        .ok()
+        .flatten();
     let mut resolved_models = Vec::new();
     let mut provider_keys = BTreeSet::new();
     for model in &args.models {
-        let normalized = normalize_model_name(model);
+        let normalized = normalize_model_name_with_aliases(model, &config.aliases);
         let provider = resolve_council_provider(
             &normalized,
             default_provider.as_deref(),

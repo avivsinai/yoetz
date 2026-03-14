@@ -5,9 +5,9 @@ use std::path::PathBuf;
 
 use crate::providers::{gemini, openai, resolve_provider_auth};
 use crate::{
-    build_model_spec, maybe_write_output, normalize_model_name, parse_media_inputs, resolve_prompt,
-    usage_from_litellm, AppContext, GenerateArgs, GenerateCommand, GenerateImageArgs,
-    GenerateVideoArgs,
+    build_model_spec, maybe_write_output, normalize_model_name_with_aliases, parse_media_inputs,
+    resolve_prompt, usage_from_litellm, AppContext, GenerateArgs, GenerateCommand,
+    GenerateImageArgs, GenerateVideoArgs,
 };
 use litellm_rust::{ImageEditRequest, ImageInputData, ImageRequest};
 use yoetz_core::media::{MediaSource, MediaType};
@@ -39,12 +39,13 @@ async fn handle_generate_image(
         .clone()
         .or(config.defaults.provider.clone())
         .ok_or_else(|| anyhow!("provider is required"))?;
-    let model = normalize_model_name(
+    let model = normalize_model_name_with_aliases(
         &args
             .model
             .clone()
             .or(config.defaults.model.clone())
             .ok_or_else(|| anyhow!("model is required"))?,
+        &config.aliases,
     );
 
     let images = parse_media_inputs(&args.image, &args.image_mime, MediaType::Image)?;
@@ -199,12 +200,13 @@ async fn handle_generate_video(
         .clone()
         .or(config.defaults.provider.clone())
         .ok_or_else(|| anyhow!("provider is required"))?;
-    let model = normalize_model_name(
+    let model = normalize_model_name_with_aliases(
         &args
             .model
             .clone()
             .or(config.defaults.model.clone())
             .ok_or_else(|| anyhow!("model is required"))?,
+        &config.aliases,
     );
 
     let images = parse_media_inputs(&args.image, &args.image_mime, MediaType::Image)?;
