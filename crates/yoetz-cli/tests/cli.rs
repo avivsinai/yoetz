@@ -87,6 +87,33 @@ fn browser_recipe_help_mentions_var() {
 }
 
 #[test]
+fn browser_attach_help_shows_cdp_flag() {
+    yoetz()
+        .args(["browser", "attach", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--cdp"));
+}
+
+#[test]
+fn browser_check_help_shows_cdp_flag() {
+    yoetz()
+        .args(["browser", "check", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--cdp"));
+}
+
+#[test]
+fn browser_recipe_help_shows_cdp_flag() {
+    yoetz()
+        .args(["browser", "recipe", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--cdp"));
+}
+
+#[test]
 fn status_runs() {
     yoetz().arg("status").assert().success();
 }

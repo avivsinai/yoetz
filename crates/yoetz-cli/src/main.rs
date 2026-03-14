@@ -205,6 +205,8 @@ enum BrowserCommand {
     Check(BrowserCheckArgs),
     /// Sync cookies from Chrome to agent-browser (bypasses Cloudflare)
     SyncCookies(BrowserSyncCookiesArgs),
+    /// Attach to a running Chrome instance via CDP and verify authentication
+    Attach(BrowserAttachArgs),
 }
 
 #[derive(Args)]
@@ -224,6 +226,10 @@ struct BrowserRecipeArgs {
     #[arg(long)]
     profile: Option<PathBuf>,
 
+    /// Connect to Chrome via CDP endpoint (e.g. http://127.0.0.1:9222)
+    #[arg(long)]
+    cdp: Option<String>,
+
     #[arg(long = "var", value_name = "KEY=VALUE")]
     vars: Vec<String>,
 }
@@ -232,12 +238,25 @@ struct BrowserRecipeArgs {
 struct BrowserLoginArgs {
     #[arg(long)]
     profile: Option<PathBuf>,
+    /// Connect to Chrome via CDP (explicit only, no auto-discovery for login)
+    #[arg(long)]
+    cdp: Option<String>,
 }
 
 #[derive(Args)]
 struct BrowserCheckArgs {
     #[arg(long)]
     profile: Option<PathBuf>,
+    /// Connect to Chrome via CDP endpoint (e.g. http://127.0.0.1:9222)
+    #[arg(long)]
+    cdp: Option<String>,
+}
+
+#[derive(Args)]
+struct BrowserAttachArgs {
+    /// CDP endpoint (e.g. http://127.0.0.1:9222). Auto-discovers if omitted.
+    #[arg(long)]
+    cdp: Option<String>,
 }
 
 #[derive(Args)]
@@ -761,6 +780,29 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
         BrowserCommand::Login(login_args) => {
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.config, login_args.profile.as_ref())?;
+
+            // If --cdp explicitly passed, try CDP first (login is conservative:
+            // no auto-discovery unless user explicitly requests it)
+            if let Some(ref cdp_url) = login_args.cdp {
+                if browser::try_cdp_attach(cdp_url, "https://chatgpt.com/").is_ok() {
+                    let payload = json!({
+                        "status": "ok",
+                        "method": "cdp_explicit",
+                        "endpoint": cdp_url,
+                        "profile": profile_dir.to_string_lossy(),
+                    });
+                    return match format {
+                        OutputFormat::Json => write_json(&payload),
+                        OutputFormat::Jsonl => write_jsonl("browser.login", &payload),
+                        OutputFormat::Text | OutputFormat::Markdown => {
+                            println!("Authenticated via CDP: {cdp_url}");
+                            Ok(())
+                        }
+                    };
+                }
+                eprintln!("CDP attach to {cdp_url} failed, falling back to cookie sync.");
+            }
+
             let mut used_cookie_sync = false;
             let mut cookie_warnings = Vec::new();
             let mut cookie_sync_error: Option<String> = None;
@@ -832,16 +874,28 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
         BrowserCommand::Check(check_args) => {
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.config, check_args.profile.as_ref())?;
-            browser::check_auth(&profile_dir, /* headed */ false)?;
+            let connection = browser::resolve_browser_connection(
+                &ctx.config,
+                check_args.cdp.as_deref(),
+                &profile_dir,
+                "https://chatgpt.com/",
+            )?;
+            let method = match &connection {
+                browser::BrowserConnection::Cdp { endpoint } => format!("cdp: {endpoint}"),
+                browser::BrowserConnection::AutoConnect => "auto_connect".to_string(),
+                browser::BrowserConnection::CookieState { .. } => "cookie_state".to_string(),
+                browser::BrowserConnection::Profile { .. } => "profile".to_string(),
+            };
             let payload = json!({
                 "status": "ok",
                 "profile": profile_dir.to_string_lossy(),
+                "method": method,
             });
             match format {
                 OutputFormat::Json => write_json(&payload),
                 OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
                 OutputFormat::Text | OutputFormat::Markdown => {
-                    println!("Browser profile authenticated: {}", profile_dir.display());
+                    println!("Browser authenticated via {method}");
                     Ok(())
                 }
             }
@@ -926,6 +980,48 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             };
 
             browser::run_recipe(recipe, ctx, format)
+        }
+        BrowserCommand::Attach(attach_args) => {
+            // Try explicit CDP first, then auto-connect. No cookie fallback for attach.
+            let cdp_endpoint =
+                browser::resolve_cdp_endpoint(attach_args.cdp.as_deref(), &ctx.config);
+
+            if let Some(ref endpoint) = cdp_endpoint {
+                if browser::try_cdp_attach(endpoint, "https://chatgpt.com/").is_ok() {
+                    let payload = json!({
+                        "status": "ok",
+                        "method": "cdp_explicit",
+                        "endpoint": endpoint,
+                    });
+                    return match format {
+                        OutputFormat::Json => write_json(&payload),
+                        OutputFormat::Jsonl => write_jsonl("browser.attach", &payload),
+                        OutputFormat::Text | OutputFormat::Markdown => {
+                            println!("Attached via CDP: {endpoint}");
+                            Ok(())
+                        }
+                    };
+                }
+            }
+
+            if browser::try_auto_connect("https://chatgpt.com/").is_ok() {
+                let payload = json!({
+                    "status": "ok",
+                    "method": "auto_connect",
+                });
+                return match format {
+                    OutputFormat::Json => write_json(&payload),
+                    OutputFormat::Jsonl => write_jsonl("browser.attach", &payload),
+                    OutputFormat::Text | OutputFormat::Markdown => {
+                        println!("Attached via Chrome auto-connect");
+                        Ok(())
+                    }
+                };
+            }
+
+            Err(anyhow!(
+                "could not attach to any Chrome instance. Enable remote debugging at chrome://inspect/#remote-debugging or pass --cdp <url>"
+            ))
         }
     }
 }

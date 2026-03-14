@@ -25,6 +25,7 @@ pub struct Defaults {
     pub provider: Option<String>,
     pub max_output_tokens: Option<usize>,
     pub browser_profile: Option<String>,
+    pub browser_cdp: Option<String>,
 }
 
 /// Configuration for a single LLM provider (base URL, API key, kind).
@@ -151,6 +152,48 @@ fn merge_defaults(target: &mut Defaults, other: Defaults) {
     }
     if other.browser_profile.is_some() {
         target.browser_profile = other.browser_profile;
+    }
+    if other.browser_cdp.is_some() {
+        target.browser_cdp = other.browser_cdp;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_config_with_browser_cdp() {
+        let toml_str = r#"
+[defaults]
+browser_cdp = "http://127.0.0.1:9222"
+"#;
+        let file: ConfigFile = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            file.defaults.unwrap().browser_cdp.as_deref(),
+            Some("http://127.0.0.1:9222")
+        );
+    }
+
+    #[test]
+    fn parse_config_without_browser_cdp_defaults_to_none() {
+        let toml_str = r#"
+[defaults]
+model = "gpt-5-4-pro"
+"#;
+        let file: ConfigFile = toml::from_str(toml_str).unwrap();
+        assert!(file.defaults.unwrap().browser_cdp.is_none());
+    }
+
+    #[test]
+    fn merge_defaults_browser_cdp() {
+        let mut target = Defaults::default();
+        let other = Defaults {
+            browser_cdp: Some("http://127.0.0.1:9222".to_string()),
+            ..Default::default()
+        };
+        merge_defaults(&mut target, other);
+        assert_eq!(target.browser_cdp.as_deref(), Some("http://127.0.0.1:9222"));
     }
 }
 
