@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Features
 
-- Dynamic model registry with auto-sync, config aliases, and degraded-fetch guard
+- Dynamic model registry with auto-sync and config aliases (#39)
 
 ## [0.2.8] - 2026-03-12
 
