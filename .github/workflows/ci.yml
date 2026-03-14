@@ -11,6 +11,10 @@ permissions:
   contents: read
   pull-requests: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -35,16 +39,6 @@ jobs:
             if (typeof toCookieHeader !== 'function') throw new Error('toCookieHeader is not a function');
             console.log('sweet-cookie exports verified');
           "
-
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-targets
 
   fmt:
     name: Format
@@ -81,6 +75,7 @@ jobs:
 
   msrv:
     name: MSRV (1.88)
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -93,6 +88,7 @@ jobs:
 
   doc:
     name: Documentation
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -196,6 +192,7 @@ jobs:
 
   build:
     name: Build (${{ matrix.os }})
+    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
