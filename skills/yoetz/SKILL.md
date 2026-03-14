@@ -54,7 +54,7 @@ Prefer Homebrew when available — pre-built binaries, fastest install.
 Before using an unfamiliar model ID, resolve it against the synced registry:
 
 ```bash
-yoetz models resolve "grok-4.1" --format json
+yoetz models resolve "grok-4" --format json
 ```
 
 Example output:
@@ -76,15 +76,15 @@ yoetz models list -s claude --format json
 
 | Task | Command |
 |------|---------|
-| Ask single model | `yoetz ask -p "question" -f src/*.rs --provider openai --model gpt-5.2 --format json` |
-| Council vote | `yoetz council -p "question" --models openai/gpt-5.2,gemini/gemini-3-pro-preview,openrouter/xai/grok-4.1 --format json` |
+| Ask single model | `yoetz ask -p "question" -f src/*.rs --provider openai --model gpt-5.4 --format json` |
+| Council vote | `yoetz council -p "question" --models openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4 --format json` |
 | Review staged diff | `yoetz review diff --staged --format json` |
 | Review file | `yoetz review file --path src/main.rs --format json` |
 | Bundle files | `yoetz bundle -p "context" -f src/**/*.rs --format json` |
-| Generate image | `yoetz generate image -p "description" --provider openai --model gpt-image-1 --format json` |
-| Resolve model ID | `yoetz models resolve "grok-4.1" --format json` |
+| Generate image | `yoetz generate image -p "description" --provider openai --model gpt-5-image --format json` |
+| Resolve model ID | `yoetz models resolve "grok-4" --format json` |
 | Search models | `yoetz models list -s claude --format json` |
-| Estimate cost | `yoetz pricing estimate --model gpt-5.2 --input-tokens 1000 --output-tokens 500` |
+| Estimate cost | `yoetz pricing estimate --model gpt-5.4 --input-tokens 1000 --output-tokens 500` |
 | Browser login | `yoetz browser login` |
 | Browser check | `yoetz browser check` |
 | Browser cookie sync | `yoetz browser sync-cookies` |
@@ -97,13 +97,13 @@ Get opinions from multiple LLMs in parallel. **`--models` is required.**
 yoetz council \
   -p "Should we use async traits or callbacks for this API?" \
   -f src/lib.rs -f src/api/*.rs \
-  --models openai/gpt-5.2,gemini/gemini-3-pro-preview,openrouter/xai/grok-4.1 \
+  --models openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4 \
   --format json
 ```
 
 **Example council sets:**
-- Cross-provider: `openai/gpt-5.2,gemini/gemini-3-pro-preview,openrouter/xai/grok-4.1`
-- Via OpenRouter only: `openrouter/openai/gpt-5.2,openrouter/anthropic/claude-sonnet-4,openrouter/google/gemini-3-pro-preview`
+- Cross-provider: `openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4`
+- Via OpenRouter only: `openrouter/openai/gpt-5.4,openrouter/anthropic/claude-sonnet-4.6,openrouter/google/gemini-3.1-pro-preview`
 
 ## Ask (Single Model)
 
@@ -113,14 +113,14 @@ Quick question with file context:
 yoetz ask \
   -p "What's the bug in this error handling?" \
   -f src/error.rs \
-  --provider openai --model gpt-5.2 \
+  --provider openai --model gpt-5.4 \
   --format json
 ```
 
 **For Anthropic/XAI models**, use OpenRouter (no extra config needed):
 ```bash
 yoetz ask -p "Review this" -f src/*.rs \
-  --provider openrouter --model anthropic/claude-sonnet-4 \
+  --provider openrouter --model anthropic/claude-sonnet-4.6 \
   --format json
 ```
 
@@ -138,7 +138,7 @@ yoetz review file --path src/main.rs --format json
 
 ### With custom model
 ```bash
-yoetz review diff --staged --provider openai --model gpt-5.2 --format json
+yoetz review diff --staged --provider openai --model gpt-5.4 --format json
 ```
 
 ## Bundle (for manual paste or browser mode)
@@ -224,7 +224,7 @@ BUNDLE=$(yoetz bundle -p "Review this code" -f src/*.rs --format json | jq -r .a
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 
 # Override the built-in model selection if needed
-yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var model=gpt-5-2-pro
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var model=gpt-5-4-pro
 ```
 
 ### Combined workflow: API + Browser
@@ -232,7 +232,7 @@ yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var model=gpt-5-2-pro
 ```bash
 # Get fast API results first
 yoetz council -p "Review" -f src/*.rs \
-  --models openai/gpt-5.2,gemini/gemini-3-pro-preview --format json > api.json
+  --models openai/gpt-5.4,gemini/gemini-3.1-pro-preview --format json > api.json
 
 # Then get ChatGPT Pro opinion
 BUNDLE=$(yoetz bundle -p "Review" -f src/*.rs --format json | jq -r .artifacts.bundle_md)
@@ -296,19 +296,19 @@ The browser module uses stealth techniques to avoid Cloudflare detection:
 - `openrouter` - `OPENROUTER_API_KEY`
 
 **Via OpenRouter** (recommended for Anthropic/XAI - no extra config):
-- `openrouter/anthropic/claude-sonnet-4`
-- `openrouter/xai/grok-4.1`
+- `openrouter/anthropic/claude-sonnet-4.6`
+- `openrouter/xai/grok-4`
 
 **Model format:** `provider/model`
-- `openai/gpt-5.2`
-- `gemini/gemini-3-pro-preview`
-- `openrouter/anthropic/claude-sonnet-4` (nested for OpenRouter)
+- `openai/gpt-5.4`
+- `gemini/gemini-3.1-pro-preview`
+- `openrouter/anthropic/claude-sonnet-4.6` (nested for OpenRouter)
 
 ## Cost Control
 
 ```bash
 # Estimate before running
-yoetz pricing estimate --model gpt-5.2 --input-tokens 12000 --output-tokens 800
+yoetz pricing estimate --model gpt-5.4 --input-tokens 12000 --output-tokens 800
 
 # Set limits
 yoetz ask -p "Review" --max-cost-usd 1.00 --daily-budget-usd 5.00 --format json
