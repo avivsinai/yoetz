@@ -1234,6 +1234,10 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn normalize_model_name(model: &str) -> String {
+        normalize_model_name_with_aliases(model, &std::collections::HashMap::new())
+    }
+
     fn temp_schema_path() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1328,6 +1332,67 @@ mod tests {
         assert_eq!(normalize_model_name("gpt-5.2"), "gpt-5.2");
         // Preserve suffix on non-matching models
         assert_eq!(normalize_model_name("gpt-5.2:free"), "gpt-5.2:free");
+    }
+
+    #[test]
+    fn normalize_config_aliases_override_builtin() {
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert(
+            "sonnet".to_string(),
+            "anthropic/claude-sonnet-4-5".to_string(),
+        );
+        assert_eq!(
+            normalize_model_name_with_aliases("sonnet", &aliases),
+            "anthropic/claude-sonnet-4-5"
+        );
+    }
+
+    #[test]
+    fn normalize_config_aliases_with_prefix_and_slash_value() {
+        // Alias value contains `/` — used as-is, caller's prefix NOT prepended
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("grok-latest".to_string(), "x-ai/grok-4.2".to_string());
+        assert_eq!(
+            normalize_model_name_with_aliases("openrouter/grok-latest", &aliases),
+            "x-ai/grok-4.2"
+        );
+    }
+
+    #[test]
+    fn normalize_config_aliases_with_prefix_bare_value() {
+        // Alias value is bare — caller's prefix IS prepended
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert("fast".to_string(), "gemini-3-flash-preview".to_string());
+        assert_eq!(
+            normalize_model_name_with_aliases("google/fast", &aliases),
+            "google/gemini-3-flash-preview"
+        );
+    }
+
+    #[test]
+    fn normalize_config_aliases_with_suffix() {
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert(
+            "sonnet".to_string(),
+            "anthropic/claude-sonnet-4-5".to_string(),
+        );
+        assert_eq!(
+            normalize_model_name_with_aliases("sonnet:free", &aliases),
+            "anthropic/claude-sonnet-4-5:free"
+        );
+    }
+
+    #[test]
+    fn normalize_config_aliases_case_insensitive() {
+        let mut aliases = std::collections::HashMap::new();
+        aliases.insert(
+            "Sonnet".to_string(),
+            "anthropic/claude-sonnet-4-5".to_string(),
+        );
+        assert_eq!(
+            normalize_model_name_with_aliases("sonnet", &aliases),
+            "anthropic/claude-sonnet-4-5"
+        );
     }
 
     #[test]
@@ -1627,7 +1692,18 @@ use --provider {prefix} or pass an unprefixed model name"
     Ok(format!("{provider}/{model}"))
 }
 
-fn normalize_model_name(model: &str) -> String {
+/// Built-in aliases (fallback when config has no matching `[aliases]` entry).
+fn builtin_aliases() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("gemini-pro-3", "gemini-3-pro-preview"),
+        ("gemini-flash-3", "gemini-3-flash-preview"),
+    ]
+}
+
+fn normalize_model_name_with_aliases(
+    model: &str,
+    config_aliases: &std::collections::HashMap<String, String>,
+) -> String {
     let lower = model.to_lowercase();
     // Strip OpenRouter suffixes like :free, :extended before matching
     let (lower_base, suffix) = lower
@@ -1635,41 +1711,38 @@ fn normalize_model_name(model: &str) -> String {
         .map(|(b, s)| (b, format!(":{s}")))
         .unwrap_or((lower.as_str(), String::new()));
 
-    let replacement = match lower_base {
-        "gemini-pro-3" => Some("gemini-3-pro-preview".to_string()),
-        "gemini-flash-3" => Some("gemini-3-flash-preview".to_string()),
-        _ => None,
-    }
-    .or_else(|| {
-        lower_base
-            .strip_prefix("gemini/")
-            .and_then(|rest| match rest {
-                "gemini-pro-3" => Some("gemini/gemini-3-pro-preview".to_string()),
-                "gemini-flash-3" => Some("gemini/gemini-3-flash-preview".to_string()),
-                _ => None,
-            })
-    })
-    .or_else(|| {
-        lower_base
-            .strip_prefix("google/")
-            .and_then(|rest| match rest {
-                "gemini-pro-3" => Some("google/gemini-3-pro-preview".to_string()),
-                "gemini-flash-3" => Some("google/gemini-3-flash-preview".to_string()),
-                _ => None,
-            })
-    })
-    .or_else(|| {
-        lower_base
-            .strip_prefix("openrouter/google/")
-            .and_then(|rest| match rest {
-                "gemini-pro-3" => Some("openrouter/google/gemini-3-pro-preview".to_string()),
-                "gemini-flash-3" => Some("openrouter/google/gemini-3-flash-preview".to_string()),
-                _ => None,
-            })
-    });
+    // Extract the bare model name (after any provider prefix).
+    // Generic: splits on the last `/` boundary to handle any `provider/model` form,
+    // with special handling for multi-segment prefixes like `openrouter/google/`.
+    let (prefix, bare) = if let Some(pos) = lower_base.rfind('/') {
+        (&lower_base[..=pos], &lower_base[pos + 1..])
+    } else {
+        ("", lower_base)
+    };
 
-    match replacement {
-        Some(r) => format!("{r}{suffix}"),
+    // Look up in config aliases first, then built-in aliases
+    let resolved = config_aliases
+        .iter()
+        .find(|(k, _)| k.to_lowercase() == bare)
+        .map(|(_, v)| v.as_str())
+        .or_else(|| {
+            builtin_aliases()
+                .iter()
+                .find(|(k, _)| *k == bare)
+                .map(|(_, v)| *v)
+        });
+
+    match resolved {
+        Some(replacement) => {
+            // If the alias value already contains a `/` (e.g. "anthropic/claude-sonnet-4-5"),
+            // use it as-is — the user specified the full path. Only prepend the caller's
+            // prefix for bare replacement values (e.g. "gemini-3-pro-preview").
+            if replacement.contains('/') {
+                format!("{replacement}{suffix}")
+            } else {
+                format!("{prefix}{replacement}{suffix}")
+            }
+        }
         None => model.to_string(),
     }
 }

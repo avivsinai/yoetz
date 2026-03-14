@@ -16,7 +16,9 @@ pub(crate) async fn handle_models(
 ) -> Result<()> {
     match args.command {
         ModelsCommand::List(list_args) => {
-            let registry = registry::load_registry_cache()?.unwrap_or_default();
+            let registry = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
+                .await?
+                .unwrap_or_default();
             let filtered = filter_registry(&registry, &list_args);
             maybe_write_output(ctx, &filtered)?;
             match format {
@@ -59,12 +61,18 @@ pub(crate) async fn handle_models(
                 }
             }
         }
-        ModelsCommand::Resolve(resolve_args) => handle_resolve(ctx, resolve_args, format),
+        ModelsCommand::Resolve(resolve_args) => handle_resolve(ctx, resolve_args, format).await,
     }
 }
 
-fn handle_resolve(ctx: &AppContext, args: ModelsResolveArgs, format: OutputFormat) -> Result<()> {
-    let registry = registry::load_registry_cache()?.unwrap_or_default();
+async fn handle_resolve(
+    ctx: &AppContext,
+    args: ModelsResolveArgs,
+    format: OutputFormat,
+) -> Result<()> {
+    let registry = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
+        .await?
+        .unwrap_or_default();
     let results = fuzzy::fuzzy_search(&registry, &args.query, args.max_results);
     maybe_write_output(ctx, &results)?;
     match format {

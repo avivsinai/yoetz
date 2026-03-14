@@ -13,6 +13,8 @@ pub struct Config {
     pub defaults: Defaults,
     pub providers: HashMap<String, ProviderConfig>,
     pub registry: RegistryConfig,
+    #[serde(default)]
+    pub aliases: HashMap<String, String>,
 }
 
 /// Default values for provider, model, and output settings.
@@ -39,6 +41,8 @@ pub struct RegistryConfig {
     pub openrouter_models_url: Option<String>,
     pub litellm_models_url: Option<String>,
     pub org_registry_path: Option<String>,
+    /// Auto-sync interval in seconds. Default 86400 (24h). Set to 0 to disable.
+    pub auto_sync_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -46,6 +50,7 @@ struct ConfigFile {
     pub defaults: Option<Defaults>,
     pub providers: Option<HashMap<String, ProviderConfig>>,
     pub registry: Option<RegistryConfig>,
+    pub aliases: Option<HashMap<String, String>>,
 }
 
 impl Config {
@@ -80,6 +85,9 @@ impl Config {
         }
         if let Some(registry) = other.registry {
             merge_registry(&mut self.registry, registry);
+        }
+        if let Some(aliases) = other.aliases {
+            self.aliases.extend(aliases);
         }
     }
 }
@@ -167,5 +175,8 @@ fn merge_registry(target: &mut RegistryConfig, other: RegistryConfig) {
     }
     if other.org_registry_path.is_some() {
         target.org_registry_path = other.org_registry_path;
+    }
+    if other.auto_sync_secs.is_some() {
+        target.auto_sync_secs = other.auto_sync_secs;
     }
 }

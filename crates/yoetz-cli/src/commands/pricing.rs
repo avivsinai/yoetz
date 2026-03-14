@@ -2,8 +2,8 @@ use anyhow::Result;
 
 use crate::registry;
 use crate::{
-    maybe_write_output, normalize_model_name, resolve_registry_model_id, AppContext, PricingArgs,
-    PricingCommand,
+    maybe_write_output, normalize_model_name_with_aliases, resolve_registry_model_id, AppContext,
+    PricingArgs, PricingCommand,
 };
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 
@@ -14,8 +14,10 @@ pub(crate) async fn handle_pricing(
 ) -> Result<()> {
     match args.command {
         PricingCommand::Estimate(e) => {
-            let model = normalize_model_name(&e.model);
-            let registry = registry::load_registry_cache()?.unwrap_or_default();
+            let model = normalize_model_name_with_aliases(&e.model, &ctx.config.aliases);
+            let registry = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
+                .await?
+                .unwrap_or_default();
             let registry_id = resolve_registry_model_id(None, Some(&model), Some(&registry));
             if let Some(ref reg_id) = registry_id {
                 crate::validate_model_or_suggest(reg_id, Some(&registry))?;

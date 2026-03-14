@@ -4,7 +4,7 @@ use crate::ReviewResult;
 use crate::{budget, registry};
 use crate::{
     build_review_diff_prompt, build_review_file_prompt, call_litellm, git_diff, maybe_write_output,
-    normalize_model_name, read_text_file, resolve_max_output_tokens,
+    normalize_model_name_with_aliases, read_text_file, resolve_max_output_tokens,
     resolve_provider_from_registry, resolve_registry_model_id, resolve_response_format, AppContext,
     ReviewArgs, ReviewCommand, ReviewDiffArgs, ReviewFileArgs,
 };
@@ -36,14 +36,18 @@ async fn handle_review_diff(
         args.response_schema.clone(),
         args.response_schema_name.clone(),
     )?;
-    let model = normalize_model_name(
+    let model = normalize_model_name_with_aliases(
         &args
             .model
             .clone()
             .or(config.defaults.model.clone())
             .ok_or_else(|| anyhow!("model is required"))?,
+        &config.aliases,
     );
-    let registry_cache = registry::load_registry_cache().ok().flatten();
+    let registry_cache = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
+        .await
+        .ok()
+        .flatten();
     // Auto-resolve provider from registry (e.g. x-ai/grok-4 → openrouter)
     let provider = args
         .provider
@@ -190,14 +194,18 @@ async fn handle_review_file(
         args.response_schema.clone(),
         args.response_schema_name.clone(),
     )?;
-    let model = normalize_model_name(
+    let model = normalize_model_name_with_aliases(
         &args
             .model
             .clone()
             .or(config.defaults.model.clone())
             .ok_or_else(|| anyhow!("model is required"))?,
+        &config.aliases,
     );
-    let registry_cache = registry::load_registry_cache().ok().flatten();
+    let registry_cache = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
+        .await
+        .ok()
+        .flatten();
     // Auto-resolve provider from registry (e.g. x-ai/grok-4 → openrouter)
     let provider = args
         .provider
