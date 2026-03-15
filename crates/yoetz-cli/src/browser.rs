@@ -886,8 +886,7 @@ fn check_auth_with_connection(
         use_stealth,
         current_headed,
     )?;
-    let deadline = Instant::now()
-        + Duration::from_millis(auth_check_timeout_ms(connection));
+    let deadline = Instant::now() + Duration::from_millis(auth_check_timeout_ms(connection));
     let mut last_issue: Option<&'static str>;
     loop {
         let snapshot = run_agent_browser_with_connection(

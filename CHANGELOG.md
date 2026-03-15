@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.13] - 2026-03-15
+
+### Bug Fixes
+
+- Increase auth check timeout for live-attach browser connections
+
 ## [0.2.12] - 2026-03-15
 
 ### Bug Fixes
