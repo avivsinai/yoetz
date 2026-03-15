@@ -24,7 +24,7 @@ const COOKIE_SYNC_TIMEOUT_MS: &str = "30000";
 const AUTH_CHECK_TIMEOUT_MS: u64 = 8_000;
 const AUTH_CHECK_POLL_MS: u64 = 500;
 const CDP_SESSION_NAME: &str = "yoetz-cdp";
-const CHATGPT_URL: &str = "https://chatgpt.com/";
+pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
     major: 24,
     minor: 4,
@@ -309,6 +309,16 @@ pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> R
         ctx.use_stealth,
     );
     run_recipe_with_connection(recipe, ctx, connection.as_ref(), format)
+}
+
+/// Run a recipe using a live browser connection (CDP or auto_connect).
+pub fn run_recipe_with_live_connection(
+    recipe: Recipe,
+    ctx: RecipeContext,
+    connection: &BrowserConnection,
+    format: OutputFormat,
+) -> Result<()> {
+    run_recipe_with_connection(recipe, ctx, Some(connection), format)
 }
 
 fn run_recipe_with_connection(

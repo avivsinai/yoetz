@@ -3,42 +3,75 @@ name: chatgpt
 # Verifies auth with: yoetz browser check
 #
 # Uses Oracle-style cookie injection + stealth flags to bypass Cloudflare.
-# Model selection defaults to GPT-5.4 Pro; override with --var model=gpt-5-2-pro
+# ChatGPT's home page currently restores the last-used model, but reopening the
+# selector under auto_connect is brittle. This recipe avoids forced reselection
+# and assumes the desired model is already active in ChatGPT.
+
+defaults:
+  prompt: Review the attached file and provide your analysis.
 
 steps:
   # Open ChatGPT
   - action: open
     args: ["https://chatgpt.com/"]
-  - sleep_ms: 3000
-
-  # Select Pro model (don't rely on last-used model)
-  # TODO: make model configurable via --var model=X once defaults: support lands
-  - action: find
-    args: ["label", "Model selector", "click"]
-  - sleep_ms: 1000
-  - action: find
-    args: ["testid", "model-switcher-gpt-5-4-pro", "click"]
-  - sleep_ms: 500
+  - action: wait
+    args: ["--load", "domcontentloaded"]
+  - sleep_ms: 2000
 
   # Disable extended thinking for faster responses
-  # Only click if extended thinking is currently enabled (aria-label contains "remove")
+  # Only click if extended thinking is currently enabled (aria-label contains
+  # "click to remove"). ChatGPT's current UI labels this as "Extended Pro".
   - action: eval
-    args: ["document.querySelector('button[aria-label*=\"remove\"][aria-label*=\"Extended thinking\"]')?.click()"]
+    args: ["document.querySelector('button[aria-label*=\"click to remove\"][aria-label*=\"Extended\"]')?.click()"]
+  - sleep_ms: 500
+
+  # Prime the visible attachment flow before targeting the underlying file input.
+  - action: find
+    args: ["label", "Add files and more", "click"]
   - sleep_ms: 500
 
   # Attach the bundle as a file (handles large codebases that exceed paste limits)
   - action: upload
     args: ["input[type=file]:not([id])", "{{bundle_path}}"]
-  - sleep_ms: 2000
+  - action: eval
+    args:
+      - |
+        (() => {
+          const input = document.querySelector('input[type="file"]:not([id])');
+          if (!input) {
+            throw new Error("upload input not found");
+          }
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          return input.files?.[0]?.name ?? null;
+        })()
+  - sleep_ms: 3000
+  - action: eval
+    args:
+      - |
+        (() => {
+          const alerts = Array.from(
+            document.querySelectorAll('[role="alert"], [aria-live]')
+          )
+            .map((el) => (el.textContent || "").trim())
+            .filter(Boolean);
+          const uploadError = alerts.find((text) =>
+            /unable to upload/i.test(text)
+          );
+          if (uploadError) {
+            throw new Error(uploadError);
+          }
+          return alerts;
+        })()
 
   # Add a short prompt referencing the attachment
-  - action: fill
-    args: ["#prompt-textarea", "Review the attached file and provide your analysis."]
+  - action: type
+    args: ["#prompt-textarea", "{{prompt}}"]
   - sleep_ms: 500
 
-  # Send the message
-  - action: find
-    args: ["label", "Send prompt", "click"]
+  # Send the message. The Send button locator becomes brittle after upload +
+  # typing, but Enter reliably submits the prompt in ChatGPT.
+  - action: press
+    args: ["Enter"]
 
   # Wait for response (file analysis may take longer with extended thinking)
   - sleep_ms: 60000

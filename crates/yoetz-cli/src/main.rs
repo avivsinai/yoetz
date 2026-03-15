@@ -950,7 +950,23 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     .to_string_lossy()
                     .to_lowercase()
                     .contains("chatgpt");
-            let profile_mode = if needs_auth {
+            // Try to resolve the best browser connection (CDP > auto_connect > cookie > profile).
+            // This reuses the same resolution logic as `check` and `attach`.
+            let live_connection = if needs_auth {
+                browser::resolve_browser_connection(
+                    &ctx.config,
+                    recipe_args.cdp.as_deref(),
+                    &profile_dir,
+                    browser::CHATGPT_URL,
+                )
+                .ok()
+                .filter(|c| c.is_live_attach())
+            } else {
+                None
+            };
+            let profile_mode = if live_connection.is_some() {
+                browser::BrowserProfileMode::ProfileOnly
+            } else if needs_auth {
                 browser::resolve_auth_mode(&profile_dir, /* headed */ false)?
             } else {
                 browser::BrowserProfileMode::ProfileOnly
@@ -979,7 +995,11 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 vars: recipe_vars,
             };
 
-            browser::run_recipe(recipe, ctx, format)
+            if let Some(connection) = live_connection {
+                browser::run_recipe_with_live_connection(recipe, ctx, &connection, format)
+            } else {
+                browser::run_recipe(recipe, ctx, format)
+            }
         }
         BrowserCommand::Attach(attach_args) => {
             // Try explicit CDP first, then auto-connect. No cookie fallback for attach.
