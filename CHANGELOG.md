@@ -7,23 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.2.12] - 2026-03-15
 
-### Bug Fixes
-
-- Browser recipe now uses auto_connect when available, falling back to cookie/profile mode (#48)
-- ChatGPT recipe: fix file upload by dispatching `change` event after programmatic file set
-- ChatGPT recipe: replace brittle send-button click with `press Enter`
-- ChatGPT recipe: update extended-thinking toggle selector for current UI
-
 ### Features
 
-- Recipe handler tries `resolve_browser_connection()` (CDP → auto_connect → cookie → profile) before legacy fallback
-- `run_recipe_with_live_connection()` public API for passing live browser connections to recipes
-- ChatGPT recipe: add post-upload error detection (fail fast on `Unable to upload` alerts)
-
-### Miscellaneous
-
-- Make `CHATGPT_URL` public for use in recipe handler
-- Remove forced model reselection from ChatGPT recipe (assumes active model)
+- Browser recipe auto_connect + ChatGPT upload fix
 
 ## [0.2.11] - 2026-03-14
 
