@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.2.12] - 2026-03-15
 
+### Bug Fixes
+
+- **ci**: Regenerate CHANGELOG.md via git-cliff for v0.2.12
+
 ### Features
 
 - Browser recipe auto_connect + ChatGPT upload fix

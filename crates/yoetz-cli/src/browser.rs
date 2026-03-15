@@ -22,6 +22,7 @@ const STEALTH_USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7
 const STEALTH_ARGS: &str = "--disable-blink-features=AutomationControlled";
 const COOKIE_SYNC_TIMEOUT_MS: &str = "30000";
 const AUTH_CHECK_TIMEOUT_MS: u64 = 8_000;
+const LIVE_ATTACH_AUTH_CHECK_TIMEOUT_MS: u64 = 30_000;
 const AUTH_CHECK_POLL_MS: u64 = 500;
 const CDP_SESSION_NAME: &str = "yoetz-cdp";
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
@@ -885,7 +886,8 @@ fn check_auth_with_connection(
         use_stealth,
         current_headed,
     )?;
-    let deadline = Instant::now() + Duration::from_millis(AUTH_CHECK_TIMEOUT_MS);
+    let deadline = Instant::now()
+        + Duration::from_millis(auth_check_timeout_ms(connection));
     let mut last_issue: Option<&'static str>;
     loop {
         let snapshot = run_agent_browser_with_connection(
@@ -934,6 +936,14 @@ fn check_auth_with_connection(
         "auth check timed out without confirming authentication. \
          The page may still be loading. Try again or run `yoetz browser login`."
     ))
+}
+
+fn auth_check_timeout_ms(connection: &BrowserConnection) -> u64 {
+    if connection.is_live_attach() {
+        LIVE_ATTACH_AUTH_CHECK_TIMEOUT_MS
+    } else {
+        AUTH_CHECK_TIMEOUT_MS
+    }
 }
 
 /// Positive confirmation that the page is authenticated (ChatGPT loaded successfully).
@@ -1408,6 +1418,26 @@ mod tests {
         assert!(looks_authenticated(r#"{"text": "Send a message"}"#));
         assert!(!looks_authenticated(r#"{"text": "Loading..."}"#));
         assert!(!looks_authenticated(""));
+    }
+
+    #[test]
+    fn auth_check_timeout_is_longer_for_live_attach() {
+        assert_eq!(
+            auth_check_timeout_ms(&BrowserConnection::AutoConnect),
+            LIVE_ATTACH_AUTH_CHECK_TIMEOUT_MS
+        );
+        assert_eq!(
+            auth_check_timeout_ms(&BrowserConnection::Cdp {
+                endpoint: "http://127.0.0.1:9222".to_string(),
+            }),
+            LIVE_ATTACH_AUTH_CHECK_TIMEOUT_MS
+        );
+        assert_eq!(
+            auth_check_timeout_ms(&BrowserConnection::Profile {
+                profile_dir: PathBuf::from("/tmp/profile"),
+            }),
+            AUTH_CHECK_TIMEOUT_MS
+        );
     }
 
     #[test]
