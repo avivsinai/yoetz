@@ -42,6 +42,7 @@ struct NodeVersion {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Recipe {
     pub name: Option<String>,
     pub defaults: Option<BTreeMap<String, String>>,
@@ -49,6 +50,7 @@ pub struct Recipe {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecipeStep {
     pub action: Option<String>,
     pub args: Option<Vec<String>>,
@@ -108,7 +110,7 @@ fn resolve_agent_browser() -> (String, Vec<String>) {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok()
+            .is_ok_and(|s| s.success())
         {
             return ("agent-browser".to_string(), vec![]);
         }
@@ -367,10 +369,7 @@ fn run_recipe_with_connection(
             .as_ref()
             .ok_or_else(|| anyhow!("recipe step {idx} missing action"))?;
 
-        let live = connection.is_some_and(BrowserConnection::is_live_attach);
-        let (effective_action, effective_args) =
-            normalize_recipe_action(action, step.args.as_deref(), live);
-        let commands = expand_step(&effective_action, effective_args.as_deref(), &ctx)?;
+        let commands = expand_step(action, step.args.as_deref(), &ctx)?;
 
         for args in commands {
             let stdout = match run_agent_browser_with_connection(
@@ -382,7 +381,25 @@ fn run_recipe_with_connection(
             ) {
                 Ok(stdout) => stdout,
                 Err(err) => {
-                    if maybe_pause_for_captcha_challenge(connection, CHATGPT_URL, headed, None)? {
+                    // Fetch current page state to check for challenge
+                    let snapshot = run_agent_browser_with_connection(
+                        vec![
+                            "snapshot".to_string(),
+                            "-c".to_string(),
+                            "--json".to_string(),
+                        ],
+                        OutputFormat::Json,
+                        connection,
+                        ctx.use_stealth,
+                        headed,
+                    )
+                    .ok();
+                    if maybe_pause_for_captcha_challenge(
+                        connection,
+                        CHATGPT_URL,
+                        headed,
+                        snapshot.as_deref(),
+                    )? {
                         headed = true;
                         run_agent_browser_with_connection(
                             args.clone(),
@@ -392,7 +409,7 @@ fn run_recipe_with_connection(
                             headed,
                         )?
                     } else {
-                        return Err(err);
+                        return Err(err.context(format!("recipe step {idx} ({action}) failed")));
                     }
                 }
             };
@@ -403,8 +420,8 @@ fn run_recipe_with_connection(
                 let event = json!({
                     "type": "browser_step",
                     "index": idx,
-                    "action": effective_action,
-                    "args": effective_args,
+                    "action": action,
+                    "args": step.args,
                     "stdout": stdout_value,
                 });
                 if wants_jsonl {
@@ -493,7 +510,14 @@ pub fn close_browser_for_connection(connection: &BrowserConnection) -> Result<()
         let (bin, prefix_args) = resolve_agent_browser();
         let mut cmd = Command::new(bin);
         cmd.args(prefix_args);
-        let _ = cmd.args(["--session", CDP_SESSION_NAME, "close"]).output();
+        match cmd.args(["--session", CDP_SESSION_NAME, "close"]).output() {
+            Ok(output) if !output.status.success() => {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                eprintln!("warning: session close failed: {stderr}");
+            }
+            Err(e) => eprintln!("warning: session close error: {e}"),
+            _ => {}
+        }
         return Ok(());
     }
     close_browser_daemon()
@@ -549,7 +573,12 @@ pub fn sync_cookies(profile_dir: &Path) -> Result<(usize, Vec<String>)> {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: Value = serde_json::from_str(stdout.trim()).unwrap_or(Value::Null);
+    let parsed: Value = serde_json::from_str(stdout.trim()).with_context(|| {
+        format!(
+            "cookie extractor returned invalid JSON (first 200 chars): {}",
+            &stdout[..stdout.len().min(200)]
+        )
+    })?;
     let warnings = parsed
         .get("warnings")
         .and_then(|v| v.as_array())
@@ -867,16 +896,6 @@ pub fn check_auth(profile_dir: &Path, headed: bool) -> Result<()> {
     check_auth_with_connection(&connection, headed, CHATGPT_URL)
 }
 
-/// Check auth using a specific connection (public API for handlers).
-#[allow(dead_code)] // Will be used when Check handler fully migrates
-pub fn check_auth_connection(
-    connection: &BrowserConnection,
-    headed: bool,
-    target_url: &str,
-) -> Result<()> {
-    check_auth_with_connection(connection, headed, target_url)
-}
-
 fn check_auth_with_connection(
     connection: &BrowserConnection,
     headed: bool,
@@ -1081,19 +1100,6 @@ fn parse_stdout_json(stdout: &str) -> Option<Value> {
     serde_json::from_str(trimmed).ok()
 }
 
-/// Normalize recipe step action/args. Currently a pass-through; the
-/// `--session` flag on `--auto-connect` already isolates navigation to a
-/// dedicated session page, so `open` navigates that page — not the user's
-/// active tab — without needing a rewrite to `tab new` (which would create
-/// an extra blank tab from the session's default page).
-fn normalize_recipe_action(
-    action: &str,
-    args: Option<&[String]>,
-    _live_attach: bool,
-) -> (String, Option<Vec<String>>) {
-    (action.to_string(), args.map(|a| a.to_vec()))
-}
-
 fn expand_step(
     action: &str,
     args: Option<&[String]>,
@@ -1259,6 +1265,7 @@ fn first_unresolved_placeholder(value: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use std::sync::{Mutex, OnceLock as TestOnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
@@ -1275,6 +1282,55 @@ mod tests {
             headed: false,
             vars: BTreeMap::from([("model".to_string(), "gpt-5-4-pro".to_string())]),
         }
+    }
+
+    fn unique_test_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("yoetz_{label}_{nanos}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn command_path(dir: &Path, name: &str) -> PathBuf {
+        if cfg!(windows) {
+            dir.join(format!("{name}.cmd"))
+        } else {
+            dir.join(name)
+        }
+    }
+
+    fn write_executable_script(path: &Path, unix_contents: &str, windows_contents: &str) {
+        let contents = if cfg!(windows) {
+            windows_contents
+        } else {
+            unix_contents
+        };
+        fs::write(path, contents).unwrap();
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+    }
+
+    fn fake_agent_browser_bin() -> PathBuf {
+        static BIN: TestOnceLock<PathBuf> = TestOnceLock::new();
+        BIN.get_or_init(|| {
+            let dir = unique_test_dir("fake_agent_browser");
+            let bin = command_path(&dir, "fake-agent-browser");
+            write_executable_script(
+                &bin,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LOG_PATH\"\n",
+                "@echo off\r\necho %*>> \"%LOG_PATH%\"\r\n",
+            );
+            bin
+        })
+        .clone()
     }
 
     #[test]
@@ -1461,6 +1517,12 @@ mod tests {
             }),
             AUTH_CHECK_TIMEOUT_MS
         );
+        assert_eq!(
+            auth_check_timeout_ms(&BrowserConnection::CookieState {
+                state_file: PathBuf::from("/tmp/state.json"),
+            }),
+            AUTH_CHECK_TIMEOUT_MS
+        );
     }
 
     #[test]
@@ -1485,42 +1547,201 @@ mod tests {
     }
 
     #[test]
-    fn normalize_open_passes_through_when_live_attach() {
-        let args = vec!["https://chatgpt.com/".to_string()];
-        let (action, new_args) = normalize_recipe_action("open", Some(&args), true);
-        assert_eq!(action, "open");
-        assert_eq!(
-            new_args.as_deref().unwrap(),
-            &["https://chatgpt.com/".to_string()]
+    fn detect_auth_issue_covers_challenge_and_non_live_paths() {
+        let live_challenge = detect_auth_issue_for_connection(
+            r#"{"text":"Verify you are human"}"#,
+            Some(&BrowserConnection::Cdp {
+                endpoint: "http://127.0.0.1:9222".to_string(),
+            }),
         );
+        assert_eq!(
+            live_challenge,
+            Some(
+                "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again."
+            )
+        );
+
+        let managed_challenge = detect_auth_issue_for_connection(
+            r#"{"text":"Checking your browser"}"#,
+            Some(&BrowserConnection::Profile {
+                profile_dir: PathBuf::from("/tmp/profile"),
+            }),
+        );
+        assert_eq!(
+            managed_challenge,
+            Some(
+                "cloudflare challenge detected. Run `yoetz browser sync-cookies` or `yoetz browser login` and try again."
+            )
+        );
+
+        let managed_login = detect_auth_issue_for_connection(
+            r#"{"text":"Please sign in"}"#,
+            Some(&BrowserConnection::CookieState {
+                state_file: PathBuf::from("/tmp/state.json"),
+            }),
+        );
+        assert_eq!(
+            managed_login,
+            Some("chatgpt login required. Run `yoetz browser login` and try again.")
+        );
+
+        let authenticated = detect_auth_issue_for_connection(
+            r#"{"text":"ChatGPT - New chat"}"#,
+            Some(&BrowserConnection::AutoConnect),
+        );
+        assert_eq!(authenticated, None);
     }
 
     #[test]
-    fn rewrite_open_is_noop_when_not_live_attach() {
-        let args = vec!["https://chatgpt.com/".to_string()];
-        let (action, new_args) = normalize_recipe_action("open", Some(&args), false);
-        assert_eq!(action, "open");
-        assert_eq!(
-            new_args.as_deref().unwrap(),
-            &["https://chatgpt.com/".to_string()]
-        );
+    #[allow(unsafe_code)]
+    fn close_browser_for_connection_uses_expected_close_mode() {
+        let _guard = env_lock().lock().unwrap();
+        let log_dir = unique_test_dir("close_browser");
+        let log_path = log_dir.join("agent-browser.log");
+        let bin = fake_agent_browser_bin();
+        unsafe {
+            env::set_var("YOETZ_AGENT_BROWSER_BIN", &bin);
+            env::set_var("LOG_PATH", &log_path);
+        }
+
+        let live_cases = [
+            BrowserConnection::AutoConnect,
+            BrowserConnection::Cdp {
+                endpoint: "http://127.0.0.1:9222".to_string(),
+            },
+        ];
+        for connection in live_cases {
+            let _ = fs::remove_file(&log_path);
+            close_browser_for_connection(&connection).unwrap();
+            let logged = fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(
+                logged.contains("--session yoetz-cdp close"),
+                "expected live-attach session close, got `{logged}`"
+            );
+        }
+
+        let managed_cases = [
+            BrowserConnection::CookieState {
+                state_file: PathBuf::from("/tmp/state.json"),
+            },
+            BrowserConnection::Profile {
+                profile_dir: PathBuf::from("/tmp/profile"),
+            },
+        ];
+        for connection in managed_cases {
+            let _ = fs::remove_file(&log_path);
+            close_browser_for_connection(&connection).unwrap();
+            let logged = fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(
+                logged.contains("close"),
+                "expected managed daemon close, got `{logged}`"
+            );
+            assert!(
+                !logged.contains("--session yoetz-cdp close"),
+                "managed close should not use the live-attach session: `{logged}`"
+            );
+        }
+
+        unsafe {
+            env::remove_var("LOG_PATH");
+        }
     }
 
     #[test]
-    fn rewrite_non_open_action_is_noop_when_live_attach() {
-        let args = vec!["#prompt-textarea".to_string(), "hello".to_string()];
-        let (action, new_args) = normalize_recipe_action("type", Some(&args), true);
-        assert_eq!(action, "type");
-        assert_eq!(
-            new_args.as_deref().unwrap(),
-            &["#prompt-textarea".to_string(), "hello".to_string()]
+    #[allow(unsafe_code)]
+    fn sync_cookies_errors_on_invalid_json_output() {
+        let _guard = env_lock().lock().unwrap();
+        let dir = unique_test_dir("fake_node");
+        let fake_node = command_path(&dir, "node");
+        write_executable_script(
+            &fake_node,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo \"v24.4.0\"\nelse\n  echo \"{not-json\"\nfi\n",
+            "@echo off\r\nif \"%1\"==\"--version\" (\r\n  echo v24.4.0\r\n) else (\r\n  echo {not-json\r\n)\r\n",
         );
+
+        let scripts_dir = dir.join("scripts");
+        fs::create_dir_all(&scripts_dir).unwrap();
+        fs::write(
+            scripts_dir.join("extract-cookies.mjs"),
+            "console.log('unused');\n",
+        )
+        .unwrap();
+
+        let original_path = env::var_os("PATH");
+        let path_entries: Vec<PathBuf> = std::iter::once(dir.clone())
+            .chain(
+                original_path
+                    .as_ref()
+                    .into_iter()
+                    .flat_map(|value| env::split_paths(value)),
+            )
+            .collect();
+        let new_path = env::join_paths(path_entries).unwrap();
+
+        unsafe {
+            env::set_var("PATH", &new_path);
+            env::set_var("YOETZ_SCRIPTS_DIR", &scripts_dir);
+        }
+
+        let profile_dir = dir.join("profile");
+        let err = sync_cookies(&profile_dir).unwrap_err();
+        assert!(err.to_string().contains("invalid JSON"));
+
+        match original_path {
+            Some(path) => unsafe { env::set_var("PATH", path) },
+            None => unsafe { env::remove_var("PATH") },
+        }
+        unsafe {
+            env::remove_var("YOETZ_SCRIPTS_DIR");
+        }
     }
 
     #[test]
-    fn normalize_open_without_args_when_live_attach() {
-        let (action, new_args) = normalize_recipe_action("open", None, true);
-        assert_eq!(action, "open");
-        assert!(new_args.is_none());
+    fn recipe_yaml_rejects_unknown_keys() {
+        let top_level_err = serde_yaml::from_str::<Recipe>(
+            r#"
+name: chatgpt
+oops: true
+steps:
+  - action: open
+    args: ["https://chatgpt.com/"]
+"#,
+        )
+        .unwrap_err();
+        assert!(top_level_err.to_string().contains("unknown field"));
+
+        let step_err = serde_yaml::from_str::<Recipe>(
+            r#"
+name: chatgpt
+steps:
+  - action: open
+    args: ["https://chatgpt.com/"]
+    slep_ms: 1
+"#,
+        )
+        .unwrap_err();
+        assert!(step_err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn recipe_step_with_sleep_and_action_prefers_sleep() {
+        let recipe = serde_yaml::from_str::<Recipe>(
+            r#"
+name: noop
+steps:
+  - sleep_ms: 0
+    action: open
+    args: ["https://chatgpt.com/"]
+"#,
+        )
+        .unwrap();
+        let connection = BrowserConnection::AutoConnect;
+        run_recipe_with_connection(
+            recipe,
+            recipe_context(),
+            Some(&connection),
+            OutputFormat::Text,
+        )
+        .unwrap();
     }
 }

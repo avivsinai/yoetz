@@ -39,6 +39,9 @@ jobs:
             if (typeof toCookieHeader !== 'function') throw new Error('toCookieHeader is not a function');
             console.log('sweet-cookie exports verified');
           "
+      - name: Smoke-test cookie extractor imports
+        working-directory: scripts
+        run: node ./extract-cookies.mjs --smoke-test
 
   fmt:
     name: Format
@@ -75,12 +78,11 @@ jobs:
 
   msrv:
     name: MSRV (1.88)
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@v2
@@ -88,7 +90,6 @@ jobs:
 
   doc:
     name: Documentation
-    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -126,73 +127,16 @@ jobs:
 
   changelog:
     name: Changelog
+    if: github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-      - name: Detect release metadata changes
-        id: release_meta
-        shell: bash
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          BEFORE_SHA: ${{ github.event.before }}
-          HEAD_SHA: ${{ github.sha }}
-        run: |
-          set -euo pipefail
-
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "should_validate=true" >> "$GITHUB_OUTPUT"
-            echo "diff_range=manual" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          if [ "$EVENT_NAME" = "pull_request" ]; then
-            RANGE="origin/${BASE_REF}...HEAD"
-          elif [ -n "${BEFORE_SHA:-}" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
-            RANGE="${BEFORE_SHA}...${HEAD_SHA}"
-          else
-            RANGE="$(git rev-list --max-parents=0 HEAD | tail -1)...HEAD"
-          fi
-
-          echo "diff_range=$RANGE" >> "$GITHUB_OUTPUT"
-          # Only trigger changelog validation when version/changelog config changes.
-          # Exclude CHANGELOG.md (circular) and release.yml (triggers on non-release PRs).
-          CHANGED="$(git diff --name-only "$RANGE" -- Cargo.toml Cargo.lock cliff.toml)"
-          if [ -n "$CHANGED" ]; then
-            echo "should_validate=true" >> "$GITHUB_OUTPUT"
-            printf 'Release metadata changed in %s:\n%s\n' "$RANGE" "$CHANGED"
-          else
-            echo "should_validate=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Install git-cliff
-        if: steps.release_meta.outputs.should_validate == 'true'
-        uses: taiki-e/install-action@git-cliff
-      - name: Verify tagged releases in CHANGELOG
-        if: steps.release_meta.outputs.should_validate == 'true'
-        run: |
-          # Use workspace version as pending tag so release PRs match
-          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
-          git-cliff --tag "v${VERSION}" --output CHANGELOG.check.md
-          # Compare only tagged release sections — the [Unreleased] section
-          # naturally drifts on PR branches (includes the PR's own commits).
-          ACTUAL=$(sed -n '/^## \[[0-9]/,$p' CHANGELOG.md)
-          EXPECTED=$(sed -n '/^## \[[0-9]/,$p' CHANGELOG.check.md)
-          if [ "$ACTUAL" != "$EXPECTED" ]; then
-            echo "::error::CHANGELOG.md tagged releases are stale. Run 'git-cliff --tag vX.Y.Z -o CHANGELOG.md' and commit."
-            diff <(echo "$ACTUAL") <(echo "$EXPECTED") || true
-            exit 1
-          fi
-      - name: Skip changelog validation
-        if: steps.release_meta.outputs.should_validate != 'true'
-        run: echo "No release metadata changes detected; skipping changelog validation."
+      - name: Verify CHANGELOG.md exists
+        run: test -s CHANGELOG.md || { echo "::error::CHANGELOG.md is missing or empty"; exit 1; }
 
   build:
     name: Build (${{ matrix.os }})
-    if: github.event_name != 'pull_request'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:

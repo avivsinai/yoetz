@@ -1,11 +1,9 @@
 name: chatgpt
-# Requires: yoetz browser sync-cookies (extracts cookies from Chrome)
-# Verifies auth with: yoetz browser check
+# Auth: resolved automatically (CDP > auto_connect > cookie > profile).
+# Falls back to cookie sync if no live browser session is available.
 #
-# Uses Oracle-style cookie injection + stealth flags to bypass Cloudflare.
-# ChatGPT's home page currently restores the last-used model, but reopening the
-# selector under auto_connect is brittle. This recipe avoids forced reselection
-# and assumes the desired model is already active in ChatGPT.
+# ChatGPT's home page restores the last-used model. This recipe avoids forced
+# reselection and assumes the desired model is already active in ChatGPT.
 
 defaults:
   prompt: Review the attached file and provide your analysis.

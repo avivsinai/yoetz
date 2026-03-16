@@ -36,6 +36,11 @@ for (let i = 0; i < args.length; i++) {
   options.set(key, value);
 }
 
+if (options.has('smoke-test')) {
+  process.stdout.write('extract-cookies smoke test ok\n');
+  process.exit(0);
+}
+
 const url = options.get('url') || 'https://chatgpt.com/';
 const browsers = (options.get('browsers') || 'chrome,edge,firefox,safari')
   .split(',')
