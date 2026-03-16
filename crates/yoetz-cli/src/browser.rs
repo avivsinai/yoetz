@@ -328,8 +328,15 @@ fn run_recipe_with_connection(
     connection: Option<&BrowserConnection>,
     format: OutputFormat,
 ) -> Result<()> {
+    // For live-attach (auto-connect / CDP), skip the pre-recipe close.
+    // The close creates a managed session that opens a blank tab in Chrome,
+    // and then the recipe's `open` (rewritten to `tab new`) opens a second tab.
+    // For non-live connections (cookie-state, profile), close the managed daemon
+    // so the recipe starts with a fresh browser.
     if let Some(connection) = connection {
-        let _ = close_browser_for_connection(connection);
+        if !connection.is_live_attach() {
+            let _ = close_browser_for_connection(connection);
+        }
     } else {
         let _ = close_browser();
     }
@@ -359,7 +366,11 @@ fn run_recipe_with_connection(
             .action
             .as_ref()
             .ok_or_else(|| anyhow!("recipe step {idx} missing action"))?;
-        let commands = expand_step(action, step.args.as_deref(), &ctx)?;
+
+        let live = connection.is_some_and(BrowserConnection::is_live_attach);
+        let (effective_action, effective_args) =
+            normalize_recipe_action(action, step.args.as_deref(), live);
+        let commands = expand_step(&effective_action, effective_args.as_deref(), &ctx)?;
 
         for args in commands {
             let stdout = match run_agent_browser_with_connection(
@@ -392,8 +403,8 @@ fn run_recipe_with_connection(
                 let event = json!({
                     "type": "browser_step",
                     "index": idx,
-                    "action": action,
-                    "args": step.args,
+                    "action": effective_action,
+                    "args": effective_args,
                     "stdout": stdout_value,
                 });
                 if wants_jsonl {
@@ -1070,6 +1081,19 @@ fn parse_stdout_json(stdout: &str) -> Option<Value> {
     serde_json::from_str(trimmed).ok()
 }
 
+/// Normalize recipe step action/args. Currently a pass-through; the
+/// `--session` flag on `--auto-connect` already isolates navigation to a
+/// dedicated session page, so `open` navigates that page — not the user's
+/// active tab — without needing a rewrite to `tab new` (which would create
+/// an extra blank tab from the session's default page).
+fn normalize_recipe_action(
+    action: &str,
+    args: Option<&[String]>,
+    _live_attach: bool,
+) -> (String, Option<Vec<String>>) {
+    (action.to_string(), args.map(|a| a.to_vec()))
+}
+
 fn expand_step(
     action: &str,
     args: Option<&[String]>,
@@ -1458,5 +1482,45 @@ mod tests {
             issue,
             Some("chatgpt login required in the attached Chrome session. Log in there and try again.")
         );
+    }
+
+    #[test]
+    fn normalize_open_passes_through_when_live_attach() {
+        let args = vec!["https://chatgpt.com/".to_string()];
+        let (action, new_args) = normalize_recipe_action("open", Some(&args), true);
+        assert_eq!(action, "open");
+        assert_eq!(
+            new_args.as_deref().unwrap(),
+            &["https://chatgpt.com/".to_string()]
+        );
+    }
+
+    #[test]
+    fn rewrite_open_is_noop_when_not_live_attach() {
+        let args = vec!["https://chatgpt.com/".to_string()];
+        let (action, new_args) = normalize_recipe_action("open", Some(&args), false);
+        assert_eq!(action, "open");
+        assert_eq!(
+            new_args.as_deref().unwrap(),
+            &["https://chatgpt.com/".to_string()]
+        );
+    }
+
+    #[test]
+    fn rewrite_non_open_action_is_noop_when_live_attach() {
+        let args = vec!["#prompt-textarea".to_string(), "hello".to_string()];
+        let (action, new_args) = normalize_recipe_action("type", Some(&args), true);
+        assert_eq!(action, "type");
+        assert_eq!(
+            new_args.as_deref().unwrap(),
+            &["#prompt-textarea".to_string(), "hello".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_open_without_args_when_live_attach() {
+        let (action, new_args) = normalize_recipe_action("open", None, true);
+        assert_eq!(action, "open");
+        assert!(new_args.is_none());
     }
 }

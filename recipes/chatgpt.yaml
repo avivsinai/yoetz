@@ -26,8 +26,10 @@ steps:
   - sleep_ms: 500
 
   # Prime the visible attachment flow before targeting the underlying file input.
-  - action: find
-    args: ["label", "Add files and more", "click"]
+  # ChatGPT removed the <label> element; the button now uses aria-label only.
+  # Use the stable data-testid / id selector instead of `find label`.
+  - action: click
+    args: ["#composer-plus-btn"]
   - sleep_ms: 500
 
   # Attach the bundle as a file (handles large codebases that exceed paste limits)
@@ -73,8 +75,8 @@ steps:
   - action: press
     args: ["Enter"]
 
-  # Wait for response (file analysis may take longer with extended thinking)
-  - sleep_ms: 60000
+  # Wait for ChatGPT to finish generating (2 minutes for large bundles)
+  - sleep_ms: 120000
 
   # Capture final state
   - action: snapshot

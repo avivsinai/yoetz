@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.14] - 2026-03-16
+
+### Bug Fixes
+
+- Skip `close_browser_for_connection` in live-attach mode to avoid opening extra blank tabs
+- **chatgpt recipe**: Replace broken `find label` selector with stable `#composer-plus-btn`
+- **chatgpt recipe**: Increase wait from 60s to 120s for large bundles
+
+### Features
+
+- Extract `normalize_recipe_action()` helper for recipe step action/args normalization
+- Telemetry events now report `effective_action`/`effective_args` instead of raw step values
+
+### Testing
+
+- Add 4 unit tests for `normalize_recipe_action`
+
 ## [0.2.13] - 2026-03-15
 
 ### Bug Fixes
