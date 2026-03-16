@@ -110,6 +110,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v8
         with:
@@ -121,10 +123,19 @@ jobs:
           cd artifacts
           sha256sum yoetz-* > SHA256SUMS.txt
 
+      - name: Generate release notes
+        uses: taiki-e/install-action@git-cliff
+      - name: Extract release notes for this tag
+        id: release_notes
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          git-cliff --tag "$TAG" --unreleased --strip header --output RELEASE_NOTES.md
+          cat RELEASE_NOTES.md
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
           files: |
             artifacts/yoetz-*
             artifacts/SHA256SUMS.txt

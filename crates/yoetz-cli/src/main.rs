@@ -642,9 +642,22 @@ struct ModelEstimate {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Capture security-sensitive env vars before dotenv loading.
+    // CWD .env files must not override executable paths (supply-chain risk).
+    let pre_agent_bin = env::var("YOETZ_AGENT_BROWSER_BIN").ok();
+    let pre_scripts_dir = env::var("YOETZ_SCRIPTS_DIR").ok();
+
     // Load environment files (.env.local takes precedence over .env)
     dotenvy::from_filename(".env.local").ok();
     dotenvy::dotenv().ok();
+
+    // Prevent CWD .env from overriding executable paths (security)
+    if pre_agent_bin.is_none() {
+        env::remove_var("YOETZ_AGENT_BROWSER_BIN");
+    }
+    if pre_scripts_dir.is_none() {
+        env::remove_var("YOETZ_SCRIPTS_DIR");
+    }
 
     let cli = Cli::parse();
     let format = resolve_format(cli.format.as_deref())?;
@@ -953,14 +966,22 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             // Try to resolve the best browser connection (CDP > auto_connect > cookie > profile).
             // This reuses the same resolution logic as `check` and `attach`.
             let live_connection = if needs_auth {
-                browser::resolve_browser_connection(
+                match browser::resolve_browser_connection(
                     &ctx.config,
                     recipe_args.cdp.as_deref(),
                     &profile_dir,
                     browser::CHATGPT_URL,
-                )
-                .ok()
-                .filter(|c| c.is_live_attach())
+                ) {
+                    Ok(c) if c.is_live_attach() => Some(c),
+                    Ok(_) => None, // non-live connection; fall through to legacy path
+                    Err(e) => {
+                        if recipe_args.cdp.is_some() {
+                            return Err(e.context("explicit --cdp failed; not falling back"));
+                        }
+                        eprintln!("live-attach unavailable, falling back to cookie/profile: {e}");
+                        None
+                    }
+                }
             } else {
                 None
             };
@@ -2033,8 +2054,27 @@ async fn save_image_outputs(
                 .context("decode image base64")?;
             std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
         } else if let Some(url) = image.url.as_ref() {
-            let bytes = client.get(url).send().await?.bytes().await?;
-            std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
+            const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+            let resp = client.get(url).send().await?.error_for_status()?;
+            if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE) {
+                let ct_str = ct.to_str().unwrap_or("");
+                if !ct_str.starts_with("image/") {
+                    eprintln!("warning: image download content-type is {ct_str}, expected image/*");
+                }
+            }
+            if let Some(cl) = resp.content_length() {
+                if cl > MAX_IMAGE_BYTES {
+                    anyhow::bail!("image download too large ({cl} bytes, max {MAX_IMAGE_BYTES})");
+                }
+            }
+            let bytes = resp.bytes().await?;
+            if bytes.len() as u64 > MAX_IMAGE_BYTES {
+                anyhow::bail!(
+                    "image download too large ({} bytes, max {MAX_IMAGE_BYTES})",
+                    bytes.len()
+                );
+            }
+            std::fs::write(&path, &bytes).with_context(|| format!("write {}", path.display()))?;
         } else {
             continue;
         }
