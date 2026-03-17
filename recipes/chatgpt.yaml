@@ -2,11 +2,15 @@ name: chatgpt
 # Auth: resolved automatically (CDP > auto_connect > cookie > profile).
 # Falls back to cookie sync if no live browser session is available.
 #
-# ChatGPT's home page restores the last-used model. This recipe avoids forced
-# reselection and assumes the desired model is already active in ChatGPT.
+# Variables:
+#   model    — ChatGPT display name to select (e.g., "Pro 5.4"). Omit to keep current.
+#   extended — set to "false" to disable Extended Pro. Default: leave as-is.
+#   prompt   — prompt text to send with the attachment.
 
 defaults:
   prompt: Review the attached file and provide your analysis.
+  model: ""
+  extended: ""
 
 steps:
   # Open ChatGPT
@@ -16,11 +20,51 @@ steps:
     args: ["--load", "domcontentloaded"]
   - sleep_ms: 2000
 
-  # Disable extended thinking for faster responses
-  # Only click if extended thinking is currently enabled (aria-label contains
-  # "click to remove"). ChatGPT's current UI labels this as "Extended Pro".
+  # Select model if --var model is provided (e.g., --var model="Pro 5.4")
   - action: eval
-    args: ["document.querySelector('button[aria-label*=\"click to remove\"][aria-label*=\"Extended\"]')?.click()"]
+    args:
+      - |
+        (() => {
+          const model = "{{model}}";
+          if (!model) return "skipped: no model specified";
+          const btn = document.querySelector('button[aria-label*="Model selector"]');
+          if (!btn) throw new Error("model selector button not found");
+          btn.click();
+          return "opened model selector";
+        })()
+  - sleep_ms: 800
+  - action: eval
+    args:
+      - |
+        (() => {
+          const model = "{{model}}";
+          if (!model) return "skipped: no model specified";
+          const items = Array.from(document.querySelectorAll(
+            '[role="menuitem"], [role="option"], [data-testid*="model"]'
+          ));
+          const match = items.find(el =>
+            (el.textContent || "").trim().includes(model)
+          );
+          if (!match) throw new Error("model '" + model + "' not found in selector");
+          match.click();
+          return "selected model: " + model;
+        })()
+  - sleep_ms: 500
+
+  # Disable Extended Pro only when explicitly requested (--var extended=false).
+  # Default: leave Extended Pro as-is.
+  - action: eval
+    args:
+      - |
+        (() => {
+          const extended = "{{extended}}";
+          if (extended !== "false") return "skipped: extended not disabled";
+          const btn = document.querySelector(
+            'button[aria-label*="click to remove"][aria-label*="Extended"]'
+          );
+          if (btn) { btn.click(); return "disabled Extended Pro"; }
+          return "Extended Pro already off";
+        })()
   - sleep_ms: 500
 
   # Prime the visible attachment flow before targeting the underlying file input.
@@ -68,10 +112,10 @@ steps:
     args: ["#prompt-textarea", "{{prompt}}"]
   - sleep_ms: 500
 
-  # Send the message. The Send button locator becomes brittle after upload +
-  # typing, but Enter reliably submits the prompt in ChatGPT.
-  - action: press
-    args: ["Enter"]
+  # Send the message. Click the send button instead of pressing Enter, which
+  # can be interpreted as a newline when a file is attached.
+  - action: click
+    args: ['button[aria-label="Send prompt"]']
 
   # Wait for ChatGPT to finish generating (2 minutes for large bundles)
   - sleep_ms: 120000
