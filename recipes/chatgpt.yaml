@@ -3,7 +3,7 @@ name: chatgpt
 # Falls back to cookie sync if no live browser session is available.
 #
 # Variables:
-#   model    — ChatGPT display name to select (e.g., "Pro 5.4"). Omit to keep current.
+#   model    — model slug or display name (e.g., "gpt-5-4-pro" or "Pro 5.4"). Omit to keep current.
 #   extended — set to "false" to disable Extended Pro. Default: leave as-is.
 #   prompt   — prompt text to send with the attachment.
 
@@ -20,13 +20,14 @@ steps:
     args: ["--load", "domcontentloaded"]
   - sleep_ms: 2000
 
-  # Select model if --var model is provided (e.g., --var model="Pro 5.4")
+  # Select model if --var model is provided. Accepts slug (gpt-5-4-pro) or
+  # display name ("Pro 5.4"). Known slugs are normalized to display names.
   - action: eval
     args:
       - |
         (() => {
-          const model = "{{model}}";
-          if (!model) return "skipped: no model specified";
+          const raw = "{{model}}";
+          if (!raw) return "skipped: no model specified";
           const btn = document.querySelector('button[aria-label*="Model selector"]');
           if (!btn) throw new Error("model selector button not found");
           btn.click();
@@ -37,17 +38,25 @@ steps:
     args:
       - |
         (() => {
-          const model = "{{model}}";
-          if (!model) return "skipped: no model specified";
+          const raw = "{{model}}";
+          if (!raw) return "skipped: no model specified";
+          const slugs = {
+            "gpt-5-4-pro": "Pro 5.4",
+            "gpt-4o": "4o",
+            "o3": "o3",
+            "o4-mini": "o4-mini",
+            "o4-mini-high": "o4-mini-high",
+          };
+          const display = slugs[raw.toLowerCase()] || raw;
           const items = Array.from(document.querySelectorAll(
             '[role="menuitem"], [role="option"], [data-testid*="model"]'
           ));
           const match = items.find(el =>
-            (el.textContent || "").trim().includes(model)
+            (el.textContent || "").trim().includes(display)
           );
-          if (!match) throw new Error("model '" + model + "' not found in selector");
+          if (!match) throw new Error("model '" + display + "' not found in selector");
           match.click();
-          return "selected model: " + model;
+          return "selected model: " + display;
         })()
   - sleep_ms: 500
 
