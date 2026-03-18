@@ -226,13 +226,13 @@ async fn handle_generate_video(
 
     let output_path = media_dir.join("video.mp4");
 
-    let outputs = if args.dry_run {
-        Vec::new()
+    let (outputs, usage) = if args.dry_run {
+        (Vec::new(), Usage::default())
     } else {
-        let output = match provider.as_str() {
+        let (output, usage) = match provider.as_str() {
             "openai" => {
                 let auth = resolve_provider_auth(config, &provider)?;
-                openai::generate_video_sora(
+                let result = openai::generate_video_sora(
                     &ctx.client,
                     &auth,
                     &prompt,
@@ -242,11 +242,12 @@ async fn handle_generate_video(
                     images.first(),
                     &output_path,
                 )
-                .await?
+                .await?;
+                (result.output, result.usage)
             }
             "gemini" => {
                 let auth = resolve_provider_auth(config, &provider)?;
-                gemini::generate_video_veo(
+                let result = gemini::generate_video_veo(
                     &ctx.client,
                     &auth,
                     &prompt,
@@ -258,7 +259,8 @@ async fn handle_generate_video(
                     args.negative_prompt.as_deref(),
                     &output_path,
                 )
-                .await?
+                .await?;
+                (result.output, result.usage)
             }
             _ => {
                 return Err(anyhow!(
@@ -266,7 +268,7 @@ async fn handle_generate_video(
                 ))
             }
         };
-        vec![output]
+        (vec![output], usage)
     };
 
     let mut result = MediaGenerationResult {
@@ -274,7 +276,7 @@ async fn handle_generate_video(
         provider: Some(provider),
         model: Some(model),
         prompt,
-        usage: Usage::default(),
+        usage,
         artifacts: artifacts.clone(),
         outputs,
     };

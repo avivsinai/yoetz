@@ -203,10 +203,7 @@ fn embedded_gemini_registry() -> Result<ModelRegistry> {
             continue;
         }
 
-        let context_length = pricing
-            .max_input_tokens
-            .or(pricing.max_output_tokens)
-            .map(|v| v as usize);
+        let context_length = pricing.max_input_tokens.map(|v| v as usize);
         let max_output_tokens = pricing.max_output_tokens.map(|v| v as usize);
 
         registry.models.push(ModelEntry {

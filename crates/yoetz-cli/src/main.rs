@@ -484,6 +484,10 @@ struct ReviewDiffArgs {
 
     #[arg(long)]
     response_schema_name: Option<String>,
+
+    /// Maximum diff size in bytes before truncation (default: 500000)
+    #[arg(long, default_value = "500000")]
+    max_diff_bytes: usize,
 }
 
 #[derive(Args)]
@@ -643,9 +647,23 @@ struct ModelEstimate {
 #[tokio::main]
 async fn main() -> Result<()> {
     // Capture security-sensitive env vars before dotenv loading.
-    // CWD .env files must not override executable paths (supply-chain risk).
+    // CWD .env files must not override executable paths (supply-chain risk)
+    // or redirect API keys to attacker-controlled endpoints.
     let pre_agent_bin = env::var("YOETZ_AGENT_BROWSER_BIN").ok();
     let pre_scripts_dir = env::var("YOETZ_SCRIPTS_DIR").ok();
+
+    // Capture API key env vars so CWD .env cannot silently replace them.
+    const PROTECTED_API_KEYS: &[&str] = &[
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "GEMINI_API_KEY",
+        "OPENROUTER_API_KEY",
+        "XAI_API_KEY",
+    ];
+    let pre_api_keys: Vec<(&str, Option<String>)> = PROTECTED_API_KEYS
+        .iter()
+        .map(|&k| (k, env::var(k).ok()))
+        .collect();
 
     // Load environment files (.env.local takes precedence over .env)
     dotenvy::from_filename(".env.local").ok();
@@ -657,6 +675,18 @@ async fn main() -> Result<()> {
     }
     if pre_scripts_dir.is_none() {
         env::remove_var("YOETZ_SCRIPTS_DIR");
+    }
+
+    // Restore API key env vars if .env changed them (prevent credential hijack)
+    for (key, pre_value) in &pre_api_keys {
+        let post_value = env::var(key).ok();
+        if post_value != *pre_value {
+            match pre_value {
+                Some(v) => env::set_var(key, v),
+                None => env::remove_var(key),
+            }
+            eprintln!("warning: CWD .env tried to override {key}, ignored");
+        }
     }
 
     let cli = Cli::parse();

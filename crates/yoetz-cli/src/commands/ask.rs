@@ -281,9 +281,11 @@ pub(crate) async fn handle_ask(
     if budget_enabled {
         if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
             if let Some(reservation) = budget_reservation {
-                let _ = reservation.commit(spend);
-            } else {
-                let _ = budget::record_spend_standalone(spend);
+                if let Err(e) = reservation.commit(spend) {
+                    eprintln!("warning: budget commit failed: {e}");
+                }
+            } else if let Err(e) = budget::record_spend_standalone(spend) {
+                eprintln!("warning: budget commit failed: {e}");
             }
         }
     }

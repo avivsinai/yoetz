@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -125,6 +126,7 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
     let exclude_expanded: Vec<String> = options.exclude.iter().map(|p| expand_tilde(p)).collect();
 
     let mut files = Vec::new();
+    let mut seen_files = HashSet::new();
     let mut total_bytes = 0usize;
     let mut total_chars = 0usize;
 
@@ -135,6 +137,11 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
                 "-f path not found or not a file: {}",
                 file_path.display()
             ));
+        }
+        let identity = file_identity(file_path)
+            .with_context(|| format!("resolve file {}", file_path.display()))?;
+        if !seen_files.insert(identity) {
+            continue;
         }
         let display_path = file_path.to_string_lossy().to_string();
         let (bf, consumed) = process_file(
@@ -178,6 +185,11 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
             }
 
             let path = entry.path();
+            let identity =
+                file_identity(path).with_context(|| format!("resolve file {}", path.display()))?;
+            if !seen_files.insert(identity) {
+                continue;
+            }
             let rel_path = path
                 .strip_prefix(&options.root)
                 .unwrap_or(path)
@@ -212,6 +224,11 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
         files,
         stats,
     })
+}
+
+fn file_identity(path: &Path) -> Result<PathBuf> {
+    path.canonicalize()
+        .with_context(|| format!("canonicalize {}", path.display()))
 }
 
 fn extract_text(
@@ -441,6 +458,31 @@ mod tests {
 
         let bundle = build_bundle("prompt", options).unwrap();
         assert_eq!(bundle.files.len(), 2);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bundle_dedups_same_file_across_direct_and_glob_inputs() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yoetz_dedup_test_{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+
+        let local = root.join("local.txt");
+        fs::write(&local, "local").unwrap();
+
+        let options = BundleOptions {
+            root: root.clone(),
+            include: vec![local.to_string_lossy().to_string(), "*.txt".to_string()],
+            ..BundleOptions::default()
+        };
+
+        let bundle = build_bundle("prompt", options).unwrap();
+        assert_eq!(bundle.files.len(), 1);
+        assert_eq!(bundle.stats.file_count, 1);
 
         let _ = fs::remove_dir_all(&root);
     }

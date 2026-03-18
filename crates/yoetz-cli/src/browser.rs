@@ -94,15 +94,16 @@ impl BrowserConnection {
 }
 
 /// Cached agent-browser resolution. Probed once per process, reused for all calls.
-static AGENT_BROWSER: OnceLock<(String, Vec<String>)> = OnceLock::new();
+static AGENT_BROWSER: OnceLock<Result<(String, Vec<String>), String>> = OnceLock::new();
 
 /// Returns (program, extra_prefix_args) for launching agent-browser.
-/// Checks YOETZ_AGENT_BROWSER_BIN env, then PATH, then falls back to npx.
+/// Checks YOETZ_AGENT_BROWSER_BIN env, then PATH, then falls back to npx
+/// (only if `YOETZ_ALLOW_NPX_FALLBACK=1` is set).
 /// Result is cached for the lifetime of the process.
-fn resolve_agent_browser() -> (String, Vec<String>) {
+fn resolve_agent_browser() -> Result<(String, Vec<String>)> {
     let cached = AGENT_BROWSER.get_or_init(|| {
         if let Ok(bin) = env::var("YOETZ_AGENT_BROWSER_BIN") {
-            return (bin, vec![]);
+            return Ok((bin, vec![]));
         }
         // Check if agent-browser is in PATH
         if Command::new("agent-browser")
@@ -112,15 +113,26 @@ fn resolve_agent_browser() -> (String, Vec<String>) {
             .status()
             .is_ok_and(|s| s.success())
         {
-            return ("agent-browser".to_string(), vec![]);
+            return Ok(("agent-browser".to_string(), vec![]));
         }
-        // Fall back to npx (handles npm cache / npx-installed packages)
-        (
-            "npx".to_string(),
-            vec!["--yes".to_string(), "agent-browser".to_string()],
-        )
+        // Fall back to npx only if explicitly allowed — downloading and executing
+        // arbitrary npm code at runtime is a security risk.
+        if env::var("YOETZ_ALLOW_NPX_FALLBACK").as_deref() == Ok("1") {
+            eprintln!("warning: agent-browser not found in PATH; falling back to `npx --yes agent-browser`. Set YOETZ_AGENT_BROWSER_BIN or install agent-browser globally to avoid this.");
+            return Ok((
+                "npx".to_string(),
+                vec!["--yes".to_string(), "agent-browser".to_string()],
+            ));
+        }
+        Err("agent-browser not found in PATH and npx fallback is disabled.\n\
+             Install it globally:  npm install -g agent-browser\n\
+             Or allow npx fallback: export YOETZ_ALLOW_NPX_FALLBACK=1"
+            .to_string())
     });
-    cached.clone()
+    match cached {
+        Ok(v) => Ok(v.clone()),
+        Err(msg) => Err(anyhow!("{msg}")),
+    }
 }
 
 pub fn run_agent_browser(
@@ -248,7 +260,7 @@ fn run_agent_browser_with_connection(
     use_stealth: bool,
     headed: bool,
 ) -> Result<String> {
-    let (bin, prefix_args) = resolve_agent_browser();
+    let (bin, prefix_args) = resolve_agent_browser()?;
     let mut cmd = Command::new(&bin);
     let final_args = build_agent_browser_args(args, format, connection, use_stealth, headed);
     let mut all_args = prefix_args;
@@ -485,6 +497,12 @@ fn expand_tilde(path: &Path) -> Result<PathBuf> {
 
 pub fn login(profile_dir: &Path) -> Result<()> {
     fs::create_dir_all(profile_dir).with_context(|| format!("create {}", profile_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(profile_dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 700 {}", profile_dir.display()))?;
+    }
     clear_state_file(profile_dir)?;
     // Close any existing daemon to ensure fresh options
     let _ = close_browser();
@@ -507,7 +525,7 @@ pub fn close_browser() -> Result<()> {
 
 pub fn close_browser_for_connection(connection: &BrowserConnection) -> Result<()> {
     if connection.is_live_attach() {
-        let (bin, prefix_args) = resolve_agent_browser();
+        let (bin, prefix_args) = resolve_agent_browser()?;
         let mut cmd = Command::new(bin);
         cmd.args(prefix_args);
         match cmd.args(["--session", CDP_SESSION_NAME, "close"]).output() {
@@ -524,7 +542,7 @@ pub fn close_browser_for_connection(connection: &BrowserConnection) -> Result<()
 }
 
 fn close_browser_daemon() -> Result<()> {
-    let (bin, prefix_args) = resolve_agent_browser();
+    let (bin, prefix_args) = resolve_agent_browser()?;
     let mut cmd = Command::new(bin);
     cmd.args(prefix_args);
     let _ = cmd.arg("close").output();
@@ -552,6 +570,12 @@ pub fn clear_state_file(profile_dir: &Path) -> Result<()> {
 /// in Playwright storageState format for agent-browser to use.
 pub fn sync_cookies(profile_dir: &Path) -> Result<(usize, Vec<String>)> {
     fs::create_dir_all(profile_dir).with_context(|| format!("create {}", profile_dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(profile_dir, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("chmod 700 {}", profile_dir.display()))?;
+    }
     ensure_supported_node_for_cookie_sync()?;
 
     let state_file = state_file(profile_dir);
@@ -597,6 +621,16 @@ pub fn sync_cookies(profile_dir: &Path) -> Result<(usize, Vec<String>)> {
     if let Err(err) = validate_cookie_sync_result(cookie_count, &warnings) {
         let _ = fs::remove_file(&state_file);
         return Err(err);
+    }
+
+    // Restrict state file permissions — it contains session cookies.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if state_file.exists() {
+            fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 600 {}", state_file.display()))?;
+        }
     }
 
     Ok((cookie_count, warnings))
@@ -1219,21 +1253,46 @@ fn chunk_text(text: &str, max_bytes: usize) -> Vec<String> {
 }
 
 fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> Result<String> {
+    if value.contains("{{bundle_path}}") && ctx.bundle_path.is_none() {
+        return Err(anyhow!("bundle path requested but no bundle provided"));
+    }
+    if value.contains("{{bundle_text}}") && bundle_text.is_none() {
+        return Err(anyhow!("bundle text requested but no bundle provided"));
+    }
+
+    // Check for unresolved placeholders in the ORIGINAL template (before substitution)
+    // so that {{...}} patterns inside bundle_text don't trigger false errors.
+    let mut known_vars: std::collections::HashSet<&str> =
+        ctx.vars.keys().map(|s| s.as_str()).collect();
+    known_vars.insert("bundle_path");
+    known_vars.insert("bundle_text");
+    let mut scan = value;
+    while let Some(start) = scan.find("{{") {
+        let rest = &scan[start + 2..];
+        if let Some(end) = rest.find("}}") {
+            let placeholder = rest[..end].trim();
+            if !placeholder.is_empty() && !known_vars.contains(placeholder) {
+                return Err(anyhow!(
+                    "recipe variable {{{{{placeholder}}}}} not provided. Pass `--var {placeholder}=...` or add it under `defaults:` in the recipe."
+                ));
+            }
+            scan = &rest[end + 2..];
+        } else {
+            break;
+        }
+    }
+
+    // Perform substitutions
     let mut out = value.to_string();
     if let Some(path) = &ctx.bundle_path {
         out = out.replace("{{bundle_path}}", path);
-    }
-    if let Some(text) = bundle_text {
-        out = out.replace("{{bundle_text}}", text);
     }
     for (key, value) in &ctx.vars {
         let needle = format!("{{{{{key}}}}}");
         out = out.replace(&needle, value);
     }
-    if let Some(var) = first_unresolved_placeholder(&out) {
-        return Err(anyhow!(
-            "recipe variable {{{{{var}}}}} not provided. Pass `--var {var}=...` or add it under `defaults:` in the recipe."
-        ));
+    if let Some(text) = bundle_text {
+        out = out.replace("{{bundle_text}}", text);
     }
     Ok(out)
 }
@@ -1247,18 +1306,6 @@ fn parse_recipe_var(entry: &str) -> Result<(String, String)> {
         return Err(anyhow!("invalid --var `{entry}` (key cannot be empty)"));
     }
     Ok((key.to_string(), value.to_string()))
-}
-
-fn first_unresolved_placeholder(value: &str) -> Option<&str> {
-    let start = value.find("{{")?;
-    let rest = &value[start + 2..];
-    let end = rest.find("}}")?;
-    let placeholder = rest[..end].trim();
-    if placeholder.is_empty() {
-        None
-    } else {
-        Some(placeholder)
-    }
 }
 
 #[cfg(test)]
@@ -1456,6 +1503,23 @@ mod tests {
         let ctx = recipe_context();
         let err = interpolate("{{missing}}", &ctx, None).unwrap_err();
         assert!(err.to_string().contains("--var missing="));
+    }
+
+    #[test]
+    fn interpolate_bundle_text_with_template_syntax_no_false_positive() {
+        let ctx = recipe_context();
+        // bundle_text contains {{handlebars}} template syntax — must not trigger an error
+        let bundle = "function render() { return `{{user_name}}`; }";
+        let result = interpolate("Review this code:\n{{bundle_text}}", &ctx, Some(bundle)).unwrap();
+        assert!(result.contains("{{user_name}}"));
+        assert!(result.contains("Review this code:"));
+    }
+
+    #[test]
+    fn interpolate_does_not_expand_recipe_vars_inside_bundle_text() {
+        let ctx = recipe_context();
+        let result = interpolate("{{bundle_text}}", &ctx, Some("literal {{model}}")).unwrap();
+        assert_eq!(result, "literal {{model}}");
     }
 
     #[test]
