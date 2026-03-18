@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use reqwest::multipart::{Form, Part};
-use reqwest::Client;
+use reqwest::{Client, RequestBuilder, Url};
 use serde_json::Value;
 use std::path::Path;
 use tokio::time::{sleep, Duration};
@@ -11,6 +11,82 @@ use yoetz_core::types::Usage;
 
 use crate::http::send_json;
 use crate::providers::ProviderAuth;
+
+/// Maximum download size for media files (100 MiB).
+const MAX_MEDIA_DOWNLOAD_BYTES: usize = 100 * 1024 * 1024;
+
+/// Known OpenAI hosts that are safe to receive bearer tokens.
+const OPENAI_ALLOWED_HOSTS: &[&str] = &[
+    "api.openai.com",
+    "oaidalleapiprodscus.blob.core.windows.net",
+];
+
+/// Wildcard suffixes: any host ending with these (including exact match) is allowed.
+const OPENAI_ALLOWED_SUFFIXES: &[&str] = &[".oaiusercontent.com"];
+
+/// Returns `true` when `url` points to a known OpenAI-controlled host.
+fn is_openai_host(url: &str) -> bool {
+    let parsed = match Url::parse(url) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    let host = match parsed.host_str() {
+        Some(h) => h,
+        None => return false,
+    };
+    // Exact matches
+    if OPENAI_ALLOWED_HOSTS.contains(&host) {
+        return true;
+    }
+    // Wildcard suffix matches (e.g. anything.oaiusercontent.com)
+    for suffix in OPENAI_ALLOWED_SUFFIXES {
+        if host == &suffix[1..] || host.ends_with(suffix) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build a GET request, attaching the bearer token **only** if the URL belongs to
+/// a known OpenAI host.  This prevents leaking API keys to arbitrary servers whose
+/// URLs appear in API response payloads.
+fn safe_image_get(client: &Client, url: &str, api_key: &str) -> RequestBuilder {
+    let rb = client.get(url);
+    if is_openai_host(url) {
+        rb.bearer_auth(api_key)
+    } else {
+        rb
+    }
+}
+
+/// Download a response body while enforcing [`MAX_MEDIA_DOWNLOAD_BYTES`].
+/// Checks `Content-Length` up-front when available and also counts bytes during
+/// streaming to guard against servers that lie about (or omit) the header.
+async fn download_with_limit(resp: reqwest::Response, url: &str) -> Result<Vec<u8>> {
+    if let Some(cl) = resp.content_length() {
+        if cl as usize > MAX_MEDIA_DOWNLOAD_BYTES {
+            return Err(anyhow!(
+                "download from {} refused: Content-Length {} exceeds {} byte limit",
+                url,
+                cl,
+                MAX_MEDIA_DOWNLOAD_BYTES
+            ));
+        }
+    }
+    let mut buf = Vec::new();
+    let mut stream = resp;
+    while let Some(chunk) = stream.chunk().await? {
+        if buf.len() + chunk.len() > MAX_MEDIA_DOWNLOAD_BYTES {
+            return Err(anyhow!(
+                "download from {} aborted: exceeded {} byte limit",
+                url,
+                MAX_MEDIA_DOWNLOAD_BYTES
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
 
 #[derive(Debug, Clone)]
 pub struct OpenAITextResult {
@@ -22,6 +98,12 @@ pub struct OpenAITextResult {
 #[derive(Debug, Clone)]
 pub struct OpenAIMediaResult {
     pub outputs: Vec<MediaOutput>,
+    pub usage: Usage,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenAIVideoResult {
+    pub output: MediaOutput,
     pub usage: Usage,
 }
 
@@ -151,13 +233,12 @@ pub async fn generate_images(
                 .context("decode image base64")?;
             std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
         } else if let Some(url) = &payload.url {
-            let bytes = client
-                .get(url)
-                .bearer_auth(&auth.api_key)
+            let resp = safe_image_get(client, url, &auth.api_key)
                 .send()
                 .await?
-                .bytes()
-                .await?;
+                .error_for_status()
+                .with_context(|| format!("download {}", url))?;
+            let bytes = download_with_limit(resp, url).await?;
             std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
         } else {
             continue;
@@ -192,8 +273,7 @@ async fn load_media_bytes(client: &Client, media: &MediaInput) -> Result<Vec<u8>
                 .await?
                 .error_for_status()
                 .with_context(|| format!("download {}", url))?;
-            let bytes = resp.bytes().await?;
-            Ok(bytes.to_vec())
+            download_with_limit(resp, url).await
         }
         _ => media.read_bytes(),
     }
@@ -286,13 +366,12 @@ async fn generate_images_via_images_api(
                 .context("decode image base64")?;
             std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
         } else if let Some(url) = &payload.url {
-            let bytes = client
-                .get(url)
-                .bearer_auth(&auth.api_key)
+            let resp = safe_image_get(client, url, &auth.api_key)
                 .send()
                 .await?
-                .bytes()
-                .await?;
+                .error_for_status()
+                .with_context(|| format!("download {}", url))?;
+            let bytes = download_with_limit(resp, url).await?;
             std::fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))?;
         } else {
             continue;
@@ -327,7 +406,7 @@ pub async fn generate_video_sora(
     size: Option<&str>,
     input_reference: Option<&MediaInput>,
     output_path: &Path,
-) -> Result<MediaOutput> {
+) -> Result<OpenAIVideoResult> {
     let url = format!("{}/videos", auth.base_url.trim_end_matches('/'));
 
     let mut form = Form::new()
@@ -356,6 +435,7 @@ pub async fn generate_video_sora(
 
     let (resp, _headers) =
         send_json::<Value>(client.post(url).bearer_auth(&auth.api_key).multipart(form)).await?;
+    let initial_usage = parse_usage(&resp);
 
     let video_id = resp
         .get("id")
@@ -369,7 +449,7 @@ pub async fn generate_video_sora(
     );
 
     let mut attempts = 0u32;
-    loop {
+    let final_usage = loop {
         let (status_resp, _headers) =
             send_json::<Value>(client.get(&status_url).bearer_auth(&auth.api_key)).await?;
         let status = status_resp
@@ -377,7 +457,7 @@ pub async fn generate_video_sora(
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
         match status {
-            "completed" => break,
+            "completed" => break parse_usage(&status_resp),
             "failed" => {
                 let msg = status_resp
                     .get("error")
@@ -393,7 +473,7 @@ pub async fn generate_video_sora(
                 sleep(Duration::from_secs(5)).await;
             }
         }
-    }
+    };
 
     let content_url = format!(
         "{}/videos/{}/content",
@@ -412,17 +492,20 @@ pub async fn generate_video_sora(
     std::fs::write(output_path, &bytes)
         .with_context(|| format!("write {}", output_path.display()))?;
 
-    Ok(MediaOutput {
-        media_type: MediaType::Video,
-        path: output_path.to_path_buf(),
-        url: None,
-        metadata: MediaMetadata {
-            width: None,
-            height: None,
-            duration_secs: seconds.map(|s| s as f32),
-            model: model.to_string(),
-            revised_prompt: None,
+    Ok(OpenAIVideoResult {
+        output: MediaOutput {
+            media_type: MediaType::Video,
+            path: output_path.to_path_buf(),
+            url: None,
+            metadata: MediaMetadata {
+                width: None,
+                height: None,
+                duration_secs: seconds.map(|s| s as f32),
+                model: model.to_string(),
+                revised_prompt: None,
+            },
         },
+        usage: fill_missing_usage(final_usage, initial_usage),
     })
 }
 
@@ -466,6 +549,25 @@ fn parse_usage(resp: &Value) -> Usage {
     } else {
         Usage::default()
     }
+}
+
+fn fill_missing_usage(mut usage: Usage, fallback: Usage) -> Usage {
+    if usage.input_tokens.is_none() {
+        usage.input_tokens = fallback.input_tokens;
+    }
+    if usage.output_tokens.is_none() {
+        usage.output_tokens = fallback.output_tokens;
+    }
+    if usage.thoughts_tokens.is_none() {
+        usage.thoughts_tokens = fallback.thoughts_tokens;
+    }
+    if usage.total_tokens.is_none() {
+        usage.total_tokens = fallback.total_tokens;
+    }
+    if usage.cost_usd.is_none() {
+        usage.cost_usd = fallback.cost_usd;
+    }
+    usage
 }
 
 struct ImagePayload {
@@ -590,5 +692,67 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].b64_json.as_deref(), Some("dGVzdA=="));
         assert_eq!(images[0].revised_prompt.as_deref(), Some("test"));
+    }
+
+    #[test]
+    fn is_openai_host_known_hosts() {
+        assert!(is_openai_host("https://api.openai.com/v1/images"));
+        assert!(is_openai_host(
+            "https://oaidalleapiprodscus.blob.core.windows.net/img/abc.png"
+        ));
+    }
+
+    #[test]
+    fn is_openai_host_wildcard_suffix() {
+        // Subdomain of oaiusercontent.com
+        assert!(is_openai_host(
+            "https://files.oaiusercontent.com/file-abc123?se=2024"
+        ));
+        // Bare oaiusercontent.com (exact match on the suffix minus the dot)
+        assert!(is_openai_host("https://oaiusercontent.com/file.png"));
+    }
+
+    #[test]
+    fn is_openai_host_rejects_unknown() {
+        assert!(!is_openai_host("https://evil.com/img.png"));
+        assert!(!is_openai_host("https://example.org/something"));
+        assert!(!is_openai_host("http://localhost:8080/test"));
+    }
+
+    #[test]
+    fn is_openai_host_rejects_spoofing() {
+        // Subdomain spoofing: attacker owns evil-api.openai.com.evil.com
+        assert!(!is_openai_host("https://api.openai.com.evil.com/steal"));
+        // Suffix spoofing: not-oaiusercontent.com
+        assert!(!is_openai_host("https://not-oaiusercontent.com/file.png"));
+        // Path spoofing
+        assert!(!is_openai_host("https://evil.com/api.openai.com"));
+        // Invalid URL
+        assert!(!is_openai_host("not-a-url"));
+    }
+
+    #[test]
+    fn fill_missing_usage_keeps_primary_values() {
+        let usage = fill_missing_usage(
+            Usage {
+                input_tokens: Some(10),
+                output_tokens: None,
+                thoughts_tokens: None,
+                total_tokens: None,
+                cost_usd: None,
+            },
+            Usage {
+                input_tokens: Some(1),
+                output_tokens: Some(2),
+                thoughts_tokens: Some(3),
+                total_tokens: Some(4),
+                cost_usd: Some(5.0),
+            },
+        );
+        assert_eq!(usage.input_tokens, Some(10));
+        assert_eq!(usage.output_tokens, Some(2));
+        assert_eq!(usage.thoughts_tokens, Some(3));
+        assert_eq!(usage.total_tokens, Some(4));
+        assert_eq!(usage.cost_usd, Some(5.0));
     }
 }

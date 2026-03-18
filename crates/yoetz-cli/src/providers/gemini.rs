@@ -20,6 +20,12 @@ pub struct GeminiTextResult {
     pub raw: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct GeminiVideoResult {
+    pub output: MediaOutput,
+    pub usage: Usage,
+}
+
 pub async fn generate_content(
     client: &Client,
     auth: &ProviderAuth,
@@ -81,7 +87,7 @@ pub async fn generate_video_veo(
     resolution: Option<&str>,
     negative_prompt: Option<&str>,
     output_path: &Path,
-) -> Result<MediaOutput> {
+) -> Result<GeminiVideoResult> {
     let mut parameters = serde_json::json!({});
     if let Some(duration) = duration_secs {
         parameters["durationSeconds"] = Value::from(duration as i64);
@@ -175,17 +181,20 @@ pub async fn generate_video_veo(
     std::fs::write(output_path, &bytes)
         .with_context(|| format!("write {}", output_path.display()))?;
 
-    Ok(MediaOutput {
-        media_type: MediaType::Video,
-        path: output_path.to_path_buf(),
-        url: Some(uri),
-        metadata: MediaMetadata {
-            width: None,
-            height: None,
-            duration_secs: duration_secs.map(|d| d as f32),
-            model: model.to_string(),
-            revised_prompt: None,
+    Ok(GeminiVideoResult {
+        output: MediaOutput {
+            media_type: MediaType::Video,
+            path: output_path.to_path_buf(),
+            url: Some(uri),
+            metadata: MediaMetadata {
+                width: None,
+                height: None,
+                duration_secs: duration_secs.map(|d| d as f32),
+                model: model.to_string(),
+                revised_prompt: None,
+            },
         },
+        usage: parse_usage(&response),
     })
 }
 
@@ -365,7 +374,15 @@ fn extract_text(resp: &Value) -> String {
 }
 
 fn parse_usage(resp: &Value) -> Usage {
-    if let Some(meta) = resp.get("usageMetadata").and_then(|v| v.as_object()) {
+    if let Some(meta) = resp
+        .get("usageMetadata")
+        .and_then(|v| v.as_object())
+        .or_else(|| {
+            resp.get("response")
+                .and_then(|v| v.get("usageMetadata"))
+                .and_then(|v| v.as_object())
+        })
+    {
         return Usage {
             input_tokens: meta.get("promptTokenCount").and_then(|v| v.as_u64()),
             output_tokens: meta.get("candidatesTokenCount").and_then(|v| v.as_u64()),
@@ -431,5 +448,24 @@ mod tests {
             extract_video_uri(&resp),
             Some("gs://bucket/video.mp4".to_string())
         );
+    }
+
+    #[test]
+    fn parse_usage_reads_nested_operation_response_usage() {
+        let resp = json!({
+            "response": {
+                "usageMetadata": {
+                    "promptTokenCount": 11,
+                    "candidatesTokenCount": 7,
+                    "thoughtsTokenCount": 3,
+                    "totalTokenCount": 21
+                }
+            }
+        });
+        let usage = parse_usage(&resp);
+        assert_eq!(usage.input_tokens, Some(11));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.thoughts_tokens, Some(3));
+        assert_eq!(usage.total_tokens, Some(21));
     }
 }

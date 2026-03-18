@@ -99,28 +99,25 @@ pub(crate) async fn handle_council(
             resolve_registry_model_id(Some(provider), Some(model), registry_cache.as_ref())
         })
         .collect();
-    // Resolve per-model and take the maximum so no model gets starved in mixed councils.
-    let max_output_tokens: Option<usize> = {
-        let mut best: Option<usize> = None;
-        for reg_id in &resolved_registry_ids {
-            if let Some(val) = resolve_max_output_tokens(
+    // Resolve per-model max_output_tokens so each model gets its own limit.
+    let per_model_max_output_tokens: Vec<Option<usize>> = resolved_registry_ids
+        .iter()
+        .map(|reg_id| {
+            resolve_max_output_tokens(
                 args.max_output_tokens,
                 config,
                 registry_cache.as_ref(),
                 reg_id.as_deref(),
-            ) {
-                best = Some(best.map_or(val, |b: usize| b.max(val)));
-            }
-        }
-        best
-    };
-    let output_tokens = max_output_tokens.unwrap_or(4096);
+            )
+        })
+        .collect();
 
     let mut per_model = Vec::new();
     let mut estimate_sum = 0.0;
     let mut estimate_complete = true;
     for (idx, (model, _provider)) in resolved_models.iter().enumerate() {
         let registry_id = &resolved_registry_ids[idx];
+        let output_tokens = per_model_max_output_tokens[idx].unwrap_or(4096);
         let estimate = registry::estimate_pricing(
             registry_cache.as_ref(),
             registry_id.as_deref().unwrap_or(model),
@@ -174,9 +171,10 @@ pub(crate) async fn handle_council(
     });
 
     if args.dry_run {
-        for (model, provider) in &resolved_models {
+        for (idx, (model, provider)) in resolved_models.iter().enumerate() {
             let registry_id =
                 resolve_registry_model_id(Some(provider), Some(model), registry_cache.as_ref());
+            let output_tokens = per_model_max_output_tokens[idx].unwrap_or(4096);
             results.push(CouncilModelResult {
                 model: model.clone(),
                 content: "(dry-run) no provider call executed".to_string(),
@@ -201,6 +199,7 @@ pub(crate) async fn handle_council(
             let semaphore = std::sync::Arc::clone(&semaphore);
             let temperature = args.temperature;
             let response_format = response_format.clone();
+            let model_max_output_tokens = per_model_max_output_tokens[idx];
             join_set.spawn(async move {
                 let _permit = semaphore.acquire_owned().await?;
                 let call = call_litellm(
@@ -209,7 +208,7 @@ pub(crate) async fn handle_council(
                     &model,
                     prompt.as_str(),
                     temperature,
-                    max_output_tokens,
+                    model_max_output_tokens,
                     response_format,
                     &[],
                     None,
@@ -239,6 +238,7 @@ pub(crate) async fn handle_council(
 
             let registry_id =
                 resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
+            let output_tokens = per_model_max_output_tokens[idx].unwrap_or(4096);
             let pricing = registry::estimate_pricing(
                 registry_cache.as_ref(),
                 registry_id.as_deref().unwrap_or(&model),

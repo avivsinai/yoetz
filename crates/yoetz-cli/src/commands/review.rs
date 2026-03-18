@@ -14,6 +14,8 @@ use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::session::{create_session_dir, write_json as write_json_file, write_text};
 use yoetz_core::types::{ArtifactPaths, Usage};
 
+const MAX_REVIEW_DIFF_TOKENS: usize = 50_000;
+
 pub(crate) async fn handle_review(
     ctx: &AppContext,
     args: ReviewArgs,
@@ -70,13 +72,29 @@ async fn handle_review_diff(
         registry_id.as_deref(),
     );
 
-    let diff = git_diff(args.staged, &args.paths)?;
+    let mut diff = git_diff(args.staged, &args.paths)?;
     if diff.trim().is_empty() {
         return Err(anyhow!("diff is empty"));
     }
 
+    let max_diff_bytes = args.max_diff_bytes;
+    if diff.len() > max_diff_bytes {
+        eprintln!(
+            "warning: diff is {} bytes, truncating to {max_diff_bytes} bytes",
+            diff.len()
+        );
+        // Truncate on a char boundary
+        let mut end = max_diff_bytes;
+        while end > 0 && !diff.is_char_boundary(end) {
+            end -= 1;
+        }
+        diff.truncate(end);
+        diff.push_str("\n\n... [diff truncated — exceeded --max-diff-bytes limit]");
+    }
+
     let review_prompt = build_review_diff_prompt(&diff, args.prompt.as_deref());
     let input_tokens = estimate_tokens(review_prompt.len());
+    ensure_review_diff_size(input_tokens)?;
     let output_tokens = max_output_tokens.unwrap_or(4096);
     let pricing = registry::estimate_pricing(
         registry_cache.as_ref(),
@@ -146,9 +164,11 @@ async fn handle_review_diff(
     if budget_enabled {
         if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
             if let Some(reservation) = budget_reservation {
-                let _ = reservation.commit(spend);
-            } else {
-                let _ = budget::record_spend_standalone(spend);
+                if let Err(e) = reservation.commit(spend) {
+                    eprintln!("warning: budget commit failed: {e}");
+                }
+            } else if let Err(e) = budget::record_spend_standalone(spend) {
+                eprintln!("warning: budget commit failed: {e}");
             }
         }
     }
@@ -180,6 +200,31 @@ async fn handle_review_diff(
             println!("{}", result.content);
             Ok(())
         }
+    }
+}
+
+fn ensure_review_diff_size(input_tokens: usize) -> Result<()> {
+    if input_tokens > MAX_REVIEW_DIFF_TOKENS {
+        return Err(anyhow!(
+            "diff too large for `yoetz review diff` (~{input_tokens} tokens > {MAX_REVIEW_DIFF_TOKENS}); narrow `--paths` or split the review into smaller chunks"
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn review_diff_guardrail_rejects_large_prompts() {
+        let err = ensure_review_diff_size(MAX_REVIEW_DIFF_TOKENS + 1).unwrap_err();
+        assert!(err.to_string().contains("diff too large"));
+    }
+
+    #[test]
+    fn review_diff_guardrail_allows_limit_boundary() {
+        ensure_review_diff_size(MAX_REVIEW_DIFF_TOKENS).unwrap();
     }
 }
 
@@ -308,9 +353,11 @@ async fn handle_review_file(
     if budget_enabled {
         if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
             if let Some(reservation) = budget_reservation {
-                let _ = reservation.commit(spend);
-            } else {
-                let _ = budget::record_spend_standalone(spend);
+                if let Err(e) = reservation.commit(spend) {
+                    eprintln!("warning: budget commit failed: {e}");
+                }
+            } else if let Err(e) = budget::record_spend_standalone(spend) {
+                eprintln!("warning: budget commit failed: {e}");
             }
         }
     }

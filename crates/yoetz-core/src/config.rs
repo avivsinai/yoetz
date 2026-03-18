@@ -63,29 +63,43 @@ impl Config {
     /// Load configuration with an optional profile overlay.
     pub fn load_with_profile(profile: Option<&str>) -> Result<Self> {
         let mut config = Config::default();
-        for path in default_config_paths(profile) {
+        for (path, trusted) in default_config_paths(profile) {
             if path.exists() {
                 let file = load_config_file(&path)?;
-                config.merge(file);
+                config.merge(file, trusted, &path);
             }
         }
         Ok(config)
     }
 
-    fn merge(&mut self, other: ConfigFile) {
+    fn merge(&mut self, other: ConfigFile, trusted: bool, source: &Path) {
         if let Some(defaults) = other.defaults {
             merge_defaults(&mut self.defaults, defaults);
         }
         if let Some(providers) = other.providers {
-            for (k, v) in providers {
-                self.providers
-                    .entry(k)
-                    .and_modify(|existing| merge_provider(existing, &v))
-                    .or_insert(v);
+            if trusted {
+                for (k, v) in providers {
+                    self.providers
+                        .entry(k)
+                        .and_modify(|existing| merge_provider(existing, &v))
+                        .or_insert(v);
+                }
+            } else {
+                eprintln!(
+                    "warning: ignoring [providers] from untrusted config {}",
+                    source.display()
+                );
             }
         }
         if let Some(registry) = other.registry {
-            merge_registry(&mut self.registry, registry);
+            if trusted {
+                merge_registry(&mut self.registry, registry);
+            } else {
+                eprintln!(
+                    "warning: ignoring [registry] from untrusted config {}",
+                    source.display()
+                );
+            }
         }
         if let Some(aliases) = other.aliases {
             self.aliases.extend(aliases);
@@ -101,38 +115,47 @@ fn load_config_file(path: &Path) -> Result<ConfigFile> {
     Ok(parsed)
 }
 
-fn default_config_paths(profile: Option<&str>) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
+/// Returns `(path, trusted)` pairs. Paths under the user's home config dirs and
+/// `YOETZ_CONFIG_PATH` are trusted; CWD-relative paths (repo-local) are untrusted.
+fn default_config_paths(profile: Option<&str>) -> Vec<(PathBuf, bool)> {
+    let mut paths: Vec<(PathBuf, bool)> = Vec::new();
 
     if let Some(home) = home_dir() {
-        paths.push(home.join(".yoetz/config.toml"));
-        paths.push(home.join(".config/yoetz/config.toml"));
+        paths.push((home.join(".yoetz/config.toml"), true));
+        paths.push((home.join(".config/yoetz/config.toml"), true));
     }
     if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        paths.push(PathBuf::from(xdg).join("yoetz/config.toml"));
+        paths.push((PathBuf::from(xdg).join("yoetz/config.toml"), true));
     }
-    paths.push(PathBuf::from("./yoetz.toml"));
+    // Repo-local config — untrusted (may come from a cloned repo)
+    paths.push((PathBuf::from("./yoetz.toml"), false));
 
     if let Ok(custom) = env::var("YOETZ_CONFIG_PATH") {
-        paths.push(PathBuf::from(custom));
+        paths.push((PathBuf::from(custom), true));
     }
 
     if let Some(name) = profile {
         if let Some(home) = home_dir() {
-            paths.push(home.join(".yoetz/profiles").join(format!("{name}.toml")));
-            paths.push(
+            paths.push((
+                home.join(".yoetz/profiles").join(format!("{name}.toml")),
+                true,
+            ));
+            paths.push((
                 home.join(".config/yoetz/profiles")
                     .join(format!("{name}.toml")),
-            );
+                true,
+            ));
         }
         if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-            paths.push(
+            paths.push((
                 PathBuf::from(xdg)
                     .join("yoetz/profiles")
                     .join(format!("{name}.toml")),
-            );
+                true,
+            ));
         }
-        paths.push(PathBuf::from(format!("./yoetz.{name}.toml")));
+        // Repo-local profile config — untrusted
+        paths.push((PathBuf::from(format!("./yoetz.{name}.toml")), false));
     }
     paths
 }
@@ -194,6 +217,71 @@ model = "gpt-5-4-pro"
         };
         merge_defaults(&mut target, other);
         assert_eq!(target.browser_cdp.as_deref(), Some("http://127.0.0.1:9222"));
+    }
+
+    #[test]
+    fn untrusted_config_skips_providers_and_registry() {
+        let mut config = Config::default();
+        let file = ConfigFile {
+            defaults: Some(Defaults {
+                model: Some("gpt-5-4-pro".to_string()),
+                ..Default::default()
+            }),
+            providers: Some(HashMap::from([(
+                "evil".to_string(),
+                ProviderConfig {
+                    base_url: Some("http://evil.example.com".to_string()),
+                    api_key_env: Some("EVIL_KEY".to_string()),
+                    kind: None,
+                },
+            )])),
+            registry: Some(RegistryConfig {
+                openrouter_models_url: Some("http://evil.example.com/models".to_string()),
+                ..Default::default()
+            }),
+            aliases: Some(HashMap::from([(
+                "fast".to_string(),
+                "gpt-5-4-pro".to_string(),
+            )])),
+        };
+        config.merge(file, false, Path::new("./yoetz.toml"));
+        // Safe fields applied
+        assert_eq!(config.defaults.model.as_deref(), Some("gpt-5-4-pro"));
+        assert_eq!(
+            config.aliases.get("fast").map(|s| s.as_str()),
+            Some("gpt-5-4-pro")
+        );
+        // Restricted fields skipped
+        assert!(config.providers.is_empty());
+        assert!(config.registry.openrouter_models_url.is_none());
+    }
+
+    #[test]
+    fn trusted_config_applies_providers_and_registry() {
+        let mut config = Config::default();
+        let file = ConfigFile {
+            defaults: None,
+            providers: Some(HashMap::from([(
+                "openai".to_string(),
+                ProviderConfig {
+                    base_url: Some("https://api.openai.com".to_string()),
+                    api_key_env: Some("OPENAI_API_KEY".to_string()),
+                    kind: None,
+                },
+            )])),
+            registry: Some(RegistryConfig {
+                openrouter_models_url: Some("https://openrouter.ai/api/v1/models".to_string()),
+                ..Default::default()
+            }),
+            aliases: None,
+        };
+        config.merge(
+            file,
+            true,
+            Path::new("/home/user/.config/yoetz/config.toml"),
+        );
+        assert!(config.providers.contains_key("openai"));
+        assert!(config.registry.openrouter_models_url.is_some());
     }
 }
 
