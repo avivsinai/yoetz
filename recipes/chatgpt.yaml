@@ -3,7 +3,7 @@ name: chatgpt
 # Falls back to cookie sync if no live browser session is available.
 #
 # Variables:
-#   model    — model slug or display name (e.g., "gpt-5-4-pro" or "Pro 5.4"). Omit to keep current.
+#   model    — model slug (e.g., "gpt-5-4-pro"). Omit to keep current.
 #   extended — set to "false" to disable Extended Pro. Default: leave as-is.
 #   prompt   — prompt text to send with the attachment.
 
@@ -13,121 +13,90 @@ defaults:
   extended: ""
 
 steps:
-  # Open ChatGPT
-  - action: open
-    args: ["https://chatgpt.com/"]
-  - action: wait
-    args: ["--load", "domcontentloaded"]
-  - sleep_ms: 2000
+  # Navigate to ChatGPT. Use eval instead of open because open delegates
+  # to system tools which creates a tab outside agent-browser's control.
+  # eval navigates the active tab directly, keeping session context correct.
+  - action: eval
+    args:
+      - "window.location.href = 'https://chatgpt.com/'"
+  - sleep_ms: 4000
 
-  # Select model if --var model is provided. Accepts slug (gpt-5-4-pro) or
-  # display name ("Pro 5.4"). Known slugs are normalized to display names.
+  # Select model if --var model is provided.
   - action: eval
     args:
       - |
         (() => {
           const raw = "{{model}}";
           if (!raw) return "skipped: no model specified";
-          const btn = document.querySelector('button[aria-label*="Model selector"]');
+          const btn = document.querySelector('[data-testid="model-switcher-dropdown-button"], button[aria-label*="Model selector"]');
           if (!btn) throw new Error("model selector button not found");
           btn.click();
           return "opened model selector";
         })()
-  - sleep_ms: 800
+  - sleep_ms: 1200
   - action: eval
     args:
       - |
         (() => {
           const raw = "{{model}}";
           if (!raw) return "skipped: no model specified";
-          const slugs = {
-            "gpt-5-4-pro": "Pro 5.4",
-            "gpt-4o": "4o",
-            "o3": "o3",
-            "o4-mini": "o4-mini",
-            "o4-mini-high": "o4-mini-high",
-          };
-          const display = slugs[raw.toLowerCase()] || raw;
-          const items = Array.from(document.querySelectorAll(
-            '[role="menuitem"], [role="option"], [data-testid*="model"]'
-          ));
-          const match = items.find(el =>
-            (el.textContent || "").trim().includes(display)
-          );
-          if (!match) throw new Error("model '" + display + "' not found in selector");
-          match.click();
-          return "selected model: " + display;
+          const slug = raw.toLowerCase();
+          const byTestId = document.querySelector('[data-testid="model-switcher-' + slug + '"]');
+          if (byTestId) { byTestId.click(); return "selected: " + slug; }
+          const names = {"gpt-5-4-pro":"pro","gpt-5-4-thinking":"thinking","gpt-5-3":"instant","pro":"pro","thinking":"thinking","instant":"instant"};
+          const target = names[slug] || slug;
+          const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
+          const match = items.find(el => (el.textContent||"").trim().toLowerCase().includes(target));
+          if (match) { match.click(); return "selected: " + target; }
+          throw new Error("model '" + slug + "' not found");
         })()
   - sleep_ms: 500
 
   # Disable Extended Pro only when explicitly requested (--var extended=false).
-  # Default: leave Extended Pro as-is.
   - action: eval
     args:
       - |
         (() => {
           const extended = "{{extended}}";
           if (extended !== "false") return "skipped: extended not disabled";
-          const btn = document.querySelector(
-            'button[aria-label*="click to remove"][aria-label*="Extended"]'
-          );
+          const btn = document.querySelector('button[aria-label*="click to remove"][aria-label*="Extended"]');
           if (btn) { btn.click(); return "disabled Extended Pro"; }
           return "Extended Pro already off";
         })()
   - sleep_ms: 500
 
-  # Prime the visible attachment flow before targeting the underlying file input.
-  # ChatGPT removed the <label> element; the button now uses aria-label only.
-  # Use the stable data-testid / id selector instead of `find label`.
-  - action: click
-    args: ["#composer-plus-btn"]
+  # Clear the textarea before injecting content. Prevents accumulation
+  # across runs when auto-connect reuses the same tab.
+  - action: eval
+    args:
+      - 'document.querySelector("#prompt-textarea").innerHTML = ""; "cleared"'
+
+  # Inject bundle content + prompt. Uses fill (handles escaping of arbitrary
+  # text) followed by eval to dispatch InputEvent (triggers React state) and
+  # click send. agent-browser fill alone doesn't trigger React on contenteditable.
+  - action: fill
+    args: ["#prompt-textarea", "{{bundle_text}}\n\n{{prompt}}"]
   - sleep_ms: 500
 
-  # Attach the bundle as a file (handles large codebases that exceed paste limits)
-  - action: upload
-    args: ["input[type=file]:not([id])", "{{bundle_path}}"]
+  # Trigger React state update and send. eval click works where native
+  # agent-browser click does not (React event handler binding).
   - action: eval
     args:
       - |
         (() => {
-          const input = document.querySelector('input[type="file"]:not([id])');
-          if (!input) {
-            throw new Error("upload input not found");
-          }
-          input.dispatchEvent(new Event("change", { bubbles: true }));
-          return input.files?.[0]?.name ?? null;
-        })()
-  - sleep_ms: 3000
-  - action: eval
-    args:
-      - |
-        (() => {
-          const alerts = Array.from(
-            document.querySelectorAll('[role="alert"], [aria-live]')
-          )
-            .map((el) => (el.textContent || "").trim())
-            .filter(Boolean);
-          const uploadError = alerts.find((text) =>
-            /unable to upload/i.test(text)
-          );
-          if (uploadError) {
-            throw new Error(uploadError);
-          }
-          return alerts;
+          const el = document.querySelector("#prompt-textarea");
+          el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+          const btn = document.querySelector("button[data-testid='send-button']");
+          if (!btn) throw new Error("send button not found");
+          if (btn.disabled) throw new Error("send button disabled — text may not have been injected");
+          btn.click();
+          return "sent";
         })()
 
-  # Add a short prompt referencing the attachment
-  - action: type
-    args: ["#prompt-textarea", "{{prompt}}"]
-  - sleep_ms: 500
-
-  # Send the message. Click the send button instead of pressing Enter, which
-  # can be interpreted as a newline when a file is attached.
-  - action: click
-    args: ['button[aria-label="Send prompt"]']
-
-  # Wait for ChatGPT to finish generating (2 minutes for large bundles)
-  - sleep_ms: 120000
+  # Wait for ChatGPT to finish generating. Poll-based wait is blocked by
+  # agent-browser's 30s IPC ceiling (EAGAIN above ~30s). Using fixed sleep
+  # until the transport supports long waits. See issue #52.
+  - sleep_ms: 180000
 
   # Capture final state
   - action: snapshot
