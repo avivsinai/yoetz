@@ -69,7 +69,13 @@ steps:
   # across runs when auto-connect reuses the same tab.
   - action: eval
     args:
-      - 'document.querySelector("#prompt-textarea").innerHTML = ""; "cleared"'
+      - |
+        (() => {
+          const el = document.querySelector("#prompt-textarea");
+          el.innerHTML = "";
+          el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+          return "cleared";
+        })()
 
   # Inject bundle content + prompt. Uses fill (handles escaping of arbitrary
   # text) followed by eval to dispatch InputEvent (triggers React state) and

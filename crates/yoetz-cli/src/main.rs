@@ -993,9 +993,9 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     .to_string_lossy()
                     .to_lowercase()
                     .contains("chatgpt");
-            // Try to resolve the best browser connection (CDP > auto_connect > cookie > profile).
-            // Use the lite auto-connect check for recipes — it verifies Chrome is reachable
-            // without opening new tabs, since the recipe itself handles navigation.
+            // Try CDP or auto-connect for a live browser connection. Falls back to
+            // cookie/profile if neither is available. Uses the lite auto-connect check
+            // for recipes — verifies Chrome is reachable without opening new tabs.
             let live_connection = if needs_auth {
                 if let Some(endpoint) =
                     browser::resolve_cdp_endpoint(recipe_args.cdp.as_deref(), &ctx.config)
