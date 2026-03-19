@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.19] - 2026-03-19
+
+### Bug Fixes
+
+- **browser**: Fix ChatGPT Pro auto-connect integration e2e (#61)
+
+### Miscellaneous
+
+- **deps**: Bump the minor-and-patch group across 1 directory with 2 updates (#58)
+- **deps**: Bump jsonschema from 0.44.1 to 0.45.0 (#51)
+- **deps**: Bump actions/setup-node from 4 to 6 in the actions group (#49)
+
 ## [0.2.18] - 2026-03-18
 
 ### Bug Fixes
