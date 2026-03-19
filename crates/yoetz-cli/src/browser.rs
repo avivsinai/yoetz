@@ -55,6 +55,7 @@ pub struct RecipeStep {
     pub action: Option<String>,
     pub args: Option<Vec<String>>,
     pub sleep_ms: Option<u64>,
+    pub timeout_ms: Option<u64>,
 }
 
 pub struct RecipeContext {
@@ -196,13 +197,9 @@ fn build_agent_browser_args(
             }
         }
         Some(BrowserConnection::AutoConnect) => {
-            if !args
-                .iter()
-                .any(|a| a == "--session" || a.starts_with("--session="))
-            {
-                args.insert(0, CDP_SESSION_NAME.to_string());
-                args.insert(0, "--session".to_string());
-            }
+            // For auto-connect, do NOT add --session. A managed session creates
+            // an isolated context that can't see the real Chrome tabs/DOM.
+            // Auto-connect should attach to the real browser directly.
             if !args.iter().any(|a| a == "--auto-connect") {
                 args.insert(0, "--auto-connect".to_string());
             }
@@ -260,11 +257,26 @@ fn run_agent_browser_with_connection(
     use_stealth: bool,
     headed: bool,
 ) -> Result<String> {
+    run_agent_browser_with_connection_timeout(args, format, connection, use_stealth, headed, None)
+}
+
+fn run_agent_browser_with_connection_timeout(
+    args: Vec<String>,
+    format: OutputFormat,
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+    timeout_ms: Option<u64>,
+) -> Result<String> {
     let (bin, prefix_args) = resolve_agent_browser()?;
     let mut cmd = Command::new(&bin);
     let final_args = build_agent_browser_args(args, format, connection, use_stealth, headed);
     let mut all_args = prefix_args;
     all_args.extend(final_args);
+
+    if let Some(timeout) = timeout_ms {
+        cmd.env("AGENT_BROWSER_DEFAULT_TIMEOUT", timeout.to_string());
+    }
 
     let output = cmd
         .args(&all_args)
@@ -384,12 +396,13 @@ fn run_recipe_with_connection(
         let commands = expand_step(action, step.args.as_deref(), &ctx)?;
 
         for args in commands {
-            let stdout = match run_agent_browser_with_connection(
+            let stdout = match run_agent_browser_with_connection_timeout(
                 args.clone(),
                 format,
                 connection,
                 ctx.use_stealth,
                 headed,
+                step.timeout_ms,
             ) {
                 Ok(stdout) => stdout,
                 Err(err) => {
@@ -413,12 +426,13 @@ fn run_recipe_with_connection(
                         snapshot.as_deref(),
                     )? {
                         headed = true;
-                        run_agent_browser_with_connection(
+                        run_agent_browser_with_connection_timeout(
                             args.clone(),
                             format,
                             connection,
                             ctx.use_stealth,
                             headed,
+                            step.timeout_ms,
                         )?
                     } else {
                         return Err(err.context(format!("recipe step {idx} ({action}) failed")));
@@ -902,6 +916,21 @@ pub fn try_auto_connect(target_url: &str) -> Result<()> {
     verify_auth_cdp(target_url, &connection)
 }
 
+/// Lightweight auto-connect check: verifies Chrome is reachable via
+/// auto-connect without opening new tabs. Used by the recipe path where
+/// the recipe itself handles navigation and auth detection.
+pub fn try_auto_connect_lite() -> Result<()> {
+    let connection = BrowserConnection::AutoConnect;
+    run_agent_browser_with_connection(
+        vec!["snapshot".to_string(), "-c".to_string()],
+        OutputFormat::Text,
+        Some(&connection),
+        /* use_stealth */ false,
+        /* headed */ false,
+    )?;
+    Ok(())
+}
+
 pub fn verify_auth_cdp(target_url: &str, connection: &BrowserConnection) -> Result<()> {
     if !connection.is_live_attach() {
         return Err(anyhow!(
@@ -1213,13 +1242,20 @@ fn expand_bundle_text_step(
             return Err(anyhow!("{action} step requires selector and text"));
         }
         let selector = interpolate(&args[0], ctx, None)?;
+        // Interpolate the full template (replaces {{bundle_text}}, {{prompt}}, etc.)
+        // then chunk the result. This ensures recipe vars like {{prompt}} aren't lost.
+        let full_text = interpolate(&args[1], ctx, Some(text))?;
+        let full_chunks = chunk_text(&full_text, CHUNK_BYTES);
+        if full_chunks.is_empty() {
+            return Ok(Vec::new());
+        }
         let mut commands = Vec::new();
         commands.push(vec![
             action.to_string(),
             selector.clone(),
-            chunks[0].clone(),
+            full_chunks[0].clone(),
         ]);
-        for chunk in chunks.iter().skip(1) {
+        for chunk in full_chunks.iter().skip(1) {
             commands.push(vec!["type".to_string(), selector.clone(), chunk.clone()]);
         }
         return Ok(commands);
@@ -1516,6 +1552,26 @@ mod tests {
     }
 
     #[test]
+    fn expand_fill_step_includes_prompt_with_bundle_text() {
+        let mut ctx = recipe_context();
+        ctx.vars
+            .insert("prompt".to_string(), "What does this do?".to_string());
+        let args = vec![
+            "#prompt-textarea".to_string(),
+            "{{bundle_text}}\n\n{{prompt}}".to_string(),
+        ];
+        let commands =
+            expand_bundle_text_step("fill", &args, ctx.bundle_text.as_deref().unwrap(), &ctx)
+                .unwrap();
+        assert_eq!(commands.len(), 1);
+        assert_eq!(commands[0][0], "fill");
+        assert_eq!(commands[0][1], "#prompt-textarea");
+        // Must contain both bundle text AND the prompt
+        assert!(commands[0][2].contains("hello world")); // bundle_text
+        assert!(commands[0][2].contains("What does this do?")); // {{prompt}}
+    }
+
+    #[test]
     fn interpolate_does_not_expand_recipe_vars_inside_bundle_text() {
         let ctx = recipe_context();
         let result = interpolate("{{bundle_text}}", &ctx, Some("literal {{model}}")).unwrap();
@@ -1542,7 +1598,7 @@ mod tests {
     }
 
     #[test]
-    fn build_agent_browser_args_adds_auto_connect_session_flags() {
+    fn build_agent_browser_args_omits_auto_connect_session_flags() {
         let args = build_agent_browser_args(
             vec!["open".to_string(), CHATGPT_URL.to_string()],
             OutputFormat::Text,
@@ -1551,8 +1607,8 @@ mod tests {
             /* headed */ false,
         );
         assert!(args.iter().any(|arg| arg == "--auto-connect"));
-        assert!(args.iter().any(|arg| arg == "--session"));
-        assert!(args.iter().any(|arg| arg == CDP_SESSION_NAME));
+        assert!(!args.iter().any(|arg| arg == "--session"));
+        assert!(!args.iter().any(|arg| arg == CDP_SESSION_NAME));
     }
 
     #[test]
@@ -1785,6 +1841,21 @@ steps:
         )
         .unwrap_err();
         assert!(step_err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn recipe_step_parses_timeout_ms() {
+        let recipe = serde_yaml::from_str::<Recipe>(
+            r#"
+name: test
+steps:
+  - action: wait
+    args: ["--fn", "document.querySelector('#done')"]
+    timeout_ms: 180000
+"#,
+        )
+        .unwrap();
+        assert_eq!(recipe.steps[0].timeout_ms, Some(180000));
     }
 
     #[test]

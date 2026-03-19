@@ -993,24 +993,26 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     .to_string_lossy()
                     .to_lowercase()
                     .contains("chatgpt");
-            // Try to resolve the best browser connection (CDP > auto_connect > cookie > profile).
-            // This reuses the same resolution logic as `check` and `attach`.
+            // Try CDP or auto-connect for a live browser connection. Falls back to
+            // cookie/profile if neither is available. Uses the lite auto-connect check
+            // for recipes — verifies Chrome is reachable without opening new tabs.
             let live_connection = if needs_auth {
-                match browser::resolve_browser_connection(
-                    &ctx.config,
-                    recipe_args.cdp.as_deref(),
-                    &profile_dir,
-                    browser::CHATGPT_URL,
-                ) {
-                    Ok(c) if c.is_live_attach() => Some(c),
-                    Ok(_) => None, // non-live connection; fall through to legacy path
-                    Err(e) => {
-                        if recipe_args.cdp.is_some() {
-                            return Err(e.context("explicit --cdp failed; not falling back"));
+                if let Some(endpoint) =
+                    browser::resolve_cdp_endpoint(recipe_args.cdp.as_deref(), &ctx.config)
+                {
+                    match browser::try_cdp_attach(&endpoint, browser::CHATGPT_URL) {
+                        Ok(()) => Some(browser::BrowserConnection::Cdp { endpoint }),
+                        Err(e) => {
+                            if recipe_args.cdp.is_some() {
+                                return Err(e.context("explicit --cdp failed; not falling back"));
+                            }
+                            None
                         }
-                        eprintln!("live-attach unavailable, falling back to cookie/profile: {e}");
-                        None
                     }
+                } else if browser::try_auto_connect_lite().is_ok() {
+                    Some(browser::BrowserConnection::AutoConnect)
+                } else {
+                    None
                 }
             } else {
                 None
