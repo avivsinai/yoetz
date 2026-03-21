@@ -63,6 +63,10 @@ struct Cli {
     #[arg(long, global = true, default_value = "60")]
     timeout_secs: u64,
 
+    /// Allow unrecognized model IDs (for self-hosted models not in the registry)
+    #[arg(long, global = true)]
+    allow_unknown: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -74,6 +78,7 @@ struct AppContext {
     output_final: Option<PathBuf>,
     output_schema: Option<PathBuf>,
     debug: bool,
+    allow_unknown: bool,
 }
 
 #[derive(Subcommand)]
@@ -547,6 +552,8 @@ enum ModelsCommand {
     Sync,
     /// Fuzzy-resolve a model ID query against the registry
     Resolve(ModelsResolveArgs),
+    /// Show the frontier model per major provider family
+    Frontier(ModelsFrontierArgs),
 }
 
 #[derive(Args)]
@@ -568,6 +575,17 @@ struct ModelsResolveArgs {
     /// Maximum number of results to return
     #[arg(long, short = 'n', default_value = "5")]
     max_results: usize,
+}
+
+#[derive(Args)]
+struct ModelsFrontierArgs {
+    /// Filter to a specific provider family (e.g. "openai", "anthropic")
+    #[arg(long)]
+    family: Option<String>,
+
+    /// Show all provider families (default: major frontier labs only)
+    #[arg(long)]
+    all: bool,
 }
 
 #[derive(Args)]
@@ -706,6 +724,7 @@ async fn main() -> Result<()> {
         output_final: cli.output_final,
         output_schema: cli.output_schema,
         debug: cli.debug,
+        allow_unknown: cli.allow_unknown,
     };
 
     match cli.command {
@@ -1592,6 +1611,7 @@ mod tests {
             pricing: Default::default(),
             provider: None,
             capability: None,
+            tier: None,
         });
         registry.rebuild_index();
         // Should cap at 16384
@@ -1617,6 +1637,7 @@ mod tests {
             pricing: Default::default(),
             provider: None,
             capability: None,
+            tier: None,
         });
         registry.rebuild_index();
         // Model max (4096) is less than cap (16384), so use model max
@@ -1651,6 +1672,7 @@ mod tests {
             pricing: Default::default(),
             provider: Some("openrouter".to_string()),
             capability: None,
+            tier: None,
         });
         registry.rebuild_index();
         let result = build_model_spec(None, "x-ai/grok-4", Some(&registry)).unwrap();
@@ -1680,6 +1702,7 @@ mod tests {
             pricing: Default::default(),
             provider: Some("gemini".to_string()),
             capability: None,
+            tier: None,
         });
         registry.rebuild_index();
         // Model with non-openrouter provider should NOT be auto-prefixed
@@ -1698,6 +1721,7 @@ mod tests {
             pricing: Default::default(),
             provider: Some("openrouter".to_string()),
             capability: None,
+            tier: None,
         });
         registry.rebuild_index();
         // Model without slash should NOT be auto-prefixed even if in registry
@@ -1725,11 +1749,17 @@ mod tests {
     }
 }
 
-/// Validate a model ID against the registry, returning an error with suggestions
-/// if the model is not found but close matches exist.
+/// Validate a model ID against the registry.
+///
+/// - Exact match: pass.
+/// - Fuzzy matches: error with "Did you mean?" suggestions.
+/// - No matches at all: error with sync hint.
+///
+/// When `allow_unknown` is true, unknown models pass silently (for self-hosted models).
 pub(crate) fn validate_model_or_suggest(
     model_id: &str,
     registry: Option<&yoetz_core::registry::ModelRegistry>,
+    allow_unknown: bool,
 ) -> Result<()> {
     let Some(registry) = registry else {
         return Ok(());
@@ -1741,8 +1771,15 @@ pub(crate) fn validate_model_or_suggest(
     // Try fuzzy search
     let matches = fuzzy::fuzzy_search(registry, model_id, 3);
     if matches.is_empty() {
-        // No matches at all — don't block; the model might just not be synced
-        return Ok(());
+        if allow_unknown {
+            return Ok(());
+        }
+        return Err(anyhow!(
+            "model '{}' not found in registry.\n\
+             Hint: run `yoetz models sync` to update the registry, \
+             or use --allow-unknown for self-hosted models.",
+            model_id,
+        ));
     }
     let suggestions: Vec<String> = matches.iter().map(|m| m.id.clone()).collect();
     Err(anyhow!(

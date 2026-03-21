@@ -47,20 +47,23 @@ Prefer Homebrew when available — pre-built binaries, fastest install.
 - Set `YOETZ_AGENT=1` environment variable
 - Parse JSON results and present summary to user
 - For large bundles, run `yoetz bundle` first to inspect size
-- Always resolve uncertain model IDs with `yoetz models resolve` before calling
+- **NEVER type a model ID from memory.** Your training data model names are WRONG. Always resolve first.
 
-## Model Discovery
+## Model Resolution Protocol (MANDATORY)
 
-Before using an unfamiliar model ID, resolve it against the synced registry:
+**NEVER type a model ID from memory.** Agent training data contains stale model names. Always query the live registry.
 
+**To find the current frontier model per provider:**
 ```bash
-yoetz models resolve "grok-4" --format json
+yoetz models frontier --format json
 ```
 
-Example output:
-```json
-[{"id":"x-ai/grok-4","score":800,"provider":"openrouter","context_length":131072,"max_output_tokens":16384}]
+**To find a specific model:**
+```bash
+yoetz models resolve "grok" --format json
 ```
+
+**Use the returned ID verbatim in your commands.** Do not modify, shorten, or guess model IDs.
 
 If the registry is stale or empty, sync first:
 ```bash
@@ -76,18 +79,22 @@ yoetz models list -s claude --format json
 
 | Task | Command |
 |------|---------|
-| Ask single model | `yoetz ask -p "question" -f src/*.rs --provider openai --model gpt-5.4 --format json` |
-| Council vote | `yoetz council -p "question" --models openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4.20-multi-agent-beta --format json` |
+| Find frontier model per provider | `yoetz models frontier --format json` |
+| Find frontier model for a provider | `yoetz models frontier --family openai --format json` |
+| Resolve a model ID | `yoetz models resolve "grok" --format json` |
+| Search models | `yoetz models list -s claude --format json` |
+| Ask single model | `yoetz ask -p "question" -f src/*.rs --provider openai --model MODEL_ID --format json` |
+| Council vote | `yoetz council -p "question" --models MODEL1,MODEL2,MODEL3 --format json` |
 | Review staged diff | `yoetz review diff --staged --format json` |
 | Review file | `yoetz review file --path src/main.rs --format json` |
 | Bundle files | `yoetz bundle -p "context" -f src/**/*.rs --format json` |
-| Generate image | `yoetz generate image -p "description" --provider openai --model gpt-5-image --format json` |
-| Resolve model ID | `yoetz models resolve "grok-4" --format json` |
-| Search models | `yoetz models list -s claude --format json` |
-| Estimate cost | `yoetz pricing estimate --model gpt-5.4 --input-tokens 1000 --output-tokens 500` |
+| Generate image | `yoetz generate image -p "description" --provider openai --model MODEL_ID --format json` |
+| Estimate cost | `yoetz pricing estimate --model MODEL_ID --input-tokens 1000 --output-tokens 500` |
 | Browser login | `yoetz browser login` |
 | Browser check | `yoetz browser check` |
 | Browser cookie sync | `yoetz browser sync-cookies` |
+
+**Replace MODEL_ID with IDs from `yoetz models frontier` or `yoetz models resolve`.**
 
 ## Council (Multi-Model Consensus)
 

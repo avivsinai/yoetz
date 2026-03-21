@@ -89,7 +89,7 @@ pub(crate) async fn handle_council(
         let reg_id =
             resolve_registry_model_id(Some(_provider), Some(model), registry_cache.as_ref());
         if let Some(ref id) = reg_id {
-            crate::validate_model_or_suggest(id, registry_cache.as_ref())?;
+            crate::validate_model_or_suggest(id, registry_cache.as_ref(), ctx.allow_unknown)?;
         }
     }
     // Resolve registry IDs up front so we can derive model-aware max_output_tokens
