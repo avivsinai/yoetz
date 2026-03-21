@@ -1,5 +1,5 @@
 use serde::Serialize;
-use yoetz_core::registry::ModelRegistry;
+use yoetz_core::registry::{ModelRegistry, ModelTier};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FuzzyMatch {
@@ -11,6 +11,8 @@ pub struct FuzzyMatch {
     pub context_length: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_output_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tier: Option<ModelTier>,
 }
 
 /// Search the registry for models matching `query`, returning up to `max_results`
@@ -28,6 +30,7 @@ pub fn fuzzy_search(registry: &ModelRegistry, query: &str, max_results: usize) -
                     provider: entry.provider.clone(),
                     context_length: entry.context_length,
                     max_output_tokens: entry.max_output_tokens,
+                    tier: entry.tier,
                 })
             } else {
                 None

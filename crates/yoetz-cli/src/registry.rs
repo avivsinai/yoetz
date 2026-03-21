@@ -217,6 +217,7 @@ fn embedded_gemini_registry() -> Result<ModelRegistry> {
             },
             provider: pricing.provider.clone(),
             capability: None,
+            tier: None,
         });
     }
     registry.rebuild_index();
@@ -325,6 +326,7 @@ fn parse_openrouter_models(value: &Value) -> ModelRegistry {
             pricing,
             provider: Some("openrouter".to_string()),
             capability,
+            tier: None,
         });
     }
 
@@ -384,6 +386,7 @@ fn parse_litellm_models(value: &Value) -> ModelRegistry {
             },
             provider: Some("litellm".to_string()),
             capability: None,
+            tier: None,
         });
     }
 

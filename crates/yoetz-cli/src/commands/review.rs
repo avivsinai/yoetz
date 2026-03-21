@@ -63,7 +63,7 @@ async fn handle_review_diff(
     let registry_id =
         resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
     if let Some(ref reg_id) = registry_id {
-        crate::validate_model_or_suggest(reg_id, registry_cache.as_ref())?;
+        crate::validate_model_or_suggest(reg_id, registry_cache.as_ref(), ctx.allow_unknown)?;
     }
     let max_output_tokens = resolve_max_output_tokens(
         args.max_output_tokens,
@@ -264,7 +264,7 @@ async fn handle_review_file(
     let registry_id =
         resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
     if let Some(ref reg_id) = registry_id {
-        crate::validate_model_or_suggest(reg_id, registry_cache.as_ref())?;
+        crate::validate_model_or_suggest(reg_id, registry_cache.as_ref(), ctx.allow_unknown)?;
     }
     let max_output_tokens = resolve_max_output_tokens(
         args.max_output_tokens,

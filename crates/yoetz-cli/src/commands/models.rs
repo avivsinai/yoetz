@@ -3,8 +3,8 @@ use std::collections::HashMap;
 
 use crate::fuzzy;
 use crate::{
-    maybe_write_output, registry, AppContext, ModelsArgs, ModelsCommand, ModelsListArgs,
-    ModelsResolveArgs,
+    maybe_write_output, registry, AppContext, ModelsArgs, ModelsCommand, ModelsFrontierArgs,
+    ModelsListArgs, ModelsResolveArgs,
 };
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::registry::ModelRegistry;
@@ -18,7 +18,8 @@ pub(crate) async fn handle_models(
         ModelsCommand::List(list_args) => {
             let registry = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
                 .await?
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .with_inferred_tiers();
             let filtered = filter_registry(&registry, &list_args);
             maybe_write_output(ctx, &filtered)?;
             match format {
@@ -27,7 +28,12 @@ pub(crate) async fn handle_models(
                 OutputFormat::Text | OutputFormat::Markdown => {
                     for model in &filtered.models {
                         let provider = model.provider.as_deref().unwrap_or("-");
-                        println!("{:<14}{}", provider, model.id);
+                        let tier_str = model.tier.map(|t| t.to_string()).unwrap_or_default();
+                        if tier_str.is_empty() {
+                            println!("{:<14}{}", provider, model.id);
+                        } else {
+                            println!("{:<14}{:<43}{}", provider, model.id, tier_str);
+                        }
                     }
                     Ok(())
                 }
@@ -62,6 +68,7 @@ pub(crate) async fn handle_models(
             }
         }
         ModelsCommand::Resolve(resolve_args) => handle_resolve(ctx, resolve_args, format).await,
+        ModelsCommand::Frontier(frontier_args) => handle_frontier(ctx, frontier_args, format).await,
     }
 }
 
@@ -72,7 +79,8 @@ async fn handle_resolve(
 ) -> Result<()> {
     let registry = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
         .await?
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .with_inferred_tiers();
     let results = fuzzy::fuzzy_search(&registry, &args.query, args.max_results);
     maybe_write_output(ctx, &results)?;
     match format {
@@ -84,11 +92,114 @@ async fn handle_resolve(
             } else {
                 for m in &results {
                     let provider = m.provider.as_deref().unwrap_or("-");
-                    println!("{:<14}{:<40} (score: {})", provider, m.id, m.score);
+                    let tier_str = m.tier.map(|t| format!("  {t}")).unwrap_or_default();
+                    println!(
+                        "{:<14}{:<40} (score: {}){tier_str}",
+                        provider, m.id, m.score,
+                    );
                 }
             }
             Ok(())
         }
+    }
+}
+
+/// Major frontier lab families, in display order.
+/// Last reviewed: 2026-03-20. Update when a new frontier lab emerges.
+const MAJOR_FAMILIES: &[&str] = &[
+    "openai",
+    "anthropic",
+    "google",
+    "x-ai",
+    "meta-llama",
+    "deepseek",
+    "mistralai",
+    "qwen",
+    "moonshotai",
+];
+
+const FAMILY_ALIASES: &[(&str, &str)] = &[
+    ("xai", "x-ai"),
+    ("meta", "meta-llama"),
+    ("moonshot", "moonshotai"),
+    ("mistral", "mistralai"),
+    ("alibaba", "qwen"),
+];
+
+async fn handle_frontier(
+    ctx: &AppContext,
+    args: ModelsFrontierArgs,
+    format: OutputFormat,
+) -> Result<()> {
+    let registry = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
+        .await?
+        .unwrap_or_default();
+    let all_entries = registry.frontier();
+
+    let entries: Vec<_> = if let Some(ref family) = args.family {
+        // --family bypasses the default filter.
+        let family_lower = normalize_family_name(family);
+        all_entries
+            .into_iter()
+            .filter(|e| e.family.eq_ignore_ascii_case(&family_lower))
+            .collect()
+    } else if args.all {
+        all_entries
+    } else {
+        // Default: curated major labs in fixed order
+        MAJOR_FAMILIES
+            .iter()
+            .filter_map(|&fam| all_entries.iter().find(|e| e.family == fam).cloned())
+            .collect()
+    };
+
+    maybe_write_output(ctx, &entries)?;
+    match format {
+        OutputFormat::Json => write_json(&entries),
+        OutputFormat::Jsonl => write_jsonl("models_frontier", &entries),
+        OutputFormat::Text | OutputFormat::Markdown => {
+            if entries.is_empty() {
+                println!(
+                    "No frontier models found (registry may be empty — try `yoetz models sync`)"
+                );
+            } else {
+                println!("{:<13}{:<43}{:<9}$/1k-out", "FAMILY", "MODEL", "CTX");
+                for e in &entries {
+                    let ctx_str = e
+                        .model
+                        .context_length
+                        .map(format_context_length)
+                        .unwrap_or_else(|| "-".to_string());
+                    let price_str = e
+                        .model
+                        .pricing
+                        .completion_per_1k
+                        .map(|p| format!("${:.3}", p))
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "{:<13}{:<43}{:<9}{}",
+                        e.family, e.model.id, ctx_str, price_str
+                    );
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn normalize_family_name(family: &str) -> String {
+    let family_lower = family.to_lowercase();
+    FAMILY_ALIASES
+        .iter()
+        .find_map(|(alias, canonical)| (*alias == family_lower).then(|| (*canonical).to_string()))
+        .unwrap_or(family_lower)
+}
+
+fn format_context_length(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{}m", tokens / 1_000_000)
+    } else {
+        format!("{}k", tokens / 1000)
     }
 }
 

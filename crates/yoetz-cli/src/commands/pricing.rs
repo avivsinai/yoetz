@@ -20,7 +20,7 @@ pub(crate) async fn handle_pricing(
                 .unwrap_or_default();
             let registry_id = resolve_registry_model_id(None, Some(&model), Some(&registry));
             if let Some(ref reg_id) = registry_id {
-                crate::validate_model_or_suggest(reg_id, Some(&registry))?;
+                crate::validate_model_or_suggest(reg_id, Some(&registry), ctx.allow_unknown)?;
             }
             let estimate = registry::estimate_pricing(
                 Some(&registry),

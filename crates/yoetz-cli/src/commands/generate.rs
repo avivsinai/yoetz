@@ -6,8 +6,8 @@ use std::path::PathBuf;
 use crate::providers::{gemini, openai, resolve_provider_auth};
 use crate::{
     build_model_spec, maybe_write_output, normalize_model_name_with_aliases, parse_media_inputs,
-    resolve_prompt, usage_from_litellm, AppContext, GenerateArgs, GenerateCommand,
-    GenerateImageArgs, GenerateVideoArgs,
+    registry, resolve_prompt, resolve_registry_model_id, usage_from_litellm, AppContext,
+    GenerateArgs, GenerateCommand, GenerateImageArgs, GenerateVideoArgs,
 };
 use litellm_rust::{ImageEditRequest, ImageInputData, ImageRequest};
 use yoetz_core::media::{MediaSource, MediaType};
@@ -47,6 +47,17 @@ async fn handle_generate_image(
             .ok_or_else(|| anyhow!("model is required"))?,
         &config.aliases,
     );
+
+    // Validate model against registry (generation models may not be in registry, so use allow_unknown)
+    let registry_cache = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
+        .await
+        .ok()
+        .flatten();
+    let reg_id = resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
+    if let Some(ref reg_id) = reg_id {
+        // Generation models are often not in the registry, so default to allowing unknown
+        crate::validate_model_or_suggest(reg_id, registry_cache.as_ref(), true)?;
+    }
 
     let images = parse_media_inputs(&args.image, &args.image_mime, MediaType::Image)?;
 
