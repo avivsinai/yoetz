@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.20] - 2026-03-21
+
+### Features
+
+- **models**: Add models frontier — live-derived rankings (#63)
+
 ## [0.2.19] - 2026-03-19
 
 ### Bug Fixes
