@@ -63,8 +63,8 @@ VERSION="$(normalize_version "$1")"
 TAG="v${VERSION}"
 BRANCH="release/${TAG}"
 
-if [[ -n "$(git status --short)" ]]; then
-  echo "error: working tree is not clean" >&2
+if [[ -n "$(git diff --stat HEAD)" ]]; then
+  echo "error: working tree has uncommitted changes" >&2
   exit 1
 fi
 
