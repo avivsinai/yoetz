@@ -737,9 +737,14 @@ fn detect_chatgpt_response_issue(snapshot: &str) -> Option<&'static str> {
 }
 
 fn chatgpt_response_complete(snapshot_changed: bool, dom: ChatgptDomState) -> bool {
-    dom.send_state == ChatgptSendState::Enabled
-        && !dom.has_stop_button
-        && (dom.copy_button_count > 0 || snapshot_changed)
+    // After response completes, ChatGPT may show the voice button instead of
+    // the send button — so `send_state` is `Missing`, not `Enabled`.  Both
+    // states indicate the composer is idle (not generating).
+    let send_idle = matches!(
+        dom.send_state,
+        ChatgptSendState::Enabled | ChatgptSendState::Missing
+    );
+    send_idle && !dom.has_stop_button && (dom.copy_button_count > 0 || snapshot_changed)
 }
 
 pub fn resolve_profile_dir(config: &Config, override_profile: Option<&PathBuf>) -> Result<PathBuf> {
@@ -2290,7 +2295,7 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_response_complete_requires_enabled_send_and_progress() {
+    fn chatgpt_response_complete_requires_idle_send_and_progress() {
         let dom = ChatgptDomState {
             send_state: ChatgptSendState::Enabled,
             has_stop_button: false,
@@ -2309,6 +2314,33 @@ mod tests {
             ChatgptDomState {
                 send_state: ChatgptSendState::Disabled,
                 ..dom
+            }
+        ));
+        // Missing send button (voice button shown instead) is also idle.
+        assert!(chatgpt_response_complete(
+            true,
+            ChatgptDomState {
+                send_state: ChatgptSendState::Missing,
+                has_stop_button: false,
+                copy_button_count: 0,
+            }
+        ));
+        // Missing + copy buttons (no snapshot change needed).
+        assert!(chatgpt_response_complete(
+            false,
+            ChatgptDomState {
+                send_state: ChatgptSendState::Missing,
+                has_stop_button: false,
+                copy_button_count: 1,
+            }
+        ));
+        // Missing + stop button still means generating.
+        assert!(!chatgpt_response_complete(
+            true,
+            ChatgptDomState {
+                send_state: ChatgptSendState::Missing,
+                has_stop_button: true,
+                copy_button_count: 0,
             }
         ));
     }

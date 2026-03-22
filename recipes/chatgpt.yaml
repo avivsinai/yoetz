@@ -39,6 +39,9 @@ steps:
   - sleep_ms: 2000
 
   # Select model if --var model is provided.
+  # ChatGPT uses Radix UI for the dropdown — .click() alone does NOT open it.
+  # A full pointer event sequence (pointerdown→mousedown→pointerup→mouseup→click)
+  # is required, matching what a real mouse click dispatches.
   - action: eval
     args:
       - |
@@ -50,7 +53,11 @@ steps:
             'button[aria-label="Model selector"]'
           );
           if (!btn) throw new Error("model selector button not found — ChatGPT may have changed their UI. Inspect the model picker for data-testid or aria-label attributes.");
-          btn.click();
+          btn.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true, pointerId: 1}));
+          btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+          btn.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, cancelable: true, pointerId: 1}));
+          btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
+          btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
           return "opened model selector";
         })()
   - sleep_ms: 1200
@@ -61,13 +68,20 @@ steps:
           const raw = "{{model}}";
           if (!raw) return "skipped: no model specified";
           const slug = raw.toLowerCase();
+          function realClick(el) {
+            el.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true, pointerId: 1}));
+            el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+            el.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, cancelable: true, pointerId: 1}));
+            el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
+            el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
+          }
           const byTestId = document.querySelector('[data-testid="model-switcher-' + slug + '"]');
-          if (byTestId) { byTestId.click(); return "selected: " + slug; }
+          if (byTestId) { realClick(byTestId); return "selected: " + slug; }
           const names = {"gpt-5-4-pro":"pro","gpt-5-4-thinking":"thinking","gpt-5-3":"instant","pro":"pro","thinking":"thinking","instant":"instant"};
           const target = names[slug] || slug;
           const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
           const match = items.find(el => (el.textContent||"").trim().toLowerCase().includes(target));
-          if (match) { match.click(); return "selected: " + target; }
+          if (match) { realClick(match); return "selected: " + target; }
           throw new Error("model '" + slug + "' not found");
         })()
   - sleep_ms: 500
@@ -85,13 +99,14 @@ steps:
         })()
   - sleep_ms: 500
 
-  # Open the attachment UI if ChatGPT hides the file input until the user
-  # clicks its paperclip button.
+  # Open the attachment UI. The button changed from "Attach" to "Add files
+  # and more" (data-testid="composer-plus-btn") — try both selectors.
   - action: eval
     args:
       - |
         (() => {
           const btn = document.querySelector(
+            'button[data-testid="composer-plus-btn"], ' +
             'button[aria-label*="Attach"], button[aria-label*="attach"], button[data-testid*="attach"]'
           );
           if (!btn) return "skipped: attach button not found";
