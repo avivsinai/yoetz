@@ -629,7 +629,13 @@ fn inspect_chatgpt_dom_state(
         headed,
         Some(timeout_ms),
     )?;
-    parse_chatgpt_dom_state(stdout.trim())
+    // agent-browser eval sometimes wraps the result in double quotes
+    let raw = stdout.trim();
+    let raw = raw
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(raw);
+    parse_chatgpt_dom_state(raw)
 }
 
 fn parse_chatgpt_poll_args(args: Option<&[String]>) -> Result<ChatgptPollOptions> {
@@ -2180,6 +2186,21 @@ mod tests {
                 has_stop_button: false,
                 copy_button_count: 2,
             }
+        );
+    }
+
+    #[test]
+    fn parse_chatgpt_dom_state_rejects_quoted_output() {
+        // agent-browser eval sometimes wraps output in double quotes;
+        // the caller (inspect_chatgpt_dom_state) strips them before calling
+        // parse_chatgpt_dom_state, but if unstripped quotes leak through the
+        // parser should fail clearly rather than silently.
+        let err = parse_chatgpt_dom_state(r#""send=enabled|stop=0|copy=1""#).unwrap_err();
+        assert!(
+            err.to_string().contains("send state")
+                || err.to_string().contains("copy count")
+                || err.to_string().contains("invalid"),
+            "expected parse error for quoted output, got: {err}"
         );
     }
 
