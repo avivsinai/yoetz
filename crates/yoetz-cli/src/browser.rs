@@ -1612,10 +1612,14 @@ fn chunk_text(text: &str, max_bytes: usize) -> Vec<String> {
 }
 
 fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> Result<String> {
-    if value.contains("{{bundle_path}}") && ctx.bundle_path.is_none() {
+    if (value.contains("{{bundle_path}}") || value.contains("{{bundle_path|json}}"))
+        && ctx.bundle_path.is_none()
+    {
         return Err(anyhow!("bundle path requested but no bundle provided"));
     }
-    if value.contains("{{bundle_text}}") && bundle_text.is_none() {
+    if (value.contains("{{bundle_text}}") || value.contains("{{bundle_text|json}}"))
+        && bundle_text.is_none()
+    {
         return Err(anyhow!("bundle text requested but no bundle provided"));
     }
 
@@ -1630,9 +1634,11 @@ fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> R
         let rest = &scan[start + 2..];
         if let Some(end) = rest.find("}}") {
             let placeholder = rest[..end].trim();
-            if !placeholder.is_empty() && !known_vars.contains(placeholder) {
+            // Strip |json filter before checking known vars
+            let base_name = placeholder.strip_suffix("|json").unwrap_or(placeholder);
+            if !base_name.is_empty() && !known_vars.contains(base_name) {
                 return Err(anyhow!(
-                    "recipe variable {{{{{placeholder}}}}} not provided. Pass `--var {placeholder}=...` or add it under `defaults:` in the recipe."
+                    "recipe variable {{{{{base_name}}}}} not provided. Pass `--var {base_name}=...` or add it under `defaults:` in the recipe."
                 ));
             }
             scan = &rest[end + 2..];
@@ -1641,16 +1647,33 @@ fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> R
         }
     }
 
-    // Perform substitutions
+    // Perform substitutions — process |json filtered variants first so they
+    // aren't consumed by the plain replacement pass.
     let mut out = value.to_string();
     if let Some(path) = &ctx.bundle_path {
+        if out.contains("{{bundle_path|json}}") {
+            let json_value =
+                serde_json::to_string(path.as_str()).unwrap_or_else(|_| format!("\"{}\"", path));
+            out = out.replace("{{bundle_path|json}}", &json_value);
+        }
         out = out.replace("{{bundle_path}}", path);
     }
     for (key, value) in &ctx.vars {
+        let json_needle = format!("{{{{{key}|json}}}}");
+        if out.contains(&json_needle) {
+            let json_value =
+                serde_json::to_string(value).unwrap_or_else(|_| format!("\"{}\"", value));
+            out = out.replace(&json_needle, &json_value);
+        }
         let needle = format!("{{{{{key}}}}}");
         out = out.replace(&needle, value);
     }
     if let Some(text) = bundle_text {
+        if out.contains("{{bundle_text|json}}") {
+            let json_value =
+                serde_json::to_string(text).unwrap_or_else(|_| format!("\"{}\"", text));
+            out = out.replace("{{bundle_text|json}}", &json_value);
+        }
         out = out.replace("{{bundle_text}}", text);
     }
     Ok(out)
@@ -1899,6 +1922,62 @@ mod tests {
         let ctx = recipe_context();
         let result = interpolate("{{bundle_text}}", &ctx, Some("literal {{model}}")).unwrap();
         assert_eq!(result, "literal {{model}}");
+    }
+
+    #[test]
+    fn interpolate_json_filter_escapes_quotes_and_newlines() {
+        let mut ctx = recipe_context();
+        ctx.vars.insert(
+            "prompt".to_string(),
+            "line 1\nline \"2\"\nline \\3".to_string(),
+        );
+        let result = interpolate("const t = {{prompt|json}};", &ctx, None).unwrap();
+        assert_eq!(result, r#"const t = "line 1\nline \"2\"\nline \\3";"#);
+    }
+
+    #[test]
+    fn interpolate_json_filter_coexists_with_plain_var() {
+        let mut ctx = recipe_context();
+        ctx.vars.insert("prompt".to_string(), "hello".to_string());
+        let result = interpolate("{{prompt|json}} {{prompt}}", &ctx, None).unwrap();
+        assert_eq!(result, r#""hello" hello"#);
+    }
+
+    #[test]
+    fn interpolate_json_filter_missing_var_reports_base_name() {
+        let ctx = recipe_context();
+        let err = interpolate("{{missing|json}}", &ctx, None).unwrap_err();
+        assert!(err.to_string().contains("--var missing="));
+    }
+
+    #[test]
+    fn interpolate_json_filter_works_for_bundle_path() {
+        let ctx = recipe_context();
+        let result = interpolate("path = {{bundle_path|json}}", &ctx, None).unwrap();
+        assert_eq!(result, r#"path = "/tmp/bundle.md""#);
+    }
+
+    #[test]
+    fn interpolate_json_filter_works_for_bundle_text() {
+        let ctx = recipe_context();
+        let result =
+            interpolate("text = {{bundle_text|json}}", &ctx, Some("line 1\nline 2")).unwrap();
+        assert_eq!(result, r#"text = "line 1\nline 2""#);
+    }
+
+    #[test]
+    fn interpolate_json_filter_errors_on_missing_bundle_path() {
+        let mut ctx = recipe_context();
+        ctx.bundle_path = None;
+        let err = interpolate("{{bundle_path|json}}", &ctx, None).unwrap_err();
+        assert!(err.to_string().contains("bundle path requested"));
+    }
+
+    #[test]
+    fn interpolate_json_filter_errors_on_missing_bundle_text() {
+        let ctx = recipe_context();
+        let err = interpolate("{{bundle_text|json}}", &ctx, None).unwrap_err();
+        assert!(err.to_string().contains("bundle text requested"));
     }
 
     #[test]
