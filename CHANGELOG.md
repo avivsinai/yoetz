@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.23] - 2026-03-22
+
+### Bug Fixes
+
+- **browser**: Chatgpt recipe ProseMirror fill bypass (#70)
+
 ## [0.2.22] - 2026-03-22
 
 ### Bug Fixes
