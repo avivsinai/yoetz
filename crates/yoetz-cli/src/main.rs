@@ -210,7 +210,8 @@ enum BrowserCommand {
     Check(BrowserCheckArgs),
     /// Sync cookies from Chrome to agent-browser (bypasses Cloudflare)
     SyncCookies(BrowserSyncCookiesArgs),
-    /// Attach to a running Chrome instance via CDP and verify authentication
+    /// Attach to a running Chrome instance and verify authentication.
+    /// Auto-discovers via chrome://inspect (Chrome 144+), or use --cdp for explicit endpoint.
     Attach(BrowserAttachArgs),
 }
 
@@ -252,14 +253,16 @@ struct BrowserLoginArgs {
 struct BrowserCheckArgs {
     #[arg(long)]
     profile: Option<PathBuf>,
-    /// Connect to Chrome via CDP endpoint (e.g. http://127.0.0.1:9222)
+    /// Explicit CDP endpoint (e.g. http://127.0.0.1:9222). Omit to auto-discover
+    /// via chrome://inspect/#remote-debugging (recommended for Chrome 144+).
     #[arg(long)]
     cdp: Option<String>,
 }
 
 #[derive(Args)]
 struct BrowserAttachArgs {
-    /// CDP endpoint (e.g. http://127.0.0.1:9222). Auto-discovers if omitted.
+    /// Explicit CDP endpoint (e.g. http://127.0.0.1:9222). Omit to auto-discover
+    /// via chrome://inspect/#remote-debugging (recommended for Chrome 144+).
     #[arg(long)]
     cdp: Option<String>,
 }
@@ -1112,7 +1115,11 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             }
 
             Err(anyhow!(
-                "could not attach to any Chrome instance. Enable remote debugging at chrome://inspect/#remote-debugging or pass --cdp <url>"
+                "could not attach to any Chrome instance.\n\n\
+                 Recommended: enable remote debugging at chrome://inspect/#remote-debugging (Chrome 144+)\n\
+                 Alternative: pass --cdp <url> with Chrome launched using --user-data-dir\n\n\
+                 Note: since Chrome 136, --remote-debugging-port is ignored on the default profile.\n\
+                 See: https://developer.chrome.com/blog/remote-debugging-port"
             ))
         }
     }

@@ -1,6 +1,7 @@
 name: chatgpt
-# Auth: resolved automatically (CDP > auto_connect > cookie > profile).
-# Falls back to cookie sync if no live browser session is available.
+# Auth: resolved automatically (explicit CDP > auto_connect > cookie > profile).
+# Recommended: enable chrome://inspect/#remote-debugging (Chrome 144+) for auto-connect.
+# Note: Chrome 136+ ignores --remote-debugging-port on the default profile.
 #
 # Variables:
 #   model    — model slug (e.g., "gpt-5-4-pro"). Omit to keep current.
