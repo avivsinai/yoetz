@@ -14,13 +14,29 @@ defaults:
   extended: ""
 
 steps:
-  # Navigate to ChatGPT. Use eval instead of open because open delegates
-  # to system tools which creates a tab outside agent-browser's control.
-  # eval navigates the active tab directly, keeping session context correct.
+  # Navigate to a fresh ChatGPT conversation. Append a timestamp query param
+  # so the SPA router treats it as a new navigation even when the tab is
+  # already on chatgpt.com/ (otherwise it's a no-op and we reuse the old thread).
   - action: eval
     args:
-      - "window.location.href = 'https://chatgpt.com/'"
+      - "window.location.href = 'https://chatgpt.com/?_yoetz=' + Date.now()"
   - sleep_ms: 4000
+
+  # Safety: if we landed on an existing conversation (URL contains /c/),
+  # click "New chat" to guarantee a clean slate.
+  - action: eval
+    args:
+      - |
+        (() => {
+          if (!window.location.pathname.startsWith('/c/')) return "already new chat";
+          const btn = document.querySelector(
+            'a[href="/"], button[data-testid="create-new-chat-button"], nav a[class*="new"]'
+          );
+          if (btn) { btn.click(); return "clicked new chat"; }
+          window.location.href = 'https://chatgpt.com/?_yoetz=' + Date.now();
+          return "force-navigated to new chat";
+        })()
+  - sleep_ms: 2000
 
   # Select model if --var model is provided.
   - action: eval
@@ -29,8 +45,11 @@ steps:
         (() => {
           const raw = "{{model}}";
           if (!raw) return "skipped: no model specified";
-          const btn = document.querySelector('[data-testid="model-switcher-dropdown-button"], button[aria-label*="Model selector"]');
-          if (!btn) throw new Error("model selector button not found");
+          const btn = document.querySelector(
+            '[data-testid="model-switcher-dropdown-button"], ' +
+            'button[aria-label="Model selector"]'
+          );
+          if (!btn) throw new Error("model selector button not found — ChatGPT may have changed their UI. Inspect the model picker for data-testid or aria-label attributes.");
           btn.click();
           return "opened model selector";
         })()
