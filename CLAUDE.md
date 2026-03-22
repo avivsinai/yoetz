@@ -21,6 +21,39 @@ cargo clippy                   # Lint
 
 Tests use WireMock for HTTP mocking - no API keys needed for `cargo test`.
 
+## Release
+
+Use the fast release path:
+
+```bash
+./scripts/release.sh 0.2.24
+```
+
+This script bumps `[workspace.package].version`, runs `cargo check --workspace`,
+creates `release/vX.Y.Z`, commits `chore(release): vX.Y.Z`, pushes the branch,
+and opens a PR with `gh`.
+
+After the release PR merges:
+- `.github/workflows/auto-tag-release.yml` detects the `chore(release): vX.Y.Z`
+  commit on `main` and pushes the matching tag automatically
+- `.github/workflows/release.yml` publishes artifacts, generates release notes
+  with `git-cliff`, and updates Homebrew/Scoop
+
+Repository setup for the fast path:
+- `RELEASE_AUTOMATION_TOKEN` secret: fine-grained PAT or GitHub App token with
+  permission to push tags so the downstream `release.yml` workflow is triggered
+- `gh auth login`: needed locally if you want `./scripts/release.sh` to open the
+  PR automatically after pushing the release branch
+
+`CHANGELOG.md` is no longer part of manual release prep. GitHub release notes
+generated in CI are the source of truth.
+
+We intentionally keep the custom GitHub Actions release flow instead of adopting
+`release-plz`/`release-please` wholesale: this repo ships GitHub release
+artifacts plus Homebrew/Scoop updates, but does not use crates.io publishing as
+its primary release path. The fastest fit here is automating tag handoff and
+cutting duplicate CI, not replacing the release pipeline.
+
 ## Code Style
 
 - Rust 2021 edition, MSRV 1.88
