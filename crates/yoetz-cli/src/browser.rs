@@ -908,7 +908,60 @@ pub fn try_cdp_attach(endpoint: &str, target_url: &str) -> Result<()> {
     let connection = BrowserConnection::Cdp {
         endpoint: endpoint.to_string(),
     };
-    verify_auth_cdp(target_url, &connection)
+    verify_auth_cdp(target_url, &connection).map_err(|e| {
+        if is_localhost_endpoint(endpoint) {
+            e.context(chrome136_cdp_warning(endpoint))
+        } else {
+            e
+        }
+    })
+}
+
+/// Returns true if the endpoint targets localhost (affected by Chrome 136+ changes).
+/// Extracts the host portion to avoid false positives on remote hostnames.
+fn is_localhost_endpoint(endpoint: &str) -> bool {
+    // Strip scheme (http://, ws://, etc.) to get authority.
+    let authority = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    // Strip path, query, fragment.
+    let host_port = authority.split('/').next().unwrap_or(authority);
+    // Strip port.
+    let host = if host_port.starts_with('[') {
+        // IPv6: [::1]:9222 → [::1]
+        host_port
+            .split_once(']')
+            .map(|(h, _)| h.trim_start_matches('['))
+            .unwrap_or(host_port)
+    } else {
+        host_port
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port)
+    };
+    matches!(
+        host.to_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
+/// Warning message explaining the Chrome 136+ breaking change for local CDP.
+fn chrome136_cdp_warning(endpoint: &str) -> String {
+    format!(
+        "Chrome 136+ ignores --remote-debugging-port on the default profile.\n\
+         \n\
+         If '{endpoint}' is unreachable, try one of these:\n\
+         \n\
+         1. Enable chrome://inspect/#remote-debugging in Chrome (recommended, Chrome 144+)\n\
+            Then use: yoetz browser attach   (auto-discovers the debug port)\n\
+         \n\
+         2. Launch Chrome with a non-default profile:\n\
+            chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug\n\
+         \n\
+         3. Use Chrome for Testing (exempt from this restriction):\n\
+            https://developer.chrome.com/blog/chrome-for-testing"
+    )
 }
 
 pub fn try_auto_connect(target_url: &str) -> Result<()> {
@@ -1878,5 +1931,29 @@ steps:
             OutputFormat::Text,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn is_localhost_endpoint_matches_common_local_addresses() {
+        assert!(is_localhost_endpoint("http://127.0.0.1:9222"));
+        assert!(is_localhost_endpoint("http://localhost:9222"));
+        assert!(is_localhost_endpoint("http://LOCALHOST:9222"));
+        assert!(is_localhost_endpoint("http://[::1]:9222"));
+        assert!(!is_localhost_endpoint("http://192.168.1.5:9222"));
+        assert!(!is_localhost_endpoint("ws://remote-host:9222"));
+        // Must not false-positive on hostnames containing "localhost"
+        assert!(!is_localhost_endpoint(
+            "http://not-localhost.example.com:9222"
+        ));
+    }
+
+    #[test]
+    fn chrome136_cdp_warning_includes_endpoint_and_guidance() {
+        let warning = chrome136_cdp_warning("http://127.0.0.1:9222");
+        assert!(warning.contains("127.0.0.1:9222"));
+        assert!(warning.contains("Chrome 136+"));
+        assert!(warning.contains("chrome://inspect/#remote-debugging"));
+        assert!(warning.contains("--user-data-dir"));
+        assert!(warning.contains("Chrome for Testing"));
     }
 }
