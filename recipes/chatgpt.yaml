@@ -65,7 +65,28 @@ steps:
         })()
   - sleep_ms: 500
 
-  # Clear the textarea before injecting content. Prevents accumulation
+  # Open the attachment UI if ChatGPT hides the file input until the user
+  # clicks its paperclip button.
+  - action: eval
+    args:
+      - |
+        (() => {
+          const btn = document.querySelector(
+            'button[aria-label*="Attach"], button[aria-label*="attach"], button[data-testid*="attach"]'
+          );
+          if (!btn) return "skipped: attach button not found";
+          btn.click();
+          return "opened attachment UI";
+        })()
+  - sleep_ms: 500
+
+  # Upload the bundle as an attachment instead of injecting it into the
+  # contenteditable composer.
+  - action: upload
+    args: ["input[type='file']", "{{bundle_path}}"]
+  - sleep_ms: 2000
+
+  # Clear the textarea before entering the prompt. Prevents accumulation
   # across runs when auto-connect reuses the same tab.
   - action: eval
     args:
@@ -77,11 +98,9 @@ steps:
           return "cleared";
         })()
 
-  # Inject bundle content + prompt. Uses fill (handles escaping of arbitrary
-  # text) followed by eval to dispatch InputEvent (triggers React state) and
-  # click send. agent-browser fill alone doesn't trigger React on contenteditable.
+  # Type only the prompt text. The bundle now travels as an uploaded file.
   - action: fill
-    args: ["#prompt-textarea", "{{bundle_text}}\n\n{{prompt}}"]
+    args: ["#prompt-textarea", "{{prompt}}"]
   - sleep_ms: 500
 
   # Trigger React state update and send. eval click works where native
@@ -99,10 +118,11 @@ steps:
           return "sent";
         })()
 
-  # Wait for ChatGPT to finish generating. Poll-based wait is blocked by
-  # agent-browser's 30s IPC ceiling (EAGAIN above ~30s). Using fixed sleep
-  # until the transport supports long waits. See issue #52.
-  - sleep_ms: 180000
+  # Poll in short bursts under the agent-browser IPC ceiling until the
+  # response completes.
+  - action: chatgpt_wait_response
+    args: ["--attempts", "30", "--interval-ms", "15000"]
+    timeout_ms: 10000
 
   # Capture final state
   - action: snapshot
