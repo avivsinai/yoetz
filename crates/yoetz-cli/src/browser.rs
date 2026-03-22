@@ -1652,8 +1652,8 @@ fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> R
     let mut out = value.to_string();
     if let Some(path) = &ctx.bundle_path {
         if out.contains("{{bundle_path|json}}") {
-            let json_value = serde_json::to_string(path.as_str())
-                .unwrap_or_else(|_| format!("\"{}\"", path));
+            let json_value =
+                serde_json::to_string(path.as_str()).unwrap_or_else(|_| format!("\"{}\"", path));
             out = out.replace("{{bundle_path|json}}", &json_value);
         }
         out = out.replace("{{bundle_path}}", path);
@@ -1938,8 +1938,7 @@ mod tests {
     #[test]
     fn interpolate_json_filter_coexists_with_plain_var() {
         let mut ctx = recipe_context();
-        ctx.vars
-            .insert("prompt".to_string(), "hello".to_string());
+        ctx.vars.insert("prompt".to_string(), "hello".to_string());
         let result = interpolate("{{prompt|json}} {{prompt}}", &ctx, None).unwrap();
         assert_eq!(result, r#""hello" hello"#);
     }
