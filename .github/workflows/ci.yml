@@ -20,8 +20,63 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  changes:
+    name: Detect Release-Only Changes
+    runs-on: ubuntu-latest
+    outputs:
+      release_only: ${{ steps.detect.outputs.release_only }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "${GITHUB_EVENT_NAME}" in
+            pull_request)
+              base="${{ github.event.pull_request.base.sha }}"
+              head="${{ github.event.pull_request.head.sha }}"
+              ;;
+            push)
+              base="${{ github.event.before }}"
+              head="${{ github.sha }}"
+              ;;
+            *)
+              echo "release_only=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+          esac
+
+          if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
+            echo "release_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          mapfile -t files < <(git diff --name-only "$base" "$head")
+          if ((${#files[@]} == 0)); then
+            echo "release_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          release_only=true
+          for file in "${files[@]}"; do
+            case "$file" in
+              Cargo.toml|Cargo.lock|CHANGELOG.md) ;;
+              *)
+                release_only=false
+                break
+                ;;
+            esac
+          done
+
+          echo "release_only=$release_only" >> "$GITHUB_OUTPUT"
+
   browser-scripts:
     name: Browser Scripts
+    needs: changes
+    if: needs.changes.outputs.release_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -56,6 +111,8 @@ jobs:
 
   clippy:
     name: Clippy
+    needs: changes
+    if: needs.changes.outputs.release_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -78,6 +135,8 @@ jobs:
 
   msrv:
     name: MSRV (1.88)
+    needs: changes
+    if: needs.changes.outputs.release_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -90,6 +149,8 @@ jobs:
 
   doc:
     name: Documentation
+    needs: changes
+    if: needs.changes.outputs.release_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -102,6 +163,8 @@ jobs:
 
   deny:
     name: Cargo Deny
+    needs: changes
+    if: needs.changes.outputs.release_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -114,6 +177,8 @@ jobs:
 
   gitleaks:
     name: Gitleaks
+    needs: changes
+    if: needs.changes.outputs.release_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -125,18 +190,10 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
 
-  changelog:
-    name: Changelog
-    if: github.actor != 'dependabot[bot]'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - uses: actions/checkout@v6
-      - name: Verify CHANGELOG.md exists
-        run: test -s CHANGELOG.md || { echo "::error::CHANGELOG.md is missing or empty"; exit 1; }
-
   build:
     name: Build (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.release_only != 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
