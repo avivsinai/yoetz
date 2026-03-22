@@ -125,6 +125,8 @@ jobs:
 
   test:
     name: Test
+    needs: changes
+    if: needs.changes.outputs.release_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

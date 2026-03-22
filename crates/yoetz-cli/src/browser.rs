@@ -1611,6 +1611,12 @@ fn chunk_text(text: &str, max_bytes: usize) -> Vec<String> {
     chunks
 }
 
+/// JSON-encode a string for safe embedding in JS source (e.g. `"hello \"world\""`).
+/// `serde_json::to_string` on `&str` is infallible.
+fn json_string_literal(s: &str) -> String {
+    serde_json::to_string(s).unwrap()
+}
+
 fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> Result<String> {
     if (value.contains("{{bundle_path}}") || value.contains("{{bundle_path|json}}"))
         && ctx.bundle_path.is_none()
@@ -1651,29 +1657,17 @@ fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> R
     // aren't consumed by the plain replacement pass.
     let mut out = value.to_string();
     if let Some(path) = &ctx.bundle_path {
-        if out.contains("{{bundle_path|json}}") {
-            let json_value =
-                serde_json::to_string(path.as_str()).unwrap_or_else(|_| format!("\"{}\"", path));
-            out = out.replace("{{bundle_path|json}}", &json_value);
-        }
+        out = out.replace("{{bundle_path|json}}", &json_string_literal(path));
         out = out.replace("{{bundle_path}}", path);
     }
     for (key, value) in &ctx.vars {
         let json_needle = format!("{{{{{key}|json}}}}");
-        if out.contains(&json_needle) {
-            let json_value =
-                serde_json::to_string(value).unwrap_or_else(|_| format!("\"{}\"", value));
-            out = out.replace(&json_needle, &json_value);
-        }
+        out = out.replace(&json_needle, &json_string_literal(value));
         let needle = format!("{{{{{key}}}}}");
         out = out.replace(&needle, value);
     }
     if let Some(text) = bundle_text {
-        if out.contains("{{bundle_text|json}}") {
-            let json_value =
-                serde_json::to_string(text).unwrap_or_else(|_| format!("\"{}\"", text));
-            out = out.replace("{{bundle_text|json}}", &json_value);
-        }
+        out = out.replace("{{bundle_text|json}}", &json_string_literal(text));
         out = out.replace("{{bundle_text}}", text);
     }
     Ok(out)

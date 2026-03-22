@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: auto-tag-${{ github.sha }}
+  group: auto-tag
   cancel-in-progress: false
 
 jobs:
@@ -58,6 +58,11 @@ jobs:
           fi
 
           if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null; then
+            existing_sha="$(git rev-parse "refs/tags/${tag}^{commit}" 2>/dev/null || git rev-parse "refs/tags/${tag}")"
+            if [[ "$existing_sha" != "${GITHUB_SHA}" ]]; then
+              echo "::error::Tag ${tag} already exists but points to ${existing_sha}, not ${GITHUB_SHA}."
+              exit 1
+            fi
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "tag=${tag}" >> "$GITHUB_OUTPUT"
             exit 0
