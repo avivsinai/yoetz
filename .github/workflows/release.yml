@@ -74,6 +74,8 @@ jobs:
             push)
               commit_subject="${COMMIT_MESSAGE%%$'\n'*}"
               tag="${commit_subject#chore(release): }"
+              # Squash-merge appends " (#NN)" — strip it.
+              tag="${tag%% \(#*}"
               validate_tag "$tag"
 
               version="${tag#v}"
