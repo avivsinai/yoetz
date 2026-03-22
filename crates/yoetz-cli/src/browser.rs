@@ -918,9 +918,32 @@ pub fn try_cdp_attach(endpoint: &str, target_url: &str) -> Result<()> {
 }
 
 /// Returns true if the endpoint targets localhost (affected by Chrome 136+ changes).
+/// Extracts the host portion to avoid false positives on remote hostnames.
 fn is_localhost_endpoint(endpoint: &str) -> bool {
-    let lower = endpoint.to_lowercase();
-    lower.contains("127.0.0.1") || lower.contains("localhost") || lower.contains("[::1]")
+    // Strip scheme (http://, ws://, etc.) to get authority.
+    let authority = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    // Strip path, query, fragment.
+    let host_port = authority.split('/').next().unwrap_or(authority);
+    // Strip port.
+    let host = if host_port.starts_with('[') {
+        // IPv6: [::1]:9222 → [::1]
+        host_port
+            .split_once(']')
+            .map(|(h, _)| h.trim_start_matches('['))
+            .unwrap_or(host_port)
+    } else {
+        host_port
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(host_port)
+    };
+    matches!(
+        host.to_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
 }
 
 /// Warning message explaining the Chrome 136+ breaking change for local CDP.
@@ -1918,6 +1941,10 @@ steps:
         assert!(is_localhost_endpoint("http://[::1]:9222"));
         assert!(!is_localhost_endpoint("http://192.168.1.5:9222"));
         assert!(!is_localhost_endpoint("ws://remote-host:9222"));
+        // Must not false-positive on hostnames containing "localhost"
+        assert!(!is_localhost_endpoint(
+            "http://not-localhost.example.com:9222"
+        ));
     }
 
     #[test]

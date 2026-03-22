@@ -253,16 +253,16 @@ struct BrowserLoginArgs {
 struct BrowserCheckArgs {
     #[arg(long)]
     profile: Option<PathBuf>,
-    /// Explicit CDP endpoint (e.g. http://127.0.0.1:9222). Omit to auto-discover
-    /// via chrome://inspect/#remote-debugging (recommended for Chrome 144+).
+    /// CDP endpoint (e.g. http://127.0.0.1:9222). Falls back to YOETZ_BROWSER_CDP env
+    /// or config, then chrome://inspect auto-connect (Chrome 144+).
     #[arg(long)]
     cdp: Option<String>,
 }
 
 #[derive(Args)]
 struct BrowserAttachArgs {
-    /// Explicit CDP endpoint (e.g. http://127.0.0.1:9222). Omit to auto-discover
-    /// via chrome://inspect/#remote-debugging (recommended for Chrome 144+).
+    /// CDP endpoint (e.g. http://127.0.0.1:9222). Falls back to YOETZ_BROWSER_CDP env
+    /// or config, then chrome://inspect auto-connect (Chrome 144+).
     #[arg(long)]
     cdp: Option<String>,
 }
