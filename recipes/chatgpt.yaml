@@ -106,31 +106,44 @@ steps:
     args: ["input[type='file']", "{{bundle_path}}"]
   - sleep_ms: 2000
 
-  # Clear the textarea before entering the prompt. Prevents accumulation
-  # across runs when auto-connect reuses the same tab.
+  # Clear the textarea before entering the prompt. Uses execCommand so the
+  # edit goes through ProseMirror's transaction system (innerHTML= bypasses it).
   - action: eval
     args:
       - |
         (() => {
           const el = document.querySelector("#prompt-textarea");
-          el.innerHTML = "";
-          el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+          el.focus();
+          if (el.textContent.trim()) {
+            document.execCommand('selectAll');
+            document.execCommand('delete');
+          }
           return "cleared";
         })()
 
-  # Type only the prompt text. The bundle now travels as an uploaded file.
-  - action: fill
-    args: ["#prompt-textarea", "{{prompt}}"]
-  - sleep_ms: 500
-
-  # Trigger React state update and send. eval click works where native
-  # agent-browser click does not (React event handler binding).
+  # Insert prompt via execCommand('insertText') which fires beforeinput/input
+  # events that ProseMirror intercepts. Playwright fill() sets innerHTML
+  # directly, bypassing ProseMirror state — leaving the send button disabled.
+  # {{prompt|json}} produces a JSON-escaped string literal (with quotes),
+  # safe for embedding in JS source regardless of quotes/newlines.
   - action: eval
     args:
       - |
         (() => {
           const el = document.querySelector("#prompt-textarea");
-          el.dispatchEvent(new InputEvent("input", { bubbles: true }));
+          el.focus();
+          const text = {{prompt|json}};
+          document.execCommand('insertText', false, text);
+          return "inserted prompt (" + text.length + " chars)";
+        })()
+  - sleep_ms: 500
+
+  # Click send. ProseMirror already processed the execCommand so React
+  # state is in sync — no extra InputEvent dispatch needed.
+  - action: eval
+    args:
+      - |
+        (() => {
           const btn = document.querySelector("button[data-testid='send-button']");
           if (!btn) throw new Error("send button not found");
           if (btn.disabled) throw new Error("send button disabled — text may not have been injected");
