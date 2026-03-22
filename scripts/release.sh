@@ -18,8 +18,8 @@ This script:
 6. Pushes the branch
 7. Creates a GitHub PR with gh
 
-After the PR merges, the auto-tag workflow creates vX.Y.Z automatically and
-the Release workflow publishes artifacts and release notes.
+After the PR merges, the Release workflow creates vX.Y.Z automatically,
+publishes artifacts, and generates release notes.
 EOF
 }
 
@@ -123,8 +123,9 @@ PR_BODY=$(
 ## Release
 
 - bumps workspace version to \`${VERSION}\`
-- relies on the auto-tag workflow after merge
-- release notes are generated in CI from git-cliff during the tag-driven release
+- merge triggers .github/workflows/release.yml, which creates the tag and
+  publishes the release
+- release notes are generated in CI from git-cliff during the release workflow
 EOF
 )
 

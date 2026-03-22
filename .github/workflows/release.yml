@@ -2,12 +2,11 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
   workflow_dispatch:
     inputs:
       tag:
-        description: "Tag to release (e.g., v0.2.0)"
+        description: "Existing tag to (re)release (e.g., v0.2.24)"
         required: true
         type: string
 
@@ -15,15 +14,124 @@ permissions:
   contents: write
 
 concurrency:
-  group: release-${{ github.ref_name }}
-  cancel-in-progress: true
+  group: "release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.sha }}"
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare:
+    name: Prepare Release
+    if: "${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'chore(release): v') }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.prepare.outputs.tag }}
+      version: ${{ steps.prepare.outputs.version }}
+      release_ref: ${{ steps.prepare.outputs.release_ref }}
+      release_sha: ${{ steps.prepare.outputs.release_sha }}
+      prerelease: ${{ steps.prepare.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release metadata
+        id: prepare
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          validate_tag() {
+            local tag="$1"
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]]; then
+              echo "::error::Release identifiers must use vX.Y.Z style tags."
+              exit 1
+            fi
+          }
+
+          tag_commit_sha() {
+            git rev-parse "refs/tags/${1}^{commit}" 2>/dev/null || git rev-parse "refs/tags/${1}"
+          }
+
+          case "$EVENT_NAME" in
+            workflow_dispatch)
+              tag="$INPUT_TAG"
+              validate_tag "$tag"
+              git fetch --force --tags origin
+              if ! git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+                echo "::error::Tag ${tag} does not exist. workflow_dispatch is only for rerunning an existing release."
+                exit 1
+              fi
+              release_ref="$tag"
+              release_sha="$(tag_commit_sha "$tag")"
+              ;;
+            push)
+              commit_subject="${COMMIT_MESSAGE%%$'\n'*}"
+              tag="${commit_subject#chore(release): }"
+              validate_tag "$tag"
+
+              version="${tag#v}"
+              cargo_version="$(
+                awk '
+                  /^\[workspace\.package\]$/ { in_section = 1; next }
+                  /^\[/ { in_section = 0 }
+                  in_section && $1 == "version" {
+                    gsub(/"/, "", $3)
+                    print $3
+                    exit
+                  }
+                ' Cargo.toml
+              )"
+              if [[ -z "$cargo_version" ]]; then
+                echo "::error::Could not read workspace version from Cargo.toml."
+                exit 1
+              fi
+              if [[ "$cargo_version" != "$version" ]]; then
+                echo "::error::Commit tag ${tag} does not match Cargo.toml version ${cargo_version}."
+                exit 1
+              fi
+
+              release_ref="${GITHUB_SHA}"
+              release_sha="${GITHUB_SHA}"
+              if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+                existing_sha="$(tag_commit_sha "$tag")"
+                if [[ "$existing_sha" != "$release_sha" ]]; then
+                  echo "::error::Tag ${tag} already exists but points to ${existing_sha}, not ${release_sha}."
+                  exit 1
+                fi
+              else
+                git tag "${tag}" "${release_sha}"
+                git push origin "refs/tags/${tag}"
+              fi
+              ;;
+            *)
+              echo "::error::Unsupported event: ${EVENT_NAME}"
+              exit 1
+              ;;
+          esac
+
+          version="${tag#v}"
+          prerelease=false
+          if [[ "$tag" == *-* ]]; then
+            prerelease=true
+          fi
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "release_ref=${release_ref}" >> "$GITHUB_OUTPUT"
+          echo "release_sha=${release_sha}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+
   build:
     name: Build (${{ matrix.target }})
+    needs: prepare
+    if: needs.prepare.result == 'success'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -50,7 +158,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+          ref: ${{ needs.prepare.outputs.release_ref }}
 
       - uses: actions/setup-node@v6
         with:
@@ -105,12 +213,14 @@ jobs:
 
   release:
     name: Create Release
-    needs: build
+    needs: [prepare, build]
+    if: needs.prepare.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v6
         with:
+          ref: ${{ needs.prepare.outputs.release_ref }}
           fetch-depth: 0
 
       - uses: actions/download-artifact@v8
@@ -123,18 +233,27 @@ jobs:
           cd artifacts
           sha256sum yoetz-* > SHA256SUMS.txt
 
+      - name: Fetch tags
+        run: git fetch --force --tags origin
+
       - name: Generate release notes
         uses: taiki-e/install-action@git-cliff
       - name: Extract release notes for this tag
         id: release_notes
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ needs.prepare.outputs.tag }}"
           git-cliff --tag "$TAG" --unreleased --strip header --output RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ needs.prepare.outputs.release_sha }}
+          name: ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          allow_updates: true
+          overwrite_files: true
           body_path: RELEASE_NOTES.md
           files: |
             artifacts/yoetz-*
@@ -144,10 +263,10 @@ jobs:
 
   update-homebrew:
     name: Update Homebrew Formula
-    needs: release
+    needs: [prepare, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ needs.prepare.result == 'success' && needs.prepare.outputs.prerelease != 'true' }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -158,8 +277,8 @@ jobs:
         env:
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          TAG="${GITHUB_REF_NAME}"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          TAG="${{ needs.prepare.outputs.tag }}"
 
           SHA_X86_MAC=$(sha256sum artifacts/yoetz-x86_64-apple-darwin.tar.gz | awk '{print $1}')
           SHA_ARM_MAC=$(sha256sum artifacts/yoetz-aarch64-apple-darwin.tar.gz | awk '{print $1}')
@@ -221,10 +340,10 @@ jobs:
 
   update-scoop:
     name: Update Scoop Manifest
-    needs: release
+    needs: [prepare, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: ${{ !contains(github.ref_name, '-') }}
+    if: ${{ needs.prepare.result == 'success' && needs.prepare.outputs.prerelease != 'true' }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -235,8 +354,8 @@ jobs:
         env:
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
         run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          TAG="${GITHUB_REF_NAME}"
+          VERSION="${{ needs.prepare.outputs.version }}"
+          TAG="${{ needs.prepare.outputs.tag }}"
 
           SHA_WIN=$(sha256sum artifacts/yoetz-x86_64-pc-windows-msvc.zip | awk '{print $1}')
 
