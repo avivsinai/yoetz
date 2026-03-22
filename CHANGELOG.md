@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.21] - 2026-03-22
+
+### Features
+
+- **browser**: Prioritize auto-connect, add Chrome 136+ CDP warning (#65)
+- Upload chatgpt bundles and poll for completion (#66)
+
 ## [0.2.20] - 2026-03-21
 
 ### Features
