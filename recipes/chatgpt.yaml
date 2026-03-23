@@ -7,16 +7,14 @@ name: chatgpt
 #   model    — model slug (e.g., "gpt-5-4-pro"). Omit to keep current.
 #   extended — set to "false" to disable Extended Pro. Default: leave as-is.
 #   prompt   — prompt text to send with the attachment.
-#
-# Content delivery:
-#   Small bundles (≤10k chars) — pasted directly into the composer textarea.
-#   Large bundles (>10k chars)  — uploaded as file attachment; recipe polls
-#   until the upload spinner disappears before sending.
+#   paste    — set to "true" to paste bundle text into textarea instead of
+#              uploading as file. Default: "false" (always upload).
 
 defaults:
   prompt: Review the attached file and provide your analysis.
   model: ""
   extended: ""
+  paste: "false"
 
 steps:
   # Navigate to a fresh ChatGPT conversation. Append a timestamp query param
@@ -104,16 +102,13 @@ steps:
         })()
   - sleep_ms: 500
 
-  # Decide delivery mode: paste small bundles (≤10k chars) directly into the
-  # textarea; upload large bundles as file attachments.
+  # Delivery mode: always upload as file attachment unless --var paste=true.
   - action: eval
     args:
       - |
         (() => {
-          const text = {{bundle_text|json}};
-          const THRESHOLD = 10000;
-          window.__yoetz_use_attachment = text.length > THRESHOLD;
-          return "bundle " + text.length + " chars → " +
+          window.__yoetz_use_attachment = ("{{paste}}" !== "true");
+          return "delivery mode → " +
             (window.__yoetz_use_attachment ? "attachment" : "paste");
         })()
 
@@ -137,8 +132,8 @@ steps:
           return "pasted prompt+bundle (" + combined.length + " chars)";
         })()
 
-  # --- Large-bundle path: upload as file attachment ---
-  # Steps below use skip_if to run only when the bundle exceeds the threshold.
+  # --- File attachment path (default) ---
+  # Steps below are skipped only when --var paste=true.
 
   # Open the attachment menu (button is "composer-plus-btn").
   - skip_if: "!window.__yoetz_use_attachment"
