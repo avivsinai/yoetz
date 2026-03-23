@@ -1049,10 +1049,15 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
 
             // Only read bundle text if the recipe actually references it. Some recipes
             // (e.g. ChatGPT file-upload flows) only need {{bundle_path}}.
+            // Check for both {{bundle_text}} and {{bundle_text|json}}.
             let needs_bundle_text = recipe.steps.iter().any(|step| {
                 step.args
                     .as_ref()
-                    .map(|args| args.iter().any(|a| a.contains("{{bundle_text}}")))
+                    .map(|args| {
+                        args.iter().any(|a| {
+                            a.contains("{{bundle_text}}") || a.contains("{{bundle_text|json}}")
+                        })
+                    })
                     .unwrap_or(false)
             });
             let bundle_text = match (needs_bundle_text, recipe_args.bundle.as_ref()) {
