@@ -109,8 +109,7 @@ impl BrowserConnection {
 static AGENT_BROWSER: OnceLock<Result<(String, Vec<String>), String>> = OnceLock::new();
 
 /// Returns (program, extra_prefix_args) for launching agent-browser.
-/// Checks YOETZ_AGENT_BROWSER_BIN env, then PATH, then falls back to npx
-/// (only if `YOETZ_ALLOW_NPX_FALLBACK=1` is set).
+/// Checks YOETZ_AGENT_BROWSER_BIN env, then PATH, then falls back to npx.
 /// Result is cached for the lifetime of the process.
 fn resolve_agent_browser() -> Result<(String, Vec<String>)> {
     let cached = AGENT_BROWSER.get_or_init(|| {
@@ -127,19 +126,12 @@ fn resolve_agent_browser() -> Result<(String, Vec<String>)> {
         {
             return Ok(("agent-browser".to_string(), vec![]));
         }
-        // Fall back to npx only if explicitly allowed — downloading and executing
-        // arbitrary npm code at runtime is a security risk.
-        if env::var("YOETZ_ALLOW_NPX_FALLBACK").as_deref() == Ok("1") {
-            eprintln!("warning: agent-browser not found in PATH; falling back to `npx --yes agent-browser`. Set YOETZ_AGENT_BROWSER_BIN or install agent-browser globally to avoid this.");
-            return Ok((
-                "npx".to_string(),
-                vec!["--yes".to_string(), "agent-browser".to_string()],
-            ));
-        }
-        Err("agent-browser not found in PATH and npx fallback is disabled.\n\
-             Install it globally:  npm install -g agent-browser\n\
-             Or allow npx fallback: export YOETZ_ALLOW_NPX_FALLBACK=1"
-            .to_string())
+        // Fall back to npx — runs from cache or downloads on first use.
+        eprintln!("info: agent-browser not found in PATH, using npx");
+        Ok((
+            "npx".to_string(),
+            vec!["--yes".to_string(), "agent-browser".to_string()],
+        ))
     });
     match cached {
         Ok(v) => Ok(v.clone()),
