@@ -25,9 +25,12 @@ const AUTH_CHECK_TIMEOUT_MS: u64 = 8_000;
 const LIVE_ATTACH_AUTH_CHECK_TIMEOUT_MS: u64 = 30_000;
 const AUTH_CHECK_POLL_MS: u64 = 500;
 const CHATGPT_WAIT_ACTION: &str = "chatgpt_wait_response";
+const CHATGPT_WAIT_UPLOAD_ACTION: &str = "chatgpt_wait_upload";
 const CHATGPT_POLL_ATTEMPTS_DEFAULT: usize = 30;
 const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 15_000;
 const CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT: u64 = 10_000;
+const CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT: usize = 30;
+const CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT: u64 = 1_000;
 const CDP_SESSION_NAME: &str = "yoetz-cdp";
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
@@ -60,6 +63,10 @@ pub struct RecipeStep {
     pub args: Option<Vec<String>>,
     pub sleep_ms: Option<u64>,
     pub timeout_ms: Option<u64>,
+    /// JS expression evaluated in the page context. If it returns a truthy
+    /// value, the step (action + sleep) is skipped. Useful for conditional
+    /// steps like "only upload if the bundle is large".
+    pub skip_if: Option<String>,
 }
 
 pub struct RecipeContext {
@@ -387,6 +394,21 @@ fn run_recipe_with_connection(
     }
 
     for (idx, step) in recipe.steps.iter().enumerate() {
+        // Evaluate skip_if before anything else (including sleep).
+        if let Some(expr) = &step.skip_if {
+            let result = run_agent_browser_with_connection(
+                vec!["eval".to_string(), expr.clone()],
+                OutputFormat::Text,
+                connection,
+                ctx.use_stealth,
+                headed,
+            )?;
+            let trimmed = result.trim().trim_matches('"');
+            if !trimmed.is_empty() && trimmed != "false" && trimmed != "0" && trimmed != "null" && trimmed != "undefined" {
+                continue;
+            }
+        }
+
         if let Some(ms) = step.sleep_ms {
             thread::sleep(Duration::from_millis(ms));
             continue;
@@ -401,6 +423,36 @@ fn run_recipe_with_connection(
             let stdout = run_chatgpt_wait_response(
                 step.args.as_deref(),
                 step.timeout_ms,
+                connection,
+                ctx.use_stealth,
+                headed,
+            )
+            .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+
+            if wants_json || wants_jsonl {
+                let stdout_value =
+                    parse_stdout_json(&stdout).unwrap_or(Value::String(stdout.clone()));
+                let event = json!({
+                    "type": "browser_step",
+                    "index": idx,
+                    "action": action,
+                    "args": step.args,
+                    "stdout": stdout_value,
+                });
+                if wants_jsonl {
+                    write_jsonl_event(&event)?;
+                } else {
+                    events.push(event);
+                }
+            } else {
+                print!("{stdout}");
+            }
+            continue;
+        }
+
+        if action == CHATGPT_WAIT_UPLOAD_ACTION {
+            let stdout = run_chatgpt_wait_upload(
+                step.args.as_deref(),
                 connection,
                 ctx.use_stealth,
                 headed,
@@ -585,6 +637,62 @@ fn run_chatgpt_wait_response(
         last_dom.send_state,
         last_dom.has_stop_button,
         last_dom.copy_button_count
+    ))
+}
+
+/// Short-burst polling for ChatGPT file upload completion.
+/// Checks whether the upload spinner (`.animate-spin` SVG whose parent has
+/// `display: none` when done) has disappeared inside the file tile.
+fn run_chatgpt_wait_upload(
+    args: Option<&[String]>,
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<String> {
+    let options = parse_chatgpt_poll_args(args).unwrap_or(ChatgptPollOptions {
+        attempts: CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT,
+        interval_ms: CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT,
+    });
+
+    let check_script = r#"(() => {
+        const tile = document.querySelector('[class*="file-tile"]');
+        if (!tile) return "no_tile";
+        const spinner = tile.querySelector('[class*="animate-spin"]');
+        if (!spinner) return "done";
+        const hidden = getComputedStyle(spinner.parentElement).display === 'none';
+        return hidden ? "done" : "uploading";
+    })()"#;
+
+    for attempt in 1..=options.attempts {
+        thread::sleep(Duration::from_millis(options.interval_ms));
+
+        let stdout = run_agent_browser_with_connection_timeout(
+            vec!["eval".to_string(), check_script.to_string()],
+            OutputFormat::Text,
+            connection,
+            use_stealth,
+            headed,
+            Some(CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT),
+        )?;
+        let status = stdout.trim().trim_matches('"');
+
+        match status {
+            "done" => {
+                return Ok(
+                    json!({"status": "ok", "polls": attempt}).to_string(),
+                );
+            }
+            "no_tile" if attempt > 5 => {
+                return Err(anyhow!("file tile never appeared after {attempt} polls"));
+            }
+            _ => {} // "uploading" or "no_tile" early — keep polling
+        }
+    }
+
+    Err(anyhow!(
+        "upload still processing after {} polls (~{}s)",
+        options.attempts,
+        (options.attempts as u64 * options.interval_ms) / 1000,
     ))
 }
 

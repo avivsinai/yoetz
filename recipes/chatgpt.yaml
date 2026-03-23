@@ -7,6 +7,11 @@ name: chatgpt
 #   model    — model slug (e.g., "gpt-5-4-pro"). Omit to keep current.
 #   extended — set to "false" to disable Extended Pro. Default: leave as-is.
 #   prompt   — prompt text to send with the attachment.
+#
+# Content delivery:
+#   Small bundles (≤10k chars) — pasted directly into the composer textarea.
+#   Large bundles (>10k chars)  — uploaded as file attachment; recipe polls
+#   until the upload spinner disappears before sending.
 
 defaults:
   prompt: Review the attached file and provide your analysis.
@@ -99,9 +104,45 @@ steps:
         })()
   - sleep_ms: 500
 
-  # Open the attachment UI. The button changed from "Attach" to "Add files
-  # and more" (data-testid="composer-plus-btn") — try both selectors.
+  # Decide delivery mode: paste small bundles (≤10k chars) directly into the
+  # textarea; upload large bundles as file attachments.
   - action: eval
+    args:
+      - |
+        (() => {
+          const text = {{bundle_text|json}};
+          const THRESHOLD = 10000;
+          window.__yoetz_use_attachment = text.length > THRESHOLD;
+          return "bundle " + text.length + " chars → " +
+            (window.__yoetz_use_attachment ? "attachment" : "paste");
+        })()
+
+  # --- Small-bundle path: paste bundle + prompt into textarea directly ---
+  - skip_if: "window.__yoetz_use_attachment"
+    action: eval
+    args:
+      - |
+        (() => {
+          if (window.__yoetz_use_attachment) return "skipped: using attachment";
+          const el = document.querySelector("#prompt-textarea");
+          el.focus();
+          if (el.textContent.trim()) {
+            document.execCommand('selectAll');
+            document.execCommand('delete');
+          }
+          const prompt = {{prompt|json}};
+          const bundle = {{bundle_text|json}};
+          const combined = prompt + "\n\n" + bundle;
+          document.execCommand('insertText', false, combined);
+          return "pasted prompt+bundle (" + combined.length + " chars)";
+        })()
+
+  # --- Large-bundle path: upload as file attachment ---
+  # Steps below use skip_if to run only when the bundle exceeds the threshold.
+
+  # Open the attachment menu (button is "composer-plus-btn").
+  - skip_if: "!window.__yoetz_use_attachment"
+    action: eval
     args:
       - |
         (() => {
@@ -113,17 +154,23 @@ steps:
           btn.click();
           return "opened attachment UI";
         })()
-  - sleep_ms: 500
+  - skip_if: "!window.__yoetz_use_attachment"
+    sleep_ms: 500
 
-  # Upload the bundle as an attachment instead of injecting it into the
-  # contenteditable composer.
-  - action: upload
+  # Upload the bundle file.
+  - skip_if: "!window.__yoetz_use_attachment"
+    action: upload
     args: ["input[type='file']", "{{bundle_path}}"]
-  - sleep_ms: 2000
 
-  # Clear the textarea before entering the prompt. Uses execCommand so the
-  # edit goes through ProseMirror's transaction system (innerHTML= bypasses it).
-  - action: eval
+  # Poll until the upload spinner disappears. Short-burst Rust-side polling
+  # keeps each eval under the agent-browser IPC ceiling (25s).
+  - skip_if: "!window.__yoetz_use_attachment"
+    action: chatgpt_wait_upload
+    args: ["--attempts", "30", "--interval-ms", "1000"]
+
+  # Insert just the prompt (bundle is in the attachment).
+  - skip_if: "!window.__yoetz_use_attachment"
+    action: eval
     args:
       - |
         (() => {
@@ -133,25 +180,12 @@ steps:
             document.execCommand('selectAll');
             document.execCommand('delete');
           }
-          return "cleared";
-        })()
-
-  # Insert prompt via execCommand('insertText') which fires beforeinput/input
-  # events that ProseMirror intercepts. Playwright fill() sets innerHTML
-  # directly, bypassing ProseMirror state — leaving the send button disabled.
-  # {{prompt|json}} produces a JSON-escaped string literal (with quotes),
-  # safe for embedding in JS source regardless of quotes/newlines.
-  - action: eval
-    args:
-      - |
-        (() => {
-          const el = document.querySelector("#prompt-textarea");
-          el.focus();
           const text = {{prompt|json}};
           document.execCommand('insertText', false, text);
           return "inserted prompt (" + text.length + " chars)";
         })()
-  - sleep_ms: 500
+  - skip_if: "!window.__yoetz_use_attachment"
+    sleep_ms: 500
 
   # Click send. ProseMirror already processed the execCommand so React
   # state is in sync — no extra InputEvent dispatch needed.
