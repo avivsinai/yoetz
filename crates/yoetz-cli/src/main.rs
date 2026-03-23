@@ -1054,8 +1054,9 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 step.args
                     .as_ref()
                     .map(|args| {
-                        args.iter()
-                            .any(|a| a.contains("{{bundle_text}}") || a.contains("{{bundle_text|json}}"))
+                        args.iter().any(|a| {
+                            a.contains("{{bundle_text}}") || a.contains("{{bundle_text|json}}")
+                        })
                     })
                     .unwrap_or(false)
             });

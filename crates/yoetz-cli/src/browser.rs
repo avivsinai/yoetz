@@ -404,7 +404,12 @@ fn run_recipe_with_connection(
                 headed,
             )?;
             let trimmed = result.trim().trim_matches('"');
-            if !trimmed.is_empty() && trimmed != "false" && trimmed != "0" && trimmed != "null" && trimmed != "undefined" {
+            if !trimmed.is_empty()
+                && trimmed != "false"
+                && trimmed != "0"
+                && trimmed != "null"
+                && trimmed != "undefined"
+            {
                 continue;
             }
         }
@@ -451,13 +456,9 @@ fn run_recipe_with_connection(
         }
 
         if action == CHATGPT_WAIT_UPLOAD_ACTION {
-            let stdout = run_chatgpt_wait_upload(
-                step.args.as_deref(),
-                connection,
-                ctx.use_stealth,
-                headed,
-            )
-            .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+            let stdout =
+                run_chatgpt_wait_upload(step.args.as_deref(), connection, ctx.use_stealth, headed)
+                    .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
 
             if wants_json || wants_jsonl {
                 let stdout_value =
@@ -678,9 +679,7 @@ fn run_chatgpt_wait_upload(
 
         match status {
             "done" => {
-                return Ok(
-                    json!({"status": "ok", "polls": attempt}).to_string(),
-                );
+                return Ok(json!({"status": "ok", "polls": attempt}).to_string());
             }
             "no_tile" if attempt > 5 => {
                 return Err(anyhow!("file tile never appeared after {attempt} polls"));
