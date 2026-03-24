@@ -31,7 +31,7 @@ yoetz/
 │       ├── providers/
 │       │   ├── openai.rs     # OpenAI/OpenRouter API client
 │       │   └── gemini.rs     # Google Gemini API client
-│       ├── browser.rs        # Browser automation (Playwright)
+│       ├── browser.rs        # Browser automation (CDP via agent-browser)
 │       ├── budget.rs         # Daily spend tracking (file-based)
 │       ├── registry.rs       # Runtime model resolution
 │       └── http.rs           # Shared HTTP utilities
@@ -71,9 +71,9 @@ This enables replay, debugging, and the `apply` command for code review suggesti
 
 Daily spend is tracked in a local JSON file. The `--max-cost-usd` flag estimates cost before sending (using the pricing registry) and aborts if over budget. `--daily-budget-usd` accumulates across commands.
 
-### Browser Fallback
+### Browser Mode
 
-For models without API access (e.g., ChatGPT Pro), yoetz bundles files into markdown, then drives a Playwright browser with extracted Chrome cookies to submit the bundle through the web UI. This is experimental and fragile by nature.
+For models without API access (e.g., ChatGPT Pro), yoetz bundles files into markdown, then connects to the user's running Chrome via CDP (Chrome DevTools Protocol) using agent-browser to submit the bundle through the web UI. Connection priority: explicit CDP endpoint > auto-connect > cookie state > profile fallback. Chrome 146+ requires a one-time "Allow remote debugging?" approval; the daemon keeps the connection alive across recipe steps.
 
 ## Data Flow
 

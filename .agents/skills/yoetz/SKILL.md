@@ -90,9 +90,9 @@ yoetz models list -s claude --format json
 | Bundle files | `yoetz bundle -p "context" -f src/**/*.rs --format json` |
 | Generate image | `yoetz generate image -p "description" --provider openai --model MODEL_ID --format json` |
 | Estimate cost | `yoetz pricing estimate --model MODEL_ID --input-tokens 1000 --output-tokens 500` |
-| Browser login | `yoetz browser login` |
 | Browser check | `yoetz browser check` |
-| Browser cookie sync | `yoetz browser sync-cookies` |
+| Browser attach | `yoetz browser attach` |
+| Browser login | `yoetz browser login` |
 
 **Replace MODEL_ID with IDs from `yoetz models frontier` or `yoetz models resolve`.**
 
@@ -168,58 +168,62 @@ BUNDLE=$(yoetz bundle -p "Review" -f src/*.rs --format json | jq -r .artifacts.b
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 ```
 
-## Browser Fallback (Experimental)
+## Browser Mode
 
-For web-only models like ChatGPT Pro that lack API access. Uses Oracle-style cookie extraction from real Chrome to bypass Cloudflare challenges.
+For web-only models like ChatGPT Pro that lack API access. Connects to your running Chrome via CDP (Chrome DevTools Protocol) to submit bundles through the web UI.
 
 ### Prerequisites
 
 ```bash
-# Node >=24.4 required for Chrome cookie sync. agent-browser is auto-resolved via npx if not in PATH.
-# Homebrew and GitHub release installs bundle the cookie extractor dependency.
-# If you're running from a source checkout, install it once:
-npm ci --prefix scripts
+# agent-browser is auto-resolved via npx if not in PATH.
+# For faster startup, install globally:
+npm install -g agent-browser
 ```
 
-### Profile location
+### How connection works
 
-Default profile dir: `~/.config/yoetz/browser-profile/`
+yoetz connects to your already logged-in Chrome session via auto-connect (CDP). No cookie extraction or separate browser needed.
 
-Override per machine:
-```bash
-export YOETZ_BROWSER_PROFILE=/path/to/profile
-```
+**Connection priority:** explicit `--cdp` > auto-connect > cookie state > profile fallback.
 
 ### First-time setup
 
-**Step 1: Log into ChatGPT in real Chrome**
-1. Open Chrome (the real browser, not Playwright)
-2. Navigate to https://chatgpt.com/
-3. Log in with your account
-4. Close Chrome completely
+**Step 1: Enable remote debugging in Chrome**
+1. Open Chrome and go to `chrome://inspect/#remote-debugging`
+2. Ensure "Discover network targets" is enabled
 
-**Step 2: Sync cookies to agent-browser**
+**Step 2: Run a recipe**
 ```bash
-yoetz browser sync-cookies
+BUNDLE=$(yoetz bundle -p "Review" -f src/*.rs --format json | jq -r .artifacts.bundle_md)
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 ```
 
-This extracts your authenticated cookies from Chrome and saves them for agent-browser.
-State file is stored at `~/.config/yoetz/browser-profile/state.json` (or your overridden profile path).
-If macOS shows a Keychain prompt for `Chrome Safe Storage`, click `Always Allow`.
+**Step 3: Approve remote debugging (Chrome 146+)**
+Chrome 146+ shows an "Allow remote debugging?" dialog on the first connection. Click **Allow** once — the daemon keeps the connection alive for subsequent runs.
 
-**Step 3: Verify authentication**
+**Step 4: Verify connection**
 ```bash
-yoetz browser check
+yoetz browser attach
 ```
 
-### Re-sync when sessions expire
+### Chrome 146+ notes
 
-If you see Cloudflare challenges or login prompts, re-sync:
+Chrome 146 introduced a security dialog for external CDP connections. yoetz handles this automatically:
+- Detects the dialog and tells you to click Allow (instead of hanging)
+- Reuses healthy daemon connections (no repeated dialogs)
+- Cleans up stale daemons when the connection breaks
+
+If you see "Allow remote debugging?" in Chrome, click Allow and retry.
+
+### Cookie sync (legacy fallback)
+
+If auto-connect isn't available, cookie sync is still supported:
 ```bash
 # Log into ChatGPT in real Chrome, close Chrome, then:
 yoetz browser sync-cookies
 yoetz browser check
 ```
+Requires Node >= 24.4. If macOS shows a Keychain prompt for `Chrome Safe Storage`, click `Always Allow`.
 
 ### Use ChatGPT Pro via recipe
 
@@ -264,12 +268,13 @@ Built-in recipes: `chatgpt`, `claude`, `gemini`.
 
 | Symptom | Fix |
 |---------|-----|
-| `extract-cookies.mjs not found` | Reinstall yoetz so the bundled browser scripts are present |
-| `cookie extraction failed` | Ensure Node >= 24.4, and if you're running from a source checkout run `npm ci --prefix scripts`. Then log into ChatGPT in real Chrome, close Chrome, and if macOS shows a `Chrome Safe Storage` prompt click `Always Allow` |
-| `cloudflare challenge detected` | Re-sync: log into ChatGPT in Chrome, close Chrome, `yoetz browser sync-cookies` |
-| `chatgpt login required` | Run `yoetz browser login` for manual auth, or sync cookies |
+| `Allow remote debugging?` dialog | Click **Allow** in Chrome, then retry. This is a one-time Chrome 146+ security prompt. |
+| `auto-connect probe timed out` | Chrome dialog is showing — click Allow. Or install agent-browser globally: `npm install -g agent-browser` |
+| `chatgpt login required` | Chrome was reached but not logged into ChatGPT. Log into ChatGPT in that Chrome session, then retry. Or use `yoetz browser login` for manual auth. |
+| `daemon already running` | Run `yoetz browser attach` to check connection, or kill stale daemon: `agent-browser close` |
 | `agent-browser failed` | Ensure `npx agent-browser --version` works, or `npm install -g agent-browser` |
 | Recipe not found | Use `--recipe chatgpt` (name) or full path. Check `brew --prefix`/share/yoetz/recipes/ |
+| `cookie extraction failed` | Legacy path: ensure Node >= 24.4, log into ChatGPT in Chrome, close Chrome, `yoetz browser sync-cookies` |
 
 ### Claude-in-Chrome MCP Fallback
 
@@ -289,11 +294,11 @@ This bypasses agent-browser entirely and works with any browser-based LLM the us
 
 ### How it works
 
-The browser module uses stealth techniques to avoid Cloudflare detection:
-- Extracts real cookies from Chrome's encrypted cookie store
-- Injects them into Playwright via `--state`
-- Uses realistic User-Agent headers
-- Disables automation detection flags (`--disable-blink-features=AutomationControlled`)
+The browser module connects to your running Chrome via CDP (Chrome DevTools Protocol):
+- **Auto-connect** (primary): attaches to Chrome's remote debugging port, reuses your logged-in session
+- **Cookie sync** (fallback): extracts cookies from Chrome's encrypted store, injects into agent-browser
+- Uses stealth User-Agent headers and disables automation detection flags
+- Daemon model: one persistent connection per session, reused across recipe steps
 
 ## Provider Configuration
 
