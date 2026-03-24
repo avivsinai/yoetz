@@ -849,23 +849,34 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             // If --cdp explicitly passed, try CDP first (login is conservative:
             // no auto-discovery unless user explicitly requests it)
             if let Some(ref cdp_url) = login_args.cdp {
-                if browser::try_cdp_attach(cdp_url, "https://chatgpt.com/").is_ok() {
-                    let payload = json!({
-                        "status": "ok",
-                        "method": "cdp_explicit",
-                        "endpoint": cdp_url,
-                        "profile": profile_dir.to_string_lossy(),
-                    });
-                    return match format {
-                        OutputFormat::Json => write_json(&payload),
-                        OutputFormat::Jsonl => write_jsonl("browser.login", &payload),
-                        OutputFormat::Text | OutputFormat::Markdown => {
-                            println!("Authenticated via CDP: {cdp_url}");
-                            Ok(())
+                match browser::try_cdp_attach(cdp_url, "https://chatgpt.com/") {
+                    Ok(()) => {
+                        let payload = json!({
+                            "status": "ok",
+                            "method": "cdp_explicit",
+                            "endpoint": cdp_url,
+                            "profile": profile_dir.to_string_lossy(),
+                        });
+                        return match format {
+                            OutputFormat::Json => write_json(&payload),
+                            OutputFormat::Jsonl => write_jsonl("browser.login", &payload),
+                            OutputFormat::Text | OutputFormat::Markdown => {
+                                println!("Authenticated via CDP: {cdp_url}");
+                                Ok(())
+                            }
+                        };
+                    }
+                    Err(_) => {
+                        let recovery = browser::force_kill_stale_daemon();
+                        if matches!(recovery, browser::DaemonRecoveryAction::AwaitingApproval) {
+                            eprintln!(
+                                "hint: Chrome may be showing an \"Allow remote debugging?\" dialog. \
+                                 Click Allow, then retry."
+                            );
                         }
-                    };
+                        eprintln!("CDP attach to {cdp_url} failed, falling back to cookie sync.");
+                    }
                 }
-                eprintln!("CDP attach to {cdp_url} failed, falling back to cookie sync.");
             }
 
             let mut used_cookie_sync = false;
@@ -944,7 +955,17 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 check_args.cdp.as_deref(),
                 &profile_dir,
                 "https://chatgpt.com/",
-            )?;
+            )
+            .map_err(|e| {
+                let recovery = browser::force_kill_stale_daemon();
+                if matches!(recovery, browser::DaemonRecoveryAction::AwaitingApproval) {
+                    return anyhow::anyhow!(
+                        "Chrome may be showing an \"Allow remote debugging?\" dialog. \
+                         Click Allow, then retry.\n\nOriginal error: {e}"
+                    );
+                }
+                e
+            })?;
             let method = match &connection {
                 browser::BrowserConnection::Cdp { endpoint } => format!("cdp: {endpoint}"),
                 browser::BrowserConnection::AutoConnect => "auto_connect".to_string(),
@@ -1025,7 +1046,17 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     match browser::try_cdp_attach(&endpoint, browser::CHATGPT_URL) {
                         Ok(()) => Some(browser::BrowserConnection::Cdp { endpoint }),
                         Err(e) => {
+                            let recovery = browser::force_kill_stale_daemon();
                             if recipe_args.cdp.is_some() {
+                                if matches!(
+                                    recovery,
+                                    browser::DaemonRecoveryAction::AwaitingApproval
+                                ) {
+                                    return Err(anyhow::anyhow!(
+                                        "Chrome may be showing an \"Allow remote debugging?\" \
+                                         dialog. Click Allow, then retry."
+                                    ));
+                                }
                                 return Err(e.context("explicit --cdp failed; not falling back"));
                             }
                             None
@@ -1107,36 +1138,58 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 browser::resolve_cdp_endpoint(attach_args.cdp.as_deref(), &ctx.config);
 
             if let Some(ref endpoint) = cdp_endpoint {
-                if browser::try_cdp_attach(endpoint, "https://chatgpt.com/").is_ok() {
+                match browser::try_cdp_attach(endpoint, "https://chatgpt.com/") {
+                    Ok(()) => {
+                        let payload = json!({
+                            "status": "ok",
+                            "method": "cdp_explicit",
+                            "endpoint": endpoint,
+                        });
+                        return match format {
+                            OutputFormat::Json => write_json(&payload),
+                            OutputFormat::Jsonl => write_jsonl("browser.attach", &payload),
+                            OutputFormat::Text | OutputFormat::Markdown => {
+                                println!("Attached via CDP: {endpoint}");
+                                Ok(())
+                            }
+                        };
+                    }
+                    Err(_) => {
+                        let recovery = browser::force_kill_stale_daemon();
+                        if matches!(recovery, browser::DaemonRecoveryAction::AwaitingApproval) {
+                            return Err(anyhow!(
+                                "Chrome may be showing an \"Allow remote debugging?\" dialog. \
+                                 Click Allow, then retry."
+                            ));
+                        }
+                    }
+                }
+            }
+
+            match browser::try_auto_connect("https://chatgpt.com/") {
+                Ok(()) => {
                     let payload = json!({
                         "status": "ok",
-                        "method": "cdp_explicit",
-                        "endpoint": endpoint,
+                        "method": "auto_connect",
                     });
                     return match format {
                         OutputFormat::Json => write_json(&payload),
                         OutputFormat::Jsonl => write_jsonl("browser.attach", &payload),
                         OutputFormat::Text | OutputFormat::Markdown => {
-                            println!("Attached via CDP: {endpoint}");
+                            println!("Attached via Chrome auto-connect");
                             Ok(())
                         }
                     };
                 }
-            }
-
-            if browser::try_auto_connect("https://chatgpt.com/").is_ok() {
-                let payload = json!({
-                    "status": "ok",
-                    "method": "auto_connect",
-                });
-                return match format {
-                    OutputFormat::Json => write_json(&payload),
-                    OutputFormat::Jsonl => write_jsonl("browser.attach", &payload),
-                    OutputFormat::Text | OutputFormat::Markdown => {
-                        println!("Attached via Chrome auto-connect");
-                        Ok(())
+                Err(_) => {
+                    let recovery = browser::force_kill_stale_daemon();
+                    if matches!(recovery, browser::DaemonRecoveryAction::AwaitingApproval) {
+                        return Err(anyhow!(
+                            "Chrome may be showing an \"Allow remote debugging?\" dialog. \
+                             Click Allow, then retry."
+                        ));
                     }
-                };
+                }
             }
 
             Err(anyhow!(
