@@ -33,6 +33,7 @@ const CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT: u64 = 10_000;
 const CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT: usize = 30;
 const CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT: u64 = 1_000;
 const DAEMON_APPROVAL_GRACE_WINDOW: Duration = Duration::from_secs(30);
+const LIVE_ATTACH_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const CDP_SESSION_NAME: &str = "yoetz-cdp";
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
@@ -111,13 +112,14 @@ impl BrowserConnection {
 static AGENT_BROWSER: OnceLock<Result<(String, Vec<String>), String>> = OnceLock::new();
 
 /// Returns (program, extra_prefix_args) for launching agent-browser.
-/// Checks YOETZ_AGENT_BROWSER_BIN env, then PATH, then falls back to npx.
-/// Result is cached for the lifetime of the process.
+/// Checks YOETZ_AGENT_BROWSER_BIN on every call, then falls back to a cached
+/// PATH/npx probe for the lifetime of the process.
 fn resolve_agent_browser() -> Result<(String, Vec<String>)> {
+    if let Ok(bin) = env::var("YOETZ_AGENT_BROWSER_BIN") {
+        return Ok((bin, vec![]));
+    }
+
     let cached = AGENT_BROWSER.get_or_init(|| {
-        if let Ok(bin) = env::var("YOETZ_AGENT_BROWSER_BIN") {
-            return Ok((bin, vec![]));
-        }
         // Check if agent-browser is in PATH
         if Command::new("agent-browser")
             .arg("--version")
@@ -1438,7 +1440,9 @@ pub fn try_cdp_attach(endpoint: &str, target_url: &str) -> Result<()> {
         endpoint: endpoint.to_string(),
     };
     verify_auth_cdp(target_url, &connection).map_err(|e| {
-        if is_localhost_endpoint(endpoint) {
+        if allow_dialog_error(&e) {
+            e
+        } else if is_localhost_endpoint(endpoint) {
             e.context(chrome136_cdp_warning(endpoint))
         } else {
             e
@@ -1494,6 +1498,9 @@ fn chrome136_cdp_warning(endpoint: &str) -> String {
 }
 
 pub fn try_auto_connect(target_url: &str) -> Result<()> {
+    if is_daemon_healthy() {
+        return Ok(());
+    }
     let connection = BrowserConnection::AutoConnect;
     verify_auth_cdp(target_url, &connection)
 }
@@ -1572,7 +1579,13 @@ pub fn verify_auth_cdp(target_url: &str, connection: &BrowserConnection) -> Resu
             "verify_auth_cdp requires a live browser connection"
         ));
     }
-    check_auth_with_connection(connection, /* headed */ false, target_url)
+    check_auth_with_connection_timeout(
+        connection,
+        /* headed */ false,
+        target_url,
+        Some(LIVE_ATTACH_COMMAND_TIMEOUT_MS),
+    )
+    .map_err(rewrite_live_attach_timeout)
 }
 
 pub fn resolve_auth(profile_dir: &Path, headed: bool) -> Result<BrowserConnection> {
@@ -1599,6 +1612,18 @@ fn check_auth_with_connection(
     headed: bool,
     target_url: &str,
 ) -> Result<()> {
+    let command_timeout_ms = connection
+        .is_live_attach()
+        .then_some(LIVE_ATTACH_COMMAND_TIMEOUT_MS);
+    check_auth_with_connection_timeout(connection, headed, target_url, command_timeout_ms)
+}
+
+fn check_auth_with_connection_timeout(
+    connection: &BrowserConnection,
+    headed: bool,
+    target_url: &str,
+    command_timeout_ms: Option<u64>,
+) -> Result<()> {
     if !connection.is_live_attach() {
         let _ = close_browser_for_connection(connection);
     }
@@ -1609,25 +1634,18 @@ fn check_auth_with_connection(
     } else {
         vec!["open".to_string(), target_url.to_string()]
     };
-    // Use a bounded timeout for the initial open so this doesn't hang
-    // if Chrome shows a "Allow remote debugging?" dialog (Chrome 146+).
-    let open_timeout = if connection.is_live_attach() {
-        Some(LIVE_ATTACH_AUTH_CHECK_TIMEOUT_MS)
-    } else {
-        None
-    };
     let _ = run_agent_browser_with_connection_timeout(
         open_args,
         OutputFormat::Text,
         Some(connection),
         use_stealth,
         current_headed,
-        open_timeout,
+        command_timeout_ms,
     )?;
     let deadline = Instant::now() + Duration::from_millis(auth_check_timeout_ms(connection));
     let mut last_issue: Option<&'static str>;
     loop {
-        let snapshot = run_agent_browser_with_connection(
+        let snapshot = run_agent_browser_with_connection_timeout(
             vec![
                 "snapshot".to_string(),
                 "-c".to_string(),
@@ -1637,6 +1655,7 @@ fn check_auth_with_connection(
             Some(connection),
             use_stealth,
             current_headed,
+            command_timeout_ms,
         )?;
 
         if is_challenge_page(&snapshot)
@@ -1673,6 +1692,25 @@ fn check_auth_with_connection(
         "auth check timed out without confirming authentication. \
          The page may still be loading. Try again or run `yoetz browser login`."
     ))
+}
+
+fn looks_like_timeout(err: &anyhow::Error) -> bool {
+    let message = err.to_string().to_lowercase();
+    message.contains("timed out") || message.contains("timeout")
+}
+
+fn allow_dialog_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("Allow remote debugging")
+}
+
+fn rewrite_live_attach_timeout(err: anyhow::Error) -> anyhow::Error {
+    if !looks_like_timeout(&err) {
+        return err;
+    }
+    anyhow!(
+        "live browser attach timed out ({}s). Chrome may be showing an \"Allow remote debugging?\" dialog — please click Allow in Chrome, then retry.",
+        LIVE_ATTACH_COMMAND_TIMEOUT_MS / 1000
+    )
 }
 
 fn auth_check_timeout_ms(connection: &BrowserConnection) -> u64 {
@@ -2009,12 +2047,47 @@ fn parse_recipe_var(entry: &str) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock as TestOnceLock};
+    use std::ffi::OsString;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard, OnceLock as TestOnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn env_lock() -> &'static Mutex<()> {
         static LOCK: TestOnceLock<Mutex<()>> = TestOnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        env_lock().lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set<K>(key: &'static str, value: K) -> Self
+        where
+            K: AsRef<std::ffi::OsStr>,
+        {
+            let original = env::var_os(key);
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { env::set_var(self.key, value) },
+                None => unsafe { env::remove_var(self.key) },
+            }
+        }
     }
 
     fn recipe_context() -> RecipeContext {
@@ -2041,11 +2114,18 @@ mod tests {
 
     #[cfg(unix)]
     fn unique_unix_socket_dir(label: &str) -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let dir = PathBuf::from("/tmp").join(format!("ytz_{label}_{}", nanos % 1_000_000));
+        let unique_id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let dir = PathBuf::from("/tmp").join(format!(
+            "ytz_{label}_{:x}_{:x}_{:x}",
+            std::process::id(),
+            nanos,
+            unique_id
+        ));
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -2096,8 +2176,23 @@ mod tests {
             let bin = command_path(&dir, "fake-agent-browser-auth");
             write_executable_script(
                 &bin,
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LOG_PATH\"\ncase \"$*\" in\n  *snapshot*) printf '{\"text\":\"ChatGPT - New chat\"}' ;;\nesac\n",
-                "@echo off\r\necho %*>> \"%LOG_PATH%\"\r\necho %* | findstr /c:\"snapshot\" >nul\r\nif %errorlevel%==0 echo {\"text\":\"ChatGPT - New chat\"}\r\n",
+                "#!/bin/sh\nprintf 'timeout=%s args=%s\\n' \"$AGENT_BROWSER_DEFAULT_TIMEOUT\" \"$*\" >> \"$LOG_PATH\"\ncase \"$*\" in\n  *snapshot*) printf '{\"text\":\"ChatGPT - New chat\"}' ;;\nesac\n",
+                "@echo off\r\necho timeout=%AGENT_BROWSER_DEFAULT_TIMEOUT% args=%*>> \"%LOG_PATH%\"\r\necho %* | findstr /c:\"snapshot\" >nul\r\nif %errorlevel%==0 echo {\"text\":\"ChatGPT - New chat\"}\r\n",
+            );
+            bin
+        })
+        .clone()
+    }
+
+    fn fake_agent_browser_timeout_bin() -> PathBuf {
+        static BIN: TestOnceLock<PathBuf> = TestOnceLock::new();
+        BIN.get_or_init(|| {
+            let dir = unique_test_dir("fake_agent_browser_timeout");
+            let bin = command_path(&dir, "fake-agent-browser-timeout");
+            write_executable_script(
+                &bin,
+                "#!/bin/sh\nprintf 'timed out waiting for Chrome approval\\n' >&2\nexit 1\n",
+                "@echo off\r\necho timed out waiting for Chrome approval 1>&2\r\nexit /b 1\r\n",
             );
             bin
         })
@@ -2195,10 +2290,8 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn resolve_cdp_endpoint_prefers_flag_then_env_then_config() {
-        let _guard = env_lock().lock().unwrap();
-        unsafe {
-            env::set_var("YOETZ_BROWSER_CDP", "http://127.0.0.1:9000");
-        }
+        let _guard = lock_env();
+        let _cdp_env = EnvVarGuard::set("YOETZ_BROWSER_CDP", "http://127.0.0.1:9000");
         let mut config = Config::default();
         config.defaults.browser_cdp = Some("http://127.0.0.1:9222".to_string());
 
@@ -2459,14 +2552,12 @@ mod tests {
     #[test]
     #[allow(unsafe_code)]
     fn close_browser_for_connection_uses_expected_close_mode() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let log_dir = unique_test_dir("close_browser");
         let log_path = log_dir.join("agent-browser.log");
         let bin = fake_agent_browser_bin();
-        unsafe {
-            env::set_var("YOETZ_AGENT_BROWSER_BIN", &bin);
-            env::set_var("LOG_PATH", &log_path);
-        }
+        let _bin_env = EnvVarGuard::set("YOETZ_AGENT_BROWSER_BIN", &bin);
+        let _log_env = EnvVarGuard::set("LOG_PATH", &log_path);
 
         let live_cases = [
             BrowserConnection::AutoConnect,
@@ -2505,23 +2596,17 @@ mod tests {
                 "managed close should not use the live-attach session: `{logged}`"
             );
         }
-
-        unsafe {
-            env::remove_var("LOG_PATH");
-        }
     }
 
     #[test]
     #[allow(unsafe_code)]
     fn check_auth_with_connection_skips_close_for_live_attach() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let log_dir = unique_test_dir("check_auth_live_attach");
         let log_path = log_dir.join("agent-browser.log");
         let bin = fake_agent_browser_auth_bin();
-        unsafe {
-            env::set_var("YOETZ_AGENT_BROWSER_BIN", &bin);
-            env::set_var("LOG_PATH", &log_path);
-        }
+        let _bin_env = EnvVarGuard::set("YOETZ_AGENT_BROWSER_BIN", &bin);
+        let _log_env = EnvVarGuard::set("LOG_PATH", &log_path);
 
         check_auth_with_connection(&BrowserConnection::AutoConnect, false, CHATGPT_URL).unwrap();
 
@@ -2535,13 +2620,13 @@ mod tests {
             "expected live-attach snapshot, got `{logged}`"
         );
         assert!(
+            logged.contains("timeout=30000"),
+            "expected bounded live-attach timeout in logged commands, got `{logged}`"
+        );
+        assert!(
             !logged.contains(" close"),
             "live-attach auth check should not close the daemon/session: `{logged}`"
         );
-
-        unsafe {
-            env::remove_var("LOG_PATH");
-        }
     }
 
     #[cfg(unix)]
@@ -2592,10 +2677,63 @@ mod tests {
         let _ = child.wait();
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[allow(unsafe_code)]
+    fn try_auto_connect_reuses_healthy_daemon() {
+        use std::os::unix::net::UnixListener;
+
+        let _guard = lock_env();
+        let home_dir = unique_unix_socket_dir("auto_connect_home");
+        let ab_dir = home_dir.join(".agent-browser");
+        fs::create_dir_all(&ab_dir).unwrap();
+        let sock_path = ab_dir.join("default.sock");
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+
+        let log_dir = unique_test_dir("auto_connect_log");
+        let log_path = log_dir.join("agent-browser.log");
+        let bin = fake_agent_browser_bin();
+        let _home_env = EnvVarGuard::set("HOME", &home_dir);
+        let _bin_env = EnvVarGuard::set("YOETZ_AGENT_BROWSER_BIN", &bin);
+        let _log_env = EnvVarGuard::set("LOG_PATH", &log_path);
+
+        try_auto_connect(CHATGPT_URL).unwrap();
+
+        let logged = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            logged.is_empty(),
+            "healthy daemon should short-circuit without invoking agent-browser, got `{logged}`"
+        );
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn try_auto_connect_surfaces_allow_dialog_timeout() {
+        let _guard = lock_env();
+        let bin = fake_agent_browser_timeout_bin();
+        let home_dir = unique_test_dir("auto_connect_timeout_home");
+        let _home_env = EnvVarGuard::set("HOME", &home_dir);
+        let _bin_env = EnvVarGuard::set("YOETZ_AGENT_BROWSER_BIN", &bin);
+
+        let err = try_auto_connect(CHATGPT_URL).unwrap_err();
+        assert!(allow_dialog_error(&err), "unexpected error: {err}");
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn try_cdp_attach_surfaces_allow_dialog_timeout() {
+        let _guard = lock_env();
+        let bin = fake_agent_browser_timeout_bin();
+        let _bin_env = EnvVarGuard::set("YOETZ_AGENT_BROWSER_BIN", &bin);
+
+        let err = try_cdp_attach("http://127.0.0.1:9222", CHATGPT_URL).unwrap_err();
+        assert!(allow_dialog_error(&err), "unexpected error: {err}");
+    }
+
     #[test]
     #[allow(unsafe_code)]
     fn sync_cookies_errors_on_invalid_json_output() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = lock_env();
         let dir = unique_test_dir("fake_node");
         let fake_node = command_path(&dir, "node");
         write_executable_script(
@@ -2623,22 +2761,12 @@ mod tests {
             .collect();
         let new_path = env::join_paths(path_entries).unwrap();
 
-        unsafe {
-            env::set_var("PATH", &new_path);
-            env::set_var("YOETZ_SCRIPTS_DIR", &scripts_dir);
-        }
+        let _path_env = EnvVarGuard::set("PATH", &new_path);
+        let _scripts_env = EnvVarGuard::set("YOETZ_SCRIPTS_DIR", &scripts_dir);
 
         let profile_dir = dir.join("profile");
         let err = sync_cookies(&profile_dir).unwrap_err();
         assert!(err.to_string().contains("invalid JSON"));
-
-        match original_path {
-            Some(path) => unsafe { env::set_var("PATH", path) },
-            None => unsafe { env::remove_var("PATH") },
-        }
-        unsafe {
-            env::remove_var("YOETZ_SCRIPTS_DIR");
-        }
     }
 
     #[test]
