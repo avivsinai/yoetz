@@ -1031,10 +1031,30 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                             None
                         }
                     }
-                } else if browser::try_auto_connect_lite().is_ok() {
-                    Some(browser::BrowserConnection::AutoConnect)
                 } else {
-                    None
+                    match browser::try_auto_connect_lite() {
+                        Ok(()) => Some(browser::BrowserConnection::AutoConnect),
+                        Err(_) => {
+                            let recovery = browser::force_kill_stale_daemon();
+                            match recovery {
+                                browser::DaemonRecoveryAction::AwaitingApproval => {
+                                    // Chrome 146+: the dialog is likely showing.
+                                    // Don't fall back to profile — that would open
+                                    // a separate browser without the login session.
+                                    return Err(anyhow::anyhow!(
+                                        "Chrome may be showing an \"Allow remote debugging?\" dialog. \
+                                         Please click Allow in Chrome, then retry the recipe."
+                                    ));
+                                }
+                                _ => {
+                                    eprintln!(
+                                        "info: auto-connect unavailable, falling back to profile"
+                                    );
+                                    None
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 None

@@ -195,10 +195,10 @@ steps:
           return "sent";
         })()
 
-  # Poll in short bursts under the agent-browser IPC ceiling until the
-  # response completes.
+  # Poll in short bursts under the agent-browser IPC ceiling, with a hard
+  # overall cap so the recipe fails fast instead of idling for minutes.
   - action: chatgpt_wait_response
-    args: ["--attempts", "30", "--interval-ms", "15000"]
+    args: ["--attempts", "36", "--interval-ms", "5000", "--timeout-ms", "180000"]
     timeout_ms: 10000
 
   # Capture final state

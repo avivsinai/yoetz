@@ -4,12 +4,12 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Read as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use yoetz_core::config::Config;
 use yoetz_core::output::{write_json, write_jsonl_event, OutputFormat};
@@ -26,11 +26,13 @@ const LIVE_ATTACH_AUTH_CHECK_TIMEOUT_MS: u64 = 30_000;
 const AUTH_CHECK_POLL_MS: u64 = 500;
 const CHATGPT_WAIT_ACTION: &str = "chatgpt_wait_response";
 const CHATGPT_WAIT_UPLOAD_ACTION: &str = "chatgpt_wait_upload";
-const CHATGPT_POLL_ATTEMPTS_DEFAULT: usize = 30;
-const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 15_000;
+const CHATGPT_POLL_ATTEMPTS_DEFAULT: usize = 36;
+const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 5_000;
+const CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT: u64 = 180_000;
 const CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT: u64 = 10_000;
 const CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT: usize = 30;
 const CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT: u64 = 1_000;
+const DAEMON_APPROVAL_GRACE_WINDOW: Duration = Duration::from_secs(30);
 const CDP_SESSION_NAME: &str = "yoetz-cdp";
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
@@ -570,6 +572,7 @@ struct ChatgptDomState {
 struct ChatgptPollOptions {
     attempts: usize,
     interval_ms: u64,
+    timeout_ms: u64,
 }
 
 fn run_chatgpt_wait_response(
@@ -581,6 +584,8 @@ fn run_chatgpt_wait_response(
 ) -> Result<String> {
     let options = parse_chatgpt_poll_args(args)?;
     let command_timeout_ms = timeout_ms.unwrap_or(CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT);
+    let started_at = Instant::now();
+    let deadline = started_at + Duration::from_millis(options.timeout_ms);
     let baseline_snapshot =
         take_chatgpt_snapshot(connection, use_stealth, headed, command_timeout_ms)?;
     let baseline = normalize_snapshot_for_compare(&baseline_snapshot);
@@ -589,11 +594,23 @@ fn run_chatgpt_wait_response(
         has_stop_button: false,
         copy_button_count: 0,
     };
+    let mut completed_polls = 0usize;
+    let mut deadline_reached = false;
 
     for attempt in 1..=options.attempts {
-        thread::sleep(Duration::from_millis(options.interval_ms));
+        let now = Instant::now();
+        if now >= deadline {
+            deadline_reached = true;
+            break;
+        }
+        let remaining_ms = deadline
+            .saturating_duration_since(now)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        thread::sleep(Duration::from_millis(options.interval_ms.min(remaining_ms)));
 
         let snapshot = take_chatgpt_snapshot(connection, use_stealth, headed, command_timeout_ms)?;
+        completed_polls = attempt;
         if maybe_pause_for_captcha_challenge(connection, CHATGPT_URL, headed, Some(&snapshot))? {
             continue;
         }
@@ -611,6 +628,7 @@ fn run_chatgpt_wait_response(
                 "attempt": attempt,
                 "attempts": options.attempts,
                 "interval_ms": options.interval_ms,
+                "timeout_ms": options.timeout_ms,
                 "send_state": match dom.send_state {
                     ChatgptSendState::Enabled => "enabled",
                     ChatgptSendState::Disabled => "disabled",
@@ -623,10 +641,21 @@ fn run_chatgpt_wait_response(
         }
     }
 
+    if Instant::now() >= deadline {
+        deadline_reached = true;
+    }
+    let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let limit_reason = if deadline_reached {
+        format!("deadline={}ms", options.timeout_ms)
+    } else {
+        format!("attempt_limit={}", options.attempts)
+    };
+
     Err(anyhow!(
-        "timed out waiting for ChatGPT response after {} polls (~{}s). last_state: send={:?}, stop={}, copy_buttons={}",
-        options.attempts,
-        (options.attempts as u64 * options.interval_ms) / 1000,
+        "timed out waiting for ChatGPT response after {} polls (~{}s elapsed, {}). last_state: send={:?}, stop={}, copy_buttons={}",
+        completed_polls,
+        elapsed_ms / 1000,
+        limit_reason,
         last_dom.send_state,
         last_dom.has_stop_button,
         last_dom.copy_button_count
@@ -645,6 +674,8 @@ fn run_chatgpt_wait_upload(
     let options = parse_chatgpt_poll_args(args).unwrap_or(ChatgptPollOptions {
         attempts: CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT,
         interval_ms: CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT,
+        timeout_ms: CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT as u64
+            * CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT,
     });
 
     let check_script = r#"(() => {
@@ -741,6 +772,7 @@ fn parse_chatgpt_poll_args(args: Option<&[String]>) -> Result<ChatgptPollOptions
     let mut options = ChatgptPollOptions {
         attempts: CHATGPT_POLL_ATTEMPTS_DEFAULT,
         interval_ms: CHATGPT_POLL_INTERVAL_MS_DEFAULT,
+        timeout_ms: CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT,
     };
     let mut iter = args.unwrap_or_default().iter();
     while let Some(arg) = iter.next() {
@@ -761,6 +793,14 @@ fn parse_chatgpt_poll_args(args: Option<&[String]>) -> Result<ChatgptPollOptions
                     .parse()
                     .with_context(|| format!("invalid --interval-ms value `{raw}`"))?;
             }
+            "--timeout-ms" => {
+                let raw = iter
+                    .next()
+                    .ok_or_else(|| anyhow!("--timeout-ms requires a value"))?;
+                options.timeout_ms = raw
+                    .parse()
+                    .with_context(|| format!("invalid --timeout-ms value `{raw}`"))?;
+            }
             other => return Err(anyhow!("unsupported {CHATGPT_WAIT_ACTION} arg `{other}`")),
         }
     }
@@ -769,6 +809,9 @@ fn parse_chatgpt_poll_args(args: Option<&[String]>) -> Result<ChatgptPollOptions
     }
     if options.interval_ms == 0 {
         return Err(anyhow!("--interval-ms must be greater than 0"));
+    }
+    if options.timeout_ms == 0 {
+        return Err(anyhow!("--timeout-ms must be greater than 0"));
     }
     Ok(options)
 }
@@ -929,6 +972,14 @@ pub fn close_browser_for_connection(connection: &BrowserConnection) -> Result<()
     close_browser_daemon()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DaemonRecoveryAction {
+    NoSocket,
+    Healthy,
+    AwaitingApproval,
+    KilledStale,
+}
+
 fn close_browser_daemon() -> Result<()> {
     let (bin, prefix_args) = resolve_agent_browser()?;
     let mut cmd = Command::new(bin);
@@ -937,6 +988,110 @@ fn close_browser_daemon() -> Result<()> {
     // Give the daemon time to fully shutdown before starting new commands
     thread::sleep(Duration::from_millis(1000));
     Ok(())
+}
+
+fn default_daemon_paths() -> Option<(PathBuf, PathBuf)> {
+    let ab_dir = home_dir()?.join(".agent-browser");
+    Some((ab_dir.join("default.pid"), ab_dir.join("default.sock")))
+}
+
+#[cfg(unix)]
+fn is_daemon_socket_healthy(sock_path: &Path) -> bool {
+    use std::os::unix::net::UnixStream;
+
+    if !sock_path.exists() {
+        return false;
+    }
+    UnixStream::connect(sock_path).is_ok()
+}
+
+#[cfg(not(unix))]
+fn is_daemon_socket_healthy(_sock_path: &Path) -> bool {
+    false
+}
+
+pub fn is_daemon_healthy() -> bool {
+    let Some((_, sock_path)) = default_daemon_paths() else {
+        return false;
+    };
+    is_daemon_socket_healthy(&sock_path)
+}
+
+fn read_daemon_pid(pid_path: &Path) -> Option<u32> {
+    fs::read_to_string(pid_path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
+}
+
+#[cfg(unix)]
+fn process_is_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+#[cfg(not(unix))]
+fn process_is_alive(_pid: u32) -> bool {
+    false
+}
+
+fn socket_is_recent(sock_path: &Path, grace_window: Duration) -> bool {
+    let Ok(metadata) = fs::metadata(sock_path) else {
+        return false;
+    };
+    let Ok(modified) = metadata.modified() else {
+        return false;
+    };
+    let age = SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::ZERO);
+    age <= grace_window
+}
+
+fn force_kill_stale_daemon_with_paths(
+    pid_path: &Path,
+    sock_path: &Path,
+    grace_window: Duration,
+) -> DaemonRecoveryAction {
+    if !sock_path.exists() {
+        return DaemonRecoveryAction::NoSocket;
+    }
+    if is_daemon_socket_healthy(sock_path) {
+        return DaemonRecoveryAction::Healthy;
+    }
+
+    if let Some(pid) = read_daemon_pid(pid_path) {
+        if process_is_alive(pid) && socket_is_recent(sock_path, grace_window) {
+            return DaemonRecoveryAction::AwaitingApproval;
+        }
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+    }
+
+    let _ = fs::remove_file(pid_path);
+    let _ = fs::remove_file(sock_path);
+    // Brief pause for OS to reclaim resources
+    thread::sleep(Duration::from_millis(500));
+    DaemonRecoveryAction::KilledStale
+}
+
+/// Force-kill a stale agent-browser daemon by reading its PID file and sending
+/// SIGKILL. Used when the daemon socket is unresponsive and `agent-browser close`
+/// would hang. Only targets the "default" session.
+pub fn force_kill_stale_daemon() -> DaemonRecoveryAction {
+    let Some((pid_path, sock_path)) = default_daemon_paths() else {
+        return DaemonRecoveryAction::NoSocket;
+    };
+    let action =
+        force_kill_stale_daemon_with_paths(&pid_path, &sock_path, DAEMON_APPROVAL_GRACE_WINDOW);
+    if matches!(action, DaemonRecoveryAction::AwaitingApproval) {
+        eprintln!(
+            "warning: existing agent-browser daemon looks recent and may be waiting for Chrome's \"Allow remote debugging?\" dialog. Approve it in Chrome, then retry."
+        );
+    }
+    action
 }
 
 pub fn state_file(profile_dir: &Path) -> PathBuf {
@@ -1346,16 +1501,69 @@ pub fn try_auto_connect(target_url: &str) -> Result<()> {
 /// Lightweight auto-connect check: verifies Chrome is reachable via
 /// auto-connect without opening new tabs. Used by the recipe path where
 /// the recipe itself handles navigation and auth detection.
+///
+/// Returns immediately if an existing daemon is healthy. Otherwise spawns
+/// a bounded probe (15s timeout) so the CLI doesn't hang if Chrome shows
+/// a "Allow remote debugging?" dialog (Chrome 146+).
 pub fn try_auto_connect_lite() -> Result<()> {
+    if is_daemon_healthy() {
+        return Ok(());
+    }
     let connection = BrowserConnection::AutoConnect;
-    run_agent_browser_with_connection(
+    let (bin, prefix_args) = resolve_agent_browser()?;
+    let args = build_agent_browser_args(
         vec!["snapshot".to_string(), "-c".to_string()],
         OutputFormat::Text,
         Some(&connection),
         /* use_stealth */ false,
         /* headed */ false,
-    )?;
-    Ok(())
+    );
+    let mut all_args = prefix_args;
+    all_args.extend(args);
+
+    let mut child = Command::new(&bin)
+        .args(&all_args)
+        .env("AGENT_BROWSER_DEFAULT_TIMEOUT", "10000")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("failed to spawn agent-browser (via {bin})"))?;
+
+    let timeout = Duration::from_secs(15);
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(());
+                }
+                let stderr = child
+                    .stderr
+                    .as_mut()
+                    .map(|s| {
+                        let mut buf = String::new();
+                        let _ = s.read_to_string(&mut buf);
+                        buf
+                    })
+                    .unwrap_or_default();
+                return Err(anyhow!("auto-connect probe failed: {stderr}"));
+            }
+            Ok(None) => {
+                if start.elapsed() > timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(anyhow!(
+                        "auto-connect probe timed out ({}s). \
+                         Chrome may be showing an \"Allow remote debugging?\" dialog — \
+                         please click Allow in Chrome to authorize the connection",
+                        timeout.as_secs()
+                    ));
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => return Err(anyhow!("auto-connect probe error: {e}")),
+        }
+    }
 }
 
 pub fn verify_auth_cdp(target_url: &str, connection: &BrowserConnection) -> Result<()> {
@@ -1391,7 +1599,9 @@ fn check_auth_with_connection(
     headed: bool,
     target_url: &str,
 ) -> Result<()> {
-    let _ = close_browser_for_connection(connection);
+    if !connection.is_live_attach() {
+        let _ = close_browser_for_connection(connection);
+    }
     let mut current_headed = headed;
     let use_stealth = !connection.is_live_attach();
     let open_args = if connection.is_live_attach() {
@@ -1399,12 +1609,20 @@ fn check_auth_with_connection(
     } else {
         vec!["open".to_string(), target_url.to_string()]
     };
-    let _ = run_agent_browser_with_connection(
+    // Use a bounded timeout for the initial open so this doesn't hang
+    // if Chrome shows a "Allow remote debugging?" dialog (Chrome 146+).
+    let open_timeout = if connection.is_live_attach() {
+        Some(LIVE_ATTACH_AUTH_CHECK_TIMEOUT_MS)
+    } else {
+        None
+    };
+    let _ = run_agent_browser_with_connection_timeout(
         open_args,
         OutputFormat::Text,
         Some(connection),
         use_stealth,
         current_headed,
+        open_timeout,
     )?;
     let deadline = Instant::now() + Duration::from_millis(auth_check_timeout_ms(connection));
     let mut last_issue: Option<&'static str>;
@@ -1821,6 +2039,17 @@ mod tests {
         dir
     }
 
+    #[cfg(unix)]
+    fn unique_unix_socket_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = PathBuf::from("/tmp").join(format!("ytz_{label}_{}", nanos % 1_000_000));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     fn command_path(dir: &Path, name: &str) -> PathBuf {
         if cfg!(windows) {
             dir.join(format!("{name}.cmd"))
@@ -1854,6 +2083,21 @@ mod tests {
                 &bin,
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LOG_PATH\"\n",
                 "@echo off\r\necho %*>> \"%LOG_PATH%\"\r\n",
+            );
+            bin
+        })
+        .clone()
+    }
+
+    fn fake_agent_browser_auth_bin() -> PathBuf {
+        static BIN: TestOnceLock<PathBuf> = TestOnceLock::new();
+        BIN.get_or_init(|| {
+            let dir = unique_test_dir("fake_agent_browser_auth");
+            let bin = command_path(&dir, "fake-agent-browser-auth");
+            write_executable_script(
+                &bin,
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$LOG_PATH\"\ncase \"$*\" in\n  *snapshot*) printf '{\"text\":\"ChatGPT - New chat\"}' ;;\nesac\n",
+                "@echo off\r\necho %*>> \"%LOG_PATH%\"\r\necho %* | findstr /c:\"snapshot\" >nul\r\nif %errorlevel%==0 echo {\"text\":\"ChatGPT - New chat\"}\r\n",
             );
             bin
         })
@@ -2269,6 +2513,87 @@ mod tests {
 
     #[test]
     #[allow(unsafe_code)]
+    fn check_auth_with_connection_skips_close_for_live_attach() {
+        let _guard = env_lock().lock().unwrap();
+        let log_dir = unique_test_dir("check_auth_live_attach");
+        let log_path = log_dir.join("agent-browser.log");
+        let bin = fake_agent_browser_auth_bin();
+        unsafe {
+            env::set_var("YOETZ_AGENT_BROWSER_BIN", &bin);
+            env::set_var("LOG_PATH", &log_path);
+        }
+
+        check_auth_with_connection(&BrowserConnection::AutoConnect, false, CHATGPT_URL).unwrap();
+
+        let logged = fs::read_to_string(&log_path).unwrap_or_default();
+        assert!(
+            logged.contains("--auto-connect tab new"),
+            "expected live-attach tab open, got `{logged}`"
+        );
+        assert!(
+            logged.contains("--auto-connect snapshot -c --json"),
+            "expected live-attach snapshot, got `{logged}`"
+        );
+        assert!(
+            !logged.contains(" close"),
+            "live-attach auth check should not close the daemon/session: `{logged}`"
+        );
+
+        unsafe {
+            env::remove_var("LOG_PATH");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_socket_health_detects_responsive_listener() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = unique_unix_socket_dir("daemon_health_ok");
+        let sock_path = dir.join("default.sock");
+        let _listener = UnixListener::bind(&sock_path).unwrap();
+        assert!(is_daemon_socket_healthy(&sock_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_socket_health_rejects_stale_socket() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = unique_unix_socket_dir("daemon_health_stale");
+        let sock_path = dir.join("default.sock");
+        {
+            let _listener = UnixListener::bind(&sock_path).unwrap();
+        }
+        assert!(!is_daemon_socket_healthy(&sock_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_kill_stale_daemon_preserves_recent_live_process() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = unique_unix_socket_dir("daemon_grace");
+        let pid_path = dir.join("default.pid");
+        let sock_path = dir.join("default.sock");
+        {
+            let _listener = UnixListener::bind(&sock_path).unwrap();
+        }
+
+        let mut child = Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap();
+        fs::write(&pid_path, child.id().to_string()).unwrap();
+
+        let action =
+            force_kill_stale_daemon_with_paths(&pid_path, &sock_path, Duration::from_secs(30));
+        assert_eq!(action, DaemonRecoveryAction::AwaitingApproval);
+        assert!(process_is_alive(child.id()));
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
     fn sync_cookies_errors_on_invalid_json_output() {
         let _guard = env_lock().lock().unwrap();
         let dir = unique_test_dir("fake_node");
@@ -2324,6 +2649,7 @@ mod tests {
             ChatgptPollOptions {
                 attempts: CHATGPT_POLL_ATTEMPTS_DEFAULT,
                 interval_ms: CHATGPT_POLL_INTERVAL_MS_DEFAULT,
+                timeout_ms: CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT,
             }
         );
     }
@@ -2335,6 +2661,8 @@ mod tests {
             "12".to_string(),
             "--interval-ms".to_string(),
             "9000".to_string(),
+            "--timeout-ms".to_string(),
+            "42000".to_string(),
         ];
         let options = parse_chatgpt_poll_args(Some(&args)).unwrap();
         assert_eq!(
@@ -2342,6 +2670,7 @@ mod tests {
             ChatgptPollOptions {
                 attempts: 12,
                 interval_ms: 9000,
+                timeout_ms: 42000,
             }
         );
     }
@@ -2351,6 +2680,13 @@ mod tests {
         let args = vec!["--nope".to_string()];
         let err = parse_chatgpt_poll_args(Some(&args)).unwrap_err();
         assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn parse_chatgpt_poll_args_rejects_zero_timeout() {
+        let args = vec!["--timeout-ms".to_string(), "0".to_string()];
+        let err = parse_chatgpt_poll_args(Some(&args)).unwrap_err();
+        assert!(err.to_string().contains("--timeout-ms"));
     }
 
     #[test]
