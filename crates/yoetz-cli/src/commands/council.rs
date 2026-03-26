@@ -258,7 +258,7 @@ pub(crate) async fn handle_council(
         results = ordered.into_iter().flatten().collect();
     }
 
-    if budget_enabled {
+    if budget_enabled && !args.dry_run {
         let mut spend = 0.0;
         let mut has_spend = false;
         for r in &results {

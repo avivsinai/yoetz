@@ -111,6 +111,13 @@ impl BrowserConnection {
 /// Cached agent-browser resolution. Probed once per process, reused for all calls.
 static AGENT_BROWSER: OnceLock<Result<(String, Vec<String>), String>> = OnceLock::new();
 
+/// Returns true if dev-browser is the active browser backend.
+/// When dev-browser is available (installed or auto-installed), it is the
+/// preferred backend for all browser operations.
+pub fn use_dev_browser() -> bool {
+    crate::dev_browser::is_available()
+}
+
 /// Returns (program, extra_prefix_args) for launching agent-browser.
 /// Checks YOETZ_AGENT_BROWSER_BIN on every call, then falls back to a cached
 /// PATH/npx probe for the lifetime of the process.
@@ -1498,10 +1505,13 @@ fn chrome136_cdp_warning(endpoint: &str) -> String {
 }
 
 pub fn try_auto_connect(target_url: &str) -> Result<()> {
-    if is_daemon_healthy() {
-        return Ok(());
-    }
     let connection = BrowserConnection::AutoConnect;
+    if is_daemon_healthy() {
+        // Daemon is running, but still verify auth state on the target page
+        // to avoid false positives where the daemon is healthy but the
+        // browser session is not authenticated.
+        return verify_auth_cdp(target_url, &connection);
+    }
     verify_auth_cdp(target_url, &connection)
 }
 
@@ -2680,7 +2690,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[allow(unsafe_code)]
-    fn try_auto_connect_reuses_healthy_daemon() {
+    fn try_auto_connect_verifies_auth_even_with_healthy_daemon() {
         use std::os::unix::net::UnixListener;
 
         let _guard = lock_env();
@@ -2692,7 +2702,7 @@ mod tests {
 
         let log_dir = unique_test_dir("auto_connect_log");
         let log_path = log_dir.join("agent-browser.log");
-        let bin = fake_agent_browser_bin();
+        let bin = fake_agent_browser_auth_bin();
         let _home_env = EnvVarGuard::set("HOME", &home_dir);
         let _bin_env = EnvVarGuard::set("YOETZ_AGENT_BROWSER_BIN", &bin);
         let _log_env = EnvVarGuard::set("LOG_PATH", &log_path);
@@ -2701,8 +2711,12 @@ mod tests {
 
         let logged = fs::read_to_string(&log_path).unwrap_or_default();
         assert!(
-            logged.is_empty(),
-            "healthy daemon should short-circuit without invoking agent-browser, got `{logged}`"
+            logged.contains("--auto-connect tab new"),
+            "healthy daemon should still verify the target page, got `{logged}`"
+        );
+        assert!(
+            logged.contains("--auto-connect snapshot -c --json"),
+            "healthy daemon should still verify auth state, got `{logged}`"
         );
     }
 

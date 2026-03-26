@@ -161,7 +161,7 @@ async fn handle_review_diff(
         }
     }
 
-    if budget_enabled {
+    if budget_enabled && !args.dry_run {
         if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
             if let Some(reservation) = budget_reservation {
                 if let Err(e) = reservation.commit(spend) {
@@ -350,7 +350,7 @@ async fn handle_review_file(
         }
     }
 
-    if budget_enabled {
+    if budget_enabled && !args.dry_run {
         if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
             if let Some(reservation) = budget_reservation {
                 if let Err(e) = reservation.commit(spend) {

@@ -63,24 +63,35 @@ fn safe_image_get(client: &Client, url: &str, api_key: &str) -> RequestBuilder {
 /// Checks `Content-Length` up-front when available and also counts bytes during
 /// streaming to guard against servers that lie about (or omit) the header.
 async fn download_with_limit(resp: reqwest::Response, url: &str) -> Result<Vec<u8>> {
+    download_with_limit_sized(resp, url, MAX_MEDIA_DOWNLOAD_BYTES).await
+}
+
+/// Download a response body while enforcing a caller-specified byte limit.
+/// Checks `Content-Length` up-front when available and also counts bytes during
+/// streaming to guard against servers that lie about (or omit) the header.
+async fn download_with_limit_sized(
+    resp: reqwest::Response,
+    url: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
     if let Some(cl) = resp.content_length() {
-        if cl as usize > MAX_MEDIA_DOWNLOAD_BYTES {
+        if cl as usize > max_bytes {
             return Err(anyhow!(
                 "download from {} refused: Content-Length {} exceeds {} byte limit",
                 url,
                 cl,
-                MAX_MEDIA_DOWNLOAD_BYTES
+                max_bytes
             ));
         }
     }
     let mut buf = Vec::new();
     let mut stream = resp;
     while let Some(chunk) = stream.chunk().await? {
-        if buf.len() + chunk.len() > MAX_MEDIA_DOWNLOAD_BYTES {
+        if buf.len() + chunk.len() > max_bytes {
             return Err(anyhow!(
                 "download from {} aborted: exceeded {} byte limit",
                 url,
-                MAX_MEDIA_DOWNLOAD_BYTES
+                max_bytes
             ));
         }
         buf.extend_from_slice(&chunk);
@@ -481,13 +492,18 @@ pub async fn generate_video_sora(
         video_id
     );
 
-    let bytes = client
-        .get(content_url)
+    // Maximum download size for video files (500 MiB).
+    const MAX_VIDEO_DOWNLOAD_BYTES: usize = 500 * 1024 * 1024;
+
+    let resp = client
+        .get(&content_url)
         .bearer_auth(&auth.api_key)
         .send()
         .await?
-        .bytes()
-        .await?;
+        .error_for_status()
+        .with_context(|| format!("download video from {}", content_url))?;
+
+    let bytes = download_with_limit_sized(resp, &content_url, MAX_VIDEO_DOWNLOAD_BYTES).await?;
 
     std::fs::write(output_path, &bytes)
         .with_context(|| format!("write {}", output_path.display()))?;

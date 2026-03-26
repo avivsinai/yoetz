@@ -168,14 +168,36 @@ pub async fn generate_video_veo(
         ));
     }
 
+    // Maximum download size for video files (500 MiB).
+    const MAX_VIDEO_DOWNLOAD_BYTES: usize = 500 * 1024 * 1024;
+
     let bytes = match client
         .get(&uri)
         .header("x-goog-api-key", &auth.api_key)
         .send()
         .await
     {
-        Ok(resp) if resp.status().is_success() => resp.bytes().await?,
-        _ => client.get(&uri).send().await?.bytes().await?,
+        Ok(resp) => match resp.error_for_status() {
+            Ok(resp) => download_with_limit(resp, &uri, MAX_VIDEO_DOWNLOAD_BYTES).await?,
+            Err(_) => {
+                let resp = client
+                    .get(&uri)
+                    .send()
+                    .await?
+                    .error_for_status()
+                    .with_context(|| format!("download video from {}", uri))?;
+                download_with_limit(resp, &uri, MAX_VIDEO_DOWNLOAD_BYTES).await?
+            }
+        },
+        Err(_) => {
+            let resp = client
+                .get(&uri)
+                .send()
+                .await?
+                .error_for_status()
+                .with_context(|| format!("download video from {}", uri))?;
+            download_with_limit(resp, &uri, MAX_VIDEO_DOWNLOAD_BYTES).await?
+        }
     };
 
     std::fs::write(output_path, &bytes)
@@ -350,6 +372,39 @@ async fn upload_file(
         .ok_or_else(|| anyhow!("missing file uri"))?;
 
     Ok(uri.to_string())
+}
+
+/// Download a response body while enforcing a caller-specified byte limit.
+/// Checks `Content-Length` up-front when available and also counts bytes during
+/// streaming to guard against servers that lie about (or omit) the header.
+async fn download_with_limit(
+    resp: reqwest::Response,
+    url: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    if let Some(cl) = resp.content_length() {
+        if cl as usize > max_bytes {
+            return Err(anyhow!(
+                "download from {} refused: Content-Length {} exceeds {} byte limit",
+                url,
+                cl,
+                max_bytes
+            ));
+        }
+    }
+    let mut buf = Vec::new();
+    let mut stream = resp;
+    while let Some(chunk) = stream.chunk().await? {
+        if buf.len() + chunk.len() > max_bytes {
+            return Err(anyhow!(
+                "download from {} aborted: exceeded {} byte limit",
+                url,
+                max_bytes
+            ));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 fn extract_text(resp: &Value) -> String {
