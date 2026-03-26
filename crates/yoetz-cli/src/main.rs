@@ -1099,7 +1099,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     let bundle_text = recipe_args
                         .bundle
                         .as_ref()
-                        .map(|p| fs::read_to_string(p))
+                        .map(fs::read_to_string)
                         .transpose()?;
 
                     let recipe_ctx = dev_browser::DevBrowserRecipeContext {

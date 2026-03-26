@@ -332,10 +332,14 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
     // Stage the bundle file if provided (for attachment mode).
     // Use a unique prefix (PID + timestamp) to avoid collisions between
     // concurrent recipe runs.
-    let unique_prefix = format!("{}_{}", std::process::id(), std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis());
+    let unique_prefix = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
     let staged_name = if !ctx.paste_mode {
         if let Some(bundle_path) = &ctx.bundle_path {
             let content = fs::read_to_string(bundle_path)
