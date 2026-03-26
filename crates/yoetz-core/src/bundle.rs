@@ -55,7 +55,7 @@ fn has_glob_chars(s: &str) -> bool {
 
 /// Process a single file into a [`BundleFile`] entry.
 ///
-/// Returns `(BundleFile, content_bytes_consumed)`.
+/// Returns `(BundleFile, content_bytes_consumed, content_chars)`.
 fn process_file(
     path: &Path,
     display_path: String,
@@ -63,7 +63,7 @@ fn process_file(
     max_total_bytes: usize,
     current_total: usize,
     include_binary: bool,
-) -> Result<(BundleFile, usize)> {
+) -> Result<(BundleFile, usize, usize)> {
     let (data, sha256, file_size) = read_prefix_and_hash(path, max_file_bytes)
         .with_context(|| format!("read file {display_path}"))?;
     let truncated_by_size = file_size > max_file_bytes;
@@ -81,6 +81,7 @@ fn process_file(
                 content: None,
             },
             0,
+            0,
         ));
     }
 
@@ -90,6 +91,8 @@ fn process_file(
         truncated = true;
         content_len = content.as_ref().map(|c| c.len()).unwrap_or(0);
     }
+
+    let content_chars = content.as_ref().map(|c| c.chars().count()).unwrap_or(0);
 
     Ok((
         BundleFile {
@@ -101,6 +104,7 @@ fn process_file(
             content,
         },
         content_len,
+        content_chars,
     ))
 }
 
@@ -144,7 +148,7 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
             continue;
         }
         let display_path = file_path.to_string_lossy().to_string();
-        let (bf, consumed) = process_file(
+        let (bf, consumed_bytes, consumed_chars) = process_file(
             file_path,
             display_path,
             options.max_file_bytes,
@@ -152,8 +156,8 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
             total_bytes,
             options.include_binary,
         )?;
-        total_bytes += consumed;
-        total_chars += consumed;
+        total_bytes += consumed_bytes;
+        total_chars += consumed_chars;
         files.push(bf);
     }
 
@@ -196,7 +200,7 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
                 .to_string_lossy()
                 .to_string();
 
-            let (bf, consumed) = process_file(
+            let (bf, consumed_bytes, consumed_chars) = process_file(
                 path,
                 rel_path,
                 options.max_file_bytes,
@@ -204,8 +208,8 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
                 total_bytes,
                 options.include_binary,
             )?;
-            total_bytes += consumed;
-            total_chars += consumed;
+            total_bytes += consumed_bytes;
+            total_chars += consumed_chars;
             files.push(bf);
         }
     }
@@ -216,7 +220,7 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
         file_count: files.len(),
         total_bytes,
         total_chars,
-        estimated_tokens: estimate_tokens(prompt.len() + total_chars),
+        estimated_tokens: estimate_tokens(prompt.chars().count() + total_chars),
     };
 
     Ok(Bundle {
@@ -292,7 +296,7 @@ pub fn estimate_tokens(chars: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::extract_text;
-    use super::{build_bundle, expand_tilde, has_glob_chars, BundleOptions};
+    use super::{build_bundle, estimate_tokens, expand_tilde, has_glob_chars, BundleOptions};
     use sha2::{Digest, Sha256};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -483,6 +487,38 @@ mod tests {
         let bundle = build_bundle("prompt", options).unwrap();
         assert_eq!(bundle.files.len(), 1);
         assert_eq!(bundle.stats.file_count, 1);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bundle_stats_count_unicode_chars_not_bytes() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yoetz_chars_test_{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+
+        let file = root.join("unicode.txt");
+        fs::write(&file, "a🙂b").unwrap();
+
+        let bundle = build_bundle(
+            "🙂",
+            BundleOptions {
+                root: root.clone(),
+                include: vec!["unicode.txt".to_string()],
+                ..BundleOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bundle.stats.total_bytes, "a🙂b".len());
+        assert_eq!(bundle.stats.total_chars, "a🙂b".chars().count());
+        assert_eq!(
+            bundle.stats.estimated_tokens,
+            estimate_tokens("🙂".chars().count() + "a🙂b".chars().count())
+        );
 
         let _ = fs::remove_dir_all(&root);
     }

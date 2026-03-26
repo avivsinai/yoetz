@@ -19,6 +19,7 @@ use std::time::Duration;
 mod browser;
 mod budget;
 mod commands;
+mod dev_browser;
 mod fuzzy;
 mod http;
 mod providers;
@@ -838,6 +839,21 @@ fn handle_session(ctx: &AppContext, args: SessionArgs, format: OutputFormat) -> 
 fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> Result<()> {
     match args.command {
         BrowserCommand::Exec(exec) => {
+            // dev-browser exec: if args look like a script (single arg with
+            // JS-like content or starts with "const"/"await"/"//"), run as script.
+            // Otherwise fall back to agent-browser for backward compat.
+            if browser::use_dev_browser() {
+                let joined = exec.args.join(" ");
+                let is_script = exec.args.len() == 1
+                    && (joined.contains("await ")
+                        || joined.starts_with("const ")
+                        || joined.starts_with("//"));
+                if is_script {
+                    let stdout = dev_browser::run_script_connect(&joined, None)?;
+                    print!("{stdout}");
+                    return Ok(());
+                }
+            }
             let stdout = browser::run_agent_browser(exec.args, format, None)?;
             print!("{stdout}");
             Ok(())
@@ -948,6 +964,35 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             }
         }
         BrowserCommand::Check(check_args) => {
+            // Try dev-browser first for auth verification, but only when no
+            // explicit --cdp or --profile is set (those target a specific
+            // connection and should go through the legacy resolution path).
+            if browser::use_dev_browser()
+                && check_args.cdp.is_none()
+                && check_args.profile.is_none()
+            {
+                match dev_browser::ensure_chatgpt_auth() {
+                    Ok(()) => {
+                        let payload = json!({
+                            "status": "ok",
+                            "method": "dev-browser (auto-connect)",
+                            "backend": "dev-browser",
+                        });
+                        return match format {
+                            OutputFormat::Json => write_json(&payload),
+                            OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
+                            OutputFormat::Text | OutputFormat::Markdown => {
+                                println!("Browser authenticated via dev-browser (auto-connect)");
+                                Ok(())
+                            }
+                        };
+                    }
+                    Err(e) => {
+                        eprintln!("info: dev-browser auth check failed ({e}), trying legacy path");
+                    }
+                }
+            }
+
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.config, check_args.profile.as_ref())?;
             let connection = browser::resolve_browser_connection(
@@ -1031,11 +1076,78 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.config, recipe_args.profile.as_ref())?;
             let recipe_name = recipe.name.as_deref().unwrap_or("");
-            let needs_auth = recipe_name.eq_ignore_ascii_case("chatgpt")
+            let is_chatgpt = recipe_name.eq_ignore_ascii_case("chatgpt")
                 || recipe_path
                     .to_string_lossy()
                     .to_lowercase()
                     .contains("chatgpt");
+
+            // --- dev-browser path (preferred for ChatGPT recipes) ---
+            // Uses Playwright-based dev-browser with full Page API, file upload
+            // via DataTransfer, and single-script execution.
+            // Skip dev-browser when --cdp or --profile is explicitly set, since
+            // dev-browser uses its own connection logic (--connect auto-discovery).
+            if is_chatgpt
+                && browser::use_dev_browser()
+                && recipe_args.cdp.is_none()
+                && recipe_args.profile.is_none()
+            {
+                dev_browser::ensure_installed()?;
+                if let Err(e) = dev_browser::ensure_chatgpt_auth() {
+                    eprintln!("info: dev-browser auth check failed ({e}), trying legacy path");
+                } else {
+                    let bundle_text = recipe_args
+                        .bundle
+                        .as_ref()
+                        .map(|p| fs::read_to_string(p))
+                        .transpose()?;
+
+                    let recipe_ctx = dev_browser::DevBrowserRecipeContext {
+                        bundle_path: recipe_args.bundle.clone(),
+                        bundle_text,
+                        model: recipe_vars.get("model").cloned().unwrap_or_default(),
+                        disable_extended: recipe_vars
+                            .get("extended")
+                            .map(|v| v == "false")
+                            .unwrap_or(false),
+                        paste_mode: recipe_vars
+                            .get("paste")
+                            .map(|v| v == "true")
+                            .unwrap_or(false),
+                        prompt: recipe_vars.get("prompt").cloned().unwrap_or_else(|| {
+                            "Review the attached file and provide your analysis.".to_string()
+                        }),
+                        ..Default::default()
+                    };
+
+                    let response = dev_browser::run_chatgpt_recipe(&recipe_ctx)?;
+                    match format {
+                        OutputFormat::Json => {
+                            let payload = json!({
+                                "status": "ok",
+                                "backend": "dev-browser",
+                                "response": response,
+                            });
+                            write_json(&payload)?;
+                        }
+                        OutputFormat::Jsonl => {
+                            let payload = json!({
+                                "type": "recipe_complete",
+                                "backend": "dev-browser",
+                                "response": response,
+                            });
+                            write_jsonl("browser.recipe", &payload)?;
+                        }
+                        OutputFormat::Text | OutputFormat::Markdown => {
+                            println!("{response}");
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
+            // --- Legacy agent-browser path (fallback) ---
+            let needs_auth = is_chatgpt;
             // Try CDP or auto-connect for a live browser connection. Falls back to
             // cookie/profile if neither is available. Uses the lite auto-connect check
             // for recipes — verifies Chrome is reachable without opening new tabs.
@@ -1214,9 +1326,13 @@ fn build_review_diff_prompt(diff: &str, extra_prompt: Option<&str>) -> String {
         prompt.push_str(extra);
         prompt.push('\n');
     }
-    prompt.push_str("\nDiff:\n```diff\n");
+    let fence = markdown_fence(diff);
+    prompt.push_str(&format!("\nDiff:\n{fence}diff\n"));
     prompt.push_str(diff);
-    prompt.push_str("\n```\n");
+    if !diff.ends_with('\n') {
+        prompt.push('\n');
+    }
+    prompt.push_str(&format!("{fence}\n"));
     prompt
 }
 
@@ -1237,12 +1353,16 @@ fn build_review_file_prompt(
         prompt.push('\n');
     }
     prompt.push_str(&format!("\nFile: {}\n", path.display()));
-    prompt.push_str("```text\n");
+    let fence = markdown_fence(content);
+    prompt.push_str(&format!("{fence}text\n"));
     prompt.push_str(content);
+    if !content.ends_with('\n') {
+        prompt.push('\n');
+    }
     if truncated {
         prompt.push_str("\n... [truncated]\n");
     }
-    prompt.push_str("```\n");
+    prompt.push_str(&format!("{fence}\n"));
     prompt
 }
 
@@ -1519,6 +1639,28 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("yoetz_schema_{nanos}.json"))
+    }
+
+    #[test]
+    fn review_diff_prompt_uses_safe_fence_length() {
+        let diff = "@@ -1 +1 @@\n-```old\n+```new\n";
+        let prompt = build_review_diff_prompt(diff, None);
+
+        assert!(prompt.contains("\nDiff:\n````diff\n"));
+        assert!(prompt.ends_with("````\n"));
+    }
+
+    #[test]
+    fn review_file_prompt_uses_safe_fence_length() {
+        let prompt = build_review_file_prompt(
+            std::path::Path::new("src/lib.rs"),
+            "fn main() {\n    println!(\"```\");\n}",
+            false,
+            None,
+        );
+
+        assert!(prompt.contains("\nFile: src/lib.rs\n````text\n"));
+        assert!(prompt.ends_with("````\n"));
     }
 
     #[test]
