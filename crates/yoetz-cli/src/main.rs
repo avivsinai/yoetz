@@ -1119,7 +1119,6 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                             "Review the attached file and provide your analysis.".to_string()
                         }),
                         poll_settings,
-                        ..Default::default()
                     };
 
                     let response = dev_browser::run_chatgpt_recipe(&recipe_ctx)?;
