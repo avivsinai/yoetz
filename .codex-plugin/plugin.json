@@ -9,5 +9,10 @@
   "repository": "https://github.com/avivsinai/yoetz",
   "license": "MIT",
   "skills": "./skills/",
-  "keywords": ["llm", "council", "multimodal", "code-review", "bundler", "ai", "cli", "agents"]
+  "keywords": ["llm", "council", "multimodal", "code-review", "bundler", "ai", "cli", "agents"],
+  "interface": {
+    "displayName": "Yoetz",
+    "shortDescription": "LLM council, bundler, and multimodal gateway for coding agents",
+    "category": "AI Tools"
+  }
 }
