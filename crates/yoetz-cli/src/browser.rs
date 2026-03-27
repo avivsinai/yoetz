@@ -2785,6 +2785,8 @@ mod tests {
         {
             let _listener = UnixListener::bind(&sock_path).unwrap();
         }
+        // Allow the kernel to fully release the socket after the listener drops.
+        thread::sleep(Duration::from_millis(50));
         assert!(!is_daemon_socket_healthy(&sock_path));
     }
 
