@@ -1101,6 +1101,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                         .as_ref()
                         .map(fs::read_to_string)
                         .transpose()?;
+                    let poll_settings = dev_browser::resolve_chatgpt_poll_settings(&recipe_vars)?;
 
                     let recipe_ctx = dev_browser::DevBrowserRecipeContext {
                         bundle_path: recipe_args.bundle.clone(),
@@ -1117,6 +1118,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                         prompt: recipe_vars.get("prompt").cloned().unwrap_or_else(|| {
                             "Review the attached file and provide your analysis.".to_string()
                         }),
+                        poll_settings,
                         ..Default::default()
                     };
 
