@@ -428,8 +428,14 @@ fn run_recipe_with_connection(
             .ok_or_else(|| anyhow!("recipe step {idx} missing action"))?;
 
         if action == CHATGPT_WAIT_ACTION {
+            // Interpolate recipe vars (e.g. {{wait_timeout_ms}}) in args before parsing.
+            let interpolated_args: Option<Vec<String>> = step.args.as_ref().map(|args| {
+                args.iter()
+                    .map(|a| interpolate(a, &ctx, None).unwrap_or_else(|_| a.clone()))
+                    .collect()
+            });
             let stdout = run_chatgpt_wait_response(
-                step.args.as_deref(),
+                interpolated_args.as_deref(),
                 step.timeout_ms,
                 connection,
                 ctx.use_stealth,
