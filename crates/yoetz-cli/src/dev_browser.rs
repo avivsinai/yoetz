@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 use yoetz_core::paths::home_dir;
 
 /// Cached dev-browser resolution.
-static DEV_BROWSER: OnceLock<Result<String, String>> = OnceLock::new();
+static DEV_BROWSER: OnceLock<String> = OnceLock::new();
 
 /// Default timeout for dev-browser scripts in seconds.
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 30;
@@ -53,6 +53,23 @@ impl Default for ChatgptPollSettings {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StagedFileGuard {
+    path: PathBuf,
+}
+
+impl StagedFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+impl Drop for StagedFileGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// dev-browser tmp directory for file staging.
 fn dev_browser_tmp_dir() -> PathBuf {
     home_dir()
@@ -61,63 +78,90 @@ fn dev_browser_tmp_dir() -> PathBuf {
         .join("tmp")
 }
 
-/// Check if dev-browser is available. Returns the binary path.
-/// Auto-installs via `npm i -g dev-browser` if not found.
-fn resolve_dev_browser() -> Result<String> {
-    if let Ok(bin) = env::var("YOETZ_DEV_BROWSER_BIN") {
-        return Ok(bin);
-    }
-
-    let cached = DEV_BROWSER.get_or_init(|| {
-        // Check if dev-browser is in PATH
-        if Command::new("dev-browser")
-            .arg("--version")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-        {
-            return Ok("dev-browser".to_string());
-        }
-
-        // Auto-install via npm
-        eprintln!("info: dev-browser not found, installing via npm...");
-        let install = Command::new("npm")
-            .args(["install", "-g", "dev-browser"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .status();
-
-        match install {
-            Ok(status) if status.success() => {
-                eprintln!("info: dev-browser installed successfully");
-                Ok("dev-browser".to_string())
-            }
-            Ok(status) => Err(format!(
-                "npm install -g dev-browser failed with exit code {:?}. \
-                 Install manually: npm i -g dev-browser",
-                status.code()
-            )),
-            Err(e) => Err(format!(
-                "failed to run npm: {e}. Install dev-browser manually: npm i -g dev-browser"
-            )),
-        }
-    });
-
-    match cached {
-        Ok(v) => Ok(v.clone()),
-        Err(msg) => Err(anyhow!("{msg}")),
-    }
+fn command_is_available(bin: &str) -> bool {
+    Command::new(bin)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
-/// Returns true if dev-browser is available (installed or installable).
+fn configured_dev_browser_bin() -> Result<Option<String>> {
+    let Some(bin) = env::var_os("YOETZ_DEV_BROWSER_BIN") else {
+        return Ok(None);
+    };
+    let bin = bin.to_string_lossy().to_string();
+    if command_is_available(&bin) {
+        return Ok(Some(bin));
+    }
+    Err(anyhow!(
+        "YOETZ_DEV_BROWSER_BIN points to `{bin}`, but it is not executable"
+    ))
+}
+
+fn find_dev_browser() -> Result<Option<String>> {
+    if let Some(bin) = DEV_BROWSER.get() {
+        return Ok(Some(bin.clone()));
+    }
+    if let Some(bin) = configured_dev_browser_bin()? {
+        let _ = DEV_BROWSER.set(bin.clone());
+        return Ok(Some(bin));
+    }
+    if command_is_available("dev-browser") {
+        let bin = "dev-browser".to_string();
+        let _ = DEV_BROWSER.set(bin.clone());
+        return Ok(Some(bin));
+    }
+    Ok(None)
+}
+
+/// Resolve the dev-browser binary after installation has already been handled.
+fn resolve_dev_browser() -> Result<String> {
+    find_dev_browser()?.ok_or_else(|| {
+        anyhow!("dev-browser not found in PATH. Install manually: npm i -g dev-browser")
+    })
+}
+
+/// Returns true if dev-browser is already available without side effects.
 pub fn is_available() -> bool {
-    resolve_dev_browser().is_ok()
+    find_dev_browser().is_ok_and(|bin| bin.is_some())
 }
 
 /// Ensure dev-browser is installed, auto-installing if needed.
 pub fn ensure_installed() -> Result<()> {
-    resolve_dev_browser()?;
+    if find_dev_browser()?.is_some() {
+        return Ok(());
+    }
+
+    eprintln!("info: dev-browser not found, installing via npm...");
+    let output = Command::new("npm")
+        .args(["install", "-g", "dev-browser"])
+        .output()
+        .context("failed to run npm. Install dev-browser manually: npm i -g dev-browser")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit code {:?}", output.status.code())
+        };
+        return Err(anyhow!(
+            "npm install -g dev-browser failed: {detail}. Install manually: npm i -g dev-browser"
+        ));
+    }
+
+    if !command_is_available("dev-browser") {
+        return Err(anyhow!(
+            "dev-browser installed successfully, but it is not available in PATH"
+        ));
+    }
+    let _ = DEV_BROWSER.set("dev-browser".to_string());
+    eprintln!("info: dev-browser installed successfully");
     Ok(())
 }
 
@@ -210,6 +254,7 @@ pub fn stage_file(name: &str, content: &str) -> Result<PathBuf> {
         .with_context(|| format!("create dev-browser tmp dir: {}", tmp_dir.display()))?;
     let path = tmp_dir.join(name);
     fs::write(&path, content).with_context(|| format!("write staged file: {}", path.display()))?;
+    set_staged_file_permissions(&path)?;
     Ok(path)
 }
 
@@ -221,7 +266,22 @@ pub fn stage_file_bytes(name: &str, content: &[u8]) -> Result<PathBuf> {
         .with_context(|| format!("create dev-browser tmp dir: {}", tmp_dir.display()))?;
     let path = tmp_dir.join(name);
     fs::write(&path, content).with_context(|| format!("write staged file: {}", path.display()))?;
+    set_staged_file_permissions(&path)?;
     Ok(path)
+}
+
+fn set_staged_file_permissions(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)
+            .with_context(|| format!("read metadata: {}", path.display()))?
+            .permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(path, permissions)
+            .with_context(|| format!("set permissions: {}", path.display()))?;
+    }
+    Ok(())
 }
 
 /// List all browser tabs visible to dev-browser (via --connect).
@@ -323,6 +383,8 @@ pub struct DevBrowserRecipeContext {
     pub prompt: String,
     /// ChatGPT response polling settings.
     pub poll_settings: ChatgptPollSettings,
+    /// Allow an empty assistant response to count as success.
+    pub allow_empty_response: bool,
 }
 
 impl Default for DevBrowserRecipeContext {
@@ -335,6 +397,7 @@ impl Default for DevBrowserRecipeContext {
             disable_extended: false,
             paste_mode: false,
             poll_settings: ChatgptPollSettings::default(),
+            allow_empty_response: false,
         }
     }
 }
@@ -386,6 +449,7 @@ const PASTE_MODE = {paste_mode};
 const DISABLE_EXTENDED = {disable_extended};
 const POLL_TIMEOUT_MS = {poll_timeout_ms};
 const POLL_INTERVAL_MS = {poll_interval_ms};
+const ALLOW_EMPTY_RESPONSE = {allow_empty_response};
 
 // --- Step 1: Navigate to fresh ChatGPT conversation ---
 const page = await browser.newPage();
@@ -475,22 +539,24 @@ if (PASTE_MODE) {{
         throw new Error("file upload input (#upload-files) not found on page");
     }}
 
-    // Poll for upload completion — wait for the file tile to appear and
-    // any spinner to disappear (matches chatgpt_wait_upload logic).
+    // Poll for upload completion on the specific attachment tile.
     let uploadDone = false;
     for (let i = 0; i < 30; i++) {{
         await page.waitForTimeout(1000);
-        const done = await page.evaluate(() => {{
-            const tiles = document.querySelectorAll('[class*="file"], [data-testid*="file"], [class*="attachment"]');
-            if (tiles.length === 0) return "waiting";
-            const spinner = document.querySelector('.animate-spin');
-            if (spinner) {{
-                const parent = spinner.closest('[style]');
-                if (parent && parent.style.display === 'none') return "done";
-                return "uploading";
-            }}
-            return "done";
-        }});
+        const done = await page.evaluate((fileName) => {{
+            const tiles = Array.from(
+                document.querySelectorAll('[class*="file"], [data-testid*="file"], [class*="attachment"]')
+            );
+            const tile = tiles.find((el) => (el.textContent || "").includes(fileName))
+                || tiles.find((el) => el.querySelector('[class*="animate-spin"]'))
+                || null;
+            if (!tile) return "waiting";
+            const spinner = tile.querySelector('[class*="animate-spin"]');
+            if (!spinner) return "done";
+            const target = spinner.parentElement || spinner;
+            const hidden = getComputedStyle(target).display === 'none';
+            return hidden ? "done" : "uploading";
+        }}, STAGED_FILE);
         if (done === "done") {{ uploadDone = true; break; }}
     }}
     if (!uploadDone) {{
@@ -510,16 +576,27 @@ if (PASTE_MODE) {{
     await page.waitForTimeout(500);
 }}
 
+const ASSISTANT_COUNT_BEFORE_SEND = await page.evaluate(() => {{
+    return document.querySelectorAll('[data-message-author-role="assistant"]').length;
+}});
+
 // --- Step 5: Click send ---
-const sendBtn = page.locator('button[data-testid="send-button"]');
-if (await sendBtn.count() > 0) {{
-    await sendBtn.click();
-}} else {{
+const sendState = await page.evaluate(() => {{
+    const btn = document.querySelector("button[data-testid='send-button']");
+    if (!btn) return "missing";
+    return btn.disabled ? "disabled" : "enabled";
+}});
+if (sendState === "missing") {{
     throw new Error("send button not found");
 }}
+if (sendState === "disabled") {{
+    throw new Error("send button disabled — text may not have been injected");
+}}
+const sendBtn = page.locator('button[data-testid="send-button"]');
+await sendBtn.click();
 
 // --- Step 6: Poll for response completion ---
-// Checks: stop button gone, send idle, no thinking indicator, stable idle poll.
+// Checks: new assistant response appeared, text is stable, send idle, no thinking indicator.
 const pollStart = Date.now();
 let completed = false;
 let pollError = null;
@@ -548,14 +625,20 @@ while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
         const thinking = document.querySelector(
             '.result-thinking, [class*="result-thinking"], [data-testid*="thinking"]'
         );
-        const assistantText = Array.from(
+        const assistantMessages = Array.from(
             document.querySelectorAll('[data-message-author-role="assistant"]')
-        ).map((m) => m.innerText).join('\n---\n');
+        );
+        const newAssistantMessages = assistantMessages.slice(ASSISTANT_COUNT_BEFORE_SEND);
+        const assistantText = newAssistantMessages
+            .map((m) => m.innerText)
+            .join('\n---\n')
+            .trim();
         return {{
             error: null,
             sendIdle: !sendBtn || !sendBtn.disabled,
             hasStopButton: Boolean(stopBtn),
             hasThinkingIndicator: Boolean(thinking) || text.includes("pro thinking"),
+            newAssistantCount: newAssistantMessages.length,
             assistantText
         }};
     }});
@@ -567,9 +650,11 @@ while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
     const idle = pollState.sendIdle &&
         !pollState.hasStopButton &&
         !pollState.hasThinkingIndicator;
+    const hasResponse = pollState.newAssistantCount > 0 &&
+        (ALLOW_EMPTY_RESPONSE || pollState.assistantText.length > 0);
 
-    if (idle) {{
-        const fingerprint = `${{pollState.assistantText.length}}:${{pollState.assistantText}}`;
+    if (idle && hasResponse) {{
+        const fingerprint = `${{pollState.newAssistantCount}}:${{pollState.assistantText}}`;
         if (idleFingerprint === fingerprint) {{
             completed = true;
             break;
@@ -581,19 +666,36 @@ while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
 }}
 
 // --- Step 7: Extract response ---
-const responseText = await page.evaluate(() => {{
-    const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
-    const texts = [];
-    msgs.forEach(m => texts.push(m.innerText));
-    return texts.join('\n---\n');
+const responseState = await page.evaluate(() => {{
+    const assistantMessages = Array.from(
+        document.querySelectorAll('[data-message-author-role="assistant"]')
+    );
+    const newAssistantMessages = assistantMessages.slice(ASSISTANT_COUNT_BEFORE_SEND);
+    const responseText = newAssistantMessages.map((m) => m.innerText).join('\n---\n').trim();
+    return {{
+        newAssistantCount: newAssistantMessages.length,
+        responseText
+    }};
 }});
 
+let status = pollError ? "error" : (completed ? "ok" : "timeout");
+let error = pollError || null;
+if (status === "ok" && responseState.newAssistantCount === 0) {{
+    status = "error";
+    error = "ChatGPT did not produce a new assistant response";
+}} else if (status === "ok" && !ALLOW_EMPTY_RESPONSE && responseState.responseText.length === 0) {{
+    status = "error";
+    error = "ChatGPT returned an empty response";
+}}
+
 const result = {{
-    status: pollError ? "error" : (completed ? "ok" : "timeout"),
-    error: pollError || null,
+    status,
+    error,
     elapsed_ms: Date.now() - pollStart,
-    response_length: responseText.length,
-    response: responseText,
+    response_length: responseState.responseText.length,
+    response: responseState.responseText,
+    assistant_message_count_before_send: ASSISTANT_COUNT_BEFORE_SEND,
+    new_assistant_message_count: responseState.newAssistantCount,
 }};
 
 console.log(JSON.stringify(result));
@@ -606,6 +708,7 @@ console.log(JSON.stringify(result));
         disable_extended = ctx.disable_extended,
         poll_timeout_ms = ctx.poll_settings.timeout_ms,
         poll_interval_ms = ctx.poll_settings.interval_ms,
+        allow_empty_response = ctx.allow_empty_response,
     )
 }
 
@@ -626,6 +729,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
             .unwrap_or_default()
             .as_millis()
     );
+    let mut staged_file_guard = None;
     let staged_name = if !ctx.paste_mode {
         if let Some(bundle_path) = &ctx.bundle_path {
             let content = fs::read_to_string(bundle_path)
@@ -635,11 +739,13 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
                 .and_then(|n| n.to_str())
                 .unwrap_or("bundle.txt");
             let name = format!("{unique_prefix}_{base_name}");
-            stage_file(&name, &content)?;
+            let path = stage_file(&name, &content)?;
+            staged_file_guard = Some(StagedFileGuard::new(path));
             Some(name)
         } else if let Some(text) = &ctx.bundle_text {
             let name = format!("{unique_prefix}_bundle.md");
-            stage_file(&name, text)?;
+            let path = stage_file(&name, text)?;
+            staged_file_guard = Some(StagedFileGuard::new(path));
             Some(name)
         } else {
             None
@@ -654,6 +760,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
         &script,
         Some(chatgpt_script_timeout_secs(ctx.poll_settings.timeout_ms)),
     )?;
+    drop(staged_file_guard);
 
     // Parse and return the response
     let result: Value = serde_json::from_str(stdout.trim())
@@ -685,6 +792,7 @@ pub fn run_yaml_recipe(
     timeout_secs: Option<u64>,
 ) -> Result<String> {
     let mut script_parts = Vec::new();
+    let mut staged_files = Vec::new();
 
     // Open a named page for persistence
     script_parts.push("const page = await browser.getPage('yoetz-recipe');".to_string());
@@ -721,7 +829,8 @@ pub fn run_yaml_recipe(
                             .file_name()
                             .and_then(|n| n.to_str())
                             .unwrap_or("upload.txt");
-                        stage_file(name, &content)?;
+                        let path = stage_file(name, &content)?;
+                        staged_files.push(StagedFileGuard::new(path));
                         let name_json = serde_json::to_string(name).unwrap();
                         script_parts.push(format!(
                             r#"{{
@@ -825,6 +934,17 @@ mod tests {
         let _ = fs::remove_file(&path);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stage_file_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = stage_file("test_permissions.txt", "secret").unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let _ = fs::remove_file(&path);
+    }
+
     #[test]
     fn resolve_chatgpt_poll_settings_uses_defaults() {
         assert_eq!(
@@ -876,11 +996,20 @@ mod tests {
 
         assert!(script.contains("const POLL_TIMEOUT_MS = 900000;"));
         assert!(script.contains("const POLL_INTERVAL_MS = 45000;"));
+        assert!(script.contains("const ALLOW_EMPTY_RESPONSE = false;"));
+        assert!(script.contains("const ASSISTANT_COUNT_BEFORE_SEND = await page.evaluate"));
         assert!(script.contains("let idleFingerprint = null;"));
         assert!(script.contains(
             ".result-thinking, [class*=\"result-thinking\"], [data-testid*=\"thinking\"]"
         ));
         assert!(script.contains("idleFingerprint === fingerprint"));
         assert!(!script.contains("await page.waitForTimeout(2000);\n        completed = true;"));
+        assert!(script.contains("send button disabled — text may not have been injected"));
+        assert!(script.contains(
+            "newAssistantMessages = assistantMessages.slice(ASSISTANT_COUNT_BEFORE_SEND)"
+        ));
+        assert!(script.contains("ChatGPT returned an empty response"));
+        assert!(script.contains("getComputedStyle"));
+        assert!(!script.contains("parent.style.display"));
     }
 }
