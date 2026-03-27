@@ -9,12 +9,16 @@ name: chatgpt
 #   prompt   — prompt text to send with the attachment.
 #   paste    — set to "true" to paste bundle text into textarea instead of
 #              uploading as file. Default: "false" (always upload).
+#   wait_timeout_ms  — overall response wait deadline in ms (default: 1800000 = 30min).
+#   wait_interval_ms — poll interval in ms (default: 30000 = 30s).
 
 defaults:
   prompt: Review the attached file and provide your analysis.
   model: ""
   extended: ""
   paste: "false"
+  wait_timeout_ms: "1800000"
+  wait_interval_ms: "30000"
 
 steps:
   # Navigate to a fresh ChatGPT conversation. Append a timestamp query param
@@ -195,10 +199,10 @@ steps:
           return "sent";
         })()
 
-  # Poll in short bursts under the agent-browser IPC ceiling, with a hard
-  # overall cap so the recipe fails fast instead of idling for minutes.
+  # Poll for response completion. Default 30min timeout for Extended Pro;
+  # override with --var wait_timeout_ms=N or --var wait_interval_ms=N.
   - action: chatgpt_wait_response
-    args: ["--attempts", "36", "--interval-ms", "5000", "--timeout-ms", "180000"]
+    args: ["--interval-ms", "{{wait_interval_ms}}", "--timeout-ms", "{{wait_timeout_ms}}"]
     timeout_ms: 10000
 
   # Capture final state

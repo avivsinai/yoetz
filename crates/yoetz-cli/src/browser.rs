@@ -26,9 +26,9 @@ const LIVE_ATTACH_AUTH_CHECK_TIMEOUT_MS: u64 = 30_000;
 const AUTH_CHECK_POLL_MS: u64 = 500;
 const CHATGPT_WAIT_ACTION: &str = "chatgpt_wait_response";
 const CHATGPT_WAIT_UPLOAD_ACTION: &str = "chatgpt_wait_upload";
-const CHATGPT_POLL_ATTEMPTS_DEFAULT: usize = 36;
-const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 5_000;
-const CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT: u64 = 180_000;
+const CHATGPT_POLL_ATTEMPTS_DEFAULT: usize = 60;
+const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 30_000;
+const CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
 const CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT: u64 = 10_000;
 const CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT: usize = 30;
 const CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT: u64 = 1_000;
@@ -574,6 +574,7 @@ enum ChatgptSendState {
 struct ChatgptDomState {
     send_state: ChatgptSendState,
     has_stop_button: bool,
+    has_thinking_indicator: bool,
     copy_button_count: usize,
 }
 
@@ -598,9 +599,11 @@ fn run_chatgpt_wait_response(
     let baseline_snapshot =
         take_chatgpt_snapshot(connection, use_stealth, headed, command_timeout_ms)?;
     let baseline = normalize_snapshot_for_compare(&baseline_snapshot);
+    let mut prev_dom: Option<ChatgptDomState> = None;
     let mut last_dom = ChatgptDomState {
         send_state: ChatgptSendState::Missing,
         has_stop_button: false,
+        has_thinking_indicator: false,
         copy_button_count: 0,
     };
     let mut completed_polls = 0usize;
@@ -629,9 +632,11 @@ fn run_chatgpt_wait_response(
 
         let dom = inspect_chatgpt_dom_state(connection, use_stealth, headed, command_timeout_ms)?;
         let changed = normalize_snapshot_for_compare(&snapshot) != baseline;
+        let prev = prev_dom;
+        prev_dom = Some(dom);
         last_dom = dom;
 
-        if chatgpt_response_complete(changed, dom) {
+        if chatgpt_response_complete(changed, dom, prev) {
             let payload = json!({
                 "status": "ok",
                 "attempt": attempt,
@@ -644,6 +649,7 @@ fn run_chatgpt_wait_response(
                     ChatgptSendState::Missing => "missing",
                 },
                 "has_stop_button": dom.has_stop_button,
+                "has_thinking_indicator": dom.has_thinking_indicator,
                 "copy_button_count": dom.copy_button_count,
             });
             return Ok(payload.to_string());
@@ -661,12 +667,13 @@ fn run_chatgpt_wait_response(
     };
 
     Err(anyhow!(
-        "timed out waiting for ChatGPT response after {} polls (~{}s elapsed, {}). last_state: send={:?}, stop={}, copy_buttons={}",
+        "timed out waiting for ChatGPT response after {} polls (~{}s elapsed, {}). last_state: send={:?}, stop={}, thinking={}, copy_buttons={}",
         completed_polls,
         elapsed_ms / 1000,
         limit_reason,
         last_dom.send_state,
         last_dom.has_stop_button,
+        last_dom.has_thinking_indicator,
         last_dom.copy_button_count
     ))
 }
@@ -757,8 +764,9 @@ fn inspect_chatgpt_dom_state(
   const send = document.querySelector("button[data-testid='send-button']");
   const stop = document.querySelector("button[data-testid='stop-button'], button[aria-label*='Stop']");
   const copyButtons = document.querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']").length;
+  const thinking = document.querySelector(".result-thinking, [data-testid*='thinking'], [class*='thinking']");
   const sendState = !send ? "missing" : send.disabled ? "disabled" : "enabled";
-  return `send=${sendState}|stop=${stop ? 1 : 0}|copy=${copyButtons}`;
+  return `send=${sendState}|stop=${stop ? 1 : 0}|thinking=${thinking ? 1 : 0}|copy=${copyButtons}`;
 })()"#;
     let stdout = run_agent_browser_with_connection_timeout(
         vec!["eval".to_string(), script.to_string()],
@@ -783,6 +791,7 @@ fn parse_chatgpt_poll_args(args: Option<&[String]>) -> Result<ChatgptPollOptions
         interval_ms: CHATGPT_POLL_INTERVAL_MS_DEFAULT,
         timeout_ms: CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT,
     };
+    let mut attempts_explicit = false;
     let mut iter = args.unwrap_or_default().iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -793,6 +802,7 @@ fn parse_chatgpt_poll_args(args: Option<&[String]>) -> Result<ChatgptPollOptions
                 options.attempts = raw
                     .parse()
                     .with_context(|| format!("invalid --attempts value `{raw}`"))?;
+                attempts_explicit = true;
             }
             "--interval-ms" => {
                 let raw = iter
@@ -813,14 +823,19 @@ fn parse_chatgpt_poll_args(args: Option<&[String]>) -> Result<ChatgptPollOptions
             other => return Err(anyhow!("unsupported {CHATGPT_WAIT_ACTION} arg `{other}`")),
         }
     }
-    if options.attempts == 0 {
-        return Err(anyhow!("--attempts must be greater than 0"));
-    }
     if options.interval_ms == 0 {
         return Err(anyhow!("--interval-ms must be greater than 0"));
     }
     if options.timeout_ms == 0 {
         return Err(anyhow!("--timeout-ms must be greater than 0"));
+    }
+    // Derive attempts from timeout/interval when not explicitly set,
+    // so the attempt cap never silently truncates a long timeout.
+    if !attempts_explicit {
+        options.attempts = options.timeout_ms.div_ceil(options.interval_ms) as usize;
+    }
+    if options.attempts == 0 {
+        return Err(anyhow!("--attempts must be greater than 0"));
     }
     Ok(options)
 }
@@ -828,6 +843,7 @@ fn parse_chatgpt_poll_args(args: Option<&[String]>) -> Result<ChatgptPollOptions
 fn parse_chatgpt_dom_state(raw: &str) -> Result<ChatgptDomState> {
     let mut send_state = None;
     let mut has_stop_button = None;
+    let mut has_thinking_indicator = None;
     let mut copy_button_count = None;
 
     for part in raw.split('|') {
@@ -850,6 +866,13 @@ fn parse_chatgpt_dom_state(raw: &str) -> Result<ChatgptDomState> {
                     other => return Err(anyhow!("invalid stop flag `{other}`")),
                 });
             }
+            "thinking" => {
+                has_thinking_indicator = Some(match value {
+                    "0" => false,
+                    "1" => true,
+                    other => return Err(anyhow!("invalid thinking flag `{other}`")),
+                });
+            }
             "copy" => {
                 copy_button_count = Some(
                     value
@@ -864,6 +887,7 @@ fn parse_chatgpt_dom_state(raw: &str) -> Result<ChatgptDomState> {
     Ok(ChatgptDomState {
         send_state: send_state.ok_or_else(|| anyhow!("missing send state"))?,
         has_stop_button: has_stop_button.ok_or_else(|| anyhow!("missing stop flag"))?,
+        has_thinking_indicator: has_thinking_indicator.unwrap_or(false),
         copy_button_count: copy_button_count.ok_or_else(|| anyhow!("missing copy count"))?,
     })
 }
@@ -887,7 +911,11 @@ fn detect_chatgpt_response_issue(snapshot: &str) -> Option<&'static str> {
         .copied()
 }
 
-fn chatgpt_response_complete(snapshot_changed: bool, dom: ChatgptDomState) -> bool {
+fn chatgpt_response_complete(
+    snapshot_changed: bool,
+    dom: ChatgptDomState,
+    prev_dom: Option<ChatgptDomState>,
+) -> bool {
     // After response completes, ChatGPT may show the voice button instead of
     // the send button — so `send_state` is `Missing`, not `Enabled`.  Both
     // states indicate the composer is idle (not generating).
@@ -895,7 +923,20 @@ fn chatgpt_response_complete(snapshot_changed: bool, dom: ChatgptDomState) -> bo
         dom.send_state,
         ChatgptSendState::Enabled | ChatgptSendState::Missing
     );
-    send_idle && !dom.has_stop_button && (dom.copy_button_count > 0 || snapshot_changed)
+    if !send_idle || dom.has_stop_button || dom.has_thinking_indicator {
+        return false;
+    }
+    let has_progress = dom.copy_button_count > 0 || snapshot_changed;
+    if !has_progress {
+        return false;
+    }
+    // Require one stable idle poll: the previous poll must also have been idle
+    // (no stop button, no thinking indicator) to avoid false positives during
+    // Extended Pro thinking-to-response transitions.
+    match prev_dom {
+        Some(prev) => !prev.has_stop_button && !prev.has_thinking_indicator,
+        None => true,
+    }
 }
 
 pub fn resolve_profile_dir(config: &Config, override_profile: Option<&PathBuf>) -> Result<PathBuf> {
@@ -2786,14 +2827,41 @@ mod tests {
     #[test]
     fn parse_chatgpt_poll_args_defaults() {
         let options = parse_chatgpt_poll_args(None).unwrap();
-        assert_eq!(
-            options,
-            ChatgptPollOptions {
-                attempts: CHATGPT_POLL_ATTEMPTS_DEFAULT,
-                interval_ms: CHATGPT_POLL_INTERVAL_MS_DEFAULT,
-                timeout_ms: CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT,
-            }
-        );
+        assert_eq!(options.interval_ms, CHATGPT_POLL_INTERVAL_MS_DEFAULT);
+        assert_eq!(options.timeout_ms, CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT);
+        // attempts derived from ceil(timeout / interval) when not explicit.
+        let expected_attempts =
+            ((CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT + CHATGPT_POLL_INTERVAL_MS_DEFAULT - 1)
+                / CHATGPT_POLL_INTERVAL_MS_DEFAULT) as usize;
+        assert_eq!(options.attempts, expected_attempts);
+    }
+
+    #[test]
+    fn parse_chatgpt_poll_args_derives_attempts_from_timeout() {
+        let args = vec![
+            "--timeout-ms".to_string(),
+            "600000".to_string(),
+            "--interval-ms".to_string(),
+            "10000".to_string(),
+        ];
+        let options = parse_chatgpt_poll_args(Some(&args)).unwrap();
+        // ceil(600000 / 10000) = 60
+        assert_eq!(options.attempts, 60);
+    }
+
+    #[test]
+    fn parse_chatgpt_poll_args_explicit_attempts_not_overridden() {
+        let args = vec![
+            "--attempts".to_string(),
+            "5".to_string(),
+            "--timeout-ms".to_string(),
+            "600000".to_string(),
+            "--interval-ms".to_string(),
+            "10000".to_string(),
+        ];
+        let options = parse_chatgpt_poll_args(Some(&args)).unwrap();
+        // Explicit --attempts should be preserved, not derived.
+        assert_eq!(options.attempts, 5);
     }
 
     #[test]
@@ -2833,15 +2901,37 @@ mod tests {
 
     #[test]
     fn parse_chatgpt_dom_state_parses_eval_output() {
-        let state = parse_chatgpt_dom_state("send=enabled|stop=0|copy=2").unwrap();
+        let state = parse_chatgpt_dom_state("send=enabled|stop=0|thinking=0|copy=2").unwrap();
         assert_eq!(
             state,
             ChatgptDomState {
                 send_state: ChatgptSendState::Enabled,
                 has_stop_button: false,
+                has_thinking_indicator: false,
                 copy_button_count: 2,
             }
         );
+    }
+
+    #[test]
+    fn parse_chatgpt_dom_state_parses_thinking_indicator() {
+        let state = parse_chatgpt_dom_state("send=disabled|stop=1|thinking=1|copy=0").unwrap();
+        assert_eq!(
+            state,
+            ChatgptDomState {
+                send_state: ChatgptSendState::Disabled,
+                has_stop_button: true,
+                has_thinking_indicator: true,
+                copy_button_count: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_chatgpt_dom_state_defaults_thinking_when_absent() {
+        // Backward compat: older agent-browser versions may not emit thinking field.
+        let state = parse_chatgpt_dom_state("send=enabled|stop=0|copy=2").unwrap();
+        assert_eq!(state.has_thinking_indicator, false);
     }
 
     #[test]
@@ -2873,43 +2963,43 @@ mod tests {
 
     #[test]
     fn chatgpt_response_complete_requires_idle_send_and_progress() {
-        let dom = ChatgptDomState {
+        let idle = ChatgptDomState {
             send_state: ChatgptSendState::Enabled,
             has_stop_button: false,
+            has_thinking_indicator: false,
             copy_button_count: 0,
         };
-        assert!(chatgpt_response_complete(true, dom));
-        assert!(!chatgpt_response_complete(
-            false,
-            ChatgptDomState {
-                copy_button_count: 0,
-                ..dom
-            }
-        ));
+        // First poll (no prev) with snapshot change → complete.
+        assert!(chatgpt_response_complete(true, idle, None));
+        // No progress (no copy buttons, no snapshot change) → not complete.
+        assert!(!chatgpt_response_complete(false, idle, None));
+        // Disabled send → not complete.
         assert!(!chatgpt_response_complete(
             true,
             ChatgptDomState {
                 send_state: ChatgptSendState::Disabled,
-                ..dom
-            }
+                ..idle
+            },
+            None,
         ));
         // Missing send button (voice button shown instead) is also idle.
         assert!(chatgpt_response_complete(
             true,
             ChatgptDomState {
                 send_state: ChatgptSendState::Missing,
-                has_stop_button: false,
-                copy_button_count: 0,
-            }
+                ..idle
+            },
+            None,
         ));
         // Missing + copy buttons (no snapshot change needed).
         assert!(chatgpt_response_complete(
             false,
             ChatgptDomState {
                 send_state: ChatgptSendState::Missing,
-                has_stop_button: false,
                 copy_button_count: 1,
-            }
+                ..idle
+            },
+            None,
         ));
         // Missing + stop button still means generating.
         assert!(!chatgpt_response_complete(
@@ -2917,9 +3007,43 @@ mod tests {
             ChatgptDomState {
                 send_state: ChatgptSendState::Missing,
                 has_stop_button: true,
-                copy_button_count: 0,
-            }
+                ..idle
+            },
+            None,
         ));
+        // Thinking indicator active → not complete even if otherwise idle.
+        assert!(!chatgpt_response_complete(
+            true,
+            ChatgptDomState {
+                has_thinking_indicator: true,
+                ..idle
+            },
+            None,
+        ));
+    }
+
+    #[test]
+    fn chatgpt_response_complete_requires_stable_idle() {
+        let idle = ChatgptDomState {
+            send_state: ChatgptSendState::Enabled,
+            has_stop_button: false,
+            has_thinking_indicator: false,
+            copy_button_count: 1,
+        };
+        let was_thinking = ChatgptDomState {
+            has_thinking_indicator: true,
+            ..idle
+        };
+        let was_generating = ChatgptDomState {
+            has_stop_button: true,
+            ..idle
+        };
+        // Previous poll was thinking → not stable yet.
+        assert!(!chatgpt_response_complete(true, idle, Some(was_thinking)));
+        // Previous poll had stop button → not stable yet.
+        assert!(!chatgpt_response_complete(true, idle, Some(was_generating)));
+        // Previous poll was also idle → stable, complete.
+        assert!(chatgpt_response_complete(true, idle, Some(idle)));
     }
 
     #[test]
