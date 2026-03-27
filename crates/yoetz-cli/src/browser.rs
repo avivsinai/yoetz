@@ -2753,8 +2753,13 @@ mod tests {
             logged.contains("timeout=30000"),
             "expected bounded live-attach timeout in logged commands, got `{logged}`"
         );
+        // Live-attach should close the verification tab but NOT the daemon/session.
         assert!(
-            !logged.contains(" close"),
+            logged.contains("tab close"),
+            "live-attach auth check should close the verification tab: `{logged}`"
+        );
+        assert!(
+            !logged.contains(" close\n") || logged.contains("tab close"),
             "live-attach auth check should not close the daemon/session: `{logged}`"
         );
     }
