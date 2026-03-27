@@ -107,9 +107,17 @@ YOETZ_VERSION="${VERSION}" perl -0pi -e '
     or die "failed to update [workspace.package].version\n";
 ' Cargo.toml
 
+# Bump .codex-plugin/plugin.json if it exists.
+PLUGIN_JSON=".codex-plugin/plugin.json"
+if [[ -f "$PLUGIN_JSON" ]]; then
+  sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" "$PLUGIN_JSON" 2>/dev/null \
+    || sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" "$PLUGIN_JSON"
+fi
+
 cargo check --workspace
 
 git add Cargo.toml Cargo.lock
+[[ -f "$PLUGIN_JSON" ]] && git add "$PLUGIN_JSON"
 if git diff --cached --quiet; then
   echo "error: release prep produced no staged changes" >&2
   exit 1
