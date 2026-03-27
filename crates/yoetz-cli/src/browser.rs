@@ -429,11 +429,16 @@ fn run_recipe_with_connection(
 
         if action == CHATGPT_WAIT_ACTION {
             // Interpolate recipe vars (e.g. {{wait_timeout_ms}}) in args before parsing.
-            let interpolated_args: Option<Vec<String>> = step.args.as_ref().map(|args| {
-                args.iter()
-                    .map(|a| interpolate(a, &ctx, None).unwrap_or_else(|_| a.clone()))
-                    .collect()
-            });
+            let interpolated_args: Option<Vec<String>> = step
+                .args
+                .as_ref()
+                .map(|args| {
+                    args.iter()
+                        .map(|a| interpolate(a, &ctx, None))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()
+                .with_context(|| format!("recipe step {idx} ({action}) var interpolation"))?;
             let stdout = run_chatgpt_wait_response(
                 interpolated_args.as_deref(),
                 step.timeout_ms,
