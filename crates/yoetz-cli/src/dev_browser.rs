@@ -34,8 +34,24 @@ static DEV_BROWSER: OnceLock<Result<String, String>> = OnceLock::new();
 /// Default timeout for dev-browser scripts in seconds.
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 30;
 
-/// Extended timeout for ChatGPT response polling (up to 10 minutes).
-const CHATGPT_POLL_TIMEOUT_SECS: u64 = 600;
+/// Extended timeout for ChatGPT response polling (30 minutes by default).
+const CHATGPT_POLL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
+const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 30_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ChatgptPollSettings {
+    pub timeout_ms: u64,
+    pub interval_ms: u64,
+}
+
+impl Default for ChatgptPollSettings {
+    fn default() -> Self {
+        Self {
+            timeout_ms: CHATGPT_POLL_TIMEOUT_MS_DEFAULT,
+            interval_ms: CHATGPT_POLL_INTERVAL_MS_DEFAULT,
+        }
+    }
+}
 
 /// dev-browser tmp directory for file staging.
 fn dev_browser_tmp_dir() -> PathBuf {
@@ -305,8 +321,8 @@ pub struct DevBrowserRecipeContext {
     pub paste_mode: bool,
     /// Custom prompt text.
     pub prompt: String,
-    /// ChatGPT poll timeout in seconds.
-    pub poll_timeout_secs: u64,
+    /// ChatGPT response polling settings.
+    pub poll_settings: ChatgptPollSettings,
 }
 
 impl Default for DevBrowserRecipeContext {
@@ -318,57 +334,49 @@ impl Default for DevBrowserRecipeContext {
             prompt: "Review the attached file and provide your analysis.".to_string(),
             disable_extended: false,
             paste_mode: false,
-            poll_timeout_secs: CHATGPT_POLL_TIMEOUT_SECS,
+            poll_settings: ChatgptPollSettings::default(),
         }
     }
 }
 
-/// Run the ChatGPT recipe via dev-browser.
-///
-/// This replaces the YAML-based chatgpt.yaml recipe with a single Playwright
-/// script that handles navigation, model selection, file upload (via DataTransfer),
-/// prompt entry, and response polling.
-pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
-    // Stage the bundle file if provided (for attachment mode).
-    // Use a unique prefix (PID + timestamp) to avoid collisions between
-    // concurrent recipe runs.
-    let unique_prefix = format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
-    let staged_name = if !ctx.paste_mode {
-        if let Some(bundle_path) = &ctx.bundle_path {
-            let content = fs::read_to_string(bundle_path)
-                .with_context(|| format!("read bundle: {}", bundle_path.display()))?;
-            let base_name = bundle_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("bundle.txt");
-            let name = format!("{unique_prefix}_{base_name}");
-            stage_file(&name, &content)?;
-            Some(name)
-        } else if let Some(text) = &ctx.bundle_text {
-            let name = format!("{unique_prefix}_bundle.md");
-            stage_file(&name, text)?;
-            Some(name)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+pub fn resolve_chatgpt_poll_settings(
+    vars: &BTreeMap<String, String>,
+) -> Result<ChatgptPollSettings> {
+    let mut settings = ChatgptPollSettings::default();
+    if let Some(timeout_ms) = parse_positive_u64_var(vars, "wait_timeout_ms")? {
+        settings.timeout_ms = timeout_ms;
+    }
+    if let Some(interval_ms) = parse_positive_u64_var(vars, "wait_interval_ms")? {
+        settings.interval_ms = interval_ms;
+    }
+    Ok(settings)
+}
 
+fn parse_positive_u64_var(vars: &BTreeMap<String, String>, key: &str) -> Result<Option<u64>> {
+    let Some(raw) = vars.get(key) else {
+        return Ok(None);
+    };
+    let value = raw
+        .parse::<u64>()
+        .with_context(|| format!("invalid recipe var `{key}` value `{raw}`"))?;
+    if value == 0 {
+        return Err(anyhow!("recipe var `{key}` must be greater than 0"));
+    }
+    Ok(Some(value))
+}
+
+fn chatgpt_script_timeout_secs(poll_timeout_ms: u64) -> u64 {
+    poll_timeout_ms.div_ceil(1000) + 60
+}
+
+fn build_chatgpt_recipe_script(ctx: &DevBrowserRecipeContext, staged_name: Option<&str>) -> String {
     let model_json = serde_json::to_string(&ctx.model).unwrap();
     let prompt_json = serde_json::to_string(&ctx.prompt).unwrap();
     let bundle_text_json =
         serde_json::to_string(&ctx.bundle_text.as_deref().unwrap_or("")).unwrap();
-    let staged_name_json = serde_json::to_string(&staged_name.as_deref().unwrap_or("")).unwrap();
+    let staged_name_json = serde_json::to_string(&staged_name.unwrap_or("")).unwrap();
 
-    let script = format!(
+    format!(
         r##"
 const MODEL = {model_json};
 const PROMPT = {prompt_json};
@@ -377,6 +385,7 @@ const STAGED_FILE = {staged_name_json};
 const PASTE_MODE = {paste_mode};
 const DISABLE_EXTENDED = {disable_extended};
 const POLL_TIMEOUT_MS = {poll_timeout_ms};
+const POLL_INTERVAL_MS = {poll_interval_ms};
 
 // --- Step 1: Navigate to fresh ChatGPT conversation ---
 const page = await browser.newPage();
@@ -510,46 +519,64 @@ if (await sendBtn.count() > 0) {{
 }}
 
 // --- Step 6: Poll for response completion ---
-// Checks: stop button gone, send button enabled, known error markers.
+// Checks: stop button gone, send idle, no thinking indicator, stable idle poll.
 const pollStart = Date.now();
 let completed = false;
 let pollError = null;
+let idleFingerprint = null;
 
 while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
-    await page.waitForTimeout(5000);
+    await page.waitForTimeout(POLL_INTERVAL_MS);
 
-    // Check for ChatGPT error markers
-    const errorCheck = await page.evaluate(() => {{
+    const pollState = await page.evaluate(() => {{
         const text = document.body.innerText.toLowerCase();
         const errors = ["network error", "something went wrong", "an error occurred",
                         "could not process", "rate limit", "too many requests"];
         for (const e of errors) {{
-            if (text.includes(e)) return e;
+            if (text.includes(e)) {{
+                return {{
+                    error: e,
+                    sendIdle: false,
+                    hasStopButton: false,
+                    hasThinkingIndicator: false,
+                    assistantText: ""
+                }};
+            }}
         }}
-        return null;
+        const sendBtn = document.querySelector("button[data-testid='send-button']");
+        const stopBtn = document.querySelector("button[data-testid='stop-button'], button[aria-label*='Stop']");
+        const thinking = document.querySelector(
+            '.result-thinking, [class*="result-thinking"], [data-testid*="thinking"]'
+        );
+        const assistantText = Array.from(
+            document.querySelectorAll('[data-message-author-role="assistant"]')
+        ).map((m) => m.innerText).join('\n---\n');
+        return {{
+            error: null,
+            sendIdle: !sendBtn || !sendBtn.disabled,
+            hasStopButton: Boolean(stopBtn),
+            hasThinkingIndicator: Boolean(thinking) || text.includes("pro thinking"),
+            assistantText
+        }};
     }});
-    if (errorCheck) {{
-        pollError = "ChatGPT error: " + errorCheck;
+    if (pollState.error) {{
+        pollError = "ChatGPT error: " + pollState.error;
         break;
     }}
 
-    const stopBtn = page.locator('button[data-testid="stop-button"]');
-    const isGenerating = await stopBtn.count() > 0;
+    const idle = pollState.sendIdle &&
+        !pollState.hasStopButton &&
+        !pollState.hasThinkingIndicator;
 
-    if (!isGenerating) {{
-        // Verify send button is enabled (response truly complete)
-        const sendEnabled = await page.evaluate(() => {{
-            const btn = document.querySelector('button[data-testid="send-button"]');
-            return btn && !btn.disabled;
-        }});
-        if (sendEnabled) {{
+    if (idle) {{
+        const fingerprint = `${{pollState.assistantText.length}}:${{pollState.assistantText}}`;
+        if (idleFingerprint === fingerprint) {{
             completed = true;
             break;
         }}
-        // If send not enabled yet, keep polling briefly
-        await page.waitForTimeout(2000);
-        completed = true;
-        break;
+        idleFingerprint = fingerprint;
+    }} else {{
+        idleFingerprint = null;
     }}
 }}
 
@@ -577,10 +604,56 @@ console.log(JSON.stringify(result));
         staged_name_json = staged_name_json,
         paste_mode = ctx.paste_mode,
         disable_extended = ctx.disable_extended,
-        poll_timeout_ms = ctx.poll_timeout_secs * 1000,
-    );
+        poll_timeout_ms = ctx.poll_settings.timeout_ms,
+        poll_interval_ms = ctx.poll_settings.interval_ms,
+    )
+}
 
-    let stdout = run_script_connect(&script, Some(ctx.poll_timeout_secs + 60))?;
+/// Run the ChatGPT recipe via dev-browser.
+///
+/// This replaces the YAML-based chatgpt.yaml recipe with a single Playwright
+/// script that handles navigation, model selection, file upload (via DataTransfer),
+/// prompt entry, and response polling.
+pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
+    // Stage the bundle file if provided (for attachment mode).
+    // Use a unique prefix (PID + timestamp) to avoid collisions between
+    // concurrent recipe runs.
+    let unique_prefix = format!(
+        "{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
+    let staged_name = if !ctx.paste_mode {
+        if let Some(bundle_path) = &ctx.bundle_path {
+            let content = fs::read_to_string(bundle_path)
+                .with_context(|| format!("read bundle: {}", bundle_path.display()))?;
+            let base_name = bundle_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("bundle.txt");
+            let name = format!("{unique_prefix}_{base_name}");
+            stage_file(&name, &content)?;
+            Some(name)
+        } else if let Some(text) = &ctx.bundle_text {
+            let name = format!("{unique_prefix}_bundle.md");
+            stage_file(&name, text)?;
+            Some(name)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let script = build_chatgpt_recipe_script(ctx, staged_name.as_deref());
+
+    let stdout = run_script_connect(
+        &script,
+        Some(chatgpt_script_timeout_secs(ctx.poll_settings.timeout_ms)),
+    )?;
 
     // Parse and return the response
     let result: Value = serde_json::from_str(stdout.trim())
@@ -593,8 +666,8 @@ console.log(JSON.stringify(result));
 
     if result["status"] == "timeout" {
         return Err(anyhow!(
-            "ChatGPT response timed out after {}s",
-            ctx.poll_timeout_secs
+            "ChatGPT response timed out after {}ms",
+            ctx.poll_settings.timeout_ms
         ));
     }
 
@@ -724,6 +797,7 @@ if (chatgpt) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn test_dev_browser_tmp_dir() {
@@ -749,5 +823,64 @@ mod tests {
         let content = fs::read(&path).unwrap();
         assert_eq!(content, data);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_chatgpt_poll_settings_uses_defaults() {
+        assert_eq!(
+            resolve_chatgpt_poll_settings(&BTreeMap::new()).unwrap(),
+            ChatgptPollSettings::default()
+        );
+    }
+
+    #[test]
+    fn resolve_chatgpt_poll_settings_accepts_recipe_vars() {
+        let vars = BTreeMap::from([
+            ("wait_timeout_ms".to_string(), "900000".to_string()),
+            ("wait_interval_ms".to_string(), "45000".to_string()),
+        ]);
+        assert_eq!(
+            resolve_chatgpt_poll_settings(&vars).unwrap(),
+            ChatgptPollSettings {
+                timeout_ms: 900_000,
+                interval_ms: 45_000,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_chatgpt_poll_settings_rejects_zero_values() {
+        let vars = BTreeMap::from([("wait_interval_ms".to_string(), "0".to_string())]);
+        let err = resolve_chatgpt_poll_settings(&vars).unwrap_err();
+        assert!(err.to_string().contains("wait_interval_ms"));
+    }
+
+    #[test]
+    fn chatgpt_script_timeout_secs_adds_grace_window() {
+        assert_eq!(chatgpt_script_timeout_secs(1_800_000), 1_860);
+    }
+
+    #[test]
+    fn build_chatgpt_recipe_script_uses_poll_settings_and_stable_idle_detection() {
+        let script = build_chatgpt_recipe_script(
+            &DevBrowserRecipeContext {
+                prompt: "test prompt".to_string(),
+                poll_settings: ChatgptPollSettings {
+                    timeout_ms: 900_000,
+                    interval_ms: 45_000,
+                },
+                ..Default::default()
+            },
+            None,
+        );
+
+        assert!(script.contains("const POLL_TIMEOUT_MS = 900000;"));
+        assert!(script.contains("const POLL_INTERVAL_MS = 45000;"));
+        assert!(script.contains("let idleFingerprint = null;"));
+        assert!(script.contains(
+            ".result-thinking, [class*=\"result-thinking\"], [data-testid*=\"thinking\"]"
+        ));
+        assert!(script.contains("idleFingerprint === fingerprint"));
+        assert!(!script.contains("await page.waitForTimeout(2000);\n        completed = true;"));
     }
 }
