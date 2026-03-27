@@ -30,6 +30,15 @@ tarpaulin-report.html
 yoetz.toml
 !docs/config.example.toml
 
+# AI agent configuration (track only skills for distribution)
+.claude/**
+!.claude/skills/
+!.claude/skills/**
+.codex/
+.agents/**
+!.agents/skills/
+!.agents/skills/**
+
 # Agent coordination (local)
 .agent-mail/
 .amqrc

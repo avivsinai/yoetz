@@ -99,6 +99,15 @@ jobs:
                 exit 1
               fi
 
+              # Validate Codex plugin manifest version matches release
+              if [[ -f .codex-plugin/plugin.json ]]; then
+                codex_version="$(jq -r '.version // empty' .codex-plugin/plugin.json)"
+                if [[ -n "$codex_version" && "$codex_version" != "$version" ]]; then
+                  echo "::error::.codex-plugin/plugin.json version ${codex_version} does not match release ${version}. Run: sed -i 's/\"version\": \".*\"/\"version\": \"${version}\"/' .codex-plugin/plugin.json"
+                  exit 1
+                fi
+              fi
+
               release_ref="${GITHUB_SHA}"
               release_sha="${GITHUB_SHA}"
               if git rev-parse -q --verify "refs/tags/${tag}" >/dev/null 2>&1; then

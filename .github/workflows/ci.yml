@@ -20,6 +20,22 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  check-skills:
+    name: Check Skills Sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check skill symlinks
+        run: |
+          for skill in yoetz; do
+            test -L .claude/skills/$skill || (echo "❌ .claude/skills/$skill is not a symlink" && exit 1)
+            test -L .agents/skills/$skill || (echo "❌ .agents/skills/$skill is not a symlink" && exit 1)
+            test "$(readlink .claude/skills/$skill)" = "../../skills/$skill" || (echo "❌ .claude/skills/$skill target wrong" && exit 1)
+            test "$(readlink .agents/skills/$skill)" = "../../skills/$skill" || (echo "❌ .agents/skills/$skill target wrong" && exit 1)
+          done
+          diff -rq skills/yoetz .claude/skills/yoetz || (echo "❌ content mismatch" && exit 1)
+          echo "✓ Skill symlinks valid"
+
   changes:
     name: Detect Release-Only Changes
     runs-on: ubuntu-latest
