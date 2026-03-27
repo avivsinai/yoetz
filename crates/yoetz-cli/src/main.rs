@@ -1087,63 +1087,73 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             // via DataTransfer, and single-script execution.
             // Skip dev-browser when --cdp or --profile is explicitly set, since
             // dev-browser uses its own connection logic (--connect auto-discovery).
-            if is_chatgpt
-                && browser::use_dev_browser()
-                && recipe_args.cdp.is_none()
-                && recipe_args.profile.is_none()
-            {
-                dev_browser::ensure_installed()?;
-                if let Err(e) = dev_browser::ensure_chatgpt_auth() {
-                    eprintln!("info: dev-browser auth check failed ({e}), trying legacy path");
-                } else {
-                    let bundle_text = recipe_args
-                        .bundle
-                        .as_ref()
-                        .map(fs::read_to_string)
-                        .transpose()?;
-                    let poll_settings = dev_browser::resolve_chatgpt_poll_settings(&recipe_vars)?;
+            if is_chatgpt && recipe_args.cdp.is_none() && recipe_args.profile.is_none() {
+                match dev_browser::ensure_installed() {
+                    Ok(()) => {
+                        if let Err(e) = dev_browser::ensure_chatgpt_auth() {
+                            eprintln!(
+                                "info: dev-browser auth check failed ({e}), trying legacy path"
+                            );
+                        } else {
+                            let bundle_text = recipe_args
+                                .bundle
+                                .as_ref()
+                                .map(fs::read_to_string)
+                                .transpose()?;
+                            let poll_settings =
+                                dev_browser::resolve_chatgpt_poll_settings(&recipe_vars)?;
 
-                    let recipe_ctx = dev_browser::DevBrowserRecipeContext {
-                        bundle_path: recipe_args.bundle.clone(),
-                        bundle_text,
-                        model: recipe_vars.get("model").cloned().unwrap_or_default(),
-                        disable_extended: recipe_vars
-                            .get("extended")
-                            .map(|v| v == "false")
-                            .unwrap_or(false),
-                        paste_mode: recipe_vars
-                            .get("paste")
-                            .map(|v| v == "true")
-                            .unwrap_or(false),
-                        prompt: recipe_vars.get("prompt").cloned().unwrap_or_else(|| {
-                            "Review the attached file and provide your analysis.".to_string()
-                        }),
-                        poll_settings,
-                    };
+                            let recipe_ctx = dev_browser::DevBrowserRecipeContext {
+                                bundle_path: recipe_args.bundle.clone(),
+                                bundle_text,
+                                model: recipe_vars.get("model").cloned().unwrap_or_default(),
+                                disable_extended: recipe_vars
+                                    .get("extended")
+                                    .map(|v| v == "false")
+                                    .unwrap_or(false),
+                                paste_mode: recipe_vars
+                                    .get("paste")
+                                    .map(|v| v == "true")
+                                    .unwrap_or(false),
+                                prompt: recipe_vars.get("prompt").cloned().unwrap_or_else(|| {
+                                    "Review the attached file and provide your analysis."
+                                        .to_string()
+                                }),
+                                poll_settings,
+                                allow_empty_response: recipe_vars
+                                    .get("allow_empty_response")
+                                    .map(|v| v == "true")
+                                    .unwrap_or(false),
+                            };
 
-                    let response = dev_browser::run_chatgpt_recipe(&recipe_ctx)?;
-                    match format {
-                        OutputFormat::Json => {
-                            let payload = json!({
-                                "status": "ok",
-                                "backend": "dev-browser",
-                                "response": response,
-                            });
-                            write_json(&payload)?;
-                        }
-                        OutputFormat::Jsonl => {
-                            let payload = json!({
-                                "type": "recipe_complete",
-                                "backend": "dev-browser",
-                                "response": response,
-                            });
-                            write_jsonl("browser.recipe", &payload)?;
-                        }
-                        OutputFormat::Text | OutputFormat::Markdown => {
-                            println!("{response}");
+                            let response = dev_browser::run_chatgpt_recipe(&recipe_ctx)?;
+                            match format {
+                                OutputFormat::Json => {
+                                    let payload = json!({
+                                        "status": "ok",
+                                        "backend": "dev-browser",
+                                        "response": response,
+                                    });
+                                    write_json(&payload)?;
+                                }
+                                OutputFormat::Jsonl => {
+                                    let payload = json!({
+                                        "type": "recipe_complete",
+                                        "backend": "dev-browser",
+                                        "response": response,
+                                    });
+                                    write_jsonl("browser.recipe", &payload)?;
+                                }
+                                OutputFormat::Text | OutputFormat::Markdown => {
+                                    println!("{response}");
+                                }
+                            }
+                            return Ok(());
                         }
                     }
-                    return Ok(());
+                    Err(e) => {
+                        eprintln!("info: dev-browser unavailable ({e}), trying legacy path");
+                    }
                 }
             }
 
