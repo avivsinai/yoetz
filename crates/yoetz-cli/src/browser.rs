@@ -2841,9 +2841,8 @@ mod tests {
         assert_eq!(options.interval_ms, CHATGPT_POLL_INTERVAL_MS_DEFAULT);
         assert_eq!(options.timeout_ms, CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT);
         // attempts derived from ceil(timeout / interval) when not explicit.
-        let expected_attempts =
-            ((CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT + CHATGPT_POLL_INTERVAL_MS_DEFAULT - 1)
-                / CHATGPT_POLL_INTERVAL_MS_DEFAULT) as usize;
+        let expected_attempts = CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT
+            .div_ceil(CHATGPT_POLL_INTERVAL_MS_DEFAULT) as usize;
         assert_eq!(options.attempts, expected_attempts);
     }
 
@@ -2942,7 +2941,7 @@ mod tests {
     fn parse_chatgpt_dom_state_defaults_thinking_when_absent() {
         // Backward compat: older agent-browser versions may not emit thinking field.
         let state = parse_chatgpt_dom_state("send=enabled|stop=0|copy=2").unwrap();
-        assert_eq!(state.has_thinking_indicator, false);
+        assert!(!state.has_thinking_indicator);
     }
 
     #[test]
