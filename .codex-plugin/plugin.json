@@ -1,6 +1,6 @@
 {
   "name": "yoetz",
-  "version": "0.2.32",
+  "version": "0.2.33",
   "description": "LLM council, bundler, and multimodal gateway - multi-model consensus, code review, image/video generation, and browser fallback for coding agents",
   "author": {
     "name": "Aviv Sinai",
