@@ -1236,6 +1236,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 profile_mode,
                 use_stealth: needs_auth,
                 headed: needs_auth,
+                target_url: browser::CHATGPT_URL.to_string(),
                 vars: recipe_vars,
             };
 
