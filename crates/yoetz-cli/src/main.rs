@@ -1083,8 +1083,8 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     .contains("chatgpt");
 
             // --- dev-browser path (preferred for ChatGPT recipes) ---
-            // Uses Playwright-based dev-browser with full Page API, file upload
-            // via DataTransfer, and single-script execution.
+            // Uses Playwright-based dev-browser with full Page API, native
+            // filechooser upload, and single-script execution.
             // Skip dev-browser when --cdp or --profile is explicitly set, since
             // dev-browser uses its own connection logic (--connect auto-discovery).
             if is_chatgpt && recipe_args.cdp.is_none() && recipe_args.profile.is_none() {
@@ -1095,11 +1095,22 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                                 "info: dev-browser auth check failed ({e}), trying legacy path"
                             );
                         } else {
-                            let bundle_text = recipe_args
-                                .bundle
-                                .as_ref()
-                                .map(fs::read_to_string)
-                                .transpose()?;
+                            let paste_mode = recipe_vars
+                                .get("paste")
+                                .map(|v| v == "true")
+                                .unwrap_or(false);
+                            // Only read bundle text when paste mode is active.
+                            // In attachment mode the file is staged directly —
+                            // reading it here would waste memory on large bundles.
+                            let bundle_text = if paste_mode {
+                                recipe_args
+                                    .bundle
+                                    .as_ref()
+                                    .map(fs::read_to_string)
+                                    .transpose()?
+                            } else {
+                                None
+                            };
                             let poll_settings =
                                 dev_browser::resolve_chatgpt_poll_settings(&recipe_vars)?;
 
@@ -1111,10 +1122,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                                     .get("extended")
                                     .map(|v| v == "false")
                                     .unwrap_or(false),
-                                paste_mode: recipe_vars
-                                    .get("paste")
-                                    .map(|v| v == "true")
-                                    .unwrap_or(false),
+                                paste_mode,
                                 prompt: recipe_vars.get("prompt").cloned().unwrap_or_else(|| {
                                     "Review the attached file and provide your analysis."
                                         .to_string()
