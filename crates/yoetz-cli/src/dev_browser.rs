@@ -372,16 +372,32 @@ pub struct TabInfo {
 }
 
 /// Check if Chrome is reachable and dev-browser can connect to it.
+/// Uses a short first probe; retries once with a longer timeout only when the
+/// first failure looks like a timeout (slow CDP handshake with many tabs).
 pub fn check_connection() -> Result<()> {
     let script = r#"
 const pages = await browser.listPages();
 console.log("ok:" + pages.length);
 "#;
-    let stdout = run_script_connect(script, Some(10))?;
-    if stdout.trim().starts_with("ok:") {
-        Ok(())
-    } else {
-        Err(anyhow!("dev-browser connection check failed: {stdout}"))
+    match run_script_connect(script, Some(10)) {
+        Ok(stdout) if stdout.trim().starts_with("ok:") => Ok(()),
+        Ok(stdout) => Err(anyhow!("dev-browser connection check failed: {stdout}")),
+        Err(first_err) => {
+            let msg = format!("{first_err:#}");
+            let is_timeout = msg.contains("Timeout") || msg.contains("timed out");
+            if !is_timeout {
+                return Err(first_err.context("dev-browser connection check failed"));
+            }
+            eprintln!("info: dev-browser connection timed out, retrying with longer timeout");
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let stdout = run_script_connect(script, Some(45))
+                .context("dev-browser connection check failed after retry")?;
+            if stdout.trim().starts_with("ok:") {
+                Ok(())
+            } else {
+                Err(anyhow!("dev-browser connection check failed: {stdout}"))
+            }
+        }
     }
 }
 
