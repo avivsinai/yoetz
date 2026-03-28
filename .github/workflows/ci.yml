@@ -227,8 +227,10 @@ jobs:
         with:
           name: yoetz-${{ matrix.os }}
           path: target/release/yoetz
+          retention-days: 3
       - uses: actions/upload-artifact@v7
         if: matrix.os == 'windows-latest'
         with:
           name: yoetz-${{ matrix.os }}
           path: target/release/yoetz.exe
+          retention-days: 3

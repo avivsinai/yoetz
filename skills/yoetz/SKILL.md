@@ -192,6 +192,8 @@ yoetz connects to your already logged-in Chrome session via auto-connect (CDP). 
 1. Open Chrome and go to `chrome://inspect/#remote-debugging`
 2. Ensure "Discover network targets" is enabled
 
+If Chrome lands on `chrome://inspect/#devices` instead, that's fine. Keep "Discover network targets" enabled there.
+
 **Step 2: Run a recipe**
 ```bash
 BUNDLE=$(yoetz bundle -p "Review" -f src/*.rs --format json | jq -r .artifacts.bundle_md)
@@ -199,7 +201,7 @@ yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 ```
 
 **Step 3: Approve remote debugging (Chrome 146+)**
-Chrome 146+ shows an "Allow remote debugging?" dialog on the first connection. Click **Allow** once — the daemon keeps the connection alive for subsequent runs.
+Chrome 146+ may show an "Allow remote debugging?" dialog on the first live attach. Click **Allow** once for that browser instance.
 
 **Step 4: Verify connection**
 ```bash
@@ -214,6 +216,16 @@ Chrome 146 introduced a security dialog for external CDP connections. yoetz hand
 - Cleans up stale daemons when the connection breaks
 
 If you see "Allow remote debugging?" in Chrome, click Allow and retry.
+
+Explicit `--cdp` is already supported on `yoetz browser attach`, `check`, `recipe`, and `login`, but it only bypasses auto-discovery. It does **not** bypass Chrome's approval gate when targeting the same live browser instance started from `chrome://inspect`.
+
+If the approval dialog is frozen or unclickable, use the manual CDP path instead:
+```bash
+chrome --remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug
+yoetz browser attach --cdp http://127.0.0.1:9222
+```
+
+Chrome for Testing is also a good fallback for this manual path.
 
 ### Cookie sync (legacy fallback)
 
@@ -268,8 +280,8 @@ Built-in recipes: `chatgpt`, `claude`, `gemini`.
 
 | Symptom | Fix |
 |---------|-----|
-| `Allow remote debugging?` dialog | Click **Allow** in Chrome, then retry. This is a one-time Chrome 146+ security prompt. |
-| `auto-connect probe timed out` | Chrome dialog is showing — click Allow. Or install agent-browser globally: `npm install -g agent-browser` |
+| `Allow remote debugging?` dialog | Click **Allow** in Chrome, then retry. If the dialog is frozen, launch Chrome with `--remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug` and use `yoetz browser attach --cdp http://127.0.0.1:9222` instead. |
+| `auto-connect probe timed out` | Chrome dialog is probably showing. Click Allow. If Chrome will not accept the dialog, switch to the manual `--cdp` flow above. If agent-browser is missing, install it with `npm install -g agent-browser`. |
 | `chatgpt login required` | Chrome was reached but not logged into ChatGPT. Log into ChatGPT in that Chrome session, then retry. Or use `yoetz browser login` for manual auth. |
 | `daemon already running` | Run `yoetz browser attach` to check connection, or kill stale daemon: `agent-browser close` |
 | `agent-browser failed` | Ensure `npx agent-browser --version` works, or `npm install -g agent-browser` |

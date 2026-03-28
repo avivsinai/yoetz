@@ -8,7 +8,7 @@
 //!
 //! Key advantages over agent-browser:
 //! - Full Playwright Page API (goto, click, fill, locator, evaluate, etc.)
-//! - File upload via readFile + DataTransfer (no filesystem access needed)
+//! - File upload via native filechooser + setFiles(FilePayload)
 //! - Persistent named pages across script runs
 //! - Daemon-managed browser instances with auto-reconnect
 //! - Single script executes batch operations (fewer IPC round-trips)
@@ -79,8 +79,10 @@ fn dev_browser_tmp_dir() -> PathBuf {
 }
 
 fn command_is_available(bin: &str) -> bool {
+    // dev-browser doesn't support --version (exits 2). Use --help which
+    // exits 0 and is universally supported.
     Command::new(bin)
-        .arg("--version")
+        .arg("--help")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
@@ -113,7 +115,50 @@ fn find_dev_browser() -> Result<Option<String>> {
         let _ = DEV_BROWSER.set(bin.clone());
         return Ok(Some(bin));
     }
+    // npm global bin may not be in PATH (e.g. Homebrew node on macOS).
+    // Check `npm prefix -g`/bin/ as a fallback.
+    if let Some(bin) = find_dev_browser_via_npm_prefix() {
+        let _ = DEV_BROWSER.set(bin.clone());
+        return Ok(Some(bin));
+    }
     Ok(None)
+}
+
+/// Locate dev-browser under the npm global prefix directory.
+fn find_dev_browser_via_npm_prefix() -> Option<String> {
+    let output = Command::new("npm")
+        .args(["prefix", "-g"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let prefix = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if prefix.is_empty() {
+        return None;
+    }
+
+    npm_prefix_dev_browser_candidates(std::path::Path::new(&prefix), cfg!(windows))
+        .into_iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .find(|candidate| command_is_available(candidate))
+}
+
+fn npm_prefix_dev_browser_candidates(prefix: &Path, windows: bool) -> Vec<PathBuf> {
+    if windows {
+        vec![
+            prefix.join("dev-browser.cmd"),
+            prefix.join("dev-browser.exe"),
+            prefix.join("dev-browser"),
+        ]
+    } else {
+        vec![
+            prefix.join("bin").join("dev-browser"),
+            prefix.join("dev-browser"),
+        ]
+    }
 }
 
 /// Resolve the dev-browser binary after installation has already been handled.
@@ -155,14 +200,15 @@ pub fn ensure_installed() -> Result<()> {
         ));
     }
 
-    if !command_is_available("dev-browser") {
-        return Err(anyhow!(
-            "dev-browser installed successfully, but it is not available in PATH"
-        ));
+    // After install, re-run full discovery (PATH + npm prefix fallback).
+    if let Some(bin) = find_dev_browser()? {
+        let _ = DEV_BROWSER.set(bin);
+        eprintln!("info: dev-browser installed successfully");
+        return Ok(());
     }
-    let _ = DEV_BROWSER.set("dev-browser".to_string());
-    eprintln!("info: dev-browser installed successfully");
-    Ok(())
+    Err(anyhow!(
+        "dev-browser installed successfully, but it is not available in PATH or npm prefix"
+    ))
 }
 
 /// Run a dev-browser script against a live Chrome instance (auto-connect).
@@ -190,6 +236,19 @@ pub fn run_script_connect(script: &str, timeout_secs: Option<u64>) -> Result<Str
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
+
+        // QuickJS WASM crashes with a GC assertion during sandbox disposal
+        // AFTER the script has already completed and printed its output.
+        // If stdout has content and stderr is just the GC crash, recover.
+        let is_gc_crash =
+            stderr.contains("list_empty(&rt->gc_obj_list)") || stderr.contains("JS_FreeRuntime");
+        if is_gc_crash && !stdout.trim().is_empty() {
+            eprintln!(
+                "info: dev-browser sandbox GC crash on disposal (known QuickJS bug), recovering from stdout"
+            );
+            return Ok(stdout.to_string());
+        }
+
         let detail = if !stderr.is_empty() {
             stderr.to_string()
         } else if !stdout.is_empty() {
@@ -340,20 +399,44 @@ const page = await browser.newPage();
 try {
     await page.goto("https://chatgpt.com/");
     await page.waitForTimeout(3000);
-    const text = await page.evaluate(() => document.body.innerText.toLowerCase());
-    const authenticated = text.includes("new chat") || text.includes("send a message") || text.includes("ask anything");
+    // Check for the composer textarea — the most reliable auth marker.
+    // Text markers like "new chat" / "send a message" drift with UI updates.
+    const authenticated = await page.evaluate(() => {
+        if (document.querySelector('#prompt-textarea')) return true;
+        const text = document.body.innerText.toLowerCase();
+        return text.includes("send a message") || text.includes("ask anything")
+            || text.includes("what are you working on") || text.includes("new chat");
+    });
     console.log(JSON.stringify({ authenticated }));
 } finally {
     await page.close().catch(() => {});
 }
 "#;
     let stdout = run_script_connect(script, Some(30))?;
-    let result: Value = serde_json::from_str(stdout.trim()).unwrap_or(json!({}));
-    Ok(result["authenticated"].as_bool().unwrap_or(false))
+    let result: Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("check_chatgpt_auth: malformed script output: {stdout}"))?;
+    result["authenticated"]
+        .as_bool()
+        .ok_or_else(|| anyhow!("check_chatgpt_auth: missing 'authenticated' field in: {stdout}"))
+}
+
+/// Ensure the connected Chrome session can reach ChatGPT.
+/// Only checks dev-browser daemon connectivity — opening a separate page
+/// to verify auth causes interference with the recipe's named page.
+/// If not authenticated, the recipe will fail with a clear error.
+pub fn ensure_chatgpt_auth() -> Result<()> {
+    check_connection().context(
+        "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
+    )?;
+    // Skip page-level auth check — it opens an anonymous page to chatgpt.com
+    // which interferes with the recipe's subsequent named page session.
+    Ok(())
 }
 
 /// Ensure the connected Chrome session can reach an authenticated ChatGPT page.
-pub fn ensure_chatgpt_auth() -> Result<()> {
+/// Opens a temporary page — use only when not immediately followed by a recipe.
+#[allow(dead_code)]
+pub fn ensure_chatgpt_auth_with_page_check() -> Result<()> {
     check_connection().context(
         "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
     )?;
@@ -435,8 +518,16 @@ fn chatgpt_script_timeout_secs(poll_timeout_ms: u64) -> u64 {
 fn build_chatgpt_recipe_script(ctx: &DevBrowserRecipeContext, staged_name: Option<&str>) -> String {
     let model_json = serde_json::to_string(&ctx.model).unwrap();
     let prompt_json = serde_json::to_string(&ctx.prompt).unwrap();
-    let bundle_text_json =
-        serde_json::to_string(&ctx.bundle_text.as_deref().unwrap_or("")).unwrap();
+    // Only embed bundle text in the script when paste mode is active.
+    // In attachment mode the content is staged to a file and read via
+    // readFile() — embedding it would bloat the script (500KB+) and crash
+    // the QuickJS WASM sandbox.
+    let bundle_text_for_script = if ctx.paste_mode {
+        ctx.bundle_text.as_deref().unwrap_or("")
+    } else {
+        ""
+    };
+    let bundle_text_json = serde_json::to_string(bundle_text_for_script).unwrap();
     let staged_name_json = serde_json::to_string(&staged_name.unwrap_or("")).unwrap();
 
     format!(
@@ -450,8 +541,11 @@ const DISABLE_EXTENDED = {disable_extended};
 const POLL_TIMEOUT_MS = {poll_timeout_ms};
 const POLL_INTERVAL_MS = {poll_interval_ms};
 const ALLOW_EMPTY_RESPONSE = {allow_empty_response};
+const warnings = [];
 
 // --- Step 1: Navigate to fresh ChatGPT conversation ---
+// Use browser.newPage() for a clean anonymous page. Named pages accumulate
+// stale ChatGPT state (cookies/localStorage) that disables the send button.
 const page = await browser.newPage();
 await page.goto("https://chatgpt.com/?_yoetz=" + Date.now());
 await page.waitForTimeout(4000);
@@ -472,31 +566,36 @@ if (currentUrl.includes("/c/")) {{
 }}
 
 // --- Step 2: Select model if provided ---
+// Model selection is best-effort with a 5s timeout per locator operation.
+// If it fails (ChatGPT UI changed, dropdown didn't open), warn and continue
+// with whatever model is currently selected.
 if (MODEL) {{
-    // Open model selector dropdown with Radix-compatible event sequence
-    const modelBtn = page.locator(
-        '[data-testid="model-switcher-dropdown-button"], button[aria-label="Model selector"]'
-    ).first();
-    if (await modelBtn.count() > 0) {{
-        await modelBtn.click();
+    try {{
+        const modelBtn = page.locator(
+            '[data-testid="model-switcher-dropdown-button"], button[aria-label="Model selector"]'
+        ).first();
+        await modelBtn.waitFor({{ state: 'visible', timeout: 5000 }});
+        await modelBtn.click({{ timeout: 5000 }});
         await page.waitForTimeout(1200);
 
-        // Try data-testid first, then text search
         const slug = MODEL.toLowerCase();
-        const byTestId = page.locator(`[data-testid="model-switcher-${{slug}}"]`);
+        const byTestId = page.locator(`[data-testid="model-switcher-${{slug}}"]`).first();
         if (await byTestId.count() > 0) {{
-            await byTestId.click();
+            await byTestId.click({{ timeout: 5000 }});
         }} else {{
             const names = {{"gpt-5-4-pro":"pro","gpt-5-4-thinking":"thinking","gpt-5-3":"instant","pro":"pro","thinking":"thinking","instant":"instant"}};
             const target = names[slug] || slug;
             const menuItem = page.locator('[role="menuitem"]').filter({{ hasText: new RegExp(target, 'i') }}).first();
-            if (await menuItem.count() > 0) {{
-                await menuItem.click();
-            }} else {{
-                throw new Error("model '" + slug + "' not found in dropdown");
-            }}
+            await menuItem.waitFor({{ state: 'visible', timeout: 5000 }});
+            await menuItem.click({{ timeout: 5000 }});
         }}
         await page.waitForTimeout(500);
+    }} catch (e) {{
+        const detail = e && typeof e.message === 'string' ? e.message : String(e);
+        warnings.push("model selection failed (" + detail + "), using current model");
+        // Dismiss any open dropdown by pressing Escape
+        await page.keyboard.press('Escape').catch(() => {{}});
+        await page.waitForTimeout(300);
     }}
 }}
 
@@ -511,68 +610,51 @@ if (DISABLE_EXTENDED) {{
 
 // --- Step 4: Deliver content (paste or file attachment) ---
 if (PASTE_MODE) {{
-    // Paste bundle text + prompt directly into textarea
-    const textarea = page.locator('#prompt-textarea');
-    await textarea.click();
-    const combined = PROMPT + "\n\n" + BUNDLE_TEXT;
-    await textarea.fill(combined);
+    // Paste bundle text + prompt via keyboard.type — Playwright fill() and
+    // execCommand both bypass ProseMirror React state, leaving send disabled.
+    await page.locator('#prompt-textarea').click();
+    await page.keyboard.type(PROMPT + "\n\n" + BUNDLE_TEXT);
     await page.waitForTimeout(500);
 }} else if (STAGED_FILE) {{
-    // Upload file via DataTransfer API (works from dev-browser sandbox)
+    // Upload via ChatGPT's native filechooser flow. DataTransfer hacks
+    // bypass React state and leave the send button disabled.
+    // Path: click + button → "Add photos & files" → filechooser →
+    // setFiles with FilePayload. Buffer must be constructed from a
+    // Uint8Array (not a string — QuickJS Buffer.from(string) is base64).
     const fileContent = await readFile(STAGED_FILE);
-
-    // Trigger the file input via DataTransfer — this works even without
-    // opening the attachment menu, because the hidden input is always in DOM.
-    const uploaded = await page.evaluate((args) => {{
-        const [content, fileName] = args;
-        const file = new File([content], fileName, {{ type: "text/plain" }});
-        const dataTransfer = new DataTransfer();
-        dataTransfer.items.add(file);
-        const input = document.getElementById('upload-files');
-        if (!input) return "input_missing";
-        input.files = dataTransfer.files;
-        input.dispatchEvent(new Event('change', {{ bubbles: true }}));
-        return "ok";
-    }}, [fileContent, STAGED_FILE]);
-
-    if (uploaded !== "ok") {{
-        throw new Error("file upload input (#upload-files) not found on page");
+    const utf8Bytes = [];
+    for (const char of fileContent) {{
+        const code = char.codePointAt(0);
+        if (code <= 0x7F) utf8Bytes.push(code);
+        else if (code <= 0x7FF) utf8Bytes.push(0xC0|(code>>6), 0x80|(code&0x3F));
+        else if (code <= 0xFFFF) utf8Bytes.push(0xE0|(code>>12), 0x80|((code>>6)&0x3F), 0x80|(code&0x3F));
+        else utf8Bytes.push(0xF0|(code>>18), 0x80|((code>>12)&0x3F), 0x80|((code>>6)&0x3F), 0x80|(code&0x3F));
     }}
 
-    // Poll for upload completion on the specific attachment tile.
-    let uploadDone = false;
-    for (let i = 0; i < 30; i++) {{
-        await page.waitForTimeout(1000);
-        const done = await page.evaluate((fileName) => {{
-            const tiles = Array.from(
-                document.querySelectorAll('[class*="file"], [data-testid*="file"], [class*="attachment"]')
-            );
-            const tile = tiles.find((el) => (el.textContent || "").includes(fileName))
-                || tiles.find((el) => el.querySelector('[class*="animate-spin"]'))
-                || null;
-            if (!tile) return "waiting";
-            const spinner = tile.querySelector('[class*="animate-spin"]');
-            if (!spinner) return "done";
-            const target = spinner.parentElement || spinner;
-            const hidden = getComputedStyle(target).display === 'none';
-            return hidden ? "done" : "uploading";
-        }}, STAGED_FILE);
-        if (done === "done") {{ uploadDone = true; break; }}
-    }}
-    if (!uploadDone) {{
-        throw new Error("file upload timed out after 30s — attachment may not be ready");
-    }}
+    await page.locator('button[data-testid="composer-plus-btn"]').click();
+    await page.waitForTimeout(500);
+    const [fileChooser] = await Promise.all([
+        page.waitForEvent('filechooser', {{ timeout: 10000 }}),
+        page.locator('div[role="menuitem"]:has-text("Add photos & files")').click(),
+    ]);
+    await fileChooser.setFiles({{
+        name: "bundle.md",
+        mimeType: "text/plain",
+        buffer: Buffer.from(new Uint8Array(utf8Bytes)),
+    }});
 
-    // Type the prompt
-    const textarea = page.locator('#prompt-textarea');
-    await textarea.click();
-    await textarea.fill(PROMPT);
+    // Wait for upload to be processed by ChatGPT's React state.
+    await page.waitForTimeout(5000);
+
+    // Type prompt via keyboard (Playwright fill()/execCommand bypass
+    // ProseMirror React state, leaving send button disabled).
+    await page.locator('#prompt-textarea').click();
+    await page.keyboard.type(PROMPT, {{ delay: 5 }});
     await page.waitForTimeout(500);
 }} else {{
     // No bundle — just type the prompt
-    const textarea = page.locator('#prompt-textarea');
-    await textarea.click();
-    await textarea.fill(PROMPT);
+    await page.locator('#prompt-textarea').click();
+    await page.keyboard.type(PROMPT, {{ delay: 5 }});
     await page.waitForTimeout(500);
 }}
 
@@ -594,6 +676,9 @@ if (sendState === "disabled") {{
 }}
 const sendBtn = page.locator('button[data-testid="send-button"]');
 await sendBtn.click();
+// After clicking send, ChatGPT navigates (SPA) from / to /c/UUID.
+// Wait for navigation to settle before starting poll loop.
+await page.waitForTimeout(2000);
 
 // --- Step 6: Poll for response completion ---
 // Checks: new assistant response appeared, text is stable, send idle, no thinking indicator.
@@ -605,30 +690,37 @@ let idleFingerprint = null;
 while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
     await page.waitForTimeout(POLL_INTERVAL_MS);
 
-    const pollState = await page.evaluate(() => {{
-        const text = document.body.innerText.toLowerCase();
-        const errors = ["network error", "something went wrong", "an error occurred",
-                        "could not process", "rate limit", "too many requests"];
-        for (const e of errors) {{
-            if (text.includes(e)) {{
-                return {{
-                    error: e,
-                    sendIdle: false,
-                    hasStopButton: false,
-                    hasThinkingIndicator: false,
-                    assistantText: ""
-                }};
-            }}
+    const pollState = await page.evaluate((baselineCount) => {{
+        // Scope error detection to actual error UI elements (toasts, alerts,
+        // error containers) — scanning document.body.innerText would match
+        // false positives from conversation text or page chrome.
+        const errEl = document.querySelector(
+            '[class*="error-toast"], [data-testid*="error"], [role="alert"]'
+        );
+        const errText = errEl ? errEl.innerText.substring(0, 200).toLowerCase() : "";
+        const errorMarkers = ["network error", "something went wrong", "error generating",
+                              "could not process", "rate limit", "too many requests",
+                              "attachment failed", "upload failed"];
+        const detectedError = errorMarkers.find(m => errText.includes(m)) || null;
+        if (detectedError) {{
+            return {{
+                error: detectedError,
+                sendIdle: false,
+                hasStopButton: false,
+                hasThinkingIndicator: false,
+                assistantText: ""
+            }};
         }}
         const sendBtn = document.querySelector("button[data-testid='send-button']");
         const stopBtn = document.querySelector("button[data-testid='stop-button'], button[aria-label*='Stop']");
         const thinking = document.querySelector(
             '.result-thinking, [class*="result-thinking"], [data-testid*="thinking"]'
         );
+        const bodyText = document.body.innerText.toLowerCase();
         const assistantMessages = Array.from(
             document.querySelectorAll('[data-message-author-role="assistant"]')
         );
-        const newAssistantMessages = assistantMessages.slice(ASSISTANT_COUNT_BEFORE_SEND);
+        const newAssistantMessages = assistantMessages.slice(baselineCount);
         const assistantText = newAssistantMessages
             .map((m) => m.innerText)
             .join('\n---\n')
@@ -637,11 +729,11 @@ while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
             error: null,
             sendIdle: !sendBtn || !sendBtn.disabled,
             hasStopButton: Boolean(stopBtn),
-            hasThinkingIndicator: Boolean(thinking) || text.includes("pro thinking"),
+            hasThinkingIndicator: Boolean(thinking) || bodyText.includes("pro thinking"),
             newAssistantCount: newAssistantMessages.length,
             assistantText
         }};
-    }});
+    }}, ASSISTANT_COUNT_BEFORE_SEND);
     if (pollState.error) {{
         pollError = "ChatGPT error: " + pollState.error;
         break;
@@ -666,17 +758,17 @@ while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
 }}
 
 // --- Step 7: Extract response ---
-const responseState = await page.evaluate(() => {{
+const responseState = await page.evaluate((baselineCount) => {{
     const assistantMessages = Array.from(
         document.querySelectorAll('[data-message-author-role="assistant"]')
     );
-    const newAssistantMessages = assistantMessages.slice(ASSISTANT_COUNT_BEFORE_SEND);
+    const newAssistantMessages = assistantMessages.slice(baselineCount);
     const responseText = newAssistantMessages.map((m) => m.innerText).join('\n---\n').trim();
     return {{
         newAssistantCount: newAssistantMessages.length,
         responseText
     }};
-}});
+}}, ASSISTANT_COUNT_BEFORE_SEND);
 
 let status = pollError ? "error" : (completed ? "ok" : "timeout");
 let error = pollError || null;
@@ -694,6 +786,7 @@ const result = {{
     elapsed_ms: Date.now() - pollStart,
     response_length: responseState.responseText.length,
     response: responseState.responseText,
+    warnings,
     assistant_message_count_before_send: ASSISTANT_COUNT_BEFORE_SEND,
     new_assistant_message_count: responseState.newAssistantCount,
 }};
@@ -712,11 +805,64 @@ console.log(JSON.stringify(result));
     )
 }
 
+fn parse_chatgpt_recipe_result(
+    stdout: &str,
+    poll_timeout_ms: u64,
+) -> Result<(String, Vec<String>)> {
+    let result: Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("parse chatgpt recipe result: {stdout}"))?;
+    let pretty_result =
+        || serde_json::to_string_pretty(&result).unwrap_or_else(|_| stdout.to_string());
+    let warnings = result
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let status = result
+        .get("status")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            anyhow!(
+                "ChatGPT recipe result missing string status: {}",
+                pretty_result()
+            )
+        })?;
+
+    match status {
+        "error" => {
+            let err_msg = result["error"].as_str().unwrap_or("unknown error");
+            Err(anyhow!("ChatGPT error: {err_msg}"))
+        }
+        "timeout" => Err(anyhow!(
+            "ChatGPT response timed out after {}ms",
+            poll_timeout_ms
+        )),
+        "ok" => match result["response"].as_str() {
+            Some(response) => Ok((response.to_string(), warnings)),
+            None => Err(anyhow!(
+                "ChatGPT recipe returned status 'ok' but response field is missing or non-string: {}",
+                pretty_result()
+            )),
+        },
+        other => Err(anyhow!(
+            "ChatGPT recipe returned unexpected status '{other}': {}",
+            pretty_result()
+        )),
+    }
+}
+
 /// Run the ChatGPT recipe via dev-browser.
 ///
 /// This replaces the YAML-based chatgpt.yaml recipe with a single Playwright
-/// script that handles navigation, model selection, file upload (via DataTransfer),
-/// prompt entry, and response polling.
+/// script that handles navigation, model selection, file upload (via
+/// filechooser + keyboard.type), prompt entry, and response polling.
 pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
     // Stage the bundle file if provided (for attachment mode).
     // Use a unique prefix (PID + timestamp) to avoid collisions between
@@ -762,23 +908,12 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
     )?;
     drop(staged_file_guard);
 
-    // Parse and return the response
-    let result: Value = serde_json::from_str(stdout.trim())
-        .with_context(|| format!("parse chatgpt recipe result: {stdout}"))?;
-
-    if result["status"] == "error" {
-        let err_msg = result["error"].as_str().unwrap_or("unknown error");
-        return Err(anyhow!("ChatGPT error: {err_msg}"));
+    let (response, warnings) = parse_chatgpt_recipe_result(&stdout, ctx.poll_settings.timeout_ms)?;
+    for warning in warnings {
+        eprintln!("warn: {warning}");
     }
 
-    if result["status"] == "timeout" {
-        return Err(anyhow!(
-            "ChatGPT response timed out after {}ms",
-            ctx.poll_settings.timeout_ms
-        ));
-    }
-
-    Ok(result["response"].as_str().unwrap_or("").to_string())
+    Ok(response)
 }
 
 /// Run a generic dev-browser recipe from a YAML recipe file.
@@ -997,6 +1132,7 @@ mod tests {
         assert!(script.contains("const POLL_TIMEOUT_MS = 900000;"));
         assert!(script.contains("const POLL_INTERVAL_MS = 45000;"));
         assert!(script.contains("const ALLOW_EMPTY_RESPONSE = false;"));
+        assert!(script.contains("const warnings = [];"));
         assert!(script.contains("const ASSISTANT_COUNT_BEFORE_SEND = await page.evaluate"));
         assert!(script.contains("let idleFingerprint = null;"));
         assert!(script.contains(
@@ -1005,11 +1141,106 @@ mod tests {
         assert!(script.contains("idleFingerprint === fingerprint"));
         assert!(!script.contains("await page.waitForTimeout(2000);\n        completed = true;"));
         assert!(script.contains("send button disabled — text may not have been injected"));
-        assert!(script.contains(
-            "newAssistantMessages = assistantMessages.slice(ASSISTANT_COUNT_BEFORE_SEND)"
-        ));
+        assert!(script.contains("newAssistantMessages = assistantMessages.slice(baselineCount)"));
         assert!(script.contains("ChatGPT returned an empty response"));
-        assert!(script.contains("getComputedStyle"));
-        assert!(!script.contains("parent.style.display"));
+        // Upload uses a fixed 5s wait (not polling) because page.evaluate
+        // calls during upload processing disrupt ChatGPT's React state.
+        // Error detection must be scoped to error UI elements, not full page body.
+        // Scanning document.body.innerText causes false positives when conversation
+        // text or page chrome contains error-like phrases.
+        assert!(
+            script.contains(r#"document.querySelector("#),
+            "error detection should use querySelector on specific error elements"
+        );
+        assert!(
+            script.contains("[role=\"alert\"]"),
+            "error detection should check role=alert elements"
+        );
+        assert!(
+            !script.contains("document.body.innerText.toLowerCase();\n        const errors"),
+            "error detection must NOT scan full page body text"
+        );
+        // File upload uses native filechooser + setFiles(FilePayload).
+        // Buffer must come from Uint8Array (not string — QuickJS base64).
+        assert!(
+            script.contains("waitForEvent('filechooser'")
+                || script.contains("waitForEvent(\"filechooser\""),
+            "file upload should use filechooser event"
+        );
+        assert!(
+            script.contains("setFiles"),
+            "file upload should use setFiles with FilePayload"
+        );
+        assert!(
+            script.contains("Buffer.from(new Uint8Array("),
+            "Buffer must be constructed from Uint8Array, not string"
+        );
+        assert!(
+            script.contains("keyboard.type"),
+            "text input should use keyboard.type (not fill/execCommand)"
+        );
+        assert!(
+            script.contains("await modelBtn.waitFor({ state: 'visible', timeout: 5000 });"),
+            "model selector button should use a 5s wait timeout"
+        );
+        assert!(
+            script.contains("await menuItem.waitFor({ state: 'visible', timeout: 5000 });"),
+            "menu item search should use a 5s wait timeout"
+        );
+        assert!(
+            script.contains("warnings.push(\"model selection failed (\" + detail + \"), using current model\");"),
+            "model selection failures should be returned as warnings"
+        );
+        assert!(
+            script.contains("warnings,"),
+            "recipe result should include script warnings"
+        );
+        assert!(
+            !script.contains("console.error(\"warn: model selection failed"),
+            "model selection warnings should not be written to stderr and lost"
+        );
+    }
+
+    #[test]
+    fn parse_chatgpt_recipe_result_requires_string_response_for_ok_status() {
+        let err =
+            parse_chatgpt_recipe_result(r#"{"status":"ok","response":null}"#, 900_000).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("status 'ok' but response field is missing or non-string"));
+    }
+
+    #[test]
+    fn parse_chatgpt_recipe_result_returns_response_and_warnings() {
+        let (response, warnings) = parse_chatgpt_recipe_result(
+            r#"{"status":"ok","response":"done","warnings":["kept current model"]}"#,
+            900_000,
+        )
+        .unwrap();
+
+        assert_eq!(response, "done");
+        assert_eq!(warnings, vec!["kept current model".to_string()]);
+    }
+
+    #[test]
+    fn npm_prefix_candidates_cover_unix_and_windows_layouts() {
+        let unix = npm_prefix_dev_browser_candidates(Path::new("/prefix"), false);
+        assert_eq!(
+            unix,
+            vec![
+                PathBuf::from("/prefix/bin/dev-browser"),
+                PathBuf::from("/prefix/dev-browser"),
+            ]
+        );
+
+        let windows = npm_prefix_dev_browser_candidates(Path::new(r"C:\npm"), true);
+        assert_eq!(
+            windows,
+            vec![
+                PathBuf::from(r"C:\npm/dev-browser.cmd"),
+                PathBuf::from(r"C:\npm/dev-browser.exe"),
+                PathBuf::from(r"C:\npm/dev-browser"),
+            ]
+        );
     }
 }

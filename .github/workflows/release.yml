@@ -179,10 +179,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
-
       - name: Install cross
         if: matrix.cross
         uses: taiki-e/install-action@cross
@@ -221,6 +217,7 @@ jobs:
         with:
           name: yoetz-${{ matrix.target }}
           path: yoetz-${{ matrix.target }}.*
+          retention-days: 1
 
   release:
     name: Create Release
