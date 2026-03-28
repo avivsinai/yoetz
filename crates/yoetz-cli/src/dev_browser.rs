@@ -243,10 +243,16 @@ pub fn run_script_connect(script: &str, timeout_secs: Option<u64>) -> Result<Str
         let is_gc_crash =
             stderr.contains("list_empty(&rt->gc_obj_list)") || stderr.contains("JS_FreeRuntime");
         if is_gc_crash && !stdout.trim().is_empty() {
+            let recovered = stdout
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| line.starts_with('{'))
+                .unwrap_or(stdout.trim());
             eprintln!(
                 "info: dev-browser sandbox GC crash on disposal (known QuickJS bug), recovering from stdout"
             );
-            return Ok(stdout.to_string());
+            return Ok(recovered.to_string());
         }
 
         let detail = if !stderr.is_empty() {
@@ -542,33 +548,122 @@ const POLL_TIMEOUT_MS = {poll_timeout_ms};
 const POLL_INTERVAL_MS = {poll_interval_ms};
 const ALLOW_EMPTY_RESPONSE = {allow_empty_response};
 const warnings = [];
+const COMPOSER_READY_TIMEOUT_MS = 15000;
+const SEND_READY_TIMEOUT_MS = 30000;
+const SEND_READY_INTERVAL_MS = 1000;
+
+function warningSuffix() {{
+    return warnings.length ? " warnings=" + warnings.join(" | ") : "";
+}}
+
+async function waitForComposerReady(page) {{
+    try {{
+        await page.locator('#prompt-textarea').first().waitFor({{ state: 'visible', timeout: COMPOSER_READY_TIMEOUT_MS }});
+    }} catch (_) {{
+        await page.locator('[role="textbox"]').first().waitFor({{ state: 'visible', timeout: COMPOSER_READY_TIMEOUT_MS }});
+    }}
+}}
+
+async function getComposerLocator(page) {{
+    const prompt = page.locator('#prompt-textarea').first();
+    if (await prompt.count() > 0) {{
+        return prompt;
+    }}
+    return page.locator('[role="textbox"]').first();
+}}
+
+async function collectComposerDiagnostics(page) {{
+    return await page.evaluate(() => {{
+        const prompt =
+            document.querySelector('#prompt-textarea') ||
+            document.querySelector('[role="textbox"]');
+        const sendBtn = document.querySelector("button[data-testid='send-button']");
+        return {{
+            url: location.href,
+            promptLength: (prompt ? (prompt.textContent || "") : "").replace(/\s+/g, " ").trim().length,
+            attachmentCount: document.querySelectorAll(
+                'img[alt*="attachment" i], [data-testid*="attachment" i], [aria-label*="attachment" i]'
+            ).length,
+            assistantCount: document.querySelectorAll('[data-message-author-role="assistant"]').length,
+            sendState: !sendBtn ? "missing" : sendBtn.disabled ? "disabled" : "enabled",
+        }};
+    }});
+}}
+
+function formatDiagnostics(diag) {{
+    return "url=" + diag.url +
+        ", prompt_length=" + diag.promptLength +
+        ", attachment_tiles=" + diag.attachmentCount +
+        ", assistant_count=" + diag.assistantCount +
+        ", send=" + diag.sendState;
+}}
+
+async function waitForSendButtonReady(page) {{
+    const sendBtn = page.locator('button[data-testid="send-button"]').first();
+    const deadline = Date.now() + SEND_READY_TIMEOUT_MS;
+    let lastState = "missing";
+    while (Date.now() < deadline) {{
+        if (await sendBtn.count() > 0) {{
+            lastState = (await sendBtn.isEnabled()) ? "enabled" : "disabled";
+            if (lastState === "enabled") {{
+                return;
+            }}
+        }} else {{
+            lastState = "missing";
+        }}
+        await page.waitForTimeout(SEND_READY_INTERVAL_MS);
+    }}
+    const diagnostics = await collectComposerDiagnostics(page);
+    throw new Error(
+        "send button " + lastState +
+        " after waiting for ChatGPT to finish processing the prompt/attachment (" +
+        formatDiagnostics(diagnostics) + ")" +
+        warningSuffix()
+    );
+}}
+
+async function ensureFreshConversation(page) {{
+    for (let attempt = 0; attempt < 2; attempt++) {{
+        await page.goto("https://chatgpt.com/?_yoetz=" + Date.now());
+        await waitForComposerReady(page);
+
+        if (page.url().includes("/c/")) {{
+            const newChatBtn = page.locator(
+                'a[href="/"], button[data-testid="create-new-chat-button"], nav a[class*="new"]'
+            ).first();
+            if (await newChatBtn.count() > 0) {{
+                await newChatBtn.click();
+                await waitForComposerReady(page);
+            }} else {{
+                await page.goto("https://chatgpt.com/?_yoetz=" + Date.now());
+                await waitForComposerReady(page);
+            }}
+        }}
+
+        const assistantCount = await page.evaluate(() => {{
+            return document.querySelectorAll('[data-message-author-role="assistant"]').length;
+        }});
+        if (assistantCount === 0) {{
+            return;
+        }}
+    }}
+
+    const diagnostics = await collectComposerDiagnostics(page);
+    throw new Error(
+        "failed to reach a clean ChatGPT conversation before sending (" +
+        formatDiagnostics(diagnostics) + ")" +
+        warningSuffix()
+    );
+}}
 
 // --- Step 1: Navigate to fresh ChatGPT conversation ---
 // Use browser.newPage() for a clean anonymous page. Named pages accumulate
 // stale ChatGPT state (cookies/localStorage) that disables the send button.
 const page = await browser.newPage();
-await page.goto("https://chatgpt.com/?_yoetz=" + Date.now());
-await page.waitForTimeout(4000);
-
-// Safety: if we landed on an existing conversation, force new chat
-const currentUrl = page.url();
-if (currentUrl.includes("/c/")) {{
-    const newChatBtn = page.locator(
-        'a[href="/"], button[data-testid="create-new-chat-button"], nav a[class*="new"]'
-    ).first();
-    if (await newChatBtn.count() > 0) {{
-        await newChatBtn.click();
-        await page.waitForTimeout(2000);
-    }} else {{
-        await page.goto("https://chatgpt.com/?_yoetz=" + Date.now());
-        await page.waitForTimeout(3000);
-    }}
-}}
+await ensureFreshConversation(page);
 
 // --- Step 2: Select model if provided ---
-// Model selection is best-effort with a 5s timeout per locator operation.
-// If it fails (ChatGPT UI changed, dropdown didn't open), warn and continue
-// with whatever model is currently selected.
+// Model selection is strict when explicitly requested.
 if (MODEL) {{
     try {{
         const modelBtn = page.locator(
@@ -576,11 +671,11 @@ if (MODEL) {{
         ).first();
         await modelBtn.waitFor({{ state: 'visible', timeout: 5000 }});
         await modelBtn.click({{ timeout: 5000 }});
-        await page.waitForTimeout(1200);
 
         const slug = MODEL.toLowerCase();
         const byTestId = page.locator(`[data-testid="model-switcher-${{slug}}"]`).first();
         if (await byTestId.count() > 0) {{
+            await byTestId.waitFor({{ state: 'visible', timeout: 5000 }});
             await byTestId.click({{ timeout: 5000 }});
         }} else {{
             const names = {{"gpt-5-4-pro":"pro","gpt-5-4-thinking":"thinking","gpt-5-3":"instant","pro":"pro","thinking":"thinking","instant":"instant"}};
@@ -592,19 +687,30 @@ if (MODEL) {{
         await page.waitForTimeout(500);
     }} catch (e) {{
         const detail = e && typeof e.message === 'string' ? e.message : String(e);
-        warnings.push("model selection failed (" + detail + "), using current model");
-        // Dismiss any open dropdown by pressing Escape
         await page.keyboard.press('Escape').catch(() => {{}});
         await page.waitForTimeout(300);
+        throw new Error("model selection failed (" + detail + ")" + warningSuffix());
     }}
 }}
 
 // --- Step 3: Disable Extended Pro if requested ---
 if (DISABLE_EXTENDED) {{
-    const extBtn = page.locator('button[aria-label*="click to remove"][aria-label*="Extended"]');
-    if (await extBtn.count() > 0) {{
-        await extBtn.click();
-        await page.waitForTimeout(500);
+    const extLocators = [
+        page.locator('button[aria-label*="click to remove"][aria-label*="Extended"]').first(),
+        page.locator('button[aria-label*="remove"][aria-label*="Extended"]').first(),
+        page.getByRole('button', {{ name: /extended.*remove|remove.*extended/i }}).first(),
+    ];
+    let extendedDisabled = false;
+    for (const extBtn of extLocators) {{
+        if (await extBtn.count() > 0) {{
+            await extBtn.click();
+            await page.waitForTimeout(500);
+            extendedDisabled = true;
+            break;
+        }}
+    }}
+    if (!extendedDisabled) {{
+        warnings.push("extended disable requested but toggle not found");
     }}
 }}
 
@@ -612,7 +718,8 @@ if (DISABLE_EXTENDED) {{
 if (PASTE_MODE) {{
     // Paste bundle text + prompt via keyboard.type — Playwright fill() and
     // execCommand both bypass ProseMirror React state, leaving send disabled.
-    await page.locator('#prompt-textarea').click();
+    const composer = await getComposerLocator(page);
+    await composer.click();
     await page.keyboard.type(PROMPT + "\n\n" + BUNDLE_TEXT);
     await page.waitForTimeout(500);
 }} else if (STAGED_FILE) {{
@@ -632,10 +739,11 @@ if (PASTE_MODE) {{
     }}
 
     await page.locator('button[data-testid="composer-plus-btn"]').click();
-    await page.waitForTimeout(500);
+    const addFilesMenuItem = page.getByRole('menuitem', {{ name: /add photos & files/i }}).first();
+    await addFilesMenuItem.waitFor({{ state: 'visible', timeout: 5000 }});
     const [fileChooser] = await Promise.all([
         page.waitForEvent('filechooser', {{ timeout: 10000 }}),
-        page.locator('div[role="menuitem"]:has-text("Add photos & files")').click(),
+        addFilesMenuItem.click(),
     ]);
     await fileChooser.setFiles({{
         name: "bundle.md",
@@ -643,42 +751,37 @@ if (PASTE_MODE) {{
         buffer: Buffer.from(new Uint8Array(utf8Bytes)),
     }});
 
-    // Wait for upload to be processed by ChatGPT's React state.
+    // Wait for upload to start before typing into the composer.
     await page.waitForTimeout(5000);
 
     // Type prompt via keyboard (Playwright fill()/execCommand bypass
     // ProseMirror React state, leaving send button disabled).
-    await page.locator('#prompt-textarea').click();
+    const composer = await getComposerLocator(page);
+    await composer.click();
     await page.keyboard.type(PROMPT, {{ delay: 5 }});
     await page.waitForTimeout(500);
 }} else {{
     // No bundle — just type the prompt
-    await page.locator('#prompt-textarea').click();
+    const composer = await getComposerLocator(page);
+    await composer.click();
     await page.keyboard.type(PROMPT, {{ delay: 5 }});
     await page.waitForTimeout(500);
 }}
+
+// ChatGPT keeps the send button disabled while it finishes attachment
+// processing. Large bundles can take several more seconds after prompt entry.
+await waitForSendButtonReady(page);
 
 const ASSISTANT_COUNT_BEFORE_SEND = await page.evaluate(() => {{
     return document.querySelectorAll('[data-message-author-role="assistant"]').length;
 }});
 
 // --- Step 5: Click send ---
-const sendState = await page.evaluate(() => {{
-    const btn = document.querySelector("button[data-testid='send-button']");
-    if (!btn) return "missing";
-    return btn.disabled ? "disabled" : "enabled";
-}});
-if (sendState === "missing") {{
-    throw new Error("send button not found");
-}}
-if (sendState === "disabled") {{
-    throw new Error("send button disabled — text may not have been injected");
-}}
-const sendBtn = page.locator('button[data-testid="send-button"]');
+const sendBtn = page.locator('button[data-testid="send-button"]').first();
 await sendBtn.click();
 // After clicking send, ChatGPT navigates (SPA) from / to /c/UUID.
 // Wait for navigation to settle before starting poll loop.
-await page.waitForTimeout(2000);
+await page.waitForURL('**/c/**', {{ timeout: 10000 }}).catch(() => {{}});
 
 // --- Step 6: Poll for response completion ---
 // Checks: new assistant response appeared, text is stable, send idle, no thinking indicator.
@@ -686,6 +789,7 @@ const pollStart = Date.now();
 let completed = false;
 let pollError = null;
 let idleFingerprint = null;
+let lastPollState = null;
 
 while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
     await page.waitForTimeout(POLL_INTERVAL_MS);
@@ -705,9 +809,13 @@ while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
         if (detectedError) {{
             return {{
                 error: detectedError,
-                sendIdle: false,
+                url: location.href,
+                sendState: "unknown",
                 hasStopButton: false,
                 hasThinkingIndicator: false,
+                composerReady: false,
+                plusButtonReady: false,
+                newAssistantCount: 0,
                 assistantText: ""
             }};
         }}
@@ -716,7 +824,10 @@ while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
         const thinking = document.querySelector(
             '.result-thinking, [class*="result-thinking"], [data-testid*="thinking"]'
         );
-        const bodyText = document.body.innerText.toLowerCase();
+        const composer =
+            document.querySelector('#prompt-textarea') ||
+            document.querySelector('[role="textbox"]');
+        const plusBtn = document.querySelector('button[data-testid="composer-plus-btn"]');
         const assistantMessages = Array.from(
             document.querySelectorAll('[data-message-author-role="assistant"]')
         );
@@ -727,19 +838,35 @@ while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
             .trim();
         return {{
             error: null,
-            sendIdle: !sendBtn || !sendBtn.disabled,
+            url: location.href,
+            sendState: !sendBtn ? "missing" : sendBtn.disabled ? "disabled" : "enabled",
             hasStopButton: Boolean(stopBtn),
-            hasThinkingIndicator: Boolean(thinking) || bodyText.includes("pro thinking"),
+            hasThinkingIndicator: Boolean(thinking),
+            composerReady: Boolean(composer),
+            plusButtonReady: Boolean(plusBtn),
             newAssistantCount: newAssistantMessages.length,
             assistantText
         }};
     }}, ASSISTANT_COUNT_BEFORE_SEND);
+    lastPollState = {{
+        url: pollState.url,
+        sendState: pollState.sendState,
+        hasStopButton: pollState.hasStopButton,
+        hasThinkingIndicator: pollState.hasThinkingIndicator,
+        composerReady: pollState.composerReady,
+        plusButtonReady: pollState.plusButtonReady,
+        newAssistantCount: pollState.newAssistantCount,
+        assistantTextLength: pollState.assistantText.length,
+    }};
     if (pollState.error) {{
-        pollError = "ChatGPT error: " + pollState.error;
+        pollError = "ChatGPT error: " + pollState.error + warningSuffix();
         break;
     }}
 
-    const idle = pollState.sendIdle &&
+    const composerIdle =
+        pollState.sendState === "enabled" ||
+        (pollState.sendState === "missing" && pollState.composerReady && pollState.plusButtonReady);
+    const idle = composerIdle &&
         !pollState.hasStopButton &&
         !pollState.hasThinkingIndicator;
     const hasResponse = pollState.newAssistantCount > 0 &&
@@ -772,12 +899,19 @@ const responseState = await page.evaluate((baselineCount) => {{
 
 let status = pollError ? "error" : (completed ? "ok" : "timeout");
 let error = pollError || null;
-if (status === "ok" && responseState.newAssistantCount === 0) {{
+if (status === "timeout") {{
+    const diagnostics = await collectComposerDiagnostics(page);
+    error =
+        "ChatGPT response timed out after " + (Date.now() - pollStart) + "ms (" +
+        "last_state=" + JSON.stringify(lastPollState || {{}}) + ", " +
+        formatDiagnostics(diagnostics) + ")" +
+        warningSuffix();
+}} else if (status === "ok" && responseState.newAssistantCount === 0) {{
     status = "error";
-    error = "ChatGPT did not produce a new assistant response";
+    error = "ChatGPT did not produce a new assistant response" + warningSuffix();
 }} else if (status === "ok" && !ALLOW_EMPTY_RESPONSE && responseState.responseText.length === 0) {{
     status = "error";
-    error = "ChatGPT returned an empty response";
+    error = "ChatGPT returned an empty response" + warningSuffix();
 }}
 
 const result = {{
@@ -813,7 +947,7 @@ fn parse_chatgpt_recipe_result(
         .with_context(|| format!("parse chatgpt recipe result: {stdout}"))?;
     let pretty_result =
         || serde_json::to_string_pretty(&result).unwrap_or_else(|_| stdout.to_string());
-    let warnings = result
+    let warnings: Vec<String> = result
         .get("warnings")
         .and_then(Value::as_array)
         .map(|items| {
@@ -824,6 +958,13 @@ fn parse_chatgpt_recipe_result(
                 .collect()
         })
         .unwrap_or_default();
+    let warning_suffix = || {
+        if warnings.is_empty() {
+            String::new()
+        } else {
+            format!(" (warnings: {})", warnings.join(" | "))
+        }
+    };
 
     let status = result
         .get("status")
@@ -838,12 +979,17 @@ fn parse_chatgpt_recipe_result(
     match status {
         "error" => {
             let err_msg = result["error"].as_str().unwrap_or("unknown error");
-            Err(anyhow!("ChatGPT error: {err_msg}"))
+            Err(anyhow!("ChatGPT error: {err_msg}{}", warning_suffix()))
         }
-        "timeout" => Err(anyhow!(
-            "ChatGPT response timed out after {}ms",
-            poll_timeout_ms
-        )),
+        "timeout" => {
+            let detail = result
+                .get("error")
+                .and_then(Value::as_str)
+                .filter(|msg| !msg.is_empty())
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("ChatGPT response timed out after {}ms", poll_timeout_ms));
+            Err(anyhow!("{detail}{}", warning_suffix()))
+        }
         "ok" => match result["response"].as_str() {
             Some(response) => Ok((response.to_string(), warnings)),
             None => Err(anyhow!(
@@ -1133,18 +1279,29 @@ mod tests {
         assert!(script.contains("const POLL_INTERVAL_MS = 45000;"));
         assert!(script.contains("const ALLOW_EMPTY_RESPONSE = false;"));
         assert!(script.contains("const warnings = [];"));
+        assert!(script.contains("const COMPOSER_READY_TIMEOUT_MS = 15000;"));
+        assert!(script.contains("const SEND_READY_TIMEOUT_MS = 30000;"));
+        assert!(script.contains("const SEND_READY_INTERVAL_MS = 1000;"));
+        assert!(script.contains("function warningSuffix()"));
+        assert!(script.contains("async function waitForComposerReady(page)"));
+        assert!(script.contains("async function ensureFreshConversation(page)"));
+        assert!(script.contains("async function waitForSendButtonReady(page)"));
         assert!(script.contains("const ASSISTANT_COUNT_BEFORE_SEND = await page.evaluate"));
         assert!(script.contains("let idleFingerprint = null;"));
+        assert!(script.contains("let lastPollState = null;"));
         assert!(script.contains(
             ".result-thinking, [class*=\"result-thinking\"], [data-testid*=\"thinking\"]"
         ));
         assert!(script.contains("idleFingerprint === fingerprint"));
         assert!(!script.contains("await page.waitForTimeout(2000);\n        completed = true;"));
-        assert!(script.contains("send button disabled — text may not have been injected"));
+        assert!(script.contains(
+            "\" after waiting for ChatGPT to finish processing the prompt/attachment (\""
+        ));
         assert!(script.contains("newAssistantMessages = assistantMessages.slice(baselineCount)"));
         assert!(script.contains("ChatGPT returned an empty response"));
-        // Upload uses a fixed 5s wait (not polling) because page.evaluate
-        // calls during upload processing disrupt ChatGPT's React state.
+        assert!(script.contains("await ensureFreshConversation(page);"));
+        assert!(script
+            .contains("await page.waitForURL('**/c/**', { timeout: 10000 }).catch(() => {});"));
         // Error detection must be scoped to error UI elements, not full page body.
         // Scanning document.body.innerText causes false positives when conversation
         // text or page chrome contains error-like phrases.
@@ -1172,12 +1329,30 @@ mod tests {
             "file upload should use setFiles with FilePayload"
         );
         assert!(
+            script.contains(
+                "const addFilesMenuItem = page.getByRole('menuitem', { name: /add photos & files/i }).first();"
+            ),
+            "upload menu selection should resolve a role+name menu item"
+        );
+        assert!(
+            script.contains("await addFilesMenuItem.waitFor({ state: 'visible', timeout: 5000 });"),
+            "upload menu item should be awaited before click"
+        );
+        assert!(
+            script.contains("addFilesMenuItem.click()"),
+            "upload menu selection should click the awaited menu item"
+        );
+        assert!(
             script.contains("Buffer.from(new Uint8Array("),
             "Buffer must be constructed from Uint8Array, not string"
         );
         assert!(
             script.contains("keyboard.type"),
             "text input should use keyboard.type (not fill/execCommand)"
+        );
+        assert!(
+            script.contains("await waitForSendButtonReady(page);"),
+            "script should wait for ChatGPT to re-enable send after attachment processing"
         );
         assert!(
             script.contains("await modelBtn.waitFor({ state: 'visible', timeout: 5000 });"),
@@ -1188,8 +1363,8 @@ mod tests {
             "menu item search should use a 5s wait timeout"
         );
         assert!(
-            script.contains("warnings.push(\"model selection failed (\" + detail + \"), using current model\");"),
-            "model selection failures should be returned as warnings"
+            !script.contains("warnings.push(\"model selection failed (\" + detail + \"), using current model\");"),
+            "explicit model selection should no longer degrade to a warning"
         );
         assert!(
             script.contains("warnings,"),
@@ -1198,6 +1373,20 @@ mod tests {
         assert!(
             !script.contains("console.error(\"warn: model selection failed"),
             "model selection warnings should not be written to stderr and lost"
+        );
+        assert!(
+            !script.contains("bodyText.includes(\"pro thinking\")"),
+            "thinking detection should not rely on English body text"
+        );
+        assert!(
+            script.contains(
+                "sendState: !sendBtn ? \"missing\" : sendBtn.disabled ? \"disabled\" : \"enabled\""
+            ),
+            "poll state should expose explicit send state"
+        );
+        assert!(
+            script.contains("pollState.sendState === \"enabled\""),
+            "poll completion should key off the explicit send state"
         );
     }
 
@@ -1220,6 +1409,19 @@ mod tests {
 
         assert_eq!(response, "done");
         assert_eq!(warnings, vec!["kept current model".to_string()]);
+    }
+
+    #[test]
+    fn parse_chatgpt_recipe_result_includes_warnings_on_timeout() {
+        let err = parse_chatgpt_recipe_result(
+            r#"{"status":"timeout","error":"ChatGPT response timed out after 900000ms (last_state={})","warnings":["extended disable requested but toggle not found"]}"#,
+            900_000,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("extended disable requested but toggle not found"));
     }
 
     #[test]
