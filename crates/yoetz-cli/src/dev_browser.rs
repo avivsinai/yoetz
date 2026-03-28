@@ -240,8 +240,8 @@ pub fn run_script_connect(script: &str, timeout_secs: Option<u64>) -> Result<Str
         // QuickJS WASM crashes with a GC assertion during sandbox disposal
         // AFTER the script has already completed and printed its output.
         // If stdout has content and stderr is just the GC crash, recover.
-        let is_gc_crash = stderr.contains("list_empty(&rt->gc_obj_list)")
-            || stderr.contains("JS_FreeRuntime");
+        let is_gc_crash =
+            stderr.contains("list_empty(&rt->gc_obj_list)") || stderr.contains("JS_FreeRuntime");
         if is_gc_crash && !stdout.trim().is_empty() {
             eprintln!(
                 "info: dev-browser sandbox GC crash on disposal (known QuickJS bug), recovering from stdout"
