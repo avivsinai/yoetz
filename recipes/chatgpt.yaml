@@ -159,7 +159,7 @@ steps:
   # Upload the bundle file.
   - skip_if: "!window.__yoetz_use_attachment"
     action: upload
-    args: ["input[type='file']", "{{bundle_path}}"]
+    args: ["#upload-files", "{{bundle_path}}"]
 
   # Poll until the upload spinner disappears. Short-burst Rust-side polling
   # keeps each eval under the agent-browser IPC ceiling (25s).
