@@ -51,15 +51,24 @@ struct NodeVersion {
     patch: u32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecipeTransport {
+    DevBrowser,
+    AgentBrowser,
+    Manual,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
     pub name: Option<String>,
+    pub transports: Option<Vec<RecipeTransport>>,
     pub defaults: Option<BTreeMap<String, String>>,
     pub steps: Vec<RecipeStep>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeStep {
     pub action: Option<String>,
@@ -118,6 +127,16 @@ static AGENT_BROWSER: OnceLock<Result<(String, Vec<String>), String>> = OnceLock
 /// preferred backend for all browser operations.
 pub fn use_dev_browser() -> bool {
     crate::dev_browser::is_available()
+}
+
+pub fn recipe_transports(recipe: &Recipe, is_chatgpt: bool) -> Vec<RecipeTransport> {
+    recipe.transports.clone().unwrap_or_else(|| {
+        if is_chatgpt {
+            vec![RecipeTransport::DevBrowser, RecipeTransport::AgentBrowser]
+        } else {
+            vec![RecipeTransport::AgentBrowser]
+        }
+    })
 }
 
 /// Returns (program, extra_prefix_args) for launching agent-browser.
@@ -3157,6 +3176,51 @@ steps:
         )
         .unwrap_err();
         assert!(step_err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn recipe_yaml_parses_transport_order() {
+        let recipe = serde_yaml::from_str::<Recipe>(
+            r#"
+name: chatgpt
+transports: [dev-browser, agent-browser, manual]
+steps:
+  - action: open
+    args: ["https://chatgpt.com/"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recipe.transports,
+            Some(vec![
+                RecipeTransport::DevBrowser,
+                RecipeTransport::AgentBrowser,
+                RecipeTransport::Manual,
+            ])
+        );
+    }
+
+    #[test]
+    fn recipe_transports_default_to_dev_browser_for_chatgpt() {
+        let recipe = serde_yaml::from_str::<Recipe>(
+            r#"
+name: chatgpt
+steps:
+  - action: open
+    args: ["https://chatgpt.com/"]
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            recipe_transports(&recipe, true),
+            vec![RecipeTransport::DevBrowser, RecipeTransport::AgentBrowser]
+        );
+        assert_eq!(
+            recipe_transports(&recipe, false),
+            vec![RecipeTransport::AgentBrowser]
+        );
     }
 
     #[test]

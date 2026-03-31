@@ -175,8 +175,10 @@ For web-only models like ChatGPT Pro that lack API access. Connects to your runn
 ### Prerequisites
 
 ```bash
-# agent-browser is auto-resolved via npx if not in PATH.
-# For faster startup, install globally:
+# Preferred browser transport:
+npm install -g dev-browser
+
+# Legacy fallback transport:
 npm install -g agent-browser
 ```
 
@@ -184,7 +186,11 @@ npm install -g agent-browser
 
 yoetz connects to your already logged-in Chrome session via auto-connect (CDP). No cookie extraction or separate browser needed.
 
+**Transport priority:** `dev-browser` > `agent-browser` > manual browser upload/paste.
+
 **Connection priority:** explicit `--cdp` > auto-connect > cookie state > profile fallback.
+
+Use `--cdp http://127.0.0.1:9222` when you need to target a specific Chrome instance/profile.
 
 ### First-time setup
 
@@ -281,34 +287,41 @@ Built-in recipes: `chatgpt`, `claude`, `gemini`.
 | Symptom | Fix |
 |---------|-----|
 | `Allow remote debugging?` dialog | Click **Allow** in Chrome, then retry. If the dialog is frozen, launch Chrome with `--remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug` and use `yoetz browser attach --cdp http://127.0.0.1:9222` instead. |
-| `auto-connect probe timed out` | Chrome dialog is probably showing. Click Allow. If Chrome will not accept the dialog, switch to the manual `--cdp` flow above. If agent-browser is missing, install it with `npm install -g agent-browser`. |
-| `chatgpt login required` | Chrome was reached but not logged into ChatGPT. Log into ChatGPT in that Chrome session, then retry. Or use `yoetz browser login` for manual auth. |
+| `auto-connect probe timed out` | Chrome dialog is probably showing. Click Allow. If Chrome will not accept the dialog, switch to the explicit `--cdp` flow above. Install `dev-browser` first; `agent-browser` remains a fallback. |
+| `chatgpt login required` | Chrome was reached but the wrong profile/tab was used. Open ChatGPT in the target Chrome profile first, or connect that profile explicitly with `--cdp`, then retry. |
 | `daemon already running` | Run `yoetz browser attach` to check connection, or kill stale daemon: `agent-browser close` |
 | `agent-browser failed` | Ensure `npx agent-browser --version` works, or `npm install -g agent-browser` |
+| `dev-browser failed` | Ensure `dev-browser --help` works, verify Chrome remote debugging is enabled, and retry with `--cdp` if you need a specific Chrome profile. |
 | Recipe not found | Use `--recipe chatgpt` (name) or full path. Check `brew --prefix`/share/yoetz/recipes/ |
 | `cookie extraction failed` | Legacy path: ensure Node >= 24.4, log into ChatGPT in Chrome, close Chrome, `yoetz browser sync-cookies` |
 
-### Claude-in-Chrome MCP Fallback
+### dev-browser Fallback
 
-When `yoetz browser` pipeline fails (agent-browser issues, cookie extraction errors), use Claude-in-Chrome MCP tools directly:
+When `yoetz browser recipe` needs manual browser automation, use `dev-browser` directly against the authenticated Chrome session:
 
-1. **Create bundle**: `yoetz bundle -p "Review" -f src/**/*.ts --format json`
-2. **Copy to clipboard as file**: Use macOS `osascript` to put the bundle.md on clipboard:
+1. **Create bundle**: `BUNDLE=$(yoetz bundle -p "Review" -f src/**/*.ts --format json | jq -r .artifacts.bundle_md)`
+2. **Connect to Chrome**:
    ```bash
-   osascript -e 'set the clipboard to POSIX file "/path/to/bundle.md"'
+   dev-browser --connect <<'EOF'
+   const page = await browser.getPage("chatgpt");
+   await page.goto("https://chatgpt.com/");
+   console.log(await page.title());
+   EOF
    ```
-3. **Navigate to ChatGPT**: Use `mcp__claude-in-chrome__navigate` to open chatgpt.com
-4. **Paste file**: Click the input area, then Cmd+V to paste the file from clipboard
-5. **Type prompt**: Use `mcp__claude-in-chrome__form_input` or `computer` tool to type the review prompt
-6. **Wait and extract**: Use `mcp__claude-in-chrome__get_page_text` to extract the response
+3. **Use the Playwright-style API**:
+   `browser.getPage(name)`, `page.goto(url)`, `page.click(selector)`, `page.fill(selector, text)`, `page.evaluate(fn)`, `page.title()`
+4. **Use file helpers when needed**:
+   `saveScreenshot(buf, name)`, `writeFile(name, data)`, `readFile(name)`
+5. **Target a specific Chrome profile**: prefer opening ChatGPT in that profile first, or connect to its explicit CDP endpoint with `yoetz browser recipe --cdp http://127.0.0.1:9222 ...`
 
-This bypasses agent-browser entirely and works with any browser-based LLM the user is logged into.
+This keeps the default path aligned with the same browser transport users already rely on outside Yoetz.
 
 ### How it works
 
 The browser module connects to your running Chrome via CDP (Chrome DevTools Protocol):
-- **Auto-connect** (primary): attaches to Chrome's remote debugging port, reuses your logged-in session
-- **Cookie sync** (fallback): extracts cookies from Chrome's encrypted store, injects into agent-browser
+- **dev-browser** (primary): Playwright-based transport that attaches to your logged-in Chrome session
+- **agent-browser** (fallback): legacy transport with cookie/profile fallback support
+- **Cookie sync** (legacy fallback): extracts cookies from Chrome's encrypted store, injects into agent-browser
 - Uses stealth User-Agent headers and disables automation detection flags
 - Daemon model: one persistent connection per session, reused across recipe steps
 

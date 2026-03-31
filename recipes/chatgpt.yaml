@@ -1,5 +1,9 @@
 name: chatgpt
-# Auth: resolved automatically (explicit CDP > auto_connect > cookie > profile).
+# Transport order:
+#   1. dev-browser (preferred; explicit CDP or Chrome auto-connect)
+#   2. agent-browser (legacy fallback; explicit CDP > auto_connect > cookie > profile)
+#   3. manual (last resort; upload/paste the bundle yourself)
+#
 # Recommended: enable chrome://inspect/#remote-debugging (Chrome 144+) for auto-connect.
 # Note: Chrome 136+ ignores --remote-debugging-port on the default profile.
 #
@@ -11,6 +15,11 @@ name: chatgpt
 #              uploading as file. Default: "false" (always upload).
 #   wait_timeout_ms  — overall response wait deadline in ms (default: 1800000 = 30min).
 #   wait_interval_ms — poll interval in ms (default: 30000 = 30s).
+
+transports:
+  - dev-browser
+  - agent-browser
+  - manual
 
 defaults:
   prompt: Review the attached file and provide your analysis.
