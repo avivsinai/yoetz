@@ -715,31 +715,11 @@ async function ensureFreshConversation(page) {{
     );
 }}
 
-async function openChatgptPage() {{
-    const pages = await browser.listPages();
-    const candidates = pages.filter((pageInfo) =>
-        typeof pageInfo.url === 'string' && pageInfo.url.includes('chatgpt.com')
-    );
-    for (const candidate of candidates) {{
-        try {{
-            const existing = await browser.getPage(candidate.id);
-            if (typeof existing.bringToFront === 'function') {{
-                await existing.bringToFront().catch(() => {{}});
-            }}
-            return existing;
-        }} catch (e) {{
-            const detail = e && typeof e.message === 'string' ? e.message : String(e);
-            warnings.push("failed to reuse existing ChatGPT tab: " + detail);
-        }}
-    }}
-    return await browser.newPage();
-}}
-
 // --- Step 1: Navigate to fresh ChatGPT conversation ---
-// Prefer an existing ChatGPT tab so we stay inside the already-authenticated
-// Chrome profile when multiple profiles are open. Fall back to a fresh page
-// when no reusable ChatGPT tab is available.
-const page = await openChatgptPage();
+// Use browser.newPage() for a clean page. Reusing existing ChatGPT tabs
+// would hijack the user's current conversation and risk picking the wrong
+// profile when multiple ChatGPT tabs are open.
+const page = await browser.newPage();
 await ensureFreshConversation(page);
 
 // --- Step 2: Select model if provided ---
@@ -1386,7 +1366,6 @@ mod tests {
         assert!(script.contains("const SEND_READY_INTERVAL_MS = 1000;"));
         assert!(script.contains("function warningSuffix()"));
         assert!(script.contains("async function waitForComposerReady(page)"));
-        assert!(script.contains("async function openChatgptPage()"));
         assert!(script.contains("async function ensureFreshConversation(page)"));
         assert!(script.contains("async function waitForSendButtonReady(page)"));
         assert!(script.contains("const ASSISTANT_COUNT_BEFORE_SEND = await page.evaluate"));
@@ -1403,9 +1382,7 @@ mod tests {
         assert!(script.contains("newAssistantMessages = assistantMessages.slice(baselineCount)"));
         assert!(script.contains("ChatGPT returned an empty response"));
         assert!(script.contains("await ensureFreshConversation(page);"));
-        assert!(script.contains("const pages = await browser.listPages();"));
-        assert!(script.contains("return await browser.newPage();"));
-        assert!(script.contains("await browser.getPage(candidate.id);"));
+        assert!(script.contains("const page = await browser.newPage();"));
         assert!(script
             .contains("await page.waitForURL('**/c/**', { timeout: 10000 }).catch(() => {});"));
         // Error detection must be scoped to error UI elements, not full page body.

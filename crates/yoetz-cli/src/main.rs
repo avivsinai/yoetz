@@ -1182,7 +1182,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             // targeting a live Chrome instance. `--profile` still routes to the
             // legacy managed-profile path.
             if browser::use_dev_browser() && check_args.profile.is_none() {
-                match dev_browser::ensure_chatgpt_auth_with_endpoint(dev_browser_cdp.as_deref()) {
+                match dev_browser::ensure_chatgpt_auth_with_page_check_and_endpoint(dev_browser_cdp.as_deref()) {
                     Ok(()) => {
                         let method = if dev_browser_cdp.is_some() {
                             "dev-browser (cdp)"
