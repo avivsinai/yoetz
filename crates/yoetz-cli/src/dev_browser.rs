@@ -214,11 +214,32 @@ pub fn ensure_installed() -> Result<()> {
 /// Run a dev-browser script against a live Chrome instance (auto-connect).
 /// Returns the script's stdout output.
 pub fn run_script_connect(script: &str, timeout_secs: Option<u64>) -> Result<String> {
+    run_script_connect_with_endpoint(script, timeout_secs, None)
+}
+
+fn connect_args(timeout_secs: u64, cdp_endpoint: Option<&str>) -> Vec<String> {
+    let mut args = vec!["--connect".to_string()];
+    if let Some(endpoint) = cdp_endpoint {
+        args.push(endpoint.to_string());
+    }
+    args.push("--timeout".to_string());
+    args.push(timeout_secs.to_string());
+    args
+}
+
+/// Run a dev-browser script against a live Chrome instance, optionally via an
+/// explicit CDP endpoint.
+pub fn run_script_connect_with_endpoint(
+    script: &str,
+    timeout_secs: Option<u64>,
+    cdp_endpoint: Option<&str>,
+) -> Result<String> {
     let bin = resolve_dev_browser()?;
     let timeout = timeout_secs.unwrap_or(DEFAULT_SCRIPT_TIMEOUT_SECS);
+    let args = connect_args(timeout, cdp_endpoint);
 
     let output = Command::new(&bin)
-        .args(["--connect", "--timeout", &timeout.to_string()])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -374,12 +395,17 @@ pub struct TabInfo {
 /// Check if Chrome is reachable and dev-browser can connect to it.
 /// Uses a short first probe; retries once with a longer timeout only when the
 /// first failure looks like a timeout (slow CDP handshake with many tabs).
+#[allow(dead_code)]
 pub fn check_connection() -> Result<()> {
+    check_connection_with_endpoint(None)
+}
+
+pub fn check_connection_with_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
     let script = r#"
 const pages = await browser.listPages();
 console.log("ok:" + pages.length);
 "#;
-    match run_script_connect(script, Some(10)) {
+    match run_script_connect_with_endpoint(script, Some(10), cdp_endpoint) {
         Ok(stdout) if stdout.trim().starts_with("ok:") => Ok(()),
         Ok(stdout) => Err(anyhow!("dev-browser connection check failed: {stdout}")),
         Err(first_err) => {
@@ -390,7 +416,7 @@ console.log("ok:" + pages.length);
             }
             eprintln!("info: dev-browser connection timed out, retrying with longer timeout");
             std::thread::sleep(std::time::Duration::from_secs(2));
-            let stdout = run_script_connect(script, Some(45))
+            let stdout = run_script_connect_with_endpoint(script, Some(45), cdp_endpoint)
                 .context("dev-browser connection check failed after retry")?;
             if stdout.trim().starts_with("ok:") {
                 Ok(())
@@ -416,6 +442,10 @@ pub fn find_chatgpt_tab() -> Result<Option<String>> {
 /// Check authentication status on ChatGPT in the connected browser.
 #[allow(dead_code)]
 pub fn check_chatgpt_auth() -> Result<bool> {
+    check_chatgpt_auth_with_endpoint(None)
+}
+
+pub fn check_chatgpt_auth_with_endpoint(cdp_endpoint: Option<&str>) -> Result<bool> {
     let script = r#"
 const page = await browser.newPage();
 try {
@@ -434,7 +464,7 @@ try {
     await page.close().catch(() => {});
 }
 "#;
-    let stdout = run_script_connect(script, Some(30))?;
+    let stdout = run_script_connect_with_endpoint(script, Some(30), cdp_endpoint)?;
     let result: Value = serde_json::from_str(stdout.trim())
         .with_context(|| format!("check_chatgpt_auth: malformed script output: {stdout}"))?;
     result["authenticated"]
@@ -446,8 +476,13 @@ try {
 /// Only checks dev-browser daemon connectivity — opening a separate page
 /// to verify auth causes interference with the recipe's named page.
 /// If not authenticated, the recipe will fail with a clear error.
+#[allow(dead_code)]
 pub fn ensure_chatgpt_auth() -> Result<()> {
-    check_connection().context(
+    ensure_chatgpt_auth_with_endpoint(None)
+}
+
+pub fn ensure_chatgpt_auth_with_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
+    check_connection_with_endpoint(cdp_endpoint).context(
         "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
     )?;
     // Skip page-level auth check — it opens an anonymous page to chatgpt.com
@@ -459,11 +494,16 @@ pub fn ensure_chatgpt_auth() -> Result<()> {
 /// Opens a temporary page — use only when not immediately followed by a recipe.
 #[allow(dead_code)]
 pub fn ensure_chatgpt_auth_with_page_check() -> Result<()> {
-    check_connection().context(
+    ensure_chatgpt_auth_with_page_check_and_endpoint(None)
+}
+
+#[allow(dead_code)]
+pub fn ensure_chatgpt_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
+    check_connection_with_endpoint(cdp_endpoint).context(
         "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
     )?;
 
-    if check_chatgpt_auth()? {
+    if check_chatgpt_auth_with_endpoint(cdp_endpoint)? {
         return Ok(());
     }
 
@@ -490,6 +530,8 @@ pub struct DevBrowserRecipeContext {
     pub poll_settings: ChatgptPollSettings,
     /// Allow an empty assistant response to count as success.
     pub allow_empty_response: bool,
+    /// Optional explicit CDP endpoint for selecting a specific Chrome instance.
+    pub cdp_endpoint: Option<String>,
 }
 
 impl Default for DevBrowserRecipeContext {
@@ -503,6 +545,7 @@ impl Default for DevBrowserRecipeContext {
             paste_mode: false,
             poll_settings: ChatgptPollSettings::default(),
             allow_empty_response: false,
+            cdp_endpoint: None,
         }
     }
 }
@@ -673,8 +716,9 @@ async function ensureFreshConversation(page) {{
 }}
 
 // --- Step 1: Navigate to fresh ChatGPT conversation ---
-// Use browser.newPage() for a clean anonymous page. Named pages accumulate
-// stale ChatGPT state (cookies/localStorage) that disables the send button.
+// Use browser.newPage() for a clean page. Reusing existing ChatGPT tabs
+// would hijack the user's current conversation and risk picking the wrong
+// profile when multiple ChatGPT tabs are open.
 const page = await browser.newPage();
 await ensureFreshConversation(page);
 
@@ -1064,9 +1108,10 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
 
     let script = build_chatgpt_recipe_script(ctx, staged_name.as_deref());
 
-    let stdout = run_script_connect(
+    let stdout = run_script_connect_with_endpoint(
         &script,
         Some(chatgpt_script_timeout_secs(ctx.poll_settings.timeout_ms)),
+        ctx.cdp_endpoint.as_deref(),
     )?;
     drop(staged_file_guard);
 
@@ -1278,6 +1323,27 @@ mod tests {
     }
 
     #[test]
+    fn connect_args_include_optional_endpoint() {
+        assert_eq!(
+            connect_args(30, Some("http://127.0.0.1:9222")),
+            vec![
+                "--connect".to_string(),
+                "http://127.0.0.1:9222".to_string(),
+                "--timeout".to_string(),
+                "30".to_string(),
+            ]
+        );
+        assert_eq!(
+            connect_args(45, None),
+            vec![
+                "--connect".to_string(),
+                "--timeout".to_string(),
+                "45".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn build_chatgpt_recipe_script_uses_poll_settings_and_stable_idle_detection() {
         let script = build_chatgpt_recipe_script(
             &DevBrowserRecipeContext {
@@ -1316,6 +1382,7 @@ mod tests {
         assert!(script.contains("newAssistantMessages = assistantMessages.slice(baselineCount)"));
         assert!(script.contains("ChatGPT returned an empty response"));
         assert!(script.contains("await ensureFreshConversation(page);"));
+        assert!(script.contains("const page = await browser.newPage();"));
         assert!(script
             .contains("await page.waitForURL('**/c/**', { timeout: 10000 }).catch(() => {});"));
         // Error detection must be scoped to error UI elements, not full page body.

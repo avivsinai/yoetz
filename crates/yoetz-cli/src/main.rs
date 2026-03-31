@@ -9,10 +9,11 @@ use litellm_rust::{
 };
 use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -836,6 +837,216 @@ fn handle_session(ctx: &AppContext, args: SessionArgs, format: OutputFormat) -> 
     }
 }
 
+fn is_chatgpt_recipe(recipe: &browser::Recipe, recipe_path: &Path) -> bool {
+    recipe
+        .name
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case("chatgpt"))
+        || recipe_path
+            .to_string_lossy()
+            .to_lowercase()
+            .contains("chatgpt")
+}
+
+fn recipe_transport_name(transport: browser::RecipeTransport) -> &'static str {
+    match transport {
+        browser::RecipeTransport::DevBrowser => "dev-browser",
+        browser::RecipeTransport::AgentBrowser => "agent-browser",
+        browser::RecipeTransport::Manual => "manual",
+    }
+}
+
+fn manual_browser_recipe_fallback(recipe_path: &Path, bundle: Option<&Path>) -> String {
+    let bundle_hint = bundle
+        .map(|path| format!(" Upload or paste `{}` manually.", path.display()))
+        .unwrap_or_default();
+    format!(
+        "manual fallback for `{}`: open ChatGPT in the target Chrome profile and complete the web flow manually.{bundle_hint}",
+        recipe_path.display()
+    )
+}
+
+fn format_recipe_transport_errors(errors: &[(browser::RecipeTransport, String)]) -> String {
+    let joined = errors
+        .iter()
+        .map(|(transport, detail)| format!("{}: {detail}", recipe_transport_name(*transport)))
+        .collect::<Vec<_>>()
+        .join("\n- ");
+    format!("all browser recipe transports failed:\n- {joined}")
+}
+
+fn run_recipe_via_dev_browser(
+    recipe_args: &BrowserRecipeArgs,
+    recipe_vars: &BTreeMap<String, String>,
+    cdp_endpoint: Option<&str>,
+    format: OutputFormat,
+    is_chatgpt: bool,
+) -> Result<()> {
+    if !is_chatgpt {
+        return Err(anyhow!(
+            "dev-browser transport currently supports only the built-in `chatgpt` recipe"
+        ));
+    }
+    if recipe_args.profile.is_some() {
+        return Err(anyhow!(
+            "dev-browser transport does not support `--profile`; use `--cdp` to target a specific Chrome instance/profile"
+        ));
+    }
+
+    dev_browser::ensure_installed()?;
+    dev_browser::ensure_chatgpt_auth_with_endpoint(cdp_endpoint)?;
+
+    let paste_mode = recipe_vars
+        .get("paste")
+        .is_some_and(|value| value == "true");
+    let bundle_text = if paste_mode {
+        recipe_args
+            .bundle
+            .as_ref()
+            .map(fs::read_to_string)
+            .transpose()?
+    } else {
+        None
+    };
+    let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
+    let recipe_ctx = dev_browser::DevBrowserRecipeContext {
+        bundle_path: recipe_args.bundle.clone(),
+        bundle_text,
+        model: recipe_vars.get("model").cloned().unwrap_or_default(),
+        disable_extended: recipe_vars
+            .get("extended")
+            .is_some_and(|value| value == "false"),
+        paste_mode,
+        prompt: recipe_vars
+            .get("prompt")
+            .cloned()
+            .unwrap_or_else(|| "Review the attached file and provide your analysis.".to_string()),
+        poll_settings,
+        allow_empty_response: recipe_vars
+            .get("allow_empty_response")
+            .is_some_and(|value| value == "true"),
+        cdp_endpoint: cdp_endpoint.map(str::to_owned),
+    };
+
+    let response = dev_browser::run_chatgpt_recipe(&recipe_ctx)?;
+    match format {
+        OutputFormat::Json => {
+            let payload = json!({
+                "status": "ok",
+                "backend": "dev-browser",
+                "response": response,
+            });
+            write_json(&payload)?;
+        }
+        OutputFormat::Jsonl => {
+            let payload = json!({
+                "type": "recipe_complete",
+                "backend": "dev-browser",
+                "response": response,
+            });
+            write_jsonl("browser.recipe", &payload)?;
+        }
+        OutputFormat::Text | OutputFormat::Markdown => {
+            println!("{response}");
+        }
+    }
+
+    Ok(())
+}
+
+fn run_recipe_via_agent_browser(
+    recipe: browser::Recipe,
+    recipe_args: &BrowserRecipeArgs,
+    recipe_vars: BTreeMap<String, String>,
+    profile_dir: PathBuf,
+    format: OutputFormat,
+    is_chatgpt: bool,
+    cdp_endpoint: Option<&str>,
+) -> Result<()> {
+    let needs_auth = is_chatgpt;
+    let live_connection = if needs_auth {
+        if let Some(endpoint) = cdp_endpoint.map(str::to_owned) {
+            match browser::try_cdp_attach(&endpoint, browser::CHATGPT_URL) {
+                Ok(()) => Some(browser::BrowserConnection::Cdp { endpoint }),
+                Err(e) => {
+                    let recovery = browser::force_kill_stale_daemon();
+                    if recipe_args.cdp.is_some() {
+                        if matches!(recovery, browser::DaemonRecoveryAction::AwaitingApproval) {
+                            return Err(anyhow!(
+                                "Chrome may be showing an \"Allow remote debugging?\" dialog. Click Allow, then retry."
+                            ));
+                        }
+                        return Err(e.context("explicit --cdp failed; not falling back"));
+                    }
+                    None
+                }
+            }
+        } else {
+            match browser::try_auto_connect_lite() {
+                Ok(()) => Some(browser::BrowserConnection::AutoConnect),
+                Err(_) => {
+                    let recovery = browser::force_kill_stale_daemon();
+                    match recovery {
+                        browser::DaemonRecoveryAction::AwaitingApproval => {
+                            return Err(anyhow!(
+                                "Chrome may be showing an \"Allow remote debugging?\" dialog. Please click Allow in Chrome, then retry the recipe."
+                            ));
+                        }
+                        _ => {
+                            eprintln!("info: auto-connect unavailable, falling back to profile");
+                            None
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        None
+    };
+    let profile_mode = if live_connection.is_some() {
+        browser::BrowserProfileMode::ProfileOnly
+    } else if needs_auth {
+        browser::resolve_auth_mode(&profile_dir, /* headed */ false)?
+    } else {
+        browser::BrowserProfileMode::ProfileOnly
+    };
+
+    let needs_bundle_text = recipe.steps.iter().any(|step| {
+        step.args
+            .as_ref()
+            .map(|args| {
+                args.iter().any(|arg| {
+                    arg.contains("{{bundle_text}}") || arg.contains("{{bundle_text|json}}")
+                })
+            })
+            .unwrap_or(false)
+    });
+    let bundle_text = match (needs_bundle_text, recipe_args.bundle.as_ref()) {
+        (true, Some(path)) => Some(fs::read_to_string(path)?),
+        _ => None,
+    };
+
+    let recipe_ctx = browser::RecipeContext {
+        bundle_path: recipe_args
+            .bundle
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+        bundle_text,
+        profile_dir: Some(profile_dir),
+        profile_mode,
+        use_stealth: needs_auth,
+        headed: needs_auth,
+        target_url: browser::CHATGPT_URL.to_string(),
+        vars: recipe_vars,
+    };
+
+    if let Some(connection) = live_connection {
+        browser::run_recipe_with_live_connection(recipe, recipe_ctx, &connection, format)
+    } else {
+        browser::run_recipe(recipe, recipe_ctx, format)
+    }
+}
+
 fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> Result<()> {
     match args.command {
         BrowserCommand::Exec(exec) => {
@@ -964,25 +1175,32 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             }
         }
         BrowserCommand::Check(check_args) => {
-            // Try dev-browser first for auth verification, but only when no
-            // explicit --cdp or --profile is set (those target a specific
-            // connection and should go through the legacy resolution path).
-            if browser::use_dev_browser()
-                && check_args.cdp.is_none()
-                && check_args.profile.is_none()
-            {
-                match dev_browser::ensure_chatgpt_auth() {
+            let dev_browser_cdp =
+                browser::resolve_cdp_endpoint(check_args.cdp.as_deref(), &ctx.config);
+
+            // Try dev-browser first for auth verification whenever we are
+            // targeting a live Chrome instance. `--profile` still routes to the
+            // legacy managed-profile path.
+            if browser::use_dev_browser() && check_args.profile.is_none() {
+                match dev_browser::ensure_chatgpt_auth_with_page_check_and_endpoint(
+                    dev_browser_cdp.as_deref(),
+                ) {
                     Ok(()) => {
+                        let method = if dev_browser_cdp.is_some() {
+                            "dev-browser (cdp)"
+                        } else {
+                            "dev-browser (auto-connect)"
+                        };
                         let payload = json!({
                             "status": "ok",
-                            "method": "dev-browser (auto-connect)",
+                            "method": method,
                             "backend": "dev-browser",
                         });
                         return match format {
                             OutputFormat::Json => write_json(&payload),
                             OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
                             OutputFormat::Text | OutputFormat::Markdown => {
-                                println!("Browser authenticated via dev-browser (auto-connect)");
+                                println!("Browser authenticated via {method}");
                                 Ok(())
                             }
                         };
@@ -1075,194 +1293,51 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)?;
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.config, recipe_args.profile.as_ref())?;
-            let recipe_name = recipe.name.as_deref().unwrap_or("");
-            let is_chatgpt = recipe_name.eq_ignore_ascii_case("chatgpt")
-                || recipe_path
-                    .to_string_lossy()
-                    .to_lowercase()
-                    .contains("chatgpt");
+            let is_chatgpt = is_chatgpt_recipe(&recipe, &recipe_path);
+            let cdp_endpoint =
+                browser::resolve_cdp_endpoint(recipe_args.cdp.as_deref(), &ctx.config);
+            let transports = browser::recipe_transports(&recipe, is_chatgpt);
+            let mut transport_errors = Vec::new();
 
-            // --- dev-browser path (preferred for ChatGPT recipes) ---
-            // Uses Playwright-based dev-browser with full Page API, native
-            // filechooser upload, and single-script execution.
-            // Skip dev-browser when --cdp or --profile is explicitly set, since
-            // dev-browser uses its own connection logic (--connect auto-discovery).
-            if is_chatgpt && recipe_args.cdp.is_none() && recipe_args.profile.is_none() {
-                match dev_browser::ensure_installed() {
-                    Ok(()) => {
-                        if let Err(e) = dev_browser::ensure_chatgpt_auth() {
+            for transport in transports {
+                let result = match transport {
+                    browser::RecipeTransport::DevBrowser => run_recipe_via_dev_browser(
+                        &recipe_args,
+                        &recipe_vars,
+                        cdp_endpoint.as_deref(),
+                        format,
+                        is_chatgpt,
+                    ),
+                    browser::RecipeTransport::AgentBrowser => run_recipe_via_agent_browser(
+                        recipe.clone(),
+                        &recipe_args,
+                        recipe_vars.clone(),
+                        profile_dir.clone(),
+                        format,
+                        is_chatgpt,
+                        cdp_endpoint.as_deref(),
+                    ),
+                    browser::RecipeTransport::Manual => Err(anyhow!(
+                        "{}",
+                        manual_browser_recipe_fallback(&recipe_path, recipe_args.bundle.as_deref())
+                    )),
+                };
+
+                match result {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        if !matches!(transport, browser::RecipeTransport::Manual) {
                             eprintln!(
-                                "info: dev-browser auth check failed ({e}), trying legacy path"
+                                "info: {} transport failed ({err}), trying next transport",
+                                recipe_transport_name(transport)
                             );
-                        } else {
-                            let paste_mode = recipe_vars
-                                .get("paste")
-                                .map(|v| v == "true")
-                                .unwrap_or(false);
-                            // Only read bundle text when paste mode is active.
-                            // In attachment mode the file is staged directly —
-                            // reading it here would waste memory on large bundles.
-                            let bundle_text = if paste_mode {
-                                recipe_args
-                                    .bundle
-                                    .as_ref()
-                                    .map(fs::read_to_string)
-                                    .transpose()?
-                            } else {
-                                None
-                            };
-                            let poll_settings =
-                                dev_browser::resolve_chatgpt_poll_settings(&recipe_vars)?;
-
-                            let recipe_ctx = dev_browser::DevBrowserRecipeContext {
-                                bundle_path: recipe_args.bundle.clone(),
-                                bundle_text,
-                                model: recipe_vars.get("model").cloned().unwrap_or_default(),
-                                disable_extended: recipe_vars
-                                    .get("extended")
-                                    .map(|v| v == "false")
-                                    .unwrap_or(false),
-                                paste_mode,
-                                prompt: recipe_vars.get("prompt").cloned().unwrap_or_else(|| {
-                                    "Review the attached file and provide your analysis."
-                                        .to_string()
-                                }),
-                                poll_settings,
-                                allow_empty_response: recipe_vars
-                                    .get("allow_empty_response")
-                                    .map(|v| v == "true")
-                                    .unwrap_or(false),
-                            };
-
-                            let response = dev_browser::run_chatgpt_recipe(&recipe_ctx)?;
-                            match format {
-                                OutputFormat::Json => {
-                                    let payload = json!({
-                                        "status": "ok",
-                                        "backend": "dev-browser",
-                                        "response": response,
-                                    });
-                                    write_json(&payload)?;
-                                }
-                                OutputFormat::Jsonl => {
-                                    let payload = json!({
-                                        "type": "recipe_complete",
-                                        "backend": "dev-browser",
-                                        "response": response,
-                                    });
-                                    write_jsonl("browser.recipe", &payload)?;
-                                }
-                                OutputFormat::Text | OutputFormat::Markdown => {
-                                    println!("{response}");
-                                }
-                            }
-                            return Ok(());
                         }
-                    }
-                    Err(e) => {
-                        eprintln!("info: dev-browser unavailable ({e}), trying legacy path");
+                        transport_errors.push((transport, err.to_string()));
                     }
                 }
             }
 
-            // --- Legacy agent-browser path (fallback) ---
-            let needs_auth = is_chatgpt;
-            // Try CDP or auto-connect for a live browser connection. Falls back to
-            // cookie/profile if neither is available. Uses the lite auto-connect check
-            // for recipes — verifies Chrome is reachable without opening new tabs.
-            let live_connection = if needs_auth {
-                if let Some(endpoint) =
-                    browser::resolve_cdp_endpoint(recipe_args.cdp.as_deref(), &ctx.config)
-                {
-                    match browser::try_cdp_attach(&endpoint, browser::CHATGPT_URL) {
-                        Ok(()) => Some(browser::BrowserConnection::Cdp { endpoint }),
-                        Err(e) => {
-                            let recovery = browser::force_kill_stale_daemon();
-                            if recipe_args.cdp.is_some() {
-                                if matches!(
-                                    recovery,
-                                    browser::DaemonRecoveryAction::AwaitingApproval
-                                ) {
-                                    return Err(anyhow::anyhow!(
-                                        "Chrome may be showing an \"Allow remote debugging?\" \
-                                         dialog. Click Allow, then retry."
-                                    ));
-                                }
-                                return Err(e.context("explicit --cdp failed; not falling back"));
-                            }
-                            None
-                        }
-                    }
-                } else {
-                    match browser::try_auto_connect_lite() {
-                        Ok(()) => Some(browser::BrowserConnection::AutoConnect),
-                        Err(_) => {
-                            let recovery = browser::force_kill_stale_daemon();
-                            match recovery {
-                                browser::DaemonRecoveryAction::AwaitingApproval => {
-                                    // Chrome 146+: the dialog is likely showing.
-                                    // Don't fall back to profile — that would open
-                                    // a separate browser without the login session.
-                                    return Err(anyhow::anyhow!(
-                                        "Chrome may be showing an \"Allow remote debugging?\" dialog. \
-                                         Please click Allow in Chrome, then retry the recipe."
-                                    ));
-                                }
-                                _ => {
-                                    eprintln!(
-                                        "info: auto-connect unavailable, falling back to profile"
-                                    );
-                                    None
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                None
-            };
-            let profile_mode = if live_connection.is_some() {
-                browser::BrowserProfileMode::ProfileOnly
-            } else if needs_auth {
-                browser::resolve_auth_mode(&profile_dir, /* headed */ false)?
-            } else {
-                browser::BrowserProfileMode::ProfileOnly
-            };
-
-            // Only read bundle text if the recipe actually references it. Some recipes
-            // (e.g. ChatGPT file-upload flows) only need {{bundle_path}}.
-            // Check for both {{bundle_text}} and {{bundle_text|json}}.
-            let needs_bundle_text = recipe.steps.iter().any(|step| {
-                step.args
-                    .as_ref()
-                    .map(|args| {
-                        args.iter().any(|a| {
-                            a.contains("{{bundle_text}}") || a.contains("{{bundle_text|json}}")
-                        })
-                    })
-                    .unwrap_or(false)
-            });
-            let bundle_text = match (needs_bundle_text, recipe_args.bundle.as_ref()) {
-                (true, Some(path)) => Some(fs::read_to_string(path)?),
-                _ => None,
-            };
-
-            let ctx = browser::RecipeContext {
-                bundle_path: recipe_args.bundle.map(|p| p.to_string_lossy().to_string()),
-                bundle_text,
-                profile_dir: Some(profile_dir),
-                profile_mode,
-                use_stealth: needs_auth,
-                headed: needs_auth,
-                target_url: browser::CHATGPT_URL.to_string(),
-                vars: recipe_vars,
-            };
-
-            if let Some(connection) = live_connection {
-                browser::run_recipe_with_live_connection(recipe, ctx, &connection, format)
-            } else {
-                browser::run_recipe(recipe, ctx, format)
-            }
+            Err(anyhow!(format_recipe_transport_errors(&transport_errors)))
         }
         BrowserCommand::Attach(attach_args) => {
             // Try explicit CDP first, then auto-connect. No cookie fallback for attach.
