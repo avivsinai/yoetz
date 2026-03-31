@@ -41,6 +41,9 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_only: ${{ steps.detect.outputs.release_only }}
+    env:
+      PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_TITLE: ${{ github.event.pull_request.title }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -54,10 +57,14 @@ jobs:
             pull_request)
               base="${{ github.event.pull_request.base.sha }}"
               head="${{ github.event.pull_request.head.sha }}"
+              if [[ ! "${PR_HEAD_REF}" =~ ^release/ ]] && [[ ! "${PR_TITLE}" =~ ^chore\(release\):[[:space:]]v?[0-9] ]]; then
+                echo "release_only=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
               ;;
             push)
-              base="${{ github.event.before }}"
-              head="${{ github.sha }}"
+              echo "release_only=false" >> "$GITHUB_OUTPUT"
+              exit 0
               ;;
             *)
               echo "release_only=false" >> "$GITHUB_OUTPUT"
@@ -79,7 +86,7 @@ jobs:
           release_only=true
           for file in "${files[@]}"; do
             case "$file" in
-              Cargo.toml|Cargo.lock|CHANGELOG.md) ;;
+              Cargo.toml|Cargo.lock|CHANGELOG.md|.claude-plugin/plugin.json|.codex-plugin/plugin.json|skills/*/SKILL.md) ;;
               *)
                 release_only=false
                 break
