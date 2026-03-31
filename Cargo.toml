@@ -23,7 +23,7 @@ thiserror = "2.0"
 ignore = "0.4"
 rand = "0.9"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 base64 = "0.22"
 mime_guess = "2.0"
