@@ -68,6 +68,9 @@ jobs:
                 echo "::error::Tag ${tag} does not exist. workflow_dispatch is only for rerunning an existing release."
                 exit 1
               fi
+              git checkout --detach "$tag"
+              version="${tag#v}"
+              ./scripts/check-release-version.sh "$version"
               release_ref="$tag"
               release_sha="$(tag_commit_sha "$tag")"
               ;;
@@ -99,14 +102,7 @@ jobs:
                 exit 1
               fi
 
-              # Validate Codex plugin manifest version matches release
-              if [[ -f .codex-plugin/plugin.json ]]; then
-                codex_version="$(jq -r '.version // empty' .codex-plugin/plugin.json)"
-                if [[ -n "$codex_version" && "$codex_version" != "$version" ]]; then
-                  echo "::error::.codex-plugin/plugin.json version ${codex_version} does not match release ${version}. Run: sed -i 's/\"version\": \".*\"/\"version\": \"${version}\"/' .codex-plugin/plugin.json"
-                  exit 1
-                fi
-              fi
+              ./scripts/check-release-version.sh "$version"
 
               release_ref="${GITHUB_SHA}"
               release_sha="${GITHUB_SHA}"
@@ -127,7 +123,6 @@ jobs:
               ;;
           esac
 
-          version="${tag#v}"
           prerelease=false
           if [[ "$tag" == *-* ]]; then
             prerelease=true
