@@ -2,6 +2,8 @@
 
 Fast CLI-first LLM council, bundler, and multimodal gateway for coding agents.
 
+This is the master agent instruction file for this repository. Keep repository policy here. `AGENTS.md` exists only as a Codex compatibility shim and should contain only Codex-specific notes.
+
 ## Project Structure
 
 Rust workspace with two crates:
@@ -22,6 +24,12 @@ cargo clippy                   # Lint
 Tests use WireMock for HTTP mocking - no API keys needed for `cargo test`.
 
 ## Release
+
+### Release Contract
+
+- Release from `main` only through `./scripts/release.sh X.Y.Z` and the resulting release PR; do not create manual tags or GitHub releases.
+- A push to `main` updates the AvivSinai marketplace immediately for the `yoetz` skill.
+- Keep one version across workspace metadata, skill/plugin metadata, and the release commit; after merge, CI tags, publishes the GitHub release, and updates Homebrew/Scoop.
 
 Use the fast release path:
 
