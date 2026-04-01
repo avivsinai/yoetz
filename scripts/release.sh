@@ -107,17 +107,26 @@ YOETZ_VERSION="${VERSION}" perl -0pi -e '
     or die "failed to update [workspace.package].version\n";
 ' Cargo.toml
 
-# Bump .codex-plugin/plugin.json if it exists.
-PLUGIN_JSON=".codex-plugin/plugin.json"
-if [[ -f "$PLUGIN_JSON" ]]; then
-  sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" "$PLUGIN_JSON" 2>/dev/null \
-    || sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" "$PLUGIN_JSON"
+# Bump plugin manifests and skill frontmatter.
+for PLUGIN_JSON in .codex-plugin/plugin.json .claude-plugin/plugin.json; do
+  if [[ -f "$PLUGIN_JSON" ]]; then
+    sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" "$PLUGIN_JSON" 2>/dev/null \
+      || sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" "$PLUGIN_JSON"
+  fi
+done
+
+SKILL_MD="skills/yoetz/SKILL.md"
+if [[ -f "$SKILL_MD" ]]; then
+  sed -i '' "s/^version: .*/version: ${VERSION}/" "$SKILL_MD" 2>/dev/null \
+    || sed -i "s/^version: .*/version: ${VERSION}/" "$SKILL_MD"
 fi
 
 cargo check --workspace
 
 git add Cargo.toml Cargo.lock
-[[ -f "$PLUGIN_JSON" ]] && git add "$PLUGIN_JSON"
+for f in .codex-plugin/plugin.json .claude-plugin/plugin.json skills/yoetz/SKILL.md; do
+  [[ -f "$f" ]] && git add "$f"
+done
 if git diff --cached --quiet; then
   echo "error: release prep produced no staged changes" >&2
   exit 1
