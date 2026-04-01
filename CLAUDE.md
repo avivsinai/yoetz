@@ -60,6 +60,27 @@ commit drive the entire pipeline, not replacing the release pipeline.
 - Async with `tokio`
 - Follow existing patterns in the crate you're modifying
 
+## dev-browser Recipe Constraints
+
+When editing `crates/yoetz-cli/src/dev_browser.rs` or adding new ChatGPT/browser
+recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
+
+- The sandbox is QuickJS. Keep recipe scripts small and linear.
+- Avoid large generated scripts, nested async helpers, or closure-heavy control
+  flow. Prefer micro-scripts orchestrated from Rust.
+- Use named pages via `browser.getPage(name)` / `browser.listPages()` to carry
+  state across scripts.
+- Use `console.log(JSON.stringify(...))` as the script-to-Rust IPC boundary.
+- Prefer Playwright actions on the page plus Rust orchestration. Do not assume
+  Node features such as `require`, arbitrary `fs`, or `fetch`.
+- For contenteditable ChatGPT inputs, use typing APIs such as
+  `pressSequentially` instead of `fill()`.
+- For file upload in `dev-browser`, prefer the host-level `uploadFile(page, tempName, options)`
+  helper against a staged file in `~/.dev-browser/tmp/` rather than building
+  Playwright file buffers inside QuickJS.
+- The QuickJS GC crash recovery in `dev_browser.rs` can salvage stdout from a
+  completed script, but recipe correctness must not depend on that recovery.
+
 ## Provider Configuration
 
 API keys via environment variables:
