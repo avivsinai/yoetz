@@ -182,6 +182,10 @@ jobs:
         if: "!matrix.cross"
         run: cargo build --release --locked --target ${{ matrix.target }}
 
+      - name: Codesign macOS binary
+        if: runner.os == 'macOS'
+        run: codesign --force --sign - --identifier io.github.avivsinai.yoetz target/${{ matrix.target }}/release/${{ matrix.artifact }}
+
       - name: Build (cross)
         if: matrix.cross
         run: cross build --release --locked --target ${{ matrix.target }}

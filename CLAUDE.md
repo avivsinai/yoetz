@@ -29,9 +29,9 @@ Use the fast release path:
 ./scripts/release.sh 0.2.24
 ```
 
-This script bumps `[workspace.package].version`, runs `cargo check --workspace`,
-creates `release/vX.Y.Z`, commits `chore(release): vX.Y.Z`, pushes the branch,
-and opens a PR with `gh`.
+This script bumps `[workspace.package].version`, aligns skill/plugin metadata,
+runs `cargo check --workspace`, creates `release/vX.Y.Z`, commits
+`chore(release): vX.Y.Z`, pushes the branch, and opens a PR with `gh`.
 
 After the release PR merges:
 - `.github/workflows/release.yml` detects the merged `chore(release): vX.Y.Z`

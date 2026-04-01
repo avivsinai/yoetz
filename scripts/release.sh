@@ -12,7 +12,7 @@ Examples:
 This script:
 1. Verifies you are on a clean, up-to-date main branch
 2. Creates release/vX.Y.Z
-3. Bumps [workspace.package].version in Cargo.toml
+3. Bumps [workspace.package].version plus skill/plugin metadata
 4. Runs cargo check --workspace
 5. Commits the release bump as chore(release): vX.Y.Z
 6. Pushes the branch
@@ -55,7 +55,6 @@ fi
 require_command git
 require_command cargo
 require_command perl
-
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -122,6 +121,7 @@ if [[ -f "$SKILL_MD" ]]; then
 fi
 
 cargo check --workspace
+./scripts/check-release-version.sh "$VERSION"
 
 git add Cargo.toml Cargo.lock
 for f in .codex-plugin/plugin.json .claude-plugin/plugin.json skills/yoetz/SKILL.md; do
@@ -140,6 +140,7 @@ PR_BODY=$(
 ## Release
 
 - bumps workspace version to \`${VERSION}\`
+- aligns skill/plugin metadata to \`${VERSION}\`
 - merge triggers .github/workflows/release.yml, which creates the tag and
   publishes the release
 - release notes are generated in CI from git-cliff during the release workflow
