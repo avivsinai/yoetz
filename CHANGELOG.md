@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.44] - 2026-04-02
 ### Documentation
 
 - Make CLAUDE the master agent guide
@@ -18,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - Removed deprecated release shims so there is exactly one supported release entrypoint.
+
 
 ## [0.2.43] - 2026-04-01
 
