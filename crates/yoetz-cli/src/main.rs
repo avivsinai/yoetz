@@ -1292,7 +1292,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 .with_context(|| format!("resolve recipe {:?}", recipe_args.recipe))?;
             let content = fs::read_to_string(&recipe_path)
                 .with_context(|| format!("read recipe {}", recipe_path.display()))?;
-            let recipe: browser::Recipe = serde_yaml::from_str(&content)?;
+            let recipe: browser::Recipe = serde_yml::from_str(&content)?;
             let recipe_vars =
                 browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)?;
             let profile_dir =
