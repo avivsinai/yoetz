@@ -1143,6 +1143,32 @@ fn process_is_alive(_pid: u32) -> bool {
     false
 }
 
+#[cfg(unix)]
+fn process_command_line(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    }
+}
+
+#[cfg(not(unix))]
+fn process_command_line(_pid: u32) -> Option<String> {
+    None
+}
+
+fn process_looks_like_agent_browser(pid: u32) -> bool {
+    process_command_line(pid).is_some_and(|command| command.contains("agent-browser"))
+}
+
 fn socket_is_recent(sock_path: &Path, grace_window: Duration) -> bool {
     let Ok(metadata) = fs::metadata(sock_path) else {
         return false;
@@ -1169,10 +1195,23 @@ fn force_kill_stale_daemon_with_paths(
     }
 
     if let Some(pid) = read_daemon_pid(pid_path) {
-        if process_is_alive(pid) && socket_is_recent(sock_path, grace_window) {
+        if process_is_alive(pid)
+            && process_looks_like_agent_browser(pid)
+            && socket_is_recent(sock_path, grace_window)
+        {
             return DaemonRecoveryAction::AwaitingApproval;
         }
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+        if process_is_alive(pid) {
+            if process_looks_like_agent_browser(pid) {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+            } else {
+                eprintln!(
+                    "warning: refusing to SIGKILL pid {} from {} because it does not look like agent-browser",
+                    pid,
+                    pid_path.display()
+                );
+            }
+        }
     }
 
     let _ = fs::remove_file(pid_path);
@@ -2812,6 +2851,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn force_kill_stale_daemon_preserves_recent_live_process() {
+        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
 
         let dir = unique_unix_socket_dir("daemon_grace");
@@ -2821,13 +2861,46 @@ mod tests {
             let _listener = UnixListener::bind(&sock_path).unwrap();
         }
 
-        let mut child = Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap();
+        let script_path = dir.join("agent-browser");
+        fs::write(&script_path, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&script_path, perms).unwrap();
+
+        let mut child = Command::new(&script_path).spawn().unwrap();
         fs::write(&pid_path, child.id().to_string()).unwrap();
 
         let action =
             force_kill_stale_daemon_with_paths(&pid_path, &sock_path, Duration::from_secs(30));
         assert_eq!(action, DaemonRecoveryAction::AwaitingApproval);
         assert!(process_is_alive(child.id()));
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_kill_stale_daemon_refuses_unverified_pid() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = unique_unix_socket_dir("daemon_refuse_unverified");
+        let pid_path = dir.join("default.pid");
+        let sock_path = dir.join("default.sock");
+        {
+            let _listener = UnixListener::bind(&sock_path).unwrap();
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        let mut child = Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap();
+        fs::write(&pid_path, child.id().to_string()).unwrap();
+
+        let action =
+            force_kill_stale_daemon_with_paths(&pid_path, &sock_path, Duration::from_secs(0));
+        assert_eq!(action, DaemonRecoveryAction::KilledStale);
+        assert!(process_is_alive(child.id()));
+        assert!(!pid_path.exists());
+        assert!(!sock_path.exists());
 
         let _ = child.kill();
         let _ = child.wait();
