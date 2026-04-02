@@ -11,6 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Make CLAUDE the master agent guide
 
+### Changed
+
+- Switched releases to the shared PR-based `scripts/release.sh` flow, with `CHANGELOG.md` supplying the GitHub release notes and CI creating the version tag only after the merged release commit verifies.
+
+### Fixed
+
+- Removed deprecated release shims so there is exactly one supported release entrypoint.
+
 ## [0.2.43] - 2026-04-01
 
 ### Miscellaneous
