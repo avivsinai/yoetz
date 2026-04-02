@@ -21,7 +21,7 @@ cargo fmt                      # Format code
 cargo clippy                   # Lint
 ```
 
-Tests use WireMock for HTTP mocking - no API keys needed for `cargo test`.
+Tests use `assert_cmd`, `predicates`, and `serial_test` — no API keys needed for `cargo test`.
 
 ## Release
 
