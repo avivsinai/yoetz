@@ -32,7 +32,6 @@ time.workspace = true
 
 clap = { version = "4.6", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = [
-    "blocking",
     "json",
     "rustls-tls",
     "multipart",
@@ -42,6 +41,7 @@ serde_yaml = "0.9"
 tempfile = "3.27"
 jsonschema = "0.45"
 fs2 = "0.4"
+ureq = "2.12"
 
 [dev-dependencies]
 serial_test = "3.4"

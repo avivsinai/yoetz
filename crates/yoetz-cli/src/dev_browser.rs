@@ -13,20 +13,15 @@
 //! - Daemon-managed browser instances with auto-reconnect
 //! - Single script executes batch operations (fewer IPC round-trips)
 
-#[allow(unused_imports)]
 use anyhow::{anyhow, Context, Result};
-#[allow(unused_imports)]
-use serde_json::{json, Value};
-#[allow(unused_imports)]
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use reqwest::blocking::Client;
 use reqwest::Url;
 use yoetz_core::paths::home_dir;
 
@@ -73,8 +68,6 @@ struct CdpCandidate {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ResolvedCdpEndpoint {
     ws_url: String,
-    probe_url: String,
-    source: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -489,31 +482,33 @@ fn probe_cdp_candidate(candidate: &CdpCandidate) -> CdpProbeOutcome {
         Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
     };
 
-    let client = match Client::builder().timeout(CDP_HEALTH_TIMEOUT).build() {
-        Ok(client) => client,
-        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
-    };
-
-    let response = match client
-        .get(probe_url.clone())
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
+    let agent = ureq::AgentBuilder::new()
+        .timeout(CDP_HEALTH_TIMEOUT)
+        .build();
+    let response = match agent
+        .get(probe_url.as_str())
+        .set("Accept", "application/json")
+        .call()
     {
         Ok(response) => response,
-        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
+        Err(ureq::Error::Status(status, response)) => {
+            if status == 404 && is_localhost_url(&probe_url) {
+                return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
+                    candidate,
+                    probe_url.as_str(),
+                    "GET /json/version returned HTTP 404 from a localhost Chrome endpoint",
+                ));
+            }
+            response
+        }
+        Err(ureq::Error::Transport(err)) => {
+            return CdpProbeOutcome::Unavailable(err.to_string());
+        }
     };
 
     // Chrome 136+ can leave localhost CDP in a half-state where DevTools is
     // listening but HTTP discovery on the real profile returns 404.
-    if response.status() == reqwest::StatusCode::NOT_FOUND && is_localhost_url(&probe_url) {
-        return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
-            candidate,
-            probe_url.as_str(),
-            "GET /json/version returned HTTP 404 from a localhost Chrome endpoint",
-        ));
-    }
-
-    if !response.status().is_success() {
+    if !(200..=299).contains(&response.status()) {
         return CdpProbeOutcome::Unavailable(format!(
             "HTTP {} from {}",
             response.status(),
@@ -521,7 +516,7 @@ fn probe_cdp_candidate(candidate: &CdpCandidate) -> CdpProbeOutcome {
         ));
     }
 
-    let body = match response.text() {
+    let body = match response.into_string() {
         Ok(body) => body,
         Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
     };
@@ -555,11 +550,7 @@ fn probe_cdp_candidate(candidate: &CdpCandidate) -> CdpProbeOutcome {
         ));
     };
 
-    CdpProbeOutcome::Healthy(ResolvedCdpEndpoint {
-        ws_url,
-        probe_url: probe_url.to_string(),
-        source: candidate.source.clone(),
-    })
+    CdpProbeOutcome::Healthy(ResolvedCdpEndpoint { ws_url })
 }
 
 fn resolve_dev_browser_connect_endpoint(cdp_endpoint: Option<&str>) -> Result<Option<String>> {
@@ -677,64 +668,9 @@ pub fn run_script_connect_with_endpoint(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Run a dev-browser script with a managed (non-connect) browser instance.
-/// Uses the named browser instance for isolation.
-#[allow(dead_code)]
-pub fn run_script_managed(
-    script: &str,
-    browser_name: &str,
-    timeout_secs: Option<u64>,
-) -> Result<String> {
-    let bin = resolve_dev_browser()?;
-    let timeout = timeout_secs.unwrap_or(DEFAULT_SCRIPT_TIMEOUT_SECS);
-
-    let output = Command::new(&bin)
-        .args(["--browser", browser_name, "--timeout", &timeout.to_string()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(script.as_bytes())?;
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .with_context(|| format!("failed to run dev-browser (via {bin})"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if !stderr.is_empty() {
-            stderr.to_string()
-        } else if !stdout.is_empty() {
-            stdout.to_string()
-        } else {
-            format!("exit code {:?}", output.status.code())
-        };
-        return Err(anyhow!("dev-browser script failed: {detail}"));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
-}
-
 /// Stage a file into dev-browser's tmp directory so scripts can read it
 /// via `readFile(name)`.
 pub fn stage_file(name: &str, content: &str) -> Result<PathBuf> {
-    let tmp_dir = dev_browser_tmp_dir();
-    fs::create_dir_all(&tmp_dir)
-        .with_context(|| format!("create dev-browser tmp dir: {}", tmp_dir.display()))?;
-    let path = tmp_dir.join(name);
-    fs::write(&path, content).with_context(|| format!("write staged file: {}", path.display()))?;
-    set_staged_file_permissions(&path)?;
-    Ok(path)
-}
-
-/// Stage a binary file into dev-browser's tmp directory.
-#[allow(dead_code)]
-pub fn stage_file_bytes(name: &str, content: &[u8]) -> Result<PathBuf> {
     let tmp_dir = dev_browser_tmp_dir();
     fs::create_dir_all(&tmp_dir)
         .with_context(|| format!("create dev-browser tmp dir: {}", tmp_dir.display()))?;
@@ -758,36 +694,9 @@ fn set_staged_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// List all browser tabs visible to dev-browser (via --connect).
-pub fn list_tabs() -> Result<Vec<TabInfo>> {
-    let script = r#"
-const pages = await browser.listPages();
-console.log(JSON.stringify(pages));
-"#;
-    let stdout = run_script_connect(script, Some(10))?;
-    let tabs: Vec<TabInfo> =
-        serde_json::from_str(stdout.trim()).context("parse dev-browser listPages")?;
-    Ok(tabs)
-}
-
-/// Tab information from dev-browser.
-#[allow(dead_code)]
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct TabInfo {
-    pub id: String,
-    pub url: String,
-    pub title: String,
-    pub name: Option<String>,
-}
-
 /// Check if Chrome is reachable and dev-browser can connect to it.
 /// Uses a short first probe; retries once with a longer timeout only when the
 /// first failure looks like a timeout (slow CDP handshake with many tabs).
-#[allow(dead_code)]
-pub fn check_connection() -> Result<()> {
-    check_connection_with_endpoint(None)
-}
-
 pub fn check_connection_with_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
     let script = r#"
 const pages = await browser.listPages();
@@ -816,24 +725,6 @@ console.log("ok:" + pages.length);
             }
         }
     }
-}
-
-/// Find a ChatGPT tab in the connected browser.
-/// Returns the tab ID of the best candidate.
-#[allow(dead_code)]
-pub fn find_chatgpt_tab() -> Result<Option<String>> {
-    let tabs = list_tabs()?;
-    let chatgpt_tab = tabs
-        .iter()
-        .find(|t| t.url.contains("chatgpt.com") && !t.url.contains("/c/"))
-        .or_else(|| tabs.iter().find(|t| t.url.contains("chatgpt.com")));
-    Ok(chatgpt_tab.map(|t| t.id.clone()))
-}
-
-/// Check authentication status on ChatGPT in the connected browser.
-#[allow(dead_code)]
-pub fn check_chatgpt_auth() -> Result<bool> {
-    check_chatgpt_auth_with_endpoint(None)
 }
 
 pub fn check_chatgpt_auth_with_endpoint(cdp_endpoint: Option<&str>) -> Result<bool> {
@@ -867,11 +758,6 @@ try {
 /// Only checks dev-browser daemon connectivity — opening a separate page
 /// to verify auth causes interference with the recipe's named page.
 /// If not authenticated, the recipe will fail with a clear error.
-#[allow(dead_code)]
-pub fn ensure_chatgpt_auth() -> Result<()> {
-    ensure_chatgpt_auth_with_endpoint(None)
-}
-
 pub fn ensure_chatgpt_auth_with_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
     check_connection_with_endpoint(cdp_endpoint).context(
         "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
@@ -883,12 +769,6 @@ pub fn ensure_chatgpt_auth_with_endpoint(cdp_endpoint: Option<&str>) -> Result<(
 
 /// Ensure the connected Chrome session can reach an authenticated ChatGPT page.
 /// Opens a temporary page — use only when not immediately followed by a recipe.
-#[allow(dead_code)]
-pub fn ensure_chatgpt_auth_with_page_check() -> Result<()> {
-    ensure_chatgpt_auth_with_page_check_and_endpoint(None)
-}
-
-#[allow(dead_code)]
 pub fn ensure_chatgpt_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
     check_connection_with_endpoint(cdp_endpoint).context(
         "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
@@ -1132,7 +1012,7 @@ const POLL_INTERVAL_MS = {poll_interval_ms};
 const ALLOW_EMPTY_RESPONSE = {allow_empty_response};
 const page = await browser.getPage(PAGE_NAME);
 const start = Date.now();
-let lastResponseLength = null;
+let lastResponseText = null;
 while (Date.now() - start < POLL_TIMEOUT_MS) {{
   const state = await page.evaluate((baselineCount) => {{
     const errorEl = document.querySelector("[role='alert'], [data-testid*='error']");
@@ -1157,13 +1037,13 @@ while (Date.now() - start < POLL_TIMEOUT_MS) {{
     state.newAssistantCount > 0 &&
     (ALLOW_EMPTY_RESPONSE || state.response.length > 0);
   if (completionCandidate) {{
-    if (lastResponseLength !== null && state.response.length === lastResponseLength) {{
+    if (lastResponseText !== null && state.response === lastResponseText) {{
       console.log(JSON.stringify({{ status: "ok", response: state.response }}));
       return;
     }}
-    lastResponseLength = state.response.length;
+    lastResponseText = state.response;
   }} else {{
-    lastResponseLength = null;
+    lastResponseText = null;
   }}
   await page.waitForTimeout(POLL_INTERVAL_MS);
 }}
@@ -1395,128 +1275,6 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
     Ok(response)
 }
 
-/// Run a generic dev-browser recipe from a YAML recipe file.
-/// Converts each YAML step into equivalent Playwright JS and executes
-/// as a single script.
-#[allow(dead_code)]
-pub fn run_yaml_recipe(
-    recipe_steps: &[(String, Option<Vec<String>>)],
-    vars: &BTreeMap<String, String>,
-    bundle_path: Option<&Path>,
-    timeout_secs: Option<u64>,
-) -> Result<String> {
-    let mut script_parts = Vec::new();
-    let mut staged_files = Vec::new();
-
-    // Open a named page for persistence
-    script_parts.push("const page = await browser.getPage('yoetz-recipe');".to_string());
-
-    for (action, args) in recipe_steps {
-        let args_ref = args.as_deref().unwrap_or_default();
-        match action.as_str() {
-            "eval" => {
-                if let Some(code) = args_ref.first() {
-                    let mut interpolated = code.clone();
-                    for (key, value) in vars {
-                        let json_needle = format!("{{{{{key}|json}}}}");
-                        interpolated = interpolated
-                            .replace(&json_needle, &serde_json::to_string(value).unwrap());
-                        let needle = format!("{{{{{key}}}}}");
-                        interpolated = interpolated.replace(&needle, value);
-                    }
-                    script_parts.push(format!(
-                        "await page.evaluate(() => {{ {} }});",
-                        interpolated
-                    ));
-                }
-            }
-            "snapshot" => {
-                script_parts.push(
-                    "const snap = await page.evaluate(() => document.body.innerText); console.log(snap);".to_string()
-                );
-            }
-            "upload" => {
-                if args_ref.len() >= 2 {
-                    if let Some(bp) = bundle_path {
-                        let content = fs::read_to_string(bp)?;
-                        let name = bp
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("upload.txt");
-                        let path = stage_file(name, &content)?;
-                        staged_files.push(StagedFileGuard::new(path));
-                        let name_json = serde_json::to_string(name).unwrap();
-                        script_parts.push(format!(
-                            r#"{{
-    const content = await readFile({name_json});
-    await page.evaluate((args) => {{
-        const [c, n] = args;
-        const f = new File([c], n, {{ type: "text/plain" }});
-        const dt = new DataTransfer();
-        dt.items.add(f);
-        const input = document.querySelector({selector_json});
-        if (input) {{ input.files = dt.files; input.dispatchEvent(new Event('change', {{ bubbles: true }})); }}
-    }}, [content, {name_json}]);
-}}"#,
-                            name_json = name_json,
-                            selector_json = serde_json::to_string(&args_ref[0]).unwrap(),
-                        ));
-                    }
-                }
-            }
-            _ => {
-                // For unknown actions, try as page method call
-                eprintln!("warn: unknown recipe action '{action}', skipping");
-            }
-        }
-    }
-
-    let full_script = script_parts.join("\n");
-    run_script_connect(&full_script, timeout_secs)
-}
-
-/// Take a screenshot of the current page via dev-browser.
-#[allow(dead_code)]
-pub fn take_screenshot(name: &str) -> Result<PathBuf> {
-    let name_json = serde_json::to_string(name).unwrap();
-    let script = format!(
-        r#"
-const pages = await browser.listPages();
-const chatgpt = pages.find(p => p.url.includes("chatgpt.com"));
-if (chatgpt) {{
-    const page = await browser.getPage(chatgpt.id);
-    const buf = await page.screenshot();
-    const path = await saveScreenshot(buf, {name_json});
-    console.log(path);
-}} else {{
-    const page = await browser.newPage();
-    const buf = await page.screenshot();
-    const path = await saveScreenshot(buf, {name_json});
-    console.log(path);
-}}
-"#,
-    );
-    let stdout = run_script_connect(&script, Some(15))?;
-    Ok(PathBuf::from(stdout.trim()))
-}
-
-/// Get the text content of the current ChatGPT page.
-#[allow(dead_code)]
-pub fn get_chatgpt_page_text() -> Result<String> {
-    let script = r#"
-const pages = await browser.listPages();
-const chatgpt = pages.find(p => p.url.includes("chatgpt.com"));
-if (chatgpt) {
-    const page = await browser.getPage(chatgpt.id);
-    const text = await page.evaluate(() => document.body.innerText);
-    console.log(text);
-} else {
-    console.log("");
-}
-"#;
-    run_script_connect(script, Some(15))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1535,16 +1293,6 @@ mod tests {
         assert!(path.exists());
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "hello world");
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_stage_file_bytes() {
-        let data = b"binary content \x00\x01\x02";
-        let path = stage_file_bytes("test_binary.bin", data).unwrap();
-        assert!(path.exists());
-        let content = fs::read(&path).unwrap();
-        assert_eq!(content, data);
         let _ = fs::remove_file(&path);
     }
 
@@ -1756,12 +1504,12 @@ mod tests {
         assert!(script.contains("const POLL_TIMEOUT_MS = 900000;"));
         assert!(script.contains("const POLL_INTERVAL_MS = 45000;"));
         assert!(script.contains("const ALLOW_EMPTY_RESPONSE = false;"));
-        assert!(script.contains("let lastResponseLength = null;"));
+        assert!(script.contains("let lastResponseText = null;"));
         assert!(script.contains(".result-thinking, [data-testid*='thinking']"));
         assert!(script.contains("[data-testid='stop-button']"));
         assert!(script.contains("[data-message-author-role='assistant']"));
         assert!(script.contains("!state.hasThinkingIndicator"));
-        assert!(script.contains("state.response.length === lastResponseLength"));
+        assert!(script.contains("state.response === lastResponseText"));
         assert!(script.contains("status: \"ok\""));
         assert!(script.contains("status: \"timeout\""));
     }
