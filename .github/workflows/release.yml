@@ -112,9 +112,6 @@ jobs:
                   echo "::error::Tag ${tag} already exists but points to ${existing_sha}, not ${release_sha}."
                   exit 1
                 fi
-              else
-                git tag "${tag}" "${release_sha}"
-                git push origin "refs/tags/${tag}"
               fi
               ;;
             *)
@@ -128,11 +125,13 @@ jobs:
             prerelease=true
           fi
 
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
-          echo "version=${version}" >> "$GITHUB_OUTPUT"
-          echo "release_ref=${release_ref}" >> "$GITHUB_OUTPUT"
-          echo "release_sha=${release_sha}" >> "$GITHUB_OUTPUT"
-          echo "prerelease=${prerelease}" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "release_ref=${release_ref}"
+            echo "release_sha=${release_sha}"
+            echo "prerelease=${prerelease}"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     name: Build (${{ matrix.target }})
@@ -221,7 +220,7 @@ jobs:
   release:
     name: Create Release
     needs: [prepare, build]
-    if: needs.prepare.result == 'success'
+    if: needs.prepare.result == 'success' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -229,6 +228,30 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.release_ref }}
           fetch-depth: 0
+
+      - name: Create release tag after verification
+        shell: bash
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          RELEASE_SHA: ${{ needs.prepare.outputs.release_sha }}
+        run: |
+          set -euo pipefail
+
+          tag_commit_sha() {
+            git rev-parse "refs/tags/${1}^{commit}" 2>/dev/null || git rev-parse "refs/tags/${1}"
+          }
+
+          git fetch --force --tags origin
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
+            existing_sha="$(tag_commit_sha "$TAG")"
+            if [[ "$existing_sha" != "$RELEASE_SHA" ]]; then
+              echo "::error::Tag ${TAG} already exists but points to ${existing_sha}, not ${RELEASE_SHA}."
+              exit 1
+            fi
+          else
+            git tag "$TAG" "$RELEASE_SHA"
+            git push origin "refs/tags/${TAG}"
+          fi
 
       - uses: actions/download-artifact@v8
         with:
@@ -240,16 +263,27 @@ jobs:
           cd artifacts
           sha256sum yoetz-* > SHA256SUMS.txt
 
-      - name: Fetch tags
-        run: git fetch --force --tags origin
-
-      - name: Generate release notes
-        uses: taiki-e/install-action@git-cliff
       - name: Extract release notes for this tag
         id: release_notes
+        shell: bash
         run: |
           TAG="${{ needs.prepare.outputs.tag }}"
-          git-cliff --tag "$TAG" --unreleased --strip header --output RELEASE_NOTES.md
+          VERSION="${TAG#v}"
+          python3 - "$VERSION" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          text = pathlib.Path("CHANGELOG.md").read_text()
+          pattern = re.compile(
+              rf"(?ms)^## \[{re.escape(version)}\] - \d{{4}}-\d{{2}}-\d{{2}}\n.*?(?=^## \[|\Z)"
+          )
+          match = pattern.search(text)
+          if not match:
+              raise SystemExit(f"missing changelog section for {version}")
+          pathlib.Path("RELEASE_NOTES.md").write_text(match.group(0).strip() + "\n")
+          PY
           cat RELEASE_NOTES.md
 
       - name: Create GitHub Release
@@ -259,7 +293,6 @@ jobs:
           target_commitish: ${{ needs.prepare.outputs.release_sha }}
           name: ${{ needs.prepare.outputs.tag }}
           prerelease: ${{ needs.prepare.outputs.prerelease }}
-          allow_updates: true
           overwrite_files: true
           body_path: RELEASE_NOTES.md
           files: |
@@ -271,7 +304,7 @@ jobs:
   publish-skills:
     name: Publish Skills
     needs: [prepare, release]
-    if: needs.prepare.result == 'success'
+    if: needs.prepare.result == 'success' && needs.release.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

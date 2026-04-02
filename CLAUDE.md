@@ -29,7 +29,7 @@ Tests use WireMock for HTTP mocking - no API keys needed for `cargo test`.
 
 - Release from `main` only through `./scripts/release.sh X.Y.Z` and the resulting release PR; do not create manual tags or GitHub releases.
 - A push to `main` updates the AvivSinai marketplace immediately for the `yoetz` skill.
-- Keep one version across workspace metadata, skill/plugin metadata, and the release commit; after merge, CI tags, publishes the GitHub release, and updates Homebrew/Scoop.
+- Keep one version across `CHANGELOG.md`, workspace metadata, skill/plugin metadata, and the release commit; after merge, CI validates the merged commit, creates the tag, publishes the GitHub release from the committed changelog entry, and updates Homebrew/Scoop.
 
 Use the fast release path:
 
@@ -37,14 +37,15 @@ Use the fast release path:
 ./scripts/release.sh 0.2.24
 ```
 
-This script bumps `[workspace.package].version`, aligns skill/plugin metadata,
-runs `cargo check --workspace`, creates `release/vX.Y.Z`, commits
+This script updates `CHANGELOG.md`, bumps `[workspace.package].version`,
+aligns skill/plugin metadata, runs `cargo check --workspace`, creates
+`release/vX.Y.Z`, commits
 `chore(release): vX.Y.Z`, pushes the branch, and opens a PR with `gh`.
 
 After the release PR merges:
 - `.github/workflows/release.yml` detects the merged `chore(release): vX.Y.Z`
   commit on `main`, creates/pushes the matching tag, publishes artifacts,
-  generates release notes with `git-cliff`, and updates Homebrew/Scoop
+  uses `CHANGELOG.md` for the GitHub release notes, and updates Homebrew/Scoop
 - `.github/workflows/release.yml` also supports `workflow_dispatch` as a retry
   path for an existing tag if a release job needs to be rerun manually
 
@@ -52,8 +53,8 @@ Repository setup for the fast path:
 - `gh auth login`: needed locally if you want `./scripts/release.sh` to open the
   PR automatically after pushing the release branch
 
-`CHANGELOG.md` is no longer part of manual release prep. GitHub release notes
-generated in CI are the source of truth.
+`CHANGELOG.md` is part of release prep again. The release commit is the source
+of truth, and CI republishes that same changelog entry in the GitHub release.
 
 We intentionally keep the custom GitHub Actions release flow instead of adopting
 `release-plz`/`release-please` wholesale: this repo ships GitHub release
