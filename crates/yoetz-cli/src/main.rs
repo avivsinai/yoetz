@@ -641,6 +641,8 @@ struct CouncilResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     bundle: Option<yoetz_core::types::Bundle>,
     results: Vec<CouncilModelResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<CouncilModelError>,
     pricing: CouncilPricing,
     usage: Usage,
     artifacts: ArtifactPaths,
@@ -653,6 +655,13 @@ struct CouncilModelResult {
     usage: Usage,
     pricing: PricingEstimate,
     response_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CouncilModelError {
+    model: String,
+    provider: String,
+    error: String,
 }
 
 #[derive(Debug, Serialize)]

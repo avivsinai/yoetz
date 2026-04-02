@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Result};
 
-use crate::CouncilResult;
 use crate::{
     add_usage, call_litellm, maybe_write_output, normalize_model_name_with_aliases,
     render_bundle_md, resolve_max_output_tokens, resolve_prompt, resolve_provider_from_registry,
@@ -8,6 +7,7 @@ use crate::{
     CouncilModelResult, CouncilPricing, ModelEstimate,
 };
 use crate::{budget, registry};
+use crate::{CouncilModelError, CouncilResult};
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use yoetz_core::bundle::{build_bundle, estimate_tokens, BundleOptions};
@@ -164,6 +164,7 @@ pub(crate) async fn handle_council(
 
     let mut results = Vec::new();
     let mut total_usage = Usage::default();
+    let mut errors = Vec::new();
     let model_prompt = std::sync::Arc::new(if let Some(bundle_ref) = &bundle {
         render_bundle_md(bundle_ref)
     } else {
@@ -201,7 +202,13 @@ pub(crate) async fn handle_council(
             let response_format = response_format.clone();
             let model_max_output_tokens = per_model_max_output_tokens[idx];
             join_set.spawn(async move {
-                let _permit = semaphore.acquire_owned().await?;
+                let _permit = semaphore.acquire_owned().await.map_err(|err| {
+                    (
+                        model.clone(),
+                        provider.clone(),
+                        anyhow!("failed to acquire council permit: {err}"),
+                    )
+                })?;
                 let call = call_litellm(
                     &litellm,
                     Some(&provider),
@@ -213,49 +220,82 @@ pub(crate) async fn handle_council(
                     &[],
                     None,
                 )
-                .await?;
-                Ok::<_, anyhow::Error>((idx, model, provider, call))
+                .await;
+                match call {
+                    Ok(call) => Ok((idx, model, provider, call)),
+                    Err(err) => Err((model, provider, err)),
+                }
             });
         }
 
         let mut ordered: Vec<Option<CouncilModelResult>> =
-            (0..args.models.len()).map(|_| None).collect();
+            (0..resolved_models.len()).map(|_| None).collect();
         while let Some(res) = join_set.join_next().await {
-            let (idx, model, provider, call) = res??;
-            let mut usage = call.usage;
-            if usage.cost_usd.is_none() {
-                usage.cost_usd = call.header_cost;
-            }
-            if usage.cost_usd.is_none() && provider == "openrouter" {
-                if let Some(id) = call.response_id.as_deref() {
-                    if let Ok(cost) = crate::fetch_openrouter_cost(&ctx.client, config, id).await {
-                        usage.cost_usd = cost;
+            match res {
+                Ok(Ok((idx, model, provider, call))) => {
+                    let mut usage = call.usage;
+                    if usage.cost_usd.is_none() {
+                        usage.cost_usd = call.header_cost;
                     }
+                    if usage.cost_usd.is_none() && provider == "openrouter" {
+                        if let Some(id) = call.response_id.as_deref() {
+                            if let Ok(cost) =
+                                crate::fetch_openrouter_cost(&ctx.client, config, id).await
+                            {
+                                usage.cost_usd = cost;
+                            }
+                        }
+                    }
+
+                    total_usage = add_usage(total_usage, &usage);
+
+                    let registry_id = resolve_registry_model_id(
+                        Some(&provider),
+                        Some(&model),
+                        registry_cache.as_ref(),
+                    );
+                    let output_tokens = per_model_max_output_tokens[idx].unwrap_or(4096);
+                    let pricing = registry::estimate_pricing(
+                        registry_cache.as_ref(),
+                        registry_id.as_deref().unwrap_or(&model),
+                        input_tokens,
+                        output_tokens,
+                    )?;
+
+                    ordered[idx] = Some(CouncilModelResult {
+                        model,
+                        content: call.content,
+                        usage,
+                        pricing,
+                        response_id: call.response_id,
+                    });
+                }
+                Ok(Err((model, provider, err))) => {
+                    errors.push(CouncilModelError {
+                        model,
+                        provider,
+                        error: err.to_string(),
+                    });
+                }
+                Err(err) => {
+                    errors.push(CouncilModelError {
+                        model: "<task>".to_string(),
+                        provider: "internal".to_string(),
+                        error: err.to_string(),
+                    });
                 }
             }
-
-            total_usage = add_usage(total_usage, &usage);
-
-            let registry_id =
-                resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
-            let output_tokens = per_model_max_output_tokens[idx].unwrap_or(4096);
-            let pricing = registry::estimate_pricing(
-                registry_cache.as_ref(),
-                registry_id.as_deref().unwrap_or(&model),
-                input_tokens,
-                output_tokens,
-            )?;
-
-            ordered[idx] = Some(CouncilModelResult {
-                model,
-                content: call.content,
-                usage,
-                pricing,
-                response_id: call.response_id,
-            });
         }
 
         results = ordered.into_iter().flatten().collect();
+        if results.is_empty() && !errors.is_empty() {
+            let joined = errors
+                .iter()
+                .map(|error| format!("- {} ({}): {}", error.model, error.provider, error.error))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Err(anyhow!("all council models failed:\n{joined}"));
+        }
     }
 
     if budget_enabled && !args.dry_run {
@@ -281,6 +321,7 @@ pub(crate) async fn handle_council(
         provider: council_provider,
         bundle,
         results,
+        errors,
         pricing: CouncilPricing {
             estimate_usd_total: total_estimate,
             per_model,
@@ -305,11 +346,25 @@ pub(crate) async fn handle_council(
             for r in &council.results {
                 println!("## {}\n{}\n", r.model, r.content);
             }
+            if !council.errors.is_empty() {
+                println!("## Errors");
+                for error in &council.errors {
+                    println!("- {} ({}): {}", error.model, error.provider, error.error);
+                }
+                println!();
+            }
             Ok(())
         }
         OutputFormat::Markdown => {
             for r in &council.results {
                 println!("## {}\n{}\n", r.model, r.content);
+            }
+            if !council.errors.is_empty() {
+                println!("## Errors");
+                for error in &council.errors {
+                    println!("- {} ({}): {}", error.model, error.provider, error.error);
+                }
+                println!();
             }
             Ok(())
         }
