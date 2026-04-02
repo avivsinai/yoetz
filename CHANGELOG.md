@@ -5,6 +5,168 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Documentation
+
+- Make CLAUDE the master agent guide
+
+## [0.2.43] - 2026-04-01
+
+### Miscellaneous
+
+- Release metadata-only cut; no additional user-facing changes
+
+## [0.2.42] - 2026-04-01
+
+### Miscellaneous
+
+- Release metadata-only cut; no additional user-facing changes
+
+## [0.2.41] - 2026-04-01
+
+### CI/CD
+
+- **release**: Sign macOS artifacts and align release prep
+
+## [0.2.40] - 2026-04-01
+
+### Bug Fixes
+
+- Stage optional codex plugin manifest in release script
+- Skip invalid skill aliases in publish workflow
+- **ci**: Narrow release-only detection (#109)
+- Include all version files in release script
+
+### CI/CD
+
+- Notify marketplace on default-branch pushes
+
+### Features
+
+- Make dev-browser the default web transport (#110)
+
+### Miscellaneous
+
+- Harden release versioning
+- **deps**: Bump toml in the minor-and-patch group across 1 directory (#107)
+- **deps**: Bump sha2 from 0.10.9 to 0.11.0 (#104)
+
+## [0.2.38] - 2026-03-30
+
+### Miscellaneous
+
+- Add tag-based skill release flow
+- Release skills v0.2.38
+
+## [0.2.37] - 2026-03-29
+
+### Bug Fixes
+
+- Update Cargo.lock for v0.2.37
+
+## [0.2.36] - 2026-03-29
+
+### Bug Fixes
+
+- **browser**: ChatGPT upload selector + dev-browser connection retry (#102)
+
+## [0.2.35] - 2026-03-29
+
+### Bug Fixes
+
+- Harden ChatGPT dev-browser recipe (#100)
+
+## [0.2.34] - 2026-03-28
+
+### Bug Fixes
+
+- Stabilize flaky socket test + auto-bump plugin.json in release (#97)
+- **browser**: Dev-browser recipe overhaul (#98)
+
+## [0.2.33] - 2026-03-27
+
+### Bug Fixes
+
+- **browser**: Auto-poll for ChatGPT Extended Pro + review fixes (#92)
+
+### Features
+
+- Add Codex interface metadata to plugin manifest
+
+### Miscellaneous
+
+- Bump plugin.json version to 0.2.33 (#95)
+
+### Refactoring
+
+- Eliminate skill duplication, add Codex plugin manifest
+
+### Reconcile
+
+- Add missing references/commands.md to canonical skills/yoetz
+
+## [0.2.32] - 2026-03-26
+
+### Documentation
+
+- Update browser docs for CDP auto-connect and Chrome 146 (#90)
+
+### Features
+
+- **browser**: Dev-browser backend + review bug fixes (#91)
+
+## [0.2.31] - 2026-03-24
+
+### Bug Fixes
+
+- **browser**: Bound all Chrome 146 live-attach paths + fix test flakiness (#88)
+
+## [0.2.30] - 2026-03-24
+
+### Bug Fixes
+
+- **browser**: Chrome 146 CDP dialog handling + faster response polling (#86)
+
+## [0.2.29] - 2026-03-23
+
+### Features
+
+- **browser**: Default to file attachment delivery in ChatGPT recipe (#84)
+
+## [0.2.28] - 2026-03-23
+
+### Bug Fixes
+
+- **browser**: Remove npx fallback env-var gate (#82)
+
+## [0.2.27] - 2026-03-23
+
+### Features
+
+- **browser**: ChatGPT size-based delivery + upload polling (#80)
+
+## [0.2.26] - 2026-03-22
+
+### Bug Fixes
+
+- **browser**: ChatGPT model selector and response completion detection (#76)
+- **ci**: Strip squash-merge PR suffix from release tag parsing (#78)
+
+### CI/CD
+
+- Merge auto-tag into release.yml, eliminate PAT requirement (#75)
+
+## [0.2.24] - 2026-03-22
+
+### CI/CD
+
+- Fast release pipeline — auto-tag, CI fast path, release script (#72)
+
+### Refactoring
+
+- Simplify interpolation and fix CI fast path gaps (#73)
+
 ## [0.2.23] - 2026-03-22
 
 ### Bug Fixes
@@ -259,4 +421,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Hardening
 
 - Gemini inline limit and config
-
