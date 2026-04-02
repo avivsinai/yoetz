@@ -673,6 +673,7 @@ async fn main() -> Result<()> {
     // CWD .env files must not override executable paths (supply-chain risk)
     // or redirect API keys to attacker-controlled endpoints.
     let pre_agent_bin = env::var("YOETZ_AGENT_BROWSER_BIN").ok();
+    let pre_dev_browser_bin = env::var("YOETZ_DEV_BROWSER_BIN").ok();
     let pre_scripts_dir = env::var("YOETZ_SCRIPTS_DIR").ok();
 
     // Capture API key env vars so CWD .env cannot silently replace them.
@@ -695,6 +696,9 @@ async fn main() -> Result<()> {
     // Prevent CWD .env from overriding executable paths (security)
     if pre_agent_bin.is_none() {
         env::remove_var("YOETZ_AGENT_BROWSER_BIN");
+    }
+    if pre_dev_browser_bin.is_none() {
+        env::remove_var("YOETZ_DEV_BROWSER_BIN");
     }
     if pre_scripts_dir.is_none() {
         env::remove_var("YOETZ_SCRIPTS_DIR");
