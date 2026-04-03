@@ -907,7 +907,9 @@ fn run_recipe_via_dev_browser(
     }
 
     dev_browser::ensure_installed()?;
-    dev_browser::ensure_chatgpt_auth_with_endpoint(cdp_endpoint)?;
+    // The recipe prepare micro-script already verifies ChatGPT login state on the
+    // named page. Avoid a separate pre-flight attach here because it can trigger
+    // a fresh approval-gated CDP connection and block an otherwise working flow.
 
     let paste_mode = recipe_vars
         .get("paste")

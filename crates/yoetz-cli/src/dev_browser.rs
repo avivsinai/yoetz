@@ -754,19 +754,6 @@ try {
         .ok_or_else(|| anyhow!("check_chatgpt_auth: missing 'authenticated' field in: {stdout}"))
 }
 
-/// Ensure the connected Chrome session can reach ChatGPT.
-/// Only checks dev-browser daemon connectivity — opening a separate page
-/// to verify auth causes interference with the recipe's named page.
-/// If not authenticated, the recipe will fail with a clear error.
-pub fn ensure_chatgpt_auth_with_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
-    check_connection_with_endpoint(cdp_endpoint).context(
-        "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
-    )?;
-    // Skip page-level auth check — it opens an anonymous page to chatgpt.com
-    // which interferes with the recipe's subsequent named page session.
-    Ok(())
-}
-
 /// Ensure the connected Chrome session can reach an authenticated ChatGPT page.
 /// Opens a temporary page — use only when not immediately followed by a recipe.
 pub fn ensure_chatgpt_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
