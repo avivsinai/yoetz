@@ -1383,10 +1383,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                         is_chatgpt,
                         cdp_endpoint.as_deref(),
                     ),
-                    browser::RecipeTransport::Manual => Err(anyhow!(
-                        "{}",
-                        manual_fallback
-                    )),
+                    browser::RecipeTransport::Manual => Err(anyhow!("{}", manual_fallback)),
                 };
 
                 match result {
@@ -1395,8 +1392,10 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                         if recipe_should_stop_live_transport_fallback(&err) {
                             transport_errors.push((transport, err.to_string()));
                             if recipe_has_remaining_manual_fallback(&transports, index) {
-                                transport_errors
-                                    .push((browser::RecipeTransport::Manual, manual_fallback.clone()));
+                                transport_errors.push((
+                                    browser::RecipeTransport::Manual,
+                                    manual_fallback.clone(),
+                                ));
                             }
                             break;
                         }
@@ -1963,7 +1962,10 @@ mod tests {
             "YOETZ_BROWSER_CDP",
             "YOETZ_BROWSER_PROFILE",
         ] {
-            assert!(PROTECTED_DOTENV_ENV_VARS.contains(&key), "{key} must stay protected");
+            assert!(
+                PROTECTED_DOTENV_ENV_VARS.contains(&key),
+                "{key} must stay protected"
+            );
         }
     }
 

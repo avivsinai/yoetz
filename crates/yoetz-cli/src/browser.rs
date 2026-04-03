@@ -1109,8 +1109,7 @@ fn chrome_approval_lock_path() -> PathBuf {
 pub fn acquire_chrome_approval_lock() -> Result<ChromeApprovalLock> {
     let lock_path = chrome_approval_lock_path();
     if let Some(parent) = lock_path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("create {}", parent.display()))?;
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
     let file = OpenOptions::new()
         .create(true)
@@ -1128,9 +1127,8 @@ pub fn acquire_chrome_approval_lock() -> Result<ChromeApprovalLock> {
             true
         }
         Err(err) => {
-            return Err(err).with_context(|| {
-                format!("lock browser approval {}", lock_path.display())
-            });
+            return Err(err)
+                .with_context(|| format!("lock browser approval {}", lock_path.display()));
         }
     };
 

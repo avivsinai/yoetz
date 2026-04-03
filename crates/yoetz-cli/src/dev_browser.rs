@@ -497,11 +497,7 @@ fn probe_cdp_candidate(candidate: &CdpCandidate) -> CdpProbeOutcome {
     }
 
     if !status.is_success() {
-        return CdpProbeOutcome::Unavailable(format!(
-            "HTTP {} from {}",
-            status,
-            probe_url
-        ));
+        return CdpProbeOutcome::Unavailable(format!("HTTP {} from {}", status, probe_url));
     }
 
     let body = match response.text() {
@@ -1414,9 +1410,8 @@ mod tests {
 
     #[test]
     fn looks_like_dev_browser_connect_failure_matches_connect_timeout() {
-        let err = anyhow!(
-            "browser.newPage: Timeout 30000ms exceeded while waiting for connectOverCDP"
-        );
+        let err =
+            anyhow!("browser.newPage: Timeout 30000ms exceeded while waiting for connectOverCDP");
         assert!(looks_like_dev_browser_connect_failure(&err));
 
         let other = anyhow!("ChatGPT response timed out after 900000ms");

@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.45] - 2026-04-03
 ### Added
 
 - Micro-script ChatGPT recipe architecture for dev-browser (prepare/send/poll/cleanup)
@@ -38,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Updated command reference to match actual CLI surface
 - Replaced hardcoded model IDs in skill examples with resolution placeholders
 - Corrected dev-browser upload guidance to match clipboard paste implementation
+
 
 ## [0.2.44] - 2026-04-02
 ### Documentation
