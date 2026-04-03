@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Micro-script ChatGPT recipe architecture for dev-browser (prepare/send/poll/cleanup)
+- Clipboard-based file upload for ChatGPT on macOS via osascript
+- Chrome approval dialog cascade prevention with cooperative file lock
+- Explicit `--browser` slot per recipe run to isolate daemon state
+- Council now preserves partial results when individual models fail
+
+### Fixed
+
+- **Security**: Gemini upload/download URLs now validated against trusted host
+- **Security**: Untrusted repo-local config blocked from setting browser_cdp/browser_profile
+- **Security**: YOETZ_CONFIG_PATH, YOETZ_REGISTRY_PATH, YOETZ_BROWSER_CDP protected from .env override
+- **Security**: Stale-daemon PID kill now verifies process identity before SIGKILL
+- Removed pre-flight auth check that blocked recipes on Chrome 144+ approval flow
+- Send micro-script re-verifies composer readiness before typing
+
+### Changed
+
+- Replaced deprecated `serde_yaml` with `serde_yml`
+- Pinned `litellm-rust` to specific Git revision instead of tracking `main` branch
+- Dropped `ureq` dependency; sync CDP probe uses `reqwest` blocking client
+- Release script now runs cargo test, clippy, and fmt check before committing
+- Release script bumps all `skills/*/SKILL.md` frontmatter, not just yoetz
+
+### Documentation
+
+- Fixed stale WireMock test tooling claim in CLAUDE.md
+- Updated command reference to match actual CLI surface
+- Replaced hardcoded model IDs in skill examples with resolution placeholders
+- Corrected dev-browser upload guidance to match clipboard paste implementation
+
 ## [0.2.44] - 2026-04-02
 ### Documentation
 
