@@ -108,9 +108,9 @@ yoetz council \
   --format json
 ```
 
-**Example council sets:**
-- Cross-provider: `openai/gpt-5.4,gemini/gemini-3.1-pro-preview,openrouter/xai/grok-4.20-multi-agent-beta`
-- Via OpenRouter only: `openrouter/openai/gpt-5.4,openrouter/anthropic/claude-sonnet-4.6,openrouter/google/gemini-3.1-pro-preview`
+**Example council sets (illustrative — always resolve live IDs via `yoetz models frontier`):**
+- Cross-provider: `openai/<FRONTIER>,gemini/<FRONTIER>,openrouter/xai/<FRONTIER>`
+- Via OpenRouter only: `openrouter/openai/<FRONTIER>,openrouter/anthropic/<FRONTIER>,openrouter/google/<FRONTIER>`
 
 ## Ask (Single Model)
 

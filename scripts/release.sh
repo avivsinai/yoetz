@@ -14,7 +14,7 @@ This script:
 2. Creates release/vX.Y.Z
 3. Moves CHANGELOG.md's Unreleased section into a versioned release entry
 4. Bumps [workspace.package].version plus skill/plugin metadata
-5. Runs cargo check --workspace
+5. Runs cargo check/test/clippy/fmt release gates
 6. Commits the release bump as chore(release): vX.Y.Z
 7. Pushes the branch
 8. Creates a GitHub PR with gh and enables squash auto-merge
@@ -25,7 +25,7 @@ publishes artifacts, and uses CHANGELOG.md as the release notes source.
 Options:
   --date YYYY-MM-DD  Override release date (default: today in UTC)
   --allow-empty      Allow releasing with an empty Unreleased section
-  --skip-verify      Skip cargo check --workspace
+  --skip-verify      Skip cargo check/test/clippy/fmt release gates
   --no-auto-merge    Create the PR but do not enable auto-merge
 EOF
 }
@@ -198,8 +198,12 @@ if [[ -f "$SKILL_MD" ]]; then
     || sed -i "s/^version: .*/version: ${VERSION}/" "$SKILL_MD"
 fi
 
+<<<<<<< HEAD
 if [[ "$skip_verify" -eq 0 ]]; then
   cargo check --workspace
+  cargo test --workspace
+  cargo clippy --workspace -- -D warnings
+  cargo fmt --all -- --check
 fi
 ./scripts/check-release-version.sh "$VERSION"
 
