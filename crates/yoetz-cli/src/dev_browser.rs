@@ -469,41 +469,42 @@ fn probe_cdp_candidate(candidate: &CdpCandidate) -> CdpProbeOutcome {
         Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
     };
 
-    let agent = ureq::AgentBuilder::new()
+    let client = match reqwest::blocking::Client::builder()
         .timeout(CDP_HEALTH_TIMEOUT)
-        .build();
-    let response = match agent
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
+    };
+    let response = match client
         .get(probe_url.as_str())
-        .set("Accept", "application/json")
-        .call()
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
     {
         Ok(response) => response,
-        Err(ureq::Error::Status(status, response)) => {
-            if status == 404 && is_localhost_url(&probe_url) {
-                return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
-                    candidate,
-                    probe_url.as_str(),
-                    "GET /json/version returned HTTP 404 from a localhost Chrome endpoint",
-                ));
-            }
-            response
-        }
-        Err(ureq::Error::Transport(err)) => {
-            return CdpProbeOutcome::Unavailable(err.to_string());
-        }
+        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
     };
+    let status = response.status();
 
     // Chrome 136+ can leave localhost CDP in a half-state where DevTools is
     // listening but HTTP discovery on the real profile returns 404.
-    if !(200..=299).contains(&response.status()) {
+    if status == reqwest::StatusCode::NOT_FOUND && is_localhost_url(&probe_url) {
+        return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
+            candidate,
+            probe_url.as_str(),
+            "GET /json/version returned HTTP 404 from a localhost Chrome endpoint",
+        ));
+    }
+
+    if !status.is_success() {
         return CdpProbeOutcome::Unavailable(format!(
             "HTTP {} from {}",
-            response.status(),
+            status,
             probe_url
         ));
     }
 
-    let body = match response.into_string() {
+    let body = match response.text() {
         Ok(body) => body,
         Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
     };
