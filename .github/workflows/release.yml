@@ -317,7 +317,7 @@ jobs:
     needs: [prepare, release]
     if: >-
       needs.prepare.result == 'success' && needs.release.result == 'success'
-      && (github.event_name == 'push' || inputs.skip-skill-publish != 'true')
+      && (github.event_name == 'push' || inputs.skip-skill-publish != true)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
