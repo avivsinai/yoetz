@@ -55,11 +55,6 @@ impl Default for ChatgptPollSettings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct StagedFileGuard {
-    path: PathBuf,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 struct CdpCandidate {
     endpoint: String,
     source: String,
@@ -83,19 +78,9 @@ enum CdpProbeOutcome {
     Poisoned(String),
 }
 
-impl StagedFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
-}
-
-impl Drop for StagedFileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
 /// dev-browser tmp directory for file staging.
+#[cfg(test)]
+#[allow(dead_code)]
 fn dev_browser_tmp_dir() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -595,8 +580,17 @@ fn resolve_dev_browser_connect_endpoint(cdp_endpoint: Option<&str>) -> Result<Op
     }
 }
 
-fn connect_args(timeout_secs: u64, cdp_endpoint: Option<&str>) -> Vec<String> {
-    let mut args = vec!["--connect".to_string()];
+fn connect_args(
+    timeout_secs: u64,
+    browser_name: Option<&str>,
+    cdp_endpoint: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(browser_name) = browser_name {
+        args.push("--browser".to_string());
+        args.push(browser_name.to_string());
+    }
+    args.push("--connect".to_string());
     if let Some(endpoint) = cdp_endpoint {
         args.push(endpoint.to_string());
     }
@@ -605,17 +599,16 @@ fn connect_args(timeout_secs: u64, cdp_endpoint: Option<&str>) -> Vec<String> {
     args
 }
 
-/// Run a dev-browser script against a live Chrome instance, optionally via an
-/// explicit CDP endpoint.
-pub fn run_script_connect_with_endpoint(
+fn run_script_connect_with_browser_and_endpoint(
     script: &str,
     timeout_secs: Option<u64>,
+    browser_name: Option<&str>,
     cdp_endpoint: Option<&str>,
 ) -> Result<String> {
     let bin = resolve_dev_browser()?;
     let timeout = timeout_secs.unwrap_or(DEFAULT_SCRIPT_TIMEOUT_SECS);
     let resolved_endpoint = resolve_dev_browser_connect_endpoint(cdp_endpoint)?;
-    let args = connect_args(timeout, resolved_endpoint.as_deref());
+    let args = connect_args(timeout, browser_name, resolved_endpoint.as_deref());
 
     let output = Command::new(&bin)
         .args(&args)
@@ -668,8 +661,20 @@ pub fn run_script_connect_with_endpoint(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Run a dev-browser script against a live Chrome instance, optionally via an
+/// explicit CDP endpoint.
+pub fn run_script_connect_with_endpoint(
+    script: &str,
+    timeout_secs: Option<u64>,
+    cdp_endpoint: Option<&str>,
+) -> Result<String> {
+    run_script_connect_with_browser_and_endpoint(script, timeout_secs, None, cdp_endpoint)
+}
+
 /// Stage a file into dev-browser's tmp directory so scripts can read it
 /// via `readFile(name)`.
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn stage_file(name: &str, content: &str) -> Result<PathBuf> {
     let tmp_dir = dev_browser_tmp_dir();
     fs::create_dir_all(&tmp_dir)
@@ -680,6 +685,8 @@ pub fn stage_file(name: &str, content: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn set_staged_file_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -777,7 +784,7 @@ pub fn ensure_chatgpt_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&st
 /// split into micro-scripts with JSON stdout handoffs instead of generating one
 /// large helper-heavy script.
 pub struct DevBrowserRecipeContext {
-    /// Path to the bundle file on disk (will be staged to dev-browser tmp).
+    /// Path to the bundle file on disk (used for macOS clipboard file upload).
     pub bundle_path: Option<PathBuf>,
     /// Bundle text content (for paste mode).
     pub bundle_text: Option<String>,
@@ -913,20 +920,17 @@ fn build_chatgpt_send_script(
     page_name: &str,
     prompt: &str,
     delivery_text: &str,
-    staged_file_name: Option<&str>,
-    upload_file_name: Option<&str>,
+    file_on_clipboard: bool,
     disable_extended: bool,
 ) -> String {
     let page_name_json = serde_json::to_string(page_name).unwrap();
-    let staged_file_name_json = serde_json::to_string(&staged_file_name).unwrap();
-    let upload_file_name_json = serde_json::to_string(&upload_file_name).unwrap();
+    let file_on_clipboard_json = serde_json::to_string(&file_on_clipboard).unwrap();
     let delivery_text_json = serde_json::to_string(delivery_text).unwrap();
     let prompt_json = serde_json::to_string(prompt).unwrap();
     format!(
         r#"
 const PAGE_NAME = {page_name_json};
-const STAGED_FILE_NAME = {staged_file_name_json};
-const UPLOAD_FILE_NAME = {upload_file_name_json};
+const FILE_ON_CLIPBOARD = {file_on_clipboard_json};
 const DELIVERY_TEXT = {delivery_text_json};
 const PROMPT = {prompt_json};
 const DISABLE_EXTENDED = {disable_extended};
@@ -941,20 +945,20 @@ if (DISABLE_EXTENDED) {{
     warning = "extended disable requested but toggle not found";
   }}
 }}
-if (STAGED_FILE_NAME) {{
-  await page.locator("[data-testid='composer-plus-btn']").first().click();
-  await page.waitForTimeout(500);
-  const menuItem = page.locator("[role='menuitem']").filter({{ hasText: /Add photos/i }}).first();
-  await menuItem.waitFor({{ state: "visible", timeout: 5000 }});
-  await menuItem.click();
-  await uploadFile(page, STAGED_FILE_NAME, {{
-    selector: "input[type='file']",
-    name: UPLOAD_FILE_NAME || undefined,
-    mimeType: "text/markdown",
-  }});
-  await page.locator("img[alt*='attachment' i], [data-testid*='attachment' i], [aria-label*='attachment' i]").first().waitFor({{ state: "visible", timeout: 10000 }}).catch(() => {{}});
-}}
 const composer = page.locator("[role='textbox']").first();
+if (FILE_ON_CLIPBOARD) {{
+  await composer.waitFor({{ state: "visible", timeout: 15000 }});
+  await composer.click();
+  await page.keyboard.press("Meta+v");
+  await page.waitForTimeout(5000);
+  const attached = await page.evaluate(() => {{
+    return !!document.querySelector("[class*='file-tile'], [data-testid*='attachment']");
+  }});
+  if (!attached) {{
+    throw new Error("file not attached after clipboard paste");
+  }}
+}}
+await composer.waitFor({{ state: "visible", timeout: 15000 }});
 await composer.click();
 await composer.pressSequentially(DELIVERY_TEXT, {{ delay: 15 }});
 const sendBtn = page.locator("[data-testid='send-button']").first();
@@ -975,12 +979,58 @@ console.log(JSON.stringify({{
 }}));
 "#,
         page_name_json = page_name_json,
-        staged_file_name_json = staged_file_name_json,
-        upload_file_name_json = upload_file_name_json,
+        file_on_clipboard_json = file_on_clipboard_json,
         delivery_text_json = delivery_text_json,
         prompt_json = prompt_json,
         disable_extended = disable_extended,
     )
+}
+
+fn set_file_on_clipboard(path: &Path) -> Result<()> {
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("resolve bundle path: {}", path.display()))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "set the clipboard to (POSIX file (item 1 of argv))",
+                "-e",
+                "end run",
+            ])
+            .arg(&canonical_path)
+            .output()
+            .context("failed to run osascript for ChatGPT file upload")?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit code {:?}", output.status.code())
+        };
+        Err(anyhow!(
+            "failed to set macOS clipboard to bundle file `{}`: {detail}",
+            canonical_path.display()
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = canonical_path;
+        Err(anyhow!(
+            "dev-browser file upload via clipboard currently requires macOS"
+        ))
+    }
 }
 
 fn build_chatgpt_poll_script(
@@ -1142,36 +1192,25 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
             .unwrap_or_default()
             .as_millis()
     );
-    let page_name = format!("yoetz-chatgpt-{unique_prefix}");
-    let mut staged_file_guard = None;
-    let mut staged_file_name = None;
-    let mut upload_file_name = None;
-    if !ctx.paste_mode {
-        if let Some(bundle_path) = &ctx.bundle_path {
-            let content = fs::read_to_string(bundle_path)
-                .with_context(|| format!("read bundle: {}", bundle_path.display()))?;
-            let base_name = bundle_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("bundle.txt");
-            let name = format!("{unique_prefix}_{base_name}");
-            let path = stage_file(&name, &content)?;
-            staged_file_name = Some(name);
-            upload_file_name = Some(base_name.to_string());
-            staged_file_guard = Some(StagedFileGuard::new(path));
-        } else if let Some(text) = &ctx.bundle_text {
-            let name = format!("{unique_prefix}_bundle.md");
-            let path = stage_file(&name, text)?;
-            staged_file_name = Some(name);
-            upload_file_name = Some("bundle.md".to_string());
-            staged_file_guard = Some(StagedFileGuard::new(path));
-        }
-    }
-
+    let browser_name = format!("yoetz-chatgpt-browser-{unique_prefix}");
+    let page_name = format!("yoetz-chatgpt-page-{unique_prefix}");
     let cdp_endpoint = ctx.cdp_endpoint.as_deref();
+    let run_script = |script: &str, timeout_secs: Option<u64>| {
+        run_script_connect_with_browser_and_endpoint(
+            script,
+            timeout_secs,
+            Some(browser_name.as_str()),
+            cdp_endpoint,
+        )
+    };
     let cleanup = |cdp_endpoint| -> Result<()> {
         let cleanup_script = build_chatgpt_cleanup_script(&page_name);
-        match run_script_connect_with_endpoint(&cleanup_script, Some(15), cdp_endpoint) {
+        match run_script_connect_with_browser_and_endpoint(
+            &cleanup_script,
+            Some(15),
+            Some(browser_name.as_str()),
+            cdp_endpoint,
+        ) {
             Ok(_) => Ok(()),
             Err(err) => {
                 eprintln!("warn: failed to clean up dev-browser recipe page `{page_name}`: {err}");
@@ -1182,6 +1221,18 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
 
     let result = (|| -> Result<(String, Vec<String>)> {
         let mut warnings = Vec::new();
+        let file_on_clipboard = if ctx.paste_mode {
+            false
+        } else if let Some(bundle_path) = &ctx.bundle_path {
+            set_file_on_clipboard(bundle_path)?;
+            true
+        } else if ctx.bundle_text.is_some() {
+            return Err(anyhow!(
+                "dev-browser file upload requires a bundle path on disk; use `--var paste=true` for text-only delivery"
+            ));
+        } else {
+            false
+        };
         let delivery_text = if ctx.paste_mode {
             format!(
                 "{}\n\n{}",
@@ -1193,8 +1244,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
         };
 
         let prepare_script = build_chatgpt_prepare_script(&page_name, &ctx.model);
-        let prepare_stdout =
-            run_script_connect_with_endpoint(&prepare_script, Some(60), cdp_endpoint)?;
+        let prepare_stdout = run_script(&prepare_script, Some(60))?;
         let prepare: ChatgptPrepareResult =
             parse_script_json("parse chatgpt prepare result", &prepare_stdout)?;
         match prepare.status.as_str() {
@@ -1222,11 +1272,10 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
             &page_name,
             &ctx.prompt,
             &delivery_text,
-            staged_file_name.as_deref(),
-            upload_file_name.as_deref(),
+            file_on_clipboard,
             ctx.disable_extended,
         );
-        let send_stdout = run_script_connect_with_endpoint(&send_script, Some(90), cdp_endpoint)?;
+        let send_stdout = run_script(&send_script, Some(90))?;
         let send: ChatgptSendResult = parse_script_json("parse chatgpt send result", &send_stdout)?;
         if send.status != "sent" {
             return Err(anyhow!("unexpected ChatGPT send status `{}`", send.status));
@@ -1241,18 +1290,15 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
             ctx.poll_settings,
             ctx.allow_empty_response,
         );
-        let poll_stdout = run_script_connect_with_endpoint(
+        let poll_stdout = run_script(
             &poll_script,
             Some(chatgpt_script_timeout_secs(ctx.poll_settings.timeout_ms)),
-            cdp_endpoint,
         )?;
         let (response, mut poll_warnings) =
             parse_chatgpt_recipe_result(&poll_stdout, ctx.poll_settings.timeout_ms)?;
         warnings.append(&mut poll_warnings);
         Ok((response, warnings))
     })();
-
-    drop(staged_file_guard);
     cleanup(cdp_endpoint)?;
 
     let (response, warnings) = result?;
@@ -1332,8 +1378,14 @@ mod tests {
     #[test]
     fn connect_args_include_optional_endpoint() {
         assert_eq!(
-            connect_args(30, Some("http://127.0.0.1:9222")),
+            connect_args(
+                30,
+                Some("yoetz-chatgpt-browser"),
+                Some("http://127.0.0.1:9222"),
+            ),
             vec![
+                "--browser".to_string(),
+                "yoetz-chatgpt-browser".to_string(),
                 "--connect".to_string(),
                 "http://127.0.0.1:9222".to_string(),
                 "--timeout".to_string(),
@@ -1341,7 +1393,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            connect_args(45, None),
+            connect_args(45, None, None),
             vec![
                 "--connect".to_string(),
                 "--timeout".to_string(),
@@ -1438,25 +1490,21 @@ mod tests {
     }
 
     #[test]
-    fn build_chatgpt_send_script_uses_file_path_and_press_sequentially() {
+    fn build_chatgpt_send_script_uses_clipboard_upload_and_press_sequentially() {
         let script = build_chatgpt_send_script(
             "yoetz-chatgpt-test",
             "Review this file.",
             "Review this file.",
-            Some("upload_123_bundle.md"),
-            Some("bundle.md"),
+            true,
             true,
         );
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
-        assert!(script.contains("const STAGED_FILE_NAME = \"upload_123_bundle.md\";"));
-        assert!(script.contains("const UPLOAD_FILE_NAME = \"bundle.md\";"));
-        assert!(script.contains("[data-testid='composer-plus-btn']"));
-        assert!(script.contains("[role='menuitem']"));
-        assert!(script.contains("hasText: /Add photos/i"));
-        assert!(script.contains("await uploadFile(page, STAGED_FILE_NAME"));
-        assert!(script.contains("selector: \"input[type='file']\""));
-        assert!(script.contains("mimeType: \"text/markdown\""));
+        assert!(script.contains("const FILE_ON_CLIPBOARD = true;"));
+        assert!(script.contains("await composer.waitFor({ state: \"visible\", timeout: 15000 });"));
+        assert!(script.contains("await page.keyboard.press(\"Meta+v\");"));
+        assert!(script.contains("file not attached after clipboard paste"));
+        assert!(script.contains("[class*='file-tile'], [data-testid*='attachment']"));
         assert!(script.contains("pressSequentially(DELIVERY_TEXT, { delay: 15 })"));
         assert!(script.contains("status: \"sent\""));
     }
