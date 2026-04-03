@@ -84,9 +84,10 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   Node features such as `require`, arbitrary `fs`, or `fetch`.
 - For contenteditable ChatGPT inputs, use typing APIs such as
   `pressSequentially` instead of `fill()`.
-- For file upload in `dev-browser`, prefer the host-level `uploadFile(page, tempName, options)`
-  helper against a staged file in `~/.dev-browser/tmp/` rather than building
-  Playwright file buffers inside QuickJS.
+- For file upload, the ChatGPT recipe uses macOS clipboard paste via `osascript`
+  (set clipboard to POSIX file, then `Meta+v` in the composer). This avoids
+  QuickJS buffer limitations and native file dialog issues with `setInputFiles`.
+  Non-macOS platforms currently fall back to paste mode (inline text).
 - The QuickJS GC crash recovery in `dev_browser.rs` can salvage stdout from a
   completed script, but recipe correctness must not depend on that recovery.
 
