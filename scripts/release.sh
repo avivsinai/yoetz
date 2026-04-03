@@ -13,7 +13,7 @@ This script:
 1. Verifies you are on a clean, up-to-date main branch
 2. Creates release/vX.Y.Z
 3. Moves CHANGELOG.md's Unreleased section into a versioned release entry
-4. Bumps [workspace.package].version plus skill/plugin metadata
+4. Bumps [workspace.package].version plus skill/plugin metadata, including all versioned skills/*/SKILL.md frontmatter
 5. Runs cargo check/test/clippy/fmt release gates
 6. Commits the release bump as chore(release): vX.Y.Z
 7. Pushes the branch
@@ -192,13 +192,13 @@ for PLUGIN_JSON in .codex-plugin/plugin.json .claude-plugin/plugin.json; do
   fi
 done
 
-SKILL_MD="skills/yoetz/SKILL.md"
-if [[ -f "$SKILL_MD" ]]; then
-  sed -i '' "s/^version: .*/version: ${VERSION}/" "$SKILL_MD" 2>/dev/null \
-    || sed -i "s/^version: .*/version: ${VERSION}/" "$SKILL_MD"
-fi
+while IFS= read -r SKILL_MD; do
+  if grep -q '^version:' "$SKILL_MD"; then
+    sed -i '' "s/^version: .*/version: ${VERSION}/" "$SKILL_MD" 2>/dev/null \
+      || sed -i "s/^version: .*/version: ${VERSION}/" "$SKILL_MD"
+  fi
+done < <(find skills -mindepth 2 -maxdepth 2 -name SKILL.md | sort)
 
-<<<<<<< HEAD
 if [[ "$skip_verify" -eq 0 ]]; then
   cargo check --workspace
   cargo test --workspace
@@ -208,8 +208,11 @@ fi
 ./scripts/check-release-version.sh "$VERSION"
 
 git add CHANGELOG.md Cargo.toml Cargo.lock
-for f in .codex-plugin/plugin.json .claude-plugin/plugin.json skills/yoetz/SKILL.md; do
+for f in .codex-plugin/plugin.json .claude-plugin/plugin.json; do
   [[ -f "$f" ]] && git add "$f"
+done
+find skills -mindepth 2 -maxdepth 2 -name SKILL.md -print0 | while IFS= read -r -d '' f; do
+  git add "$f"
 done
 if git diff --cached --quiet; then
   echo "error: release prep produced no staged changes" >&2
