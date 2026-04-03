@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde_json::Value;
 use std::path::Path;
 use tokio::time::{sleep, Duration};
@@ -12,6 +12,38 @@ use crate::http::send_json;
 use crate::providers::ProviderAuth;
 
 const INLINE_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
+
+fn is_gemini_host(url: &str, base_url: &str) -> bool {
+    let parsed = match Url::parse(url) {
+        Ok(url) => url,
+        Err(_) => return false,
+    };
+    let candidate_host = match parsed.host_str() {
+        Some(host) => host,
+        None => return false,
+    };
+    let base_host = match Url::parse(base_url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+    {
+        Some(host) => host,
+        None => return false,
+    };
+    candidate_host == base_host
+}
+
+fn validate_gemini_url(url: &str, base_url: &str, purpose: &str) -> Result<()> {
+    if is_gemini_host(url, base_url) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "refusing to {purpose} from untrusted Gemini URL `{url}` (base host `{}`)",
+        Url::parse(base_url)
+            .ok()
+            .and_then(|parsed| parsed.host_str().map(str::to_owned))
+            .unwrap_or_else(|| "<invalid>".to_string())
+    ))
+}
 
 #[derive(Debug, Clone)]
 pub struct GeminiTextResult {
@@ -141,6 +173,7 @@ pub async fn generate_video_veo(
     } else {
         format!("{}/{}", auth.base_url.trim_end_matches('/'), op_name)
     };
+    validate_gemini_url(&op_url, &auth.base_url, "poll operation status")?;
 
     let mut attempts = 0u32;
     let response = loop {
@@ -162,6 +195,7 @@ pub async fn generate_video_veo(
 
     let uri =
         extract_video_uri(&response).ok_or_else(|| anyhow!("missing video uri in response"))?;
+    validate_gemini_url(&uri, &auth.base_url, "download generated video")?;
     if uri.starts_with("gs://") {
         return Err(anyhow!(
             "video is stored in GCS at {uri}; yoetz cannot download gs:// URIs without GCS credentials. Download with gsutil or gcloud and retry"
@@ -354,6 +388,7 @@ async fn upload_file(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| anyhow!("missing upload url"))?
         .to_string();
+    validate_gemini_url(&upload_url, &auth.base_url, "upload file content")?;
 
     let (resp, _headers) = send_json::<Value>(
         client
@@ -486,6 +521,34 @@ mod tests {
             ]
         });
         assert_eq!(extract_text(&resp), "hi there");
+    }
+
+    #[test]
+    fn is_gemini_host_accepts_base_host() {
+        assert!(is_gemini_host(
+            "https://generativelanguage.googleapis.com/v1beta/files/abc",
+            "https://generativelanguage.googleapis.com/v1beta"
+        ));
+        assert!(is_gemini_host(
+            "https://generativelanguage.googleapis.com/upload/v1beta/files",
+            "https://generativelanguage.googleapis.com/v1beta"
+        ));
+    }
+
+    #[test]
+    fn is_gemini_host_rejects_spoofing_and_other_hosts() {
+        assert!(!is_gemini_host(
+            "https://generativelanguage.googleapis.com.evil.com/v1beta/files/abc",
+            "https://generativelanguage.googleapis.com/v1beta"
+        ));
+        assert!(!is_gemini_host(
+            "https://evil.example.com/download",
+            "https://generativelanguage.googleapis.com/v1beta"
+        ));
+        assert!(!is_gemini_host(
+            "not-a-url",
+            "https://generativelanguage.googleapis.com/v1beta"
+        ));
     }
 
     #[test]

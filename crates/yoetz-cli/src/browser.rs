@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Context, Result};
+use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,6 +36,7 @@ const CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT: u64 = 1_000;
 const DAEMON_APPROVAL_GRACE_WINDOW: Duration = Duration::from_secs(30);
 const LIVE_ATTACH_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const CDP_SESSION_NAME: &str = "yoetz-cdp";
+const CHROME_APPROVAL_LOCK_FILENAME: &str = "chrome-approval.lock";
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
     major: 24,
@@ -1085,6 +1087,65 @@ pub enum DaemonRecoveryAction {
     KilledStale,
 }
 
+#[derive(Debug)]
+pub struct ChromeApprovalLock {
+    _lock_file: File,
+    waited: bool,
+}
+
+impl ChromeApprovalLock {
+    pub fn waited(&self) -> bool {
+        self.waited
+    }
+}
+
+fn chrome_approval_lock_path() -> PathBuf {
+    if let Some(home) = home_dir() {
+        return home.join(".yoetz").join(CHROME_APPROVAL_LOCK_FILENAME);
+    }
+    PathBuf::from(".yoetz").join(CHROME_APPROVAL_LOCK_FILENAME)
+}
+
+pub fn acquire_chrome_approval_lock() -> Result<ChromeApprovalLock> {
+    let lock_path = chrome_approval_lock_path();
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open browser approval lock {}", lock_path.display()))?;
+
+    let waited = match file.try_lock_exclusive() {
+        Ok(()) => false,
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            file.lock_exclusive()
+                .with_context(|| format!("lock browser approval {}", lock_path.display()))?;
+            true
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("lock browser approval {}", lock_path.display())
+            });
+        }
+    };
+
+    Ok(ChromeApprovalLock {
+        _lock_file: file,
+        waited,
+    })
+}
+
+pub fn is_chrome_approval_wait_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}")
+        .to_lowercase()
+        .contains("allow remote debugging")
+}
+
 fn close_browser_daemon() -> Result<()> {
     let (bin, prefix_args) = resolve_agent_browser()?;
     let mut cmd = Command::new(bin);
@@ -1143,6 +1204,32 @@ fn process_is_alive(_pid: u32) -> bool {
     false
 }
 
+#[cfg(unix)]
+fn process_command_line(pid: u32) -> Option<String> {
+    let output = Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "command="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let command = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if command.is_empty() {
+        None
+    } else {
+        Some(command)
+    }
+}
+
+#[cfg(not(unix))]
+fn process_command_line(_pid: u32) -> Option<String> {
+    None
+}
+
+fn process_looks_like_agent_browser(pid: u32) -> bool {
+    process_command_line(pid).is_some_and(|command| command.contains("agent-browser"))
+}
+
 fn socket_is_recent(sock_path: &Path, grace_window: Duration) -> bool {
     let Ok(metadata) = fs::metadata(sock_path) else {
         return false;
@@ -1169,10 +1256,23 @@ fn force_kill_stale_daemon_with_paths(
     }
 
     if let Some(pid) = read_daemon_pid(pid_path) {
-        if process_is_alive(pid) && socket_is_recent(sock_path, grace_window) {
+        if process_is_alive(pid)
+            && process_looks_like_agent_browser(pid)
+            && socket_is_recent(sock_path, grace_window)
+        {
             return DaemonRecoveryAction::AwaitingApproval;
         }
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+        if process_is_alive(pid) {
+            if process_looks_like_agent_browser(pid) {
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
+            } else {
+                eprintln!(
+                    "warning: refusing to SIGKILL pid {} from {} because it does not look like agent-browser",
+                    pid,
+                    pid_path.display()
+                );
+            }
+        }
     }
 
     let _ = fs::remove_file(pid_path);
@@ -2812,6 +2912,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn force_kill_stale_daemon_preserves_recent_live_process() {
+        use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixListener;
 
         let dir = unique_unix_socket_dir("daemon_grace");
@@ -2821,13 +2922,46 @@ mod tests {
             let _listener = UnixListener::bind(&sock_path).unwrap();
         }
 
-        let mut child = Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap();
+        let script_path = dir.join("agent-browser");
+        fs::write(&script_path, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&script_path, perms).unwrap();
+
+        let mut child = Command::new(&script_path).spawn().unwrap();
         fs::write(&pid_path, child.id().to_string()).unwrap();
 
         let action =
             force_kill_stale_daemon_with_paths(&pid_path, &sock_path, Duration::from_secs(30));
         assert_eq!(action, DaemonRecoveryAction::AwaitingApproval);
         assert!(process_is_alive(child.id()));
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn force_kill_stale_daemon_refuses_unverified_pid() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = unique_unix_socket_dir("daemon_refuse_unverified");
+        let pid_path = dir.join("default.pid");
+        let sock_path = dir.join("default.sock");
+        {
+            let _listener = UnixListener::bind(&sock_path).unwrap();
+        }
+        thread::sleep(Duration::from_millis(50));
+
+        let mut child = Command::new("sh").args(["-c", "sleep 30"]).spawn().unwrap();
+        fs::write(&pid_path, child.id().to_string()).unwrap();
+
+        let action =
+            force_kill_stale_daemon_with_paths(&pid_path, &sock_path, Duration::from_secs(0));
+        assert_eq!(action, DaemonRecoveryAction::KilledStale);
+        assert!(process_is_alive(child.id()));
+        assert!(!pid_path.exists());
+        assert!(!sock_path.exists());
 
         let _ = child.kill();
         let _ = child.wait();
@@ -2888,6 +3022,13 @@ mod tests {
 
         let err = try_cdp_attach("http://127.0.0.1:9222", CHATGPT_URL).unwrap_err();
         assert!(allow_dialog_error(&err), "unexpected error: {err}");
+        assert!(is_chrome_approval_wait_error(&err));
+    }
+
+    #[test]
+    fn is_chrome_approval_wait_error_rejects_non_approval_timeouts() {
+        let err = anyhow!("ChatGPT response timed out after 900000ms");
+        assert!(!is_chrome_approval_wait_error(&err));
     }
 
     #[test]
@@ -3153,7 +3294,7 @@ mod tests {
 
     #[test]
     fn recipe_yaml_rejects_unknown_keys() {
-        let top_level_err = serde_yaml::from_str::<Recipe>(
+        let top_level_err = serde_yml::from_str::<Recipe>(
             r#"
 name: chatgpt
 oops: true
@@ -3165,7 +3306,7 @@ steps:
         .unwrap_err();
         assert!(top_level_err.to_string().contains("unknown field"));
 
-        let step_err = serde_yaml::from_str::<Recipe>(
+        let step_err = serde_yml::from_str::<Recipe>(
             r#"
 name: chatgpt
 steps:
@@ -3180,7 +3321,7 @@ steps:
 
     #[test]
     fn recipe_yaml_parses_transport_order() {
-        let recipe = serde_yaml::from_str::<Recipe>(
+        let recipe = serde_yml::from_str::<Recipe>(
             r#"
 name: chatgpt
 transports: [dev-browser, agent-browser, manual]
@@ -3203,7 +3344,7 @@ steps:
 
     #[test]
     fn recipe_transports_default_to_dev_browser_for_chatgpt() {
-        let recipe = serde_yaml::from_str::<Recipe>(
+        let recipe = serde_yml::from_str::<Recipe>(
             r#"
 name: chatgpt
 steps:
@@ -3225,7 +3366,7 @@ steps:
 
     #[test]
     fn recipe_step_parses_timeout_ms() {
-        let recipe = serde_yaml::from_str::<Recipe>(
+        let recipe = serde_yml::from_str::<Recipe>(
             r#"
 name: test
 steps:
@@ -3240,7 +3381,7 @@ steps:
 
     #[test]
     fn recipe_step_with_sleep_and_action_prefers_sleep() {
-        let recipe = serde_yaml::from_str::<Recipe>(
+        let recipe = serde_yml::from_str::<Recipe>(
             r#"
 name: noop
 steps:

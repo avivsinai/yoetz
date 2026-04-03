@@ -8,31 +8,34 @@
 //!
 //! Key advantages over agent-browser:
 //! - Full Playwright Page API (goto, click, fill, locator, evaluate, etc.)
-//! - File upload via native filechooser + setFiles(FilePayload)
+//! - File upload via host-level sandbox helper backed by Node Playwright
 //! - Persistent named pages across script runs
 //! - Daemon-managed browser instances with auto-reconnect
 //! - Single script executes batch operations (fewer IPC round-trips)
 
-#[allow(unused_imports)]
 use anyhow::{anyhow, Context, Result};
-#[allow(unused_imports)]
-use serde_json::{json, Value};
-#[allow(unused_imports)]
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
-#[allow(unused_imports)]
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
+use reqwest::Url;
 use yoetz_core::paths::home_dir;
+
+use crate::browser;
 
 /// Cached dev-browser resolution.
 static DEV_BROWSER: OnceLock<String> = OnceLock::new();
 
 /// Default timeout for dev-browser scripts in seconds.
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 30;
+const CDP_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const CHROME_EXPLICIT_REMOTE_DEBUGGING_PORT: u16 = 9222;
+const CDP_HALF_STATE_MARKER: &str =
+    "Chrome CDP endpoint is reachable but not responding to protocol commands";
 
 /// Extended timeout for ChatGPT response polling (30 minutes by default).
 const CHATGPT_POLL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
@@ -54,23 +57,32 @@ impl Default for ChatgptPollSettings {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct StagedFileGuard {
-    path: PathBuf,
+struct CdpCandidate {
+    endpoint: String,
+    source: String,
 }
 
-impl StagedFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path }
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ResolvedCdpEndpoint {
+    ws_url: String,
 }
 
-impl Drop for StagedFileGuard {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
-    }
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DevToolsActivePortEntry {
+    port: u16,
+    ws_url: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CdpProbeOutcome {
+    Healthy(ResolvedCdpEndpoint),
+    Unavailable(String),
+    Poisoned(String),
 }
 
 /// dev-browser tmp directory for file staging.
+#[cfg(test)]
+#[allow(dead_code)]
 fn dev_browser_tmp_dir() -> PathBuf {
     home_dir()
         .unwrap_or_else(|| PathBuf::from("/tmp"))
@@ -217,8 +229,371 @@ pub fn run_script_connect(script: &str, timeout_secs: Option<u64>) -> Result<Str
     run_script_connect_with_endpoint(script, timeout_secs, None)
 }
 
-fn connect_args(timeout_secs: u64, cdp_endpoint: Option<&str>) -> Vec<String> {
-    let mut args = vec!["--connect".to_string()];
+fn chrome_default_profile_cdp_guidance() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let profile_dir = home_dir()
+            .map(|home| {
+                home.join("Library")
+                    .join("Application Support")
+                    .join("Google")
+                    .join("Chrome")
+            })
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "~/Library/Application Support/Google/Chrome".to_string());
+        format!(
+            "This is a known Chrome 136+ limitation when using the default profile.\n\
+             For a reliable explicit CDP endpoint, relaunch Chrome with:\n\
+               --remote-debugging-port={CHROME_EXPLICIT_REMOTE_DEBUGGING_PORT} --user-data-dir={profile_dir}\n\
+             Or use Chrome for Testing."
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        format!(
+        "This is a known Chrome 136+ limitation when using the default profile.\n\
+         For a reliable explicit CDP endpoint, relaunch Chrome with:\n\
+           --remote-debugging-port={CHROME_EXPLICIT_REMOTE_DEBUGGING_PORT} --user-data-dir=~/.config/yoetz/chrome-profile\n\
+         Or use Chrome for Testing."
+        )
+    }
+}
+
+fn is_poisoned_cdp_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains(CDP_HALF_STATE_MARKER)
+}
+
+fn is_localhost_url(url: &Url) -> bool {
+    matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
+}
+
+fn endpoint_port(endpoint: &str) -> Option<u16> {
+    let url = Url::parse(endpoint).ok()?;
+    url.port_or_known_default()
+}
+
+fn standard_devtools_active_port_candidates() -> Vec<PathBuf> {
+    let Some(home_dir) = home_dir() else {
+        return Vec::new();
+    };
+
+    #[cfg(target_os = "macos")]
+    {
+        return vec![
+            home_dir
+                .join("Library")
+                .join("Application Support")
+                .join("Google")
+                .join("Chrome")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join("Library")
+                .join("Application Support")
+                .join("Google")
+                .join("Chrome Canary")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join("Library")
+                .join("Application Support")
+                .join("Chromium")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join("Library")
+                .join("Application Support")
+                .join("BraveSoftware")
+                .join("Brave-Browser")
+                .join("DevToolsActivePort"),
+        ];
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        return vec![
+            home_dir
+                .join(".config")
+                .join("google-chrome")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join(".config")
+                .join("chromium")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join(".config")
+                .join("google-chrome-beta")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join(".config")
+                .join("google-chrome-unstable")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join(".config")
+                .join("BraveSoftware")
+                .join("Brave-Browser")
+                .join("DevToolsActivePort"),
+        ];
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return vec![
+            home_dir
+                .join("AppData")
+                .join("Local")
+                .join("Google")
+                .join("Chrome")
+                .join("User Data")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join("AppData")
+                .join("Local")
+                .join("Google")
+                .join("Chrome Beta")
+                .join("User Data")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join("AppData")
+                .join("Local")
+                .join("Google")
+                .join("Chrome SxS")
+                .join("User Data")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join("AppData")
+                .join("Local")
+                .join("Chromium")
+                .join("User Data")
+                .join("DevToolsActivePort"),
+            home_dir
+                .join("AppData")
+                .join("Local")
+                .join("BraveSoftware")
+                .join("Brave-Browser")
+                .join("User Data")
+                .join("DevToolsActivePort"),
+        ];
+    }
+
+    #[allow(unreachable_code)]
+    Vec::new()
+}
+
+fn parse_devtools_active_port(contents: &str) -> Option<DevToolsActivePortEntry> {
+    let lines = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let port = lines.first()?.parse::<u16>().ok()?;
+    let ws_path = *lines.get(1)?;
+    if port == 0 || !ws_path.starts_with("/devtools/browser/") {
+        return None;
+    }
+    Some(DevToolsActivePortEntry {
+        port,
+        ws_url: format!("ws://127.0.0.1:{port}{ws_path}"),
+    })
+}
+
+fn devtools_active_port_entries() -> Vec<(PathBuf, DevToolsActivePortEntry)> {
+    standard_devtools_active_port_candidates()
+        .into_iter()
+        .filter_map(|path| {
+            let contents = fs::read_to_string(&path).ok()?;
+            let entry = parse_devtools_active_port(&contents)?;
+            Some((path, entry))
+        })
+        .collect()
+}
+
+fn matching_devtools_active_port_candidate(port: u16) -> Option<CdpCandidate> {
+    devtools_active_port_entries()
+        .into_iter()
+        .find_map(|(path, entry)| {
+            (entry.port == port).then_some(CdpCandidate {
+                endpoint: entry.ws_url,
+                source: format!("DevToolsActivePort ({})", path.display()),
+            })
+        })
+}
+
+fn json_version_url(endpoint: &str) -> Result<Url> {
+    let mut url = Url::parse(endpoint)
+        .with_context(|| format!("invalid Chrome CDP endpoint `{endpoint}`"))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        "ws" => {
+            url.set_scheme("http")
+                .map_err(|_| anyhow!("invalid CDP endpoint scheme for `{endpoint}`"))?;
+        }
+        "wss" => {
+            url.set_scheme("https")
+                .map_err(|_| anyhow!("invalid CDP endpoint scheme for `{endpoint}`"))?;
+        }
+        other => {
+            return Err(anyhow!(
+                "unsupported Chrome CDP endpoint scheme `{other}` in `{endpoint}`"
+            ));
+        }
+    }
+    url.set_path("/json/version");
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+#[derive(serde::Deserialize)]
+struct JsonVersionResponse {
+    #[serde(rename = "webSocketDebuggerUrl")]
+    web_socket_debugger_url: Option<String>,
+}
+
+fn build_half_state_diagnostic(candidate: &CdpCandidate, probe_url: &str, detail: &str) -> String {
+    format!(
+        "{CDP_HALF_STATE_MARKER}.\n\
+         Endpoint: {}\n\
+         Probe: {probe_url}\n\
+         Source: {}\n\
+         Observed: {detail}\n\
+         {}\n\
+         Restart Chrome with chrome://inspect/#remote-debugging enabled, then retry auto-connect or pass the exact ws:// CDP endpoint.",
+        candidate.endpoint,
+        candidate.source,
+        chrome_default_profile_cdp_guidance(),
+    )
+}
+
+fn probe_cdp_candidate(candidate: &CdpCandidate) -> CdpProbeOutcome {
+    let probe_url = match json_version_url(&candidate.endpoint) {
+        Ok(url) => url,
+        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
+    };
+
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(CDP_HEALTH_TIMEOUT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
+    };
+    let response = match client
+        .get(probe_url.as_str())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .send()
+    {
+        Ok(response) => response,
+        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
+    };
+    let status = response.status();
+
+    // Chrome 136+ can leave localhost CDP in a half-state where DevTools is
+    // listening but HTTP discovery on the real profile returns 404.
+    if status == reqwest::StatusCode::NOT_FOUND && is_localhost_url(&probe_url) {
+        return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
+            candidate,
+            probe_url.as_str(),
+            "GET /json/version returned HTTP 404 from a localhost Chrome endpoint",
+        ));
+    }
+
+    if !status.is_success() {
+        return CdpProbeOutcome::Unavailable(format!(
+            "HTTP {} from {}",
+            status,
+            probe_url
+        ));
+    }
+
+    let body = match response.text() {
+        Ok(body) => body,
+        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
+    };
+    if body.trim().is_empty() {
+        return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
+            candidate,
+            probe_url.as_str(),
+            "GET /json/version returned an empty body",
+        ));
+    }
+
+    let payload: JsonVersionResponse = match serde_json::from_str(&body) {
+        Ok(payload) => payload,
+        Err(err) => {
+            return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
+                candidate,
+                probe_url.as_str(),
+                &format!("GET /json/version returned invalid JSON ({err})"),
+            ));
+        }
+    };
+
+    let Some(ws_url) = payload
+        .web_socket_debugger_url
+        .filter(|url| !url.trim().is_empty())
+    else {
+        return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
+            candidate,
+            probe_url.as_str(),
+            "GET /json/version did not include webSocketDebuggerUrl",
+        ));
+    };
+
+    CdpProbeOutcome::Healthy(ResolvedCdpEndpoint { ws_url })
+}
+
+fn resolve_dev_browser_connect_endpoint(cdp_endpoint: Option<&str>) -> Result<Option<String>> {
+    let Some(endpoint) = cdp_endpoint else {
+        // Let dev-browser own auto-connect discovery. It already knows how to
+        // read DevToolsActivePort without relying on /json/version.
+        return Ok(None);
+    };
+
+    let url = Url::parse(endpoint)
+        .with_context(|| format!("invalid Chrome CDP endpoint `{endpoint}`"))?;
+    match url.scheme() {
+        "ws" | "wss" => return Ok(Some(endpoint.to_string())),
+        "http" | "https" => {}
+        other => {
+            return Err(anyhow!(
+                "unsupported Chrome CDP endpoint scheme `{other}` in `{endpoint}`"
+            ));
+        }
+    }
+
+    let candidate = CdpCandidate {
+        endpoint: endpoint.to_string(),
+        source: "explicit --cdp".to_string(),
+    };
+    match probe_cdp_candidate(&candidate) {
+        CdpProbeOutcome::Healthy(resolved) => Ok(Some(resolved.ws_url)),
+        CdpProbeOutcome::Poisoned(detail) => {
+            if let Some(port) = endpoint_port(endpoint) {
+                if let Some(ws_candidate) = matching_devtools_active_port_candidate(port) {
+                    match probe_cdp_candidate(&ws_candidate) {
+                        CdpProbeOutcome::Healthy(resolved) => return Ok(Some(resolved.ws_url)),
+                        CdpProbeOutcome::Poisoned(_) | CdpProbeOutcome::Unavailable(_) => {}
+                    }
+                }
+            }
+            Err(anyhow!(detail))
+        }
+        CdpProbeOutcome::Unavailable(detail) => Err(anyhow!(
+            "dev-browser could not resolve a healthy Chrome CDP endpoint from `{endpoint}`: {detail}"
+        )),
+    }
+}
+
+fn connect_args(
+    timeout_secs: u64,
+    browser_name: Option<&str>,
+    cdp_endpoint: Option<&str>,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(browser_name) = browser_name {
+        args.push("--browser".to_string());
+        args.push(browser_name.to_string());
+    }
+    args.push("--connect".to_string());
     if let Some(endpoint) = cdp_endpoint {
         args.push(endpoint.to_string());
     }
@@ -227,16 +602,16 @@ fn connect_args(timeout_secs: u64, cdp_endpoint: Option<&str>) -> Vec<String> {
     args
 }
 
-/// Run a dev-browser script against a live Chrome instance, optionally via an
-/// explicit CDP endpoint.
-pub fn run_script_connect_with_endpoint(
+fn run_script_connect_with_browser_and_endpoint(
     script: &str,
     timeout_secs: Option<u64>,
+    browser_name: Option<&str>,
     cdp_endpoint: Option<&str>,
 ) -> Result<String> {
     let bin = resolve_dev_browser()?;
     let timeout = timeout_secs.unwrap_or(DEFAULT_SCRIPT_TIMEOUT_SECS);
-    let args = connect_args(timeout, cdp_endpoint);
+    let resolved_endpoint = resolve_dev_browser_connect_endpoint(cdp_endpoint)?;
+    let args = connect_args(timeout, browser_name, resolved_endpoint.as_deref());
 
     let output = Command::new(&bin)
         .args(&args)
@@ -289,51 +664,20 @@ pub fn run_script_connect_with_endpoint(
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// Run a dev-browser script with a managed (non-connect) browser instance.
-/// Uses the named browser instance for isolation.
-#[allow(dead_code)]
-pub fn run_script_managed(
+/// Run a dev-browser script against a live Chrome instance, optionally via an
+/// explicit CDP endpoint.
+pub fn run_script_connect_with_endpoint(
     script: &str,
-    browser_name: &str,
     timeout_secs: Option<u64>,
+    cdp_endpoint: Option<&str>,
 ) -> Result<String> {
-    let bin = resolve_dev_browser()?;
-    let timeout = timeout_secs.unwrap_or(DEFAULT_SCRIPT_TIMEOUT_SECS);
-
-    let output = Command::new(&bin)
-        .args(["--browser", browser_name, "--timeout", &timeout.to_string()])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(script.as_bytes())?;
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
-        .with_context(|| format!("failed to run dev-browser (via {bin})"))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if !stderr.is_empty() {
-            stderr.to_string()
-        } else if !stdout.is_empty() {
-            stdout.to_string()
-        } else {
-            format!("exit code {:?}", output.status.code())
-        };
-        return Err(anyhow!("dev-browser script failed: {detail}"));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    run_script_connect_with_browser_and_endpoint(script, timeout_secs, None, cdp_endpoint)
 }
 
 /// Stage a file into dev-browser's tmp directory so scripts can read it
 /// via `readFile(name)`.
+#[cfg(test)]
+#[allow(dead_code)]
 pub fn stage_file(name: &str, content: &str) -> Result<PathBuf> {
     let tmp_dir = dev_browser_tmp_dir();
     fs::create_dir_all(&tmp_dir)
@@ -344,18 +688,8 @@ pub fn stage_file(name: &str, content: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Stage a binary file into dev-browser's tmp directory.
+#[cfg(test)]
 #[allow(dead_code)]
-pub fn stage_file_bytes(name: &str, content: &[u8]) -> Result<PathBuf> {
-    let tmp_dir = dev_browser_tmp_dir();
-    fs::create_dir_all(&tmp_dir)
-        .with_context(|| format!("create dev-browser tmp dir: {}", tmp_dir.display()))?;
-    let path = tmp_dir.join(name);
-    fs::write(&path, content).with_context(|| format!("write staged file: {}", path.display()))?;
-    set_staged_file_permissions(&path)?;
-    Ok(path)
-}
-
 fn set_staged_file_permissions(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -370,36 +704,9 @@ fn set_staged_file_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// List all browser tabs visible to dev-browser (via --connect).
-pub fn list_tabs() -> Result<Vec<TabInfo>> {
-    let script = r#"
-const pages = await browser.listPages();
-console.log(JSON.stringify(pages));
-"#;
-    let stdout = run_script_connect(script, Some(10))?;
-    let tabs: Vec<TabInfo> =
-        serde_json::from_str(stdout.trim()).context("parse dev-browser listPages")?;
-    Ok(tabs)
-}
-
-/// Tab information from dev-browser.
-#[allow(dead_code)]
-#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
-pub struct TabInfo {
-    pub id: String,
-    pub url: String,
-    pub title: String,
-    pub name: Option<String>,
-}
-
 /// Check if Chrome is reachable and dev-browser can connect to it.
 /// Uses a short first probe; retries once with a longer timeout only when the
 /// first failure looks like a timeout (slow CDP handshake with many tabs).
-#[allow(dead_code)]
-pub fn check_connection() -> Result<()> {
-    check_connection_with_endpoint(None)
-}
-
 pub fn check_connection_with_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
     let script = r#"
 const pages = await browser.listPages();
@@ -409,6 +716,9 @@ console.log("ok:" + pages.length);
         Ok(stdout) if stdout.trim().starts_with("ok:") => Ok(()),
         Ok(stdout) => Err(anyhow!("dev-browser connection check failed: {stdout}")),
         Err(first_err) => {
+            if is_poisoned_cdp_error(&first_err) {
+                return Err(first_err.context("dev-browser connection check failed"));
+            }
             let msg = format!("{first_err:#}");
             let is_timeout = msg.contains("Timeout") || msg.contains("timed out");
             if !is_timeout {
@@ -425,24 +735,6 @@ console.log("ok:" + pages.length);
             }
         }
     }
-}
-
-/// Find a ChatGPT tab in the connected browser.
-/// Returns the tab ID of the best candidate.
-#[allow(dead_code)]
-pub fn find_chatgpt_tab() -> Result<Option<String>> {
-    let tabs = list_tabs()?;
-    let chatgpt_tab = tabs
-        .iter()
-        .find(|t| t.url.contains("chatgpt.com") && !t.url.contains("/c/"))
-        .or_else(|| tabs.iter().find(|t| t.url.contains("chatgpt.com")));
-    Ok(chatgpt_tab.map(|t| t.id.clone()))
-}
-
-/// Check authentication status on ChatGPT in the connected browser.
-#[allow(dead_code)]
-pub fn check_chatgpt_auth() -> Result<bool> {
-    check_chatgpt_auth_with_endpoint(None)
 }
 
 pub fn check_chatgpt_auth_with_endpoint(cdp_endpoint: Option<&str>) -> Result<bool> {
@@ -472,32 +764,8 @@ try {
         .ok_or_else(|| anyhow!("check_chatgpt_auth: missing 'authenticated' field in: {stdout}"))
 }
 
-/// Ensure the connected Chrome session can reach ChatGPT.
-/// Only checks dev-browser daemon connectivity — opening a separate page
-/// to verify auth causes interference with the recipe's named page.
-/// If not authenticated, the recipe will fail with a clear error.
-#[allow(dead_code)]
-pub fn ensure_chatgpt_auth() -> Result<()> {
-    ensure_chatgpt_auth_with_endpoint(None)
-}
-
-pub fn ensure_chatgpt_auth_with_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
-    check_connection_with_endpoint(cdp_endpoint).context(
-        "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
-    )?;
-    // Skip page-level auth check — it opens an anonymous page to chatgpt.com
-    // which interferes with the recipe's subsequent named page session.
-    Ok(())
-}
-
 /// Ensure the connected Chrome session can reach an authenticated ChatGPT page.
 /// Opens a temporary page — use only when not immediately followed by a recipe.
-#[allow(dead_code)]
-pub fn ensure_chatgpt_auth_with_page_check() -> Result<()> {
-    ensure_chatgpt_auth_with_page_check_and_endpoint(None)
-}
-
-#[allow(dead_code)]
 pub fn ensure_chatgpt_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
     check_connection_with_endpoint(cdp_endpoint).context(
         "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
@@ -513,8 +781,13 @@ pub fn ensure_chatgpt_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&st
 }
 
 /// Context for running a ChatGPT recipe via dev-browser.
+///
+/// Recipe implementation note:
+/// dev-browser runs scripts inside QuickJS/WASM, not Node. Keep browser flows
+/// split into micro-scripts with JSON stdout handoffs instead of generating one
+/// large helper-heavy script.
 pub struct DevBrowserRecipeContext {
-    /// Path to the bundle file on disk (will be staged to dev-browser tmp).
+    /// Path to the bundle file on disk (used for macOS clipboard file upload).
     pub bundle_path: Option<PathBuf>,
     /// Bundle text content (for paste mode).
     pub bundle_text: Option<String>,
@@ -532,6 +805,8 @@ pub struct DevBrowserRecipeContext {
     pub allow_empty_response: bool,
     /// Optional explicit CDP endpoint for selecting a specific Chrome instance.
     pub cdp_endpoint: Option<String>,
+    /// Whether to print interactive Chrome-approval guidance to stderr.
+    pub show_approval_guidance: bool,
 }
 
 impl Default for DevBrowserRecipeContext {
@@ -546,6 +821,7 @@ impl Default for DevBrowserRecipeContext {
             poll_settings: ChatgptPollSettings::default(),
             allow_empty_response: false,
             cdp_endpoint: None,
+            show_approval_guidance: false,
         }
     }
 }
@@ -576,426 +852,279 @@ fn parse_positive_u64_var(vars: &BTreeMap<String, String>, key: &str) -> Result<
     Ok(Some(value))
 }
 
+fn looks_like_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_lowercase();
+    (message.contains("connectovercdp")
+        || message.contains("auto-connect")
+        || message.contains("auto connect")
+        || message.contains("could not connect to chrome")
+        || message.contains("browser.getversion"))
+        && (message.contains("timed out") || message.contains("timeout"))
+}
+
 fn chatgpt_script_timeout_secs(poll_timeout_ms: u64) -> u64 {
     poll_timeout_ms.div_ceil(1000) + 60
 }
 
-fn build_chatgpt_recipe_script(ctx: &DevBrowserRecipeContext, staged_name: Option<&str>) -> String {
-    let model_json = serde_json::to_string(&ctx.model).unwrap();
-    let prompt_json = serde_json::to_string(&ctx.prompt).unwrap();
-    // Only embed bundle text in the script when paste mode is active.
-    // In attachment mode the content is staged to a file and read via
-    // readFile() — embedding it would bloat the script (500KB+) and crash
-    // the QuickJS WASM sandbox.
-    let bundle_text_for_script = if ctx.paste_mode {
-        ctx.bundle_text.as_deref().unwrap_or("")
-    } else {
-        ""
-    };
-    let bundle_text_json = serde_json::to_string(bundle_text_for_script).unwrap();
-    let staged_name_json = serde_json::to_string(&staged_name.unwrap_or("")).unwrap();
+#[derive(Debug, serde::Deserialize)]
+struct ChatgptPrepareResult {
+    status: String,
+    #[serde(rename = "loggedIn")]
+    logged_in: bool,
+    #[serde(rename = "composerReady")]
+    composer_ready: bool,
+    url: String,
+}
 
+#[derive(Debug, serde::Deserialize)]
+struct ChatgptSendResult {
+    status: String,
+    #[serde(rename = "assistantCountBeforeSend")]
+    assistant_count_before_send: usize,
+    warning: Option<String>,
+}
+
+fn parse_script_json<T: serde::de::DeserializeOwned>(label: &str, stdout: &str) -> Result<T> {
+    serde_json::from_str(stdout.trim())
+        .with_context(|| format!("{label}: malformed script output: {stdout}"))
+}
+
+fn build_chatgpt_prepare_script(page_name: &str, model: &str) -> String {
+    let page_name_json = serde_json::to_string(page_name).unwrap();
+    let model_json = serde_json::to_string(model).unwrap();
     format!(
-        r##"
+        r#"
+const PAGE_NAME = {page_name_json};
 const MODEL = {model_json};
+const page = await browser.getPage(PAGE_NAME);
+await page.goto("https://chatgpt.com/");
+let composerReady = true;
+try {{
+  await page.locator("[role='textbox']").first().waitFor({{ state: "visible", timeout: 20000 }});
+}} catch (_) {{
+  composerReady = false;
+}}
+const loggedIn = (await page.locator("[data-testid='login-button']").first().count()) === 0;
+if (loggedIn && composerReady && MODEL) {{
+  const modelBtn = page.locator("[data-testid='model-switcher-dropdown-button'], button[aria-label='Model selector']").first();
+  await modelBtn.waitFor({{ state: "visible", timeout: 5000 }});
+  await modelBtn.click({{ timeout: 5000 }});
+  const slug = MODEL.toLowerCase();
+  const byTestId = page.locator(`[data-testid="model-switcher-${{slug}}"]`).first();
+  if (await byTestId.count() > 0) {{
+    await byTestId.click({{ timeout: 5000 }});
+  }} else {{
+    const menuItem = page.locator("[role='menuitem']").filter({{ hasText: new RegExp(slug.includes("thinking") ? "thinking" : slug.includes("pro") ? "pro" : slug.includes("instant") || slug.includes("5-3") ? "instant" : slug, "i") }}).first();
+    await menuItem.waitFor({{ state: "visible", timeout: 5000 }});
+    await menuItem.click({{ timeout: 5000 }});
+  }}
+  await page.waitForTimeout(500);
+}}
+console.log(JSON.stringify({{
+  status: !loggedIn ? "login_required" : composerReady ? "ready" : "not_ready",
+  loggedIn,
+  composerReady,
+  url: page.url(),
+}}));
+"#,
+        page_name_json = page_name_json,
+        model_json = model_json,
+    )
+}
+
+fn build_chatgpt_send_script(
+    page_name: &str,
+    prompt: &str,
+    delivery_text: &str,
+    file_on_clipboard: bool,
+    disable_extended: bool,
+) -> String {
+    let page_name_json = serde_json::to_string(page_name).unwrap();
+    let file_on_clipboard_json = serde_json::to_string(&file_on_clipboard).unwrap();
+    let delivery_text_json = serde_json::to_string(delivery_text).unwrap();
+    let prompt_json = serde_json::to_string(prompt).unwrap();
+    format!(
+        r#"
+const PAGE_NAME = {page_name_json};
+const FILE_ON_CLIPBOARD = {file_on_clipboard_json};
+const DELIVERY_TEXT = {delivery_text_json};
 const PROMPT = {prompt_json};
-const BUNDLE_TEXT = {bundle_text_json};
-const STAGED_FILE = {staged_name_json};
-const PASTE_MODE = {paste_mode};
 const DISABLE_EXTENDED = {disable_extended};
+const page = await browser.getPage(PAGE_NAME);
+let warning = null;
+if (DISABLE_EXTENDED) {{
+  const extButton = page.locator("button[aria-label*='click to remove'][aria-label*='Extended'], button[aria-label*='remove'][aria-label*='Extended']").first();
+  if (await extButton.count() > 0) {{
+    await extButton.click();
+    await page.waitForTimeout(500);
+  }} else {{
+    warning = "extended disable requested but toggle not found";
+  }}
+}}
+const composer = page.locator("[role='textbox']").first();
+if (FILE_ON_CLIPBOARD) {{
+  await composer.waitFor({{ state: "visible", timeout: 15000 }});
+  await composer.click();
+  await page.keyboard.press("Meta+v");
+  await page.waitForTimeout(5000);
+  const attached = await page.evaluate(() => {{
+    return !!document.querySelector("[class*='file-tile'], [data-testid*='attachment']");
+  }});
+  if (!attached) {{
+    throw new Error("file not attached after clipboard paste");
+  }}
+}}
+await composer.waitFor({{ state: "visible", timeout: 15000 }});
+await composer.click();
+await composer.pressSequentially(DELIVERY_TEXT, {{ delay: 15 }});
+const sendBtn = page.locator("[data-testid='send-button']").first();
+const deadline = Date.now() + 30000;
+while (Date.now() < deadline) {{
+  if (await sendBtn.count() > 0 && await sendBtn.isEnabled()) break;
+  await page.waitForTimeout(1000);
+}}
+if (await sendBtn.count() === 0 || !(await sendBtn.isEnabled())) {{
+  throw new Error("send button did not become enabled for prompt: " + PROMPT.slice(0, 80));
+}}
+const assistantCountBeforeSend = await page.locator("[data-message-author-role='assistant']").count();
+await sendBtn.click();
+console.log(JSON.stringify({{
+        status: "sent",
+        assistantCountBeforeSend,
+        warning,
+}}));
+"#,
+        page_name_json = page_name_json,
+        file_on_clipboard_json = file_on_clipboard_json,
+        delivery_text_json = delivery_text_json,
+        prompt_json = prompt_json,
+        disable_extended = disable_extended,
+    )
+}
+
+fn set_file_on_clipboard(path: &Path) -> Result<()> {
+    let canonical_path = path
+        .canonicalize()
+        .with_context(|| format!("resolve bundle path: {}", path.display()))?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("osascript")
+            .args([
+                "-e",
+                "on run argv",
+                "-e",
+                "set the clipboard to (POSIX file (item 1 of argv))",
+                "-e",
+                "end run",
+            ])
+            .arg(&canonical_path)
+            .output()
+            .context("failed to run osascript for ChatGPT file upload")?;
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit code {:?}", output.status.code())
+        };
+        Err(anyhow!(
+            "failed to set macOS clipboard to bundle file `{}`: {detail}",
+            canonical_path.display()
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = canonical_path;
+        Err(anyhow!(
+            "dev-browser file upload via clipboard currently requires macOS"
+        ))
+    }
+}
+
+fn build_chatgpt_poll_script(
+    page_name: &str,
+    assistant_count_before_send: usize,
+    poll_settings: ChatgptPollSettings,
+    allow_empty_response: bool,
+) -> String {
+    let page_name_json = serde_json::to_string(page_name).unwrap();
+    format!(
+        r#"
+const PAGE_NAME = {page_name_json};
+const BASELINE = {assistant_count_before_send};
 const POLL_TIMEOUT_MS = {poll_timeout_ms};
 const POLL_INTERVAL_MS = {poll_interval_ms};
 const ALLOW_EMPTY_RESPONSE = {allow_empty_response};
-const warnings = [];
-const COMPOSER_READY_TIMEOUT_MS = 15000;
-const SEND_READY_TIMEOUT_MS = 30000;
-const SEND_READY_INTERVAL_MS = 1000;
-
-function warningSuffix() {{
-    return warnings.length ? " warnings=" + warnings.join(" | ") : "";
-}}
-
-async function waitForComposerReady(page) {{
-    try {{
-        await page.locator('#prompt-textarea').first().waitFor({{ state: 'visible', timeout: COMPOSER_READY_TIMEOUT_MS }});
-    }} catch (_) {{
-        await page.locator('[role="textbox"]').first().waitFor({{ state: 'visible', timeout: COMPOSER_READY_TIMEOUT_MS }});
-    }}
-}}
-
-async function getComposerLocator(page) {{
-    const prompt = page.locator('#prompt-textarea').first();
-    if (await prompt.count() > 0) {{
-        return prompt;
-    }}
-    return page.locator('[role="textbox"]').first();
-}}
-
-async function collectComposerDiagnostics(page) {{
-    return await page.evaluate(() => {{
-        const prompt =
-            document.querySelector('#prompt-textarea') ||
-            document.querySelector('[role="textbox"]');
-        const sendBtn = document.querySelector("button[data-testid='send-button']");
-        return {{
-            url: location.href,
-            promptLength: (prompt ? (prompt.textContent || "") : "").replace(/\s+/g, " ").trim().length,
-            attachmentCount: document.querySelectorAll(
-                'img[alt*="attachment" i], [data-testid*="attachment" i], [aria-label*="attachment" i]'
-            ).length,
-            assistantCount: document.querySelectorAll('[data-message-author-role="assistant"]').length,
-            sendState: !sendBtn ? "missing" : sendBtn.disabled ? "disabled" : "enabled",
-        }};
-    }});
-}}
-
-function formatDiagnostics(diag) {{
-    return "url=" + diag.url +
-        ", prompt_length=" + diag.promptLength +
-        ", attachment_tiles=" + diag.attachmentCount +
-        ", assistant_count=" + diag.assistantCount +
-        ", send=" + diag.sendState;
-}}
-
-async function waitForSendButtonReady(page) {{
-    const sendBtn = page.locator('button[data-testid="send-button"]').first();
-    const deadline = Date.now() + SEND_READY_TIMEOUT_MS;
-    let lastState = "missing";
-    while (Date.now() < deadline) {{
-        if (await sendBtn.count() > 0) {{
-            lastState = (await sendBtn.isEnabled()) ? "enabled" : "disabled";
-            if (lastState === "enabled") {{
-                return;
-            }}
-        }} else {{
-            lastState = "missing";
-        }}
-        await page.waitForTimeout(SEND_READY_INTERVAL_MS);
-    }}
-    const diagnostics = await collectComposerDiagnostics(page);
-    throw new Error(
-        "send button " + lastState +
-        " after waiting for ChatGPT to finish processing the prompt/attachment (" +
-        formatDiagnostics(diagnostics) + ")" +
-        warningSuffix()
-    );
-}}
-
-async function ensureFreshConversation(page) {{
-    for (let attempt = 0; attempt < 2; attempt++) {{
-        await page.goto("https://chatgpt.com/?_yoetz=" + Date.now());
-        await waitForComposerReady(page);
-
-        if (page.url().includes("/c/")) {{
-            const newChatBtn = page.locator(
-                'a[href="/"], button[data-testid="create-new-chat-button"], nav a[class*="new"]'
-            ).first();
-            if (await newChatBtn.count() > 0) {{
-                await newChatBtn.click();
-                await waitForComposerReady(page);
-            }} else {{
-                await page.goto("https://chatgpt.com/?_yoetz=" + Date.now());
-                await waitForComposerReady(page);
-            }}
-        }}
-
-        const assistantCount = await page.evaluate(() => {{
-            return document.querySelectorAll('[data-message-author-role="assistant"]').length;
-        }});
-        if (assistantCount === 0) {{
-            return;
-        }}
-    }}
-
-    const diagnostics = await collectComposerDiagnostics(page);
-    throw new Error(
-        "failed to reach a clean ChatGPT conversation before sending (" +
-        formatDiagnostics(diagnostics) + ")" +
-        warningSuffix()
-    );
-}}
-
-// --- Step 1: Navigate to fresh ChatGPT conversation ---
-// Use browser.newPage() for a clean page. Reusing existing ChatGPT tabs
-// would hijack the user's current conversation and risk picking the wrong
-// profile when multiple ChatGPT tabs are open.
-const page = await browser.newPage();
-await ensureFreshConversation(page);
-
-// --- Step 2: Select model if provided ---
-// Model selection is strict when explicitly requested.
-if (MODEL) {{
-    try {{
-        const modelBtn = page.locator(
-            '[data-testid="model-switcher-dropdown-button"], button[aria-label="Model selector"]'
-        ).first();
-        await modelBtn.waitFor({{ state: 'visible', timeout: 5000 }});
-        await modelBtn.click({{ timeout: 5000 }});
-
-        const slug = MODEL.toLowerCase();
-        const byTestId = page.locator(`[data-testid="model-switcher-${{slug}}"]`).first();
-        if (await byTestId.count() > 0) {{
-            await byTestId.waitFor({{ state: 'visible', timeout: 5000 }});
-            await byTestId.click({{ timeout: 5000 }});
-        }} else {{
-            const names = {{"gpt-5-4-pro":"pro","gpt-5-4-thinking":"thinking","gpt-5-3":"instant","pro":"pro","thinking":"thinking","instant":"instant"}};
-            const target = names[slug] || slug;
-            const menuItem = page.locator('[role="menuitem"]').filter({{ hasText: new RegExp(target, 'i') }}).first();
-            await menuItem.waitFor({{ state: 'visible', timeout: 5000 }});
-            await menuItem.click({{ timeout: 5000 }});
-        }}
-        await page.waitForTimeout(500);
-    }} catch (e) {{
-        const detail = e && typeof e.message === 'string' ? e.message : String(e);
-        await page.keyboard.press('Escape').catch(() => {{}});
-        await page.waitForTimeout(300);
-        throw new Error("model selection failed (" + detail + ")" + warningSuffix());
-    }}
-}}
-
-// --- Step 3: Disable Extended Pro if requested ---
-if (DISABLE_EXTENDED) {{
-    const extLocators = [
-        page.locator('button[aria-label*="click to remove"][aria-label*="Extended"]').first(),
-        page.locator('button[aria-label*="remove"][aria-label*="Extended"]').first(),
-        page.getByRole('button', {{ name: /extended.*remove|remove.*extended/i }}).first(),
-    ];
-    let extendedDisabled = false;
-    for (const extBtn of extLocators) {{
-        if (await extBtn.count() > 0) {{
-            await extBtn.click();
-            await page.waitForTimeout(500);
-            extendedDisabled = true;
-            break;
-        }}
-    }}
-    if (!extendedDisabled) {{
-        warnings.push("extended disable requested but toggle not found");
-    }}
-}}
-
-// --- Step 4: Deliver content (paste or file attachment) ---
-if (PASTE_MODE) {{
-    // Paste bundle text + prompt via keyboard.type — Playwright fill() and
-    // execCommand both bypass ProseMirror React state, leaving send disabled.
-    const composer = await getComposerLocator(page);
-    await composer.click();
-    await page.keyboard.type(PROMPT + "\n\n" + BUNDLE_TEXT);
-    await page.waitForTimeout(500);
-}} else if (STAGED_FILE) {{
-    // Upload via ChatGPT's native filechooser flow. DataTransfer hacks
-    // bypass React state and leave the send button disabled.
-    // Path: click + button → "Add photos & files" → filechooser →
-    // setFiles with FilePayload. Buffer must be constructed from a
-    // Uint8Array (not a string — QuickJS Buffer.from(string) is base64).
-    const fileContent = await readFile(STAGED_FILE);
-    const utf8Bytes = [];
-    for (const char of fileContent) {{
-        const code = char.codePointAt(0);
-        if (code <= 0x7F) utf8Bytes.push(code);
-        else if (code <= 0x7FF) utf8Bytes.push(0xC0|(code>>6), 0x80|(code&0x3F));
-        else if (code <= 0xFFFF) utf8Bytes.push(0xE0|(code>>12), 0x80|((code>>6)&0x3F), 0x80|(code&0x3F));
-        else utf8Bytes.push(0xF0|(code>>18), 0x80|((code>>12)&0x3F), 0x80|((code>>6)&0x3F), 0x80|(code&0x3F));
-    }}
-
-    await page.locator('button[data-testid="composer-plus-btn"]').click();
-    const addFilesMenuItem = page.getByRole('menuitem', {{ name: /add photos & files/i }}).first();
-    await addFilesMenuItem.waitFor({{ state: 'visible', timeout: 5000 }});
-    const [fileChooser] = await Promise.all([
-        page.waitForEvent('filechooser', {{ timeout: 10000 }}),
-        addFilesMenuItem.click(),
-    ]);
-    await fileChooser.setFiles({{
-        name: "bundle.md",
-        mimeType: "text/plain",
-        buffer: Buffer.from(new Uint8Array(utf8Bytes)),
-    }});
-
-    // Wait for upload to start before typing into the composer.
-    await page.waitForTimeout(5000);
-
-    // Type prompt via keyboard (Playwright fill()/execCommand bypass
-    // ProseMirror React state, leaving send button disabled).
-    const composer = await getComposerLocator(page);
-    await composer.click();
-    await page.keyboard.type(PROMPT, {{ delay: 5 }});
-    await page.waitForTimeout(500);
-}} else {{
-    // No bundle — just type the prompt
-    const composer = await getComposerLocator(page);
-    await composer.click();
-    await page.keyboard.type(PROMPT, {{ delay: 5 }});
-    await page.waitForTimeout(500);
-}}
-
-// ChatGPT keeps the send button disabled while it finishes attachment
-// processing. Large bundles can take several more seconds after prompt entry.
-await waitForSendButtonReady(page);
-
-const ASSISTANT_COUNT_BEFORE_SEND = await page.evaluate(() => {{
-    return document.querySelectorAll('[data-message-author-role="assistant"]').length;
-}});
-
-// --- Step 5: Click send ---
-const sendBtn = page.locator('button[data-testid="send-button"]').first();
-await sendBtn.click();
-// After clicking send, ChatGPT navigates (SPA) from / to /c/UUID.
-// Wait for navigation to settle before starting poll loop.
-await page.waitForURL('**/c/**', {{ timeout: 10000 }}).catch(() => {{}});
-
-// --- Step 6: Poll for response completion ---
-// Checks: new assistant response appeared, text is stable, send idle, no thinking indicator.
-const pollStart = Date.now();
-let completed = false;
-let pollError = null;
-let idleFingerprint = null;
-let lastPollState = null;
-
-while (Date.now() - pollStart < POLL_TIMEOUT_MS) {{
-    await page.waitForTimeout(POLL_INTERVAL_MS);
-
-    const pollState = await page.evaluate((baselineCount) => {{
-        // Scope error detection to actual error UI elements (toasts, alerts,
-        // error containers) — scanning document.body.innerText would match
-        // false positives from conversation text or page chrome.
-        const errEl = document.querySelector(
-            '[class*="error-toast"], [data-testid*="error"], [role="alert"]'
-        );
-        const errText = errEl ? errEl.innerText.substring(0, 200).toLowerCase() : "";
-        const errorMarkers = ["network error", "something went wrong", "error generating",
-                              "could not process", "rate limit", "too many requests",
-                              "attachment failed", "upload failed"];
-        const detectedError = errorMarkers.find(m => errText.includes(m)) || null;
-        if (detectedError) {{
-            return {{
-                error: detectedError,
-                url: location.href,
-                sendState: "unknown",
-                hasStopButton: false,
-                hasThinkingIndicator: false,
-                composerReady: false,
-                plusButtonReady: false,
-                newAssistantCount: 0,
-                assistantText: ""
-            }};
-        }}
-        const sendBtn = document.querySelector("button[data-testid='send-button']");
-        const stopBtn = document.querySelector("button[data-testid='stop-button'], button[aria-label*='Stop']");
-        const thinking = document.querySelector(
-            '.result-thinking, [class*="result-thinking"], [data-testid*="thinking"]'
-        );
-        const composer =
-            document.querySelector('#prompt-textarea') ||
-            document.querySelector('[role="textbox"]');
-        const plusBtn = document.querySelector('button[data-testid="composer-plus-btn"]');
-        const assistantMessages = Array.from(
-            document.querySelectorAll('[data-message-author-role="assistant"]')
-        );
-        const newAssistantMessages = assistantMessages.slice(baselineCount);
-        const assistantText = newAssistantMessages
-            .map((m) => m.innerText)
-            .join('\n---\n')
-            .trim();
-        return {{
-            error: null,
-            url: location.href,
-            sendState: !sendBtn ? "missing" : sendBtn.disabled ? "disabled" : "enabled",
-            hasStopButton: Boolean(stopBtn),
-            hasThinkingIndicator: Boolean(thinking),
-            composerReady: Boolean(composer),
-            plusButtonReady: Boolean(plusBtn),
-            newAssistantCount: newAssistantMessages.length,
-            assistantText
-        }};
-    }}, ASSISTANT_COUNT_BEFORE_SEND);
-    lastPollState = {{
-        url: pollState.url,
-        sendState: pollState.sendState,
-        hasStopButton: pollState.hasStopButton,
-        hasThinkingIndicator: pollState.hasThinkingIndicator,
-        composerReady: pollState.composerReady,
-        plusButtonReady: pollState.plusButtonReady,
-        newAssistantCount: pollState.newAssistantCount,
-        assistantTextLength: pollState.assistantText.length,
-    }};
-    if (pollState.error) {{
-        pollError = "ChatGPT error: " + pollState.error + warningSuffix();
-        break;
-    }}
-
-    const composerIdle =
-        pollState.sendState === "enabled" ||
-        (pollState.sendState === "missing" && pollState.composerReady && pollState.plusButtonReady);
-    const idle = composerIdle &&
-        !pollState.hasStopButton &&
-        !pollState.hasThinkingIndicator;
-    const hasResponse = pollState.newAssistantCount > 0 &&
-        (ALLOW_EMPTY_RESPONSE || pollState.assistantText.length > 0);
-
-    if (idle && hasResponse) {{
-        const fingerprint = `${{pollState.newAssistantCount}}:${{pollState.assistantText}}`;
-        if (idleFingerprint === fingerprint) {{
-            completed = true;
-            break;
-        }}
-        idleFingerprint = fingerprint;
-    }} else {{
-        idleFingerprint = null;
-    }}
-}}
-
-// --- Step 7: Extract response ---
-const responseState = await page.evaluate((baselineCount) => {{
-    const assistantMessages = Array.from(
-        document.querySelectorAll('[data-message-author-role="assistant"]')
-    );
-    const newAssistantMessages = assistantMessages.slice(baselineCount);
-    const responseText = newAssistantMessages.map((m) => m.innerText).join('\n---\n').trim();
+const page = await browser.getPage(PAGE_NAME);
+const start = Date.now();
+let lastResponseText = null;
+while (Date.now() - start < POLL_TIMEOUT_MS) {{
+  const state = await page.evaluate((baselineCount) => {{
+    const errorEl = document.querySelector("[role='alert'], [data-testid*='error']");
+    const hasThinkingIndicator = !!document.querySelector(".result-thinking, [data-testid*='thinking']");
+    const assistantMessages = Array.from(document.querySelectorAll("[data-message-author-role='assistant']")).slice(baselineCount);
+    const response = assistantMessages.map((message) => message.innerText).join("\n---\n").trim();
     return {{
-        newAssistantCount: newAssistantMessages.length,
-        responseText
+      error: errorEl ? errorEl.innerText.slice(0, 200).trim() : null,
+      hasThinkingIndicator,
+      hasStopButton: !!document.querySelector("[data-testid='stop-button']"),
+      newAssistantCount: assistantMessages.length,
+      response,
     }};
-}}, ASSISTANT_COUNT_BEFORE_SEND);
-
-let status = pollError ? "error" : (completed ? "ok" : "timeout");
-let error = pollError || null;
-if (status === "timeout") {{
-    const diagnostics = await collectComposerDiagnostics(page);
-    error =
-        "ChatGPT response timed out after " + (Date.now() - pollStart) + "ms (" +
-        "last_state=" + JSON.stringify(lastPollState || {{}}) + ", " +
-        formatDiagnostics(diagnostics) + ")" +
-        warningSuffix();
-}} else if (status === "ok" && responseState.newAssistantCount === 0) {{
-    status = "error";
-    error = "ChatGPT did not produce a new assistant response" + warningSuffix();
-}} else if (status === "ok" && !ALLOW_EMPTY_RESPONSE && responseState.responseText.length === 0) {{
-    status = "error";
-    error = "ChatGPT returned an empty response" + warningSuffix();
+  }}, BASELINE);
+  if (state.error) {{
+    console.log(JSON.stringify({{ status: "error", error: state.error }}));
+    return;
+  }}
+  const completionCandidate =
+    !state.hasStopButton &&
+    !state.hasThinkingIndicator &&
+    state.newAssistantCount > 0 &&
+    (ALLOW_EMPTY_RESPONSE || state.response.length > 0);
+  if (completionCandidate) {{
+    if (lastResponseText !== null && state.response === lastResponseText) {{
+      console.log(JSON.stringify({{ status: "ok", response: state.response }}));
+      return;
+    }}
+    lastResponseText = state.response;
+  }} else {{
+    lastResponseText = null;
+  }}
+  await page.waitForTimeout(POLL_INTERVAL_MS);
 }}
+console.log(JSON.stringify({{
+  status: "timeout",
+  error: `ChatGPT response timed out after ${{POLL_TIMEOUT_MS}}ms`,
+}}));
+"#,
+        page_name_json = page_name_json,
+        assistant_count_before_send = assistant_count_before_send,
+        poll_timeout_ms = poll_settings.timeout_ms,
+        poll_interval_ms = poll_settings.interval_ms,
+        allow_empty_response = allow_empty_response,
+    )
+}
 
-const result = {{
-    status,
-    error,
-    elapsed_ms: Date.now() - pollStart,
-    response_length: responseState.responseText.length,
-    response: responseState.responseText,
-    warnings,
-    assistant_message_count_before_send: ASSISTANT_COUNT_BEFORE_SEND,
-    new_assistant_message_count: responseState.newAssistantCount,
-}};
-
-console.log(JSON.stringify(result));
-"##,
-        model_json = model_json,
-        prompt_json = prompt_json,
-        bundle_text_json = bundle_text_json,
-        staged_name_json = staged_name_json,
-        paste_mode = ctx.paste_mode,
-        disable_extended = ctx.disable_extended,
-        poll_timeout_ms = ctx.poll_settings.timeout_ms,
-        poll_interval_ms = ctx.poll_settings.interval_ms,
-        allow_empty_response = ctx.allow_empty_response,
+fn build_chatgpt_cleanup_script(page_name: &str) -> String {
+    let page_name_json = serde_json::to_string(page_name).unwrap();
+    format!(
+        r#"
+const PAGE_NAME = {page_name_json};
+const pages = await browser.listPages();
+if (pages.find((page) => page.name === PAGE_NAME)) {{
+    const page = await browser.getPage(PAGE_NAME);
+    await page.close().catch(() => {{}});
+}}
+"#,
+        page_name_json = page_name_json,
     )
 }
 
@@ -1066,13 +1195,11 @@ fn parse_chatgpt_recipe_result(
 
 /// Run the ChatGPT recipe via dev-browser.
 ///
-/// This replaces the YAML-based chatgpt.yaml recipe with a single Playwright
-/// script that handles navigation, model selection, file upload (via
-/// filechooser + keyboard.type), prompt entry, and response polling.
+/// The flow is intentionally split into micro-scripts because dev-browser runs
+/// QuickJS/WASM sandboxes, and large scripts with many closures are prone to a
+/// GC assertion on disposal. Rust owns the orchestration; each script only does
+/// one browser phase and returns JSON over stdout.
 pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
-    // Stage the bundle file if provided (for attachment mode).
-    // Use a unique prefix (PID + timestamp) to avoid collisions between
-    // concurrent recipe runs.
     let unique_prefix = format!(
         "{}_{}",
         std::process::id(),
@@ -1081,168 +1208,141 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
             .unwrap_or_default()
             .as_millis()
     );
-    let mut staged_file_guard = None;
-    let staged_name = if !ctx.paste_mode {
-        if let Some(bundle_path) = &ctx.bundle_path {
-            let content = fs::read_to_string(bundle_path)
-                .with_context(|| format!("read bundle: {}", bundle_path.display()))?;
-            let base_name = bundle_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("bundle.txt");
-            let name = format!("{unique_prefix}_{base_name}");
-            let path = stage_file(&name, &content)?;
-            staged_file_guard = Some(StagedFileGuard::new(path));
-            Some(name)
-        } else if let Some(text) = &ctx.bundle_text {
-            let name = format!("{unique_prefix}_bundle.md");
-            let path = stage_file(&name, text)?;
-            staged_file_guard = Some(StagedFileGuard::new(path));
-            Some(name)
-        } else {
-            None
+    let browser_name = format!("yoetz-chatgpt-browser-{unique_prefix}");
+    let page_name = format!("yoetz-chatgpt-page-{unique_prefix}");
+    let cdp_endpoint = ctx.cdp_endpoint.as_deref();
+    let run_script = |script: &str, timeout_secs: Option<u64>| {
+        run_script_connect_with_browser_and_endpoint(
+            script,
+            timeout_secs,
+            Some(browser_name.as_str()),
+            cdp_endpoint,
+        )
+    };
+    let cleanup = |cdp_endpoint| -> Result<()> {
+        let cleanup_script = build_chatgpt_cleanup_script(&page_name);
+        match run_script_connect_with_browser_and_endpoint(
+            &cleanup_script,
+            Some(15),
+            Some(browser_name.as_str()),
+            cdp_endpoint,
+        ) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                eprintln!("warn: failed to clean up dev-browser recipe page `{page_name}`: {err}");
+                Ok(())
+            }
         }
-    } else {
-        None
     };
 
-    let script = build_chatgpt_recipe_script(ctx, staged_name.as_deref());
+    let result = (|| -> Result<(String, Vec<String>)> {
+        let mut warnings = Vec::new();
+        let file_on_clipboard = if ctx.paste_mode {
+            false
+        } else if let Some(bundle_path) = &ctx.bundle_path {
+            set_file_on_clipboard(bundle_path)?;
+            true
+        } else if ctx.bundle_text.is_some() {
+            return Err(anyhow!(
+                "dev-browser file upload requires a bundle path on disk; use `--var paste=true` for text-only delivery"
+            ));
+        } else {
+            false
+        };
+        let delivery_text = if ctx.paste_mode {
+            format!(
+                "{}\n\n{}",
+                ctx.prompt,
+                ctx.bundle_text.as_deref().unwrap_or("")
+            )
+        } else {
+            ctx.prompt.clone()
+        };
 
-    let stdout = run_script_connect_with_endpoint(
-        &script,
-        Some(chatgpt_script_timeout_secs(ctx.poll_settings.timeout_ms)),
-        ctx.cdp_endpoint.as_deref(),
-    )?;
-    drop(staged_file_guard);
+        let prepare_script = build_chatgpt_prepare_script(&page_name, &ctx.model);
+        let prepare_stdout = {
+            let approval_lock = browser::acquire_chrome_approval_lock()?;
+            if ctx.show_approval_guidance {
+                if approval_lock.waited() {
+                    eprintln!(
+                        "info: another yoetz process is already requesting Chrome approval; waiting for it to finish before trying the dev-browser transport"
+                    );
+                }
+                eprintln!(
+                    "info: connecting to Chrome — if prompted, click Allow in Chrome's remote debugging dialog"
+                );
+            }
+            run_script(&prepare_script, Some(60)).map_err(|err| {
+                if looks_like_dev_browser_connect_failure(&err) {
+                    err.context(
+                        "dev-browser could not connect to Chrome. Chrome may be showing an \"Allow remote debugging?\" dialog — click Allow in Chrome, then retry."
+                    )
+                } else {
+                    err
+                }
+            })?
+        };
+        let prepare: ChatgptPrepareResult =
+            parse_script_json("parse chatgpt prepare result", &prepare_stdout)?;
+        match prepare.status.as_str() {
+            "ready" if prepare.logged_in && prepare.composer_ready => {}
+            "login_required" => {
+                return Err(anyhow!(
+                    "chatgpt login required in the attached Chrome session. Log in there and try again."
+                ));
+            }
+            "not_ready" => {
+                return Err(anyhow!(
+                    "ChatGPT did not finish loading the composer on {}. Restart Chrome with chrome://inspect/#remote-debugging enabled and try again.",
+                    prepare.url
+                ));
+            }
+            other => {
+                return Err(anyhow!(
+                    "unexpected ChatGPT prepare status `{other}` on {}",
+                    prepare.url
+                ));
+            }
+        }
 
-    let (response, warnings) = parse_chatgpt_recipe_result(&stdout, ctx.poll_settings.timeout_ms)?;
+        let send_script = build_chatgpt_send_script(
+            &page_name,
+            &ctx.prompt,
+            &delivery_text,
+            file_on_clipboard,
+            ctx.disable_extended,
+        );
+        let send_stdout = run_script(&send_script, Some(90))?;
+        let send: ChatgptSendResult = parse_script_json("parse chatgpt send result", &send_stdout)?;
+        if send.status != "sent" {
+            return Err(anyhow!("unexpected ChatGPT send status `{}`", send.status));
+        }
+        if let Some(warning) = send.warning {
+            warnings.push(warning);
+        }
+
+        let poll_script = build_chatgpt_poll_script(
+            &page_name,
+            send.assistant_count_before_send,
+            ctx.poll_settings,
+            ctx.allow_empty_response,
+        );
+        let poll_stdout = run_script(
+            &poll_script,
+            Some(chatgpt_script_timeout_secs(ctx.poll_settings.timeout_ms)),
+        )?;
+        let (response, mut poll_warnings) =
+            parse_chatgpt_recipe_result(&poll_stdout, ctx.poll_settings.timeout_ms)?;
+        warnings.append(&mut poll_warnings);
+        Ok((response, warnings))
+    })();
+    cleanup(cdp_endpoint)?;
+
+    let (response, warnings) = result?;
     for warning in warnings {
         eprintln!("warn: {warning}");
     }
-
     Ok(response)
-}
-
-/// Run a generic dev-browser recipe from a YAML recipe file.
-/// Converts each YAML step into equivalent Playwright JS and executes
-/// as a single script.
-#[allow(dead_code)]
-pub fn run_yaml_recipe(
-    recipe_steps: &[(String, Option<Vec<String>>)],
-    vars: &BTreeMap<String, String>,
-    bundle_path: Option<&Path>,
-    timeout_secs: Option<u64>,
-) -> Result<String> {
-    let mut script_parts = Vec::new();
-    let mut staged_files = Vec::new();
-
-    // Open a named page for persistence
-    script_parts.push("const page = await browser.getPage('yoetz-recipe');".to_string());
-
-    for (action, args) in recipe_steps {
-        let args_ref = args.as_deref().unwrap_or_default();
-        match action.as_str() {
-            "eval" => {
-                if let Some(code) = args_ref.first() {
-                    let mut interpolated = code.clone();
-                    for (key, value) in vars {
-                        let json_needle = format!("{{{{{key}|json}}}}");
-                        interpolated = interpolated
-                            .replace(&json_needle, &serde_json::to_string(value).unwrap());
-                        let needle = format!("{{{{{key}}}}}");
-                        interpolated = interpolated.replace(&needle, value);
-                    }
-                    script_parts.push(format!(
-                        "await page.evaluate(() => {{ {} }});",
-                        interpolated
-                    ));
-                }
-            }
-            "snapshot" => {
-                script_parts.push(
-                    "const snap = await page.evaluate(() => document.body.innerText); console.log(snap);".to_string()
-                );
-            }
-            "upload" => {
-                if args_ref.len() >= 2 {
-                    if let Some(bp) = bundle_path {
-                        let content = fs::read_to_string(bp)?;
-                        let name = bp
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("upload.txt");
-                        let path = stage_file(name, &content)?;
-                        staged_files.push(StagedFileGuard::new(path));
-                        let name_json = serde_json::to_string(name).unwrap();
-                        script_parts.push(format!(
-                            r#"{{
-    const content = await readFile({name_json});
-    await page.evaluate((args) => {{
-        const [c, n] = args;
-        const f = new File([c], n, {{ type: "text/plain" }});
-        const dt = new DataTransfer();
-        dt.items.add(f);
-        const input = document.querySelector({selector_json});
-        if (input) {{ input.files = dt.files; input.dispatchEvent(new Event('change', {{ bubbles: true }})); }}
-    }}, [content, {name_json}]);
-}}"#,
-                            name_json = name_json,
-                            selector_json = serde_json::to_string(&args_ref[0]).unwrap(),
-                        ));
-                    }
-                }
-            }
-            _ => {
-                // For unknown actions, try as page method call
-                eprintln!("warn: unknown recipe action '{action}', skipping");
-            }
-        }
-    }
-
-    let full_script = script_parts.join("\n");
-    run_script_connect(&full_script, timeout_secs)
-}
-
-/// Take a screenshot of the current page via dev-browser.
-#[allow(dead_code)]
-pub fn take_screenshot(name: &str) -> Result<PathBuf> {
-    let name_json = serde_json::to_string(name).unwrap();
-    let script = format!(
-        r#"
-const pages = await browser.listPages();
-const chatgpt = pages.find(p => p.url.includes("chatgpt.com"));
-if (chatgpt) {{
-    const page = await browser.getPage(chatgpt.id);
-    const buf = await page.screenshot();
-    const path = await saveScreenshot(buf, {name_json});
-    console.log(path);
-}} else {{
-    const page = await browser.newPage();
-    const buf = await page.screenshot();
-    const path = await saveScreenshot(buf, {name_json});
-    console.log(path);
-}}
-"#,
-    );
-    let stdout = run_script_connect(&script, Some(15))?;
-    Ok(PathBuf::from(stdout.trim()))
-}
-
-/// Get the text content of the current ChatGPT page.
-#[allow(dead_code)]
-pub fn get_chatgpt_page_text() -> Result<String> {
-    let script = r#"
-const pages = await browser.listPages();
-const chatgpt = pages.find(p => p.url.includes("chatgpt.com"));
-if (chatgpt) {
-    const page = await browser.getPage(chatgpt.id);
-    const text = await page.evaluate(() => document.body.innerText);
-    console.log(text);
-} else {
-    console.log("");
-}
-"#;
-    run_script_connect(script, Some(15))
 }
 
 #[cfg(test)]
@@ -1263,16 +1363,6 @@ mod tests {
         assert!(path.exists());
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "hello world");
-        let _ = fs::remove_file(&path);
-    }
-
-    #[test]
-    fn test_stage_file_bytes() {
-        let data = b"binary content \x00\x01\x02";
-        let path = stage_file_bytes("test_binary.bin", data).unwrap();
-        assert!(path.exists());
-        let content = fs::read(&path).unwrap();
-        assert_eq!(content, data);
         let _ = fs::remove_file(&path);
     }
 
@@ -1323,10 +1413,27 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_dev_browser_connect_failure_matches_connect_timeout() {
+        let err = anyhow!(
+            "browser.newPage: Timeout 30000ms exceeded while waiting for connectOverCDP"
+        );
+        assert!(looks_like_dev_browser_connect_failure(&err));
+
+        let other = anyhow!("ChatGPT response timed out after 900000ms");
+        assert!(!looks_like_dev_browser_connect_failure(&other));
+    }
+
+    #[test]
     fn connect_args_include_optional_endpoint() {
         assert_eq!(
-            connect_args(30, Some("http://127.0.0.1:9222")),
+            connect_args(
+                30,
+                Some("yoetz-chatgpt-browser"),
+                Some("http://127.0.0.1:9222"),
+            ),
             vec![
+                "--browser".to_string(),
+                "yoetz-chatgpt-browser".to_string(),
                 "--connect".to_string(),
                 "http://127.0.0.1:9222".to_string(),
                 "--timeout".to_string(),
@@ -1334,7 +1441,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            connect_args(45, None),
+            connect_args(45, None, None),
             vec![
                 "--connect".to_string(),
                 "--timeout".to_string(),
@@ -1344,133 +1451,150 @@ mod tests {
     }
 
     #[test]
-    fn build_chatgpt_recipe_script_uses_poll_settings_and_stable_idle_detection() {
-        let script = build_chatgpt_recipe_script(
-            &DevBrowserRecipeContext {
-                prompt: "test prompt".to_string(),
-                poll_settings: ChatgptPollSettings {
-                    timeout_ms: 900_000,
-                    interval_ms: 45_000,
-                },
-                ..Default::default()
-            },
-            None,
+    fn parse_devtools_active_port_returns_browser_ws_url() {
+        let entry =
+            parse_devtools_active_port("9222\n/devtools/browser/test-browser-id\n").unwrap();
+
+        assert_eq!(entry.port, 9222);
+        assert_eq!(
+            entry.ws_url,
+            "ws://127.0.0.1:9222/devtools/browser/test-browser-id"
+        );
+    }
+
+    #[test]
+    fn parse_devtools_active_port_rejects_malformed_payload() {
+        assert!(
+            parse_devtools_active_port("9222\n/devtools/page/not-a-browser-target\n").is_none()
+        );
+        assert!(parse_devtools_active_port("not-a-port\n/devtools/browser/test\n").is_none());
+    }
+
+    #[test]
+    fn json_version_url_normalizes_http_and_ws_endpoints() {
+        assert_eq!(
+            json_version_url("http://127.0.0.1:9222/devtools/browser/test")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:9222/json/version"
+        );
+        assert_eq!(
+            json_version_url("ws://127.0.0.1:9222/devtools/browser/test")
+                .unwrap()
+                .as_str(),
+            "http://127.0.0.1:9222/json/version"
+        );
+    }
+
+    #[test]
+    fn resolve_dev_browser_connect_endpoint_skips_probing_for_auto_connect() {
+        assert_eq!(resolve_dev_browser_connect_endpoint(None).unwrap(), None);
+    }
+
+    #[test]
+    fn probe_cdp_candidate_marks_local_404_as_poisoned() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let _ = stream.read(&mut request);
+            stream
+                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+
+        let candidate = CdpCandidate {
+            endpoint: format!("http://127.0.0.1:{}", addr.port()),
+            source: "test".to_string(),
+        };
+        let outcome = probe_cdp_candidate(&candidate);
+        server.join().unwrap();
+
+        match outcome {
+            CdpProbeOutcome::Poisoned(detail) => {
+                assert!(detail.contains("HTTP 404"));
+                assert!(detail.contains(CDP_HALF_STATE_MARKER));
+            }
+            other => panic!("expected poisoned outcome, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_chatgpt_prepare_script_uses_named_page_and_login_check() {
+        let script = build_chatgpt_prepare_script("yoetz-chatgpt-test", "gpt-5-4-pro");
+
+        assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
+        assert!(script.contains("const MODEL = \"gpt-5-4-pro\";"));
+        assert!(script.contains("const page = await browser.getPage(PAGE_NAME);"));
+        assert!(script.contains("await page.goto(\"https://chatgpt.com/\");"));
+        assert!(script.contains("[data-testid='login-button']"));
+        assert!(script.contains(
+            "status: !loggedIn ? \"login_required\" : composerReady ? \"ready\" : \"not_ready\""
+        ));
+    }
+
+    #[test]
+    fn build_chatgpt_send_script_uses_clipboard_upload_and_press_sequentially() {
+        let script = build_chatgpt_send_script(
+            "yoetz-chatgpt-test",
+            "Review this file.",
+            "Review this file.",
+            true,
+            true,
         );
 
+        assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
+        assert!(script.contains("const FILE_ON_CLIPBOARD = true;"));
+        assert!(script.contains("await composer.waitFor({ state: \"visible\", timeout: 15000 });"));
+        assert!(script.contains("await page.keyboard.press(\"Meta+v\");"));
+        assert!(script.contains("file not attached after clipboard paste"));
+        assert!(script.contains("[class*='file-tile'], [data-testid*='attachment']"));
+        assert!(script.contains("pressSequentially(DELIVERY_TEXT, { delay: 15 })"));
+        assert!(script.contains("status: \"sent\""));
+    }
+
+    #[test]
+    fn parse_script_json_reads_prepare_result() {
+        let result: ChatgptPrepareResult = parse_script_json(
+            "prepare",
+            r#"{"status":"ready","loggedIn":true,"composerReady":true,"url":"https://chatgpt.com/"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(result.status, "ready");
+        assert!(result.logged_in);
+        assert!(result.composer_ready);
+    }
+
+    #[test]
+    fn build_chatgpt_poll_script_waits_for_stable_non_thinking_idle() {
+        let script = build_chatgpt_poll_script(
+            "yoetz-chatgpt-test",
+            3,
+            ChatgptPollSettings {
+                timeout_ms: 900_000,
+                interval_ms: 45_000,
+            },
+            false,
+        );
+
+        assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
+        assert!(script.contains("const BASELINE = 3;"));
         assert!(script.contains("const POLL_TIMEOUT_MS = 900000;"));
         assert!(script.contains("const POLL_INTERVAL_MS = 45000;"));
         assert!(script.contains("const ALLOW_EMPTY_RESPONSE = false;"));
-        assert!(script.contains("const warnings = [];"));
-        assert!(script.contains("const COMPOSER_READY_TIMEOUT_MS = 15000;"));
-        assert!(script.contains("const SEND_READY_TIMEOUT_MS = 30000;"));
-        assert!(script.contains("const SEND_READY_INTERVAL_MS = 1000;"));
-        assert!(script.contains("function warningSuffix()"));
-        assert!(script.contains("async function waitForComposerReady(page)"));
-        assert!(script.contains("async function ensureFreshConversation(page)"));
-        assert!(script.contains("async function waitForSendButtonReady(page)"));
-        assert!(script.contains("const ASSISTANT_COUNT_BEFORE_SEND = await page.evaluate"));
-        assert!(script.contains("let idleFingerprint = null;"));
-        assert!(script.contains("let lastPollState = null;"));
-        assert!(script.contains(
-            ".result-thinking, [class*=\"result-thinking\"], [data-testid*=\"thinking\"]"
-        ));
-        assert!(script.contains("idleFingerprint === fingerprint"));
-        assert!(!script.contains("await page.waitForTimeout(2000);\n        completed = true;"));
-        assert!(script.contains(
-            "\" after waiting for ChatGPT to finish processing the prompt/attachment (\""
-        ));
-        assert!(script.contains("newAssistantMessages = assistantMessages.slice(baselineCount)"));
-        assert!(script.contains("ChatGPT returned an empty response"));
-        assert!(script.contains("await ensureFreshConversation(page);"));
-        assert!(script.contains("const page = await browser.newPage();"));
-        assert!(script
-            .contains("await page.waitForURL('**/c/**', { timeout: 10000 }).catch(() => {});"));
-        // Error detection must be scoped to error UI elements, not full page body.
-        // Scanning document.body.innerText causes false positives when conversation
-        // text or page chrome contains error-like phrases.
-        assert!(
-            script.contains(r#"document.querySelector("#),
-            "error detection should use querySelector on specific error elements"
-        );
-        assert!(
-            script.contains("[role=\"alert\"]"),
-            "error detection should check role=alert elements"
-        );
-        assert!(
-            !script.contains("document.body.innerText.toLowerCase();\n        const errors"),
-            "error detection must NOT scan full page body text"
-        );
-        // File upload uses native filechooser + setFiles(FilePayload).
-        // Buffer must come from Uint8Array (not string — QuickJS base64).
-        assert!(
-            script.contains("waitForEvent('filechooser'")
-                || script.contains("waitForEvent(\"filechooser\""),
-            "file upload should use filechooser event"
-        );
-        assert!(
-            script.contains("setFiles"),
-            "file upload should use setFiles with FilePayload"
-        );
-        assert!(
-            script.contains(
-                "const addFilesMenuItem = page.getByRole('menuitem', { name: /add photos & files/i }).first();"
-            ),
-            "upload menu selection should resolve a role+name menu item"
-        );
-        assert!(
-            script.contains("await addFilesMenuItem.waitFor({ state: 'visible', timeout: 5000 });"),
-            "upload menu item should be awaited before click"
-        );
-        assert!(
-            script.contains("addFilesMenuItem.click()"),
-            "upload menu selection should click the awaited menu item"
-        );
-        assert!(
-            script.contains("Buffer.from(new Uint8Array("),
-            "Buffer must be constructed from Uint8Array, not string"
-        );
-        assert!(
-            script.contains("keyboard.type"),
-            "text input should use keyboard.type (not fill/execCommand)"
-        );
-        assert!(
-            script.contains("await waitForSendButtonReady(page);"),
-            "script should wait for ChatGPT to re-enable send after attachment processing"
-        );
-        assert!(
-            script.contains("await modelBtn.waitFor({ state: 'visible', timeout: 5000 });"),
-            "model selector button should use a 5s wait timeout"
-        );
-        assert!(
-            script.contains("await menuItem.waitFor({ state: 'visible', timeout: 5000 });"),
-            "menu item search should use a 5s wait timeout"
-        );
-        assert!(
-            !script.contains("warnings.push(\"model selection failed (\" + detail + \"), using current model\");"),
-            "explicit model selection should no longer degrade to a warning"
-        );
-        assert!(
-            script.contains("warnings,"),
-            "recipe result should include script warnings"
-        );
-        assert!(
-            !script.contains("console.error(\"warn: model selection failed"),
-            "model selection warnings should not be written to stderr and lost"
-        );
-        assert!(
-            !script.contains("bodyText.includes(\"pro thinking\")"),
-            "thinking detection should not rely on English body text"
-        );
-        assert!(
-            script.contains(
-                "sendState: !sendBtn ? \"missing\" : sendBtn.disabled ? \"disabled\" : \"enabled\""
-            ),
-            "poll state should expose explicit send state"
-        );
-        assert!(
-            script.contains("pollState.sendState === \"enabled\""),
-            "poll completion should key off the explicit send state"
-        );
+        assert!(script.contains("let lastResponseText = null;"));
+        assert!(script.contains(".result-thinking, [data-testid*='thinking']"));
+        assert!(script.contains("[data-testid='stop-button']"));
+        assert!(script.contains("[data-message-author-role='assistant']"));
+        assert!(script.contains("!state.hasThinkingIndicator"));
+        assert!(script.contains("state.response === lastResponseText"));
+        assert!(script.contains("status: \"ok\""));
+        assert!(script.contains("status: \"timeout\""));
     }
 
     #[test]

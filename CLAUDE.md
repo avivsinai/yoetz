@@ -21,7 +21,7 @@ cargo fmt                      # Format code
 cargo clippy                   # Lint
 ```
 
-Tests use WireMock for HTTP mocking - no API keys needed for `cargo test`.
+Tests use `assert_cmd`, `predicates`, and `serial_test` — no API keys needed for `cargo test`.
 
 ## Release
 
@@ -68,6 +68,28 @@ commit drive the entire pipeline, not replacing the release pipeline.
 - Use `anyhow::Result` for CLI, `thiserror` for library errors
 - Async with `tokio`
 - Follow existing patterns in the crate you're modifying
+
+## dev-browser Recipe Constraints
+
+When editing `crates/yoetz-cli/src/dev_browser.rs` or adding new ChatGPT/browser
+recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
+
+- The sandbox is QuickJS. Keep recipe scripts small and linear.
+- Avoid large generated scripts, nested async helpers, or closure-heavy control
+  flow. Prefer micro-scripts orchestrated from Rust.
+- Use named pages via `browser.getPage(name)` / `browser.listPages()` to carry
+  state across scripts.
+- Use `console.log(JSON.stringify(...))` as the script-to-Rust IPC boundary.
+- Prefer Playwright actions on the page plus Rust orchestration. Do not assume
+  Node features such as `require`, arbitrary `fs`, or `fetch`.
+- For contenteditable ChatGPT inputs, use typing APIs such as
+  `pressSequentially` instead of `fill()`.
+- For file upload, the ChatGPT recipe uses macOS clipboard paste via `osascript`
+  (set clipboard to POSIX file, then `Meta+v` in the composer). This avoids
+  QuickJS buffer limitations and native file dialog issues with `setInputFiles`.
+  Non-macOS platforms currently fall back to paste mode (inline text).
+- The QuickJS GC crash recovery in `dev_browser.rs` can salvage stdout from a
+  completed script, but recipe correctness must not depend on that recovery.
 
 ## Provider Configuration
 

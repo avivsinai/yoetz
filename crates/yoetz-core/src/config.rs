@@ -74,6 +74,11 @@ impl Config {
 
     fn merge(&mut self, other: ConfigFile, trusted: bool, source: &Path) {
         if let Some(defaults) = other.defaults {
+            let defaults = if trusted {
+                defaults
+            } else {
+                sanitize_untrusted_defaults(defaults, source)
+            };
             merge_defaults(&mut self.defaults, defaults);
         }
         if let Some(providers) = other.providers {
@@ -105,6 +110,22 @@ impl Config {
             self.aliases.extend(aliases);
         }
     }
+}
+
+fn sanitize_untrusted_defaults(mut defaults: Defaults, source: &Path) -> Defaults {
+    if defaults.browser_profile.take().is_some() {
+        eprintln!(
+            "warning: ignoring defaults.browser_profile from untrusted config {}",
+            source.display()
+        );
+    }
+    if defaults.browser_cdp.take().is_some() {
+        eprintln!(
+            "warning: ignoring defaults.browser_cdp from untrusted config {}",
+            source.display()
+        );
+    }
+    defaults
 }
 
 fn load_config_file(path: &Path) -> Result<ConfigFile> {
@@ -225,6 +246,8 @@ model = "gpt-5-4-pro"
         let file = ConfigFile {
             defaults: Some(Defaults {
                 model: Some("gpt-5-4-pro".to_string()),
+                browser_profile: Some("/tmp/evil-profile".to_string()),
+                browser_cdp: Some("http://evil.example.com:9222".to_string()),
                 ..Default::default()
             }),
             providers: Some(HashMap::from([(
@@ -247,6 +270,8 @@ model = "gpt-5-4-pro"
         config.merge(file, false, Path::new("./yoetz.toml"));
         // Safe fields applied
         assert_eq!(config.defaults.model.as_deref(), Some("gpt-5-4-pro"));
+        assert!(config.defaults.browser_profile.is_none());
+        assert!(config.defaults.browser_cdp.is_none());
         assert_eq!(
             config.aliases.get("fast").map(|s| s.as_str()),
             Some("gpt-5-4-pro")

@@ -641,6 +641,8 @@ struct CouncilResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     bundle: Option<yoetz_core::types::Bundle>,
     results: Vec<CouncilModelResult>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    errors: Vec<CouncilModelError>,
     pricing: CouncilPricing,
     usage: Usage,
     artifacts: ArtifactPaths,
@@ -656,6 +658,13 @@ struct CouncilModelResult {
 }
 
 #[derive(Debug, Serialize)]
+struct CouncilModelError {
+    model: String,
+    provider: String,
+    error: String,
+}
+
+#[derive(Debug, Serialize)]
 struct CouncilPricing {
     estimate_usd_total: Option<f64>,
     per_model: Vec<ModelEstimate>,
@@ -667,50 +676,53 @@ struct ModelEstimate {
     estimate_usd: Option<f64>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Capture security-sensitive env vars before dotenv loading.
-    // CWD .env files must not override executable paths (supply-chain risk)
-    // or redirect API keys to attacker-controlled endpoints.
-    let pre_agent_bin = env::var("YOETZ_AGENT_BROWSER_BIN").ok();
-    let pre_scripts_dir = env::var("YOETZ_SCRIPTS_DIR").ok();
+const PROTECTED_DOTENV_ENV_VARS: &[&str] = &[
+    "YOETZ_AGENT_BROWSER_BIN",
+    "YOETZ_DEV_BROWSER_BIN",
+    "YOETZ_SCRIPTS_DIR",
+    "YOETZ_CONFIG_PATH",
+    "YOETZ_REGISTRY_PATH",
+    "YOETZ_BROWSER_CDP",
+    "YOETZ_BROWSER_PROFILE",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+];
 
-    // Capture API key env vars so CWD .env cannot silently replace them.
-    const PROTECTED_API_KEYS: &[&str] = &[
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "XAI_API_KEY",
-    ];
-    let pre_api_keys: Vec<(&str, Option<String>)> = PROTECTED_API_KEYS
+fn snapshot_protected_dotenv_env() -> Vec<(&'static str, Option<String>)> {
+    PROTECTED_DOTENV_ENV_VARS
         .iter()
-        .map(|&k| (k, env::var(k).ok()))
-        .collect();
+        .map(|&key| (key, env::var(key).ok()))
+        .collect()
+}
 
-    // Load environment files (.env.local takes precedence over .env)
-    dotenvy::from_filename(".env.local").ok();
-    dotenvy::dotenv().ok();
-
-    // Prevent CWD .env from overriding executable paths (security)
-    if pre_agent_bin.is_none() {
-        env::remove_var("YOETZ_AGENT_BROWSER_BIN");
-    }
-    if pre_scripts_dir.is_none() {
-        env::remove_var("YOETZ_SCRIPTS_DIR");
-    }
-
-    // Restore API key env vars if .env changed them (prevent credential hijack)
-    for (key, pre_value) in &pre_api_keys {
+fn restore_protected_dotenv_env(snapshot: &[(&str, Option<String>)]) {
+    for (key, pre_value) in snapshot {
         let post_value = env::var(key).ok();
         if post_value != *pre_value {
             match pre_value {
-                Some(v) => env::set_var(key, v),
+                Some(value) => env::set_var(key, value),
                 None => env::remove_var(key),
             }
             eprintln!("warning: CWD .env tried to override {key}, ignored");
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Capture security-sensitive env vars before dotenv loading.
+    // CWD .env files must not override executable paths (supply-chain risk)
+    // or redirect config, registry, browser targets, or API keys.
+    let protected_env = snapshot_protected_dotenv_env();
+
+    // Load environment files (.env.local takes precedence over .env)
+    dotenvy::from_filename(".env.local").ok();
+    dotenvy::dotenv().ok();
+
+    restore_protected_dotenv_env(&protected_env);
 
     let cli = Cli::parse();
     let format = resolve_format(cli.format.as_deref())?;
@@ -875,6 +887,34 @@ fn format_recipe_transport_errors(errors: &[(browser::RecipeTransport, String)])
     format!("all browser recipe transports failed:\n- {joined}")
 }
 
+fn print_recipe_chrome_approval_message(transport: browser::RecipeTransport) {
+    eprintln!(
+        "info: connecting to Chrome via {} — if prompted, click Allow in Chrome's remote debugging dialog",
+        recipe_transport_name(transport)
+    );
+}
+
+fn print_recipe_chrome_approval_lock_wait_message(transport: browser::RecipeTransport) {
+    eprintln!(
+        "info: another yoetz process is already requesting Chrome approval; waiting for it to finish before trying the {} transport",
+        recipe_transport_name(transport)
+    );
+}
+
+fn recipe_has_remaining_manual_fallback(
+    transports: &[browser::RecipeTransport],
+    current_index: usize,
+) -> bool {
+    transports[current_index + 1..]
+        .iter()
+        .copied()
+        .any(|next| matches!(next, browser::RecipeTransport::Manual))
+}
+
+fn recipe_should_stop_live_transport_fallback(err: &anyhow::Error) -> bool {
+    browser::is_chrome_approval_wait_error(err)
+}
+
 fn run_recipe_via_dev_browser(
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
@@ -894,7 +934,9 @@ fn run_recipe_via_dev_browser(
     }
 
     dev_browser::ensure_installed()?;
-    dev_browser::ensure_chatgpt_auth_with_endpoint(cdp_endpoint)?;
+    // The recipe prepare micro-script already verifies ChatGPT login state on the
+    // named page. Avoid a separate pre-flight attach here because it can trigger
+    // a fresh approval-gated CDP connection and block an otherwise working flow.
 
     let paste_mode = recipe_vars
         .get("paste")
@@ -926,6 +968,7 @@ fn run_recipe_via_dev_browser(
             .get("allow_empty_response")
             .is_some_and(|value| value == "true"),
         cdp_endpoint: cdp_endpoint.map(str::to_owned),
+        show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
     };
 
     let response = dev_browser::run_chatgpt_recipe(&recipe_ctx)?;
@@ -966,6 +1009,15 @@ fn run_recipe_via_agent_browser(
     let needs_auth = is_chatgpt;
     let live_connection = if needs_auth {
         if let Some(endpoint) = cdp_endpoint.map(str::to_owned) {
+            let approval_lock = browser::acquire_chrome_approval_lock()?;
+            if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+                if approval_lock.waited() {
+                    print_recipe_chrome_approval_lock_wait_message(
+                        browser::RecipeTransport::AgentBrowser,
+                    );
+                }
+                print_recipe_chrome_approval_message(browser::RecipeTransport::AgentBrowser);
+            }
             match browser::try_cdp_attach(&endpoint, browser::CHATGPT_URL) {
                 Ok(()) => Some(browser::BrowserConnection::Cdp { endpoint }),
                 Err(e) => {
@@ -982,6 +1034,18 @@ fn run_recipe_via_agent_browser(
                 }
             }
         } else {
+            let approval_lock = browser::acquire_chrome_approval_lock()?;
+            let should_warn_about_approval = !browser::is_daemon_healthy();
+            if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+                if approval_lock.waited() {
+                    print_recipe_chrome_approval_lock_wait_message(
+                        browser::RecipeTransport::AgentBrowser,
+                    );
+                }
+                if should_warn_about_approval {
+                    print_recipe_chrome_approval_message(browser::RecipeTransport::AgentBrowser);
+                }
+            }
             match browser::try_auto_connect_lite() {
                 Ok(()) => Some(browser::BrowserConnection::AutoConnect),
                 Err(_) => {
@@ -1288,7 +1352,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 .with_context(|| format!("resolve recipe {:?}", recipe_args.recipe))?;
             let content = fs::read_to_string(&recipe_path)
                 .with_context(|| format!("read recipe {}", recipe_path.display()))?;
-            let recipe: browser::Recipe = serde_yaml::from_str(&content)?;
+            let recipe: browser::Recipe = serde_yml::from_str(&content)?;
             let recipe_vars =
                 browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)?;
             let profile_dir =
@@ -1297,9 +1361,11 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             let cdp_endpoint =
                 browser::resolve_cdp_endpoint(recipe_args.cdp.as_deref(), &ctx.config);
             let transports = browser::recipe_transports(&recipe, is_chatgpt);
+            let manual_fallback =
+                manual_browser_recipe_fallback(&recipe_path, recipe_args.bundle.as_deref());
             let mut transport_errors = Vec::new();
 
-            for transport in transports {
+            for (index, transport) in transports.iter().copied().enumerate() {
                 let result = match transport {
                     browser::RecipeTransport::DevBrowser => run_recipe_via_dev_browser(
                         &recipe_args,
@@ -1319,13 +1385,21 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     ),
                     browser::RecipeTransport::Manual => Err(anyhow!(
                         "{}",
-                        manual_browser_recipe_fallback(&recipe_path, recipe_args.bundle.as_deref())
+                        manual_fallback
                     )),
                 };
 
                 match result {
                     Ok(()) => return Ok(()),
                     Err(err) => {
+                        if recipe_should_stop_live_transport_fallback(&err) {
+                            transport_errors.push((transport, err.to_string()));
+                            if recipe_has_remaining_manual_fallback(&transports, index) {
+                                transport_errors
+                                    .push((browser::RecipeTransport::Manual, manual_fallback.clone()));
+                            }
+                            break;
+                        }
                         if !matches!(transport, browser::RecipeTransport::Manual) {
                             eprintln!(
                                 "info: {} transport failed ({err}), trying next transport",
@@ -1879,6 +1953,44 @@ mod tests {
             normalize_model_name_with_aliases("google/fast", &aliases),
             "google/gemini-3-flash-preview"
         );
+    }
+
+    #[test]
+    fn protected_dotenv_env_vars_cover_sensitive_paths_and_targets() {
+        for key in [
+            "YOETZ_CONFIG_PATH",
+            "YOETZ_REGISTRY_PATH",
+            "YOETZ_BROWSER_CDP",
+            "YOETZ_BROWSER_PROFILE",
+        ] {
+            assert!(PROTECTED_DOTENV_ENV_VARS.contains(&key), "{key} must stay protected");
+        }
+    }
+
+    #[test]
+    fn recipe_should_stop_live_transport_fallback_on_approval_wait() {
+        let err = anyhow!(
+            "live browser attach timed out (30s). Chrome may be showing an \"Allow remote debugging?\" dialog — please click Allow in Chrome, then retry."
+        );
+        assert!(recipe_should_stop_live_transport_fallback(&err));
+    }
+
+    #[test]
+    fn recipe_should_not_stop_live_transport_fallback_on_non_approval_error() {
+        let err = anyhow!("chatgpt send button not found");
+        assert!(!recipe_should_stop_live_transport_fallback(&err));
+    }
+
+    #[test]
+    fn recipe_has_remaining_manual_fallback_detects_manual_transport() {
+        let transports = vec![
+            browser::RecipeTransport::DevBrowser,
+            browser::RecipeTransport::AgentBrowser,
+            browser::RecipeTransport::Manual,
+        ];
+        assert!(recipe_has_remaining_manual_fallback(&transports, 0));
+        assert!(recipe_has_remaining_manual_fallback(&transports, 1));
+        assert!(!recipe_has_remaining_manual_fallback(&transports, 2));
     }
 
     #[test]

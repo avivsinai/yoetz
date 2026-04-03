@@ -104,8 +104,7 @@ yoetz browser recipe --recipe <yaml> --bundle <path>
 ### `session` - Session management
 
 ```bash
-yoetz session list
-yoetz session show <id>
+yoetz session <id>
 ```
 
 ### `status` - Show configuration status
@@ -117,5 +116,5 @@ yoetz status
 ### `apply` - Apply code changes from review
 
 ```bash
-yoetz apply <session-id>
+yoetz apply --patch-file <path> [--check] [--reverse]
 ```
