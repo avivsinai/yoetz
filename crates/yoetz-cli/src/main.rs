@@ -676,54 +676,53 @@ struct ModelEstimate {
     estimate_usd: Option<f64>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Capture security-sensitive env vars before dotenv loading.
-    // CWD .env files must not override executable paths (supply-chain risk)
-    // or redirect API keys to attacker-controlled endpoints.
-    let pre_agent_bin = env::var("YOETZ_AGENT_BROWSER_BIN").ok();
-    let pre_dev_browser_bin = env::var("YOETZ_DEV_BROWSER_BIN").ok();
-    let pre_scripts_dir = env::var("YOETZ_SCRIPTS_DIR").ok();
+const PROTECTED_DOTENV_ENV_VARS: &[&str] = &[
+    "YOETZ_AGENT_BROWSER_BIN",
+    "YOETZ_DEV_BROWSER_BIN",
+    "YOETZ_SCRIPTS_DIR",
+    "YOETZ_CONFIG_PATH",
+    "YOETZ_REGISTRY_PATH",
+    "YOETZ_BROWSER_CDP",
+    "YOETZ_BROWSER_PROFILE",
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "XAI_API_KEY",
+];
 
-    // Capture API key env vars so CWD .env cannot silently replace them.
-    const PROTECTED_API_KEYS: &[&str] = &[
-        "OPENAI_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENROUTER_API_KEY",
-        "XAI_API_KEY",
-    ];
-    let pre_api_keys: Vec<(&str, Option<String>)> = PROTECTED_API_KEYS
+fn snapshot_protected_dotenv_env() -> Vec<(&'static str, Option<String>)> {
+    PROTECTED_DOTENV_ENV_VARS
         .iter()
-        .map(|&k| (k, env::var(k).ok()))
-        .collect();
+        .map(|&key| (key, env::var(key).ok()))
+        .collect()
+}
 
-    // Load environment files (.env.local takes precedence over .env)
-    dotenvy::from_filename(".env.local").ok();
-    dotenvy::dotenv().ok();
-
-    // Prevent CWD .env from overriding executable paths (security)
-    if pre_agent_bin.is_none() {
-        env::remove_var("YOETZ_AGENT_BROWSER_BIN");
-    }
-    if pre_dev_browser_bin.is_none() {
-        env::remove_var("YOETZ_DEV_BROWSER_BIN");
-    }
-    if pre_scripts_dir.is_none() {
-        env::remove_var("YOETZ_SCRIPTS_DIR");
-    }
-
-    // Restore API key env vars if .env changed them (prevent credential hijack)
-    for (key, pre_value) in &pre_api_keys {
+fn restore_protected_dotenv_env(snapshot: &[(&str, Option<String>)]) {
+    for (key, pre_value) in snapshot {
         let post_value = env::var(key).ok();
         if post_value != *pre_value {
             match pre_value {
-                Some(v) => env::set_var(key, v),
+                Some(value) => env::set_var(key, value),
                 None => env::remove_var(key),
             }
             eprintln!("warning: CWD .env tried to override {key}, ignored");
         }
     }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Capture security-sensitive env vars before dotenv loading.
+    // CWD .env files must not override executable paths (supply-chain risk)
+    // or redirect config, registry, browser targets, or API keys.
+    let protected_env = snapshot_protected_dotenv_env();
+
+    // Load environment files (.env.local takes precedence over .env)
+    dotenvy::from_filename(".env.local").ok();
+    dotenvy::dotenv().ok();
+
+    restore_protected_dotenv_env(&protected_env);
 
     let cli = Cli::parse();
     let format = resolve_format(cli.format.as_deref())?;
@@ -1894,6 +1893,18 @@ mod tests {
             normalize_model_name_with_aliases("google/fast", &aliases),
             "google/gemini-3-flash-preview"
         );
+    }
+
+    #[test]
+    fn protected_dotenv_env_vars_cover_sensitive_paths_and_targets() {
+        for key in [
+            "YOETZ_CONFIG_PATH",
+            "YOETZ_REGISTRY_PATH",
+            "YOETZ_BROWSER_CDP",
+            "YOETZ_BROWSER_PROFILE",
+        ] {
+            assert!(PROTECTED_DOTENV_ENV_VARS.contains(&key), "{key} must stay protected");
+        }
     }
 
     #[test]
