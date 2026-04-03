@@ -887,6 +887,34 @@ fn format_recipe_transport_errors(errors: &[(browser::RecipeTransport, String)])
     format!("all browser recipe transports failed:\n- {joined}")
 }
 
+fn print_recipe_chrome_approval_message(transport: browser::RecipeTransport) {
+    eprintln!(
+        "info: connecting to Chrome via {} — if prompted, click Allow in Chrome's remote debugging dialog",
+        recipe_transport_name(transport)
+    );
+}
+
+fn print_recipe_chrome_approval_lock_wait_message(transport: browser::RecipeTransport) {
+    eprintln!(
+        "info: another yoetz process is already requesting Chrome approval; waiting for it to finish before trying the {} transport",
+        recipe_transport_name(transport)
+    );
+}
+
+fn recipe_has_remaining_manual_fallback(
+    transports: &[browser::RecipeTransport],
+    current_index: usize,
+) -> bool {
+    transports[current_index + 1..]
+        .iter()
+        .copied()
+        .any(|next| matches!(next, browser::RecipeTransport::Manual))
+}
+
+fn recipe_should_stop_live_transport_fallback(err: &anyhow::Error) -> bool {
+    browser::is_chrome_approval_wait_error(err)
+}
+
 fn run_recipe_via_dev_browser(
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
@@ -940,6 +968,7 @@ fn run_recipe_via_dev_browser(
             .get("allow_empty_response")
             .is_some_and(|value| value == "true"),
         cdp_endpoint: cdp_endpoint.map(str::to_owned),
+        show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
     };
 
     let response = dev_browser::run_chatgpt_recipe(&recipe_ctx)?;
@@ -980,6 +1009,15 @@ fn run_recipe_via_agent_browser(
     let needs_auth = is_chatgpt;
     let live_connection = if needs_auth {
         if let Some(endpoint) = cdp_endpoint.map(str::to_owned) {
+            let approval_lock = browser::acquire_chrome_approval_lock()?;
+            if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+                if approval_lock.waited() {
+                    print_recipe_chrome_approval_lock_wait_message(
+                        browser::RecipeTransport::AgentBrowser,
+                    );
+                }
+                print_recipe_chrome_approval_message(browser::RecipeTransport::AgentBrowser);
+            }
             match browser::try_cdp_attach(&endpoint, browser::CHATGPT_URL) {
                 Ok(()) => Some(browser::BrowserConnection::Cdp { endpoint }),
                 Err(e) => {
@@ -996,6 +1034,18 @@ fn run_recipe_via_agent_browser(
                 }
             }
         } else {
+            let approval_lock = browser::acquire_chrome_approval_lock()?;
+            let should_warn_about_approval = !browser::is_daemon_healthy();
+            if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+                if approval_lock.waited() {
+                    print_recipe_chrome_approval_lock_wait_message(
+                        browser::RecipeTransport::AgentBrowser,
+                    );
+                }
+                if should_warn_about_approval {
+                    print_recipe_chrome_approval_message(browser::RecipeTransport::AgentBrowser);
+                }
+            }
             match browser::try_auto_connect_lite() {
                 Ok(()) => Some(browser::BrowserConnection::AutoConnect),
                 Err(_) => {
@@ -1311,9 +1361,11 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             let cdp_endpoint =
                 browser::resolve_cdp_endpoint(recipe_args.cdp.as_deref(), &ctx.config);
             let transports = browser::recipe_transports(&recipe, is_chatgpt);
+            let manual_fallback =
+                manual_browser_recipe_fallback(&recipe_path, recipe_args.bundle.as_deref());
             let mut transport_errors = Vec::new();
 
-            for transport in transports {
+            for (index, transport) in transports.iter().copied().enumerate() {
                 let result = match transport {
                     browser::RecipeTransport::DevBrowser => run_recipe_via_dev_browser(
                         &recipe_args,
@@ -1333,13 +1385,21 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     ),
                     browser::RecipeTransport::Manual => Err(anyhow!(
                         "{}",
-                        manual_browser_recipe_fallback(&recipe_path, recipe_args.bundle.as_deref())
+                        manual_fallback
                     )),
                 };
 
                 match result {
                     Ok(()) => return Ok(()),
                     Err(err) => {
+                        if recipe_should_stop_live_transport_fallback(&err) {
+                            transport_errors.push((transport, err.to_string()));
+                            if recipe_has_remaining_manual_fallback(&transports, index) {
+                                transport_errors
+                                    .push((browser::RecipeTransport::Manual, manual_fallback.clone()));
+                            }
+                            break;
+                        }
                         if !matches!(transport, browser::RecipeTransport::Manual) {
                             eprintln!(
                                 "info: {} transport failed ({err}), trying next transport",
@@ -1905,6 +1965,32 @@ mod tests {
         ] {
             assert!(PROTECTED_DOTENV_ENV_VARS.contains(&key), "{key} must stay protected");
         }
+    }
+
+    #[test]
+    fn recipe_should_stop_live_transport_fallback_on_approval_wait() {
+        let err = anyhow!(
+            "live browser attach timed out (30s). Chrome may be showing an \"Allow remote debugging?\" dialog — please click Allow in Chrome, then retry."
+        );
+        assert!(recipe_should_stop_live_transport_fallback(&err));
+    }
+
+    #[test]
+    fn recipe_should_not_stop_live_transport_fallback_on_non_approval_error() {
+        let err = anyhow!("chatgpt send button not found");
+        assert!(!recipe_should_stop_live_transport_fallback(&err));
+    }
+
+    #[test]
+    fn recipe_has_remaining_manual_fallback_detects_manual_transport() {
+        let transports = vec![
+            browser::RecipeTransport::DevBrowser,
+            browser::RecipeTransport::AgentBrowser,
+            browser::RecipeTransport::Manual,
+        ];
+        assert!(recipe_has_remaining_manual_fallback(&transports, 0));
+        assert!(recipe_has_remaining_manual_fallback(&transports, 1));
+        assert!(!recipe_has_remaining_manual_fallback(&transports, 2));
     }
 
     #[test]

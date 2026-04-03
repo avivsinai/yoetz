@@ -1,9 +1,10 @@
 use anyhow::{anyhow, Context, Result};
+use fs2::FileExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,6 +36,7 @@ const CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT: u64 = 1_000;
 const DAEMON_APPROVAL_GRACE_WINDOW: Duration = Duration::from_secs(30);
 const LIVE_ATTACH_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const CDP_SESSION_NAME: &str = "yoetz-cdp";
+const CHROME_APPROVAL_LOCK_FILENAME: &str = "chrome-approval.lock";
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
     major: 24,
@@ -1083,6 +1085,65 @@ pub enum DaemonRecoveryAction {
     Healthy,
     AwaitingApproval,
     KilledStale,
+}
+
+#[derive(Debug)]
+pub struct ChromeApprovalLock {
+    _lock_file: File,
+    waited: bool,
+}
+
+impl ChromeApprovalLock {
+    pub fn waited(&self) -> bool {
+        self.waited
+    }
+}
+
+fn chrome_approval_lock_path() -> PathBuf {
+    if let Some(home) = home_dir() {
+        return home.join(".yoetz").join(CHROME_APPROVAL_LOCK_FILENAME);
+    }
+    PathBuf::from(".yoetz").join(CHROME_APPROVAL_LOCK_FILENAME)
+}
+
+pub fn acquire_chrome_approval_lock() -> Result<ChromeApprovalLock> {
+    let lock_path = chrome_approval_lock_path();
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open browser approval lock {}", lock_path.display()))?;
+
+    let waited = match file.try_lock_exclusive() {
+        Ok(()) => false,
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+            file.lock_exclusive()
+                .with_context(|| format!("lock browser approval {}", lock_path.display()))?;
+            true
+        }
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!("lock browser approval {}", lock_path.display())
+            });
+        }
+    };
+
+    Ok(ChromeApprovalLock {
+        _lock_file: file,
+        waited,
+    })
+}
+
+pub fn is_chrome_approval_wait_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}")
+        .to_lowercase()
+        .contains("allow remote debugging")
 }
 
 fn close_browser_daemon() -> Result<()> {
@@ -2961,6 +3022,13 @@ mod tests {
 
         let err = try_cdp_attach("http://127.0.0.1:9222", CHATGPT_URL).unwrap_err();
         assert!(allow_dialog_error(&err), "unexpected error: {err}");
+        assert!(is_chrome_approval_wait_error(&err));
+    }
+
+    #[test]
+    fn is_chrome_approval_wait_error_rejects_non_approval_timeouts() {
+        let err = anyhow!("ChatGPT response timed out after 900000ms");
+        assert!(!is_chrome_approval_wait_error(&err));
     }
 
     #[test]

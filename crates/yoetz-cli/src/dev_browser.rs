@@ -25,6 +25,8 @@ use std::sync::OnceLock;
 use reqwest::Url;
 use yoetz_core::paths::home_dir;
 
+use crate::browser;
+
 /// Cached dev-browser resolution.
 static DEV_BROWSER: OnceLock<String> = OnceLock::new();
 
@@ -802,6 +804,8 @@ pub struct DevBrowserRecipeContext {
     pub allow_empty_response: bool,
     /// Optional explicit CDP endpoint for selecting a specific Chrome instance.
     pub cdp_endpoint: Option<String>,
+    /// Whether to print interactive Chrome-approval guidance to stderr.
+    pub show_approval_guidance: bool,
 }
 
 impl Default for DevBrowserRecipeContext {
@@ -816,6 +820,7 @@ impl Default for DevBrowserRecipeContext {
             poll_settings: ChatgptPollSettings::default(),
             allow_empty_response: false,
             cdp_endpoint: None,
+            show_approval_guidance: false,
         }
     }
 }
@@ -844,6 +849,16 @@ fn parse_positive_u64_var(vars: &BTreeMap<String, String>, key: &str) -> Result<
         return Err(anyhow!("recipe var `{key}` must be greater than 0"));
     }
     Ok(Some(value))
+}
+
+fn looks_like_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_lowercase();
+    (message.contains("connectovercdp")
+        || message.contains("auto-connect")
+        || message.contains("auto connect")
+        || message.contains("could not connect to chrome")
+        || message.contains("browser.getversion"))
+        && (message.contains("timed out") || message.contains("timeout"))
 }
 
 fn chatgpt_script_timeout_secs(poll_timeout_ms: u64) -> u64 {
@@ -1244,7 +1259,28 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
         };
 
         let prepare_script = build_chatgpt_prepare_script(&page_name, &ctx.model);
-        let prepare_stdout = run_script(&prepare_script, Some(60))?;
+        let prepare_stdout = {
+            let approval_lock = browser::acquire_chrome_approval_lock()?;
+            if ctx.show_approval_guidance {
+                if approval_lock.waited() {
+                    eprintln!(
+                        "info: another yoetz process is already requesting Chrome approval; waiting for it to finish before trying the dev-browser transport"
+                    );
+                }
+                eprintln!(
+                    "info: connecting to Chrome — if prompted, click Allow in Chrome's remote debugging dialog"
+                );
+            }
+            run_script(&prepare_script, Some(60)).map_err(|err| {
+                if looks_like_dev_browser_connect_failure(&err) {
+                    err.context(
+                        "dev-browser could not connect to Chrome. Chrome may be showing an \"Allow remote debugging?\" dialog — click Allow in Chrome, then retry."
+                    )
+                } else {
+                    err
+                }
+            })?
+        };
         let prepare: ChatgptPrepareResult =
             parse_script_json("parse chatgpt prepare result", &prepare_stdout)?;
         match prepare.status.as_str() {
@@ -1373,6 +1409,17 @@ mod tests {
     #[test]
     fn chatgpt_script_timeout_secs_adds_grace_window() {
         assert_eq!(chatgpt_script_timeout_secs(1_800_000), 1_860);
+    }
+
+    #[test]
+    fn looks_like_dev_browser_connect_failure_matches_connect_timeout() {
+        let err = anyhow!(
+            "browser.newPage: Timeout 30000ms exceeded while waiting for connectOverCDP"
+        );
+        assert!(looks_like_dev_browser_connect_failure(&err));
+
+        let other = anyhow!("ChatGPT response timed out after 900000ms");
+        assert!(!looks_like_dev_browser_connect_failure(&other));
     }
 
     #[test]
