@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Security**: Pin all GitHub Actions to commit SHAs across ci.yml, release.yml, publish-skill.yml
+- Remove broken `push: tags: v*` trigger from standalone publish-skill.yml (GITHUB_TOKEN tag-push bug); keep only `workflow_dispatch` with `tag` input
+- Add `skip-downstream` dispatch input to release.yml for selective rerun of release without re-triggering publish-skills, update-homebrew, update-scoop
+- Scope permissions per job in release.yml (read for prepare/build, write for release)
+- Add concurrency and timeout-minutes to notify-marketplace.yml
+- Add missing timeout-minutes to check-skills and changes jobs in ci.yml
+
 ## [0.2.45] - 2026-04-03
 ### Added
 

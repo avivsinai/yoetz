@@ -9,9 +9,14 @@ on:
         description: "Existing tag to (re)release (e.g., v0.2.24)"
         required: true
         type: string
+      skip-skill-publish:
+        description: "Skip skill publishing (Homebrew/Scoop always update when release runs)"
+        required: false
+        type: boolean
+        default: true
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: "release-${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.sha }}"
@@ -26,6 +31,8 @@ jobs:
     if: "${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'chore(release): v') }}"
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: read
     outputs:
       tag: ${{ steps.prepare.outputs.tag }}
       version: ${{ steps.prepare.outputs.version }}
@@ -33,7 +40,7 @@ jobs:
       release_sha: ${{ steps.prepare.outputs.release_sha }}
       prerelease: ${{ steps.prepare.outputs.prerelease }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           fetch-depth: 0
 
@@ -139,6 +146,8 @@ jobs:
     if: needs.prepare.result == 'success'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -161,21 +170,21 @@ jobs:
             artifact: yoetz.exe
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ needs.prepare.outputs.release_ref }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: 24
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
 
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@cross
+        uses: taiki-e/install-action@9c28cc1e9a88ba271487a912a46f2ef66471dbc6 # cross
 
       - name: Build (native)
         if: "!matrix.cross"
@@ -211,7 +220,7 @@ jobs:
           npm ci --prefix staging/scripts --omit=dev --ignore-scripts
           Compress-Archive -Path "staging/*" -DestinationPath "yoetz-${{ matrix.target }}.zip"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
         with:
           name: yoetz-${{ matrix.target }}
           path: yoetz-${{ matrix.target }}.*
@@ -223,8 +232,10 @@ jobs:
     if: needs.prepare.result == 'success' && needs.build.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ needs.prepare.outputs.release_ref }}
           fetch-depth: 0
@@ -253,7 +264,7 @@ jobs:
             git push origin "refs/tags/${TAG}"
           fi
 
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
@@ -287,7 +298,7 @@ jobs:
           cat RELEASE_NOTES.md
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           target_commitish: ${{ needs.prepare.outputs.release_sha }}
@@ -304,15 +315,19 @@ jobs:
   publish-skills:
     name: Publish Skills
     needs: [prepare, release]
-    if: needs.prepare.result == 'success' && needs.release.result == 'success'
+    if: >-
+      needs.prepare.result == 'success' && needs.release.result == 'success'
+      && (github.event_name == 'push' || inputs.skip-skill-publish != true)
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ needs.prepare.outputs.release_ref }}
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: 20
 
@@ -391,9 +406,12 @@ jobs:
     needs: [prepare, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: ${{ needs.prepare.result == 'success' && needs.prepare.outputs.prerelease != 'true' }}
+    permissions:
+      contents: read
+    if: >-
+      needs.prepare.result == 'success' && needs.prepare.outputs.prerelease != 'true'
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
@@ -468,9 +486,12 @@ jobs:
     needs: [prepare, release]
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    if: ${{ needs.prepare.result == 'success' && needs.prepare.outputs.prerelease != 'true' }}
+    permissions:
+      contents: read
+    if: >-
+      needs.prepare.result == 'success' && needs.prepare.outputs.prerelease != 'true'
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           merge-multiple: true
