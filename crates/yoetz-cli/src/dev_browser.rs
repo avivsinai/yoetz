@@ -158,8 +158,28 @@ fn find_dev_browser_via_npm_prefix() -> Option<String> {
         .find(|candidate| command_is_available(candidate))
 }
 
+/// Platform-specific native binary name shipped inside the dev-browser npm
+/// package (e.g. `dev-browser-darwin-arm64`).  Returns `None` on unsupported
+/// platforms.
+fn dev_browser_native_binary_name() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Some("dev-browser-darwin-arm64"),
+        ("macos", "x86_64") => Some("dev-browser-darwin-x64"),
+        ("linux", "x86_64") => {
+            if cfg!(target_env = "musl") {
+                Some("dev-browser-linux-musl-x64")
+            } else {
+                Some("dev-browser-linux-x64")
+            }
+        }
+        ("linux", "aarch64") if !cfg!(target_env = "musl") => Some("dev-browser-linux-arm64"),
+        ("windows", "x86_64") => Some("dev-browser-windows-x64.exe"),
+        _ => None,
+    }
+}
+
 fn npm_prefix_dev_browser_candidates(prefix: &Path, windows: bool) -> Vec<PathBuf> {
-    if windows {
+    let mut candidates = if windows {
         vec![
             prefix.join("dev-browser.cmd"),
             prefix.join("dev-browser.exe"),
@@ -170,7 +190,22 @@ fn npm_prefix_dev_browser_candidates(prefix: &Path, windows: bool) -> Vec<PathBu
             prefix.join("bin").join("dev-browser"),
             prefix.join("dev-browser"),
         ]
+    };
+
+    // Homebrew Node sometimes installs the package under node_modules but
+    // does not create a bin symlink.  Probe the native binary directly.
+    // On Unix, global packages live under {prefix}/lib/node_modules/;
+    // on Windows they live directly under {prefix}/node_modules/.
+    if let Some(native) = dev_browser_native_binary_name() {
+        let modules_root = if windows {
+            prefix.join("node_modules")
+        } else {
+            prefix.join("lib").join("node_modules")
+        };
+        candidates.push(modules_root.join("dev-browser").join("bin").join(native));
     }
+
+    candidates
 }
 
 /// Resolve the dev-browser binary after installation has already been handled.
@@ -218,8 +253,14 @@ pub fn ensure_installed() -> Result<()> {
         eprintln!("info: dev-browser installed successfully");
         return Ok(());
     }
+    let hint = if cfg!(target_os = "macos") {
+        " On Homebrew Node, npm may not create PATH symlinks. \
+         Fix: ln -sf \"$(npm prefix -g)/lib/node_modules/dev-browser/bin/dev-browser-darwin-\"* \"$(npm prefix -g)/bin/dev-browser\""
+    } else {
+        ""
+    };
     Err(anyhow!(
-        "dev-browser installed successfully, but it is not available in PATH or npm prefix"
+        "dev-browser installed but not discoverable in PATH or npm prefix.{hint}"
     ))
 }
 
@@ -1629,22 +1670,48 @@ mod tests {
     #[test]
     fn npm_prefix_candidates_cover_unix_and_windows_layouts() {
         let unix = npm_prefix_dev_browser_candidates(Path::new("/prefix"), false);
-        assert_eq!(
-            unix,
-            vec![
-                PathBuf::from("/prefix/bin/dev-browser"),
-                PathBuf::from("/prefix/dev-browser"),
-            ]
+        // First two are the standard bin symlink paths.
+        assert_eq!(unix[0], PathBuf::from("/prefix/bin/dev-browser"));
+        assert_eq!(unix[1], PathBuf::from("/prefix/dev-browser"));
+        // Third is the native binary inside node_modules (Homebrew fallback).
+        assert!(
+            unix.len() >= 3,
+            "expected native binary candidate for this platform"
+        );
+        assert!(
+            unix[2]
+                .to_string_lossy()
+                .starts_with("/prefix/lib/node_modules/dev-browser/bin/dev-browser-"),
+            "native candidate should be under node_modules: {:?}",
+            unix[2]
         );
 
         let windows = npm_prefix_dev_browser_candidates(Path::new(r"C:\npm"), true);
-        assert_eq!(
-            windows,
-            vec![
-                PathBuf::from(r"C:\npm/dev-browser.cmd"),
-                PathBuf::from(r"C:\npm/dev-browser.exe"),
-                PathBuf::from(r"C:\npm/dev-browser"),
-            ]
+        assert_eq!(windows[0], PathBuf::from(r"C:\npm/dev-browser.cmd"));
+        assert_eq!(windows[1], PathBuf::from(r"C:\npm/dev-browser.exe"));
+        assert_eq!(windows[2], PathBuf::from(r"C:\npm/dev-browser"));
+        // Windows native candidate lives under node_modules/ (no lib/ prefix).
+        assert!(
+            windows.len() >= 4,
+            "expected native binary candidate for windows"
         );
+        assert!(
+            windows[3]
+                .to_string_lossy()
+                .starts_with(r"C:\npm/node_modules/dev-browser/bin/dev-browser-"),
+            "windows native candidate should be under node_modules (no lib/): {:?}",
+            windows[3]
+        );
+    }
+
+    #[test]
+    fn dev_browser_native_binary_name_returns_some_on_supported_platforms() {
+        // This test runs on the host platform, so it should always return Some.
+        let name = dev_browser_native_binary_name();
+        assert!(
+            name.is_some(),
+            "expected a native binary name for the current platform"
+        );
+        assert!(name.unwrap().starts_with("dev-browser-"));
     }
 }
