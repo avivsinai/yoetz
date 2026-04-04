@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.46] - 2026-04-04
 ### Changed
 
 - **Security**: Pin all GitHub Actions to commit SHAs across ci.yml, release.yml, publish-skill.yml
@@ -15,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Scope permissions per job in release.yml (read for prepare/build, write for release)
 - Add concurrency and timeout-minutes to notify-marketplace.yml
 - Add missing timeout-minutes to check-skills and changes jobs in ci.yml
+
 
 ## [0.2.45] - 2026-04-03
 ### Added
