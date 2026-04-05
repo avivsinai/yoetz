@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Reuse stable CDP browser name across ChatGPT recipe invocations to avoid repeated Chrome "Allow remote debugging?" dialogs
+
 ## [0.2.46] - 2026-04-04
 ### Changed
 
