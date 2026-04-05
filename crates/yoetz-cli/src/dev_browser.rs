@@ -1245,7 +1245,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
             .unwrap_or_default()
             .as_millis()
     );
-    let browser_name = format!("yoetz-chatgpt-browser-{unique_prefix}");
+    let browser_name = "yoetz-chatgpt".to_string();
     let page_name = format!("yoetz-chatgpt-page-{unique_prefix}");
     let cdp_endpoint = ctx.cdp_endpoint.as_deref();
     let run_script = |script: &str, timeout_secs: Option<u64>| {
