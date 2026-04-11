@@ -566,6 +566,16 @@ fn looks_like_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
         && (message.contains("timed out") || message.contains("timeout"))
 }
 
+fn maybe_add_dev_browser_connect_guidance(err: anyhow::Error) -> anyhow::Error {
+    if looks_like_dev_browser_connect_failure(&err) {
+        err.context(
+            "dev-browser could not connect to Chrome. If Chrome is showing a remote debugging approval dialog, click Allow, then retry. Raw transport error follows.",
+        )
+    } else {
+        err
+    }
+}
+
 fn chatgpt_script_timeout_secs(poll_timeout_ms: u64) -> u64 {
     poll_timeout_ms.div_ceil(1000) + 60
 }
@@ -988,15 +998,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
                     "info: connecting to Chrome — if prompted, click Allow in Chrome's remote debugging dialog"
                 );
             }
-            run_script(&prepare_script, Some(60)).map_err(|err| {
-                if looks_like_dev_browser_connect_failure(&err) {
-                    err.context(
-                        "dev-browser could not connect to Chrome. Chrome may be showing an \"Allow remote debugging?\" dialog — click Allow in Chrome, then retry."
-                    )
-                } else {
-                    err
-                }
-            })?
+            run_script(&prepare_script, Some(60)).map_err(maybe_add_dev_browser_connect_guidance)?
         };
         let prepare: ChatgptPrepareResult =
             parse_script_json("parse chatgpt prepare result", &prepare_stdout)?;
@@ -1135,6 +1137,18 @@ mod tests {
 
         let other = anyhow!("ChatGPT response timed out after 900000ms");
         assert!(!looks_like_dev_browser_connect_failure(&other));
+    }
+
+    #[test]
+    fn maybe_add_dev_browser_connect_guidance_preserves_raw_cause_without_allow_marker() {
+        let err = anyhow!(
+            "browserType.connectOverCDP: Timeout 30000ms exceeded while waiting for connectOverCDP"
+        );
+        let err = maybe_add_dev_browser_connect_guidance(err);
+        let detail = format!("{err:#}");
+        assert!(detail.contains("dev-browser could not connect to Chrome"));
+        assert!(detail.contains("browserType.connectOverCDP: Timeout 30000ms exceeded"));
+        assert!(!detail.contains("Allow remote debugging"));
     }
 
     #[test]
