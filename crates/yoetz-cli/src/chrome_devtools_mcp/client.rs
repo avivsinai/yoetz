@@ -86,20 +86,53 @@ pub struct WaitForResult {
     pub matched_text: String,
 }
 
+/// Locate the `chrome-devtools-mcp` invocation to spawn.
+///
+/// Preference order:
+/// 1. The globally installed `chrome-devtools-mcp` binary on `PATH` (from
+///    `npm install -g chrome-devtools-mcp`). Fastest path, version-pinned
+///    at install time, no per-invocation network fetch.
+/// 2. `npx -y chrome-devtools-mcp@latest` as the transparent fallback for
+///    users who haven't installed it globally yet. Slower first run (npx
+///    fetches the package) but zero-setup on a fresh machine.
+fn resolve_chrome_devtools_mcp_command() -> Command {
+    if let Some(path) = which_chrome_devtools_mcp() {
+        let mut command = Command::new(path);
+        command.arg("--experimentalStructuredContent");
+        return command;
+    }
+
+    let mut command = Command::new("npx");
+    command
+        .arg("-y")
+        .arg("chrome-devtools-mcp@latest")
+        .arg("--experimentalStructuredContent");
+    command
+}
+
+/// Look up `chrome-devtools-mcp` on `PATH` using the same rules as the shell.
+fn which_chrome_devtools_mcp() -> Option<std::path::PathBuf> {
+    let path_env = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_env) {
+        let candidate = dir.join("chrome-devtools-mcp");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 impl CdpMcpClient {
     pub async fn connect_to_running_chrome(cdp_endpoint: Option<&str>) -> Result<Self> {
         let endpoint = cdp_endpoint.unwrap_or("http://127.0.0.1:9222");
         let parsed = Url::parse(endpoint)
             .with_context(|| format!("invalid Chrome CDP endpoint `{endpoint}`"))?;
 
-        let mut command = Command::new("npx");
+        let mut command = resolve_chrome_devtools_mcp_command();
         command
             .kill_on_drop(true)
             .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .arg("-y")
-            .arg("chrome-devtools-mcp@latest")
-            .arg("--experimentalStructuredContent");
+            .stdout(Stdio::piped());
 
         match parsed.scheme() {
             "ws" | "wss" => {
@@ -114,7 +147,7 @@ impl CdpMcpClient {
             .stderr(Stdio::piped())
             .spawn()
             .context(
-                "failed to start `npx chrome-devtools-mcp@latest`; ensure Node.js and npx are installed",
+                "failed to start chrome-devtools-mcp; ensure it is installed via `npm install -g chrome-devtools-mcp`",
             )?;
 
         if let Some(stderr) = stderr {

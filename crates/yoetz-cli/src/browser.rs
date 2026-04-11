@@ -133,17 +133,48 @@ pub fn use_dev_browser() -> bool {
     crate::dev_browser::is_available()
 }
 
+/// Detect whether `chrome-devtools-mcp` is installed and callable.
+///
+/// Returns true when either (a) the globally installed
+/// `chrome-devtools-mcp` binary is on `PATH` (fast path, from
+/// `npm install -g chrome-devtools-mcp`), or (b) `npx` is on `PATH` as a
+/// transparent fallback — npx ships with Node.js and is the default
+/// recipe runner when no global install exists yet.
+///
+/// This detection is cheap (PATH walks + `is_file`) and synchronous, so
+/// it is safe to call from the transport funnel walker without
+/// triggering a subprocess spawn or a network fetch.
 pub fn is_chrome_devtools_mcp_available() -> bool {
-    false
+    let Some(path_env) = env::var_os("PATH") else {
+        return false;
+    };
+    let mut has_npx = false;
+    for dir in env::split_paths(&path_env) {
+        if dir.join("chrome-devtools-mcp").is_file() {
+            return true;
+        }
+        if !has_npx && dir.join("npx").is_file() {
+            has_npx = true;
+        }
+    }
+    has_npx
 }
 
 pub fn recipe_transports(recipe: &Recipe, is_chatgpt: bool) -> Vec<RecipeTransport> {
     recipe.transports.clone().unwrap_or_else(|| {
         if is_chatgpt {
+            // Chrome 147+ compat waterfall. chrome-devtools-mcp is primary
+            // because it is the only tier that works against a running
+            // logged-in Chrome 147 default profile (Playwright-based
+            // dev-browser hangs on `Target.setAutoAttach`, agent-browser
+            // inherits the same gating). dev-browser stays second-tier for
+            // Chrome ≤ 146 and Chrome for Testing. agent-browser stays
+            // third for cookie/profile managed flows. Manual is the final
+            // escape hatch.
             vec![
+                RecipeTransport::ChromeDevtoolsMcp,
                 RecipeTransport::DevBrowser,
                 RecipeTransport::AgentBrowser,
-                RecipeTransport::ChromeDevtoolsMcp,
                 RecipeTransport::Manual,
             ]
         } else {
@@ -3428,12 +3459,15 @@ steps:
         )
         .unwrap();
 
+        // Chrome 147+ waterfall: chrome-devtools-mcp is the primary tier,
+        // then dev-browser for Chrome ≤ 146 / Chrome for Testing, then
+        // agent-browser for cookie/profile managed flows, then manual.
         assert_eq!(
             recipe_transports(&recipe, true),
             vec![
+                RecipeTransport::ChromeDevtoolsMcp,
                 RecipeTransport::DevBrowser,
                 RecipeTransport::AgentBrowser,
-                RecipeTransport::ChromeDevtoolsMcp,
                 RecipeTransport::Manual,
             ]
         );
@@ -3444,8 +3478,24 @@ steps:
     }
 
     #[test]
-    fn chrome_devtools_mcp_is_unavailable_by_default() {
-        assert!(!is_chrome_devtools_mcp_available());
+    fn chrome_devtools_mcp_availability_matches_path() {
+        // The detector should return true when either `chrome-devtools-mcp`
+        // itself is on PATH (e.g. `npm install -g chrome-devtools-mcp`) OR
+        // when `npx` is on PATH as a transparent fallback. On any developer
+        // machine running this test suite, at least one of the two is
+        // expected to be present (yoetz's own CI installs Node).
+        //
+        // If the test environment does not have Node at all, the detector
+        // correctly returns false — that's a valid "transport unavailable"
+        // signal and the funnel walker skips the tier.
+        let expected = env::var_os("PATH")
+            .map(|path_env| {
+                env::split_paths(&path_env).any(|dir| {
+                    dir.join("chrome-devtools-mcp").is_file() || dir.join("npx").is_file()
+                })
+            })
+            .unwrap_or(false);
+        assert_eq!(is_chrome_devtools_mcp_available(), expected);
     }
 
     #[test]
