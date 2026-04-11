@@ -19,6 +19,7 @@ use std::time::Duration;
 
 mod browser;
 mod budget;
+mod chrome_devtools_mcp;
 mod commands;
 mod dev_browser;
 mod fuzzy;
