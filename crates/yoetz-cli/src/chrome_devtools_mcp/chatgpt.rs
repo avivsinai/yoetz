@@ -100,7 +100,7 @@ async () => {
 }
 "##;
     let composer_ready = client
-        .evaluate_script(wait_composer_js, &[])
+        .evaluate_script(wait_composer_js, vec![])
         .await
         .context("evaluate_script wait-for-composer")?;
     if composer_ready != serde_json::Value::Bool(true) {
@@ -157,7 +157,7 @@ async () => {
 }
 "##;
     let _ = client
-        .evaluate_script(refocus_js, &[])
+        .evaluate_script(refocus_js, vec![])
         .await
         .context("refocus composer after upload")?;
 
@@ -189,7 +189,7 @@ async () => {
 }
 "##;
     let clicked = client
-        .evaluate_script(click_send_js, &[])
+        .evaluate_script(click_send_js, vec![])
         .await
         .context("evaluate_script click send button")?;
     if clicked == serde_json::Value::Null {
@@ -234,7 +234,7 @@ async fn try_upload_bundle(client: &CdpMcpClient, bundle_path: &std::path::Path)
 }
 "##;
     let clicked = client
-        .evaluate_script(click_attach_js, &[])
+        .evaluate_script(click_attach_js, vec![])
         .await
         .context("evaluate_script click attach button")?;
     if clicked == serde_json::Value::Null {
@@ -254,7 +254,7 @@ async fn try_upload_bundle(client: &CdpMcpClient, bundle_path: &std::path::Path)
   return false;
 }
 "##;
-    let _ = client.evaluate_script(menu_click_js, &[]).await;
+    let _ = client.evaluate_script(menu_click_js, vec![]).await;
 
     // Now snapshot and find the upload input's uid.
     //
@@ -336,7 +336,7 @@ async fn poll_for_stable_response(
 
         tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
 
-        let state = match client.evaluate_script(read_state_js, &[]).await {
+        let state = match client.evaluate_script(read_state_js, vec![]).await {
             Ok(state) => state,
             Err(err) => {
                 // Treat transient eval errors as non-fatal; keep polling.

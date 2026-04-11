@@ -942,10 +942,92 @@ fn default_daemon_recovery_error(original: Option<&anyhow::Error>) -> Option<any
     }
 }
 
-fn run_recipe_via_chrome_devtools_mcp() -> Result<()> {
-    Err(anyhow!(
-        "chrome-devtools-mcp transport not yet supported; install chrome-devtools-mcp and file an issue if you want it implemented"
-    ))
+fn run_recipe_via_chrome_devtools_mcp(
+    recipe_args: &BrowserRecipeArgs,
+    recipe_vars: &BTreeMap<String, String>,
+    cdp_endpoint: Option<&str>,
+    format: OutputFormat,
+    is_chatgpt: bool,
+) -> Result<()> {
+    if !is_chatgpt {
+        return Err(anyhow!(
+            "chrome-devtools-mcp transport currently supports only the built-in `chatgpt` recipe; \
+             claude and gemini ports will land after the chatgpt path is verified end-to-end"
+        ));
+    }
+    if recipe_args.profile.is_some() {
+        return Err(anyhow!(
+            "chrome-devtools-mcp transport does not support `--profile`; \
+             use `--cdp` to target a specific Chrome instance or omit both for default auto-connect"
+        ));
+    }
+
+    let paste_mode = recipe_vars
+        .get("paste")
+        .is_some_and(|value| value == "true");
+    let bundle_text = if paste_mode {
+        recipe_args
+            .bundle
+            .as_ref()
+            .map(fs::read_to_string)
+            .transpose()?
+    } else {
+        None
+    };
+
+    // Use the existing dev-browser poll settings resolver so the response
+    // timeout env/recipe-var knobs stay symmetric with the dev-browser path.
+    let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
+
+    let ctx = chrome_devtools_mcp::DevtoolsMcpRecipeContext {
+        cdp_endpoint: cdp_endpoint.map(str::to_owned),
+        bundle_path: if paste_mode {
+            None
+        } else {
+            recipe_args.bundle.clone()
+        },
+        bundle_text,
+        model: recipe_vars.get("model").cloned().unwrap_or_default(),
+        prompt: recipe_vars
+            .get("prompt")
+            .cloned()
+            .unwrap_or_else(|| "Review the attached file and provide your analysis.".to_string()),
+        response_timeout_ms: poll_settings.timeout_ms,
+        show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
+    };
+
+    // The chrome-devtools-mcp recipe is async; yoetz-cli is a sync `main`, so
+    // spin up a single-threaded tokio runtime just for this dispatch. No
+    // long-lived runtime — one yoetz invocation, one recipe, one runtime.
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("start tokio runtime for chrome-devtools-mcp recipe")?;
+    let response = runtime.block_on(chrome_devtools_mcp::chatgpt::run(&ctx))?;
+
+    match format {
+        OutputFormat::Json => {
+            let payload = json!({
+                "status": "ok",
+                "backend": "chrome-devtools-mcp",
+                "response": response,
+            });
+            write_json(&payload)?;
+        }
+        OutputFormat::Jsonl => {
+            let payload = json!({
+                "type": "recipe_complete",
+                "backend": "chrome-devtools-mcp",
+                "response": response,
+            });
+            write_jsonl("browser.recipe", &payload)?;
+        }
+        OutputFormat::Text | OutputFormat::Markdown => {
+            println!("{response}");
+        }
+    }
+
+    Ok(())
 }
 
 fn run_recipe_via_dev_browser(
@@ -1441,7 +1523,13 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                         cdp_endpoint.as_deref(),
                     ),
                     browser::RecipeTransport::ChromeDevtoolsMcp => {
-                        run_recipe_via_chrome_devtools_mcp()
+                        run_recipe_via_chrome_devtools_mcp(
+                            &recipe_args,
+                            &recipe_vars,
+                            cdp_endpoint.as_deref(),
+                            format,
+                            is_chatgpt,
+                        )
                     }
                     browser::RecipeTransport::Manual => Err(anyhow!("{}", manual_fallback)),
                 };
@@ -2061,10 +2149,54 @@ mod tests {
     }
 
     #[test]
-    fn run_recipe_via_chrome_devtools_mcp_reports_not_supported() {
-        let err = run_recipe_via_chrome_devtools_mcp().unwrap_err();
-        assert!(err.to_string().contains("not yet supported"));
-        assert!(err.to_string().contains("chrome-devtools-mcp"));
+    fn run_recipe_via_chrome_devtools_mcp_rejects_non_chatgpt_recipes() {
+        // Until the claude/gemini ports land, non-chatgpt recipes through the
+        // chrome-devtools-mcp transport surface a clear guidance error rather
+        // than silently trying to drive the wrong DOM.
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/claude.yaml"),
+            bundle: None,
+            profile: None,
+            cdp: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::new();
+        let err = run_recipe_via_chrome_devtools_mcp(
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ false,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("chrome-devtools-mcp"));
+        assert!(msg.contains("chatgpt"));
+    }
+
+    #[test]
+    fn run_recipe_via_chrome_devtools_mcp_rejects_profile_flag() {
+        // --profile is a managed-profile concept from agent-browser; the MCP
+        // transport attaches to a running Chrome via --cdp or auto-discovery
+        // only. Surface that clearly instead of silently ignoring the flag.
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: None,
+            profile: Some(PathBuf::from("/tmp/ignored")),
+            cdp: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::new();
+        let err = run_recipe_via_chrome_devtools_mcp(
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ true,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("--profile"));
+        assert!(err.to_string().contains("--cdp"));
     }
 
     #[test]
