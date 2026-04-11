@@ -210,6 +210,9 @@ enum BrowserCommand {
     Recipe(BrowserRecipeArgs),
     Login(BrowserLoginArgs),
     Check(BrowserCheckArgs),
+    /// Explicitly reset browser automation daemons. Use this when recovery is
+    /// needed; yoetz does not silently recycle live-attach daemons for you.
+    Reset(BrowserResetArgs),
     /// Sync cookies from Chrome to agent-browser (bypasses Cloudflare)
     SyncCookies(BrowserSyncCookiesArgs),
     /// Attach to a running Chrome instance and verify authentication.
@@ -268,6 +271,9 @@ struct BrowserAttachArgs {
     #[arg(long)]
     cdp: Option<String>,
 }
+
+#[derive(Args)]
+struct BrowserResetArgs {}
 
 #[derive(Args)]
 struct BrowserSyncCookiesArgs {
@@ -915,6 +921,21 @@ fn recipe_should_stop_live_transport_fallback(err: &anyhow::Error) -> bool {
     browser::is_chrome_approval_wait_error(err)
 }
 
+fn default_daemon_recovery_error(original: Option<&anyhow::Error>) -> Option<anyhow::Error> {
+    let suffix = original
+        .map(|err| format!("\n\nOriginal error: {err}"))
+        .unwrap_or_default();
+    match browser::inspect_default_daemon() {
+        browser::DaemonState::AwaitingApproval => Some(anyhow!(
+            "Chrome may be showing an \"Allow remote debugging?\" dialog. Click Allow, then retry.{suffix}"
+        )),
+        browser::DaemonState::Stale => Some(anyhow!(
+            "The legacy agent-browser daemon looks stale. Run `yoetz browser reset` and retry.{suffix}"
+        )),
+        browser::DaemonState::NoSocket | browser::DaemonState::Healthy => None,
+    }
+}
+
 fn run_recipe_via_dev_browser(
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
@@ -1021,13 +1042,12 @@ fn run_recipe_via_agent_browser(
             match browser::try_cdp_attach(&endpoint, browser::CHATGPT_URL) {
                 Ok(()) => Some(browser::BrowserConnection::Cdp { endpoint }),
                 Err(e) => {
-                    let recovery = browser::force_kill_stale_daemon();
+                    if browser::is_chrome_approval_wait_error(&e) {
+                        return Err(anyhow!(
+                            "Chrome may be showing an \"Allow remote debugging?\" dialog. Click Allow, then retry."
+                        ));
+                    }
                     if recipe_args.cdp.is_some() {
-                        if matches!(recovery, browser::DaemonRecoveryAction::AwaitingApproval) {
-                            return Err(anyhow!(
-                                "Chrome may be showing an \"Allow remote debugging?\" dialog. Click Allow, then retry."
-                            ));
-                        }
                         return Err(e.context("explicit --cdp failed; not falling back"));
                     }
                     None
@@ -1049,18 +1069,11 @@ fn run_recipe_via_agent_browser(
             match browser::try_auto_connect_lite() {
                 Ok(()) => Some(browser::BrowserConnection::AutoConnect),
                 Err(_) => {
-                    let recovery = browser::force_kill_stale_daemon();
-                    match recovery {
-                        browser::DaemonRecoveryAction::AwaitingApproval => {
-                            return Err(anyhow!(
-                                "Chrome may be showing an \"Allow remote debugging?\" dialog. Please click Allow in Chrome, then retry the recipe."
-                            ));
-                        }
-                        _ => {
-                            eprintln!("info: auto-connect unavailable, falling back to profile");
-                            None
-                        }
+                    if let Some(err) = default_daemon_recovery_error(None) {
+                        return Err(err);
                     }
+                    eprintln!("info: auto-connect unavailable, falling back to profile");
+                    None
                 }
             }
         }
@@ -1157,9 +1170,8 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                             }
                         };
                     }
-                    Err(_) => {
-                        let recovery = browser::force_kill_stale_daemon();
-                        if matches!(recovery, browser::DaemonRecoveryAction::AwaitingApproval) {
+                    Err(e) => {
+                        if browser::is_chrome_approval_wait_error(&e) {
                             eprintln!(
                                 "hint: Chrome may be showing an \"Allow remote debugging?\" dialog. \
                                  Click Allow, then retry."
@@ -1284,12 +1296,8 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 "https://chatgpt.com/",
             )
             .map_err(|e| {
-                let recovery = browser::force_kill_stale_daemon();
-                if matches!(recovery, browser::DaemonRecoveryAction::AwaitingApproval) {
-                    return anyhow::anyhow!(
-                        "Chrome may be showing an \"Allow remote debugging?\" dialog. \
-                         Click Allow, then retry.\n\nOriginal error: {e}"
-                    );
+                if let Some(recovery) = default_daemon_recovery_error(Some(&e)) {
+                    return recovery;
                 }
                 e
             })?;
@@ -1309,6 +1317,37 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                 OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
                 OutputFormat::Text | OutputFormat::Markdown => {
                     println!("Browser authenticated via {method}");
+                    Ok(())
+                }
+            }
+        }
+        BrowserCommand::Reset(_) => {
+            let dev_browser_stopped = if browser::use_dev_browser() {
+                dev_browser::stop_daemon()?
+            } else {
+                false
+            };
+            browser::close_live_attach_session()?;
+            browser::close_browser()?;
+            let legacy_reset = browser::force_kill_stale_daemon();
+
+            let payload = json!({
+                "status": "ok",
+                "dev_browser_daemon_stopped": dev_browser_stopped,
+                "agent_browser_default": format!("{legacy_reset:?}"),
+                "agent_browser_cdp_session_closed": true,
+            });
+            match format {
+                OutputFormat::Json => write_json(&payload),
+                OutputFormat::Jsonl => write_jsonl("browser.reset", &payload),
+                OutputFormat::Text | OutputFormat::Markdown => {
+                    if dev_browser_stopped {
+                        println!("Stopped dev-browser daemon.");
+                    } else if browser::use_dev_browser() {
+                        println!("dev-browser daemon was not running.");
+                    }
+                    println!("Closed agent-browser live-attach session.");
+                    println!("Reset agent-browser default daemon state: {legacy_reset:?}.");
                     Ok(())
                 }
             }
@@ -1434,9 +1473,8 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                             }
                         };
                     }
-                    Err(_) => {
-                        let recovery = browser::force_kill_stale_daemon();
-                        if matches!(recovery, browser::DaemonRecoveryAction::AwaitingApproval) {
+                    Err(e) => {
+                        if attach_args.cdp.is_some() && browser::is_chrome_approval_wait_error(&e) {
                             return Err(anyhow!(
                                 "Chrome may be showing an \"Allow remote debugging?\" dialog. \
                                  Click Allow, then retry."
@@ -1462,12 +1500,8 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     };
                 }
                 Err(_) => {
-                    let recovery = browser::force_kill_stale_daemon();
-                    if matches!(recovery, browser::DaemonRecoveryAction::AwaitingApproval) {
-                        return Err(anyhow!(
-                            "Chrome may be showing an \"Allow remote debugging?\" dialog. \
-                             Click Allow, then retry."
-                        ));
+                    if let Some(recovery) = default_daemon_recovery_error(None) {
+                        return Err(recovery);
                     }
                 }
             }

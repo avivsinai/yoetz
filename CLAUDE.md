@@ -91,6 +91,22 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 - The QuickJS GC crash recovery in `dev_browser.rs` can salvage stdout from a
   completed script, but recipe correctness must not depend on that recovery.
 
+## Browser Architecture
+
+Yoetz browser integrations are extension-free by design.
+
+- Treat yoetz as a thin wrapper over the underlying browser transport unless
+  yoetz must own behavior for correctness or UX.
+- Preferred transport order for live Chrome work is `dev-browser` first,
+  `agent-browser` second. `chrome-devtools-mcp` is an extension-free fallback
+  candidate, not an excuse to add an extension-based path.
+- Default mode is connect-first: attach to the user's already running Chrome
+  session (`--connect`, auto-connect, or explicit `--cdp`) before considering
+  cookie sync or managed-profile fallbacks.
+- The daemon is trusted by default. Do not silently recycle live-attach daemons
+  during normal attach/check/recipe flows. If recovery is needed, require an
+  explicit `yoetz browser reset`.
+
 ## Provider Configuration
 
 API keys via environment variables:

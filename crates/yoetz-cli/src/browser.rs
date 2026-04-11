@@ -37,6 +37,7 @@ const DAEMON_APPROVAL_GRACE_WINDOW: Duration = Duration::from_secs(30);
 const LIVE_ATTACH_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const CDP_SESSION_NAME: &str = "yoetz-cdp";
 const CHROME_APPROVAL_LOCK_FILENAME: &str = "chrome-approval.lock";
+const CHATGPT_RECIPE_LOCK_FILENAME: &str = "chatgpt-recipe.lock";
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
     major: 24,
@@ -1061,20 +1062,24 @@ pub fn close_browser() -> Result<()> {
     close_browser_daemon()
 }
 
+pub fn close_live_attach_session() -> Result<()> {
+    let (bin, prefix_args) = resolve_agent_browser()?;
+    let mut cmd = Command::new(bin);
+    cmd.args(prefix_args);
+    match cmd.args(["--session", CDP_SESSION_NAME, "close"]).output() {
+        Ok(output) if !output.status.success() => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("warning: session close failed: {stderr}");
+        }
+        Err(e) => eprintln!("warning: session close error: {e}"),
+        _ => {}
+    }
+    Ok(())
+}
+
 pub fn close_browser_for_connection(connection: &BrowserConnection) -> Result<()> {
     if connection.is_live_attach() {
-        let (bin, prefix_args) = resolve_agent_browser()?;
-        let mut cmd = Command::new(bin);
-        cmd.args(prefix_args);
-        match cmd.args(["--session", CDP_SESSION_NAME, "close"]).output() {
-            Ok(output) if !output.status.success() => {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                eprintln!("warning: session close failed: {stderr}");
-            }
-            Err(e) => eprintln!("warning: session close error: {e}"),
-            _ => {}
-        }
-        return Ok(());
+        return close_live_attach_session();
     }
     close_browser_daemon()
 }
@@ -1085,6 +1090,14 @@ pub enum DaemonRecoveryAction {
     Healthy,
     AwaitingApproval,
     KilledStale,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DaemonState {
+    NoSocket,
+    Healthy,
+    AwaitingApproval,
+    Stale,
 }
 
 #[derive(Debug)]
@@ -1099,15 +1112,26 @@ impl ChromeApprovalLock {
     }
 }
 
-fn chrome_approval_lock_path() -> PathBuf {
-    if let Some(home) = home_dir() {
-        return home.join(".yoetz").join(CHROME_APPROVAL_LOCK_FILENAME);
-    }
-    PathBuf::from(".yoetz").join(CHROME_APPROVAL_LOCK_FILENAME)
+#[derive(Debug)]
+pub struct ChatgptRecipeLock {
+    _lock_file: File,
+    waited: bool,
 }
 
-pub fn acquire_chrome_approval_lock() -> Result<ChromeApprovalLock> {
-    let lock_path = chrome_approval_lock_path();
+impl ChatgptRecipeLock {
+    pub fn waited(&self) -> bool {
+        self.waited
+    }
+}
+
+fn yoetz_lock_path(filename: &str) -> PathBuf {
+    if let Some(home) = home_dir() {
+        return home.join(".yoetz").join(filename);
+    }
+    PathBuf::from(".yoetz").join(filename)
+}
+
+fn acquire_waitable_lock(lock_path: &Path, action: &str) -> Result<(File, bool)> {
     if let Some(parent) = lock_path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
@@ -1116,23 +1140,39 @@ pub fn acquire_chrome_approval_lock() -> Result<ChromeApprovalLock> {
         .read(true)
         .write(true)
         .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("open browser approval lock {}", lock_path.display()))?;
+        .open(lock_path)
+        .with_context(|| format!("open {action} {}", lock_path.display()))?;
 
     let waited = match file.try_lock_exclusive() {
         Ok(()) => false,
         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
             file.lock_exclusive()
-                .with_context(|| format!("lock browser approval {}", lock_path.display()))?;
+                .with_context(|| format!("lock {action} {}", lock_path.display()))?;
             true
         }
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("lock browser approval {}", lock_path.display()));
+            return Err(err).with_context(|| format!("lock {action} {}", lock_path.display()));
         }
     };
 
+    Ok((file, waited))
+}
+
+pub fn acquire_chrome_approval_lock() -> Result<ChromeApprovalLock> {
+    let lock_path = yoetz_lock_path(CHROME_APPROVAL_LOCK_FILENAME);
+    let (file, waited) = acquire_waitable_lock(&lock_path, "browser approval lock")?;
+
     Ok(ChromeApprovalLock {
+        _lock_file: file,
+        waited,
+    })
+}
+
+pub fn acquire_chatgpt_recipe_lock() -> Result<ChatgptRecipeLock> {
+    let lock_path = yoetz_lock_path(CHATGPT_RECIPE_LOCK_FILENAME);
+    let (file, waited) = acquire_waitable_lock(&lock_path, "chatgpt recipe lock")?;
+
+    Ok(ChatgptRecipeLock {
         _lock_file: file,
         waited,
     })
@@ -1241,16 +1281,16 @@ fn socket_is_recent(sock_path: &Path, grace_window: Duration) -> bool {
     age <= grace_window
 }
 
-fn force_kill_stale_daemon_with_paths(
+fn inspect_daemon_with_paths(
     pid_path: &Path,
     sock_path: &Path,
     grace_window: Duration,
-) -> DaemonRecoveryAction {
+) -> DaemonState {
     if !sock_path.exists() {
-        return DaemonRecoveryAction::NoSocket;
+        return DaemonState::NoSocket;
     }
     if is_daemon_socket_healthy(sock_path) {
-        return DaemonRecoveryAction::Healthy;
+        return DaemonState::Healthy;
     }
 
     if let Some(pid) = read_daemon_pid(pid_path) {
@@ -1258,8 +1298,33 @@ fn force_kill_stale_daemon_with_paths(
             && process_looks_like_agent_browser(pid)
             && socket_is_recent(sock_path, grace_window)
         {
-            return DaemonRecoveryAction::AwaitingApproval;
+            return DaemonState::AwaitingApproval;
         }
+    }
+
+    DaemonState::Stale
+}
+
+pub fn inspect_default_daemon() -> DaemonState {
+    let Some((pid_path, sock_path)) = default_daemon_paths() else {
+        return DaemonState::NoSocket;
+    };
+    inspect_daemon_with_paths(&pid_path, &sock_path, DAEMON_APPROVAL_GRACE_WINDOW)
+}
+
+fn force_kill_stale_daemon_with_paths(
+    pid_path: &Path,
+    sock_path: &Path,
+    grace_window: Duration,
+) -> DaemonRecoveryAction {
+    match inspect_daemon_with_paths(pid_path, sock_path, grace_window) {
+        DaemonState::NoSocket => return DaemonRecoveryAction::NoSocket,
+        DaemonState::Healthy => return DaemonRecoveryAction::Healthy,
+        DaemonState::AwaitingApproval => return DaemonRecoveryAction::AwaitingApproval,
+        DaemonState::Stale => {}
+    }
+
+    if let Some(pid) = read_daemon_pid(pid_path) {
         if process_is_alive(pid) {
             if process_looks_like_agent_browser(pid) {
                 let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
