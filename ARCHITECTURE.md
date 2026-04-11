@@ -79,6 +79,7 @@ Browser integrations are extension-free by design. Yoetz prefers to act as a wra
 
 - `dev-browser` is the primary live-Chrome transport for ChatGPT recipes.
 - `agent-browser` remains the legacy fallback when `dev-browser` is unavailable or a non-ChatGPT path still depends on it.
+- `chrome-devtools-mcp` is an extension-free fallback candidate, but it is not integrated yet.
 - Explicit CDP endpoints are forwarded to the transport unchanged; the transport owns `/json/version`, `DevToolsActivePort`, and related connection logic.
 
 Connection priority remains connect-first: explicit CDP endpoint > auto-connect > cookie state > profile fallback.

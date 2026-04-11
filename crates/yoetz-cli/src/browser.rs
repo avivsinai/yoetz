@@ -59,6 +59,7 @@ struct NodeVersion {
 pub enum RecipeTransport {
     DevBrowser,
     AgentBrowser,
+    ChromeDevtoolsMcp,
     Manual,
 }
 
@@ -132,10 +133,19 @@ pub fn use_dev_browser() -> bool {
     crate::dev_browser::is_available()
 }
 
+pub fn is_chrome_devtools_mcp_available() -> bool {
+    false
+}
+
 pub fn recipe_transports(recipe: &Recipe, is_chatgpt: bool) -> Vec<RecipeTransport> {
     recipe.transports.clone().unwrap_or_else(|| {
         if is_chatgpt {
-            vec![RecipeTransport::DevBrowser, RecipeTransport::AgentBrowser]
+            vec![
+                RecipeTransport::DevBrowser,
+                RecipeTransport::AgentBrowser,
+                RecipeTransport::ChromeDevtoolsMcp,
+                RecipeTransport::Manual,
+            ]
         } else {
             vec![RecipeTransport::AgentBrowser]
         }
@@ -3387,7 +3397,7 @@ steps:
         let recipe = serde_yml::from_str::<Recipe>(
             r#"
 name: chatgpt
-transports: [dev-browser, agent-browser, manual]
+transports: [dev-browser, agent-browser, chrome-devtools-mcp, manual]
 steps:
   - action: open
     args: ["https://chatgpt.com/"]
@@ -3400,13 +3410,14 @@ steps:
             Some(vec![
                 RecipeTransport::DevBrowser,
                 RecipeTransport::AgentBrowser,
+                RecipeTransport::ChromeDevtoolsMcp,
                 RecipeTransport::Manual,
             ])
         );
     }
 
     #[test]
-    fn recipe_transports_default_to_dev_browser_for_chatgpt() {
+    fn recipe_transports_default_to_chatgpt_funnel() {
         let recipe = serde_yml::from_str::<Recipe>(
             r#"
 name: chatgpt
@@ -3419,12 +3430,22 @@ steps:
 
         assert_eq!(
             recipe_transports(&recipe, true),
-            vec![RecipeTransport::DevBrowser, RecipeTransport::AgentBrowser]
+            vec![
+                RecipeTransport::DevBrowser,
+                RecipeTransport::AgentBrowser,
+                RecipeTransport::ChromeDevtoolsMcp,
+                RecipeTransport::Manual,
+            ]
         );
         assert_eq!(
             recipe_transports(&recipe, false),
             vec![RecipeTransport::AgentBrowser]
         );
+    }
+
+    #[test]
+    fn chrome_devtools_mcp_is_unavailable_by_default() {
+        assert!(!is_chrome_devtools_mcp_available());
     }
 
     #[test]

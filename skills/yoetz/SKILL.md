@@ -323,6 +323,7 @@ This keeps the default path aligned with the same browser transport users alread
 The browser module connects to your running Chrome via CDP (Chrome DevTools Protocol):
 - **dev-browser** (primary): Playwright-based transport that attaches to your logged-in Chrome session
 - **agent-browser** (fallback): legacy transport with cookie/profile fallback support
+- **chrome-devtools-mcp** (fallback 2, stub): Google's official CDP MCP server, not yet integrated
 - **Cookie sync** (legacy fallback): extracts cookies from Chrome's encrypted store, injects into agent-browser only after live attach paths are exhausted
 - Extension-free by design: no browser extension is required or desired
 - Daemon model: one persistent connection per session, reused across invocations until you explicitly run `yoetz browser reset`

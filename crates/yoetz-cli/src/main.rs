@@ -870,6 +870,7 @@ fn recipe_transport_name(transport: browser::RecipeTransport) -> &'static str {
     match transport {
         browser::RecipeTransport::DevBrowser => "dev-browser",
         browser::RecipeTransport::AgentBrowser => "agent-browser",
+        browser::RecipeTransport::ChromeDevtoolsMcp => "chrome-devtools-mcp",
         browser::RecipeTransport::Manual => "manual",
     }
 }
@@ -934,6 +935,12 @@ fn default_daemon_recovery_error(original: Option<&anyhow::Error>) -> Option<any
         )),
         browser::DaemonState::NoSocket | browser::DaemonState::Healthy => None,
     }
+}
+
+fn run_recipe_via_chrome_devtools_mcp() -> Result<()> {
+    Err(anyhow!(
+        "chrome-devtools-mcp transport not yet supported; install chrome-devtools-mcp and file an issue if you want it implemented"
+    ))
 }
 
 fn run_recipe_via_dev_browser(
@@ -1405,6 +1412,12 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             let mut transport_errors = Vec::new();
 
             for (index, transport) in transports.iter().copied().enumerate() {
+                if matches!(transport, browser::RecipeTransport::ChromeDevtoolsMcp)
+                    && !browser::is_chrome_devtools_mcp_available()
+                {
+                    continue;
+                }
+
                 let result = match transport {
                     browser::RecipeTransport::DevBrowser => run_recipe_via_dev_browser(
                         &recipe_args,
@@ -1422,6 +1435,9 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                         is_chatgpt,
                         cdp_endpoint.as_deref(),
                     ),
+                    browser::RecipeTransport::ChromeDevtoolsMcp => {
+                        run_recipe_via_chrome_devtools_mcp()
+                    }
                     browser::RecipeTransport::Manual => Err(anyhow!("{}", manual_fallback)),
                 };
 
@@ -2022,11 +2038,28 @@ mod tests {
         let transports = vec![
             browser::RecipeTransport::DevBrowser,
             browser::RecipeTransport::AgentBrowser,
+            browser::RecipeTransport::ChromeDevtoolsMcp,
             browser::RecipeTransport::Manual,
         ];
         assert!(recipe_has_remaining_manual_fallback(&transports, 0));
         assert!(recipe_has_remaining_manual_fallback(&transports, 1));
-        assert!(!recipe_has_remaining_manual_fallback(&transports, 2));
+        assert!(recipe_has_remaining_manual_fallback(&transports, 2));
+        assert!(!recipe_has_remaining_manual_fallback(&transports, 3));
+    }
+
+    #[test]
+    fn recipe_transport_name_covers_chrome_devtools_mcp() {
+        assert_eq!(
+            recipe_transport_name(browser::RecipeTransport::ChromeDevtoolsMcp),
+            "chrome-devtools-mcp"
+        );
+    }
+
+    #[test]
+    fn run_recipe_via_chrome_devtools_mcp_reports_not_supported() {
+        let err = run_recipe_via_chrome_devtools_mcp().unwrap_err();
+        assert!(err.to_string().contains("not yet supported"));
+        assert!(err.to_string().contains("chrome-devtools-mcp"));
     }
 
     #[test]
