@@ -894,6 +894,10 @@ fn format_recipe_transport_errors(errors: &[(browser::RecipeTransport, String)])
     format!("all browser recipe transports failed:\n- {joined}")
 }
 
+fn recipe_transport_error_detail(err: &anyhow::Error) -> String {
+    format!("{err:#}")
+}
+
 fn print_recipe_chrome_approval_message(transport: browser::RecipeTransport) {
     eprintln!(
         "info: connecting to Chrome via {} — if prompted, click Allow in Chrome's remote debugging dialog",
@@ -1445,7 +1449,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                     Ok(()) => return Ok(()),
                     Err(err) => {
                         if recipe_should_stop_live_transport_fallback(&err) {
-                            transport_errors.push((transport, err.to_string()));
+                            transport_errors.push((transport, recipe_transport_error_detail(&err)));
                             if recipe_has_remaining_manual_fallback(&transports, index) {
                                 transport_errors.push((
                                     browser::RecipeTransport::Manual,
@@ -1460,7 +1464,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                                 recipe_transport_name(transport)
                             );
                         }
-                        transport_errors.push((transport, err.to_string()));
+                        transport_errors.push((transport, recipe_transport_error_detail(&err)));
                     }
                 }
             }
@@ -2060,6 +2064,15 @@ mod tests {
         let err = run_recipe_via_chrome_devtools_mcp().unwrap_err();
         assert!(err.to_string().contains("not yet supported"));
         assert!(err.to_string().contains("chrome-devtools-mcp"));
+    }
+
+    #[test]
+    fn recipe_transport_error_detail_preserves_error_chain() {
+        let err = anyhow::anyhow!("browserType.connectOverCDP: Timeout 30000ms exceeded")
+            .context("dev-browser could not connect to Chrome");
+        let detail = recipe_transport_error_detail(&err);
+        assert!(detail.contains("dev-browser could not connect to Chrome"));
+        assert!(detail.contains("browserType.connectOverCDP: Timeout 30000ms exceeded"));
     }
 
     #[test]
