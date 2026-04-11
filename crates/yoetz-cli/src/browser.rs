@@ -199,7 +199,7 @@ pub fn run_agent_browser(
     )
 }
 
-fn managed_profile_connection(
+fn managed_connection(
     profile_dir: Option<&Path>,
     profile_mode: BrowserProfileMode,
     use_stealth: bool,
@@ -373,12 +373,12 @@ fn run_agent_browser_with_options(
     headed: bool,
     profile_mode: BrowserProfileMode,
 ) -> Result<String> {
-    let connection = managed_profile_connection(profile_dir, profile_mode, use_stealth);
+    let connection = managed_connection(profile_dir, profile_mode, use_stealth);
     run_agent_browser_with_connection(args, format, connection.as_ref(), use_stealth, headed)
 }
 
 pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> Result<()> {
-    let connection = managed_profile_connection(
+    let connection = managed_connection(
         ctx.profile_dir.as_deref(),
         ctx.profile_mode,
         ctx.use_stealth,
