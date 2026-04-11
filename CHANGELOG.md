@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- Keep the ChatGPT dev-browser page stable across recipe runs so Chrome does not need a fresh remote-debugging approval for each new session request; the shared ChatGPT tab now persists between runs and yoetz serializes access to it
+- Stop re-probing explicit dev-browser CDP endpoints in yoetz; explicit `--cdp` values now pass through unchanged so dev-browser owns Chrome 146+ DevToolsActivePort fallback behavior
+- Stop silently recycling legacy live-attach daemons during normal browser flows; stale recovery is now explicit via `yoetz browser reset`
 
 ## [0.2.47] - 2026-04-05
 ### Fixed

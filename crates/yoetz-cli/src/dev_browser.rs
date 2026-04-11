@@ -14,15 +14,17 @@
 //! - Single script executes batch operations (fewer IPC round-trips)
 
 use anyhow::{anyhow, Context, Result};
+use reqwest::Url;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-use reqwest::Url;
+#[cfg(test)]
 use yoetz_core::paths::home_dir;
 
 use crate::browser;
@@ -32,14 +34,12 @@ static DEV_BROWSER: OnceLock<String> = OnceLock::new();
 
 /// Default timeout for dev-browser scripts in seconds.
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 30;
-const CDP_HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const CHROME_EXPLICIT_REMOTE_DEBUGGING_PORT: u16 = 9222;
-const CDP_HALF_STATE_MARKER: &str =
-    "Chrome CDP endpoint is reachable but not responding to protocol commands";
 
 /// Extended timeout for ChatGPT response polling (30 minutes by default).
 const CHATGPT_POLL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
 const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 30_000;
+const CHATGPT_BROWSER_NAME: &str = "yoetz-chatgpt";
+const CHATGPT_PAGE_NAME: &str = "yoetz-chatgpt-main";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChatgptPollSettings {
@@ -54,30 +54,6 @@ impl Default for ChatgptPollSettings {
             interval_ms: CHATGPT_POLL_INTERVAL_MS_DEFAULT,
         }
     }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CdpCandidate {
-    endpoint: String,
-    source: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct ResolvedCdpEndpoint {
-    ws_url: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct DevToolsActivePortEntry {
-    port: u16,
-    ws_url: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum CdpProbeOutcome {
-    Healthy(ResolvedCdpEndpoint),
-    Unavailable(String),
-    Poisoned(String),
 }
 
 /// dev-browser tmp directory for file staging.
@@ -264,358 +240,52 @@ pub fn ensure_installed() -> Result<()> {
     ))
 }
 
+/// Stop the dev-browser daemon explicitly. Returns true when a running daemon
+/// was asked to stop, false when no daemon was running.
+pub fn stop_daemon() -> Result<bool> {
+    let bin = resolve_dev_browser()?;
+    let output = Command::new(&bin)
+        .arg("stop")
+        .output()
+        .with_context(|| format!("failed to run dev-browser stop (via {bin})"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit code {:?}", output.status.code())
+        };
+        return Err(anyhow!("dev-browser stop failed: {detail}"));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(!stdout.to_lowercase().contains("not running"))
+}
+
 /// Run a dev-browser script against a live Chrome instance (auto-connect).
 /// Returns the script's stdout output.
 pub fn run_script_connect(script: &str, timeout_secs: Option<u64>) -> Result<String> {
     run_script_connect_with_endpoint(script, timeout_secs, None)
 }
 
-fn chrome_default_profile_cdp_guidance() -> String {
-    #[cfg(target_os = "macos")]
-    {
-        let profile_dir = home_dir()
-            .map(|home| {
-                home.join("Library")
-                    .join("Application Support")
-                    .join("Google")
-                    .join("Chrome")
-            })
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| "~/Library/Application Support/Google/Chrome".to_string());
-        format!(
-            "This is a known Chrome 136+ limitation when using the default profile.\n\
-             For a reliable explicit CDP endpoint, relaunch Chrome with:\n\
-               --remote-debugging-port={CHROME_EXPLICIT_REMOTE_DEBUGGING_PORT} --user-data-dir={profile_dir}\n\
-             Or use Chrome for Testing."
-        )
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        format!(
-        "This is a known Chrome 136+ limitation when using the default profile.\n\
-         For a reliable explicit CDP endpoint, relaunch Chrome with:\n\
-           --remote-debugging-port={CHROME_EXPLICIT_REMOTE_DEBUGGING_PORT} --user-data-dir=~/.config/yoetz/chrome-profile\n\
-         Or use Chrome for Testing."
-        )
-    }
-}
-
-fn is_poisoned_cdp_error(err: &anyhow::Error) -> bool {
-    err.to_string().contains(CDP_HALF_STATE_MARKER)
-}
-
-fn is_localhost_url(url: &Url) -> bool {
-    matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "::1"))
-}
-
-fn endpoint_port(endpoint: &str) -> Option<u16> {
-    let url = Url::parse(endpoint).ok()?;
-    url.port_or_known_default()
-}
-
-fn standard_devtools_active_port_candidates() -> Vec<PathBuf> {
-    let Some(home_dir) = home_dir() else {
-        return Vec::new();
-    };
-
-    #[cfg(target_os = "macos")]
-    {
-        return vec![
-            home_dir
-                .join("Library")
-                .join("Application Support")
-                .join("Google")
-                .join("Chrome")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join("Library")
-                .join("Application Support")
-                .join("Google")
-                .join("Chrome Canary")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join("Library")
-                .join("Application Support")
-                .join("Chromium")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join("Library")
-                .join("Application Support")
-                .join("BraveSoftware")
-                .join("Brave-Browser")
-                .join("DevToolsActivePort"),
-        ];
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        return vec![
-            home_dir
-                .join(".config")
-                .join("google-chrome")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join(".config")
-                .join("chromium")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join(".config")
-                .join("google-chrome-beta")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join(".config")
-                .join("google-chrome-unstable")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join(".config")
-                .join("BraveSoftware")
-                .join("Brave-Browser")
-                .join("DevToolsActivePort"),
-        ];
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        return vec![
-            home_dir
-                .join("AppData")
-                .join("Local")
-                .join("Google")
-                .join("Chrome")
-                .join("User Data")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join("AppData")
-                .join("Local")
-                .join("Google")
-                .join("Chrome Beta")
-                .join("User Data")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join("AppData")
-                .join("Local")
-                .join("Google")
-                .join("Chrome SxS")
-                .join("User Data")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join("AppData")
-                .join("Local")
-                .join("Chromium")
-                .join("User Data")
-                .join("DevToolsActivePort"),
-            home_dir
-                .join("AppData")
-                .join("Local")
-                .join("BraveSoftware")
-                .join("Brave-Browser")
-                .join("User Data")
-                .join("DevToolsActivePort"),
-        ];
-    }
-
-    #[allow(unreachable_code)]
-    Vec::new()
-}
-
-fn parse_devtools_active_port(contents: &str) -> Option<DevToolsActivePortEntry> {
-    let lines = contents
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>();
-    let port = lines.first()?.parse::<u16>().ok()?;
-    let ws_path = *lines.get(1)?;
-    if port == 0 || !ws_path.starts_with("/devtools/browser/") {
-        return None;
-    }
-    Some(DevToolsActivePortEntry {
-        port,
-        ws_url: format!("ws://127.0.0.1:{port}{ws_path}"),
-    })
-}
-
-fn devtools_active_port_entries() -> Vec<(PathBuf, DevToolsActivePortEntry)> {
-    standard_devtools_active_port_candidates()
-        .into_iter()
-        .filter_map(|path| {
-            let contents = fs::read_to_string(&path).ok()?;
-            let entry = parse_devtools_active_port(&contents)?;
-            Some((path, entry))
-        })
-        .collect()
-}
-
-fn matching_devtools_active_port_candidate(port: u16) -> Option<CdpCandidate> {
-    devtools_active_port_entries()
-        .into_iter()
-        .find_map(|(path, entry)| {
-            (entry.port == port).then_some(CdpCandidate {
-                endpoint: entry.ws_url,
-                source: format!("DevToolsActivePort ({})", path.display()),
-            })
-        })
-}
-
-fn json_version_url(endpoint: &str) -> Result<Url> {
-    let mut url = Url::parse(endpoint)
-        .with_context(|| format!("invalid Chrome CDP endpoint `{endpoint}`"))?;
-    match url.scheme() {
-        "http" | "https" => {}
-        "ws" => {
-            url.set_scheme("http")
-                .map_err(|_| anyhow!("invalid CDP endpoint scheme for `{endpoint}`"))?;
-        }
-        "wss" => {
-            url.set_scheme("https")
-                .map_err(|_| anyhow!("invalid CDP endpoint scheme for `{endpoint}`"))?;
-        }
-        other => {
-            return Err(anyhow!(
-                "unsupported Chrome CDP endpoint scheme `{other}` in `{endpoint}`"
-            ));
-        }
-    }
-    url.set_path("/json/version");
-    url.set_query(None);
-    url.set_fragment(None);
-    Ok(url)
-}
-
-#[derive(serde::Deserialize)]
-struct JsonVersionResponse {
-    #[serde(rename = "webSocketDebuggerUrl")]
-    web_socket_debugger_url: Option<String>,
-}
-
-fn build_half_state_diagnostic(candidate: &CdpCandidate, probe_url: &str, detail: &str) -> String {
-    format!(
-        "{CDP_HALF_STATE_MARKER}.\n\
-         Endpoint: {}\n\
-         Probe: {probe_url}\n\
-         Source: {}\n\
-         Observed: {detail}\n\
-         {}\n\
-         Restart Chrome with chrome://inspect/#remote-debugging enabled, then retry auto-connect or pass the exact ws:// CDP endpoint.",
-        candidate.endpoint,
-        candidate.source,
-        chrome_default_profile_cdp_guidance(),
-    )
-}
-
-fn probe_cdp_candidate(candidate: &CdpCandidate) -> CdpProbeOutcome {
-    let probe_url = match json_version_url(&candidate.endpoint) {
-        Ok(url) => url,
-        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
-    };
-
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(CDP_HEALTH_TIMEOUT)
-        .build()
-    {
-        Ok(client) => client,
-        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
-    };
-    let response = match client
-        .get(probe_url.as_str())
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-    {
-        Ok(response) => response,
-        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
-    };
-    let status = response.status();
-
-    // Chrome 136+ can leave localhost CDP in a half-state where DevTools is
-    // listening but HTTP discovery on the real profile returns 404.
-    if status == reqwest::StatusCode::NOT_FOUND && is_localhost_url(&probe_url) {
-        return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
-            candidate,
-            probe_url.as_str(),
-            "GET /json/version returned HTTP 404 from a localhost Chrome endpoint",
-        ));
-    }
-
-    if !status.is_success() {
-        return CdpProbeOutcome::Unavailable(format!("HTTP {} from {}", status, probe_url));
-    }
-
-    let body = match response.text() {
-        Ok(body) => body,
-        Err(err) => return CdpProbeOutcome::Unavailable(err.to_string()),
-    };
-    if body.trim().is_empty() {
-        return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
-            candidate,
-            probe_url.as_str(),
-            "GET /json/version returned an empty body",
-        ));
-    }
-
-    let payload: JsonVersionResponse = match serde_json::from_str(&body) {
-        Ok(payload) => payload,
-        Err(err) => {
-            return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
-                candidate,
-                probe_url.as_str(),
-                &format!("GET /json/version returned invalid JSON ({err})"),
-            ));
-        }
-    };
-
-    let Some(ws_url) = payload
-        .web_socket_debugger_url
-        .filter(|url| !url.trim().is_empty())
-    else {
-        return CdpProbeOutcome::Poisoned(build_half_state_diagnostic(
-            candidate,
-            probe_url.as_str(),
-            "GET /json/version did not include webSocketDebuggerUrl",
-        ));
-    };
-
-    CdpProbeOutcome::Healthy(ResolvedCdpEndpoint { ws_url })
-}
-
 fn resolve_dev_browser_connect_endpoint(cdp_endpoint: Option<&str>) -> Result<Option<String>> {
     let Some(endpoint) = cdp_endpoint else {
-        // Let dev-browser own auto-connect discovery. It already knows how to
-        // read DevToolsActivePort without relying on /json/version.
         return Ok(None);
     };
 
+    // dev-browser already owns HTTP probing, /json/version fallback, and
+    // DevToolsActivePort resolution. yoetz only validates that the caller
+    // passed a recognizable CDP URL shape, then forwards it unchanged.
     let url = Url::parse(endpoint)
         .with_context(|| format!("invalid Chrome CDP endpoint `{endpoint}`"))?;
     match url.scheme() {
-        "ws" | "wss" => return Ok(Some(endpoint.to_string())),
-        "http" | "https" => {}
-        other => {
-            return Err(anyhow!(
-                "unsupported Chrome CDP endpoint scheme `{other}` in `{endpoint}`"
-            ));
-        }
-    }
-
-    let candidate = CdpCandidate {
-        endpoint: endpoint.to_string(),
-        source: "explicit --cdp".to_string(),
-    };
-    match probe_cdp_candidate(&candidate) {
-        CdpProbeOutcome::Healthy(resolved) => Ok(Some(resolved.ws_url)),
-        CdpProbeOutcome::Poisoned(detail) => {
-            if let Some(port) = endpoint_port(endpoint) {
-                if let Some(ws_candidate) = matching_devtools_active_port_candidate(port) {
-                    match probe_cdp_candidate(&ws_candidate) {
-                        CdpProbeOutcome::Healthy(resolved) => return Ok(Some(resolved.ws_url)),
-                        CdpProbeOutcome::Poisoned(_) | CdpProbeOutcome::Unavailable(_) => {}
-                    }
-                }
-            }
-            Err(anyhow!(detail))
-        }
-        CdpProbeOutcome::Unavailable(detail) => Err(anyhow!(
-            "dev-browser could not resolve a healthy Chrome CDP endpoint from `{endpoint}`: {detail}"
+        "http" | "https" | "ws" | "wss" => Ok(Some(endpoint.to_string())),
+        other => Err(anyhow!(
+            "unsupported Chrome CDP endpoint scheme `{other}` in `{endpoint}`"
         )),
     }
 }
@@ -753,9 +423,6 @@ console.log("ok:" + pages.length);
         Ok(stdout) if stdout.trim().starts_with("ok:") => Ok(()),
         Ok(stdout) => Err(anyhow!("dev-browser connection check failed: {stdout}")),
         Err(first_err) => {
-            if is_poisoned_cdp_error(&first_err) {
-                return Err(first_err.context("dev-browser connection check failed"));
-            }
             let msg = format!("{first_err:#}");
             let is_timeout = msg.contains("Timeout") || msg.contains("timed out");
             if !is_timeout {
@@ -930,18 +597,62 @@ fn build_chatgpt_prepare_script(page_name: &str, model: &str) -> String {
     let page_name_json = serde_json::to_string(page_name).unwrap();
     let model_json = serde_json::to_string(model).unwrap();
     format!(
-        r#"
+        r##"
 const PAGE_NAME = {page_name_json};
 const MODEL = {model_json};
 const page = await browser.getPage(PAGE_NAME);
-await page.goto("https://chatgpt.com/");
-let composerReady = true;
-try {{
-  await page.locator("[role='textbox']").first().waitFor({{ state: "visible", timeout: 20000 }});
-}} catch (_) {{
-  composerReady = false;
-}}
+const CHATGPT_URL = "https://chatgpt.com/";
+const COMPOSER_SELECTOR = "#prompt-textarea, [role='textbox']";
+const ASSISTANT_SELECTOR = "[data-message-author-role='assistant']";
+const NEW_CHAT_SELECTOR = "[data-testid='new-chat-button']";
+await page.goto(CHATGPT_URL, {{ waitUntil: "domcontentloaded" }});
+await page.waitForTimeout(800);
 const loggedIn = (await page.locator("[data-testid='login-button']").first().count()) === 0;
+// QuickJS: keep this helper small and let Rust own the broader orchestration.
+// Playwright's page.evaluate accepts exactly one arg after the function, so
+// the selectors are passed as a single object.
+const readState = async () => await page.evaluate(({{ composerSelector, assistantSelector }}) => {{
+  const composer = document.querySelector(composerSelector);
+  const assistantCount = document.querySelectorAll(assistantSelector).length;
+  const pathname = window.location.pathname || "/";
+  return {{
+    url: window.location.href,
+    pathname,
+    onConversationPath: pathname.startsWith("/c/"),
+    assistantCount,
+    composerVisible: !!composer,
+  }};
+}}, {{ composerSelector: COMPOSER_SELECTOR, assistantSelector: ASSISTANT_SELECTOR }});
+let state = await readState();
+let composerReady =
+  loggedIn &&
+  state.composerVisible &&
+  state.assistantCount === 0 &&
+  !state.onConversationPath;
+if (loggedIn && !composerReady) {{
+  for (let attempt = 0; attempt < 2 && !composerReady; attempt += 1) {{
+    const canUseNewChat = attempt === 0;
+    const newChatButton = canUseNewChat ? page.locator(NEW_CHAT_SELECTOR).first() : null;
+    if (newChatButton && (await newChatButton.count() > 0)) {{
+      await newChatButton.click({{ timeout: 5000 }});
+    }} else {{
+      await page.reload({{ waitUntil: "domcontentloaded" }});
+    }}
+    await page.waitForTimeout(1000);
+    state = await readState();
+    composerReady =
+      state.composerVisible &&
+      state.assistantCount === 0 &&
+      !state.onConversationPath;
+  }}
+}}
+if (loggedIn && composerReady) {{
+  try {{
+    await page.locator(COMPOSER_SELECTOR).first().waitFor({{ state: "visible", timeout: 20000 }});
+  }} catch (_) {{
+    composerReady = false;
+  }}
+}}
 if (loggedIn && composerReady && MODEL) {{
   const modelBtn = page.locator("[data-testid='model-switcher-dropdown-button'], button[aria-label='Model selector']").first();
   await modelBtn.waitFor({{ state: "visible", timeout: 5000 }});
@@ -961,9 +672,9 @@ console.log(JSON.stringify({{
   status: !loggedIn ? "login_required" : composerReady ? "ready" : "not_ready",
   loggedIn,
   composerReady,
-  url: page.url(),
+  url: state.url,
 }}));
-"#,
+"##,
         page_name_json = page_name_json,
         model_json = model_json,
     )
@@ -1150,21 +861,6 @@ console.log(JSON.stringify({{
     )
 }
 
-fn build_chatgpt_cleanup_script(page_name: &str) -> String {
-    let page_name_json = serde_json::to_string(page_name).unwrap();
-    format!(
-        r#"
-const PAGE_NAME = {page_name_json};
-const pages = await browser.listPages();
-if (pages.find((page) => page.name === PAGE_NAME)) {{
-    const page = await browser.getPage(PAGE_NAME);
-    await page.close().catch(() => {{}});
-}}
-"#,
-        page_name_json = page_name_json,
-    )
-}
-
 fn parse_chatgpt_recipe_result(
     stdout: &str,
     poll_timeout_ms: u64,
@@ -1237,16 +933,9 @@ fn parse_chatgpt_recipe_result(
 /// GC assertion on disposal. Rust owns the orchestration; each script only does
 /// one browser phase and returns JSON over stdout.
 pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
-    let unique_prefix = format!(
-        "{}_{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
-    let browser_name = "yoetz-chatgpt".to_string();
-    let page_name = format!("yoetz-chatgpt-page-{unique_prefix}");
+    let recipe_lock = browser::acquire_chatgpt_recipe_lock()?;
+    let browser_name = CHATGPT_BROWSER_NAME.to_string();
+    let page_name = CHATGPT_PAGE_NAME.to_string();
     let cdp_endpoint = ctx.cdp_endpoint.as_deref();
     let run_script = |script: &str, timeout_secs: Option<u64>| {
         run_script_connect_with_browser_and_endpoint(
@@ -1256,21 +945,11 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
             cdp_endpoint,
         )
     };
-    let cleanup = |cdp_endpoint| -> Result<()> {
-        let cleanup_script = build_chatgpt_cleanup_script(&page_name);
-        match run_script_connect_with_browser_and_endpoint(
-            &cleanup_script,
-            Some(15),
-            Some(browser_name.as_str()),
-            cdp_endpoint,
-        ) {
-            Ok(_) => Ok(()),
-            Err(err) => {
-                eprintln!("warn: failed to clean up dev-browser recipe page `{page_name}`: {err}");
-                Ok(())
-            }
-        }
-    };
+    if ctx.show_approval_guidance && recipe_lock.waited() {
+        eprintln!(
+            "info: another yoetz process is already using the shared ChatGPT dev-browser page; waiting for it to finish before reusing the tab"
+        );
+    }
 
     let result = (|| -> Result<(String, Vec<String>)> {
         let mut warnings = Vec::new();
@@ -1373,7 +1052,6 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
         warnings.append(&mut poll_warnings);
         Ok((response, warnings))
     })();
-    cleanup(cdp_endpoint)?;
 
     let (response, warnings) = result?;
     for warning in warnings {
@@ -1487,76 +1165,23 @@ mod tests {
     }
 
     #[test]
-    fn parse_devtools_active_port_returns_browser_ws_url() {
-        let entry =
-            parse_devtools_active_port("9222\n/devtools/browser/test-browser-id\n").unwrap();
-
-        assert_eq!(entry.port, 9222);
-        assert_eq!(
-            entry.ws_url,
-            "ws://127.0.0.1:9222/devtools/browser/test-browser-id"
-        );
-    }
-
-    #[test]
-    fn parse_devtools_active_port_rejects_malformed_payload() {
-        assert!(
-            parse_devtools_active_port("9222\n/devtools/page/not-a-browser-target\n").is_none()
-        );
-        assert!(parse_devtools_active_port("not-a-port\n/devtools/browser/test\n").is_none());
-    }
-
-    #[test]
-    fn json_version_url_normalizes_http_and_ws_endpoints() {
-        assert_eq!(
-            json_version_url("http://127.0.0.1:9222/devtools/browser/test")
-                .unwrap()
-                .as_str(),
-            "http://127.0.0.1:9222/json/version"
-        );
-        assert_eq!(
-            json_version_url("ws://127.0.0.1:9222/devtools/browser/test")
-                .unwrap()
-                .as_str(),
-            "http://127.0.0.1:9222/json/version"
-        );
-    }
-
-    #[test]
     fn resolve_dev_browser_connect_endpoint_skips_probing_for_auto_connect() {
         assert_eq!(resolve_dev_browser_connect_endpoint(None).unwrap(), None);
     }
 
     #[test]
-    fn probe_cdp_candidate_marks_local_404_as_poisoned() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request);
-            stream
-                .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
-                .unwrap();
-        });
-
-        let candidate = CdpCandidate {
-            endpoint: format!("http://127.0.0.1:{}", addr.port()),
-            source: "test".to_string(),
-        };
-        let outcome = probe_cdp_candidate(&candidate);
-        server.join().unwrap();
-
-        match outcome {
-            CdpProbeOutcome::Poisoned(detail) => {
-                assert!(detail.contains("HTTP 404"));
-                assert!(detail.contains(CDP_HALF_STATE_MARKER));
-            }
-            other => panic!("expected poisoned outcome, got {other:?}"),
-        }
+    fn resolve_dev_browser_connect_endpoint_passes_explicit_endpoints_through() {
+        assert_eq!(
+            resolve_dev_browser_connect_endpoint(Some("http://127.0.0.1:9222")).unwrap(),
+            Some("http://127.0.0.1:9222".to_string())
+        );
+        assert_eq!(
+            resolve_dev_browser_connect_endpoint(Some(
+                "ws://127.0.0.1:9222/devtools/browser/test-browser-id"
+            ))
+            .unwrap(),
+            Some("ws://127.0.0.1:9222/devtools/browser/test-browser-id".to_string())
+        );
     }
 
     #[test]
@@ -1566,11 +1191,28 @@ mod tests {
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
         assert!(script.contains("const MODEL = \"gpt-5-4-pro\";"));
         assert!(script.contains("const page = await browser.getPage(PAGE_NAME);"));
-        assert!(script.contains("await page.goto(\"https://chatgpt.com/\");"));
+        assert!(
+            script.contains("await page.goto(CHATGPT_URL, { waitUntil: \"domcontentloaded\" });")
+        );
         assert!(script.contains("[data-testid='login-button']"));
+        assert!(script.contains("const NEW_CHAT_SELECTOR = \"[data-testid='new-chat-button']\";"));
+        assert!(script.contains("const canUseNewChat = attempt === 0;"));
+        assert!(script.contains("await page.reload({ waitUntil: \"domcontentloaded\" });"));
+        assert!(script.contains("page.evaluate(({ composerSelector, assistantSelector })"));
+        assert!(!script.contains("page.evaluate((composerSelector, assistantSelector)"));
+        assert!(script.contains("state.assistantCount === 0"));
+        assert!(script.contains("pathname.startsWith(\"/c/\")"));
         assert!(script.contains(
             "status: !loggedIn ? \"login_required\" : composerReady ? \"ready\" : \"not_ready\""
         ));
+    }
+
+    #[test]
+    fn chatgpt_recipe_uses_stable_browser_and_page_names() {
+        assert_eq!(CHATGPT_BROWSER_NAME, "yoetz-chatgpt");
+        assert_eq!(CHATGPT_PAGE_NAME, "yoetz-chatgpt-main");
+        assert!(!CHATGPT_PAGE_NAME.contains("pid"));
+        assert!(!CHATGPT_PAGE_NAME.contains('_'));
     }
 
     #[test]

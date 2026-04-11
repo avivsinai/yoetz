@@ -216,10 +216,12 @@ yoetz browser attach
 
 ### Chrome 146+ notes
 
-Chrome 146 introduced a security dialog for external CDP connections. yoetz handles this automatically:
-- Detects the dialog and tells you to click Allow (instead of hanging)
-- Reuses healthy daemon connections (no repeated dialogs)
-- Cleans up stale daemons when the connection breaks
+Chrome 146 introduced a security dialog for external CDP connections. Yoetz is extension-free by design, so the only way to get "approve once, then run silently" behavior is to keep the daemon/CDP session alive and avoid tearing it down between invocations.
+
+Current policy:
+- Prefer live attach over cookie sync: `dev-browser` first, `agent-browser` second.
+- Trust an existing live-attach daemon by default; yoetz does not silently recycle it during normal attach/check/recipe flows.
+- If recovery is actually needed, use `yoetz browser reset` explicitly.
 
 If you see "Allow remote debugging?" in Chrome, click Allow and retry.
 
@@ -289,7 +291,7 @@ Built-in recipes: `chatgpt`, `claude`, `gemini`.
 | `Allow remote debugging?` dialog | Click **Allow** in Chrome, then retry. If the dialog is frozen, launch Chrome with `--remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug` and use `yoetz browser attach --cdp http://127.0.0.1:9222` instead. |
 | `auto-connect probe timed out` | Chrome dialog is probably showing. Click Allow. If Chrome will not accept the dialog, switch to the explicit `--cdp` flow above. Install `dev-browser` first; `agent-browser` remains a fallback. |
 | `chatgpt login required` | Chrome was reached but the wrong profile/tab was used. Open ChatGPT in the target Chrome profile first, or connect that profile explicitly with `--cdp`, then retry. |
-| `daemon already running` | Run `yoetz browser attach` to check connection, or kill stale daemon: `agent-browser close` |
+| `daemon already running` | Run `yoetz browser attach` to check connection. If the daemon is stale, use `yoetz browser reset`, not `agent-browser close` directly. |
 | `agent-browser failed` | Ensure `npx agent-browser --version` works, or `npm install -g agent-browser` |
 | `dev-browser failed` | Ensure `dev-browser --help` works, verify Chrome remote debugging is enabled, and retry with `--cdp` if you need a specific Chrome profile. |
 | Recipe not found | Use `--recipe chatgpt` (name) or full path. Check `brew --prefix`/share/yoetz/recipes/ |
@@ -321,9 +323,10 @@ This keeps the default path aligned with the same browser transport users alread
 The browser module connects to your running Chrome via CDP (Chrome DevTools Protocol):
 - **dev-browser** (primary): Playwright-based transport that attaches to your logged-in Chrome session
 - **agent-browser** (fallback): legacy transport with cookie/profile fallback support
-- **Cookie sync** (legacy fallback): extracts cookies from Chrome's encrypted store, injects into agent-browser
-- Uses stealth User-Agent headers and disables automation detection flags
-- Daemon model: one persistent connection per session, reused across recipe steps
+- **chrome-devtools-mcp** (fallback 2, stub): Google's official CDP MCP server, not yet integrated
+- **Cookie sync** (legacy fallback): extracts cookies from Chrome's encrypted store, injects into agent-browser only after live attach paths are exhausted
+- Extension-free by design: no browser extension is required or desired
+- Daemon model: one persistent connection per session, reused across invocations until you explicitly run `yoetz browser reset`
 
 ## Provider Configuration
 

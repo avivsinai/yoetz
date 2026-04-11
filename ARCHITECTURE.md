@@ -73,7 +73,18 @@ Daily spend is tracked in a local JSON file. The `--max-cost-usd` flag estimates
 
 ### Browser Mode
 
-For models without API access (e.g., ChatGPT Pro), yoetz bundles files into markdown, then connects to the user's running Chrome via CDP (Chrome DevTools Protocol) using agent-browser to submit the bundle through the web UI. Connection priority: explicit CDP endpoint > auto-connect > cookie state > profile fallback. Chrome 146+ requires a one-time "Allow remote debugging?" approval; the daemon keeps the connection alive across recipe steps.
+For models without API access (e.g., ChatGPT Pro), yoetz bundles files into markdown, then connects to the user's running Chrome via CDP (Chrome DevTools Protocol) and submits the bundle through the web UI.
+
+Browser integrations are extension-free by design. Yoetz prefers to act as a wrapper over the underlying transport rather than reimplementing transport logic itself:
+
+- `dev-browser` is the primary live-Chrome transport for ChatGPT recipes.
+- `agent-browser` remains the legacy fallback when `dev-browser` is unavailable or a non-ChatGPT path still depends on it.
+- `chrome-devtools-mcp` is an extension-free fallback candidate, but it is not integrated yet.
+- Explicit CDP endpoints are forwarded to the transport unchanged; the transport owns `/json/version`, `DevToolsActivePort`, and related connection logic.
+
+Connection priority remains connect-first: explicit CDP endpoint > auto-connect > cookie state > profile fallback.
+
+Chrome 146+ may show a one-time "Allow remote debugging?" approval dialog for a new CDP session. The acceptance criterion is one approval per browser session, not per yoetz invocation, so yoetz avoids silently tearing down live-attach daemons in normal attach/check/recipe flows. Recovery is explicit via `yoetz browser reset`.
 
 ## Data Flow
 
