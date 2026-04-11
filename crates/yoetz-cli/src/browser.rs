@@ -199,7 +199,7 @@ pub fn run_agent_browser(
     )
 }
 
-fn legacy_connection(
+fn managed_profile_connection(
     profile_dir: Option<&Path>,
     profile_mode: BrowserProfileMode,
     use_stealth: bool,
@@ -373,12 +373,12 @@ fn run_agent_browser_with_options(
     headed: bool,
     profile_mode: BrowserProfileMode,
 ) -> Result<String> {
-    let connection = legacy_connection(profile_dir, profile_mode, use_stealth);
+    let connection = managed_profile_connection(profile_dir, profile_mode, use_stealth);
     run_agent_browser_with_connection(args, format, connection.as_ref(), use_stealth, headed)
 }
 
 pub fn run_recipe(recipe: Recipe, ctx: RecipeContext, format: OutputFormat) -> Result<()> {
-    let connection = legacy_connection(
+    let connection = managed_profile_connection(
         ctx.profile_dir.as_deref(),
         ctx.profile_mode,
         ctx.use_stealth,
@@ -1480,7 +1480,7 @@ pub fn build_recipe_vars(
 /// Search for a yoetz data file (script or recipe) across standard locations.
 /// Order: YOETZ_SCRIPTS_DIR env, relative to exe, Homebrew share, XDG, ~/.local/share.
 fn find_data_file(subdir: &str, filename: &str) -> Result<PathBuf> {
-    // Check YOETZ_SCRIPTS_DIR env var (legacy, works for scripts)
+    // Check YOETZ_SCRIPTS_DIR env var (works for scripts)
     if subdir == "scripts" {
         if let Ok(dir) = env::var("YOETZ_SCRIPTS_DIR") {
             let path = PathBuf::from(dir).join(filename);
@@ -1876,7 +1876,7 @@ pub fn resolve_auth_mode(profile_dir: &Path, headed: bool) -> Result<BrowserProf
         BrowserConnection::CookieState { .. } => Ok(BrowserProfileMode::PreferState),
         BrowserConnection::Profile { .. } => Ok(BrowserProfileMode::ProfileOnly),
         BrowserConnection::Cdp { .. } | BrowserConnection::AutoConnect => Err(anyhow!(
-            "legacy auth mode cannot map a live browser connection"
+            "managed-profile auth mode cannot map a live browser connection"
         )),
     }
 }

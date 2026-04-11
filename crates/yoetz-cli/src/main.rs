@@ -935,7 +935,7 @@ fn default_daemon_recovery_error(original: Option<&anyhow::Error>) -> Option<any
             "Chrome may be showing an \"Allow remote debugging?\" dialog. Click Allow, then retry.{suffix}"
         )),
         browser::DaemonState::Stale => Some(anyhow!(
-            "The legacy agent-browser daemon looks stale. Run `yoetz browser reset` and retry.{suffix}"
+            "The agent-browser default daemon looks stale. Run `yoetz browser reset` and retry.{suffix}"
         )),
         browser::DaemonState::NoSocket | browser::DaemonState::Healthy => None,
     }
@@ -1267,7 +1267,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
 
             // Try dev-browser first for auth verification whenever we are
             // targeting a live Chrome instance. `--profile` still routes to the
-            // legacy managed-profile path.
+            // managed-profile path.
             if browser::use_dev_browser() && check_args.profile.is_none() {
                 match dev_browser::ensure_chatgpt_auth_with_page_check_and_endpoint(
                     dev_browser_cdp.as_deref(),
@@ -1293,7 +1293,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                         };
                     }
                     Err(e) => {
-                        eprintln!("info: dev-browser auth check failed ({e}), trying legacy path");
+                        eprintln!("info: dev-browser auth check failed ({e}), trying managed-profile path");
                     }
                 }
             }
@@ -1340,12 +1340,12 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
             };
             browser::close_live_attach_session()?;
             browser::close_browser()?;
-            let legacy_reset = browser::force_kill_stale_daemon();
+            let default_daemon_reset = browser::force_kill_stale_daemon();
 
             let payload = json!({
                 "status": "ok",
                 "dev_browser_daemon_stopped": dev_browser_stopped,
-                "agent_browser_default": format!("{legacy_reset:?}"),
+                "agent_browser_default": format!("{default_daemon_reset:?}"),
                 "agent_browser_cdp_session_closed": true,
             });
             match format {
@@ -1358,7 +1358,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                         println!("dev-browser daemon was not running.");
                     }
                     println!("Closed agent-browser live-attach session.");
-                    println!("Reset agent-browser default daemon state: {legacy_reset:?}.");
+                    println!("Reset agent-browser default daemon state: {default_daemon_reset:?}.");
                     Ok(())
                 }
             }

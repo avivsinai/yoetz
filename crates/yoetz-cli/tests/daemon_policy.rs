@@ -28,7 +28,7 @@ fn main_keeps_destructive_recovery_scoped_to_browser_reset() {
     assert_eq!(
         occurrences(&main_rs, "browser::close_browser()?;"),
         1,
-        "legacy managed daemon close should only run in BrowserCommand::Reset"
+        "managed-profile daemon close should only run in BrowserCommand::Reset"
     );
     assert_eq!(
         occurrences(&main_rs, "browser::close_live_attach_session()?;"),
