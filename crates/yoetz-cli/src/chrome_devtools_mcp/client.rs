@@ -132,10 +132,26 @@ impl CdpMcpClient {
         Err(anyhow!("client.wait_for: not yet implemented"))
     }
 
+    /// Call chrome-devtools-mcp's `evaluate_script` tool.
+    ///
+    /// `function` is a string containing a JS function literal (arrow or
+    /// `async () => { ... }`). `arg_uids` is an array of snapshot uids —
+    /// chrome-devtools-mcp resolves each uid to a `JSHandle` server-side and
+    /// passes those handles into the function as args. Pass `&[]` for no args.
+    /// Do NOT pass arbitrary JSON — that's not how this tool works.
+    ///
+    /// The tool's return value is wrapped server-side as
+    /// ```text
+    /// ```json
+    /// <JSON.stringify(result)>
+    /// ```
+    /// ```
+    /// inside a MCP `TextContent` block. This wrapper unwraps the code fence
+    /// and parses the inner JSON, returning a clean `serde_json::Value`.
     pub async fn evaluate_script(
         &self,
         _function: &str,
-        _args: Vec<serde_json::Value>,
+        _arg_uids: &[&str],
     ) -> Result<serde_json::Value> {
         Err(anyhow!("client.evaluate_script: not yet implemented"))
     }

@@ -38,11 +38,10 @@ pub mod client;
 
 pub mod chatgpt;
 
-#[cfg(any())] // placeholders — wired after chatgpt is proven
-pub mod claude;
-
-#[cfg(any())] // placeholders — wired after chatgpt is proven
-pub mod gemini;
+// `pub mod claude;` and `pub mod gemini;` land after the chatgpt recipe is
+// proven end-to-end against live Chrome 147. They share the same seven-step
+// shape (new_page → focus → upload → type → click → wait → extract) with
+// per-LLM selectors — trivial to add once the client plumbing is verified.
 
 use std::path::PathBuf;
 
