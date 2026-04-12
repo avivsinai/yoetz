@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.2.49] - 2026-04-12
 ### Added
 
 - Chrome 147 live-attach via vendored `headless_chrome` — primary transport for the ChatGPT recipe that bypasses the Playwright/Puppeteer `Target.setAutoAttach` hang on Chrome 147's default-profile built-in remote debugging
@@ -22,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - ChatGPT completion poller scopes copy-button detection to the latest assistant message only
 - Full error chain surfaced in recipe transport errors (PR #129)
 - Agent-browser ChatGPT recipe uses real keyboard typing instead of ProseMirror-incompatible `fill()`
+
 
 ## [0.2.48] - 2026-04-11
 ### Fixed
