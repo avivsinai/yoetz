@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.49] - 2026-04-12
+### Added
+
+- Chrome 147 live-attach via vendored `headless_chrome` — primary transport for the ChatGPT recipe that bypasses the Playwright/Puppeteer `Target.setAutoAttach` hang on Chrome 147's default-profile built-in remote debugging
+- Three-tier browser transport waterfall: `headless_chrome` (primary) > `dev-browser` (second tier) > `agent-browser` (third tier), with each tier working end-to-end against Chrome 147
+- `PW_CHROMIUM_ATTACH_TO_OTHER=1` injected into dev-browser child process for Chrome 147 Playwright compat (upstream issue filed: SawyerHood/dev-browser#103)
+- Custom DOM snapshot engine in `chrome_devtools_mcp/client.rs` for uid-based element targeting without external MCP server dependency
+- Stable-idle ChatGPT response polling ported from v0.2.33 Pro Extended heuristic
+- Vendored `headless_chrome` 1.0.21 with pre-generated CDP bindings — zero GPL in the dependency tree
+
+### Fixed
+
+- Auth probe tab close now targets the probe tab explicitly instead of blind-closing the user's active tab
+- Explicit `--cdp` is terminal on `browser attach`, `browser check`, and `browser login` — no silent fallback to auto-connect/cookies/profile
+- ChatGPT completion poller scopes copy-button detection to the latest assistant message only
+- Full error chain surfaced in recipe transport errors (PR #129)
+- Agent-browser ChatGPT recipe uses real keyboard typing instead of ProseMirror-incompatible `fill()`
+
 ## [0.2.48] - 2026-04-11
 ### Fixed
 
