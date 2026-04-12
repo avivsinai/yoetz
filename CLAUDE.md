@@ -97,9 +97,9 @@ Yoetz browser integrations are extension-free by design.
 
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
-- Preferred transport order for live Chrome work is `dev-browser` first,
-  `agent-browser` second. `chrome-devtools-mcp` is an extension-free fallback
-  candidate, not an excuse to add an extension-based path.
+- Preferred transport order for live Chrome work is `chrome-devtools-mcp`
+  first, `dev-browser` second, `agent-browser` third. Keep the stack
+  extension-free.
 - Default mode is connect-first: attach to the user's already running Chrome
   session (`--connect`, auto-connect, or explicit `--cdp`) before considering
   cookie sync or managed-profile fallbacks.

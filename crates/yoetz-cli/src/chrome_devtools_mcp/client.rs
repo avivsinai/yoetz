@@ -76,6 +76,20 @@ impl Snapshot {
     pub fn count_by_role(&self, role: &str) -> usize {
         count_nodes(&self.raw, role)
     }
+
+    pub fn find_file_input_uid(&self) -> Option<String> {
+        walk_snapshot(&self.raw, &mut |node| {
+            let tag = node.get("tag").and_then(Value::as_str)?;
+            let input_type = node.get("type").and_then(Value::as_str)?;
+            if tag == "input" && input_type == "file" {
+                node.get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -177,14 +191,14 @@ impl CdpMcpClient {
             )
         })?;
 
+        let _ = tab.set_file_chooser_dialog_interception(true, None);
         if let Ok(element) = find_snapshot_element(&tab, uid) {
             if element.tag_name.eq_ignore_ascii_case("input")
                 && element.get_attribute_value("type")?.as_deref() == Some("file")
             {
-                element
-                    .set_input_files(&[file_path])
-                    .with_context(|| format!("setting files on input `{uid}` failed"))?;
-                return Ok(());
+                let result = inject_files_on_input(&tab, &element, file_path, uid);
+                let _ = tab.set_file_chooser_dialog_interception(false, None);
+                return result;
             }
 
             let _ = element.click();
@@ -193,10 +207,9 @@ impl CdpMcpClient {
         let input = tab
             .find_element("input[type='file']")
             .context("no file input became available after clicking the upload affordance")?;
-        input
-            .set_input_files(&[file_path])
-            .context("setting files on the Chrome file input failed")?;
-        Ok(())
+        let result = inject_files_on_input(&tab, &input, file_path, uid);
+        let _ = tab.set_file_chooser_dialog_interception(false, None);
+        result
     }
 
     pub async fn wait_for(&self, text: &[&str], timeout_ms: u64) -> Result<WaitForResult> {
@@ -275,6 +288,28 @@ fn create_target(url: &str, background: bool) -> CreateTarget {
 
 fn configure_tab_timeout(tab: &Arc<Tab>, timeout_ms: u64) {
     tab.set_default_timeout(Duration::from_millis(timeout_ms.max(1)));
+}
+
+fn inject_files_on_input(
+    tab: &Arc<Tab>,
+    input: &Element<'_>,
+    file_path: &str,
+    uid: &str,
+) -> Result<()> {
+    match input.set_input_files(&[file_path]) {
+        Ok(_) => Ok(()),
+        Err(primary) => {
+            let secondary = tab
+                .handle_file_chooser(vec![file_path.to_owned()], input.node_id)
+                .err();
+            match secondary {
+                None => Ok(()),
+                Some(secondary) => Err(anyhow!(
+                    "setting files on input `{uid}` failed via set_input_files ({primary:#}) and handle_file_chooser ({secondary:#})"
+                )),
+            }
+        }
+    }
 }
 
 fn resolve_browser_websocket(parsed: &Url) -> Result<String> {
@@ -559,7 +594,7 @@ fn build_snapshot_script(verbose: bool) -> String {
     );
   }};
 
-  const shouldInclude = (el) => {{
+    const shouldInclude = (el) => {{
     if (!(el instanceof Element)) return false;
     const tag = el.tagName.toLowerCase();
     const role = detectRole(el);
@@ -571,6 +606,7 @@ fn build_snapshot_script(verbose: bool) -> String {
       name ||
       text ||
       el.hasAttribute("data-message-author-role") ||
+      el.matches("input[type='file']") ||
       el.matches("button, a[href], input, textarea, select, option, summary, label, [contenteditable='true']")
     );
   }};

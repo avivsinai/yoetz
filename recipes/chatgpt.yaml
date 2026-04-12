@@ -3,7 +3,7 @@ name: chatgpt
 #   1. chrome-devtools-mcp (primary for Chrome 147+ live-attached Chrome)
 #   2. dev-browser (fallback for Chrome <= 146 / Chrome for Testing)
 #   3. agent-browser (managed browser fallback)
-#   4. manual (last resort; upload/paste the bundle yourself)
+#   4. manual (last resort; upload the bundle yourself)
 #
 # Recommended: enable chrome://inspect/#remote-debugging (Chrome 144+) for auto-connect.
 # Note: Chrome 136+ ignores --remote-debugging-port on the default profile.
@@ -12,8 +12,6 @@ name: chatgpt
 #   model    — model slug (e.g., "gpt-5-4-pro"). Omit to keep current.
 #   extended — set to "false" to disable Extended Pro. Default: leave as-is.
 #   prompt   — prompt text to send with the attachment.
-#   paste    — set to "true" to paste bundle text into textarea instead of
-#              uploading as file. Default: "false" (always upload).
 #   wait_timeout_ms  — overall response wait deadline in ms (default: 1800000 = 30min).
 #   wait_interval_ms — poll interval in ms (default: 30000 = 30s).
 
@@ -27,7 +25,6 @@ defaults:
   prompt: Review the attached file and provide your analysis.
   model: ""
   extended: ""
-  paste: "false"
   wait_timeout_ms: "1800000"
   wait_interval_ms: "30000"
 
@@ -117,42 +114,9 @@ steps:
         })()
   - sleep_ms: 500
 
-  # Delivery mode: always upload as file attachment unless --var paste=true.
-  - action: eval
-    args:
-      - |
-        (() => {
-          window.__yoetz_use_attachment = ("{{paste}}" !== "true");
-          return "delivery mode → " +
-            (window.__yoetz_use_attachment ? "attachment" : "paste");
-        })()
-
-  # --- Small-bundle path: paste bundle + prompt into textarea directly ---
-  - skip_if: "window.__yoetz_use_attachment"
-    action: eval
-    args:
-      - |
-        (() => {
-          if (window.__yoetz_use_attachment) return "skipped: using attachment";
-          const el = document.querySelector("#prompt-textarea");
-          el.focus();
-          if (el.textContent.trim()) {
-            document.execCommand('selectAll');
-            document.execCommand('delete');
-          }
-          const prompt = {{prompt|json}};
-          const bundle = {{bundle_text|json}};
-          const combined = prompt + "\n\n" + bundle;
-          document.execCommand('insertText', false, combined);
-          return "pasted prompt+bundle (" + combined.length + " chars)";
-        })()
-
-  # --- File attachment path (default) ---
-  # Steps below are skipped only when --var paste=true.
-
+  # File attachment is the only delivery path.
   # Open the attachment menu (button is "composer-plus-btn").
-  - skip_if: "!window.__yoetz_use_attachment"
-    action: eval
+  - action: eval
     args:
       - |
         (() => {
@@ -164,41 +128,37 @@ steps:
           btn.click();
           return "opened attachment UI";
         })()
-  - skip_if: "!window.__yoetz_use_attachment"
-    sleep_ms: 500
+  - sleep_ms: 500
 
   # Upload the bundle file.
-  - skip_if: "!window.__yoetz_use_attachment"
-    action: upload
+  - action: upload
     args: ["#upload-files", "{{bundle_path}}"]
 
   # Poll until the upload spinner disappears. Short-burst Rust-side polling
   # keeps each eval under the agent-browser IPC ceiling (25s).
-  - skip_if: "!window.__yoetz_use_attachment"
-    action: chatgpt_wait_upload
+  - action: chatgpt_wait_upload
     args: ["--attempts", "30", "--interval-ms", "1000"]
 
-  # Insert just the prompt (bundle is in the attachment).
-  - skip_if: "!window.__yoetz_use_attachment"
-    action: eval
+  # Click back into the composer so the next step uses real keyboard input
+  # against ProseMirror after the attachment flow completes.
+  - action: eval
     args:
       - |
         (() => {
           const el = document.querySelector("#prompt-textarea");
-          el.focus();
-          if (el.textContent.trim()) {
-            document.execCommand('selectAll');
-            document.execCommand('delete');
-          }
-          const text = {{prompt|json}};
-          document.execCommand('insertText', false, text);
-          return "inserted prompt (" + text.length + " chars)";
+          if (!el) throw new Error("prompt textarea not found");
+          el.click();
+          return "focused prompt textarea";
         })()
-  - skip_if: "!window.__yoetz_use_attachment"
-    sleep_ms: 500
+  - sleep_ms: 500
 
-  # Click send. ProseMirror already processed the execCommand so React
-  # state is in sync — no extra InputEvent dispatch needed.
+  # Type just the prompt (bundle is already attached) with real key events so
+  # the send button enables reliably.
+  - action: type
+    args: ["#prompt-textarea", "{{prompt}}"]
+  - sleep_ms: 500
+
+  # Click send once the typed prompt has enabled the button.
   - action: eval
     args:
       - |

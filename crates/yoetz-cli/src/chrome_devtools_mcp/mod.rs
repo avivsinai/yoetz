@@ -55,15 +55,13 @@ pub struct DevtoolsMcpRecipeContext {
     /// DevToolsActivePort or `/json/version`."
     pub cdp_endpoint: Option<String>,
 
-    /// Path to the bundle markdown file to upload via `upload_file`. `None`
-    /// means the recipe should paste-mode inline the bundle text into the
-    /// prompt instead of uploading. (Parity with dev-browser's paste fallback
-    /// for non-macOS platforms; chrome-devtools-mcp's `upload_file` should
-    /// work on all platforms, so prefer `Some(path)` by default.)
+    /// Path to the bundle markdown file to upload via `upload_file`.
+    /// The live-attach Chrome transport requires a real file attachment and
+    /// does not fall back to paste mode.
     pub bundle_path: Option<PathBuf>,
 
-    /// Optional inline bundle text (used only when `bundle_path` is `None`
-    /// and paste-mode was requested via recipe vars).
+    /// Reserved for compatibility with other recipe contexts. The current
+    /// live-attach Chrome transport does not use inline bundle text.
     pub bundle_text: Option<String>,
 
     /// Model slug to select in the LLM provider's UI (e.g. `gpt-5-4-pro`,

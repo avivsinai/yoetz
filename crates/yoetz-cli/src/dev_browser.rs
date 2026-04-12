@@ -34,6 +34,7 @@ static DEV_BROWSER: OnceLock<String> = OnceLock::new();
 
 /// Default timeout for dev-browser scripts in seconds.
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 30;
+const DEV_BROWSER_ATTACH_TO_OTHER_ENV: &str = "PW_CHROMIUM_ATTACH_TO_OTHER";
 
 /// Extended timeout for ChatGPT response polling (30 minutes by default).
 const CHATGPT_POLL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
@@ -244,7 +245,7 @@ pub fn ensure_installed() -> Result<()> {
 /// was asked to stop, false when no daemon was running.
 pub fn stop_daemon() -> Result<bool> {
     let bin = resolve_dev_browser()?;
-    let output = Command::new(&bin)
+    let output = dev_browser_command(&bin)
         .arg("stop")
         .output()
         .with_context(|| format!("failed to run dev-browser stop (via {bin})"))?;
@@ -320,7 +321,7 @@ fn run_script_connect_with_browser_and_endpoint(
     let resolved_endpoint = resolve_dev_browser_connect_endpoint(cdp_endpoint)?;
     let args = connect_args(timeout, browser_name, resolved_endpoint.as_deref());
 
-    let output = Command::new(&bin)
+    let output = dev_browser_command(&bin)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -369,6 +370,15 @@ fn run_script_connect_with_browser_and_endpoint(
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn dev_browser_command(bin: &str) -> Command {
+    let mut command = Command::new(bin);
+    // Chrome 147+ built-in remote debugging can expose the first attached tab
+    // as target type `other`. Playwright ignores those targets unless this
+    // compatibility flag is set on the dev-browser process/daemon.
+    command.env(DEV_BROWSER_ATTACH_TO_OTHER_ENV, "1");
+    command
 }
 
 /// Run a dev-browser script against a live Chrome instance, optionally via an
@@ -569,7 +579,7 @@ fn looks_like_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
 fn maybe_add_dev_browser_connect_guidance(err: anyhow::Error) -> anyhow::Error {
     if looks_like_dev_browser_connect_failure(&err) {
         err.context(
-            "dev-browser could not connect to Chrome. If Chrome is showing a remote debugging approval dialog, click Allow, then retry. Raw transport error follows.",
+            "dev-browser could not connect to Chrome. If Chrome is showing a remote debugging approval dialog, click Allow, then retry. If you recently upgraded yoetz, run `yoetz browser reset` once so the dev-browser daemon relaunches with the Chrome 147 compatibility flag. Raw transport error follows.",
         )
     } else {
         err
@@ -593,8 +603,9 @@ struct ChatgptPrepareResult {
 #[derive(Debug, serde::Deserialize)]
 struct ChatgptSendResult {
     status: String,
+    error: Option<String>,
     #[serde(rename = "assistantCountBeforeSend")]
-    assistant_count_before_send: usize,
+    assistant_count_before_send: Option<usize>,
     warning: Option<String>,
 }
 
@@ -702,7 +713,7 @@ fn build_chatgpt_send_script(
     let delivery_text_json = serde_json::to_string(delivery_text).unwrap();
     let prompt_json = serde_json::to_string(prompt).unwrap();
     format!(
-        r#"
+        r##"
 const PAGE_NAME = {page_name_json};
 const FILE_ON_CLIPBOARD = {file_on_clipboard_json};
 const DELIVERY_TEXT = {delivery_text_json};
@@ -736,22 +747,76 @@ await composer.waitFor({{ state: "visible", timeout: 15000 }});
 await composer.click();
 await composer.pressSequentially(DELIVERY_TEXT, {{ delay: 15 }});
 const sendBtn = page.locator("[data-testid='send-button']").first();
-const deadline = Date.now() + 30000;
-while (Date.now() < deadline) {{
+const readSendState = async () => await page.evaluate(() => {{
+  const send = document.querySelector("[data-testid='send-button']");
+  const composerEl = document.querySelector("#prompt-textarea, [role='textbox']");
+  return {{
+    sendButtonPresent: !!send,
+    sendDisabled: send ? !!send.disabled : false,
+    composerTextLength: (composerEl?.innerText || composerEl?.textContent || "").trim().length,
+    attachmentPresent: !!document.querySelector("[class*='file-tile'], [data-testid*='attachment']"),
+  }};
+}});
+const enableDeadline = Date.now() + 10000;
+let sendState = await readSendState();
+while (Date.now() < enableDeadline) {{
   if (await sendBtn.count() > 0 && await sendBtn.isEnabled()) break;
-  await page.waitForTimeout(1000);
+  await page.waitForTimeout(500);
+  sendState = await readSendState();
 }}
 if (await sendBtn.count() === 0 || !(await sendBtn.isEnabled())) {{
-  throw new Error("send button did not become enabled for prompt: " + PROMPT.slice(0, 80));
+  console.log(JSON.stringify({{
+    status: "error",
+    error: "ChatGPT send button never became enabled after typing; this usually means dev-browser is still on the broken Playwright live-attach path. If you upgraded yoetz, run `yoetz browser reset` once so the dev-browser daemon restarts with the Chrome 147 compatibility flag. " + JSON.stringify(sendState),
+    warning,
+  }}));
+  return;
 }}
 const assistantCountBeforeSend = await page.locator("[data-message-author-role='assistant']").count();
 await sendBtn.click();
+const transitionDeadline = Date.now() + 10000;
+let transitionState = null;
+while (Date.now() < transitionDeadline) {{
+  transitionState = await page.evaluate((baselineCount) => {{
+    const send = document.querySelector("[data-testid='send-button']");
+    const stopButton = document.querySelector("[data-testid='stop-button']");
+    const assistantCount = document.querySelectorAll("[data-message-author-role='assistant']").length;
+    const composerEl = document.querySelector("#prompt-textarea, [role='textbox']");
+    const composerText = (composerEl?.innerText || composerEl?.textContent || "").trim();
+    const attachmentPresent = !!document.querySelector("[class*='file-tile'], [data-testid*='attachment']");
+    return {{
+      sendButtonPresent: !!send,
+      sendDisabled: send ? !!send.disabled : false,
+      stopButtonPresent: !!stopButton,
+      assistantCount,
+      composerTextLength: composerText.length,
+      attachmentPresent,
+      transitionObserved:
+        !!stopButton ||
+        assistantCount > baselineCount ||
+        !send ||
+        (!!send && !!send.disabled) ||
+        composerText.length === 0,
+    }};
+  }}, assistantCountBeforeSend);
+  if (transitionState.transitionObserved) break;
+  await page.waitForTimeout(500);
+}}
+if (!transitionState || !transitionState.transitionObserved) {{
+  console.log(JSON.stringify({{
+    status: "error",
+    error: "ChatGPT send click did not trigger a UI transition within 10s. " + JSON.stringify(transitionState || {{}}),
+    assistantCountBeforeSend,
+    warning,
+  }}));
+  return;
+}}
 console.log(JSON.stringify({{
         status: "sent",
         assistantCountBeforeSend,
         warning,
 }}));
-"#,
+"##,
         page_name_json = page_name_json,
         file_on_clipboard_json = file_on_clipboard_json,
         delivery_text_json = delivery_text_json,
@@ -1032,8 +1097,17 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
         );
         let send_stdout = run_script(&send_script, Some(90))?;
         let send: ChatgptSendResult = parse_script_json("parse chatgpt send result", &send_stdout)?;
-        if send.status != "sent" {
-            return Err(anyhow!("unexpected ChatGPT send status `{}`", send.status));
+        match send.status.as_str() {
+            "sent" => {}
+            "error" => {
+                let detail = send
+                    .error
+                    .unwrap_or_else(|| "ChatGPT send phase failed".to_string());
+                return Err(anyhow!("{detail}"));
+            }
+            other => {
+                return Err(anyhow!("unexpected ChatGPT send status `{other}`"));
+            }
         }
         if let Some(warning) = send.warning {
             warnings.push(warning);
@@ -1041,7 +1115,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
 
         let poll_script = build_chatgpt_poll_script(
             &page_name,
-            send.assistant_count_before_send,
+            send.assistant_count_before_send.unwrap_or(0),
             ctx.poll_settings,
             ctx.allow_empty_response,
         );
@@ -1149,6 +1223,20 @@ mod tests {
         assert!(detail.contains("dev-browser could not connect to Chrome"));
         assert!(detail.contains("browserType.connectOverCDP: Timeout 30000ms exceeded"));
         assert!(!detail.contains("Allow remote debugging"));
+        assert!(detail.contains("yoetz browser reset"));
+    }
+
+    #[test]
+    fn dev_browser_command_enables_attach_to_other_compat_flag() {
+        let command = dev_browser_command("dev-browser");
+        let envs = command.get_envs().collect::<Vec<_>>();
+        assert!(
+            envs.iter().any(|(key, value)| {
+                *key == std::ffi::OsStr::new(DEV_BROWSER_ATTACH_TO_OTHER_ENV)
+                    && *value == Some(std::ffi::OsStr::new("1"))
+            }),
+            "expected {DEV_BROWSER_ATTACH_TO_OTHER_ENV}=1 on dev-browser child"
+        );
     }
 
     #[test]

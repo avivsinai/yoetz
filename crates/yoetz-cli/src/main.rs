@@ -961,19 +961,19 @@ async fn run_recipe_via_chrome_devtools_mcp(
              use `--cdp` to target a specific Chrome instance or omit both for default auto-connect"
         ));
     }
-
-    let paste_mode = recipe_vars
+    if recipe_vars
         .get("paste")
-        .is_some_and(|value| value == "true");
-    let bundle_text = if paste_mode {
-        recipe_args
-            .bundle
-            .as_ref()
-            .map(fs::read_to_string)
-            .transpose()?
-    } else {
-        None
-    };
+        .is_some_and(|value| value == "true")
+    {
+        return Err(anyhow!(
+            "chrome-devtools-mcp transport does not support paste mode; file attachment upload is required"
+        ));
+    }
+    if recipe_args.bundle.is_none() {
+        return Err(anyhow!(
+            "chrome-devtools-mcp transport requires `--bundle`; it does not support inline paste mode"
+        ));
+    }
 
     // Use the existing dev-browser poll settings resolver so the response
     // timeout env/recipe-var knobs stay symmetric with the dev-browser path.
@@ -981,12 +981,8 @@ async fn run_recipe_via_chrome_devtools_mcp(
 
     let ctx = chrome_devtools_mcp::DevtoolsMcpRecipeContext {
         cdp_endpoint: cdp_endpoint.map(str::to_owned),
-        bundle_path: if paste_mode {
-            None
-        } else {
-            recipe_args.bundle.clone()
-        },
-        bundle_text,
+        bundle_path: recipe_args.bundle.clone(),
+        bundle_text: None,
         model: recipe_vars.get("model").cloned().unwrap_or_default(),
         prompt: recipe_vars
             .get("prompt")
@@ -2193,6 +2189,54 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("--profile"));
         assert!(err.to_string().contains("--cdp"));
+    }
+
+    #[tokio::test]
+    async fn run_recipe_via_chrome_devtools_mcp_rejects_paste_mode() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::from([("paste".to_string(), "true".to_string())]);
+        let err = run_recipe_via_chrome_devtools_mcp(
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("paste mode"));
+        assert!(msg.contains("file attachment"));
+    }
+
+    #[tokio::test]
+    async fn run_recipe_via_chrome_devtools_mcp_requires_bundle() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: None,
+            profile: None,
+            cdp: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::new();
+        let err = run_recipe_via_chrome_devtools_mcp(
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--bundle"));
+        assert!(msg.contains("paste mode"));
     }
 
     #[test]

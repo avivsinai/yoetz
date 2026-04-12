@@ -50,12 +50,14 @@ const POLL_INTERVAL_MS: u64 = 5_000;
 /// stable polls = 20s of genuinely idle generation, which is enough to
 /// distinguish "response finished" from "brief mid-stream pause."
 const STABLE_IDLE_CONSECUTIVE_POLLS: u32 = 4;
+const UPLOAD_INPUT_WAIT_MS: u64 = 5_000;
+const ATTACHMENT_VERIFY_WAIT_MS: u64 = 15_000;
 
 /// The full ChatGPT Pro recipe. Returns the assistant's final response text.
 pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<String> {
-    if ctx.bundle_path.is_none() && ctx.bundle_text.is_none() {
+    if ctx.bundle_path.is_none() {
         return Err(anyhow!(
-            "ChatGPT recipe requires either a bundle file (--bundle) or inline bundle text"
+            "ChatGPT recipe requires `--bundle`; this transport uploads a file attachment and does not support paste mode"
         ));
     }
 
@@ -116,38 +118,19 @@ async () => {
     // `take_snapshot` to find the input's uid, then `upload_file` against
     // that uid.
     //
-    // If the attach button is missing or the upload flow fails, fall back
-    // to inlining the bundle text into the prompt only when paste mode is
-    // explicitly available. Refuse to silently degrade into prompt-only mode.
-    let uploaded = if let Some(bundle_path) = &ctx.bundle_path {
-        try_upload_bundle(&client, bundle_path)
-            .await
-            .unwrap_or_else(|err| {
-                eprintln!(
-                    "warn: chrome-devtools-mcp upload failed ({err:#}), falling back to paste mode"
-                );
-                false
-            })
-    } else {
-        false
-    };
+    let bundle_path = ctx
+        .bundle_path
+        .as_ref()
+        .context("ChatGPT recipe requires a bundle file path")?;
+    try_upload_bundle(&client, bundle_path)
+        .await
+        .context("upload bundle to ChatGPT")?;
 
     // Step 4: type the delivery text into the focused composer.
     //
     // `type_text` types into the currently focused element, which we already
-    // focused in Step 2. If upload succeeded, the delivery text is just the
-    // user's prompt. Otherwise inline the bundle.
-    let delivery_text = if uploaded {
-        ctx.prompt.clone()
-    } else if let Some(text) = &ctx.bundle_text {
-        format!("{}\n\n{}", ctx.prompt, text)
-    } else if ctx.bundle_path.is_some() {
-        return Err(anyhow!(
-            "bundle upload failed and no inline paste fallback text was provided; refusing to send a prompt-only request"
-        ));
-    } else {
-        ctx.prompt.clone()
-    };
+    // focused in Step 2.
+    let delivery_text = ctx.prompt.clone();
 
     // Make sure the composer is still focused (upload step may have stolen
     // focus to the file picker).
@@ -220,68 +203,355 @@ async () => {
 /// `upload_file`. `upload_file` accepts either the file input itself or the
 /// element that opens the file chooser, so prefer visible menu items/buttons
 /// over guessing a hidden input uid.
-async fn try_upload_bundle(client: &CdpMcpClient, bundle_path: &std::path::Path) -> Result<bool> {
-    // Trigger the lazy mount of `<input type="file">` by clicking the attach
-    // button. No stable testid — match by aria-label containing "Attach".
-    let click_attach_js = r##"
-() => {
-  const selectors = [
-    "button[aria-label*='Attach' i]",
-    "button[aria-label*='Upload' i]",
-    "button[data-testid*='attach' i]",
-  ];
-  for (const sel of selectors) {
-    const btn = document.querySelector(sel);
-    if (btn) { btn.click(); return sel; }
-  }
-  return null;
-}
-"##;
-    let clicked = client
-        .evaluate_script(click_attach_js, vec![])
+async fn try_upload_bundle(client: &CdpMcpClient, bundle_path: &std::path::Path) -> Result<()> {
+    let file_name = bundle_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .map(ToOwned::to_owned)
+        .context("bundle path must end in a UTF-8 filename")?;
+
+    if try_upload_via_file_input(client, bundle_path, &file_name)
         .await
-        .context("evaluate_script click attach button")?;
-    if clicked == serde_json::Value::Null {
-        return Err(anyhow!("attach button not found via aria-label"));
+        .context("eager file input upload")?
+    {
+        return Ok(());
     }
 
-    // Give the attach menu / upload affordance a moment to mount.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Snapshot and find the upload trigger. Some ChatGPT variants expose
-    // an "Upload from computer" menu item, others keep a visible attach
-    // button, and only some expose a discoverable file input in the a11y tree.
-    let snapshot = client
-        .take_snapshot(/* verbose */ false)
+    let initial_diagnostics = collect_upload_diagnostics(client)
         .await
-        .context("take_snapshot after attach click")?;
+        .context("collect initial upload diagnostics")?;
+    let candidates = initial_diagnostics
+        .get("candidates")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
-    let upload_uid = snapshot
-        .find_uid_by_text("upload from computer")
-        .or_else(|| snapshot.find_uid_by_text("from computer"))
-        .or_else(|| snapshot.find_uid_by_text("upload files"))
-        .or_else(|| snapshot.find_uid_by_role("button", "Upload files and more"))
-        .or_else(|| snapshot.find_uid_by_text("attach"))
-        .or_else(|| snapshot.find_uid_by_text("file"));
+    if candidates.is_empty() {
+        return Err(anyhow!(
+            "no attach/upload controls were detected near the ChatGPT composer.\n{}",
+            format_upload_diagnostics(&initial_diagnostics)
+        ));
+    }
 
-    let uid = match upload_uid {
-        Some(uid) => uid,
-        None => {
-            return Err(anyhow!(
-                "upload target not found in snapshot after attach click"
-            ))
+    let mut attempts = Vec::new();
+
+    for candidate in candidates.iter().take(6) {
+        let candidate_id = match candidate.get("id").and_then(serde_json::Value::as_str) {
+            Some(value) if !value.is_empty() => value,
+            _ => continue,
+        };
+        let label = describe_upload_candidate(candidate);
+
+        let clicked = click_upload_candidate(client, candidate_id)
+            .await
+            .with_context(|| format!("click upload candidate {label}"))?;
+        if !clicked {
+            attempts.push(format!("candidate vanished before click: {label}"));
+            continue;
         }
+
+        attempts.push(format!("clicked candidate: {label}"));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        if try_upload_via_file_input(client, bundle_path, &file_name)
+            .await
+            .with_context(|| format!("upload after clicking {label}"))?
+        {
+            return Ok(());
+        }
+
+        let menu_clicked = click_upload_menu_item(client)
+            .await
+            .context("click upload menu item")?;
+        if menu_clicked {
+            attempts.push(format!("clicked upload menu after: {label}"));
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            if try_upload_via_file_input(client, bundle_path, &file_name)
+                .await
+                .with_context(|| format!("upload after upload menu from {label}"))?
+            {
+                return Ok(());
+            }
+        }
+    }
+
+    let final_diagnostics = collect_upload_diagnostics(client)
+        .await
+        .context("collect final upload diagnostics")?;
+    Err(anyhow!(
+        "could not attach `{file_name}` to ChatGPT.\nAttempts:\n- {}\nInitial diagnostics:\n{}\nFinal diagnostics:\n{}",
+        attempts.join("\n- "),
+        format_upload_diagnostics(&initial_diagnostics),
+        format_upload_diagnostics(&final_diagnostics),
+    ))
+}
+
+async fn try_upload_via_file_input(
+    client: &CdpMcpClient,
+    bundle_path: &std::path::Path,
+    file_name: &str,
+) -> Result<bool> {
+    let input_uid = wait_for_file_input_uid(client, UPLOAD_INPUT_WAIT_MS)
+        .await
+        .context("wait for file input")?;
+
+    let Some(input_uid) = input_uid else {
+        return Ok(false);
     };
 
     client
-        .upload_file(&uid, bundle_path)
+        .upload_file(&input_uid, bundle_path)
         .await
-        .context("chrome-devtools-mcp upload_file")?;
+        .with_context(|| format!("upload_file via input `{input_uid}`"))?;
 
-    // Give ChatGPT a moment to process the upload + show the attachment chip.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
+    wait_for_attachment_visible(client, file_name)
+        .await
+        .with_context(|| format!("verify attachment chip for `{file_name}`"))?;
 
     Ok(true)
+}
+
+async fn wait_for_file_input_uid(client: &CdpMcpClient, timeout_ms: u64) -> Result<Option<String>> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+
+    loop {
+        let snapshot = client
+            .take_snapshot(false)
+            .await
+            .context("take snapshot while searching for file input")?;
+        if let Some(uid) = snapshot.find_file_input_uid() {
+            return Ok(Some(uid));
+        }
+
+        if std::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+async fn click_upload_candidate(client: &CdpMcpClient, candidate_id: &str) -> Result<bool> {
+    let candidate_json = serde_json::to_string(candidate_id)?;
+    let script = format!(
+        r#"() => {{
+  const candidate = document.querySelector(`[data-yoetz-upload-candidate=${candidate_json}]`);
+  if (!candidate) return false;
+  candidate.click();
+  return true;
+}}"#
+    );
+    Ok(client.evaluate_script(&script, vec![]).await? == serde_json::Value::Bool(true))
+}
+
+async fn click_upload_menu_item(client: &CdpMcpClient) -> Result<bool> {
+    let script = r##"
+() => {
+  const selectors = ["[role='menuitem']", "button", "[role='button']", "label", "li"];
+  const nodes = Array.from(document.querySelectorAll(selectors.join(",")));
+  const target = nodes.find((el) => {
+    const text = `${el.innerText || ""} ${el.getAttribute?.("aria-label") || ""} ${el.getAttribute?.("title") || ""}`
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    return /upload from computer|from computer|upload files|choose files|browse/i.test(text);
+  });
+  if (!target) return false;
+  target.click();
+  return true;
+}
+"##;
+
+    Ok(client.evaluate_script(script, vec![]).await? == serde_json::Value::Bool(true))
+}
+
+async fn collect_upload_diagnostics(client: &CdpMcpClient) -> Result<serde_json::Value> {
+    let script = r##"
+() => {
+  const composer = document.querySelector("#prompt-textarea, div[contenteditable='true'][role='textbox']");
+  const composerRect = composer?.getBoundingClientRect() || null;
+  const composerForm = composer?.closest("form") || null;
+
+  const clip = (value, max = 160) =>
+    String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+
+  const isVisible = (el) => {
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 &&
+      rect.height > 0 &&
+      style.visibility !== "hidden" &&
+      style.display !== "none" &&
+      style.pointerEvents !== "none";
+  };
+
+  const distanceToComposer = (el) => {
+    if (!composerRect) return 99999;
+    const rect = el.getBoundingClientRect();
+    const dx = rect.left + rect.width / 2 - (composerRect.left + composerRect.width / 2);
+    const dy = rect.top + rect.height / 2 - (composerRect.top + composerRect.height / 2);
+    return Math.round(Math.hypot(dx, dy));
+  };
+
+  const describe = (el) => {
+    const text = clip(el.innerText || el.textContent || "");
+    const ariaLabel = clip(el.getAttribute?.("aria-label") || "");
+    const title = clip(el.getAttribute?.("title") || "");
+    const testId = clip(el.getAttribute?.("data-testid") || "");
+    const className = clip(el.getAttribute?.("class") || "");
+    const id = clip(el.getAttribute?.("id") || "");
+    const normalized = `${ariaLabel} ${title} ${testId} ${id} ${className} ${text}`.toLowerCase();
+    const sameForm = !!composerForm && el.closest("form") === composerForm;
+    const distance = distanceToComposer(el);
+    const hasSvg = !!el.querySelector("svg");
+    const sendLike = el.matches("[data-testid='send-button'], [data-testid='fruitjuice-send-button'], button[type='submit']") || /\bsend\b|\bsubmit\b/.test(normalized);
+    let score = 0;
+    if (sameForm) score += 60;
+    if (distance <= 220) score += 40;
+    if (/attach|upload|file|paperclip|computer|plus/.test(normalized)) score += 160;
+    if (hasSvg) score += 20;
+    if (!text) score += 5;
+    if (sendLike) score -= 500;
+    return {
+      tag: el.tagName.toLowerCase(),
+      role: clip(el.getAttribute?.("role") || "", 40),
+      ariaLabel,
+      title,
+      testId,
+      id,
+      className,
+      text,
+      sameForm,
+      distance,
+      hasSvg,
+      sendLike,
+      score,
+    };
+  };
+
+  const candidates = Array.from(document.querySelectorAll("button, [role='button'], label"))
+    .filter((el) => el instanceof HTMLElement && isVisible(el))
+    .map((el, index) => {
+      const description = describe(el);
+      const candidateId = `yoetz-upload-candidate-${index}`;
+      el.setAttribute("data-yoetz-upload-candidate", candidateId);
+      return { id: candidateId, ...description };
+    })
+    .filter((candidate) => candidate.sameForm || candidate.distance <= 260)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 12);
+
+  const fileInputs = Array.from(document.querySelectorAll("input[type='file']")).map((input, index) => ({
+    id: `file-input-${index}`,
+    visible: isVisible(input),
+    multiple: !!input.multiple,
+    accept: clip(input.getAttribute("accept") || "", 80),
+    hasFiles: (input.files?.length || 0) > 0,
+    fileNames: Array.from(input.files || []).map((file) => file.name),
+    sameForm: !!composerForm && input.closest("form") === composerForm,
+    distance: distanceToComposer(input),
+  }));
+
+  return {
+    composerFound: !!composer,
+    composerTag: composer?.tagName?.toLowerCase() || null,
+    composerText: clip(composer?.innerText || composer?.textContent || "", 80),
+    fileInputs,
+    candidates,
+  };
+}
+"##;
+
+    client
+        .evaluate_script(script, vec![])
+        .await
+        .context("evaluate upload diagnostics")
+}
+
+fn describe_upload_candidate(candidate: &serde_json::Value) -> String {
+    let id = candidate
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let aria_label = candidate
+        .get("ariaLabel")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let title = candidate
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let test_id = candidate
+        .get("testId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let text = candidate
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    format!("{id} aria={aria_label:?} title={title:?} testid={test_id:?} text={text:?}")
+}
+
+fn format_upload_diagnostics(diagnostics: &serde_json::Value) -> String {
+    serde_json::to_string_pretty(diagnostics).unwrap_or_else(|_| diagnostics.to_string())
+}
+
+async fn wait_for_attachment_visible(client: &CdpMcpClient, file_name: &str) -> Result<()> {
+    let file_name_json = serde_json::to_string(file_name)?;
+    let file_stem = std::path::Path::new(file_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(file_name);
+    let file_stem_json = serde_json::to_string(file_stem)?;
+    let script = format!(
+        r#"
+async () => {{
+  const fileName = {file_name_json};
+  const fileStem = {file_stem_json};
+  const deadline = Date.now() + {ATTACHMENT_VERIFY_WAIT_MS};
+  const clip = (value, max = 120) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+  while (Date.now() < deadline) {{
+    const visibleEvidence = Array.from(document.querySelectorAll("button, span, div, li"))
+      .map((el) => {{
+        const text = clip(el.innerText || el.textContent || "");
+        const ariaLabel = clip(el.getAttribute?.("aria-label") || "");
+        const title = clip(el.getAttribute?.("title") || "");
+        return {{ text, ariaLabel, title }};
+      }})
+      .filter((entry) => {{
+        const combined = `${{entry.text}} ${{entry.ariaLabel}} ${{entry.title}}`;
+        return combined.includes(fileName) || (fileStem && combined.includes(fileStem));
+      }})
+      .slice(0, 6);
+
+    if (visibleEvidence.length > 0) {{
+      return {{ ok: true, visibleEvidence }};
+    }}
+
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }}
+
+  const inputs = Array.from(document.querySelectorAll("input[type='file']")).map((input) => ({{
+    fileNames: Array.from(input.files || []).map((file) => file.name),
+    multiple: !!input.multiple,
+  }}));
+  return {{ ok: false, inputs }};
+}}
+"#
+    );
+
+    let evidence = client
+        .evaluate_script(&script, vec![])
+        .await
+        .context("evaluate attachment visibility")?;
+    if evidence.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "attachment chip for `{file_name}` did not appear in the composer.\n{}",
+        format_upload_diagnostics(&evidence)
+    ))
 }
 
 /// Stable-idle polling for ChatGPT response completion.
