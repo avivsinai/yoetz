@@ -927,6 +927,17 @@ fn recipe_should_stop_live_transport_fallback(err: &anyhow::Error) -> bool {
     browser::is_chrome_approval_wait_error(err)
 }
 
+fn explicit_cdp_attach_failure(err: anyhow::Error) -> anyhow::Error {
+    if browser::is_chrome_approval_wait_error(&err) {
+        anyhow!(
+            "Chrome may be showing an \"Allow remote debugging?\" dialog. \
+             Click Allow, then retry."
+        )
+    } else {
+        err.context("explicit --cdp failed; not falling back")
+    }
+}
+
 fn default_daemon_recovery_error(original: Option<&anyhow::Error>) -> Option<anyhow::Error> {
     let suffix = original
         .map(|err| format!("\n\nOriginal error: {err}"))
@@ -1253,15 +1264,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             }
                         };
                     }
-                    Err(e) => {
-                        if browser::is_chrome_approval_wait_error(&e) {
-                            eprintln!(
-                                "hint: Chrome may be showing an \"Allow remote debugging?\" dialog. \
-                                 Click Allow, then retry."
-                            );
-                        }
-                        eprintln!("CDP attach to {cdp_url} failed, falling back to cookie sync.");
-                    }
+                    Err(e) => return Err(explicit_cdp_attach_failure(e)),
                 }
             }
 
@@ -1336,6 +1339,22 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
         BrowserCommand::Check(check_args) => {
             let dev_browser_cdp =
                 browser::resolve_cdp_endpoint(check_args.cdp.as_deref(), &ctx.config);
+            if let Some(ref cdp_url) = check_args.cdp {
+                browser::try_cdp_attach(cdp_url, "https://chatgpt.com/")
+                    .map_err(explicit_cdp_attach_failure)?;
+                let payload = json!({
+                    "status": "ok",
+                    "method": format!("cdp: {cdp_url}"),
+                });
+                return match format {
+                    OutputFormat::Json => write_json(&payload),
+                    OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
+                    OutputFormat::Text | OutputFormat::Markdown => {
+                        println!("Browser authenticated via cdp: {cdp_url}");
+                        Ok(())
+                    }
+                };
+            }
 
             // Try dev-browser first for auth verification whenever we are
             // targeting a live Chrome instance. `--profile` still routes to the
@@ -1572,14 +1591,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             }
                         };
                     }
-                    Err(e) => {
-                        if attach_args.cdp.is_some() && browser::is_chrome_approval_wait_error(&e) {
-                            return Err(anyhow!(
-                                "Chrome may be showing an \"Allow remote debugging?\" dialog. \
-                                 Click Allow, then retry."
-                            ));
-                        }
+                    Err(e) if attach_args.cdp.is_some() => {
+                        return Err(explicit_cdp_attach_failure(e));
                     }
+                    Err(_) => {}
                 }
             }
 
@@ -2114,6 +2129,25 @@ mod tests {
     fn recipe_should_not_stop_live_transport_fallback_on_non_approval_error() {
         let err = anyhow!("chatgpt send button not found");
         assert!(!recipe_should_stop_live_transport_fallback(&err));
+    }
+
+    #[test]
+    fn explicit_cdp_attach_failure_rewrites_approval_waits() {
+        let err = anyhow!(
+            "live browser attach timed out (30s). Chrome may be showing an \"Allow remote debugging?\" dialog — please click Allow in Chrome, then retry."
+        );
+        let rewritten = explicit_cdp_attach_failure(err);
+        assert!(rewritten.to_string().contains("Allow remote debugging"));
+        assert!(!rewritten.to_string().contains("not falling back"));
+    }
+
+    #[test]
+    fn explicit_cdp_attach_failure_preserves_non_approval_context() {
+        let err = anyhow!("browserType.connectOverCDP: failed to list pages");
+        let rewritten = explicit_cdp_attach_failure(err);
+        let msg = format!("{rewritten:#}");
+        assert!(msg.contains("explicit --cdp failed; not falling back"));
+        assert!(msg.contains("failed to list pages"));
     }
 
     #[test]

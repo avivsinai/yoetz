@@ -651,6 +651,7 @@ struct ChatgptDomState {
     send_state: ChatgptSendState,
     has_stop_button: bool,
     has_thinking_indicator: bool,
+    /// Copy buttons scoped to the latest assistant message only.
     copy_button_count: usize,
     /// Number of assistant messages on the page.
     assistant_msg_count: usize,
@@ -658,6 +659,29 @@ struct ChatgptDomState {
     assistant_last_len: usize,
     /// Error text from scoped toast/alert containers (empty = no error).
     error: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+struct AgentBrowserTab {
+    index: usize,
+    #[serde(default)]
+    active: bool,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    url: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct AgentBrowserTabListData {
+    #[serde(default)]
+    tabs: Vec<AgentBrowserTab>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentBrowserTabListEnvelope {
+    #[serde(default)]
+    data: AgentBrowserTabListData,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -844,9 +868,10 @@ fn inspect_chatgpt_dom_state(
     let script = r#"(() => {
   const send = document.querySelector("button[data-testid='send-button']");
   const stop = document.querySelector("button[data-testid='stop-button'], button[aria-label*='Stop']");
-  const copyButtons = document.querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']").length;
   const thinking = document.querySelector(".result-thinking, [data-testid*='thinking'], [class*='thinking']");
   const msgs = document.querySelectorAll('[data-message-author-role="assistant"]');
+  const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+  const copyButtons = lastMsg ? lastMsg.querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']").length : 0;
   const lastLen = msgs.length > 0 ? msgs[msgs.length - 1].innerText.length : 0;
   const sendState = !send ? "missing" : send.disabled ? "disabled" : "enabled";
   const errEl = document.querySelector('[class*="error-toast"], [data-testid*="error"], [role="alert"]');
@@ -1011,11 +1036,14 @@ fn chatgpt_response_complete(
     if !send_idle || dom.has_stop_button || dom.has_thinking_indicator {
         return false;
     }
-    // Progress: a new assistant message appeared (count increased from baseline)
-    // with non-empty text, OR copy buttons appeared.
     let new_msg =
         dom.assistant_msg_count > baseline_dom.assistant_msg_count && dom.assistant_last_len > 0;
-    let has_progress = new_msg || dom.copy_button_count > 0;
+    let same_message_grew = dom.assistant_msg_count > 0
+        && dom.assistant_msg_count == baseline_dom.assistant_msg_count
+        && dom.assistant_last_len > baseline_dom.assistant_last_len;
+    let copy_button_on_new_response =
+        dom.assistant_msg_count > baseline_dom.assistant_msg_count && dom.copy_button_count > 0;
+    let has_progress = new_msg || same_message_grew || copy_button_on_new_response;
     if !has_progress {
         return false;
     }
@@ -1939,19 +1967,25 @@ fn check_auth_with_connection_timeout(
     }
     let mut current_headed = headed;
     let use_stealth = !connection.is_live_attach();
-    let open_args = if connection.is_live_attach() {
-        vec!["tab".to_string(), "new".to_string(), target_url.to_string()]
+    let verification_tab_index = if connection.is_live_attach() {
+        open_live_attach_verification_tab(
+            connection,
+            use_stealth,
+            current_headed,
+            target_url,
+            command_timeout_ms,
+        )?
     } else {
-        vec!["open".to_string(), target_url.to_string()]
+        let _ = run_agent_browser_with_connection_timeout(
+            vec!["open".to_string(), target_url.to_string()],
+            OutputFormat::Text,
+            Some(connection),
+            use_stealth,
+            current_headed,
+            command_timeout_ms,
+        )?;
+        None
     };
-    let _ = run_agent_browser_with_connection_timeout(
-        open_args,
-        OutputFormat::Text,
-        Some(connection),
-        use_stealth,
-        current_headed,
-        command_timeout_ms,
-    )?;
     let deadline = Instant::now() + Duration::from_millis(auth_check_timeout_ms(connection));
     let mut last_issue: Option<&'static str>;
     loop {
@@ -1986,17 +2020,13 @@ fn check_auth_with_connection_timeout(
 
         // Positive confirmation: page loaded and no auth issues detected
         if last_issue.is_none() && looks_authenticated(&snapshot) {
-            // Close the verification tab for live-attach to avoid clutter.
-            if connection.is_live_attach() {
-                let _ = run_agent_browser_with_connection_timeout(
-                    vec!["tab".to_string(), "close".to_string()],
-                    OutputFormat::Text,
-                    Some(connection),
-                    use_stealth,
-                    current_headed,
-                    command_timeout_ms,
-                );
-            }
+            close_live_attach_verification_tab(
+                connection,
+                use_stealth,
+                current_headed,
+                verification_tab_index,
+                command_timeout_ms,
+            );
             return Ok(());
         }
 
@@ -2006,17 +2036,13 @@ fn check_auth_with_connection_timeout(
         thread::sleep(Duration::from_millis(AUTH_CHECK_POLL_MS));
     }
 
-    // Close the verification tab for live-attach on failure too.
-    if connection.is_live_attach() {
-        let _ = run_agent_browser_with_connection_timeout(
-            vec!["tab".to_string(), "close".to_string()],
-            OutputFormat::Text,
-            Some(connection),
-            use_stealth,
-            current_headed,
-            command_timeout_ms,
-        );
-    }
+    close_live_attach_verification_tab(
+        connection,
+        use_stealth,
+        current_headed,
+        verification_tab_index,
+        command_timeout_ms,
+    );
 
     if let Some(issue) = last_issue {
         return Err(anyhow!("{issue}"));
@@ -2025,6 +2051,127 @@ fn check_auth_with_connection_timeout(
         "auth check timed out without confirming authentication. \
          The page may still be loading. Try again or run `yoetz browser login`."
     ))
+}
+
+fn open_live_attach_verification_tab(
+    connection: &BrowserConnection,
+    use_stealth: bool,
+    headed: bool,
+    target_url: &str,
+    command_timeout_ms: Option<u64>,
+) -> Result<Option<usize>> {
+    let before_tabs =
+        list_live_attach_tabs(connection, use_stealth, headed, command_timeout_ms).ok();
+    let _ = run_agent_browser_with_connection_timeout(
+        vec!["tab".to_string(), "new".to_string(), target_url.to_string()],
+        OutputFormat::Text,
+        Some(connection),
+        use_stealth,
+        headed,
+        command_timeout_ms,
+    )?;
+    let after_tabs =
+        list_live_attach_tabs(connection, use_stealth, headed, command_timeout_ms).ok();
+    Ok(match (before_tabs.as_deref(), after_tabs.as_deref()) {
+        (Some(before), Some(after)) => identify_live_attach_probe_tab(before, after),
+        _ => None,
+    })
+}
+
+fn close_live_attach_verification_tab(
+    connection: &BrowserConnection,
+    use_stealth: bool,
+    headed: bool,
+    verification_tab_index: Option<usize>,
+    command_timeout_ms: Option<u64>,
+) {
+    if !connection.is_live_attach() {
+        return;
+    }
+    let Some(index) = verification_tab_index else {
+        return;
+    };
+    if run_agent_browser_with_connection_timeout(
+        vec!["tab".to_string(), index.to_string()],
+        OutputFormat::Text,
+        Some(connection),
+        use_stealth,
+        headed,
+        command_timeout_ms,
+    )
+    .is_err()
+    {
+        return;
+    }
+    let _ = run_agent_browser_with_connection_timeout(
+        vec!["tab".to_string(), "close".to_string()],
+        OutputFormat::Text,
+        Some(connection),
+        use_stealth,
+        headed,
+        command_timeout_ms,
+    );
+}
+
+fn list_live_attach_tabs(
+    connection: &BrowserConnection,
+    use_stealth: bool,
+    headed: bool,
+    command_timeout_ms: Option<u64>,
+) -> Result<Vec<AgentBrowserTab>> {
+    let stdout = run_agent_browser_with_connection_timeout(
+        vec!["tab".to_string(), "list".to_string(), "--json".to_string()],
+        OutputFormat::Text,
+        Some(connection),
+        use_stealth,
+        headed,
+        command_timeout_ms,
+    )?;
+    let parsed: AgentBrowserTabListEnvelope =
+        serde_json::from_str(stdout.trim()).with_context(|| {
+            format!(
+                "agent-browser returned invalid tab list JSON (first 200 chars): {}",
+                &stdout[..stdout.len().min(200)]
+            )
+        })?;
+    Ok(parsed.data.tabs)
+}
+
+fn identify_live_attach_probe_tab(
+    before_tabs: &[AgentBrowserTab],
+    after_tabs: &[AgentBrowserTab],
+) -> Option<usize> {
+    let mut before_counts = BTreeMap::<String, usize>::new();
+    for tab in before_tabs {
+        *before_counts
+            .entry(live_attach_tab_signature(tab))
+            .or_insert(0) += 1;
+    }
+
+    let mut extras = Vec::new();
+    for tab in after_tabs {
+        let signature = live_attach_tab_signature(tab);
+        match before_counts.get_mut(&signature) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => extras.push(tab),
+        }
+    }
+
+    extras
+        .iter()
+        .find(|tab| tab.active)
+        .copied()
+        .or_else(|| {
+            after_tabs.iter().find(|tab| {
+                tab.active && !before_tabs.iter().any(|before| before.index == tab.index)
+            })
+        })
+        .or_else(|| extras.last().copied())
+        .map(|tab| tab.index)
+}
+
+fn live_attach_tab_signature(tab: &AgentBrowserTab) -> String {
+    format!("{}\n{}", tab.title, tab.url)
 }
 
 fn looks_like_timeout(err: &anyhow::Error) -> bool {
@@ -2528,6 +2675,21 @@ mod tests {
         .clone()
     }
 
+    fn fake_agent_browser_auth_with_tab_list_bin() -> PathBuf {
+        static BIN: TestOnceLock<PathBuf> = TestOnceLock::new();
+        BIN.get_or_init(|| {
+            let dir = unique_test_dir("fake_agent_browser_auth_tabs");
+            let bin = command_path(&dir, "fake-agent-browser-auth-tabs");
+            write_executable_script(
+                &bin,
+                "#!/bin/sh\nprintf 'timeout=%s args=%s\\n' \"$AGENT_BROWSER_DEFAULT_TIMEOUT\" \"$*\" >> \"$LOG_PATH\"\ncase \"$*\" in\n  *\"tab list --json\"*)\n    count=0\n    if [ -f \"$TAB_STATE_PATH\" ]; then\n      count=$(cat \"$TAB_STATE_PATH\")\n    fi\n    if [ \"$count\" = \"0\" ]; then\n      printf '1' > \"$TAB_STATE_PATH\"\n      printf '{\"success\":true,\"data\":{\"tabs\":[{\"active\":false,\"index\":0,\"title\":\"Docs\",\"url\":\"https://docs.example.com/\"},{\"active\":true,\"index\":2,\"title\":\"Workspace\",\"url\":\"https://app.example.com/\"}]}}'\n    else\n      printf '{\"success\":true,\"data\":{\"tabs\":[{\"active\":false,\"index\":0,\"title\":\"Docs\",\"url\":\"https://docs.example.com/\"},{\"active\":false,\"index\":2,\"title\":\"Workspace\",\"url\":\"https://app.example.com/\"},{\"active\":true,\"index\":5,\"title\":\"ChatGPT\",\"url\":\"https://chatgpt.com/\"}]}}'\n    fi\n    ;;\n  *snapshot*) printf '{\"text\":\"ChatGPT - New chat\"}' ;;\nesac\n",
+                "@echo off\r\necho timeout=%AGENT_BROWSER_DEFAULT_TIMEOUT% args=%*>> \"%LOG_PATH%\"\r\necho %* | findstr /c:\"tab list --json\" >nul\r\nif %errorlevel%==0 (\r\n  if not exist \"%TAB_STATE_PATH%\" (\r\n    > \"%TAB_STATE_PATH%\" echo 1\r\n    echo {\"success\":true,\"data\":{\"tabs\":[{\"active\":false,\"index\":0,\"title\":\"Docs\",\"url\":\"https://docs.example.com/\"},{\"active\":true,\"index\":2,\"title\":\"Workspace\",\"url\":\"https://app.example.com/\"}]}}\r\n  ) else (\r\n    echo {\"success\":true,\"data\":{\"tabs\":[{\"active\":false,\"index\":0,\"title\":\"Docs\",\"url\":\"https://docs.example.com/\"},{\"active\":false,\"index\":2,\"title\":\"Workspace\",\"url\":\"https://app.example.com/\"},{\"active\":true,\"index\":5,\"title\":\"ChatGPT\",\"url\":\"https://chatgpt.com/\"}]}}\r\n  )\r\n)\r\necho %* | findstr /c:\"snapshot\" >nul\r\nif %errorlevel%==0 echo {\"text\":\"ChatGPT - New chat\"}\r\n",
+            );
+            bin
+        })
+        .clone()
+    }
+
     fn fake_agent_browser_timeout_bin() -> PathBuf {
         static BIN: TestOnceLock<PathBuf> = TestOnceLock::new();
         BIN.get_or_init(|| {
@@ -2957,16 +3119,28 @@ mod tests {
         let _guard = lock_env();
         let log_dir = unique_test_dir("check_auth_live_attach");
         let log_path = log_dir.join("agent-browser.log");
-        let bin = fake_agent_browser_auth_bin();
+        let tab_state_path = log_dir.join("tab-state");
+        let bin = fake_agent_browser_auth_with_tab_list_bin();
         let _bin_env = EnvVarGuard::set("YOETZ_AGENT_BROWSER_BIN", &bin);
         let _log_env = EnvVarGuard::set("LOG_PATH", &log_path);
+        let _tab_state_env = EnvVarGuard::set("TAB_STATE_PATH", &tab_state_path);
 
         check_auth_with_connection(&BrowserConnection::AutoConnect, false, CHATGPT_URL).unwrap();
 
         let logged = fs::read_to_string(&log_path).unwrap_or_default();
+        let select_pos = logged
+            .find("--auto-connect tab 5")
+            .expect("expected verification tab selection before close");
+        let close_pos = logged
+            .find("--auto-connect tab close")
+            .expect("expected verification tab close");
         assert!(
             logged.contains("--auto-connect tab new"),
             "expected live-attach tab open, got `{logged}`"
+        );
+        assert!(
+            logged.contains("--auto-connect tab list --json"),
+            "expected live-attach tab discovery, got `{logged}`"
         );
         assert!(
             logged.contains("--auto-connect snapshot -c --json"),
@@ -2976,9 +3150,12 @@ mod tests {
             logged.contains("timeout=30000"),
             "expected bounded live-attach timeout in logged commands, got `{logged}`"
         );
-        // Live-attach should close the verification tab but NOT the daemon/session.
         assert!(
-            logged.contains("tab close"),
+            select_pos < close_pos,
+            "live-attach auth check should select the verification tab before closing it: `{logged}`"
+        );
+        assert!(
+            logged.contains("--auto-connect tab close"),
             "live-attach auth check should close the verification tab: `{logged}`"
         );
         assert!(
@@ -3345,19 +3522,46 @@ mod tests {
         // Missing send (voice button) is also idle → complete.
         let missing = dom(ChatgptSendState::Missing, false, false, 0);
         assert!(chatgpt_response_complete(&missing, None, &bl));
-        // Copy buttons provide progress even without new message count.
-        let copy_only = ChatgptDomState {
-            assistant_msg_count: 0,
-            copy_button_count: 2,
-            ..idle_with_msg.clone()
-        };
-        assert!(chatgpt_response_complete(&copy_only, None, &bl));
         // Stop button → generating.
         let generating = dom(ChatgptSendState::Enabled, true, false, 0);
         assert!(!chatgpt_response_complete(&generating, None, &bl));
         // Thinking indicator → not complete.
         let thinking = dom(ChatgptSendState::Enabled, false, true, 0);
         assert!(!chatgpt_response_complete(&thinking, None, &bl));
+    }
+
+    #[test]
+    fn chatgpt_response_complete_scopes_copy_buttons_to_new_response() {
+        let baseline = ChatgptDomState {
+            send_state: ChatgptSendState::Missing,
+            has_stop_button: false,
+            has_thinking_indicator: false,
+            copy_button_count: 1,
+            assistant_msg_count: 1,
+            assistant_last_len: 80,
+            error: String::new(),
+        };
+        let stale_latest = ChatgptDomState {
+            copy_button_count: 1,
+            assistant_msg_count: 1,
+            assistant_last_len: 80,
+            ..dom(ChatgptSendState::Enabled, false, false, 0)
+        };
+        let new_latest = ChatgptDomState {
+            copy_button_count: 1,
+            assistant_msg_count: 2,
+            assistant_last_len: 0,
+            ..dom(ChatgptSendState::Enabled, false, false, 0)
+        };
+
+        assert!(
+            !chatgpt_response_complete(&stale_latest, None, &baseline),
+            "copy buttons on the existing latest message must not satisfy completion"
+        );
+        assert!(
+            chatgpt_response_complete(&new_latest, None, &baseline),
+            "copy buttons on a newly created latest response may confirm completion"
+        );
     }
 
     #[test]
