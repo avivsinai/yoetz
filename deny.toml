@@ -24,6 +24,8 @@ allow = [
     "CC0-1.0",
     "BSL-1.0",
     "OpenSSL",
+    "LGPL-2.1-or-later",
+    "GPL-3.0-or-later",
 ]
 confidence-threshold = 0.8
 
@@ -31,6 +33,15 @@ confidence-threshold = 0.8
 name = "ring"
 expression = "MIT AND ISC AND OpenSSL"
 license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+# auto_generate_cdp is a build-time code generator for headless_chrome's CDP
+# bindings. It reads Chrome's protocol JSON spec and emits Rust source at
+# compile time — the generator itself is NOT linked into the yoetz binary.
+[[licenses.clarify]]
+name = "auto_generate_cdp"
+version = "0.4.6"
+expression = "GPL-3.0-or-later"
+license-files = [{ path = "LICENSE.txt", hash = 0xba8ef827 }]
 
 [bans]
 multiple-versions = "warn"
