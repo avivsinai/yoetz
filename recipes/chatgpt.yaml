@@ -1,8 +1,9 @@
 name: chatgpt
 # Transport order:
-#   1. dev-browser (preferred; explicit CDP or Chrome auto-connect)
-#   2. agent-browser (legacy fallback; explicit CDP > auto_connect > cookie > profile)
-#   3. manual (last resort; upload/paste the bundle yourself)
+#   1. chrome-devtools-mcp (primary for Chrome 147+ live-attached Chrome)
+#   2. dev-browser (fallback for Chrome <= 146 / Chrome for Testing)
+#   3. agent-browser (managed browser fallback)
+#   4. manual (last resort; upload/paste the bundle yourself)
 #
 # Recommended: enable chrome://inspect/#remote-debugging (Chrome 144+) for auto-connect.
 # Note: Chrome 136+ ignores --remote-debugging-port on the default profile.
@@ -17,6 +18,7 @@ name: chatgpt
 #   wait_interval_ms — poll interval in ms (default: 30000 = 30s).
 
 transports:
+  - chrome-devtools-mcp
   - dev-browser
   - agent-browser
   - manual

@@ -2,11 +2,10 @@
 // until then the items here are intentionally unused.
 #![allow(dead_code)]
 
-//! Chrome DevTools MCP transport for yoetz browser recipes.
+//! Chrome live-attach transport for yoetz browser recipes.
 //!
-//! This module implements the primary browser transport for Chrome 147+, which
-//! delegates to `chrome-devtools-mcp` (Google-maintained MCP server) over stdio
-//! using the official `rmcp` Rust SDK.
+//! Historical note: the module name stayed `chrome_devtools_mcp` to avoid a
+//! wider dispatcher/schema churn while the transport internals changed.
 //!
 //! ## Why this exists
 //!
@@ -18,17 +17,14 @@
 //! - Playwright 1.58.2 calls `Target.setAutoAttach { flatten: true }` on the root
 //!   browser session and waits for inline `Target.attachedToTarget` events that
 //!   Chrome 147 never emits for pre-existing tabs.
-//! - `chrome-devtools-mcp` uses Puppeteer 24.40.0 internally, which uses a
-//!   discover-then-attach-at-tab-level bootstrap that Chrome 147 accepts.
-//!
-//! Switching the client (Playwright → Puppeteer via chrome-devtools-mcp) while
-//! keeping the target (user's real logged-in Chrome) restores Chrome 147
-//! compatibility without violating the "attach to running Chrome" invariant.
+//! - `headless_chrome` uses browser discovery plus per-tab attach, which avoids
+//!   the broken root-session bootstrap while still attaching to the user's real
+//!   logged-in Chrome session.
 //!
 //! ## Module layout
 //!
-//! - [`client`] — `CdpMcpClient`: rmcp subprocess lifecycle + typed tool-call
-//!   wrappers over `chrome-devtools-mcp` stdio.
+//! - [`client`] — `CdpMcpClient`: direct `headless_chrome` browser/tab client
+//!   with a small compatibility surface for the recipe layer.
 //! - [`chatgpt`] — seven-step ChatGPT Pro recipe: navigate → snapshot → upload
 //!   → snapshot → type → click → wait → evaluate.
 //! - [`claude`] — claude.ai recipe (follows after chatgpt is verified).
@@ -55,8 +51,8 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct DevtoolsMcpRecipeContext {
     /// Explicit CDP endpoint (e.g. `http://127.0.0.1:9222`). `None` means
-    /// "use the default localhost:9222, let chrome-devtools-mcp auto-resolve
-    /// the browser URL under the hood via Puppeteer."
+    /// "use the default localhost:9222 and resolve the browser websocket from
+    /// DevToolsActivePort or `/json/version`."
     pub cdp_endpoint: Option<String>,
 
     /// Path to the bundle markdown file to upload via `upload_file`. `None`

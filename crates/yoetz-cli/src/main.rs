@@ -758,7 +758,7 @@ async fn main() -> Result<()> {
         Commands::Session(args) => handle_session(&ctx, args, format),
         Commands::Models(args) => commands::models::handle_models(&ctx, args, format).await,
         Commands::Pricing(args) => commands::pricing::handle_pricing(&ctx, args, format).await,
-        Commands::Browser(args) => handle_browser(&ctx, args, format),
+        Commands::Browser(args) => handle_browser(&ctx, args, format).await,
         Commands::Council(args) => commands::council::handle_council(&ctx, args, format).await,
         Commands::Apply(args) => commands::apply::handle_apply(args),
         Commands::Review(args) => commands::review::handle_review(&ctx, args, format).await,
@@ -942,7 +942,7 @@ fn default_daemon_recovery_error(original: Option<&anyhow::Error>) -> Option<any
     }
 }
 
-fn run_recipe_via_chrome_devtools_mcp(
+async fn run_recipe_via_chrome_devtools_mcp(
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
     cdp_endpoint: Option<&str>,
@@ -996,14 +996,7 @@ fn run_recipe_via_chrome_devtools_mcp(
         show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
     };
 
-    // The chrome-devtools-mcp recipe is async; yoetz-cli is a sync `main`, so
-    // spin up a single-threaded tokio runtime just for this dispatch. No
-    // long-lived runtime — one yoetz invocation, one recipe, one runtime.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("start tokio runtime for chrome-devtools-mcp recipe")?;
-    let response = runtime.block_on(chrome_devtools_mcp::chatgpt::run(&ctx))?;
+    let response = chrome_devtools_mcp::chatgpt::run(&ctx).await?;
 
     match format {
         OutputFormat::Json => {
@@ -1218,7 +1211,7 @@ fn run_recipe_via_agent_browser(
     }
 }
 
-fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> Result<()> {
+async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> Result<()> {
     match args.command {
         BrowserCommand::Exec(exec) => {
             // dev-browser exec: if args look like a script (single arg with
@@ -1530,6 +1523,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                             format,
                             is_chatgpt,
                         )
+                        .await
                     }
                     browser::RecipeTransport::Manual => Err(anyhow!("{}", manual_fallback)),
                 };
@@ -2148,8 +2142,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_recipe_via_chrome_devtools_mcp_rejects_non_chatgpt_recipes() {
+    #[tokio::test]
+    async fn run_recipe_via_chrome_devtools_mcp_rejects_non_chatgpt_recipes() {
         // Until the claude/gemini ports land, non-chatgpt recipes through the
         // chrome-devtools-mcp transport surface a clear guidance error rather
         // than silently trying to drive the wrong DOM.
@@ -2168,14 +2162,15 @@ mod tests {
             OutputFormat::Text,
             /* is_chatgpt */ false,
         )
+        .await
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("chrome-devtools-mcp"));
         assert!(msg.contains("chatgpt"));
     }
 
-    #[test]
-    fn run_recipe_via_chrome_devtools_mcp_rejects_profile_flag() {
+    #[tokio::test]
+    async fn run_recipe_via_chrome_devtools_mcp_rejects_profile_flag() {
         // --profile is a managed-profile concept from agent-browser; the MCP
         // transport attaches to a running Chrome via --cdp or auto-discovery
         // only. Surface that clearly instead of silently ignoring the flag.
@@ -2194,6 +2189,7 @@ mod tests {
             OutputFormat::Text,
             /* is_chatgpt */ true,
         )
+        .await
         .unwrap_err();
         assert!(err.to_string().contains("--profile"));
         assert!(err.to_string().contains("--cdp"));

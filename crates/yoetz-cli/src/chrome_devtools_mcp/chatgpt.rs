@@ -15,8 +15,7 @@
 //! model. This is still a massive simplification over the old dev-browser
 //! recipe because:
 //!
-//! - No Playwright `connectOverCDP` hang — chrome-devtools-mcp uses Puppeteer
-//!   which handles Chrome 147's target bootstrap correctly
+//! - No Playwright `connectOverCDP` hang in the live-attach path
 //! - No QuickJS sandbox — `evaluate_script` runs plain JS in the page
 //! - No SPA reset dance — `new_page` creates a fresh page so the thread
 //!   starts empty
@@ -60,11 +59,10 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<String> {
         ));
     }
 
-    // Step 0: bring up the MCP client. chrome-devtools-mcp attaches to user's
-    // running Chrome via its internal Puppeteer `connect({browserURL})` call.
-    // The Chrome 147 "Allow remote debugging" dialog fires here, once per
-    // Chrome session. Every subsequent yoetz invocation in the same Chrome
-    // session is silent.
+    // Step 0: attach directly to the user's running Chrome session.
+    // The Chrome "Allow remote debugging" dialog fires here, once per Chrome
+    // session. Every subsequent yoetz invocation in the same Chrome session
+    // should be silent.
     if ctx.show_approval_guidance {
         eprintln!(
             "info: connecting to Chrome via chrome-devtools-mcp — if prompted, click Allow in Chrome's remote debugging dialog (one-time per Chrome session)"
@@ -119,7 +117,8 @@ async () => {
     // that uid.
     //
     // If the attach button is missing or the upload flow fails, fall back
-    // to inlining the bundle text into the prompt (paste mode).
+    // to inlining the bundle text into the prompt only when paste mode is
+    // explicitly available. Refuse to silently degrade into prompt-only mode.
     let uploaded = if let Some(bundle_path) = &ctx.bundle_path {
         try_upload_bundle(&client, bundle_path)
             .await
@@ -142,8 +141,11 @@ async () => {
         ctx.prompt.clone()
     } else if let Some(text) = &ctx.bundle_text {
         format!("{}\n\n{}", ctx.prompt, text)
+    } else if ctx.bundle_path.is_some() {
+        return Err(anyhow!(
+            "bundle upload failed and no inline paste fallback text was provided; refusing to send a prompt-only request"
+        ));
     } else {
-        // No bundle available and no paste-mode text — just send the prompt.
         ctx.prompt.clone()
     };
 
@@ -214,8 +216,10 @@ async () => {
     Ok(response_text)
 }
 
-/// Click the attach button, snapshot to find the lazy-mounted file input,
-/// call `upload_file`. Returns true on success, errors or false on fallback.
+/// Click the attach button, snapshot the mounted upload affordance, then call
+/// `upload_file`. `upload_file` accepts either the file input itself or the
+/// element that opens the file chooser, so prefer visible menu items/buttons
+/// over guessing a hidden input uid.
 async fn try_upload_bundle(client: &CdpMcpClient, bundle_path: &std::path::Path) -> Result<bool> {
     // Trigger the lazy mount of `<input type="file">` by clicking the attach
     // button. No stable testid — match by aria-label containing "Attach".
@@ -241,43 +245,30 @@ async fn try_upload_bundle(client: &CdpMcpClient, bundle_path: &std::path::Path)
         return Err(anyhow!("attach button not found via aria-label"));
     }
 
-    // Give the menu / file picker a moment to mount the hidden input.
+    // Give the attach menu / upload affordance a moment to mount.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Some ChatGPT variants open a menu with "Upload from computer" rather
-    // than mounting the file input directly. Try that path too.
-    let menu_click_js = r##"
-() => {
-  const items = Array.from(document.querySelectorAll("[role='menuitem'], li"));
-  const target = items.find((el) => /upload|from computer/i.test(el.textContent || ''));
-  if (target) { target.click(); return true; }
-  return false;
-}
-"##;
-    let _ = client.evaluate_script(menu_click_js, vec![]).await;
-
-    // Now snapshot and find the upload input's uid.
-    //
-    // The snapshot should include the newly-mounted `<input type="file">`
-    // as a node. We look for it by searching for "file" in input type.
+    // Snapshot and find the upload trigger. Some ChatGPT variants expose
+    // an "Upload from computer" menu item, others keep a visible attach
+    // button, and only some expose a discoverable file input in the a11y tree.
     let snapshot = client
         .take_snapshot(/* verbose */ false)
         .await
         .context("take_snapshot after attach click")?;
 
-    let upload_uid = snapshot.find_uid_by_text("file").or_else(|| {
-        // Fallback: some snapshot renderers label the input as
-        // "file upload" or similar.
-        snapshot
-            .find_uid_by_role("textbox", "File upload")
-            .or_else(|| snapshot.find_uid_by_role("button", "Upload"))
-    });
+    let upload_uid = snapshot
+        .find_uid_by_text("upload from computer")
+        .or_else(|| snapshot.find_uid_by_text("from computer"))
+        .or_else(|| snapshot.find_uid_by_text("upload files"))
+        .or_else(|| snapshot.find_uid_by_role("button", "Upload files and more"))
+        .or_else(|| snapshot.find_uid_by_text("attach"))
+        .or_else(|| snapshot.find_uid_by_text("file"));
 
     let uid = match upload_uid {
         Some(uid) => uid,
         None => {
             return Err(anyhow!(
-                "upload input not found in snapshot after attach click"
+                "upload target not found in snapshot after attach click"
             ))
         }
     };

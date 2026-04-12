@@ -1,24 +1,21 @@
-//! rmcp client wrapper over `chrome-devtools-mcp` (stdio MCP server).
+//! Direct Chrome live-attach client used by the historical
+//! `chrome_devtools_mcp` transport module.
 
 use anyhow::{anyhow, bail, Context, Result};
-use reqwest::Url;
-use rmcp::{
-    model::{CallToolRequestParams, CallToolResult, Content, RawContent, ResourceContents},
-    service::{RoleClient, RunningService},
-    transport::TokioChildProcess,
-    ServiceExt,
+use headless_chrome::{
+    browser::tab::element::Element, protocol::cdp::Target::CreateTarget, Browser, Tab,
 };
-use serde_json::{json, Value};
-use std::path::Path;
-use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::Command;
-use tokio::sync::Mutex;
-
-type CdpService = RunningService<RoleClient, ()>;
+use reqwest::Url;
+use serde_json::Value;
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 pub struct CdpMcpClient {
-    service: Mutex<Option<CdpService>>,
+    browser: Browser,
+    selected_tab: Mutex<Option<Arc<Tab>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,88 +83,20 @@ pub struct WaitForResult {
     pub matched_text: String,
 }
 
-/// Locate the `chrome-devtools-mcp` invocation to spawn.
-///
-/// Preference order:
-/// 1. The globally installed `chrome-devtools-mcp` binary on `PATH` (from
-///    `npm install -g chrome-devtools-mcp`). Fastest path, version-pinned
-///    at install time, no per-invocation network fetch.
-/// 2. `npx -y chrome-devtools-mcp@latest` as the transparent fallback for
-///    users who haven't installed it globally yet. Slower first run (npx
-///    fetches the package) but zero-setup on a fresh machine.
-fn resolve_chrome_devtools_mcp_command() -> Command {
-    if let Some(path) = which_chrome_devtools_mcp() {
-        let mut command = Command::new(path);
-        command.arg("--experimentalStructuredContent");
-        return command;
-    }
-
-    let mut command = Command::new("npx");
-    command
-        .arg("-y")
-        .arg("chrome-devtools-mcp@latest")
-        .arg("--experimentalStructuredContent");
-    command
-}
-
-/// Look up `chrome-devtools-mcp` on `PATH` using the same rules as the shell.
-fn which_chrome_devtools_mcp() -> Option<std::path::PathBuf> {
-    let path_env = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path_env) {
-        let candidate = dir.join("chrome-devtools-mcp");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
 impl CdpMcpClient {
     pub async fn connect_to_running_chrome(cdp_endpoint: Option<&str>) -> Result<Self> {
         let endpoint = cdp_endpoint.unwrap_or("http://127.0.0.1:9222");
         let parsed = Url::parse(endpoint)
             .with_context(|| format!("invalid Chrome CDP endpoint `{endpoint}`"))?;
+        let ws_endpoint = resolve_browser_websocket(&parsed)?;
+        let browser = Browser::connect_with_timeout(ws_endpoint.clone(), Duration::from_secs(300))
+            .with_context(|| format!("connecting to Chrome websocket `{ws_endpoint}` failed"))?;
 
-        let mut command = resolve_chrome_devtools_mcp_command();
-        command
-            .kill_on_drop(true)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped());
-
-        match parsed.scheme() {
-            "ws" | "wss" => {
-                command.arg(format!("--wsEndpoint={endpoint}"));
-            }
-            _ => {
-                command.arg(format!("--browser-url={endpoint}"));
-            }
-        }
-
-        let (transport, stderr) = TokioChildProcess::builder(command)
-            .stderr(Stdio::piped())
-            .spawn()
-            .context(
-                "failed to start chrome-devtools-mcp; ensure it is installed via `npm install -g chrome-devtools-mcp`",
-            )?;
-
-        if let Some(stderr) = stderr {
-            let verbose = std::env::var_os("YOETZ_BROWSER_DEBUG").is_some();
-            tokio::spawn(async move {
-                let mut lines = BufReader::new(stderr).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    if verbose && !line.trim().is_empty() {
-                        eprintln!("chrome-devtools-mcp: {line}");
-                    }
-                }
-            });
-        }
-
-        let service = ().serve(transport).await.with_context(|| {
-            format!("handshaking with chrome-devtools-mcp at `{endpoint}` failed")
-        })?;
+        browser.register_missing_tabs();
 
         Ok(Self {
-            service: Mutex::new(Some(service)),
+            browser,
+            selected_tab: Mutex::new(None),
         })
     }
 
@@ -177,40 +106,27 @@ impl CdpMcpClient {
         background: bool,
         timeout_ms: u64,
     ) -> Result<NewPageResult> {
-        let result = self
-            .call_tool(
-                "new_page",
-                json!({
-                    "url": url,
-                    "background": background,
-                    "timeout": timeout_ms,
-                }),
-            )
-            .await?;
-
-        let page = selected_page_entry(&result).context(
-            "chrome-devtools-mcp `new_page` did not return a selected page in structuredContent.pages",
-        )?;
-        let page_id = page
-            .get("id")
-            .and_then(Value::as_i64)
-            .context("chrome-devtools-mcp `new_page` selected page is missing numeric `id`")?;
+        let tab = self
+            .browser
+            .new_tab_with_options(create_target(url, background))
+            .with_context(|| format!("creating a new Chrome page for `{url}` failed"))?;
+        configure_tab_timeout(&tab, timeout_ms);
+        tab.wait_until_navigated()
+            .with_context(|| format!("waiting for Chrome page `{url}` to finish navigating"))?;
+        self.set_selected_tab(tab.clone());
 
         Ok(NewPageResult {
-            page_id: page_id.to_string(),
+            page_id: tab.get_target_id().to_string(),
         })
     }
 
     pub async fn navigate_page(&self, url: &str, timeout_ms: u64) -> Result<NavigateResult> {
-        self.call_tool(
-            "navigate_page",
-            json!({
-                "type": "url",
-                "url": url,
-                "timeout": timeout_ms,
-            }),
-        )
-        .await?;
+        let tab = self.selected_tab()?;
+        configure_tab_timeout(&tab, timeout_ms);
+        tab.navigate_to(url)
+            .with_context(|| format!("navigating selected Chrome page to `{url}` failed"))?
+            .wait_until_navigated()
+            .with_context(|| format!("waiting for Chrome page `{url}` to finish navigating"))?;
 
         Ok(NavigateResult {
             url: url.to_owned(),
@@ -218,43 +134,42 @@ impl CdpMcpClient {
     }
 
     pub async fn take_snapshot(&self, verbose: bool) -> Result<Snapshot> {
-        let result = self
-            .call_tool("take_snapshot", json!({ "verbose": verbose }))
-            .await?;
-
-        let structured = structured_content(&result, "take_snapshot")?;
-        let snapshot = structured.get("snapshot").cloned().context(
-            "chrome-devtools-mcp `take_snapshot` response is missing structuredContent.snapshot",
-        )?;
-
+        let tab = self.selected_tab()?;
+        let snapshot = evaluate_json_payload(&tab, &build_snapshot_script(verbose), false)
+            .context("building Chrome DOM snapshot failed")?;
         Ok(Snapshot { raw: snapshot })
     }
 
     pub async fn click(&self, uid: &str, double_click: bool) -> Result<()> {
-        self.call_tool(
-            "click",
-            json!({
-                "uid": uid,
-                "dblClick": double_click,
-            }),
-        )
-        .await?;
+        let tab = self.selected_tab()?;
+        let element = find_snapshot_element(&tab, uid)?;
+        element
+            .click()
+            .with_context(|| format!("clicking snapshot element `{uid}` failed"))?;
+        if double_click {
+            element
+                .click()
+                .with_context(|| format!("double-clicking snapshot element `{uid}` failed"))?;
+        }
         Ok(())
     }
 
     pub async fn type_text(&self, text: &str, submit_key: Option<&str>) -> Result<()> {
-        let mut arguments = json!({
-            "text": text,
-        });
+        let tab = self.selected_tab()?;
+        tab.type_str(text)
+            .context("typing into selected Chrome page failed")?;
         if let Some(submit_key) = submit_key {
-            arguments["submitKey"] = Value::String(submit_key.to_owned());
+            tab.press_key(submit_key)
+                .with_context(|| format!("pressing `{submit_key}` failed"))?;
         }
-
-        self.call_tool("type_text", arguments).await?;
         Ok(())
     }
 
     pub async fn upload_file(&self, uid: &str, file_path: &Path) -> Result<()> {
+        let tab = self.selected_tab()?;
+        let file_path = file_path
+            .canonicalize()
+            .with_context(|| format!("resolving upload path `{}` failed", file_path.display()))?;
         let file_path = file_path.to_str().ok_or_else(|| {
             anyhow!(
                 "upload_file path is not valid UTF-8: {}",
@@ -262,14 +177,25 @@ impl CdpMcpClient {
             )
         })?;
 
-        self.call_tool(
-            "upload_file",
-            json!({
-                "uid": uid,
-                "filePath": file_path,
-            }),
-        )
-        .await?;
+        if let Ok(element) = find_snapshot_element(&tab, uid) {
+            if element.tag_name.eq_ignore_ascii_case("input")
+                && element.get_attribute_value("type")?.as_deref() == Some("file")
+            {
+                element
+                    .set_input_files(&[file_path])
+                    .with_context(|| format!("setting files on input `{uid}` failed"))?;
+                return Ok(());
+            }
+
+            let _ = element.click();
+        }
+
+        let input = tab
+            .find_element("input[type='file']")
+            .context("no file input became available after clicking the upload affordance")?;
+        input
+            .set_input_files(&[file_path])
+            .context("setting files on the Chrome file input failed")?;
         Ok(())
     }
 
@@ -278,146 +204,428 @@ impl CdpMcpClient {
             bail!("wait_for requires at least one text hint");
         }
 
-        self.call_tool(
-            "wait_for",
-            json!({
-                "text": text,
-                "timeout": timeout_ms,
-            }),
-        )
-        .await?;
+        let tab = self.selected_tab()?;
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        let wanted = text
+            .iter()
+            .map(|value| ((*value).to_owned(), value.to_ascii_lowercase()))
+            .collect::<Vec<_>>();
 
-        Ok(WaitForResult {
-            matched_text: text[0].to_owned(),
-        })
-    }
-
-    pub async fn evaluate_script(
-        &self,
-        function: &str,
-        args: Vec<serde_json::Value>,
-    ) -> Result<serde_json::Value> {
-        let uid_args = normalize_uid_args(args)?;
-        let result = self
-            .call_tool(
-                "evaluate_script",
-                json!({
-                    "function": function,
-                    "args": uid_args,
-                }),
-            )
-            .await?;
-
-        let text = join_text_content(&result);
-        parse_evaluate_script_json(&text)
-            .with_context(|| format!("failed to parse `evaluate_script` JSON response:\n{text}"))
-    }
-
-    async fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<CallToolResult> {
-        let params = CallToolRequestParams::new(tool_name.to_owned())
-            .with_arguments(value_to_object(arguments, tool_name)?);
-
-        let guard = self.service.lock().await;
-        let service = guard
-            .as_ref()
-            .context("chrome-devtools-mcp client has already been shut down")?;
-        let result = service
-            .peer()
-            .call_tool(params)
-            .await
-            .with_context(|| format!("chrome-devtools-mcp `{tool_name}` call failed"))?;
-
-        if result.is_error.unwrap_or(false) {
-            bail!(
-                "chrome-devtools-mcp `{tool_name}` failed: {}",
-                tool_failure_text(&result)
-            );
-        }
-
-        Ok(result)
-    }
-}
-
-impl Drop for CdpMcpClient {
-    fn drop(&mut self) {
-        if let Ok(mut guard) = self.service.try_lock() {
-            if let Some(service) = guard.take() {
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    handle.spawn(async move {
-                        let _ = service.cancel().await;
-                    });
-                } else {
-                    drop(service);
-                }
+        loop {
+            let page_text = read_page_text(&tab)?.to_ascii_lowercase();
+            if let Some((matched, _)) = wanted
+                .iter()
+                .find(|(_, needle)| !needle.is_empty() && page_text.contains(needle))
+            {
+                return Ok(WaitForResult {
+                    matched_text: matched.clone(),
+                });
             }
+
+            if Instant::now() >= deadline {
+                bail!(
+                    "did not find any of the requested text hints within {timeout_ms}ms: {}",
+                    text.join(", ")
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    }
+
+    pub async fn evaluate_script(&self, function: &str, args: Vec<Value>) -> Result<Value> {
+        let tab = self.selected_tab()?;
+        let uid_args = normalize_uid_args(args)?;
+        let expression = build_evaluate_script_expression(function, &uid_args)?;
+        let response = evaluate_json_payload(&tab, &expression, true)?;
+        Ok(response.get("value").cloned().unwrap_or(Value::Null))
+    }
+
+    fn set_selected_tab(&self, tab: Arc<Tab>) {
+        let mut guard = self.selected_tab.lock().unwrap();
+        *guard = Some(tab);
+    }
+
+    fn selected_tab(&self) -> Result<Arc<Tab>> {
+        self.selected_tab
+            .lock()
+            .unwrap()
+            .as_ref()
+            .cloned()
+            .context("no Chrome page is currently selected; call `new_page` first")
+    }
+}
+
+fn create_target(url: &str, background: bool) -> CreateTarget {
+    CreateTarget {
+        url: url.to_owned(),
+        left: None,
+        top: None,
+        width: None,
+        height: None,
+        window_state: None,
+        browser_context_id: None,
+        enable_begin_frame_control: None,
+        new_window: None,
+        background: Some(background),
+        for_tab: None,
+        hidden: None,
+    }
+}
+
+fn configure_tab_timeout(tab: &Arc<Tab>, timeout_ms: u64) {
+    tab.set_default_timeout(Duration::from_millis(timeout_ms.max(1)));
+}
+
+fn resolve_browser_websocket(parsed: &Url) -> Result<String> {
+    match parsed.scheme() {
+        "ws" | "wss" => Ok(parsed.as_str().to_owned()),
+        _ => {
+            if let Some(ws_endpoint) = resolve_devtools_active_port_ws(parsed) {
+                return Ok(ws_endpoint);
+            }
+
+            resolve_browser_websocket_via_json_version(parsed)
         }
     }
 }
 
-fn value_to_object(arguments: Value, tool_name: &str) -> Result<rmcp::model::JsonObject> {
-    match arguments {
-        Value::Object(map) => Ok(map),
-        other => {
-            bail!("chrome-devtools-mcp `{tool_name}` arguments must be a JSON object, got {other}")
-        }
-    }
+fn resolve_browser_websocket_via_json_version(endpoint: &Url) -> Result<String> {
+    let version_url = browser_version_url(endpoint)?;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("building /json/version HTTP client failed")?;
+    let payload = client
+        .get(version_url.clone())
+        .send()
+        .with_context(|| format!("requesting `{version_url}` failed"))?
+        .error_for_status()
+        .with_context(|| format!("Chrome rejected `{version_url}`"))?
+        .json::<Value>()
+        .with_context(|| format!("parsing `{version_url}` as JSON failed"))?;
+
+    browser_websocket_from_json_version_payload(&payload)
+        .with_context(|| format!("`{version_url}` did not expose a valid browser websocket URL"))
 }
 
-fn structured_content<'a>(result: &'a CallToolResult, tool_name: &str) -> Result<&'a Value> {
-    result.structured_content.as_ref().ok_or_else(|| {
-        anyhow!("chrome-devtools-mcp `{tool_name}` did not return structuredContent")
-    })
+fn browser_version_url(endpoint: &Url) -> Result<Url> {
+    let mut version_url = endpoint.clone();
+    version_url.set_path("/json/version");
+    version_url.set_query(None);
+    version_url.set_fragment(None);
+    Ok(version_url)
 }
 
-fn selected_page_entry(result: &CallToolResult) -> Option<&Value> {
-    let pages = result
-        .structured_content
-        .as_ref()?
-        .get("pages")?
-        .as_array()?;
-    pages
-        .iter()
-        .find(|page| page.get("selected").and_then(Value::as_bool) == Some(true))
-        .or_else(|| pages.last())
-}
-
-fn join_text_content(result: &CallToolResult) -> String {
-    result
-        .content
-        .iter()
-        .filter_map(content_text)
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn tool_failure_text(result: &CallToolResult) -> String {
-    let mut parts = Vec::new();
-    let text = join_text_content(result);
-    if !text.trim().is_empty() {
-        parts.push(text);
-    }
-    if let Some(structured) = &result.structured_content {
-        let structured = structured.to_string();
-        if !structured.is_empty() {
-            parts.push(structured);
-        }
-    }
-    if parts.is_empty() {
-        "tool returned an error with no message".to_owned()
+fn browser_websocket_from_json_version_payload(payload: &Value) -> Result<String> {
+    let ws_endpoint = payload
+        .get("webSocketDebuggerUrl")
+        .and_then(Value::as_str)
+        .context("missing `webSocketDebuggerUrl` in /json/version payload")?;
+    if ws_endpoint.starts_with("ws://") || ws_endpoint.starts_with("wss://") {
+        Ok(ws_endpoint.to_owned())
     } else {
-        parts.join("\n")
+        bail!("`webSocketDebuggerUrl` was not a websocket URL: {ws_endpoint}");
     }
 }
 
-fn content_text(content: &Content) -> Option<String> {
-    match &content.raw {
-        RawContent::Text(text) => Some(text.text.clone()),
-        RawContent::Resource(resource) => match &resource.resource {
-            ResourceContents::TextResourceContents { text, .. } => Some(text.clone()),
-            _ => None,
-        },
-        _ => None,
+fn resolve_devtools_active_port_ws(endpoint: &Url) -> Option<String> {
+    if !matches!(endpoint.scheme(), "http" | "https") || !is_localhost_host(endpoint) {
+        return None;
     }
+
+    let expected_port = endpoint.port_or_known_default()?;
+    devtools_active_port_candidates()
+        .into_iter()
+        .find_map(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| parse_devtools_active_port(&contents, expected_port))
+        })
+}
+
+fn is_localhost_host(endpoint: &Url) -> bool {
+    matches!(
+        endpoint.host_str(),
+        Some("127.0.0.1") | Some("localhost") | Some("[::1]") | Some("::1")
+    )
+}
+
+fn devtools_active_port_candidates() -> Vec<PathBuf> {
+    let home = home_dir_candidates();
+    match std::env::consts::OS {
+        "macos" => home
+            .into_iter()
+            .flat_map(|home| {
+                [
+                    home.join("Library/Application Support/Google/Chrome/DevToolsActivePort"),
+                    home.join(
+                        "Library/Application Support/Google/Chrome Canary/DevToolsActivePort",
+                    ),
+                    home.join("Library/Application Support/Chromium/DevToolsActivePort"),
+                    home.join(
+                        "Library/Application Support/BraveSoftware/Brave-Browser/DevToolsActivePort",
+                    ),
+                ]
+            })
+            .collect(),
+        "windows" => home
+            .into_iter()
+            .flat_map(|home| {
+                [
+                    home.join("AppData/Local/Google/Chrome/User Data/DevToolsActivePort"),
+                    home.join(
+                        "AppData/Local/Google/Chrome Beta/User Data/DevToolsActivePort",
+                    ),
+                    home.join("AppData/Local/Google/Chrome SxS/User Data/DevToolsActivePort"),
+                    home.join("AppData/Local/Chromium/User Data/DevToolsActivePort"),
+                    home.join(
+                        "AppData/Local/BraveSoftware/Brave-Browser/User Data/DevToolsActivePort",
+                    ),
+                ]
+            })
+            .collect(),
+        _ => home
+            .into_iter()
+            .flat_map(|home| {
+                [
+                    home.join(".config/google-chrome/DevToolsActivePort"),
+                    home.join(".config/chromium/DevToolsActivePort"),
+                    home.join(".config/google-chrome-beta/DevToolsActivePort"),
+                    home.join(".config/google-chrome-unstable/DevToolsActivePort"),
+                    home.join(".config/BraveSoftware/Brave-Browser/DevToolsActivePort"),
+                ]
+            })
+            .collect(),
+    }
+}
+
+fn home_dir_candidates() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(home));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let path = PathBuf::from(profile);
+        if !dirs.iter().any(|existing| existing == &path) {
+            dirs.push(path);
+        }
+    }
+    dirs
+}
+
+fn parse_devtools_active_port(contents: &str, expected_port: u16) -> Option<String> {
+    let lines = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let port = lines.first()?.parse::<u16>().ok()?;
+    let web_socket_path = *lines.get(1)?;
+
+    if port != expected_port || !web_socket_path.starts_with("/devtools/browser/") {
+        return None;
+    }
+
+    Some(format!("ws://127.0.0.1:{port}{web_socket_path}"))
+}
+
+fn find_snapshot_element<'a>(tab: &'a Arc<Tab>, uid: &str) -> Result<Element<'a>> {
+    tab.find_element(&query_selector_for_uid(uid))
+        .with_context(|| format!("snapshot element `{uid}` is no longer present in the DOM"))
+}
+
+fn query_selector_for_uid(uid: &str) -> String {
+    let safe_uid = uid.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("[data-yoetz-snapshot-id=\"{safe_uid}\"]")
+}
+
+fn evaluate_value(tab: &Arc<Tab>, expression: &str, await_promise: bool) -> Result<Value> {
+    let remote = tab
+        .evaluate(expression, await_promise)
+        .with_context(|| format!("evaluating Chrome script failed:\n{expression}"))?;
+
+    if let Some(value) = remote.value {
+        return Ok(value);
+    }
+
+    if let Some(description) = remote.description {
+        return Ok(Value::String(description));
+    }
+
+    bail!("Chrome evaluation returned no serializable value");
+}
+
+fn evaluate_json_payload(tab: &Arc<Tab>, expression: &str, await_promise: bool) -> Result<Value> {
+    let raw = evaluate_value(tab, expression, await_promise)?;
+    let json_text = raw
+        .as_str()
+        .context("Chrome evaluation did not return a JSON string payload")?;
+    serde_json::from_str(json_text)
+        .with_context(|| format!("Chrome evaluation returned invalid JSON: {json_text}"))
+}
+
+fn read_page_text(tab: &Arc<Tab>) -> Result<String> {
+    let value = evaluate_value(
+        tab,
+        r#"(() => {
+  const title = document.title || "";
+  const body = document.body?.innerText || document.documentElement?.innerText || "";
+  return `${title}\n${body}`.trim();
+})()"#,
+        false,
+    )?;
+
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .context("Chrome page text evaluation did not return a string")
+}
+
+fn build_snapshot_script(verbose: bool) -> String {
+    let max_text_chars = if verbose { 4_000 } else { 400 };
+    format!(
+        r#"(() => {{
+  const maxTextChars = {max_text_chars};
+  let nextId = Number(window.__yoetzSnapshotNextId || 1);
+
+  const clip = (value) => {{
+    if (typeof value !== "string") return "";
+    const normalized = value.replace(/\s+/g, " ").trim();
+    return normalized.length > maxTextChars
+      ? normalized.slice(0, maxTextChars)
+      : normalized;
+  }};
+
+  const labelledText = (el) => {{
+    const ids = (el.getAttribute("aria-labelledby") || "")
+      .split(/\s+/)
+      .map((value) => value.trim())
+      .filter(Boolean);
+    if (ids.length === 0) return "";
+    return clip(
+      ids
+        .map((id) => document.getElementById(id)?.innerText || "")
+        .filter(Boolean)
+        .join(" ")
+    );
+  }};
+
+  const detectRole = (el) => {{
+    const explicit = el.getAttribute("role");
+    if (explicit) return explicit;
+
+    const tag = el.tagName.toLowerCase();
+    const type = (el.getAttribute("type") || "").toLowerCase();
+    if (tag === "button") return "button";
+    if (tag === "a" && el.hasAttribute("href")) return "link";
+    if (tag === "textarea") return "textbox";
+    if (tag === "input") {{
+      if (type === "button" || type === "submit" || type === "reset") return "button";
+      if (type === "checkbox") return "checkbox";
+      if (type === "radio") return "radio";
+      return "textbox";
+    }}
+    if (tag === "select") return "combobox";
+    if (tag === "option") return "option";
+    if (tag === "ul" || tag === "ol") return "list";
+    if (tag === "li") return "listitem";
+    if (tag === "img") return "img";
+    if (tag === "dialog") return "dialog";
+    if (tag === "nav") return "navigation";
+    if (tag === "main") return "main";
+    if (tag === "article") return "article";
+    if (el.getAttribute("contenteditable") === "true") return "textbox";
+    if (el.getAttribute("data-message-author-role") === "assistant") return "article";
+    return "";
+  }};
+
+  const elementText = (el) => {{
+    const tag = el.tagName.toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") {{
+      return clip(el.value || "");
+    }}
+    return clip(el.innerText || el.textContent || "");
+  }};
+
+  const inferredName = (el) => {{
+    return (
+      clip(el.getAttribute("aria-label") || "") ||
+      labelledText(el) ||
+      clip(el.getAttribute("title") || "") ||
+      clip(el.getAttribute("placeholder") || "") ||
+      clip(el.getAttribute("alt") || "") ||
+      elementText(el)
+    );
+  }};
+
+  const shouldInclude = (el) => {{
+    if (!(el instanceof Element)) return false;
+    const tag = el.tagName.toLowerCase();
+    const role = detectRole(el);
+    const name = inferredName(el);
+    const text = elementText(el);
+    return Boolean(
+      el === document.activeElement ||
+      role ||
+      name ||
+      text ||
+      el.hasAttribute("data-message-author-role") ||
+      el.matches("button, a[href], input, textarea, select, option, summary, label, [contenteditable='true']")
+    );
+  }};
+
+  const ensureId = (el) => {{
+    if (!el.dataset.yoetzSnapshotId) {{
+      el.dataset.yoetzSnapshotId = `yoetz-${{nextId++}}`;
+    }}
+    return el.dataset.yoetzSnapshotId;
+  }};
+
+  const children = [];
+  for (const el of Array.from(document.querySelectorAll("*"))) {{
+    if (children.length >= 1200) break;
+    if (!shouldInclude(el)) continue;
+
+    const role = detectRole(el) || "generic";
+    const name = inferredName(el);
+    const text = elementText(el);
+    const description = clip(el.getAttribute("data-message-author-role") || "");
+    const node = {{
+      id: ensureId(el),
+      role,
+      tag: el.tagName.toLowerCase(),
+    }};
+    if (name) node.name = name;
+    if (description) node.description = description;
+    if (text) node.text = text;
+    const type = clip(el.getAttribute("type") || "");
+    if (type) node.type = type;
+    children.push(node);
+  }}
+
+  window.__yoetzSnapshotNextId = nextId;
+  return JSON.stringify({{
+    id: "root",
+    role: "root_web_area",
+    name: document.title || "",
+    children,
+  }});
+}})()"#
+    )
+}
+
+fn build_evaluate_script_expression(function: &str, uid_args: &[String]) -> Result<String> {
+    let args_json = serde_json::to_string(uid_args).context("serializing evaluate_script args")?;
+    Ok(format!(
+        r#"(async () => {{
+  const fn = ({function});
+  const argIds = {args_json};
+  const args = argIds.map((id) => document.querySelector(`[data-yoetz-snapshot-id="${{id}}"]`));
+  const result = await fn(...args);
+  return JSON.stringify({{ value: result === undefined ? null : result }});
+}})()"#
+    ))
 }
 
 fn normalize_uid_args(args: Vec<Value>) -> Result<Vec<String>> {
@@ -430,45 +638,6 @@ fn normalize_uid_args(args: Vec<Value>) -> Result<Vec<String>> {
             }
         })
         .collect()
-}
-
-fn parse_evaluate_script_json(text: &str) -> Result<Value> {
-    if let Some(fenced) = extract_json_fence(text) {
-        return serde_json::from_str(&fenced)
-            .with_context(|| format!("invalid JSON inside evaluate_script fence: {fenced}"));
-    }
-
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        bail!("evaluate_script returned no text content");
-    }
-
-    serde_json::from_str(trimmed).with_context(|| {
-        "evaluate_script response did not contain a fenced ```json block or raw JSON payload"
-    })
-}
-
-fn extract_json_fence(text: &str) -> Option<String> {
-    let mut in_fence = false;
-    let mut body = Vec::new();
-
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if !in_fence {
-            if trimmed.eq_ignore_ascii_case("```json") || trimmed == "```" {
-                in_fence = true;
-            }
-            continue;
-        }
-
-        if trimmed == "```" {
-            return Some(body.join("\n"));
-        }
-
-        body.push(line);
-    }
-
-    None
 }
 
 fn walk_snapshot<T, F>(node: &Value, visit: &mut F) -> Option<T>
@@ -518,7 +687,7 @@ fn node_contains_text(node: &serde_json::Map<String, Value>, wanted: &str) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::model::AnnotateAble;
+    use serde_json::json;
 
     fn snapshot_fixture() -> Snapshot {
         Snapshot {
@@ -592,14 +761,6 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_script_parser_reads_fenced_json() {
-        let value =
-            parse_evaluate_script_json("Script ran on page and returned:\n```json\n\"hello\"\n```")
-                .expect("should parse fenced json");
-        assert_eq!(value, Value::String("hello".to_owned()));
-    }
-
-    #[test]
     fn evaluate_script_args_must_be_uid_strings() {
         let err = normalize_uid_args(vec![Value::String("uid-1".to_owned()), json!(1)])
             .expect_err("non-string args should be rejected");
@@ -607,52 +768,48 @@ mod tests {
     }
 
     #[test]
-    fn selected_page_parses_structured_pages() {
-        let mut result = CallToolResult::success(vec![]);
-        result.structured_content = Some(json!({
-            "pages": [
-                {"id": 4, "url": "https://example.com", "selected": false},
-                {"id": 7, "url": "https://chatgpt.com", "selected": true}
-            ]
-        }));
-
-        let page = selected_page_entry(&result).expect("selected page should exist");
-        assert_eq!(page.get("id").and_then(Value::as_i64), Some(7));
+    fn build_evaluate_script_expression_embeds_uid_array() {
+        let expression = build_evaluate_script_expression(
+            "() => true",
+            &["yoetz-1".to_owned(), "yoetz-2".to_owned()],
+        )
+        .expect("expression should build");
+        assert!(expression.contains(r#"const argIds = ["yoetz-1","yoetz-2"];"#));
+        assert!(expression.contains("const fn = (() => true);"));
     }
 
     #[test]
-    fn call_tool_result_error_text_includes_text_and_structured_content() {
-        let mut result = CallToolResult::error(vec![RawContent::text("boom").no_annotation()]);
-        result.structured_content = Some(json!({"message": "bad"}));
-
-        let detail = tool_failure_text(&result);
-        assert!(detail.contains("boom"));
-        assert!(detail.contains("\"message\":\"bad\""));
+    fn browser_websocket_from_json_version_reads_ws_url() {
+        let payload = json!({
+            "Browser": "Chrome/147.0.0.0",
+            "webSocketDebuggerUrl": "ws://127.0.0.1:9222/devtools/browser/abc"
+        });
+        assert_eq!(
+            browser_websocket_from_json_version_payload(&payload).expect("ws url should parse"),
+            "ws://127.0.0.1:9222/devtools/browser/abc"
+        );
     }
 
     #[test]
-    fn value_to_object_rejects_non_objects() {
-        let err = value_to_object(json!(["bad"]), "take_snapshot")
-            .expect_err("non-object args should fail");
-        assert!(err.to_string().contains("must be a JSON object"));
+    fn browser_websocket_from_json_version_rejects_missing_url() {
+        let payload = json!({ "Browser": "Chrome/147.0.0.0" });
+        let err = browser_websocket_from_json_version_payload(&payload)
+            .expect_err("missing websocket url should fail");
+        assert!(err.to_string().contains("webSocketDebuggerUrl"));
     }
 
     #[test]
-    fn evaluate_script_parser_rejects_non_json_text() {
-        let err = parse_evaluate_script_json("Script ran on page and returned:\nnot json")
-            .expect_err("raw non-json text should fail");
-        assert!(err.to_string().contains("fenced ```json block"));
+    fn parse_devtools_active_port_returns_browser_websocket() {
+        let parsed = parse_devtools_active_port("9222\n/devtools/browser/from-active-port\n", 9222);
+        assert_eq!(
+            parsed.as_deref(),
+            Some("ws://127.0.0.1:9222/devtools/browser/from-active-port")
+        );
     }
 
     #[test]
-    fn resource_text_content_is_extracted() {
-        let content = RawContent::embedded_text("memory://note", "hello").no_annotation();
-        assert_eq!(content_text(&content), Some("hello".to_owned()));
-    }
-
-    #[test]
-    fn rmcp_object_helper_stays_compatible_with_empty_object_calls() {
-        let args = rmcp::model::object(json!({}));
-        assert!(args.is_empty());
+    fn parse_devtools_active_port_rejects_mismatched_port_or_path() {
+        assert!(parse_devtools_active_port("9333\n/devtools/browser/x\n", 9222).is_none());
+        assert!(parse_devtools_active_port("9222\n/devtools/page/x\n", 9222).is_none());
     }
 }
