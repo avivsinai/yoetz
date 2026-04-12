@@ -53,3 +53,6 @@ debug = true
 
 [profile.dev.package."*"]
 opt-level = 3
+
+[patch.crates-io]
+headless_chrome = { path = "vendor/headless_chrome" }
