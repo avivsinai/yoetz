@@ -27,8 +27,8 @@
 //!   with a small compatibility surface for the recipe layer.
 //! - [`chatgpt`] — seven-step ChatGPT Pro recipe: navigate → snapshot → upload
 //!   → snapshot → type → click → wait → evaluate.
-//! - [`claude`] — claude.ai recipe (follows after chatgpt is verified).
-//! - [`gemini`] — gemini.google.com recipe (follows after chatgpt is verified).
+//! - `claude` — claude.ai recipe (follows after chatgpt is verified).
+//! - `gemini` — gemini.google.com recipe (follows after chatgpt is verified).
 
 pub mod client;
 
