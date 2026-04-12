@@ -175,10 +175,10 @@ For web-only models like ChatGPT Pro that lack API access. Connects to your runn
 ### Prerequisites
 
 ```bash
-# Preferred browser transport:
+# Optional fallback browser transports:
 npm install -g dev-browser
 
-# Legacy fallback transport:
+# Secondary fallback transport:
 npm install -g agent-browser
 ```
 
@@ -186,7 +186,7 @@ npm install -g agent-browser
 
 yoetz connects to your already logged-in Chrome session via auto-connect (CDP). No cookie extraction or separate browser needed.
 
-**Transport priority:** `dev-browser` > `agent-browser` > manual browser upload/paste.
+**Transport priority:** `chrome-devtools-mcp` > `dev-browser` > `agent-browser` > manual browser upload.
 
 **Connection priority:** explicit `--cdp` > auto-connect > cookie state > profile fallback.
 
@@ -219,7 +219,7 @@ yoetz browser attach
 Chrome 146 introduced a security dialog for external CDP connections. Yoetz is extension-free by design, so the only way to get "approve once, then run silently" behavior is to keep the daemon/CDP session alive and avoid tearing it down between invocations.
 
 Current policy:
-- Prefer live attach over cookie sync: `dev-browser` first, `agent-browser` second.
+- Prefer live attach over cookie sync: `chrome-devtools-mcp` first, `dev-browser` second, `agent-browser` third.
 - Trust an existing live-attach daemon by default; yoetz does not silently recycle it during normal attach/check/recipe flows.
 - If recovery is actually needed, use `yoetz browser reset` explicitly.
 
@@ -321,10 +321,10 @@ This keeps the default path aligned with the same browser transport users alread
 ### How it works
 
 The browser module connects to your running Chrome via CDP (Chrome DevTools Protocol):
-- **dev-browser** (primary): Playwright-based transport that attaches to your logged-in Chrome session
-- **agent-browser** (fallback): legacy transport with cookie/profile fallback support
-- **chrome-devtools-mcp** (fallback 2, stub): Google's official CDP MCP server, not yet integrated
-- **Cookie sync** (legacy fallback): extracts cookies from Chrome's encrypted store, injects into agent-browser only after live attach paths are exhausted
+- **chrome-devtools-mcp** (primary): built into yoetz, backed by `headless_chrome`, attaches directly to your logged-in Chrome session
+- **dev-browser** (fallback): Playwright-based transport for the same live-attach flow
+- **agent-browser** (fallback 2): browser automation fallback with cookie/profile fallback support
+- **Cookie sync** (final fallback): extracts cookies from Chrome's encrypted store, injects into agent-browser only after live attach paths are exhausted
 - Extension-free by design: no browser extension is required or desired
 - Daemon model: one persistent connection per session, reused across invocations until you explicitly run `yoetz browser reset`
 

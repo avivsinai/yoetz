@@ -19,6 +19,7 @@ use std::time::Duration;
 
 mod browser;
 mod budget;
+mod chrome_devtools_mcp;
 mod commands;
 mod dev_browser;
 mod fuzzy;
@@ -757,7 +758,7 @@ async fn main() -> Result<()> {
         Commands::Session(args) => handle_session(&ctx, args, format),
         Commands::Models(args) => commands::models::handle_models(&ctx, args, format).await,
         Commands::Pricing(args) => commands::pricing::handle_pricing(&ctx, args, format).await,
-        Commands::Browser(args) => handle_browser(&ctx, args, format),
+        Commands::Browser(args) => handle_browser(&ctx, args, format).await,
         Commands::Council(args) => commands::council::handle_council(&ctx, args, format).await,
         Commands::Apply(args) => commands::apply::handle_apply(args),
         Commands::Review(args) => commands::review::handle_review(&ctx, args, format).await,
@@ -926,6 +927,17 @@ fn recipe_should_stop_live_transport_fallback(err: &anyhow::Error) -> bool {
     browser::is_chrome_approval_wait_error(err)
 }
 
+fn explicit_cdp_attach_failure(err: anyhow::Error) -> anyhow::Error {
+    if browser::is_chrome_approval_wait_error(&err) {
+        anyhow!(
+            "Chrome may be showing an \"Allow remote debugging?\" dialog. \
+             Click Allow, then retry."
+        )
+    } else {
+        err.context("explicit --cdp failed; not falling back")
+    }
+}
+
 fn default_daemon_recovery_error(original: Option<&anyhow::Error>) -> Option<anyhow::Error> {
     let suffix = original
         .map(|err| format!("\n\nOriginal error: {err}"))
@@ -941,10 +953,81 @@ fn default_daemon_recovery_error(original: Option<&anyhow::Error>) -> Option<any
     }
 }
 
-fn run_recipe_via_chrome_devtools_mcp() -> Result<()> {
-    Err(anyhow!(
-        "chrome-devtools-mcp transport not yet supported; install chrome-devtools-mcp and file an issue if you want it implemented"
-    ))
+async fn run_recipe_via_chrome_devtools_mcp(
+    recipe_args: &BrowserRecipeArgs,
+    recipe_vars: &BTreeMap<String, String>,
+    cdp_endpoint: Option<&str>,
+    format: OutputFormat,
+    is_chatgpt: bool,
+) -> Result<()> {
+    if !is_chatgpt {
+        return Err(anyhow!(
+            "chrome-devtools-mcp transport currently supports only the built-in `chatgpt` recipe; \
+             claude and gemini ports will land after the chatgpt path is verified end-to-end"
+        ));
+    }
+    if recipe_args.profile.is_some() {
+        return Err(anyhow!(
+            "chrome-devtools-mcp transport does not support `--profile`; \
+             use `--cdp` to target a specific Chrome instance or omit both for default auto-connect"
+        ));
+    }
+    if recipe_vars
+        .get("paste")
+        .is_some_and(|value| value == "true")
+    {
+        return Err(anyhow!(
+            "chrome-devtools-mcp transport does not support paste mode; file attachment upload is required"
+        ));
+    }
+    if recipe_args.bundle.is_none() {
+        return Err(anyhow!(
+            "chrome-devtools-mcp transport requires `--bundle`; it does not support inline paste mode"
+        ));
+    }
+
+    // Use the existing dev-browser poll settings resolver so the response
+    // timeout env/recipe-var knobs stay symmetric with the dev-browser path.
+    let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
+
+    let ctx = chrome_devtools_mcp::DevtoolsMcpRecipeContext {
+        cdp_endpoint: cdp_endpoint.map(str::to_owned),
+        bundle_path: recipe_args.bundle.clone(),
+        bundle_text: None,
+        model: recipe_vars.get("model").cloned().unwrap_or_default(),
+        prompt: recipe_vars
+            .get("prompt")
+            .cloned()
+            .unwrap_or_else(|| "Review the attached file and provide your analysis.".to_string()),
+        response_timeout_ms: poll_settings.timeout_ms,
+        show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
+    };
+
+    let response = chrome_devtools_mcp::chatgpt::run(&ctx).await?;
+
+    match format {
+        OutputFormat::Json => {
+            let payload = json!({
+                "status": "ok",
+                "backend": "chrome-devtools-mcp",
+                "response": response,
+            });
+            write_json(&payload)?;
+        }
+        OutputFormat::Jsonl => {
+            let payload = json!({
+                "type": "recipe_complete",
+                "backend": "chrome-devtools-mcp",
+                "response": response,
+            });
+            write_jsonl("browser.recipe", &payload)?;
+        }
+        OutputFormat::Text | OutputFormat::Markdown => {
+            println!("{response}");
+        }
+    }
+
+    Ok(())
 }
 
 fn run_recipe_via_dev_browser(
@@ -1135,7 +1218,7 @@ fn run_recipe_via_agent_browser(
     }
 }
 
-fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> Result<()> {
+async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> Result<()> {
     match args.command {
         BrowserCommand::Exec(exec) => {
             // dev-browser exec: if args look like a script (single arg with
@@ -1181,15 +1264,7 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                             }
                         };
                     }
-                    Err(e) => {
-                        if browser::is_chrome_approval_wait_error(&e) {
-                            eprintln!(
-                                "hint: Chrome may be showing an \"Allow remote debugging?\" dialog. \
-                                 Click Allow, then retry."
-                            );
-                        }
-                        eprintln!("CDP attach to {cdp_url} failed, falling back to cookie sync.");
-                    }
+                    Err(e) => return Err(explicit_cdp_attach_failure(e)),
                 }
             }
 
@@ -1264,6 +1339,22 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
         BrowserCommand::Check(check_args) => {
             let dev_browser_cdp =
                 browser::resolve_cdp_endpoint(check_args.cdp.as_deref(), &ctx.config);
+            if let Some(ref cdp_url) = check_args.cdp {
+                browser::try_cdp_attach(cdp_url, "https://chatgpt.com/")
+                    .map_err(explicit_cdp_attach_failure)?;
+                let payload = json!({
+                    "status": "ok",
+                    "method": format!("cdp: {cdp_url}"),
+                });
+                return match format {
+                    OutputFormat::Json => write_json(&payload),
+                    OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
+                    OutputFormat::Text | OutputFormat::Markdown => {
+                        println!("Browser authenticated via cdp: {cdp_url}");
+                        Ok(())
+                    }
+                };
+            }
 
             // Try dev-browser first for auth verification whenever we are
             // targeting a live Chrome instance. `--profile` still routes to the
@@ -1440,7 +1531,14 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                         cdp_endpoint.as_deref(),
                     ),
                     browser::RecipeTransport::ChromeDevtoolsMcp => {
-                        run_recipe_via_chrome_devtools_mcp()
+                        run_recipe_via_chrome_devtools_mcp(
+                            &recipe_args,
+                            &recipe_vars,
+                            cdp_endpoint.as_deref(),
+                            format,
+                            is_chatgpt,
+                        )
+                        .await
                     }
                     browser::RecipeTransport::Manual => Err(anyhow!("{}", manual_fallback)),
                 };
@@ -1493,14 +1591,10 @@ fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputFormat) -> 
                             }
                         };
                     }
-                    Err(e) => {
-                        if attach_args.cdp.is_some() && browser::is_chrome_approval_wait_error(&e) {
-                            return Err(anyhow!(
-                                "Chrome may be showing an \"Allow remote debugging?\" dialog. \
-                                 Click Allow, then retry."
-                            ));
-                        }
+                    Err(e) if attach_args.cdp.is_some() => {
+                        return Err(explicit_cdp_attach_failure(e));
                     }
+                    Err(_) => {}
                 }
             }
 
@@ -2038,6 +2132,25 @@ mod tests {
     }
 
     #[test]
+    fn explicit_cdp_attach_failure_rewrites_approval_waits() {
+        let err = anyhow!(
+            "live browser attach timed out (30s). Chrome may be showing an \"Allow remote debugging?\" dialog — please click Allow in Chrome, then retry."
+        );
+        let rewritten = explicit_cdp_attach_failure(err);
+        assert!(rewritten.to_string().contains("Allow remote debugging"));
+        assert!(!rewritten.to_string().contains("not falling back"));
+    }
+
+    #[test]
+    fn explicit_cdp_attach_failure_preserves_non_approval_context() {
+        let err = anyhow!("browserType.connectOverCDP: failed to list pages");
+        let rewritten = explicit_cdp_attach_failure(err);
+        let msg = format!("{rewritten:#}");
+        assert!(msg.contains("explicit --cdp failed; not falling back"));
+        assert!(msg.contains("failed to list pages"));
+    }
+
+    #[test]
     fn recipe_has_remaining_manual_fallback_detects_manual_transport() {
         let transports = vec![
             browser::RecipeTransport::DevBrowser,
@@ -2059,11 +2172,105 @@ mod tests {
         );
     }
 
-    #[test]
-    fn run_recipe_via_chrome_devtools_mcp_reports_not_supported() {
-        let err = run_recipe_via_chrome_devtools_mcp().unwrap_err();
-        assert!(err.to_string().contains("not yet supported"));
-        assert!(err.to_string().contains("chrome-devtools-mcp"));
+    #[tokio::test]
+    async fn run_recipe_via_chrome_devtools_mcp_rejects_non_chatgpt_recipes() {
+        // Until the claude/gemini ports land, non-chatgpt recipes through the
+        // chrome-devtools-mcp transport surface a clear guidance error rather
+        // than silently trying to drive the wrong DOM.
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/claude.yaml"),
+            bundle: None,
+            profile: None,
+            cdp: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::new();
+        let err = run_recipe_via_chrome_devtools_mcp(
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ false,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("chrome-devtools-mcp"));
+        assert!(msg.contains("chatgpt"));
+    }
+
+    #[tokio::test]
+    async fn run_recipe_via_chrome_devtools_mcp_rejects_profile_flag() {
+        // --profile is a managed-profile concept from agent-browser; the MCP
+        // transport attaches to a running Chrome via --cdp or auto-discovery
+        // only. Surface that clearly instead of silently ignoring the flag.
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: None,
+            profile: Some(PathBuf::from("/tmp/ignored")),
+            cdp: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::new();
+        let err = run_recipe_via_chrome_devtools_mcp(
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ true,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("--profile"));
+        assert!(err.to_string().contains("--cdp"));
+    }
+
+    #[tokio::test]
+    async fn run_recipe_via_chrome_devtools_mcp_rejects_paste_mode() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::from([("paste".to_string(), "true".to_string())]);
+        let err = run_recipe_via_chrome_devtools_mcp(
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("paste mode"));
+        assert!(msg.contains("file attachment"));
+    }
+
+    #[tokio::test]
+    async fn run_recipe_via_chrome_devtools_mcp_requires_bundle() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: None,
+            profile: None,
+            cdp: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::new();
+        let err = run_recipe_via_chrome_devtools_mcp(
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--bundle"));
+        assert!(msg.contains("paste mode"));
     }
 
     #[test]
