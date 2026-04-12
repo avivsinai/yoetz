@@ -6,8 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
-
-## [0.2.49] - 2026-04-12
 ### Added
 
 - Chrome 147 live-attach via vendored `headless_chrome` — primary transport for the ChatGPT recipe that bypasses the Playwright/Puppeteer `Target.setAutoAttach` hang on Chrome 147's default-profile built-in remote debugging
