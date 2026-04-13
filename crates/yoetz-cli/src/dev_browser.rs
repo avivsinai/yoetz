@@ -20,9 +20,12 @@ use std::collections::BTreeMap;
 use std::env;
 #[cfg(test)]
 use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::OnceLock;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use yoetz_core::paths::home_dir;
@@ -35,6 +38,8 @@ static DEV_BROWSER: OnceLock<String> = OnceLock::new();
 /// Default timeout for dev-browser scripts in seconds.
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 30;
 const DEV_BROWSER_ATTACH_TO_OTHER_ENV: &str = "PW_CHROMIUM_ATTACH_TO_OTHER";
+const DEV_BROWSER_PARENT_TIMEOUT_GRACE_SECS: u64 = 20;
+const DEV_BROWSER_WAIT_POLL_MS: u64 = 100;
 
 /// Extended timeout for ChatGPT response polling (30 minutes by default).
 const CHATGPT_POLL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
@@ -321,21 +326,25 @@ fn run_script_connect_with_browser_and_endpoint(
     let resolved_endpoint = resolve_dev_browser_connect_endpoint(cdp_endpoint)?;
     let args = connect_args(timeout, browser_name, resolved_endpoint.as_deref());
 
-    let output = dev_browser_command(&bin)
+    let mut child = dev_browser_command(&bin)
         .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .and_then(|mut child| {
-            use std::io::Write;
-            if let Some(ref mut stdin) = child.stdin {
-                stdin.write_all(script.as_bytes())?;
-            }
-            drop(child.stdin.take());
-            child.wait_with_output()
-        })
         .with_context(|| format!("failed to run dev-browser (via {bin})"))?;
+    {
+        use std::io::Write;
+        if let Some(ref mut stdin) = child.stdin {
+            stdin.write_all(script.as_bytes())?;
+        }
+    }
+    drop(child.stdin.take());
+    let output = wait_with_output_timeout(
+        child,
+        Duration::from_secs(timeout.saturating_add(DEV_BROWSER_PARENT_TIMEOUT_GRACE_SECS)),
+    )
+    .with_context(|| format!("failed to run dev-browser (via {bin})"))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -359,17 +368,93 @@ fn run_script_connect_with_browser_and_endpoint(
             return Ok(recovered.to_string());
         }
 
-        let detail = if !stderr.is_empty() {
-            stderr.to_string()
-        } else if !stdout.is_empty() {
-            stdout.to_string()
-        } else {
-            format!("exit code {:?}", output.status.code())
-        };
+        let detail = format_dev_browser_output_detail(&output);
         return Err(anyhow!("dev-browser script failed: {detail}"));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn wait_with_output_timeout(mut child: Child, timeout: Duration) -> Result<Output> {
+    let stdout_reader = child.stdout.take().map(spawn_pipe_reader);
+    let stderr_reader = child.stderr.take().map(spawn_pipe_reader);
+    let deadline = Instant::now() + timeout;
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    timed_out = true;
+                    let _ = child.kill();
+                    break child
+                        .wait()
+                        .context("failed to stop timed out dev-browser child")?;
+                }
+                thread::sleep(Duration::from_millis(DEV_BROWSER_WAIT_POLL_MS));
+            }
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_pipe_reader(stdout_reader, "stdout");
+                let _ = join_pipe_reader(stderr_reader, "stderr");
+                return Err(err).context("failed while waiting for dev-browser child");
+            }
+        }
+    };
+    let stdout = join_pipe_reader(stdout_reader, "stdout")?;
+    let stderr = join_pipe_reader(stderr_reader, "stderr")?;
+    let output = Output {
+        status,
+        stdout,
+        stderr,
+    };
+
+    if timed_out {
+        let detail = format_dev_browser_output_detail(&output);
+        Err(anyhow!(
+            "dev-browser timed out after {}s while waiting for script output: {detail}",
+            timeout.as_secs()
+        ))
+    } else {
+        Ok(output)
+    }
+}
+
+fn spawn_pipe_reader<R>(mut reader: R) -> JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        Ok(buf)
+    })
+}
+
+fn join_pipe_reader(
+    reader: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    label: &str,
+) -> Result<Vec<u8>> {
+    match reader {
+        Some(reader) => reader
+            .join()
+            .map_err(|_| anyhow!("dev-browser {label} reader thread panicked"))?
+            .with_context(|| format!("failed to read dev-browser {label}")),
+        None => Ok(Vec::new()),
+    }
+}
+
+fn format_dev_browser_output_detail(output: &Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stderr.trim().is_empty() {
+        stderr.to_string()
+    } else if !stdout.trim().is_empty() {
+        stdout.to_string()
+    } else {
+        format!("exit code {:?}", output.status.code())
+    }
 }
 
 fn dev_browser_command(bin: &str) -> Command {
@@ -481,10 +566,14 @@ try {
 /// Ensure the connected Chrome session can reach an authenticated ChatGPT page.
 /// Opens a temporary page — use only when not immediately followed by a recipe.
 pub fn ensure_chatgpt_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
-    check_connection_with_endpoint(cdp_endpoint).context(
-        "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
-    )?;
+    eprintln!("info: probing Chrome reachability via dev-browser");
+    check_connection_with_endpoint(cdp_endpoint)
+        .map_err(maybe_add_dev_browser_connect_guidance)
+        .context(
+            "dev-browser cannot connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging",
+        )?;
 
+    eprintln!("info: probing ChatGPT auth state via dev-browser");
     if check_chatgpt_auth_with_endpoint(cdp_endpoint)? {
         return Ok(());
     }
