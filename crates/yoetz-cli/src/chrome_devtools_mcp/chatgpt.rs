@@ -354,22 +354,12 @@ fn format_page_probe_summary(state: &serde_json::Value) -> String {
         .and_then(serde_json::Value::as_str)
         .unwrap_or("")
         .trim();
-    let body_text = state
-        .get("bodyText")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .trim();
     let title_part = if title.is_empty() {
         "title=<empty>".to_string()
     } else {
         format!("title={title:?}")
     };
-    let body_part = if body_text.is_empty() {
-        "body=<empty>".to_string()
-    } else {
-        format!("body={body_text:?}")
-    };
-    format!("Current page: url={url}, {title_part}, {body_part}")
+    format!("Current page: url={url}, {title_part}")
 }
 
 /// Click the attach button, snapshot the mounted upload affordance, then call
@@ -933,6 +923,19 @@ mod tests {
             classify_live_chatgpt_page_issue("https://chatgpt.com/", "ChatGPT", "Send a message"),
             None
         );
+    }
+
+    #[test]
+    fn page_probe_summary_redacts_body_text() {
+        let summary = format_page_probe_summary(&serde_json::json!({
+            "url": "https://chatgpt.com/",
+            "title": "ChatGPT",
+            "bodyText": "secret review draft"
+        }));
+        assert!(summary.contains("url=https://chatgpt.com/"));
+        assert!(summary.contains("title=\"ChatGPT\""));
+        assert!(!summary.contains("secret review draft"));
+        assert!(!summary.contains("body="));
     }
 
     #[test]

@@ -344,17 +344,12 @@ pub fn discover_running_chrome_targets() -> Vec<RunningChromeTarget> {
         let modified_at = std::fs::metadata(&source_path)
             .ok()
             .and_then(|metadata| metadata.modified().ok());
-        let browser_name = fetch_browser_name(&ws_endpoint)
-            .unwrap_or_else(|| browser_name_from_source_path(&source_path));
-        let chatgpt_tab_count = fetch_chatgpt_tab_count(&ws_endpoint).unwrap_or(0);
+        let Some(target) = describe_running_chrome_target(&ws_endpoint, &source_path, modified_at)
+        else {
+            continue;
+        };
 
-        targets.push(RunningChromeTarget {
-            ws_endpoint,
-            source_path,
-            browser_name,
-            chatgpt_tab_count,
-            modified_at,
-        });
+        targets.push(target);
     }
 
     targets
@@ -474,20 +469,36 @@ fn resolve_any_devtools_active_port_ws() -> Option<String> {
     devtools_active_port_candidates()
         .into_iter()
         .find_map(|path| {
-            std::fs::read_to_string(path)
+            let contents = std::fs::read_to_string(&path).ok()?;
+            let ws_endpoint = parse_devtools_active_port(&contents, None)?;
+            let modified_at = std::fs::metadata(&path)
                 .ok()
-                .and_then(|contents| parse_devtools_active_port(&contents, None))
+                .and_then(|metadata| metadata.modified().ok());
+            describe_running_chrome_target(&ws_endpoint, &path, modified_at)
+                .map(|target| target.ws_endpoint)
         })
 }
 
-fn fetch_browser_name(ws_endpoint: &str) -> Option<String> {
-    let payload = local_http_json::<DevtoolsVersionPayload>(ws_endpoint, "/json/version")?;
-    payload.browser.map(|browser| {
-        browser
-            .split('/')
-            .next()
-            .unwrap_or(browser.as_str())
-            .to_string()
+fn describe_running_chrome_target(
+    ws_endpoint: &str,
+    source_path: &Path,
+    modified_at: Option<SystemTime>,
+) -> Option<RunningChromeTarget> {
+    let version = local_http_json::<DevtoolsVersionPayload>(ws_endpoint, "/json/version")?;
+    let browser_name = version
+        .browser
+        .as_deref()
+        .and_then(|browser| browser.split('/').next())
+        .filter(|browser| !browser.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| browser_name_from_source_path(source_path));
+    let chatgpt_tab_count = fetch_chatgpt_tab_count(ws_endpoint).unwrap_or(0);
+    Some(RunningChromeTarget {
+        ws_endpoint: ws_endpoint.to_string(),
+        source_path: source_path.to_path_buf(),
+        browser_name,
+        chatgpt_tab_count,
+        modified_at,
     })
 }
 
@@ -498,9 +509,8 @@ fn fetch_chatgpt_tab_count(ws_endpoint: &str) -> Option<usize> {
             .iter()
             .filter(|entry| entry.target_type.as_deref() == Some("page"))
             .filter(|entry| {
-                entry.url.as_deref().is_some_and(|url| {
-                    is_chatgpt_url(url) || is_chatgpt_title(entry.title.as_deref())
-                })
+                entry.url.as_deref().is_some_and(is_chatgpt_url)
+                    || (entry.url.as_deref().is_none() && is_chatgpt_title(entry.title.as_deref()))
             })
             .count(),
     )
@@ -646,7 +656,10 @@ fn is_chatgpt_url(url: &str) -> bool {
 
 fn is_chatgpt_title(title: Option<&str>) -> bool {
     title
-        .map(|value| value.to_ascii_lowercase().contains("chatgpt"))
+        .map(|value| value.trim().to_ascii_lowercase())
+        .map(|value| {
+            value == "chatgpt" || value.starts_with("chatgpt ") || value.starts_with("chatgpt -")
+        })
         .unwrap_or(false)
 }
 
@@ -943,6 +956,112 @@ fn node_contains_text(node: &serde_json::Map<String, Value>, wanted: &str) -> bo
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::{
+        fs,
+        io::{Read, Write},
+        net::TcpListener,
+        path::{Path, PathBuf},
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+        thread,
+        time::Duration,
+    };
+    use tempfile::tempdir;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set<K>(key: &'static str, value: K) -> Self
+        where
+            K: AsRef<std::ffi::OsStr>,
+        {
+            let original = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match &self.original {
+                Some(value) => unsafe { std::env::set_var(self.key, value) },
+                None => unsafe { std::env::remove_var(self.key) },
+            }
+        }
+    }
+
+    fn devtools_active_port_test_paths(home: &Path) -> (PathBuf, PathBuf) {
+        match std::env::consts::OS {
+            "macos" => (
+                home.join("Library/Application Support/Google/Chrome/DevToolsActivePort"),
+                home.join("Library/Application Support/Google/Chrome Canary/DevToolsActivePort"),
+            ),
+            "windows" => (
+                home.join("AppData/Local/Google/Chrome/User Data/DevToolsActivePort"),
+                home.join("AppData/Local/Google/Chrome SxS/User Data/DevToolsActivePort"),
+            ),
+            _ => (
+                home.join(".config/google-chrome/DevToolsActivePort"),
+                home.join(".config/chromium/DevToolsActivePort"),
+            ),
+        }
+    }
+
+    fn write_devtools_active_port(path: &Path, port: u16, suffix: &str) {
+        fs::create_dir_all(path.parent().expect("candidate must have parent")).unwrap();
+        fs::write(path, format!("{port}\n/devtools/browser/{suffix}\n")).unwrap();
+    }
+
+    fn spawn_fake_devtools_server() -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener
+            .set_nonblocking(true)
+            .expect("listener should accept nonblocking mode");
+        let port = listener.local_addr().unwrap().port();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_signal = shutdown.clone();
+        let handle = thread::spawn(move || {
+            while !shutdown_signal.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = [0_u8; 2048];
+                        let _ = stream.read(&mut request);
+                        let request = String::from_utf8_lossy(&request);
+                        let body = if request.starts_with("GET /json/version ") {
+                            r#"{"Browser":"Chrome/147.0.0.0"}"#
+                        } else if request.starts_with("GET /json/list ") {
+                            r#"[{"type":"page","url":"https://chatgpt.com/c/123","title":"ChatGPT - New chat"}]"#
+                        } else {
+                            ""
+                        };
+                        let response = if body.is_empty() {
+                            "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_string()
+                        } else {
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                                body.len(),
+                                body
+                            )
+                        };
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (port, shutdown, handle)
+    }
 
     fn snapshot_fixture() -> Snapshot {
         Snapshot {
@@ -1101,11 +1220,36 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_matchers_cover_url_and_title() {
+    fn chatgpt_matchers_cover_url_and_title_fallback() {
         assert!(is_chatgpt_url("https://chatgpt.com/c/123"));
         assert!(is_chatgpt_url("https://chat.openai.com/"));
         assert!(!is_chatgpt_url("https://example.com/"));
         assert!(is_chatgpt_title(Some("ChatGPT - New chat")));
+        assert!(is_chatgpt_title(Some("ChatGPT Workspace")));
+        assert!(!is_chatgpt_title(Some("Notes about ChatGPT pricing")));
         assert!(!is_chatgpt_title(Some("Docs")));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn discover_running_chrome_targets_skips_unhealthy_active_port_files() {
+        let home = tempdir().unwrap();
+        let (stale_path, healthy_path) = devtools_active_port_test_paths(home.path());
+        let (port, shutdown, handle) = spawn_fake_devtools_server();
+        write_devtools_active_port(&stale_path, port + 1, "stale");
+        write_devtools_active_port(&healthy_path, port, "healthy");
+
+        let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
+        let _profile = EnvVarGuard::set("USERPROFILE", home.path().as_os_str());
+
+        let targets = discover_running_chrome_targets();
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].source_path, healthy_path);
+        assert_eq!(targets[0].browser_name, "Chrome");
+        assert_eq!(targets[0].chatgpt_tab_count, 1);
     }
 }
