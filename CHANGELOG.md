@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.52] - 2026-04-13
 ### Fixed
 
 - Browser target auto-discovery now rejects unhealthy `DevToolsActivePort` endpoints, keeps env/config auto-selection best-effort, restores managed-profile fallback on live auth/challenge failures, and stops leaking page body text in ChatGPT probe errors.
@@ -15,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 
 - Release automation now re-verifies the merged release commit before tagging and publishes GitHub build provenance attestations for the shipped archives.
+
 
 ## [0.2.51] - 2026-04-13
 ### Fixed
