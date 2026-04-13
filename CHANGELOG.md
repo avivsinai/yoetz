@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.2.51] - 2026-04-13
 ### Fixed
 
 - `yoetz browser recipe --recipe chatgpt` now actually attempts the `chrome-devtools-mcp` transport instead of silently skipping it when `chrome-devtools-mcp` and `npx` are both absent from `PATH`. The availability gate was a leftover from v0.2.48 when the external binary was required for DOM snapshots; v0.2.49 removed that dependency, but the gate stayed. Each transport attempt now logs `info: attempting <name> transport` so skipped tiers are no longer invisible.
@@ -15,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Clarified
 
 - The `chrome-devtools-mcp` transport is a **direct CDP client** using vendored `headless_chrome` (`crates/yoetz-cli/src/chrome_devtools_mcp/client.rs`). It does NOT bridge to the chrome-devtools-mcp MCP server, despite the name. yoetz CLI runs as its own subprocess and cannot proxy MCP calls through a parent agent. Documentation updated in `recipes/chatgpt.yaml`.
+
 
 ## [0.2.50] - 2026-04-13
 ### Fixed
