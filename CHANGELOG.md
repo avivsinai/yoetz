@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.50] - 2026-04-13
 ### Fixed
 
 - ChatGPT recipe no longer captures the streaming preamble ("I'm reviewing the bundle now...") as the final answer. The completion heuristic now requires either a copy button on the new assistant message (strong signal) or a real-time stable-idle window of `max(90s, 3 × wait_interval_ms)` with unchanged length. Removed the first-poll false-positive from the old `prev_dom=None => true` branch.
@@ -15,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `--var thread=fresh|reuse` on `yoetz browser recipe --recipe chatgpt` (default `fresh`, byte-identical to prior behavior). `thread=reuse` keeps follow-up turns in the currently active ChatGPT conversation instead of opening a fresh tab on every call. Fail-fasts when the attached tab is not on chatgpt.com.
 - `completion_reason` (`copy_button` | `stable_idle_fallback`), `elapsed_ms`, `stable_for_ms`, and `stable_idle_threshold_ms` in the ChatGPT wait response JSON payload for observability.
+
 
 ## [0.2.49] - 2026-04-12
 ### Added
