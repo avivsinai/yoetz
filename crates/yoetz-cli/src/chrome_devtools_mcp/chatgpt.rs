@@ -72,7 +72,7 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<String> {
     }
     let client = CdpMcpClient::connect_to_running_chrome(ctx.cdp_endpoint.as_deref())
         .await
-        .context("chrome-devtools-mcp attach to running Chrome")?;
+        .map_err(cdp_attach_hint)?;
 
     // Step 1: open a fresh chatgpt.com page. Fresh page = zero conversation
     // history, no SPA reset dance needed.
@@ -197,6 +197,29 @@ async () => {
         .context("stable-idle polling for ChatGPT response")?;
 
     Ok(response_text)
+}
+
+/// Rewrite a CDP attach failure with actionable guidance.
+///
+/// Chrome 136+ ignores `--remote-debugging-port` on the default profile, so
+/// the most common failure mode is "port 9222 not listening" — which surfaces
+/// as a refused TCP connection or a non-2xx response on `/json/version`.
+/// Instead of leaking the raw reqwest error, point the user at the fix.
+fn cdp_attach_hint(err: anyhow::Error) -> anyhow::Error {
+    let raw = format!("{err:#}");
+    // Preserve approval-dialog errors verbatim so the outer fallback funnel can
+    // classify them as "stop, user needs to click Allow" rather than
+    // "transport broken, try the next one."
+    if raw.to_lowercase().contains("allow remote debugging") {
+        return err.context("chrome-devtools-mcp attach to running Chrome");
+    }
+    err.context(
+        "chrome-devtools-mcp could not reach Chrome's CDP endpoint. \
+         Chrome 136+ ignores --remote-debugging-port on the default profile — \
+         either enable chrome://inspect/#remote-debugging (Chrome 144+) and retry, \
+         or pass --cdp=ws://127.0.0.1:PORT after launching Chrome with a non-default \
+         --user-data-dir, or use Chrome for Testing",
+    )
 }
 
 /// Click the attach button, snapshot the mounted upload affordance, then call
@@ -679,4 +702,30 @@ mod tests {
         assert!(STABLE_IDLE_CONSECUTIVE_POLLS >= 2);
         assert!(!CHATGPT_URL.is_empty());
     };
+
+    #[test]
+    fn cdp_attach_hint_preserves_approval_dialog_errors() {
+        // Approval-wait errors must pass through so the outer transport funnel
+        // can classify them as "user needs to click Allow" (stop-fallback)
+        // rather than wrap them in generic Chrome-136+ guidance.
+        let err = anyhow!(
+            "live browser attach timed out (30s). Chrome may be showing an \"Allow remote debugging?\" dialog — click Allow, then retry."
+        );
+        let rewritten = cdp_attach_hint(err);
+        let msg = format!("{rewritten:#}");
+        assert!(msg.contains("Allow remote debugging"));
+        assert!(!msg.contains("chrome://inspect"));
+    }
+
+    #[test]
+    fn cdp_attach_hint_wraps_other_errors_with_actionable_guidance() {
+        let err =
+            anyhow!("requesting `http://127.0.0.1:9222/json/version` failed: connection refused");
+        let rewritten = cdp_attach_hint(err);
+        let msg = format!("{rewritten:#}");
+        assert!(msg.contains("chrome://inspect"));
+        assert!(msg.contains("Chrome 136+"));
+        // Original error chain is preserved.
+        assert!(msg.contains("connection refused"));
+    }
 }

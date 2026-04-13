@@ -1507,10 +1507,11 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             let mut transport_errors = Vec::new();
 
             for (index, transport) in transports.iter().copied().enumerate() {
-                if matches!(transport, browser::RecipeTransport::ChromeDevtoolsMcp)
-                    && !browser::is_chrome_devtools_mcp_available()
-                {
-                    continue;
+                if !matches!(transport, browser::RecipeTransport::Manual) {
+                    eprintln!(
+                        "info: attempting {} transport",
+                        recipe_transport_name(transport)
+                    );
                 }
 
                 let result = match transport {
