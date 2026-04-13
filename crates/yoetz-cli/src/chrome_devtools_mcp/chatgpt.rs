@@ -47,9 +47,11 @@ const CHATGPT_URL: &str = "https://chatgpt.com/";
 const POLL_INTERVAL_MS: u64 = 5_000;
 /// Number of consecutive polls where (messageCount, textLength) must be
 /// unchanged before we declare the response complete. At 5s intervals, 4
-/// stable polls = 20s of genuinely idle generation, which is enough to
-/// distinguish "response finished" from "brief mid-stream pause."
-const STABLE_IDLE_CONSECUTIVE_POLLS: u32 = 4;
+/// stable polls = 60s of genuinely idle generation. ChatGPT Pro can pause
+/// for tens of seconds while still thinking, so keep the quiet window long
+/// enough that we do not return the early "I'm tracing the patch..." preamble
+/// as if it were the final review.
+const STABLE_IDLE_CONSECUTIVE_POLLS: u32 = 12;
 const UPLOAD_INPUT_WAIT_MS: u64 = 5_000;
 const ATTACHMENT_VERIFY_WAIT_MS: u64 = 15_000;
 
@@ -88,25 +90,90 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<String> {
     let wait_composer_js = r##"
 async () => {
   const deadline = Date.now() + 20000;
-  while (Date.now() < deadline) {
+  const clip = (value, max = 240) =>
+    String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+  const readState = () => {
     const composer = document.querySelector("#prompt-textarea, div[contenteditable='true'][role='textbox']");
+    const url = window.location.href || "";
+    const title = document.title || "";
+    const bodyText = clip(document.body?.innerText || "");
+    const haystack = `${title} ${bodyText}`.toLowerCase();
     if (composer) {
       composer.focus();
-      return true;
+      return { status: "ready", url, title, bodyText };
     }
-    await new Promise(r => setTimeout(r, 200));
+    if (/cloudflare|checking your browser|attention required|security check|just a moment|verify you are human|cf-chl/i.test(haystack)) {
+      return { status: "challenge", url, title, bodyText };
+    }
+    if (
+      /log in|login|sign in|sign up|create account|continue with google|continue with microsoft|continue with apple/i.test(haystack) ||
+      /auth\.openai\.com|\/auth\/|\/login/.test(url.toLowerCase())
+    ) {
+      return { status: "login", url, title, bodyText };
+    }
+    return { status: "pending", url, title, bodyText };
+  };
+
+  let state = readState();
+  if (state.status !== "pending") return state;
+
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    state = readState();
+    if (state.status !== "pending") return state;
   }
-  return false;
+
+  state.status = "timeout";
+  return state;
 }
 "##;
-    let composer_ready = client
+    let composer_state = client
         .evaluate_script(wait_composer_js, vec![])
         .await
         .context("evaluate_script wait-for-composer")?;
-    if composer_ready != serde_json::Value::Bool(true) {
-        return Err(anyhow!(
-            "ChatGPT composer did not mount within 20s — page may not have loaded correctly"
-        ));
+    match composer_state
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("ready") => {}
+        Some("challenge") => {
+            return Err(anyhow!(
+                "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again. {}",
+                format_page_probe_summary(&composer_state)
+            ));
+        }
+        Some("login") => {
+            return Err(anyhow!(
+                "chatgpt login required in the attached Chrome session. Log in there and try again. {}",
+                format_page_probe_summary(&composer_state)
+            ));
+        }
+        _ => {
+            let detail = match classify_live_chatgpt_page_issue(
+                composer_state
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                composer_state
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                composer_state
+                    .get("bodyText")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            ) {
+                Some(issue) => issue.to_string(),
+                None => {
+                    "ChatGPT composer did not mount within 20s — page may not have loaded correctly"
+                        .to_string()
+                }
+            };
+            return Err(anyhow!(
+                "{detail}. {}",
+                format_page_probe_summary(&composer_state)
+            ));
+        }
     }
 
     // Step 3: upload the bundle if we have a path.
@@ -220,6 +287,89 @@ fn cdp_attach_hint(err: anyhow::Error) -> anyhow::Error {
          or pass --cdp=ws://127.0.0.1:PORT after launching Chrome with a non-default \
          --user-data-dir, or use Chrome for Testing",
     )
+}
+
+fn is_closed_cdp_transport_error(err: &anyhow::Error) -> bool {
+    let raw = format!("{err:#}").to_lowercase();
+    raw.contains("underlying connection is closed")
+        || raw.contains("connectionclosed")
+        || raw.contains("received shutdown message")
+}
+
+fn classify_live_chatgpt_page_issue(
+    url: &str,
+    title: &str,
+    body_text: &str,
+) -> Option<&'static str> {
+    let haystack = format!("{title} {body_text}").to_lowercase();
+    let url = url.to_lowercase();
+    if [
+        "cloudflare",
+        "checking your browser",
+        "attention required",
+        "security check",
+        "just a moment",
+        "verify you are human",
+        "cf-chl",
+    ]
+    .iter()
+    .any(|marker| haystack.contains(marker))
+    {
+        return Some(
+            "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again",
+        );
+    }
+
+    if [
+        "log in",
+        "login",
+        "sign in",
+        "sign up",
+        "create account",
+        "continue with google",
+        "continue with microsoft",
+        "continue with apple",
+    ]
+    .iter()
+    .any(|marker| haystack.contains(marker))
+        || url.contains("auth.openai.com")
+        || url.contains("/auth/")
+        || url.contains("/login")
+    {
+        return Some(
+            "chatgpt login required in the attached Chrome session. Log in there and try again",
+        );
+    }
+
+    None
+}
+
+fn format_page_probe_summary(state: &serde_json::Value) -> String {
+    let url = state
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let title = state
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let body_text = state
+        .get("bodyText")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let title_part = if title.is_empty() {
+        "title=<empty>".to_string()
+    } else {
+        format!("title={title:?}")
+    };
+    let body_part = if body_text.is_empty() {
+        "body=<empty>".to_string()
+    } else {
+        format!("body={body_text:?}")
+    };
+    format!("Current page: url={url}, {title_part}, {body_part}")
 }
 
 /// Click the attach button, snapshot the mounted upload affordance, then call
@@ -589,11 +739,33 @@ async fn poll_for_stable_response(
     let read_state_js = r##"
 () => {
   const nodes = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
+  const stopSelectors = [
+    "[data-testid='stop-button']",
+    "[data-testid='fruitjuice-stop-button']",
+    "button[aria-label*='Stop']",
+    "button[aria-label*='stop']",
+  ];
+  const stopGenerating = stopSelectors.some((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    return style.display !== "none" && style.visibility !== "hidden" && !el.disabled;
+  });
   if (nodes.length === 0) {
-    return { ready: false, count: 0, length: 0, text: null, streaming: false };
+    return {
+      ready: false,
+      count: 0,
+      length: 0,
+      text: null,
+      streaming: stopGenerating,
+      stopGenerating,
+    };
   }
   const last = nodes[nodes.length - 1];
-  const streaming = !!last.querySelector(".result-streaming") || last.classList.contains("result-streaming");
+  const streaming =
+    stopGenerating ||
+    !!last.querySelector(".result-streaming") ||
+    last.classList.contains("result-streaming");
   const text = last.innerText || "";
   return {
     ready: !streaming && text.length > 0,
@@ -601,6 +773,7 @@ async fn poll_for_stable_response(
     length: text.length,
     text,
     streaming,
+    stopGenerating,
   };
 }
 "##;
@@ -623,6 +796,11 @@ async fn poll_for_stable_response(
         let state = match client.evaluate_script(read_state_js, vec![]).await {
             Ok(state) => state,
             Err(err) => {
+                if is_closed_cdp_transport_error(&err) {
+                    return Err(err.context(
+                        "chrome-devtools-mcp lost the Chrome websocket while waiting for the ChatGPT response",
+                    ));
+                }
                 // Treat transient eval errors as non-fatal; keep polling.
                 eprintln!("warn: stable-idle poll eval failed ({err:#}), retrying");
                 continue;
@@ -727,5 +905,41 @@ mod tests {
         assert!(msg.contains("Chrome 136+"));
         // Original error chain is preserved.
         assert!(msg.contains("connection refused"));
+    }
+
+    #[test]
+    fn classify_live_chatgpt_page_issue_detects_login_and_challenge() {
+        assert_eq!(
+            classify_live_chatgpt_page_issue(
+                "https://chatgpt.com/auth/login",
+                "Log in - OpenAI",
+                "Continue with Google"
+            ),
+            Some(
+                "chatgpt login required in the attached Chrome session. Log in there and try again"
+            )
+        );
+        assert_eq!(
+            classify_live_chatgpt_page_issue(
+                "https://chatgpt.com/",
+                "Just a moment...",
+                "Verify you are human"
+            ),
+            Some(
+                "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again"
+            )
+        );
+        assert_eq!(
+            classify_live_chatgpt_page_issue("https://chatgpt.com/", "ChatGPT", "Send a message"),
+            None
+        );
+    }
+
+    #[test]
+    fn closed_cdp_transport_errors_are_classified() {
+        let err = anyhow!("Unable to make method calls because underlying connection is closed");
+        assert!(is_closed_cdp_transport_error(&err));
+        let other = anyhow!("timed out waiting for ChatGPT response");
+        assert!(!is_closed_cdp_transport_error(&other));
     }
 }

@@ -269,16 +269,47 @@ impl Browser {
 
         util::Wait::with_timeout(Duration::from_secs(20))
             .until(|| {
-                let tabs = self.inner.tabs.lock().unwrap();
-                tabs.iter().find_map(|tab| {
-                    if *tab.get_target_id() == target_id {
-                        Some(tab.clone())
-                    } else {
-                        None
-                    }
-                })
+                self.find_existing_tab(&target_id)
+                    .or_else(|| self.attach_tab_from_target_list(&target_id).ok().flatten())
             })
             .map_err(Into::into)
+    }
+
+    fn find_existing_tab(&self, target_id: &str) -> Option<Arc<Tab>> {
+        let tabs = self.inner.tabs.lock().unwrap();
+        tabs.iter()
+            .find(|tab| tab.get_target_id().as_str() == target_id)
+            .cloned()
+    }
+
+    fn attach_tab_from_target_list(&self, target_id: &str) -> Result<Option<Arc<Tab>>> {
+        let target = self
+            .call_method(GetTargets { filter: None })?
+            .target_infos
+            .into_iter()
+            .find(|target| {
+                target.Type == "page" && target.target_id.as_str() == target_id
+            });
+
+        let Some(target) = target else {
+            return Ok(None);
+        };
+
+        if let Some(existing) = self.find_existing_tab(target_id) {
+            return Ok(Some(existing));
+        }
+
+        let tab = Arc::new(Tab::new(target, self.inner.transport.clone())?);
+        let mut tabs = self.inner.tabs.lock().unwrap();
+        if let Some(existing) = tabs
+            .iter()
+            .find(|existing| existing.get_target_id() == tab.get_target_id())
+            .cloned()
+        {
+            return Ok(Some(existing));
+        }
+        tabs.push(tab.clone());
+        Ok(Some(tab))
     }
 
     /// Creates the equivalent of a new incognito window, AKA a browser context
@@ -393,9 +424,24 @@ impl Browser {
                                 // meaning the devtools has ben opened automatically..
                                 // for now ignoring devtools tabs to be in tabs..
                                 if target_info.Type == "page" {
+                                    if tabs
+                                        .lock()
+                                        .unwrap()
+                                        .iter()
+                                        .any(|tab| tab.get_target_id() == &target_info.target_id)
+                                    {
+                                        continue;
+                                    }
                                     match Tab::new(target_info, Arc::clone(&transport)) {
                                         Ok(new_tab) => {
-                                            tabs.lock().unwrap().push(Arc::new(new_tab));
+                                            let new_tab = Arc::new(new_tab);
+                                            let mut locked_tabs = tabs.lock().unwrap();
+                                            if locked_tabs.iter().any(|existing| {
+                                                existing.get_target_id() == new_tab.get_target_id()
+                                            }) {
+                                                continue;
+                                            }
+                                            locked_tabs.push(new_tab);
                                         }
                                         Err(_tab_creation_err) => {
                                             info!("Failed to create a handle to new tab");

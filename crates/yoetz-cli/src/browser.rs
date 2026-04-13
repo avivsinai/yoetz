@@ -1,17 +1,18 @@
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, IsTerminal, Read as _};
+use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::chrome_devtools_mcp::client::{discover_running_chrome_targets, RunningChromeTarget};
 use yoetz_core::config::Config;
 use yoetz_core::output::{write_json, write_jsonl_event, OutputFormat};
 use yoetz_core::paths::home_dir;
@@ -46,6 +47,7 @@ const LIVE_ATTACH_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const CDP_SESSION_NAME: &str = "yoetz-cdp";
 const CHROME_APPROVAL_LOCK_FILENAME: &str = "chrome-approval.lock";
 const CHATGPT_RECIPE_LOCK_FILENAME: &str = "chatgpt-recipe.lock";
+const BROWSER_TARGET_STATE_FILENAME: &str = "browser-target.json";
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
     major: 24,
@@ -131,8 +133,40 @@ impl BrowserConnection {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ResolvedCdpTargetSource {
+    Flag,
+    Env,
+    Config,
+    Auto,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedCdpTarget {
+    pub endpoint: String,
+    pub source: ResolvedCdpTargetSource,
+    pub description: String,
+    source_path: Option<PathBuf>,
+}
+
+impl ResolvedCdpTarget {
+    pub fn is_auto_discovered(&self) -> bool {
+        matches!(self.source, ResolvedCdpTargetSource::Auto)
+    }
+
+    pub fn is_authoritative(&self) -> bool {
+        !self.is_auto_discovered()
+    }
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct BrowserTargetState {
+    last_source_path: Option<PathBuf>,
+}
+
 /// Cached agent-browser resolution. Probed once per process, reused for all calls.
 static AGENT_BROWSER: OnceLock<Result<(String, Vec<String>), String>> = OnceLock::new();
+static BROWSER_TARGET_STATE_WARNING_EMITTED: OnceLock<()> = OnceLock::new();
 
 /// Returns true if dev-browser is the active browser backend.
 /// When dev-browser is available (installed or auto-installed), it is the
@@ -1322,9 +1356,24 @@ pub fn is_chrome_approval_wait_error(err: &anyhow::Error) -> bool {
 /// Stopping at tier 1 and jumping to manual gives the user an immediate,
 /// actionable error instead of a long wait.
 pub fn is_chrome_cdp_unreachable_error(err: &anyhow::Error) -> bool {
-    format!("{err:#}")
-        .to_lowercase()
-        .contains("chrome://inspect")
+    let message = format!("{err:#}").to_lowercase();
+    message.contains("chrome://inspect")
+        && (message.contains("could not reach chrome's cdp endpoint")
+            || message.contains("ignores --remote-debugging-port")
+            || (message.contains("requesting `http")
+                && message.contains("/json/version")
+                && (message.contains("failed") || message.contains("connection refused")))
+            || (message.contains("connectovercdp")
+                && (message.contains("econnrefused")
+                    || message.contains("connection refused")
+                    || message.contains("browser.getversion"))))
+}
+
+pub fn is_chatgpt_auth_issue_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_lowercase();
+    message.contains("chatgpt login required")
+        || message.contains("cloudflare challenge detected")
+        || message.contains("captcha detected")
 }
 
 fn close_browser_daemon() -> Result<()> {
@@ -1795,6 +1844,207 @@ pub fn resolve_cdp_endpoint(cdp_override: Option<&str>, config: &Config) -> Opti
         .filter(|value| !value.is_empty())
 }
 
+pub fn resolve_cdp_target(
+    cdp_override: Option<&str>,
+    config: &Config,
+) -> Result<Option<ResolvedCdpTarget>> {
+    resolve_cdp_target_with_implicit(cdp_override, config, true)
+}
+
+pub fn resolve_cdp_target_with_implicit(
+    cdp_override: Option<&str>,
+    config: &Config,
+    allow_implicit: bool,
+) -> Result<Option<ResolvedCdpTarget>> {
+    if let Some(endpoint) = cdp_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+    {
+        return Ok(Some(ResolvedCdpTarget {
+            description: format!("using explicit --cdp target `{endpoint}`"),
+            endpoint,
+            source: ResolvedCdpTargetSource::Flag,
+            source_path: None,
+        }));
+    }
+
+    if !allow_implicit {
+        return Ok(None);
+    }
+
+    if let Some(endpoint) = env::var("YOETZ_BROWSER_CDP")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(ResolvedCdpTarget {
+            description: format!("using YOETZ_BROWSER_CDP target `{endpoint}`"),
+            endpoint,
+            source: ResolvedCdpTargetSource::Env,
+            source_path: None,
+        }));
+    }
+
+    if let Some(endpoint) = config
+        .defaults
+        .browser_cdp
+        .clone()
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(Some(ResolvedCdpTarget {
+            description: format!("using defaults.browser_cdp target `{endpoint}`"),
+            endpoint,
+            source: ResolvedCdpTargetSource::Config,
+            source_path: None,
+        }));
+    }
+
+    let mut targets = discover_running_chrome_targets();
+    let mut sticky_source = match load_browser_target_state() {
+        Ok(state) => state.last_source_path,
+        Err(err) => {
+            warn_invalid_browser_target_state(&err);
+            let _ = clear_browser_target_state();
+            None
+        }
+    };
+    if sticky_source
+        .as_ref()
+        .is_some_and(|path| !targets.iter().any(|target| target.source_path == *path))
+    {
+        let _ = clear_browser_target_state();
+        sticky_source = None;
+    }
+    let Some(target) =
+        select_preferred_running_chrome_target(&mut targets, sticky_source.as_deref())
+    else {
+        return Ok(None);
+    };
+    let description = if sticky_source
+        .as_deref()
+        .is_some_and(|sticky| sticky == target.source_path.as_path())
+    {
+        format!(
+            "reusing last successful Chrome target: {}",
+            target.summary()
+        )
+    } else {
+        format!("auto-selected running Chrome target: {}", target.summary())
+    };
+    Ok(Some(ResolvedCdpTarget {
+        endpoint: target.ws_endpoint.clone(),
+        source: ResolvedCdpTargetSource::Auto,
+        description,
+        source_path: Some(target.source_path.clone()),
+    }))
+}
+
+pub fn remember_cdp_target(target: &ResolvedCdpTarget) -> Result<()> {
+    let Some(source_path) = target.source_path.clone() else {
+        return Ok(());
+    };
+    save_browser_target_state(&BrowserTargetState {
+        last_source_path: Some(source_path),
+    })
+}
+
+pub fn forget_cdp_target(target: &ResolvedCdpTarget) -> Result<()> {
+    if target.source_path.is_none() {
+        return Ok(());
+    }
+    clear_browser_target_state()
+}
+
+fn browser_target_state_path() -> PathBuf {
+    if let Some(path) = env::var("YOETZ_BROWSER_TARGET_PATH")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return PathBuf::from(path);
+    }
+    if let Some(home) = home_dir() {
+        return home.join(".yoetz").join(BROWSER_TARGET_STATE_FILENAME);
+    }
+    PathBuf::from(".yoetz").join(BROWSER_TARGET_STATE_FILENAME)
+}
+
+fn load_browser_target_state() -> Result<BrowserTargetState> {
+    let path = browser_target_state_path();
+    if !path.exists() {
+        return Ok(BrowserTargetState::default());
+    }
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("read browser target {}", path.display()))?;
+    serde_json::from_str(&content)
+        .with_context(|| format!("parse browser target {}", path.display()))
+}
+
+fn save_browser_target_state(state: &BrowserTargetState) -> Result<()> {
+    let path = browser_target_state_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    let data = serde_json::to_string_pretty(state)?;
+    let tmp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    fs::write(&tmp_path, data).with_context(|| format!("write {}", tmp_path.display()))?;
+    fs::rename(&tmp_path, &path)
+        .with_context(|| format!("rename {} -> {}", tmp_path.display(), path.display()))
+}
+
+fn select_preferred_running_chrome_target(
+    targets: &mut [RunningChromeTarget],
+    sticky_source: Option<&Path>,
+) -> Option<RunningChromeTarget> {
+    targets.sort_by(|left, right| compare_running_chrome_targets(left, right, sticky_source));
+    targets.first().cloned()
+}
+
+fn compare_running_chrome_targets(
+    left: &RunningChromeTarget,
+    right: &RunningChromeTarget,
+    sticky_source: Option<&Path>,
+) -> std::cmp::Ordering {
+    let sticky_left = sticky_source.is_some_and(|path| path == left.source_path.as_path());
+    let sticky_right = sticky_source.is_some_and(|path| path == right.source_path.as_path());
+    right
+        .has_chatgpt_tab()
+        .cmp(&left.has_chatgpt_tab())
+        .then_with(|| right.chatgpt_tab_count.cmp(&left.chatgpt_tab_count))
+        .then_with(|| {
+            browser_family_priority(&right.browser_name)
+                .cmp(&browser_family_priority(&left.browser_name))
+        })
+        .then_with(|| {
+            modified_sort_key(right.modified_at).cmp(&modified_sort_key(left.modified_at))
+        })
+        .then_with(|| sticky_right.cmp(&sticky_left))
+        .then_with(|| left.source_path.cmp(&right.source_path))
+}
+
+fn browser_family_priority(browser_name: &str) -> u8 {
+    let name = browser_name.to_ascii_lowercase();
+    if name.contains("chrome beta") {
+        3
+    } else if name.contains("chrome canary") {
+        2
+    } else if name.contains("chrome") {
+        4
+    } else if name.contains("chromium") {
+        1
+    } else {
+        0
+    }
+}
+
+fn modified_sort_key(modified_at: Option<SystemTime>) -> u128 {
+    modified_at
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
 fn resolve_browser_connection_fallback(
     profile_dir: &Path,
     headed: bool,
@@ -1832,13 +2082,23 @@ pub fn resolve_browser_connection(
     target_url: &str,
 ) -> Result<BrowserConnection> {
     if let Some(endpoint) = resolve_cdp_endpoint(cdp_override, config) {
-        if try_cdp_attach(&endpoint, target_url).is_ok() {
-            return Ok(BrowserConnection::Cdp { endpoint });
+        match try_cdp_attach(&endpoint, target_url) {
+            Ok(()) => return Ok(BrowserConnection::Cdp { endpoint }),
+            Err(err)
+                if is_chrome_approval_wait_error(&err) || is_chatgpt_auth_issue_error(&err) =>
+            {
+                return Err(err);
+            }
+            Err(_) => {}
         }
     }
 
-    if try_auto_connect(target_url).is_ok() {
-        return Ok(BrowserConnection::AutoConnect);
+    match try_auto_connect(target_url) {
+        Ok(()) => return Ok(BrowserConnection::AutoConnect),
+        Err(err) if is_chrome_approval_wait_error(&err) || is_chatgpt_auth_issue_error(&err) => {
+            return Err(err);
+        }
+        Err(_) => {}
     }
 
     resolve_browser_connection_fallback(profile_dir, /* headed */ false, target_url)
@@ -1917,23 +2177,47 @@ pub fn try_auto_connect(target_url: &str) -> Result<()> {
     verify_auth_cdp(target_url, &connection)
 }
 
+pub fn try_cdp_attach_lite(endpoint: &str) -> Result<()> {
+    let connection = BrowserConnection::Cdp {
+        endpoint: endpoint.to_string(),
+    };
+    probe_live_attach_connection(&connection).map_err(|e| {
+        if allow_dialog_error(&e) {
+            e
+        } else if is_localhost_endpoint(endpoint) {
+            e.context(chrome136_cdp_warning(endpoint))
+        } else {
+            e
+        }
+    })
+}
+
 /// Lightweight auto-connect check: verifies Chrome is reachable via
 /// auto-connect without opening new tabs. Used by the recipe path where
 /// the recipe itself handles navigation and auth detection.
 ///
 /// Returns immediately if an existing daemon is healthy. Otherwise spawns
-/// a bounded probe (15s timeout) so the CLI doesn't hang if Chrome shows
-/// a "Allow remote debugging?" dialog (Chrome 146+).
+/// a bounded probe so the CLI does not hang indefinitely on approval-gated
+/// CDP connections.
 pub fn try_auto_connect_lite() -> Result<()> {
     if is_daemon_healthy() {
         return Ok(());
     }
     let connection = BrowserConnection::AutoConnect;
+    probe_live_attach_connection(&connection)
+}
+
+fn probe_live_attach_connection(connection: &BrowserConnection) -> Result<()> {
+    if !connection.is_live_attach() {
+        return Err(anyhow!(
+            "probe_live_attach_connection requires a live browser connection"
+        ));
+    }
     let (bin, prefix_args) = resolve_agent_browser()?;
     let args = build_agent_browser_args(
         vec!["snapshot".to_string(), "-c".to_string()],
         OutputFormat::Text,
-        Some(&connection),
+        Some(connection),
         /* use_stealth */ false,
         /* headed */ false,
     );
@@ -1943,8 +2227,8 @@ pub fn try_auto_connect_lite() -> Result<()> {
     let mut child = Command::new(&bin)
         .args(&all_args)
         .env("AGENT_BROWSER_DEFAULT_TIMEOUT", "10000")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .with_context(|| format!("failed to spawn agent-browser (via {bin})"))?;
 
@@ -1959,20 +2243,20 @@ pub fn try_auto_connect_lite() -> Result<()> {
                 let stderr = child
                     .stderr
                     .as_mut()
-                    .map(|s| {
+                    .map(|stream| {
                         let mut buf = String::new();
-                        let _ = s.read_to_string(&mut buf);
+                        let _ = stream.read_to_string(&mut buf);
                         buf
                     })
                     .unwrap_or_default();
-                return Err(anyhow!("auto-connect probe failed: {stderr}"));
+                return Err(anyhow!("live browser reachability probe failed: {stderr}"));
             }
             Ok(None) => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(anyhow!(
-                        "auto-connect probe timed out ({}s). \
+                        "live browser reachability probe timed out ({}s). \
                          Chrome may be showing an \"Allow remote debugging?\" dialog — \
                          please click Allow in Chrome to authorize the connection",
                         timeout.as_secs()
@@ -1980,9 +2264,26 @@ pub fn try_auto_connect_lite() -> Result<()> {
                 }
                 thread::sleep(Duration::from_millis(200));
             }
-            Err(e) => return Err(anyhow!("auto-connect probe error: {e}")),
+            Err(err) => return Err(anyhow!("live browser reachability probe error: {err}")),
         }
     }
+}
+
+fn clear_browser_target_state() -> Result<()> {
+    let path = browser_target_state_path();
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn warn_invalid_browser_target_state(err: &anyhow::Error) {
+    BROWSER_TARGET_STATE_WARNING_EMITTED.get_or_init(|| {
+        eprintln!(
+            "warning: failed to load browser target state ({err}); clearing sticky target state"
+        );
+    });
 }
 
 pub fn verify_auth_cdp(target_url: &str, connection: &BrowserConnection) -> Result<()> {
@@ -2889,6 +3190,104 @@ mod tests {
     }
 
     #[test]
+    #[allow(unsafe_code)]
+    fn resolve_cdp_target_can_suppress_implicit_live_targets() {
+        let _guard = lock_env();
+        let _cdp_env = EnvVarGuard::set("YOETZ_BROWSER_CDP", "http://127.0.0.1:9000");
+        let mut config = Config::default();
+        config.defaults.browser_cdp = Some("http://127.0.0.1:9222".to_string());
+
+        let suppressed = resolve_cdp_target_with_implicit(None, &config, false).unwrap();
+        assert!(suppressed.is_none());
+
+        let explicit =
+            resolve_cdp_target_with_implicit(Some("http://127.0.0.1:9333"), &config, false)
+                .unwrap()
+                .unwrap();
+        assert_eq!(explicit.endpoint, "http://127.0.0.1:9333");
+        assert_eq!(explicit.source, ResolvedCdpTargetSource::Flag);
+    }
+
+    #[test]
+    fn select_preferred_running_chrome_target_prefers_chatgpt_before_sticky() {
+        let sticky_path = PathBuf::from("/tmp/chrome-sticky/DevToolsActivePort");
+        let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let newer = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        let mut targets = vec![
+            RunningChromeTarget {
+                ws_endpoint: "ws://127.0.0.1:9333/devtools/browser/sticky".to_string(),
+                source_path: sticky_path.clone(),
+                browser_name: "Brave".to_string(),
+                chatgpt_tab_count: 0,
+                modified_at: Some(older),
+            },
+            RunningChromeTarget {
+                ws_endpoint: "ws://127.0.0.1:9222/devtools/browser/chatgpt".to_string(),
+                source_path: PathBuf::from("/tmp/chrome-default/DevToolsActivePort"),
+                browser_name: "Chrome".to_string(),
+                chatgpt_tab_count: 2,
+                modified_at: Some(newer),
+            },
+        ];
+
+        let sticky_choice =
+            select_preferred_running_chrome_target(&mut targets, Some(sticky_path.as_path()))
+                .unwrap();
+        assert_eq!(
+            sticky_choice.ws_endpoint,
+            "ws://127.0.0.1:9222/devtools/browser/chatgpt"
+        );
+
+        let chatgpt_choice = select_preferred_running_chrome_target(&mut targets, None).unwrap();
+        assert_eq!(
+            chatgpt_choice.ws_endpoint,
+            "ws://127.0.0.1:9222/devtools/browser/chatgpt"
+        );
+    }
+
+    #[test]
+    fn remember_cdp_target_persists_auto_selected_source_path() {
+        let _guard = lock_env();
+        let dir = unique_test_dir("browser_target_state");
+        let state_path = dir.join("browser-target.json");
+        let _state_env = EnvVarGuard::set("YOETZ_BROWSER_TARGET_PATH", &state_path);
+
+        let target = ResolvedCdpTarget {
+            endpoint: "ws://127.0.0.1:9222/devtools/browser/test".to_string(),
+            source: ResolvedCdpTargetSource::Auto,
+            description: "auto-selected running Chrome target".to_string(),
+            source_path: Some(PathBuf::from("/tmp/chrome-default/DevToolsActivePort")),
+        };
+
+        remember_cdp_target(&target).unwrap();
+        let loaded = load_browser_target_state().unwrap();
+        assert_eq!(
+            loaded.last_source_path,
+            Some(PathBuf::from("/tmp/chrome-default/DevToolsActivePort"))
+        );
+    }
+
+    #[test]
+    fn forget_cdp_target_clears_persisted_auto_selected_source_path() {
+        let _guard = lock_env();
+        let dir = unique_test_dir("browser_target_state_forget");
+        let state_path = dir.join("browser-target.json");
+        let _state_env = EnvVarGuard::set("YOETZ_BROWSER_TARGET_PATH", &state_path);
+
+        let target = ResolvedCdpTarget {
+            endpoint: "ws://127.0.0.1:9222/devtools/browser/test".to_string(),
+            source: ResolvedCdpTargetSource::Auto,
+            description: "auto-selected running Chrome target".to_string(),
+            source_path: Some(PathBuf::from("/tmp/chrome-default/DevToolsActivePort")),
+        };
+
+        remember_cdp_target(&target).unwrap();
+        forget_cdp_target(&target).unwrap();
+        let loaded = load_browser_target_state().unwrap();
+        assert_eq!(loaded.last_source_path, None);
+    }
+
+    #[test]
     fn interpolate_replaces_bundle_and_recipe_vars() {
         let ctx = recipe_context();
         let value = interpolate("open {{bundle_path}} {{model}}", &ctx, Some("ignored")).unwrap();
@@ -3404,6 +3803,31 @@ mod tests {
     fn is_chrome_cdp_unreachable_error_rejects_unrelated_errors() {
         let err = anyhow!("ChatGPT response timed out after 900000ms");
         assert!(!is_chrome_cdp_unreachable_error(&err));
+    }
+
+    #[test]
+    fn is_chrome_cdp_unreachable_error_requires_a_real_cdp_failure_shape() {
+        let err = anyhow!("read the docs at chrome://inspect/#remote-debugging before retrying");
+        assert!(!is_chrome_cdp_unreachable_error(&err));
+    }
+
+    #[test]
+    fn is_chatgpt_auth_issue_error_detects_login_and_challenge_errors() {
+        let login = anyhow!(
+            "chatgpt login required in the attached Chrome session. Log in there and try again."
+        );
+        let challenge = anyhow!(
+            "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again."
+        );
+        let captcha = anyhow!(
+            "captcha detected in the attached Chrome session, but stdin is not interactive."
+        );
+        let other = anyhow!("browserType.connectOverCDP: failed to list pages");
+
+        assert!(is_chatgpt_auth_issue_error(&login));
+        assert!(is_chatgpt_auth_issue_error(&challenge));
+        assert!(is_chatgpt_auth_issue_error(&captcha));
+        assert!(!is_chatgpt_auth_issue_error(&other));
     }
 
     #[test]

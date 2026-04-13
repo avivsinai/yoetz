@@ -6,12 +6,25 @@ use headless_chrome::{
     browser::tab::element::Element, protocol::cdp::Target::CreateTarget, Browser, Tab,
 };
 use reqwest::Url;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::Value;
 use std::{
+    collections::BTreeSet,
+    io::{Read, Write},
+    net::TcpStream,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
+
+const DEFAULT_LOCAL_CDP_ENDPOINT: &str = "http://127.0.0.1:9222";
+// `headless_chrome::Browser::connect_with_timeout` uses this as the transport's
+// idle lifetime, not just the initial dial budget. ChatGPT Pro reviews can sit
+// quiet for longer than 45s while the model thinks, so keep the attached CDP
+// session alive for long-running recipes.
+const CDP_SESSION_IDLE_TIMEOUT_SECS: u64 = 60 * 60;
+const DISCOVERY_HTTP_TIMEOUT_MS: u64 = 750;
 
 pub struct CdpMcpClient {
     browser: Browser,
@@ -97,16 +110,42 @@ pub struct WaitForResult {
     pub matched_text: String,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct RunningChromeTarget {
+    pub ws_endpoint: String,
+    pub source_path: PathBuf,
+    pub browser_name: String,
+    pub chatgpt_tab_count: usize,
+    pub modified_at: Option<SystemTime>,
+}
+
+impl RunningChromeTarget {
+    pub fn has_chatgpt_tab(&self) -> bool {
+        self.chatgpt_tab_count > 0
+    }
+
+    pub fn summary(&self) -> String {
+        if self.chatgpt_tab_count > 0 {
+            format!(
+                "{} at {} (chatgpt tabs: {})",
+                self.browser_name,
+                self.source_path.display(),
+                self.chatgpt_tab_count
+            )
+        } else {
+            format!("{} at {}", self.browser_name, self.source_path.display())
+        }
+    }
+}
+
 impl CdpMcpClient {
     pub async fn connect_to_running_chrome(cdp_endpoint: Option<&str>) -> Result<Self> {
-        let endpoint = cdp_endpoint.unwrap_or("http://127.0.0.1:9222");
-        let parsed = Url::parse(endpoint)
-            .with_context(|| format!("invalid Chrome CDP endpoint `{endpoint}`"))?;
-        let ws_endpoint = resolve_browser_websocket(&parsed)?;
-        let browser = Browser::connect_with_timeout(ws_endpoint.clone(), Duration::from_secs(300))
-            .with_context(|| format!("connecting to Chrome websocket `{ws_endpoint}` failed"))?;
-
-        browser.register_missing_tabs();
+        let ws_endpoint = resolve_connect_ws_endpoint(cdp_endpoint)?;
+        let browser = Browser::connect_with_timeout(
+            ws_endpoint.clone(),
+            Duration::from_secs(CDP_SESSION_IDLE_TIMEOUT_SECS),
+        )
+        .with_context(|| format!("connecting to Chrome websocket `{ws_endpoint}` failed"))?;
 
         Ok(Self {
             browser,
@@ -269,6 +308,58 @@ impl CdpMcpClient {
     }
 }
 
+fn resolve_connect_ws_endpoint(cdp_endpoint: Option<&str>) -> Result<String> {
+    match cdp_endpoint {
+        Some(endpoint) => {
+            let parsed = Url::parse(endpoint)
+                .with_context(|| format!("invalid Chrome CDP endpoint `{endpoint}`"))?;
+            resolve_browser_websocket(&parsed)
+        }
+        None => {
+            if let Some(ws_endpoint) = resolve_any_devtools_active_port_ws() {
+                return Ok(ws_endpoint);
+            }
+            let parsed = Url::parse(DEFAULT_LOCAL_CDP_ENDPOINT)
+                .expect("DEFAULT_LOCAL_CDP_ENDPOINT must be a valid URL");
+            resolve_browser_websocket(&parsed)
+        }
+    }
+}
+
+pub fn discover_running_chrome_targets() -> Vec<RunningChromeTarget> {
+    let mut seen = BTreeSet::new();
+    let mut targets = Vec::new();
+
+    for source_path in devtools_active_port_candidates() {
+        let Ok(contents) = std::fs::read_to_string(&source_path) else {
+            continue;
+        };
+        let Some(ws_endpoint) = parse_devtools_active_port(&contents, None) else {
+            continue;
+        };
+        if !seen.insert(ws_endpoint.clone()) {
+            continue;
+        }
+
+        let modified_at = std::fs::metadata(&source_path)
+            .ok()
+            .and_then(|metadata| metadata.modified().ok());
+        let browser_name = fetch_browser_name(&ws_endpoint)
+            .unwrap_or_else(|| browser_name_from_source_path(&source_path));
+        let chatgpt_tab_count = fetch_chatgpt_tab_count(&ws_endpoint).unwrap_or(0);
+
+        targets.push(RunningChromeTarget {
+            ws_endpoint,
+            source_path,
+            browser_name,
+            chatgpt_tab_count,
+            modified_at,
+        });
+    }
+
+    targets
+}
+
 fn create_target(url: &str, background: bool) -> CreateTarget {
     CreateTarget {
         url: url.to_owned(),
@@ -375,8 +466,92 @@ fn resolve_devtools_active_port_ws(endpoint: &Url) -> Option<String> {
         .find_map(|path| {
             std::fs::read_to_string(path)
                 .ok()
-                .and_then(|contents| parse_devtools_active_port(&contents, expected_port))
+                .and_then(|contents| parse_devtools_active_port(&contents, Some(expected_port)))
         })
+}
+
+fn resolve_any_devtools_active_port_ws() -> Option<String> {
+    devtools_active_port_candidates()
+        .into_iter()
+        .find_map(|path| {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| parse_devtools_active_port(&contents, None))
+        })
+}
+
+fn fetch_browser_name(ws_endpoint: &str) -> Option<String> {
+    let payload = local_http_json::<DevtoolsVersionPayload>(ws_endpoint, "/json/version")?;
+    payload.browser.map(|browser| {
+        browser
+            .split('/')
+            .next()
+            .unwrap_or(browser.as_str())
+            .to_string()
+    })
+}
+
+fn fetch_chatgpt_tab_count(ws_endpoint: &str) -> Option<usize> {
+    let entries = local_http_json::<Vec<DevtoolsTargetListEntry>>(ws_endpoint, "/json/list")?;
+    Some(
+        entries
+            .iter()
+            .filter(|entry| entry.target_type.as_deref() == Some("page"))
+            .filter(|entry| {
+                entry.url.as_deref().is_some_and(|url| {
+                    is_chatgpt_url(url) || is_chatgpt_title(entry.title.as_deref())
+                })
+            })
+            .count(),
+    )
+}
+
+fn local_http_json<T: DeserializeOwned>(ws_endpoint: &str, path: &str) -> Option<T> {
+    let url = browser_json_endpoint_from_ws(ws_endpoint, path)?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let host = url.host_str()?;
+    let port = url.port_or_known_default()?;
+    let request_path = match url.query() {
+        Some(query) => format!("{}?{query}", url.path()),
+        None => url.path().to_string(),
+    };
+    let mut stream = TcpStream::connect((host, port)).ok()?;
+    let timeout = Some(Duration::from_millis(DISCOVERY_HTTP_TIMEOUT_MS));
+    let _ = stream.set_read_timeout(timeout);
+    let _ = stream.set_write_timeout(timeout);
+    let request =
+        format!("GET {request_path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).ok()?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).ok()?;
+    parse_http_json_response(&response)
+}
+
+fn parse_http_json_response<T: DeserializeOwned>(response: &str) -> Option<T> {
+    if !response.starts_with("HTTP/1.1 200") && !response.starts_with("HTTP/1.0 200") {
+        return None;
+    }
+    let (_, body) = response.split_once("\r\n\r\n")?;
+    serde_json::from_str(body).ok()
+}
+
+fn browser_json_endpoint_from_ws(ws_endpoint: &str, path: &str) -> Option<Url> {
+    let mut url = Url::parse(ws_endpoint).ok()?;
+    match url.scheme() {
+        "ws" => {
+            let _ = url.set_scheme("http");
+        }
+        "wss" => {
+            let _ = url.set_scheme("https");
+        }
+        _ => return None,
+    }
+    url.set_path(path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Some(url)
 }
 
 fn is_localhost_host(endpoint: &Url) -> bool {
@@ -449,7 +624,33 @@ fn home_dir_candidates() -> Vec<PathBuf> {
     dirs
 }
 
-fn parse_devtools_active_port(contents: &str, expected_port: u16) -> Option<String> {
+fn browser_name_from_source_path(source_path: &Path) -> String {
+    let path = source_path.to_string_lossy().to_lowercase();
+    if path.contains("chrome canary") || path.contains("google-chrome-unstable") {
+        "Chrome Canary".to_string()
+    } else if path.contains("chrome beta") || path.contains("google-chrome-beta") {
+        "Chrome Beta".to_string()
+    } else if path.contains("brave-browser") {
+        "Brave".to_string()
+    } else if path.contains("chromium") {
+        "Chromium".to_string()
+    } else {
+        "Chrome".to_string()
+    }
+}
+
+fn is_chatgpt_url(url: &str) -> bool {
+    let haystack = url.to_ascii_lowercase();
+    haystack.contains("chatgpt.com") || haystack.contains("chat.openai.com")
+}
+
+fn is_chatgpt_title(title: Option<&str>) -> bool {
+    title
+        .map(|value| value.to_ascii_lowercase().contains("chatgpt"))
+        .unwrap_or(false)
+}
+
+fn parse_devtools_active_port(contents: &str, expected_port: Option<u16>) -> Option<String> {
     let lines = contents
         .lines()
         .map(str::trim)
@@ -458,11 +659,29 @@ fn parse_devtools_active_port(contents: &str, expected_port: u16) -> Option<Stri
     let port = lines.first()?.parse::<u16>().ok()?;
     let web_socket_path = *lines.get(1)?;
 
-    if port != expected_port || !web_socket_path.starts_with("/devtools/browser/") {
+    if expected_port.is_some_and(|expected| port != expected)
+        || !web_socket_path.starts_with("/devtools/browser/")
+    {
         return None;
     }
 
     Some(format!("ws://127.0.0.1:{port}{web_socket_path}"))
+}
+
+#[derive(Debug, Deserialize)]
+struct DevtoolsVersionPayload {
+    #[serde(rename = "Browser")]
+    browser: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DevtoolsTargetListEntry {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, rename = "type")]
+    target_type: Option<String>,
 }
 
 fn find_snapshot_element<'a>(tab: &'a Arc<Tab>, uid: &str) -> Result<Element<'a>> {
@@ -836,7 +1055,8 @@ mod tests {
 
     #[test]
     fn parse_devtools_active_port_returns_browser_websocket() {
-        let parsed = parse_devtools_active_port("9222\n/devtools/browser/from-active-port\n", 9222);
+        let parsed =
+            parse_devtools_active_port("9222\n/devtools/browser/from-active-port\n", Some(9222));
         assert_eq!(
             parsed.as_deref(),
             Some("ws://127.0.0.1:9222/devtools/browser/from-active-port")
@@ -845,7 +1065,47 @@ mod tests {
 
     #[test]
     fn parse_devtools_active_port_rejects_mismatched_port_or_path() {
-        assert!(parse_devtools_active_port("9333\n/devtools/browser/x\n", 9222).is_none());
-        assert!(parse_devtools_active_port("9222\n/devtools/page/x\n", 9222).is_none());
+        assert!(parse_devtools_active_port("9333\n/devtools/browser/x\n", Some(9222)).is_none());
+        assert!(parse_devtools_active_port("9222\n/devtools/page/x\n", Some(9222)).is_none());
+    }
+
+    #[test]
+    fn parse_devtools_active_port_allows_auto_discovery_without_expected_port() {
+        let parsed = parse_devtools_active_port("9333\n/devtools/browser/from-active-port\n", None);
+        assert_eq!(
+            parsed.as_deref(),
+            Some("ws://127.0.0.1:9333/devtools/browser/from-active-port")
+        );
+    }
+
+    #[test]
+    fn browser_name_from_source_path_prefers_family_specific_labels() {
+        assert_eq!(
+            browser_name_from_source_path(Path::new(
+                "/Users/test/Library/Application Support/Google/Chrome Canary/DevToolsActivePort"
+            )),
+            "Chrome Canary"
+        );
+        assert_eq!(
+            browser_name_from_source_path(Path::new(
+                "/Users/test/Library/Application Support/BraveSoftware/Brave-Browser/DevToolsActivePort"
+            )),
+            "Brave"
+        );
+        assert_eq!(
+            browser_name_from_source_path(Path::new(
+                "/home/test/.config/chromium/DevToolsActivePort"
+            )),
+            "Chromium"
+        );
+    }
+
+    #[test]
+    fn chatgpt_matchers_cover_url_and_title() {
+        assert!(is_chatgpt_url("https://chatgpt.com/c/123"));
+        assert!(is_chatgpt_url("https://chat.openai.com/"));
+        assert!(!is_chatgpt_url("https://example.com/"));
+        assert!(is_chatgpt_title(Some("ChatGPT - New chat")));
+        assert!(!is_chatgpt_title(Some("Docs")));
     }
 }
