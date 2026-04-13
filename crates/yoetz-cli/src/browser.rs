@@ -31,6 +31,14 @@ const CHATGPT_POLL_ATTEMPTS_DEFAULT: usize = 60;
 const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 30_000;
 const CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
 const CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT: u64 = 10_000;
+/// Minimum stable-idle window before falling back to "response done" without a
+/// copy button. Set to 90s so that with the default 30s poll interval, three
+/// consecutive identical idle polls are required — preventing preamble-pause
+/// false positives where ChatGPT briefly stops streaming during Pro deliberation.
+/// For shorter intervals we still require ≥90s real time; for longer intervals
+/// we require ≥3 × interval_ms so the policy degrades gracefully.
+const CHATGPT_STABLE_IDLE_FLOOR_MS: u64 = 90_000;
+const CHATGPT_STABLE_IDLE_INTERVAL_MULTIPLIER: u64 = 3;
 const CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT: usize = 30;
 const CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT: u64 = 1_000;
 const DAEMON_APPROVAL_GRACE_WINDOW: Duration = Duration::from_secs(30);
@@ -661,6 +669,23 @@ struct ChatgptDomState {
     error: String,
 }
 
+/// Per-poll classification of ChatGPT response state.
+///
+/// The poll loop interprets these verdicts:
+/// - `CopyButton`: copy control rendered on a *new* assistant message — the
+///   strongest "streaming finished" signal ChatGPT emits. Complete immediately.
+/// - `Idle`: composer is idle and at least some progress beyond baseline, but
+///   no copy button yet. Caller must verify the message length stays unchanged
+///   for a stable-idle window before declaring completion (fallback path).
+/// - `Generating`: still streaming, thinking, or no progress yet. Reset any
+///   in-flight idle window and keep polling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompletionVerdict {
+    CopyButton,
+    Idle,
+    Generating,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 struct AgentBrowserTab {
     index: usize,
@@ -705,7 +730,7 @@ fn run_chatgpt_wait_response(
     // Capture baseline assistant message state before send was clicked.
     let baseline_dom =
         inspect_chatgpt_dom_state(connection, use_stealth, headed, command_timeout_ms)?;
-    let mut prev_dom: Option<ChatgptDomState> = None;
+    let stable_idle_threshold_ms = chatgpt_stable_idle_threshold_ms(options.interval_ms);
     let mut last_dom = ChatgptDomState {
         send_state: ChatgptSendState::Missing,
         has_stop_button: false,
@@ -715,6 +740,12 @@ fn run_chatgpt_wait_response(
         assistant_last_len: 0,
         error: String::new(),
     };
+    // Stable-idle accounting: once we see an `Idle` verdict, anchor the
+    // (msg_count, last_len) and start a real-time clock. The fallback only
+    // fires if subsequent polls keep the same anchor for the threshold window.
+    // Any growth or `Generating` verdict resets the anchor.
+    let mut idle_since: Option<Instant> = None;
+    let mut idle_anchor: Option<(usize, usize)> = None;
     let mut completed_polls = 0usize;
     let mut deadline_reached = false;
 
@@ -736,29 +767,71 @@ fn run_chatgpt_wait_response(
         if !dom.error.is_empty() {
             return Err(anyhow!("ChatGPT error: {}", dom.error));
         }
-        let prev = prev_dom;
-        prev_dom = Some(dom.clone());
         last_dom = dom.clone();
 
-        if chatgpt_response_complete(&dom, prev.as_ref(), &baseline_dom) {
-            let payload = json!({
-                "status": "ok",
-                "attempt": attempt,
-                "attempts": options.attempts,
-                "interval_ms": options.interval_ms,
-                "timeout_ms": options.timeout_ms,
-                "send_state": match dom.send_state {
-                    ChatgptSendState::Enabled => "enabled",
-                    ChatgptSendState::Disabled => "disabled",
-                    ChatgptSendState::Missing => "missing",
-                },
-                "has_stop_button": dom.has_stop_button,
-                "has_thinking_indicator": dom.has_thinking_indicator,
-                "copy_button_count": dom.copy_button_count,
-                "assistant_msg_count": dom.assistant_msg_count,
-                "assistant_last_len": dom.assistant_last_len,
-            });
-            return Ok(payload.to_string());
+        match classify_chatgpt_completion(&dom, &baseline_dom) {
+            CompletionVerdict::CopyButton => {
+                let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                let payload = json!({
+                    "status": "ok",
+                    "completion_reason": "copy_button",
+                    "attempt": attempt,
+                    "attempts": options.attempts,
+                    "interval_ms": options.interval_ms,
+                    "timeout_ms": options.timeout_ms,
+                    "elapsed_ms": elapsed_ms,
+                    "stable_for_ms": 0,
+                    "stable_idle_threshold_ms": stable_idle_threshold_ms,
+                    "send_state": chatgpt_send_state_str(dom.send_state),
+                    "has_stop_button": dom.has_stop_button,
+                    "has_thinking_indicator": dom.has_thinking_indicator,
+                    "copy_button_count": dom.copy_button_count,
+                    "assistant_msg_count": dom.assistant_msg_count,
+                    "assistant_last_len": dom.assistant_last_len,
+                });
+                return Ok(payload.to_string());
+            }
+            CompletionVerdict::Idle => {
+                let anchor = (dom.assistant_msg_count, dom.assistant_last_len);
+                let stable_for_ms = match (idle_since, idle_anchor) {
+                    (Some(since), Some(prev_anchor)) if prev_anchor == anchor => Instant::now()
+                        .duration_since(since)
+                        .as_millis()
+                        .min(u128::from(u64::MAX))
+                        as u64,
+                    _ => {
+                        idle_since = Some(Instant::now());
+                        idle_anchor = Some(anchor);
+                        0
+                    }
+                };
+                if stable_for_ms >= stable_idle_threshold_ms {
+                    let elapsed_ms =
+                        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+                    let payload = json!({
+                        "status": "ok",
+                        "completion_reason": "stable_idle_fallback",
+                        "attempt": attempt,
+                        "attempts": options.attempts,
+                        "interval_ms": options.interval_ms,
+                        "timeout_ms": options.timeout_ms,
+                        "elapsed_ms": elapsed_ms,
+                        "stable_for_ms": stable_for_ms,
+                        "stable_idle_threshold_ms": stable_idle_threshold_ms,
+                        "send_state": chatgpt_send_state_str(dom.send_state),
+                        "has_stop_button": dom.has_stop_button,
+                        "has_thinking_indicator": dom.has_thinking_indicator,
+                        "copy_button_count": dom.copy_button_count,
+                        "assistant_msg_count": dom.assistant_msg_count,
+                        "assistant_last_len": dom.assistant_last_len,
+                    });
+                    return Ok(payload.to_string());
+                }
+            }
+            CompletionVerdict::Generating => {
+                idle_since = None;
+                idle_anchor = None;
+            }
         }
     }
 
@@ -1021,48 +1094,60 @@ fn parse_chatgpt_dom_state(raw: &str) -> Result<ChatgptDomState> {
     })
 }
 
-fn chatgpt_response_complete(
+/// Classify the ChatGPT page state into a [`CompletionVerdict`].
+///
+/// Pure function over the current DOM snapshot and the pre-send baseline. All
+/// stability/timing logic lives in the caller (`run_chatgpt_wait_response`),
+/// because the stable-idle window must scale with the configurable poll
+/// interval — that is policy state, not DOM state.
+fn classify_chatgpt_completion(
     dom: &ChatgptDomState,
-    prev_dom: Option<&ChatgptDomState>,
     baseline_dom: &ChatgptDomState,
-) -> bool {
+) -> CompletionVerdict {
     // After response completes, ChatGPT may show the voice button instead of
-    // the send button — so `send_state` is `Missing`, not `Enabled`.  Both
+    // the send button — so `send_state` is `Missing`, not `Enabled`. Both
     // states indicate the composer is idle (not generating).
-    let send_idle = matches!(
+    let composer_idle = matches!(
         dom.send_state,
         ChatgptSendState::Enabled | ChatgptSendState::Missing
     );
-    if !send_idle || dom.has_stop_button || dom.has_thinking_indicator {
-        return false;
+    if !composer_idle || dom.has_stop_button || dom.has_thinking_indicator {
+        return CompletionVerdict::Generating;
     }
-    let new_msg =
-        dom.assistant_msg_count > baseline_dom.assistant_msg_count && dom.assistant_last_len > 0;
+    let new_msg = dom.assistant_msg_count > baseline_dom.assistant_msg_count;
+    // Strong gate: copy button only renders after a *specific* assistant
+    // message finishes streaming. Scope to a new message (msg_count grew past
+    // baseline) so we don't accept a stale copy button left over from a prior
+    // turn in the same tab.
+    if new_msg && dom.copy_button_count > 0 {
+        return CompletionVerdict::CopyButton;
+    }
+    let new_msg_with_text = new_msg && dom.assistant_last_len > 0;
     let same_message_grew = dom.assistant_msg_count > 0
         && dom.assistant_msg_count == baseline_dom.assistant_msg_count
         && dom.assistant_last_len > baseline_dom.assistant_last_len;
-    let copy_button_on_new_response =
-        dom.assistant_msg_count > baseline_dom.assistant_msg_count && dom.copy_button_count > 0;
-    let has_progress = new_msg || same_message_grew || copy_button_on_new_response;
-    if !has_progress {
-        return false;
+    if new_msg_with_text || same_message_grew {
+        CompletionVerdict::Idle
+    } else {
+        CompletionVerdict::Generating
     }
-    // Stable idle: the previous poll must also have been idle with the same
-    // assistant text length (response stopped growing). Also check that the
-    // previous poll's send state was idle (not Disabled).
-    match prev_dom {
-        Some(prev) => {
-            let prev_idle = matches!(
-                prev.send_state,
-                ChatgptSendState::Enabled | ChatgptSendState::Missing
-            );
-            prev_idle
-                && !prev.has_stop_button
-                && !prev.has_thinking_indicator
-                && prev.assistant_last_len == dom.assistant_last_len
-                && prev.assistant_msg_count == dom.assistant_msg_count
-        }
-        None => true,
+}
+
+/// Stable-idle window required before the fallback completion path fires.
+/// `max(floor, multiplier * interval_ms)` — guarantees ≥3 consecutive identical
+/// idle polls regardless of how `wait_interval_ms` is configured, and ≥90s of
+/// real time even when the interval is short.
+fn chatgpt_stable_idle_threshold_ms(interval_ms: u64) -> u64 {
+    interval_ms
+        .saturating_mul(CHATGPT_STABLE_IDLE_INTERVAL_MULTIPLIER)
+        .max(CHATGPT_STABLE_IDLE_FLOOR_MS)
+}
+
+fn chatgpt_send_state_str(state: ChatgptSendState) -> &'static str {
+    match state {
+        ChatgptSendState::Enabled => "enabled",
+        ChatgptSendState::Disabled => "disabled",
+        ChatgptSendState::Missing => "missing",
     }
 }
 
@@ -3499,39 +3584,83 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_response_complete_requires_idle_send_and_new_message() {
+    fn classify_chatgpt_completion_distinguishes_generating_idle_copybutton() {
         let bl = baseline_dom();
-        let idle_with_msg = dom(ChatgptSendState::Enabled, false, false, 0);
-        // New message appeared and text is non-empty → complete on first poll.
-        assert!(chatgpt_response_complete(&idle_with_msg, None, &bl));
-        // No new message (same count as baseline) → not complete.
+
+        // No copy button + new message + non-empty text → Idle (caller must
+        // verify length stability across the threshold window before declaring
+        // completion). Critically, this is NOT immediate completion — the
+        // preamble-capture bug came from treating this case as instantly done.
+        let idle_no_copy = dom(ChatgptSendState::Enabled, false, false, 0);
+        assert_eq!(
+            classify_chatgpt_completion(&idle_no_copy, &bl),
+            CompletionVerdict::Idle
+        );
+
+        // No new message (same count as baseline) → Generating.
         let no_new = ChatgptDomState {
             assistant_msg_count: 0,
-            ..idle_with_msg.clone()
+            ..idle_no_copy.clone()
         };
-        assert!(!chatgpt_response_complete(&no_new, None, &bl));
-        // Empty response (lastlen=0) → not complete even with new message.
+        assert_eq!(
+            classify_chatgpt_completion(&no_new, &bl),
+            CompletionVerdict::Generating
+        );
+
+        // Empty response (new msg but lastlen=0, no copy button) → Generating.
         let empty = ChatgptDomState {
             assistant_last_len: 0,
-            ..idle_with_msg.clone()
+            ..idle_no_copy.clone()
         };
-        assert!(!chatgpt_response_complete(&empty, None, &bl));
-        // Disabled send → not complete.
+        assert_eq!(
+            classify_chatgpt_completion(&empty, &bl),
+            CompletionVerdict::Generating
+        );
+
+        // Disabled send (composer locked while sending) → Generating.
         let disabled = dom(ChatgptSendState::Disabled, false, false, 0);
-        assert!(!chatgpt_response_complete(&disabled, None, &bl));
-        // Missing send (voice button) is also idle → complete.
+        assert_eq!(
+            classify_chatgpt_completion(&disabled, &bl),
+            CompletionVerdict::Generating
+        );
+
+        // Missing send (voice button replaces send post-completion) → Idle.
         let missing = dom(ChatgptSendState::Missing, false, false, 0);
-        assert!(chatgpt_response_complete(&missing, None, &bl));
-        // Stop button → generating.
+        assert_eq!(
+            classify_chatgpt_completion(&missing, &bl),
+            CompletionVerdict::Idle
+        );
+
+        // Stop button present → Generating regardless of other signals.
         let generating = dom(ChatgptSendState::Enabled, true, false, 0);
-        assert!(!chatgpt_response_complete(&generating, None, &bl));
-        // Thinking indicator → not complete.
+        assert_eq!(
+            classify_chatgpt_completion(&generating, &bl),
+            CompletionVerdict::Generating
+        );
+
+        // Thinking indicator → Generating.
         let thinking = dom(ChatgptSendState::Enabled, false, true, 0);
-        assert!(!chatgpt_response_complete(&thinking, None, &bl));
+        assert_eq!(
+            classify_chatgpt_completion(&thinking, &bl),
+            CompletionVerdict::Generating
+        );
+
+        // Strong gate: copy button on a NEW assistant message → CopyButton.
+        let copy_on_new = ChatgptDomState {
+            copy_button_count: 1,
+            ..idle_no_copy.clone()
+        };
+        assert_eq!(
+            classify_chatgpt_completion(&copy_on_new, &bl),
+            CompletionVerdict::CopyButton
+        );
     }
 
     #[test]
-    fn chatgpt_response_complete_scopes_copy_buttons_to_new_response() {
+    fn classify_chatgpt_completion_scopes_copy_button_to_new_message() {
+        // Tab is being reused: baseline already has an assistant message with
+        // its own copy button. Without msg_count growth, that stale copy
+        // button must NOT be treated as completion of the new turn.
         let baseline = ChatgptDomState {
             send_state: ChatgptSendState::Missing,
             has_stop_button: false,
@@ -3554,50 +3683,66 @@ mod tests {
             ..dom(ChatgptSendState::Enabled, false, false, 0)
         };
 
-        assert!(
-            !chatgpt_response_complete(&stale_latest, None, &baseline),
-            "copy buttons on the existing latest message must not satisfy completion"
+        // Same msg_count as baseline + same length → no progress at all.
+        assert_eq!(
+            classify_chatgpt_completion(&stale_latest, &baseline),
+            CompletionVerdict::Generating
         );
-        assert!(
-            chatgpt_response_complete(&new_latest, None, &baseline),
-            "copy buttons on a newly created latest response may confirm completion"
+        // Genuinely new message with copy button → CopyButton even with
+        // assistant_last_len=0 (the copy button itself proves completion).
+        assert_eq!(
+            classify_chatgpt_completion(&new_latest, &baseline),
+            CompletionVerdict::CopyButton
         );
     }
 
     #[test]
-    fn chatgpt_response_complete_requires_stable_idle() {
-        let bl = baseline_dom();
-        let idle = dom(ChatgptSendState::Enabled, false, false, 1);
-        let was_thinking = ChatgptDomState {
-            has_thinking_indicator: true,
-            ..idle.clone()
+    fn classify_chatgpt_completion_handles_same_message_growth() {
+        // Reused thread: baseline includes a non-empty assistant message
+        // (e.g., a previous turn). The new turn has not yet incremented
+        // msg_count but the latest message has grown — that is still progress
+        // and should classify as Idle (caller verifies stability).
+        let baseline = ChatgptDomState {
+            send_state: ChatgptSendState::Missing,
+            has_stop_button: false,
+            has_thinking_indicator: false,
+            copy_button_count: 1,
+            assistant_msg_count: 1,
+            assistant_last_len: 80,
+            error: String::new(),
         };
-        let was_generating = ChatgptDomState {
-            has_stop_button: true,
-            ..idle.clone()
+        let grew = ChatgptDomState {
+            copy_button_count: 0,
+            assistant_msg_count: 1,
+            assistant_last_len: 200,
+            ..dom(ChatgptSendState::Enabled, false, false, 0)
         };
-        let was_disabled = ChatgptDomState {
-            send_state: ChatgptSendState::Disabled,
-            ..idle.clone()
-        };
-        let was_growing = ChatgptDomState {
-            assistant_last_len: 50,
-            ..idle.clone()
-        };
-        // Previous poll was thinking → not stable.
-        assert!(!chatgpt_response_complete(&idle, Some(&was_thinking), &bl));
-        // Previous poll had stop button → not stable.
-        assert!(!chatgpt_response_complete(
-            &idle,
-            Some(&was_generating),
-            &bl
-        ));
-        // Previous poll had disabled send → not stable.
-        assert!(!chatgpt_response_complete(&idle, Some(&was_disabled), &bl));
-        // Previous poll had different text length → still growing.
-        assert!(!chatgpt_response_complete(&idle, Some(&was_growing), &bl));
-        // Previous poll was also idle with same text → stable, complete.
-        assert!(chatgpt_response_complete(&idle, Some(&idle), &bl));
+        assert_eq!(
+            classify_chatgpt_completion(&grew, &baseline),
+            CompletionVerdict::Idle
+        );
+    }
+
+    #[test]
+    fn chatgpt_stable_idle_threshold_floors_and_scales() {
+        // Very short interval → floor at 90s.
+        assert_eq!(chatgpt_stable_idle_threshold_ms(1_000), 90_000);
+        assert_eq!(chatgpt_stable_idle_threshold_ms(10_000), 90_000);
+        // Default 30s interval → still 90s (== 3 × 30s == floor).
+        assert_eq!(chatgpt_stable_idle_threshold_ms(30_000), 90_000);
+        // Long interval → scales up (3 × interval).
+        assert_eq!(chatgpt_stable_idle_threshold_ms(60_000), 180_000);
+        assert_eq!(chatgpt_stable_idle_threshold_ms(120_000), 360_000);
+    }
+
+    #[test]
+    fn chatgpt_send_state_str_covers_all_variants() {
+        assert_eq!(chatgpt_send_state_str(ChatgptSendState::Enabled), "enabled");
+        assert_eq!(
+            chatgpt_send_state_str(ChatgptSendState::Disabled),
+            "disabled"
+        );
+        assert_eq!(chatgpt_send_state_str(ChatgptSendState::Missing), "missing");
     }
 
     #[test]
