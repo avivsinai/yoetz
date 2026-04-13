@@ -924,7 +924,31 @@ fn recipe_has_remaining_manual_fallback(
 }
 
 fn recipe_should_stop_live_transport_fallback(err: &anyhow::Error) -> bool {
-    browser::is_chrome_approval_wait_error(err) || browser::is_chrome_cdp_unreachable_error(err)
+    browser::is_chrome_approval_wait_error(err)
+}
+
+/// A transport is "pure live-CDP" if its only way to drive the browser is
+/// attaching to a running Chrome over CDP. `chrome-devtools-mcp` (vendored
+/// headless_chrome) and `dev-browser` (Playwright `connectOverCDP`) are
+/// pure live-CDP. `agent-browser` is NOT — when live-attach fails, it
+/// transparently falls back to a managed profile with stored cookies, so
+/// it still works on Chrome 146+ default profiles where CDP is unreachable.
+/// `manual` never needs CDP.
+fn is_live_cdp_only_transport(transport: browser::RecipeTransport) -> bool {
+    matches!(
+        transport,
+        browser::RecipeTransport::ChromeDevtoolsMcp | browser::RecipeTransport::DevBrowser
+    )
+}
+
+/// When tier 1 (chrome-devtools-mcp) already determined Chrome is not
+/// listening on CDP, any other pure live-CDP transport will fail for the
+/// same reason — and dev-browser's Playwright `connectOverCDP` in
+/// particular hangs on `Target.setAutoAttach` instead of failing fast.
+/// Skip those tiers but still let agent-browser try (it can fall back to
+/// managed profile without CDP).
+fn recipe_should_skip_remaining_live_cdp_transports(err: &anyhow::Error) -> bool {
+    browser::is_chrome_cdp_unreachable_error(err)
 }
 
 fn explicit_cdp_attach_failure(err: anyhow::Error) -> anyhow::Error {
@@ -1506,7 +1530,15 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 manual_browser_recipe_fallback(&recipe_path, recipe_args.bundle.as_deref());
             let mut transport_errors = Vec::new();
 
+            let mut skip_remaining_live_cdp = false;
             for (index, transport) in transports.iter().copied().enumerate() {
+                if skip_remaining_live_cdp && is_live_cdp_only_transport(transport) {
+                    eprintln!(
+                        "info: skipping {} transport — Chrome CDP was unreachable in an earlier tier",
+                        recipe_transport_name(transport)
+                    );
+                    continue;
+                }
                 if !matches!(transport, browser::RecipeTransport::Manual) {
                     eprintln!(
                         "info: attempting {} transport",
@@ -1556,6 +1588,9 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                 ));
                             }
                             break;
+                        }
+                        if recipe_should_skip_remaining_live_cdp_transports(&err) {
+                            skip_remaining_live_cdp = true;
                         }
                         if !matches!(transport, browser::RecipeTransport::Manual) {
                             eprintln!(
@@ -2133,12 +2168,14 @@ mod tests {
     }
 
     #[test]
-    fn recipe_should_stop_live_transport_fallback_on_cdp_unreachable() {
+    fn recipe_should_skip_remaining_live_cdp_transports_on_cdp_unreachable() {
         // When tier 1 (chrome-devtools-mcp) fails because Chrome is not
-        // listening on CDP at all, dev-browser and agent-browser will fail
-        // for the same reason. Stop the live fallback immediately and fall
-        // through to the manual path so the user gets an actionable error
-        // rather than waiting on dev-browser's `Target.setAutoAttach` hang.
+        // listening on CDP at all, dev-browser will fail for the same
+        // reason and Playwright's `connectOverCDP` hangs on
+        // `Target.setAutoAttach` instead of failing fast. Skip remaining
+        // pure live-CDP tiers — but NOT agent-browser, which transparently
+        // falls back from live-attach to a managed profile with stored
+        // cookies and still works without CDP.
         let err =
             anyhow!("requesting `http://127.0.0.1:9222/json/version` failed: connection refused")
                 .context(
@@ -2148,7 +2185,28 @@ mod tests {
              or pass --cdp=ws://127.0.0.1:PORT after launching Chrome with a non-default \
              --user-data-dir, or use Chrome for Testing",
                 );
-        assert!(recipe_should_stop_live_transport_fallback(&err));
+        assert!(recipe_should_skip_remaining_live_cdp_transports(&err));
+        // Crucial invariant: CDP-unreachable must NOT stop the whole
+        // funnel — agent-browser still gets a chance via managed profile.
+        assert!(!recipe_should_stop_live_transport_fallback(&err));
+    }
+
+    #[test]
+    fn is_live_cdp_only_transport_excludes_agent_browser_and_manual() {
+        assert!(is_live_cdp_only_transport(
+            browser::RecipeTransport::ChromeDevtoolsMcp
+        ));
+        assert!(is_live_cdp_only_transport(
+            browser::RecipeTransport::DevBrowser
+        ));
+        // agent-browser has a managed-profile fallback that does not need
+        // a live CDP endpoint, so CDP-unreachable must not skip it.
+        assert!(!is_live_cdp_only_transport(
+            browser::RecipeTransport::AgentBrowser
+        ));
+        assert!(!is_live_cdp_only_transport(
+            browser::RecipeTransport::Manual
+        ));
     }
 
     #[test]
