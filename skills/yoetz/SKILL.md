@@ -256,7 +256,20 @@ yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 
 # Override the built-in model selection if needed
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var model=gpt-5-4-pro
+
+# Reuse the currently active ChatGPT tab/conversation for a follow-up turn
+# instead of opening a fresh one (default is "fresh" — a fresh conversation
+# per call; whether that is a new tab or same-tab navigation depends on the
+# transport/session state). Requires the attached tab to already be on chatgpt.com.
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var thread=reuse
 ```
+
+The wait loop reports `completion_reason` in its JSON output:
+- `copy_button` — the strong signal: a copy control rendered on the new
+  assistant message (response is fully streamed).
+- `stable_idle_fallback` — the page looked idle with unchanged length for
+  ≥ `max(90s, 3 × wait_interval_ms)`. Used when ChatGPT changes its copy-button
+  selectors; otherwise `copy_button` is the normal completion path.
 
 ### Combined workflow: API + Browser
 

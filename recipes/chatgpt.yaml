@@ -12,6 +12,10 @@ name: chatgpt
 #   model    — model slug (e.g., "gpt-5-4-pro"). Omit to keep current.
 #   extended — set to "false" to disable Extended Pro. Default: leave as-is.
 #   prompt   — prompt text to send with the attachment.
+#   thread   — "fresh" (default) opens a new ChatGPT conversation each call.
+#              "reuse" keeps the currently active ChatGPT tab/conversation so
+#              follow-up turns land in the same thread. Reuse requires the
+#              attached tab to already be on chatgpt.com.
 #   wait_timeout_ms  — overall response wait deadline in ms (default: 1800000 = 30min).
 #   wait_interval_ms — poll interval in ms (default: 30000 = 30s).
 
@@ -25,24 +29,42 @@ defaults:
   prompt: Review the attached file and provide your analysis.
   model: ""
   extended: ""
+  thread: "fresh"
   wait_timeout_ms: "1800000"
   wait_interval_ms: "30000"
 
 steps:
-  # Navigate to a fresh ChatGPT conversation. Append a timestamp query param
-  # so the SPA router treats it as a new navigation even when the tab is
-  # already on chatgpt.com/ (otherwise it's a no-op and we reuse the old thread).
-  - action: eval
-    args:
-      - "window.location.href = 'https://chatgpt.com/?_yoetz=' + Date.now()"
-  - sleep_ms: 4000
-
-  # Safety: if we landed on an existing conversation (URL contains /c/),
-  # click "New chat" to guarantee a clean slate.
+  # Step 1: navigate or stay put depending on `thread`.
+  # - thread=fresh (default): force a brand-new conversation by appending a
+  #   timestamp query param so the SPA router treats it as a real navigation
+  #   (otherwise it's a no-op and we'd reuse the old thread).
+  # - thread=reuse: stay on the current tab; fail-fast if it isn't chatgpt.com
+  #   so we don't accidentally type into some unrelated page.
   - action: eval
     args:
       - |
         (() => {
+          const thread = "{{thread}}";
+          if (thread === "reuse") {
+            if (location.host !== "chatgpt.com") {
+              throw new Error("thread=reuse requires the attached tab to be on chatgpt.com (current host: " + location.host + ")");
+            }
+            return "thread=reuse: staying on " + location.pathname;
+          }
+          window.location.href = 'https://chatgpt.com/?_yoetz=' + Date.now();
+          return "thread=fresh: navigating to new chat";
+        })()
+  - sleep_ms: 4000
+
+  # Step 2: safety net for thread=fresh — if we somehow landed on an existing
+  # conversation (URL contains /c/), click "New chat" to guarantee a clean
+  # slate. Skipped entirely when thread=reuse.
+  - action: eval
+    args:
+      - |
+        (() => {
+          const thread = "{{thread}}";
+          if (thread === "reuse") return "skipped: thread=reuse";
           if (!window.location.pathname.startsWith('/c/')) return "already new chat";
           const btn = document.querySelector(
             'a[href="/"], button[data-testid="create-new-chat-button"], nav a[class*="new"]'
