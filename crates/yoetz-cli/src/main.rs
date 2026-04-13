@@ -933,9 +933,9 @@ fn recipe_should_stop_live_transport_fallback(
         return true;
     }
 
-    // Once the user or config has pinned a specific live Chrome target, do not
-    // fan out into more browser transports after the first failure. Auto-
-    // selected targets are only heuristics and remain advisory.
+    // Once the user has explicitly pinned a specific live Chrome target, do not
+    // fan out into more browser transports after the first failure. Env/config
+    // targets and auto-selected targets remain advisory.
     selected_cdp_target.is_some_and(browser::ResolvedCdpTarget::is_authoritative)
         && !matches!(transport, browser::RecipeTransport::Manual)
 }
@@ -1038,7 +1038,7 @@ fn maybe_demote_auto_selected_cdp_target(
     if !selected.is_auto_discovered() {
         return;
     }
-    if browser::is_chrome_approval_wait_error(err) || browser::is_chatgpt_auth_issue_error(err) {
+    if browser::is_chrome_approval_wait_error(err) {
         return;
     }
 
@@ -1050,6 +1050,17 @@ fn maybe_demote_auto_selected_cdp_target(
 
     if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
         eprintln!("info: {description} failed ({err}); continuing with fallback discovery");
+    }
+}
+
+fn maybe_remember_cdp_target(target: Option<&browser::ResolvedCdpTarget>, format: OutputFormat) {
+    let Some(target) = target else {
+        return;
+    };
+    if let Err(err) = browser::remember_cdp_target(target) {
+        if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+            eprintln!("warning: failed to persist last successful Chrome target: {err}");
+        }
     }
 }
 
@@ -1488,9 +1499,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             if let Some(ref cdp_url) = check_args.cdp {
                 browser::try_cdp_attach(cdp_url, "https://chatgpt.com/")
                     .map_err(explicit_cdp_attach_failure)?;
-                if let Some(target) = resolved_cdp_target.as_ref() {
-                    browser::remember_cdp_target(target)?;
-                }
+                maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
                 let payload = json!({
                     "status": "ok",
                     "method": format!("cdp: {cdp_url}"),
@@ -1523,9 +1532,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             "method": method,
                             "backend": "dev-browser",
                         });
-                        if let Some(target) = resolved_cdp_target.as_ref() {
-                            browser::remember_cdp_target(target)?;
-                        }
+                        maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
                         return match format {
                             OutputFormat::Json => write_json(&payload),
                             OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
@@ -1536,9 +1543,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         };
                     }
                     Err(e) => {
-                        if browser::is_chrome_approval_wait_error(&e)
-                            || browser::is_chatgpt_auth_issue_error(&e)
-                        {
+                        if browser::is_chrome_approval_wait_error(&e) {
                             return Err(e);
                         }
                         if resolved_cdp_target
@@ -1647,9 +1652,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 "method": method,
             });
             if matches!(connection, browser::BrowserConnection::Cdp { .. }) {
-                if let Some(target) = resolved_cdp_target.as_ref() {
-                    browser::remember_cdp_target(target)?;
-                }
+                maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
             }
             match format {
                 OutputFormat::Json => write_json(&payload),
@@ -1807,9 +1810,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                 | browser::RecipeTransport::DevBrowser
                                 | browser::RecipeTransport::AgentBrowser
                         ) {
-                            if let Some(target) = resolved_cdp_target.as_ref() {
-                                browser::remember_cdp_target(target)?;
-                            }
+                            maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
                         }
                         return Ok(());
                     }
@@ -1866,9 +1867,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             if let Some(endpoint) = cdp_endpoint {
                 match browser::try_cdp_attach(endpoint, "https://chatgpt.com/") {
                     Ok(()) => {
-                        if let Some(target) = resolved_cdp_target.as_ref() {
-                            browser::remember_cdp_target(target)?;
-                        }
+                        maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
                         let payload = json!({
                             "status": "ok",
                             "method": if attach_args.cdp.is_some() {

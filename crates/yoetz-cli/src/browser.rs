@@ -155,7 +155,7 @@ impl ResolvedCdpTarget {
     }
 
     pub fn is_authoritative(&self) -> bool {
-        !self.is_auto_discovered()
+        matches!(self.source, ResolvedCdpTargetSource::Flag)
     }
 }
 
@@ -1360,13 +1360,7 @@ pub fn is_chrome_cdp_unreachable_error(err: &anyhow::Error) -> bool {
     message.contains("chrome://inspect")
         && (message.contains("could not reach chrome's cdp endpoint")
             || message.contains("ignores --remote-debugging-port")
-            || (message.contains("requesting `http")
-                && message.contains("/json/version")
-                && (message.contains("failed") || message.contains("connection refused")))
-            || (message.contains("connectovercdp")
-                && (message.contains("econnrefused")
-                    || message.contains("connection refused")
-                    || message.contains("browser.getversion"))))
+            || looks_like_cdp_transport_failure(err))
 }
 
 pub fn is_chatgpt_auth_issue_error(err: &anyhow::Error) -> bool {
@@ -2084,9 +2078,7 @@ pub fn resolve_browser_connection(
     if let Some(endpoint) = resolve_cdp_endpoint(cdp_override, config) {
         match try_cdp_attach(&endpoint, target_url) {
             Ok(()) => return Ok(BrowserConnection::Cdp { endpoint }),
-            Err(err)
-                if is_chrome_approval_wait_error(&err) || is_chatgpt_auth_issue_error(&err) =>
-            {
+            Err(err) if should_stop_live_attach_fallback(&err) => {
                 return Err(err);
             }
             Err(_) => {}
@@ -2095,7 +2087,7 @@ pub fn resolve_browser_connection(
 
     match try_auto_connect(target_url) {
         Ok(()) => return Ok(BrowserConnection::AutoConnect),
-        Err(err) if is_chrome_approval_wait_error(&err) || is_chatgpt_auth_issue_error(&err) => {
+        Err(err) if should_stop_live_attach_fallback(&err) => {
             return Err(err);
         }
         Err(_) => {}
@@ -2111,7 +2103,7 @@ pub fn try_cdp_attach(endpoint: &str, target_url: &str) -> Result<()> {
     verify_auth_cdp(target_url, &connection).map_err(|e| {
         if allow_dialog_error(&e) {
             e
-        } else if is_localhost_endpoint(endpoint) {
+        } else if should_attach_chrome136_warning(endpoint, &e) {
             e.context(chrome136_cdp_warning(endpoint))
         } else {
             e
@@ -2146,6 +2138,26 @@ fn is_localhost_endpoint(endpoint: &str) -> bool {
         host.to_lowercase().as_str(),
         "127.0.0.1" | "localhost" | "::1"
     )
+}
+
+fn should_attach_chrome136_warning(endpoint: &str, err: &anyhow::Error) -> bool {
+    is_localhost_endpoint(endpoint) && looks_like_cdp_transport_failure(err)
+}
+
+fn should_stop_live_attach_fallback(err: &anyhow::Error) -> bool {
+    is_chrome_approval_wait_error(err)
+}
+
+fn looks_like_cdp_transport_failure(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_lowercase();
+    message.contains("could not reach chrome's cdp endpoint")
+        || (message.contains("requesting `http")
+            && message.contains("/json/version")
+            && (message.contains("failed") || message.contains("connection refused")))
+        || (message.contains("connectovercdp")
+            && (message.contains("econnrefused")
+                || message.contains("connection refused")
+                || message.contains("browser.getversion")))
 }
 
 /// Warning message explaining the Chrome 136+ breaking change for local CDP.
@@ -2184,7 +2196,7 @@ pub fn try_cdp_attach_lite(endpoint: &str) -> Result<()> {
     probe_live_attach_connection(&connection).map_err(|e| {
         if allow_dialog_error(&e) {
             e
-        } else if is_localhost_endpoint(endpoint) {
+        } else if should_attach_chrome136_warning(endpoint, &e) {
             e.context(chrome136_cdp_warning(endpoint))
         } else {
             e
@@ -3209,6 +3221,32 @@ mod tests {
     }
 
     #[test]
+    fn only_explicit_cdp_targets_are_authoritative() {
+        let explicit = ResolvedCdpTarget {
+            endpoint: "ws://127.0.0.1:9222/devtools/browser/flag".to_string(),
+            source: ResolvedCdpTargetSource::Flag,
+            description: "explicit".to_string(),
+            source_path: None,
+        };
+        let configured = ResolvedCdpTarget {
+            endpoint: "ws://127.0.0.1:9222/devtools/browser/config".to_string(),
+            source: ResolvedCdpTargetSource::Config,
+            description: "config".to_string(),
+            source_path: None,
+        };
+        let automatic = ResolvedCdpTarget {
+            endpoint: "ws://127.0.0.1:9222/devtools/browser/auto".to_string(),
+            source: ResolvedCdpTargetSource::Auto,
+            description: "auto".to_string(),
+            source_path: Some(PathBuf::from("/tmp/DevToolsActivePort")),
+        };
+
+        assert!(explicit.is_authoritative());
+        assert!(!configured.is_authoritative());
+        assert!(!automatic.is_authoritative());
+    }
+
+    #[test]
     fn select_preferred_running_chrome_target_prefers_chatgpt_before_sticky() {
         let sticky_path = PathBuf::from("/tmp/chrome-sticky/DevToolsActivePort");
         let older = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
@@ -3780,6 +3818,24 @@ mod tests {
     }
 
     #[test]
+    fn should_attach_chrome136_warning_only_for_transport_failures() {
+        let auth_issue = anyhow!(
+            "chatgpt login required in the attached Chrome session. Log in there and try again."
+        );
+        let connect_failure =
+            anyhow!("requesting `http://127.0.0.1:9222/json/version` failed: connection refused");
+
+        assert!(!should_attach_chrome136_warning(
+            "http://127.0.0.1:9222",
+            &auth_issue
+        ));
+        assert!(should_attach_chrome136_warning(
+            "http://127.0.0.1:9222",
+            &connect_failure
+        ));
+    }
+
+    #[test]
     fn is_chrome_approval_wait_error_rejects_non_approval_timeouts() {
         let err = anyhow!("ChatGPT response timed out after 900000ms");
         assert!(!is_chrome_approval_wait_error(&err));
@@ -3828,6 +3884,19 @@ mod tests {
         assert!(is_chatgpt_auth_issue_error(&challenge));
         assert!(is_chatgpt_auth_issue_error(&captcha));
         assert!(!is_chatgpt_auth_issue_error(&other));
+    }
+
+    #[test]
+    fn should_stop_live_attach_fallback_only_on_approval_wait() {
+        let approval = anyhow!(
+            "live browser attach timed out (30s). Chrome may be showing an \"Allow remote debugging?\" dialog — please click Allow in Chrome, then retry."
+        );
+        let auth_issue = anyhow!(
+            "chatgpt login required in the attached Chrome session. Log in there and try again."
+        );
+
+        assert!(should_stop_live_attach_fallback(&approval));
+        assert!(!should_stop_live_attach_fallback(&auth_issue));
     }
 
     #[test]
