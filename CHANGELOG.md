@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - `yoetz browser recipe --recipe chatgpt` now actually attempts the `chrome-devtools-mcp` transport instead of silently skipping it when `chrome-devtools-mcp` and `npx` are both absent from `PATH`. The availability gate was a leftover from v0.2.48 when the external binary was required for DOM snapshots; v0.2.49 removed that dependency, but the gate stayed. Each transport attempt now logs `info: attempting <name> transport` so skipped tiers are no longer invisible.
 - CDP-unreachable errors on the `chrome-devtools-mcp` transport now surface actionable guidance — enable `chrome://inspect/#remote-debugging`, pass `--cdp`, or use Chrome for Testing — instead of leaking the raw reqwest error. Chrome 136+ ignores `--remote-debugging-port` on the default profile, so this is the most common failure mode.
+- CDP-unreachable failures at tier 1 now stop the live-transport funnel and jump straight to manual, instead of cascading into dev-browser's `Target.setAutoAttach` hang (upstream Playwright bug). All live transports share the same CDP endpoint, so if tier 1 already determined Chrome is not listening, retrying the same endpoint via dev-browser or agent-browser cannot succeed.
 
 ### Clarified
 

@@ -1311,6 +1311,22 @@ pub fn is_chrome_approval_wait_error(err: &anyhow::Error) -> bool {
         .contains("allow remote debugging")
 }
 
+/// Detect the actionable "Chrome CDP unreachable" error produced by
+/// `chrome_devtools_mcp::chatgpt::cdp_attach_hint`.
+///
+/// When tier 1 (chrome-devtools-mcp) already determined that Chrome is not
+/// listening on CDP, the funnel should skip all remaining *live* transports
+/// — dev-browser and agent-browser are the same CDP endpoint behind
+/// different adapters, so they will fail for the same reason (dev-browser's
+/// Playwright `connectOverCDP` in particular hangs instead of failing fast).
+/// Stopping at tier 1 and jumping to manual gives the user an immediate,
+/// actionable error instead of a long wait.
+pub fn is_chrome_cdp_unreachable_error(err: &anyhow::Error) -> bool {
+    format!("{err:#}")
+        .to_lowercase()
+        .contains("chrome://inspect")
+}
+
 fn close_browser_daemon() -> Result<()> {
     let (bin, prefix_args) = resolve_agent_browser()?;
     let mut cmd = Command::new(bin);
@@ -3368,6 +3384,26 @@ mod tests {
     fn is_chrome_approval_wait_error_rejects_non_approval_timeouts() {
         let err = anyhow!("ChatGPT response timed out after 900000ms");
         assert!(!is_chrome_approval_wait_error(&err));
+    }
+
+    #[test]
+    fn is_chrome_cdp_unreachable_error_detects_wrapped_hint() {
+        let err =
+            anyhow!("requesting `http://127.0.0.1:9222/json/version` failed: connection refused")
+                .context(
+                    "chrome-devtools-mcp could not reach Chrome's CDP endpoint. \
+                 Chrome 136+ ignores --remote-debugging-port on the default profile — \
+                 either enable chrome://inspect/#remote-debugging (Chrome 144+) and retry, \
+                 or pass --cdp=ws://127.0.0.1:PORT after launching Chrome with a non-default \
+                 --user-data-dir, or use Chrome for Testing",
+                );
+        assert!(is_chrome_cdp_unreachable_error(&err));
+    }
+
+    #[test]
+    fn is_chrome_cdp_unreachable_error_rejects_unrelated_errors() {
+        let err = anyhow!("ChatGPT response timed out after 900000ms");
+        assert!(!is_chrome_cdp_unreachable_error(&err));
     }
 
     #[test]

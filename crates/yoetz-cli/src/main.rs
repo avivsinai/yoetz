@@ -924,7 +924,7 @@ fn recipe_has_remaining_manual_fallback(
 }
 
 fn recipe_should_stop_live_transport_fallback(err: &anyhow::Error) -> bool {
-    browser::is_chrome_approval_wait_error(err)
+    browser::is_chrome_approval_wait_error(err) || browser::is_chrome_cdp_unreachable_error(err)
 }
 
 fn explicit_cdp_attach_failure(err: anyhow::Error) -> anyhow::Error {
@@ -2130,6 +2130,25 @@ mod tests {
     fn recipe_should_not_stop_live_transport_fallback_on_non_approval_error() {
         let err = anyhow!("chatgpt send button not found");
         assert!(!recipe_should_stop_live_transport_fallback(&err));
+    }
+
+    #[test]
+    fn recipe_should_stop_live_transport_fallback_on_cdp_unreachable() {
+        // When tier 1 (chrome-devtools-mcp) fails because Chrome is not
+        // listening on CDP at all, dev-browser and agent-browser will fail
+        // for the same reason. Stop the live fallback immediately and fall
+        // through to the manual path so the user gets an actionable error
+        // rather than waiting on dev-browser's `Target.setAutoAttach` hang.
+        let err =
+            anyhow!("requesting `http://127.0.0.1:9222/json/version` failed: connection refused")
+                .context(
+                    "chrome-devtools-mcp could not reach Chrome's CDP endpoint. \
+             Chrome 136+ ignores --remote-debugging-port on the default profile — \
+             either enable chrome://inspect/#remote-debugging (Chrome 144+) and retry, \
+             or pass --cdp=ws://127.0.0.1:PORT after launching Chrome with a non-default \
+             --user-data-dir, or use Chrome for Testing",
+                );
+        assert!(recipe_should_stop_live_transport_fallback(&err));
     }
 
     #[test]
