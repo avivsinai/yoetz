@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `yoetz browser recipe --recipe chatgpt` now honors `--var thread=reuse` in the primary `chrome-devtools-mcp` transport instead of always opening a fresh ChatGPT tab. Reuse now fails fast when the candidate tab is ambiguous or still streaming, instead of stealing an in-flight ChatGPT Pro run.
+- `yoetz browser check` no longer opens extra ChatGPT probe tabs on repeated checks when a ChatGPT tab is already open. The auth probe reuses an existing ChatGPT tab read-only when possible and only falls back to a temporary background tab when nothing is open.
+- Reuse-related failures now stop browser-transport fallback immediately, preventing a second CDP attach attempt and the extra Chrome “Allow remote debugging?” popup that used to appear after an initial reuse failure.
+- `yoetz browser check` now uses the intended transport order again (`chrome-devtools-mcp` before `dev-browser`) and reports the chosen transport in its output.
+- The ChatGPT recipe now auto-selects the strongest available ChatGPT model by default, preferring GPT-5/Pro when present, and surfaces `model_used` in JSON output.
+- `yoetz bundle` now handles explicit ignored/untracked files reliably, rejects comma-separated `-f` values with a clear error, and allows prompt-only bundles without walking the repo.
+
 ## [0.2.52] - 2026-04-13
 ### Fixed
 

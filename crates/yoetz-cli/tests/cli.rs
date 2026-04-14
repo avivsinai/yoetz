@@ -319,11 +319,8 @@ fn browser_login_explicit_cdp_failure_does_not_fallback() {
 
 #[test]
 fn browser_check_explicit_cdp_failure_does_not_fallback() {
-    let (_dir, bin) = fake_agent_browser_failure_bin("connectOverCDP blew up");
-
     yoetz()
-        .args(["browser", "check", "--cdp", "http://127.0.0.1:9222"])
-        .env("YOETZ_AGENT_BROWSER_BIN", &bin)
+        .args(["browser", "check", "--cdp", "http://127.0.0.1:1"])
         .env("YOETZ_DEV_BROWSER_BIN", "/definitely/missing")
         .assert()
         .failure()
@@ -371,12 +368,32 @@ fn ask_em_dash_in_prompt_parses() {
 
 #[test]
 fn bundle_em_dash_in_prompt_parses() {
-    // Bundle with em-dash should parse without argument errors.
-    // --all is required to avoid "files required" error.
-    let result = yoetz()
-        .args(["bundle", "--prompt", "review \u{2014} all code", "--all"])
-        .assert();
-    result.stderr(predicate::str::contains("unexpected argument").not());
+    // Bundle with em-dash should parse without argument errors, even with a
+    // prompt-only bundle.
+    yoetz()
+        .args(["bundle", "--prompt", "review \u{2014} all code"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("unexpected argument").not());
+}
+
+#[test]
+fn bundle_prompt_file_without_files_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let prompt_file = dir.path().join("prompt.md");
+    fs::write(&prompt_file, "Review this dossier").unwrap();
+
+    yoetz()
+        .args([
+            "bundle",
+            "--prompt-file",
+            prompt_file.to_str().unwrap(),
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"file_count\": 0"));
 }
 
 #[test]

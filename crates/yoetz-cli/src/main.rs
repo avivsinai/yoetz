@@ -932,12 +932,22 @@ fn recipe_should_stop_live_transport_fallback(
     if browser::is_chrome_approval_wait_error(err) {
         return true;
     }
+    if is_thread_reuse_error(err) {
+        return true;
+    }
 
     // Once the user has explicitly pinned a specific live Chrome target, do not
     // fan out into more browser transports after the first failure. Env/config
     // targets and auto-selected targets remain advisory.
     selected_cdp_target.is_some_and(browser::ResolvedCdpTarget::is_authoritative)
         && !matches!(transport, browser::RecipeTransport::Manual)
+}
+
+fn is_thread_reuse_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        let message = cause.to_string();
+        message.contains("thread=reuse")
+    })
 }
 
 /// A transport is "pure live-CDP" if its only way to drive the browser is
@@ -962,6 +972,44 @@ fn is_live_cdp_only_transport(transport: browser::RecipeTransport) -> bool {
 /// managed profile without CDP).
 fn recipe_should_skip_remaining_live_cdp_transports(err: &anyhow::Error) -> bool {
     browser::is_chrome_cdp_unreachable_error(err)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BrowserCheckTransport {
+    ChromeDevtoolsMcp,
+    DevBrowser,
+    AgentBrowser,
+}
+
+fn browser_check_transports(
+    dev_browser_available: bool,
+    managed_profile_only: bool,
+) -> Vec<BrowserCheckTransport> {
+    if managed_profile_only {
+        return vec![BrowserCheckTransport::AgentBrowser];
+    }
+
+    let mut transports = vec![BrowserCheckTransport::ChromeDevtoolsMcp];
+    if dev_browser_available {
+        transports.push(BrowserCheckTransport::DevBrowser);
+    }
+    transports.push(BrowserCheckTransport::AgentBrowser);
+    transports
+}
+
+fn browser_check_transport_name(transport: BrowserCheckTransport) -> &'static str {
+    match transport {
+        BrowserCheckTransport::ChromeDevtoolsMcp => "chrome-devtools-mcp",
+        BrowserCheckTransport::DevBrowser => "dev-browser",
+        BrowserCheckTransport::AgentBrowser => "agent-browser",
+    }
+}
+
+fn browser_check_live_method(target: Option<&browser::ResolvedCdpTarget>) -> String {
+    match target {
+        Some(target) if !target.is_auto_discovered() => format!("cdp: {}", target.endpoint),
+        _ => "auto_connect".to_string(),
+    }
 }
 
 fn maybe_print_auto_selected_cdp_target(
@@ -1115,6 +1163,9 @@ async fn run_recipe_via_chrome_devtools_mcp(
     // Use the existing dev-browser poll settings resolver so the response
     // timeout env/recipe-var knobs stay symmetric with the dev-browser path.
     let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
+    let thread_mode = chrome_devtools_mcp::RecipeThreadMode::parse(
+        recipe_vars.get("thread").map(String::as_str),
+    )?;
 
     let ctx = chrome_devtools_mcp::DevtoolsMcpRecipeContext {
         cdp_endpoint: cdp_endpoint.map(str::to_owned),
@@ -1125,6 +1176,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
             .get("prompt")
             .cloned()
             .unwrap_or_else(|| "Review the attached file and provide your analysis.".to_string()),
+        thread_mode,
         response_timeout_ms: poll_settings.timeout_ms,
         show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
     };
@@ -1136,7 +1188,8 @@ async fn run_recipe_via_chrome_devtools_mcp(
             let payload = json!({
                 "status": "ok",
                 "backend": "chrome-devtools-mcp",
-                "response": response,
+                "response": response.response,
+                "model_used": response.model_used,
             });
             write_json(&payload)?;
         }
@@ -1144,12 +1197,13 @@ async fn run_recipe_via_chrome_devtools_mcp(
             let payload = json!({
                 "type": "recipe_complete",
                 "backend": "chrome-devtools-mcp",
-                "response": response,
+                "response": response.response,
+                "model_used": response.model_used,
             });
             write_jsonl("browser.recipe", &payload)?;
         }
         OutputFormat::Text | OutputFormat::Markdown => {
-            println!("{response}");
+            println!("{}", response.response);
         }
     }
 
@@ -1493,175 +1547,207 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 !managed_profile_only,
             )?;
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
-            let dev_browser_cdp = resolved_cdp_target
-                .as_ref()
-                .map(|target| target.endpoint.clone());
             if let Some(ref cdp_url) = check_args.cdp {
-                browser::try_cdp_attach(cdp_url, "https://chatgpt.com/")
+                chrome_devtools_mcp::chatgpt::check_auth(Some(cdp_url))
+                    .await
                     .map_err(explicit_cdp_attach_failure)?;
                 maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
                 let payload = json!({
                     "status": "ok",
                     "method": format!("cdp: {cdp_url}"),
+                    "transport": "chrome-devtools-mcp",
                 });
                 return match format {
                     OutputFormat::Json => write_json(&payload),
                     OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
                     OutputFormat::Text | OutputFormat::Markdown => {
-                        println!("Browser authenticated via cdp: {cdp_url}");
+                        println!("Browser authenticated via cdp: {cdp_url} (chrome-devtools-mcp)");
                         Ok(())
                     }
                 };
-            }
-
-            // Try dev-browser first for auth verification whenever we are
-            // targeting a live Chrome instance. `--profile` still routes to the
-            // legacy managed-profile path.
-            if browser::use_dev_browser() && check_args.profile.is_none() {
-                match dev_browser::ensure_chatgpt_auth_with_page_check_and_endpoint(
-                    dev_browser_cdp.as_deref(),
-                ) {
-                    Ok(()) => {
-                        let method = if dev_browser_cdp.is_some() {
-                            "dev-browser (cdp)"
-                        } else {
-                            "dev-browser (auto-connect)"
-                        };
-                        let payload = json!({
-                            "status": "ok",
-                            "method": method,
-                            "backend": "dev-browser",
-                        });
-                        maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
-                        return match format {
-                            OutputFormat::Json => write_json(&payload),
-                            OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
-                            OutputFormat::Text | OutputFormat::Markdown => {
-                                println!("Browser authenticated via {method}");
-                                Ok(())
-                            }
-                        };
-                    }
-                    Err(e) => {
-                        if browser::is_chrome_approval_wait_error(&e) {
-                            return Err(e);
-                        }
-                        if resolved_cdp_target
-                            .as_ref()
-                            .is_some_and(browser::ResolvedCdpTarget::is_authoritative)
-                        {
-                            return Err(resolved_cdp_attach_failure(
-                                e.context("dev-browser auth check failed"),
-                                resolved_cdp_target.as_ref().expect("checked above"),
-                            ));
-                        }
-                        if resolved_cdp_target
-                            .as_ref()
-                            .is_some_and(browser::ResolvedCdpTarget::is_auto_discovered)
-                        {
-                            maybe_demote_auto_selected_cdp_target(
-                                &mut resolved_cdp_target,
-                                format,
-                                &e,
-                            );
-                        }
-                        eprintln!("info: dev-browser auth check failed ({e}), trying legacy path");
-                    }
-                }
             }
 
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.config, check_args.profile.as_ref())?;
-            if managed_profile_only {
-                let connection = browser::resolve_auth(&profile_dir, /* headed */ false)?;
-                let method = match &connection {
-                    browser::BrowserConnection::CookieState { .. } => "cookie_state".to_string(),
-                    browser::BrowserConnection::Profile { .. } => "profile".to_string(),
-                    browser::BrowserConnection::Cdp { endpoint } => format!("cdp: {endpoint}"),
-                    browser::BrowserConnection::AutoConnect => "auto_connect".to_string(),
-                };
-                let payload = json!({
-                    "status": "ok",
-                    "profile": profile_dir.to_string_lossy(),
-                    "method": method,
-                });
-                return match format {
-                    OutputFormat::Json => write_json(&payload),
-                    OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
-                    OutputFormat::Text | OutputFormat::Markdown => {
-                        println!("Browser authenticated via {method}");
-                        Ok(())
+            let transports =
+                browser_check_transports(browser::use_dev_browser(), managed_profile_only);
+
+            for transport in transports {
+                match transport {
+                    BrowserCheckTransport::ChromeDevtoolsMcp => {
+                        let cdp_endpoint = resolved_cdp_target
+                            .as_ref()
+                            .map(|target| target.endpoint.as_str());
+                        match chrome_devtools_mcp::chatgpt::check_auth(cdp_endpoint).await {
+                            Ok(()) => {
+                                maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
+                                let method =
+                                    browser_check_live_method(resolved_cdp_target.as_ref());
+                                let payload = json!({
+                                    "status": "ok",
+                                    "method": method,
+                                    "transport": browser_check_transport_name(transport),
+                                });
+                                return match format {
+                                    OutputFormat::Json => write_json(&payload),
+                                    OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
+                                    OutputFormat::Text | OutputFormat::Markdown => {
+                                        println!(
+                                            "Browser authenticated via {} ({})",
+                                            payload["method"].as_str().unwrap_or("auto_connect"),
+                                            browser_check_transport_name(transport)
+                                        );
+                                        Ok(())
+                                    }
+                                };
+                            }
+                            Err(e) => {
+                                if browser::is_chrome_approval_wait_error(&e) {
+                                    return Err(e);
+                                }
+                                if resolved_cdp_target
+                                    .as_ref()
+                                    .is_some_and(browser::ResolvedCdpTarget::is_authoritative)
+                                {
+                                    return Err(resolved_cdp_attach_failure(
+                                        e,
+                                        resolved_cdp_target.as_ref().expect("checked above"),
+                                    ));
+                                }
+                                if resolved_cdp_target
+                                    .as_ref()
+                                    .is_some_and(browser::ResolvedCdpTarget::is_auto_discovered)
+                                {
+                                    maybe_demote_auto_selected_cdp_target(
+                                        &mut resolved_cdp_target,
+                                        format,
+                                        &e,
+                                    );
+                                }
+                                eprintln!(
+                                    "info: {} auth check failed ({e}), trying next transport",
+                                    browser_check_transport_name(transport)
+                                );
+                            }
+                        }
                     }
-                };
+                    BrowserCheckTransport::DevBrowser => {
+                        let cdp_endpoint = resolved_cdp_target
+                            .as_ref()
+                            .map(|target| target.endpoint.as_str());
+                        match dev_browser::ensure_chatgpt_auth_with_page_check_and_endpoint(
+                            cdp_endpoint,
+                        ) {
+                            Ok(()) => {
+                                let payload = json!({
+                                    "status": "ok",
+                                    "method": if cdp_endpoint.is_some() {
+                                        "cdp"
+                                    } else {
+                                        "auto_connect"
+                                    },
+                                    "transport": browser_check_transport_name(transport),
+                                });
+                                maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
+                                return match format {
+                                    OutputFormat::Json => write_json(&payload),
+                                    OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
+                                    OutputFormat::Text | OutputFormat::Markdown => {
+                                        println!(
+                                            "Browser authenticated via {} ({})",
+                                            payload["method"].as_str().unwrap_or("auto_connect"),
+                                            browser_check_transport_name(transport)
+                                        );
+                                        Ok(())
+                                    }
+                                };
+                            }
+                            Err(e) => {
+                                if browser::is_chrome_approval_wait_error(&e) {
+                                    return Err(e);
+                                }
+                                if resolved_cdp_target
+                                    .as_ref()
+                                    .is_some_and(browser::ResolvedCdpTarget::is_authoritative)
+                                {
+                                    return Err(resolved_cdp_attach_failure(
+                                        e.context("dev-browser auth check failed"),
+                                        resolved_cdp_target.as_ref().expect("checked above"),
+                                    ));
+                                }
+                                if resolved_cdp_target
+                                    .as_ref()
+                                    .is_some_and(browser::ResolvedCdpTarget::is_auto_discovered)
+                                {
+                                    maybe_demote_auto_selected_cdp_target(
+                                        &mut resolved_cdp_target,
+                                        format,
+                                        &e,
+                                    );
+                                }
+                                eprintln!(
+                                    "info: {} auth check failed ({e}), trying next transport",
+                                    browser_check_transport_name(transport)
+                                );
+                            }
+                        }
+                    }
+                    BrowserCheckTransport::AgentBrowser => {
+                        let connection = if managed_profile_only {
+                            browser::resolve_auth(&profile_dir, /* headed */ false)?
+                        } else {
+                            let fallback_cdp = resolved_cdp_target
+                                .as_ref()
+                                .map(|target| target.endpoint.as_str());
+                            browser::resolve_browser_connection(
+                                &ctx.config,
+                                fallback_cdp.or(check_args.cdp.as_deref()),
+                                &profile_dir,
+                                "https://chatgpt.com/",
+                            )
+                            .map_err(|e| {
+                                if let Some(recovery) = default_daemon_recovery_error(Some(&e)) {
+                                    return recovery;
+                                }
+                                e
+                            })?
+                        };
+                        let method = match &connection {
+                            browser::BrowserConnection::Cdp { endpoint } => {
+                                format!("cdp: {endpoint}")
+                            }
+                            browser::BrowserConnection::AutoConnect => "auto_connect".to_string(),
+                            browser::BrowserConnection::CookieState { .. } => {
+                                "cookie_state".to_string()
+                            }
+                            browser::BrowserConnection::Profile { .. } => "profile".to_string(),
+                        };
+                        let payload = json!({
+                            "status": "ok",
+                            "profile": profile_dir.to_string_lossy(),
+                            "method": method,
+                            "transport": browser_check_transport_name(transport),
+                        });
+                        if matches!(connection, browser::BrowserConnection::Cdp { .. }) {
+                            maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
+                        }
+                        return match format {
+                            OutputFormat::Json => write_json(&payload),
+                            OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
+                            OutputFormat::Text | OutputFormat::Markdown => {
+                                println!(
+                                    "Browser authenticated via {} ({})",
+                                    payload["method"].as_str().unwrap_or("auto_connect"),
+                                    browser_check_transport_name(transport)
+                                );
+                                Ok(())
+                            }
+                        };
+                    }
+                }
             }
 
-            let connection = if let Some(target) = resolved_cdp_target.as_ref() {
-                match browser::try_cdp_attach(&target.endpoint, "https://chatgpt.com/") {
-                    Ok(()) => browser::BrowserConnection::Cdp {
-                        endpoint: target.endpoint.clone(),
-                    },
-                    Err(err) if target.is_authoritative() => {
-                        return Err(resolved_cdp_attach_failure(err, target));
-                    }
-                    Err(err) => {
-                        maybe_demote_auto_selected_cdp_target(
-                            &mut resolved_cdp_target,
-                            format,
-                            &err,
-                        );
-                        browser::resolve_browser_connection(
-                            &ctx.config,
-                            None,
-                            &profile_dir,
-                            "https://chatgpt.com/",
-                        )
-                        .map_err(|e| {
-                            if let Some(recovery) = default_daemon_recovery_error(Some(&e)) {
-                                return recovery;
-                            }
-                            e
-                        })?
-                    }
-                }
-            } else {
-                let fallback_cdp = resolved_cdp_target
-                    .as_ref()
-                    .map(|target| target.endpoint.as_str());
-                browser::resolve_browser_connection(
-                    &ctx.config,
-                    fallback_cdp.or(check_args.cdp.as_deref()),
-                    &profile_dir,
-                    "https://chatgpt.com/",
-                )
-                .map_err(|e| {
-                    if let Some(recovery) = default_daemon_recovery_error(Some(&e)) {
-                        return recovery;
-                    }
-                    e
-                })?
-            };
-            let method = match &connection {
-                browser::BrowserConnection::Cdp { endpoint } => format!("cdp: {endpoint}"),
-                browser::BrowserConnection::AutoConnect => "auto_connect".to_string(),
-                browser::BrowserConnection::CookieState { .. } => "cookie_state".to_string(),
-                browser::BrowserConnection::Profile { .. } => "profile".to_string(),
-            };
-            let payload = json!({
-                "status": "ok",
-                "profile": profile_dir.to_string_lossy(),
-                "method": method,
-            });
-            if matches!(connection, browser::BrowserConnection::Cdp { .. }) {
-                maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
-            }
-            match format {
-                OutputFormat::Json => write_json(&payload),
-                OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
-                OutputFormat::Text | OutputFormat::Markdown => {
-                    println!("Browser authenticated via {method}");
-                    Ok(())
-                }
-            }
+            unreachable!("browser check transport list must include a fallback transport")
         }
         BrowserCommand::Reset(_) => {
             let dev_browser_stopped = if browser::use_dev_browser() {
@@ -2446,6 +2532,18 @@ mod tests {
     }
 
     #[test]
+    fn recipe_should_stop_live_transport_fallback_on_thread_reuse_errors() {
+        let err = anyhow!(
+            "thread=reuse found multiple ChatGPT tabs but could not identify a unique active tab"
+        );
+        assert!(recipe_should_stop_live_transport_fallback(
+            &err,
+            None,
+            browser::RecipeTransport::ChromeDevtoolsMcp
+        ));
+    }
+
+    #[test]
     fn recipe_should_not_stop_live_transport_fallback_on_non_approval_error() {
         let err = anyhow!("chatgpt send button not found");
         assert!(!recipe_should_stop_live_transport_fallback(
@@ -2558,6 +2656,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn browser_check_prefers_cdp_before_other_transports() {
+        assert_eq!(
+            browser_check_transports(false, false),
+            vec![
+                BrowserCheckTransport::ChromeDevtoolsMcp,
+                BrowserCheckTransport::AgentBrowser,
+            ]
+        );
+        assert_eq!(
+            browser_check_transports(true, false),
+            vec![
+                BrowserCheckTransport::ChromeDevtoolsMcp,
+                BrowserCheckTransport::DevBrowser,
+                BrowserCheckTransport::AgentBrowser,
+            ]
+        );
+        assert_eq!(
+            browser_check_transports(true, true),
+            vec![BrowserCheckTransport::AgentBrowser]
+        );
+    }
+
+    #[test]
+    fn browser_check_live_method_uses_auto_connect_for_implicit_targets() {
+        assert_eq!(browser_check_live_method(None), "auto_connect");
+
+        let mut config = Config::default();
+        config.defaults.browser_cdp = Some("ws://127.0.0.1:9222/devtools/browser/config".into());
+        let configured = browser::resolve_cdp_target(None, &config)
+            .unwrap()
+            .expect("configured target");
+        assert_eq!(
+            browser_check_live_method(Some(&configured)),
+            "cdp: ws://127.0.0.1:9222/devtools/browser/config"
+        );
+    }
+
     #[tokio::test]
     async fn run_recipe_via_chrome_devtools_mcp_rejects_non_chatgpt_recipes() {
         // Until the claude/gemini ports land, non-chatgpt recipes through the
@@ -2657,6 +2793,31 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("--bundle"));
         assert!(msg.contains("paste mode"));
+    }
+
+    #[tokio::test]
+    async fn run_recipe_via_chrome_devtools_mcp_rejects_invalid_thread_mode() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::from([("thread".to_string(), "sideways".to_string())]);
+        let err = run_recipe_via_chrome_devtools_mcp(
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("thread"));
+        assert!(msg.contains("fresh"));
+        assert!(msg.contains("reuse"));
     }
 
     #[test]

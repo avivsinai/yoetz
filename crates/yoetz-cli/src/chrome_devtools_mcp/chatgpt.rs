@@ -17,8 +17,9 @@
 //!
 //! - No Playwright `connectOverCDP` hang in the live-attach path
 //! - No QuickJS sandbox — `evaluate_script` runs plain JS in the page
-//! - No SPA reset dance — `new_page` creates a fresh page so the thread
-//!   starts empty
+//! - `thread=fresh` can still use `new_page` for a blank conversation, while
+//!   `thread=reuse` reattaches to an existing ChatGPT tab instead of opening
+//!   another one
 //! - First-class `upload_file` replaces the macOS clipboard-paste hack
 //!
 //! The one place we use `chrome-devtools-mcp`'s uid model is `upload_file`:
@@ -39,7 +40,7 @@ use anyhow::{anyhow, Context, Result};
 use std::time::Duration;
 
 use super::client::CdpMcpClient;
-use super::DevtoolsMcpRecipeContext;
+use super::{DevtoolsMcpRecipeContext, RecipeThreadMode};
 
 const CHATGPT_URL: &str = "https://chatgpt.com/";
 
@@ -54,41 +55,8 @@ const POLL_INTERVAL_MS: u64 = 5_000;
 const STABLE_IDLE_CONSECUTIVE_POLLS: u32 = 12;
 const UPLOAD_INPUT_WAIT_MS: u64 = 5_000;
 const ATTACHMENT_VERIFY_WAIT_MS: u64 = 15_000;
-
-/// The full ChatGPT Pro recipe. Returns the assistant's final response text.
-pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<String> {
-    if ctx.bundle_path.is_none() {
-        return Err(anyhow!(
-            "ChatGPT recipe requires `--bundle`; this transport uploads a file attachment and does not support paste mode"
-        ));
-    }
-
-    // Step 0: attach directly to the user's running Chrome session.
-    // The Chrome "Allow remote debugging" dialog fires here, once per Chrome
-    // session. Every subsequent yoetz invocation in the same Chrome session
-    // should be silent.
-    if ctx.show_approval_guidance {
-        eprintln!(
-            "info: connecting to Chrome via chrome-devtools-mcp — if prompted, click Allow in Chrome's remote debugging dialog (one-time per Chrome session)"
-        );
-    }
-    let client = CdpMcpClient::connect_to_running_chrome(ctx.cdp_endpoint.as_deref())
-        .await
-        .map_err(cdp_attach_hint)?;
-
-    // Step 1: open a fresh chatgpt.com page. Fresh page = zero conversation
-    // history, no SPA reset dance needed.
-    client
-        .new_page(CHATGPT_URL, /* background */ false, 30_000)
-        .await
-        .context("chrome-devtools-mcp new_page on chatgpt.com")?;
-
-    // Step 2: wait for the composer to mount, then focus it. We use
-    // `evaluate_script` rather than the snapshot-uid model because ChatGPT's
-    // composer role + accessible name are locale-dependent and unreliable.
-    // `#prompt-textarea` has been stable since 2023 (per Agent Y research).
-    let wait_composer_js = r##"
-async () => {
+const WAIT_FOR_COMPOSER_JS: &str = r##"
+async (focusComposer = true) => {
   const deadline = Date.now() + 20000;
   const clip = (value, max = 240) =>
     String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
@@ -99,7 +67,7 @@ async () => {
     const bodyText = clip(document.body?.innerText || "");
     const haystack = `${title} ${bodyText}`.toLowerCase();
     if (composer) {
-      composer.focus();
+      if (focusComposer) composer.focus();
       return { status: "ready", url, title, bodyText };
     }
     if (/cloudflare|checking your browser|attention required|security check|just a moment|verify you are human|cf-chl/i.test(haystack)) {
@@ -127,54 +95,57 @@ async () => {
   return state;
 }
 "##;
-    let composer_state = client
-        .evaluate_script(wait_composer_js, vec![])
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ChatgptRunResult {
+    pub response: String,
+    pub model_used: Option<String>,
+}
+
+/// The full ChatGPT Pro recipe. Returns the assistant's final response text.
+pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ChatgptRunResult> {
+    if ctx.bundle_path.is_none() {
+        return Err(anyhow!(
+            "ChatGPT recipe requires `--bundle`; this transport uploads a file attachment and does not support paste mode"
+        ));
+    }
+
+    // Step 0: attach directly to the user's running Chrome session.
+    // The Chrome "Allow remote debugging" dialog fires here, once per Chrome
+    // session. Every subsequent yoetz invocation in the same Chrome session
+    // should be silent.
+    if ctx.show_approval_guidance {
+        eprintln!(
+            "info: connecting to Chrome via chrome-devtools-mcp — if prompted, click Allow in Chrome's remote debugging dialog (one-time per Chrome session)"
+        );
+    }
+    let client = CdpMcpClient::connect_to_running_chrome(ctx.cdp_endpoint.as_deref())
         .await
-        .context("evaluate_script wait-for-composer")?;
-    match composer_state
-        .get("status")
-        .and_then(serde_json::Value::as_str)
-    {
-        Some("ready") => {}
-        Some("challenge") => {
-            return Err(anyhow!(
-                "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again. {}",
-                format_page_probe_summary(&composer_state)
-            ));
+        .map_err(cdp_attach_hint)?;
+
+    // Step 1: either start a fresh conversation or reuse the user's current
+    // ChatGPT tab, depending on the documented `thread` recipe variable.
+    match ctx.thread_mode {
+        RecipeThreadMode::Fresh => {
+            client
+                .new_page(CHATGPT_URL, /* background */ false, 30_000)
+                .await
+                .context("chrome-devtools-mcp new_page on chatgpt.com")?;
         }
-        Some("login") => {
-            return Err(anyhow!(
-                "chatgpt login required in the attached Chrome session. Log in there and try again. {}",
-                format_page_probe_summary(&composer_state)
-            ));
-        }
-        _ => {
-            let detail = match classify_live_chatgpt_page_issue(
-                composer_state
-                    .get("url")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-                composer_state
-                    .get("title")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-                composer_state
-                    .get("bodyText")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            ) {
-                Some(issue) => issue.to_string(),
-                None => {
-                    "ChatGPT composer did not mount within 20s — page may not have loaded correctly"
-                        .to_string()
-                }
-            };
-            return Err(anyhow!(
-                "{detail}. {}",
-                format_page_probe_summary(&composer_state)
-            ));
+        RecipeThreadMode::Reuse => {
+            client
+                .reuse_chatgpt_page(30_000)
+                .await
+                .context("chrome-devtools-mcp select existing ChatGPT tab")?;
         }
     }
+
+    // Step 2: wait for the composer to mount, then select the best model the
+    // user can actually access. When `model` is `auto` or empty, prefer the
+    // strongest available Pro/GPT-5 option and fall back to the current model
+    // if the selector UI is unavailable.
+    wait_for_composer_ready(&client, /* focus_composer */ true).await?;
+    let model_used = maybe_select_model(&client, &ctx.model).await?;
 
     // Step 3: upload the bundle if we have a path.
     //
@@ -263,7 +234,270 @@ async () => {
         .await
         .context("stable-idle polling for ChatGPT response")?;
 
-    Ok(response_text)
+    Ok(ChatgptRunResult {
+        response: response_text,
+        model_used,
+    })
+}
+
+pub async fn check_auth(cdp_endpoint: Option<&str>) -> Result<()> {
+    let client = CdpMcpClient::connect_to_running_chrome(cdp_endpoint)
+        .await
+        .map_err(cdp_attach_hint)?;
+    let used_probe_page = client
+        .select_chatgpt_page_for_probe(30_000)
+        .await
+        .context("select existing ChatGPT page for auth probe")?
+        .is_none();
+    if used_probe_page {
+        client
+            .new_page(CHATGPT_URL, /* background */ true, 30_000)
+            .await
+            .context("chrome-devtools-mcp new_page on chatgpt.com")?;
+    }
+    let result = wait_for_composer_ready(&client, /* focus_composer */ false).await;
+    if used_probe_page {
+        let _ = client.close_selected_page(true);
+    }
+    result
+}
+
+async fn wait_for_composer_ready(client: &CdpMcpClient, focus_composer: bool) -> Result<()> {
+    let composer_state = client
+        .evaluate_script(
+            WAIT_FOR_COMPOSER_JS,
+            vec![serde_json::Value::Bool(focus_composer)],
+        )
+        .await
+        .context("evaluate_script wait-for-composer")?;
+    match composer_state
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some("ready") => Ok(()),
+        Some("challenge") => Err(anyhow!(
+            "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again. {}",
+            format_page_probe_summary(&composer_state)
+        )),
+        Some("login") => Err(anyhow!(
+            "chatgpt login required in the attached Chrome session. Log in there and try again. {}",
+            format_page_probe_summary(&composer_state)
+        )),
+        _ => {
+            let detail = match classify_live_chatgpt_page_issue(
+                composer_state
+                    .get("url")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                composer_state
+                    .get("title")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+                composer_state
+                    .get("bodyText")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default(),
+            ) {
+                Some(issue) => issue.to_string(),
+                None => {
+                    "ChatGPT composer did not mount within 20s — page may not have loaded correctly"
+                        .to_string()
+                }
+            };
+            Err(anyhow!(
+                "{detail}. {}",
+                format_page_probe_summary(&composer_state)
+            ))
+        }
+    }
+}
+
+async fn maybe_select_model(
+    client: &CdpMcpClient,
+    requested_model: &str,
+) -> Result<Option<String>> {
+    let script = build_model_selection_script(requested_model);
+    let selection = client
+        .evaluate_script(&script, vec![])
+        .await
+        .context("evaluate_script select model")?;
+    let status = selection
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let model_used = selection
+        .get("modelUsed")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    match status {
+        "selected" | "already-selected" | "kept-current" | "kept-current-no-selector" => {
+            Ok(model_used)
+        }
+        "missing-selector" => Err(anyhow!(
+            "ChatGPT model selector button not found. {}",
+            format_page_probe_summary(&selection)
+        )),
+        "not-found" => {
+            let requested = selection
+                .get("requested")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(requested_model);
+            Err(anyhow!(
+                "requested ChatGPT model `{requested}` was not available in the current session. {}",
+                format_page_probe_summary(&selection)
+            ))
+        }
+        other => Err(anyhow!(
+            "unexpected ChatGPT model selection status `{other}`"
+        )),
+    }
+}
+
+fn build_model_selection_script(requested_model: &str) -> String {
+    let requested_model =
+        serde_json::to_string(requested_model).expect("serialize requested model");
+    format!(
+        r##"
+async () => {{
+  const requested = {requested_model};
+  const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const toHaystack = (value) => normalize(value).toLowerCase();
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const realClick = (el) => {{
+    el.dispatchEvent(new PointerEvent("pointerdown", {{ bubbles: true, cancelable: true, pointerId: 1 }}));
+    el.dispatchEvent(new MouseEvent("mousedown", {{ bubbles: true, cancelable: true }}));
+    el.dispatchEvent(new PointerEvent("pointerup", {{ bubbles: true, cancelable: true, pointerId: 1 }}));
+    el.dispatchEvent(new MouseEvent("mouseup", {{ bubbles: true, cancelable: true }}));
+    el.dispatchEvent(new MouseEvent("click", {{ bubbles: true, cancelable: true }}));
+  }};
+  const selectorButton = document.querySelector(
+    "[data-testid='model-switcher-dropdown-button'], button[aria-label='Model selector'], button[aria-label='Model selector menu']"
+  );
+  const currentLabel = normalize(
+    selectorButton?.querySelector?.("[data-testid='selected-model'], [data-testid='model-switcher-selected-model']")?.textContent ||
+    selectorButton?.innerText ||
+    selectorButton?.textContent ||
+    selectorButton?.getAttribute?.("aria-label") ||
+    ""
+  );
+  const responseBase = {{
+    requested,
+    currentLabel,
+    url: window.location.href || "",
+    title: document.title || "",
+    bodyText: normalize(document.body?.innerText || "").slice(0, 240),
+  }};
+  const requestedTrimmed = normalize(requested);
+  const requestedLower = requestedTrimmed.toLowerCase();
+  const autoMode = !requestedTrimmed || requestedLower === "auto";
+
+  if (!selectorButton) {{
+    return {{
+      ...responseBase,
+      status: autoMode ? "kept-current-no-selector" : "missing-selector",
+      modelUsed: currentLabel || null,
+    }};
+  }}
+
+  const readItems = () => Array.from(document.querySelectorAll("[role='menuitem'], [data-testid^='model-switcher-']"))
+    .map((el) => {{
+      const text = normalize(el.innerText || el.textContent || el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "");
+      const testId = normalize(el.getAttribute?.("data-testid") || "");
+      const haystack = `${{testId}} ${{text}}`.toLowerCase();
+      return {{ el, text, testId, haystack }};
+    }})
+    .filter((item) => item.text || item.testId);
+
+  let items = readItems();
+  if (items.length === 0) {{
+    realClick(selectorButton);
+    await wait(350);
+    items = readItems();
+  }}
+
+  if (items.length === 0) {{
+    return {{
+      ...responseBase,
+      status: autoMode ? "kept-current" : "not-found",
+      modelUsed: currentLabel || null,
+    }};
+  }}
+
+  const requestedNeedles = (() => {{
+    if (autoMode) return [];
+    const needles = new Set([requestedLower]);
+    if (requestedLower.includes("gpt-5")) {{
+      needles.add("gpt-5");
+      needles.add("gpt 5");
+    }}
+    if (requestedLower.includes("pro")) needles.add("pro");
+    if (requestedLower.includes("thinking")) needles.add("thinking");
+    if (requestedLower.includes("instant") || requestedLower.includes("5-3")) {{
+      needles.add("instant");
+      needles.add("5-3");
+    }}
+    return Array.from(needles);
+  }})();
+
+  const score = (haystack) => {{
+    let total = 0;
+    if (/gpt[- ]?5/.test(haystack)) total += 100;
+    if (/\bpro\b/.test(haystack)) total += 90;
+    if (/thinking/.test(haystack)) total += 60;
+    if (/instant/.test(haystack) || /\b5[- ]?3\b/.test(haystack)) total += 30;
+    return total;
+  }};
+
+  let target = null;
+  if (autoMode) {{
+    target = items
+      .map((item) => ({{ ...item, score: score(item.haystack) }}))
+      .sort((left, right) => right.score - left.score || right.text.length - left.text.length)[0];
+    if (!target || target.score <= 0) {{
+      return {{
+        ...responseBase,
+        status: "kept-current",
+        modelUsed: currentLabel || null,
+      }};
+    }}
+  }} else {{
+    target =
+      items.find((item) => item.testId.toLowerCase() === `model-switcher-${{requestedLower}}`) ||
+      items.find((item) => requestedNeedles.some((needle) => item.haystack.includes(needle))) ||
+      null;
+    if (!target) {{
+      return {{
+        ...responseBase,
+        status: "not-found",
+        modelUsed: currentLabel || null,
+      }};
+    }}
+  }}
+
+  const targetNeedles = autoMode
+    ? [target.haystack]
+    : requestedNeedles;
+  const currentHaystack = toHaystack(currentLabel);
+  if (currentHaystack && targetNeedles.some((needle) => needle && currentHaystack.includes(needle))) {{
+    return {{
+      ...responseBase,
+      status: "already-selected",
+      modelUsed: target.text || currentLabel || requestedTrimmed || null,
+    }};
+  }}
+
+  realClick(target.el);
+  await wait(300);
+  return {{
+    ...responseBase,
+    status: "selected",
+    modelUsed: target.text || requestedTrimmed || currentLabel || null,
+  }};
+}}
+"##,
+    )
 }
 
 /// Rewrite a CDP attach failure with actionable guidance.
@@ -944,5 +1178,18 @@ mod tests {
         assert!(is_closed_cdp_transport_error(&err));
         let other = anyhow!("timed out waiting for ChatGPT response");
         assert!(!is_closed_cdp_transport_error(&other));
+    }
+
+    #[test]
+    fn model_selection_script_supports_auto_and_explicit_modes() {
+        let auto_script = build_model_selection_script("auto");
+        assert!(auto_script.contains(r#"const requested = "auto";"#));
+        assert!(auto_script.contains(r#"/gpt[- ]?5/"#));
+        assert!(auto_script.contains(r#""kept-current-no-selector""#));
+
+        let explicit_script = build_model_selection_script("gpt-5-4-pro");
+        assert!(explicit_script.contains(r#"const requested = "gpt-5-4-pro";"#));
+        assert!(explicit_script.contains("requestedNeedles"));
+        assert!(explicit_script.contains("model-switcher-${requestedLower}"));
     }
 }

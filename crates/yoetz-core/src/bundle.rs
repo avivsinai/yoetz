@@ -1,5 +1,5 @@
 use crate::types::{Bundle, BundleFile, BundleStats};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use ignore::overrides::OverrideBuilder;
 use ignore::WalkBuilder;
 use sha2::{Digest, Sha256};
@@ -16,6 +16,7 @@ pub struct BundleOptions {
     pub exclude: Vec<String>,
     pub max_file_bytes: usize,
     pub max_total_bytes: usize,
+    pub include_all: bool,
     pub include_hidden: bool,
     pub include_binary: bool,
 }
@@ -28,6 +29,7 @@ impl Default for BundleOptions {
             exclude: Vec::new(),
             max_file_bytes: 200_000,
             max_total_bytes: 5_000_000,
+            include_all: false,
             include_hidden: false,
             include_binary: false,
         }
@@ -115,13 +117,36 @@ fn process_file(
 pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
     // Partition include patterns: absolute literal paths are read directly;
     // everything else (relative paths, globs) goes through the directory walker.
-    let mut direct_files: Vec<PathBuf> = Vec::new();
+    let mut direct_files: Vec<(PathBuf, String)> = Vec::new();
     let mut glob_patterns: Vec<String> = Vec::new();
 
     for pattern in &options.include {
         let expanded = expand_tilde(pattern);
-        if Path::new(&expanded).is_absolute() && !has_glob_chars(&expanded) {
-            direct_files.push(PathBuf::from(expanded));
+        if !has_glob_chars(&expanded) {
+            let display_path = expanded.clone();
+            let resolved_path = if Path::new(&expanded).is_absolute() {
+                PathBuf::from(&expanded)
+            } else {
+                options.root.join(&expanded)
+            };
+            if resolved_path.is_file() {
+                direct_files.push((resolved_path, display_path));
+                continue;
+            }
+            if resolved_path.is_dir() {
+                let normalized = expanded.trim_end_matches('/');
+                glob_patterns.push(format!("{normalized}/**/*"));
+                continue;
+            }
+            if expanded.contains(',') {
+                return Err(anyhow!(
+                    "comma-separated file lists are not supported in `-f/--files`; repeat the flag instead (for example: `-f first -f second`)"
+                ));
+            }
+            return Err(anyhow!(
+                "-f path not found or not a file: {}",
+                Path::new(&display_path).display()
+            ));
         } else {
             glob_patterns.push(expanded);
         }
@@ -135,9 +160,9 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
     let mut total_chars = 0usize;
 
     // 1. Read directly-specified absolute files.
-    for file_path in &direct_files {
+    for (file_path, display_path) in &direct_files {
         if !file_path.is_file() {
-            return Err(anyhow::anyhow!(
+            return Err(anyhow!(
                 "-f path not found or not a file: {}",
                 file_path.display()
             ));
@@ -147,10 +172,9 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
         if !seen_files.insert(identity) {
             continue;
         }
-        let display_path = file_path.to_string_lossy().to_string();
         let (bf, consumed_bytes, consumed_chars) = process_file(
             file_path,
-            display_path,
+            display_path.clone(),
             options.max_file_bytes,
             options.max_total_bytes,
             total_bytes,
@@ -163,7 +187,7 @@ pub fn build_bundle(prompt: &str, options: BundleOptions) -> Result<Bundle> {
 
     // 2. Walk the directory tree for glob / relative patterns.
     //    Also walk when include was empty (the "walk everything" case, e.g. --all).
-    if !glob_patterns.is_empty() || options.include.is_empty() {
+    if !glob_patterns.is_empty() || options.include_all {
         let mut override_builder = OverrideBuilder::new(&options.root);
         for pattern in &glob_patterns {
             override_builder.add(pattern)?;
@@ -457,6 +481,7 @@ mod tests {
         let options = BundleOptions {
             root: root.clone(),
             include: vec![], // --all mode: no include patterns
+            include_all: true,
             ..BundleOptions::default()
         };
 
@@ -519,6 +544,89 @@ mod tests {
             bundle.stats.estimated_tokens,
             estimate_tokens("🙂".chars().count() + "a🙂b".chars().count())
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bundle_includes_explicit_relative_ignored_file() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yoetz_ignored_literal_{nanos}"));
+        let tmp_dir = root.join("tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        fs::write(root.join(".gitignore"), "tmp/\n").unwrap();
+        fs::write(tmp_dir.join("dossier.md"), "generated review dossier").unwrap();
+
+        let bundle = build_bundle(
+            "prompt",
+            BundleOptions {
+                root: root.clone(),
+                include: vec!["tmp/dossier.md".to_string()],
+                ..BundleOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(bundle.files.len(), 1);
+        assert_eq!(bundle.files[0].path, "tmp/dossier.md");
+        assert_eq!(
+            bundle.files[0].content.as_deref(),
+            Some("generated review dossier")
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bundle_errors_on_comma_separated_file_list() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yoetz_comma_files_{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        fs::write(root.join("b.txt"), "b").unwrap();
+
+        let err = build_bundle(
+            "prompt",
+            BundleOptions {
+                root: root.clone(),
+                include: vec!["a.txt,b.txt".to_string()],
+                ..BundleOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("comma-separated file lists"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn bundle_allows_prompt_only_without_walking_repo() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yoetz_prompt_only_{nanos}"));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a.txt"), "aaa").unwrap();
+
+        let bundle = build_bundle(
+            "prompt only",
+            BundleOptions {
+                root: root.clone(),
+                ..BundleOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert!(bundle.files.is_empty());
+        assert_eq!(bundle.stats.file_count, 0);
 
         let _ = fs::remove_dir_all(&root);
     }
