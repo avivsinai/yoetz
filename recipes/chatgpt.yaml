@@ -13,7 +13,8 @@ name: chatgpt
 # transports connect directly to Chrome via CDP.
 #
 # Variables:
-#   model    — model slug (e.g., "gpt-5-4-pro"). Omit to keep current.
+#   model    — model slug (e.g., "gpt-5-4-pro"). Default: "auto" selects the
+#              best available model, preferring GPT-5/Pro when the account has it.
 #   extended — set to "false" to disable Extended Pro. Default: leave as-is.
 #   prompt   — prompt text to send with the attachment.
 #   thread   — "fresh" (default) opens a new ChatGPT conversation each call.
@@ -31,7 +32,7 @@ transports:
 
 defaults:
   prompt: Review the attached file and provide your analysis.
-  model: ""
+  model: "auto"
   extended: ""
   thread: "fresh"
   wait_timeout_ms: "1800000"
@@ -87,28 +88,31 @@ steps:
     args:
       - |
         (() => {
-          const raw = "{{model}}";
-          if (!raw) return "skipped: no model specified";
+          const raw = "{{model}}".trim();
+          const autoMode = !raw || raw.toLowerCase() === "auto";
           const btn = document.querySelector(
             '[data-testid="model-switcher-dropdown-button"], ' +
             'button[aria-label="Model selector"]'
           );
-          if (!btn) throw new Error("model selector button not found — ChatGPT may have changed their UI. Inspect the model picker for data-testid or aria-label attributes.");
+          if (!btn) {
+            if (autoMode) return "kept current model: selector not found";
+            throw new Error("model selector button not found — ChatGPT may have changed their UI. Inspect the model picker for data-testid or aria-label attributes.");
+          }
           btn.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true, pointerId: 1}));
           btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
           btn.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, cancelable: true, pointerId: 1}));
           btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
           btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-          return "opened model selector";
+          return autoMode ? "opened model selector for auto selection" : "opened model selector";
         })()
   - sleep_ms: 1200
   - action: eval
     args:
       - |
         (() => {
-          const raw = "{{model}}";
-          if (!raw) return "skipped: no model specified";
+          const raw = "{{model}}".trim();
           const slug = raw.toLowerCase();
+          const autoMode = !slug || slug === "auto";
           function realClick(el) {
             el.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true, pointerId: 1}));
             el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
@@ -116,13 +120,49 @@ steps:
             el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
             el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
           }
-          const byTestId = document.querySelector('[data-testid="model-switcher-' + slug + '"]');
-          if (byTestId) { realClick(byTestId); return "selected: " + slug; }
+          const items = Array.from(document.querySelectorAll('[role="menuitem"], [data-testid^="model-switcher-"]'))
+            .map((el) => {
+              const text = ((el.textContent || '').replace(/\s+/g, ' ').trim());
+              const testId = el.getAttribute('data-testid') || '';
+              return {el, text, haystack: (testId + ' ' + text).toLowerCase()};
+            })
+            .filter((item) => item.text || item.haystack);
+          if (items.length === 0) {
+            if (autoMode) return "kept current model: no menu items";
+            throw new Error("model selector opened but no model options were visible");
+          }
+          const currentLabel = (((document.querySelector('[data-testid="model-switcher-dropdown-button"], button[aria-label="Model selector"]') || {}).textContent) || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+          if (autoMode) {
+            const ranked = items
+              .map((item) => {
+                let score = 0;
+                if (/gpt[- ]?5/.test(item.haystack)) score += 100;
+                if (/\bpro\b/.test(item.haystack)) score += 90;
+                if (/thinking/.test(item.haystack)) score += 60;
+                if (/instant/.test(item.haystack) || /\b5[- ]?3\b/.test(item.haystack)) score += 30;
+                return {...item, score};
+              })
+              .sort((a, b) => b.score - a.score || b.text.length - a.text.length);
+            if (!ranked[0] || ranked[0].score <= 0) return "kept current model";
+            if (currentLabel && currentLabel.includes(ranked[0].text.toLowerCase())) {
+              return "kept current model: " + ranked[0].text;
+            }
+            realClick(ranked[0].el);
+            return "selected: " + ranked[0].text;
+          }
           const names = {"gpt-5-4-pro":"pro","gpt-5-4-thinking":"thinking","gpt-5-3":"instant","pro":"pro","thinking":"thinking","instant":"instant"};
           const target = names[slug] || slug;
-          const items = Array.from(document.querySelectorAll('[role="menuitem"]'));
-          const match = items.find(el => (el.textContent||"").trim().toLowerCase().includes(target));
-          if (match) { realClick(match); return "selected: " + target; }
+          const byTestId = document.querySelector('[data-testid="model-switcher-' + slug + '"]');
+          if (byTestId) { realClick(byTestId); return "selected: " + slug; }
+          const match = items.find(item => item.haystack.includes(target));
+          if (match) {
+            if (currentLabel && currentLabel.includes(target)) return "kept current model: " + match.text;
+            realClick(match.el);
+            return "selected: " + match.text;
+          }
           throw new Error("model '" + slug + "' not found");
         })()
   - sleep_ms: 500
@@ -191,7 +231,15 @@ steps:
         (() => {
           const btn = document.querySelector("button[data-testid='send-button']");
           if (!btn) throw new Error("send button not found");
-          if (btn.disabled) throw new Error("send button disabled — text may not have been injected");
+          if (btn.disabled) {
+            const composerEl = document.querySelector("#prompt-textarea, [role='textbox']");
+            const state = {
+              url: window.location.href,
+              attachmentPresent: !!document.querySelector("[class*='file-tile'], [data-testid*='attachment']"),
+              composerTextLength: ((composerEl?.innerText || composerEl?.textContent || "").trim()).length,
+            };
+            throw new Error("send button disabled — page is likely recoverable: " + JSON.stringify(state));
+          }
           btn.click();
           return "sent";
         })()

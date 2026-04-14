@@ -37,6 +37,12 @@ pub struct NewPageResult {
 }
 
 #[derive(Debug, Clone)]
+pub struct ReusedPageResult {
+    pub page_id: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct NavigateResult {
     pub url: String,
 }
@@ -173,6 +179,39 @@ impl CdpMcpClient {
         })
     }
 
+    pub async fn reuse_chatgpt_page(&self, timeout_ms: u64) -> Result<ReusedPageResult> {
+        let candidates = self.chatgpt_tabs();
+        let tab = select_chatgpt_reuse_tab(candidates, timeout_ms)?;
+        configure_tab_timeout(&tab, timeout_ms);
+        let _ = tab.activate();
+        let _ = tab.bring_to_front();
+        self.set_selected_tab(tab.clone());
+
+        Ok(ReusedPageResult {
+            page_id: tab.get_target_id().to_string(),
+            url: tab.get_url(),
+        })
+    }
+
+    pub async fn select_chatgpt_page_for_probe(
+        &self,
+        timeout_ms: u64,
+    ) -> Result<Option<ReusedPageResult>> {
+        let candidates = self.chatgpt_tabs();
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+
+        let tab = select_chatgpt_probe_tab(candidates, timeout_ms);
+        configure_tab_timeout(&tab, timeout_ms);
+        self.set_selected_tab(tab.clone());
+
+        Ok(Some(ReusedPageResult {
+            page_id: tab.get_target_id().to_string(),
+            url: tab.get_url(),
+        }))
+    }
+
     pub async fn navigate_page(&self, url: &str, timeout_ms: u64) -> Result<NavigateResult> {
         let tab = self.selected_tab()?;
         configure_tab_timeout(&tab, timeout_ms);
@@ -293,6 +332,13 @@ impl CdpMcpClient {
         Ok(response.get("value").cloned().unwrap_or(Value::Null))
     }
 
+    pub fn close_selected_page(&self, fire_unload: bool) -> Result<()> {
+        let tab = self.selected_tab()?;
+        tab.close(fire_unload)
+            .context("closing selected Chrome page failed")?;
+        Ok(())
+    }
+
     fn set_selected_tab(&self, tab: Arc<Tab>) {
         let mut guard = self.selected_tab.lock().unwrap();
         *guard = Some(tab);
@@ -305,6 +351,18 @@ impl CdpMcpClient {
             .as_ref()
             .cloned()
             .context("no Chrome page is currently selected; call `new_page` first")
+    }
+
+    fn chatgpt_tabs(&self) -> Vec<Arc<Tab>> {
+        self.browser.register_missing_tabs();
+        self.browser
+            .get_tabs()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|tab| is_chatgpt_url(&tab.get_url()))
+            .cloned()
+            .collect::<Vec<_>>()
     }
 }
 
@@ -376,6 +434,180 @@ fn configure_tab_timeout(tab: &Arc<Tab>, timeout_ms: u64) {
     tab.set_default_timeout(Duration::from_millis(timeout_ms.max(1)));
 }
 
+fn select_chatgpt_reuse_tab(candidates: Vec<Arc<Tab>>, timeout_ms: u64) -> Result<Arc<Tab>> {
+    match candidates.len() {
+        0 => bail!("thread=reuse requires an existing ChatGPT tab, but none are currently open"),
+        1 => Ok(candidates.into_iter().next().expect("single candidate")),
+        _ => {
+            let probes = candidates
+                .iter()
+                .map(|tab| probe_chatgpt_tab(tab, timeout_ms))
+                .collect::<Vec<_>>();
+            let index = choose_chatgpt_reuse_probe(&probes)?;
+            Ok(candidates
+                .into_iter()
+                .nth(index)
+                .expect("chosen probe index should map to a candidate"))
+        }
+    }
+}
+
+fn select_chatgpt_probe_tab(candidates: Vec<Arc<Tab>>, timeout_ms: u64) -> Arc<Tab> {
+    if candidates.len() == 1 {
+        return candidates.into_iter().next().expect("single candidate");
+    }
+
+    let probes = candidates
+        .iter()
+        .map(|tab| probe_chatgpt_tab(tab, timeout_ms))
+        .collect::<Vec<_>>();
+    let index = choose_chatgpt_probe_index(&probes);
+    candidates
+        .into_iter()
+        .nth(index)
+        .expect("chosen probe index should map to a candidate")
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ChatgptTabProbe {
+    url: String,
+    visible: bool,
+    has_focus: bool,
+    is_generating: bool,
+}
+
+fn choose_chatgpt_reuse_probe(probes: &[ChatgptTabProbe]) -> Result<usize> {
+    if probes.is_empty() {
+        bail!("no ChatGPT tabs were available for reuse");
+    }
+
+    let available = probes
+        .iter()
+        .enumerate()
+        .filter(|(_, probe)| !probe.is_generating)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if available.is_empty() {
+        bail!(
+            "thread=reuse found ChatGPT tabs, but all of them are still generating. \
+             Wait for the current run to finish or use `--var thread=fresh`."
+        );
+    }
+
+    let focused = probes
+        .iter()
+        .enumerate()
+        .filter(|(index, probe)| probe.has_focus && available.contains(index))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if focused.len() == 1 {
+        return Ok(focused[0]);
+    }
+
+    let visible = probes
+        .iter()
+        .enumerate()
+        .filter(|(index, probe)| probe.visible && available.contains(index))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if visible.len() == 1 {
+        return Ok(visible[0]);
+    }
+
+    if available.len() == 1 {
+        return Ok(available[0]);
+    }
+
+    let rendered = probes
+        .iter()
+        .enumerate()
+        .map(|(index, probe)| {
+            format!(
+                "#{index}: visible={}, focus={}, generating={}, url={}",
+                probe.visible, probe.has_focus, probe.is_generating, probe.url
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    bail!(
+        "thread=reuse found multiple ChatGPT tabs but could not identify a unique active tab. \
+         Keep only one ChatGPT tab visible or use `--var thread=fresh`. Candidates: {rendered}"
+    );
+}
+
+fn choose_chatgpt_probe_index(probes: &[ChatgptTabProbe]) -> usize {
+    let focused = probes
+        .iter()
+        .enumerate()
+        .filter(|(_, probe)| probe.has_focus)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if focused.len() == 1 {
+        return focused[0];
+    }
+
+    let visible = probes
+        .iter()
+        .enumerate()
+        .filter(|(_, probe)| probe.visible)
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if visible.len() == 1 {
+        return visible[0];
+    }
+
+    0
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ChatgptTabProbePayload {
+    #[serde(default)]
+    url: String,
+    #[serde(default)]
+    visible: bool,
+    #[serde(default)]
+    has_focus: bool,
+    #[serde(default)]
+    is_generating: bool,
+}
+
+fn probe_chatgpt_tab(tab: &Arc<Tab>, timeout_ms: u64) -> ChatgptTabProbe {
+    configure_tab_timeout(tab, timeout_ms);
+    let fallback = ChatgptTabProbe {
+        url: tab.get_url(),
+        visible: false,
+        has_focus: false,
+        is_generating: false,
+    };
+    let payload = evaluate_json_payload(
+        tab,
+        r#"(() => JSON.stringify({
+  url: window.location.href || "",
+  visible: document.visibilityState === "visible",
+  has_focus: typeof document.hasFocus === "function" ? !!document.hasFocus() : false,
+  is_generating:
+    !!document.querySelector("[data-message-author-role='assistant'].result-streaming, .result-streaming") ||
+    !!document.querySelector("[data-testid='stop-button'], button[aria-label*='Stop']")
+}))()"#,
+        false,
+    )
+    .ok()
+    .and_then(|value| serde_json::from_value::<ChatgptTabProbePayload>(value).ok());
+
+    payload
+        .map(|payload| ChatgptTabProbe {
+            url: if payload.url.is_empty() {
+                fallback.url.clone()
+            } else {
+                payload.url
+            },
+            visible: payload.visible,
+            has_focus: payload.has_focus,
+            is_generating: payload.is_generating,
+        })
+        .unwrap_or(fallback)
+}
+
 fn inject_files_on_input(
     tab: &Arc<Tab>,
     input: &Element<'_>,
@@ -413,18 +645,23 @@ fn resolve_browser_websocket(parsed: &Url) -> Result<String> {
 
 fn resolve_browser_websocket_via_json_version(endpoint: &Url) -> Result<String> {
     let version_url = browser_version_url(endpoint)?;
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .context("building /json/version HTTP client failed")?;
-    let payload = client
-        .get(version_url.clone())
-        .send()
-        .with_context(|| format!("requesting `{version_url}` failed"))?
-        .error_for_status()
-        .with_context(|| format!("Chrome rejected `{version_url}`"))?
-        .json::<Value>()
-        .with_context(|| format!("parsing `{version_url}` as JSON failed"))?;
+    let version_url_for_thread = version_url.clone();
+    let payload = std::thread::spawn(move || -> Result<Value> {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .context("building /json/version HTTP client failed")?;
+        client
+            .get(version_url_for_thread.clone())
+            .send()
+            .with_context(|| format!("requesting `{version_url_for_thread}` failed"))?
+            .error_for_status()
+            .with_context(|| format!("Chrome rejected `{version_url_for_thread}`"))?
+            .json::<Value>()
+            .with_context(|| format!("parsing `{version_url_for_thread}` as JSON failed"))
+    })
+    .join()
+    .map_err(|_| anyhow!("requesting `{version_url}` panicked"))??;
 
     browser_websocket_from_json_version_payload(&payload)
         .with_context(|| format!("`{version_url}` did not expose a valid browser websocket URL"))
@@ -1099,6 +1336,149 @@ mod tests {
                 ]
             }),
         }
+    }
+
+    #[test]
+    fn choose_chatgpt_reuse_probe_prefers_unique_focus() {
+        let probes = vec![
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/old".to_string(),
+                visible: false,
+                has_focus: false,
+                is_generating: false,
+            },
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/current".to_string(),
+                visible: true,
+                has_focus: true,
+                is_generating: false,
+            },
+        ];
+
+        assert_eq!(choose_chatgpt_reuse_probe(&probes).unwrap(), 1);
+    }
+
+    #[test]
+    fn choose_chatgpt_reuse_probe_prefers_unique_visible_when_focus_missing() {
+        let probes = vec![
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/old".to_string(),
+                visible: false,
+                has_focus: false,
+                is_generating: false,
+            },
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/current".to_string(),
+                visible: true,
+                has_focus: false,
+                is_generating: false,
+            },
+        ];
+
+        assert_eq!(choose_chatgpt_reuse_probe(&probes).unwrap(), 1);
+    }
+
+    #[test]
+    fn choose_chatgpt_reuse_probe_rejects_ambiguous_tabs() {
+        let probes = vec![
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/1".to_string(),
+                visible: false,
+                has_focus: false,
+                is_generating: false,
+            },
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/2".to_string(),
+                visible: false,
+                has_focus: false,
+                is_generating: false,
+            },
+        ];
+
+        let err = choose_chatgpt_reuse_probe(&probes).unwrap_err();
+        assert!(err.to_string().contains("multiple ChatGPT tabs"));
+        assert!(err.to_string().contains("thread=fresh"));
+    }
+
+    #[test]
+    fn choose_chatgpt_probe_index_prefers_unique_focus() {
+        let probes = vec![
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/old".to_string(),
+                visible: false,
+                has_focus: false,
+                is_generating: false,
+            },
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/current".to_string(),
+                visible: true,
+                has_focus: true,
+                is_generating: true,
+            },
+        ];
+
+        assert_eq!(choose_chatgpt_probe_index(&probes), 1);
+    }
+
+    #[test]
+    fn choose_chatgpt_probe_index_falls_back_to_first_candidate() {
+        let probes = vec![
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/1".to_string(),
+                visible: false,
+                has_focus: false,
+                is_generating: false,
+            },
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/2".to_string(),
+                visible: false,
+                has_focus: false,
+                is_generating: true,
+            },
+        ];
+
+        assert_eq!(choose_chatgpt_probe_index(&probes), 0);
+    }
+
+    #[test]
+    fn choose_chatgpt_reuse_probe_skips_busy_tab() {
+        let probes = vec![
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/busy".to_string(),
+                visible: true,
+                has_focus: true,
+                is_generating: true,
+            },
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/idle".to_string(),
+                visible: false,
+                has_focus: false,
+                is_generating: false,
+            },
+        ];
+
+        assert_eq!(choose_chatgpt_reuse_probe(&probes).unwrap(), 1);
+    }
+
+    #[test]
+    fn choose_chatgpt_reuse_probe_rejects_all_busy_tabs() {
+        let probes = vec![
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/1".to_string(),
+                visible: true,
+                has_focus: true,
+                is_generating: true,
+            },
+            ChatgptTabProbe {
+                url: "https://chatgpt.com/c/2".to_string(),
+                visible: false,
+                has_focus: false,
+                is_generating: true,
+            },
+        ];
+
+        let err = choose_chatgpt_reuse_probe(&probes).unwrap_err();
+        assert!(err.to_string().contains("still generating"));
     }
 
     #[test]

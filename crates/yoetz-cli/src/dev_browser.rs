@@ -73,14 +73,15 @@ fn dev_browser_tmp_dir() -> PathBuf {
 }
 
 fn command_is_available(bin: &str) -> bool {
-    // dev-browser doesn't support --version (exits 2). Use --help which
-    // exits 0 and is universally supported.
+    // Treat "process could be spawned at all" as availability. Some
+    // dev-browser builds print help and exit non-zero, and we do not want that
+    // to trigger a pointless npm reinstall over an existing binary.
     Command::new(bin)
         .arg("--help")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .output()
+        .is_ok()
 }
 
 fn configured_dev_browser_bin() -> Result<Option<String>> {
@@ -763,18 +764,62 @@ if (loggedIn && composerReady) {{
     composerReady = false;
   }}
 }}
-if (loggedIn && composerReady && MODEL) {{
+if (loggedIn && composerReady) {{
+  const requested = (MODEL || "").trim().toLowerCase();
+  const autoMode = !requested || requested === "auto";
   const modelBtn = page.locator("[data-testid='model-switcher-dropdown-button'], button[aria-label='Model selector']").first();
-  await modelBtn.waitFor({{ state: "visible", timeout: 5000 }});
-  await modelBtn.click({{ timeout: 5000 }});
-  const slug = MODEL.toLowerCase();
-  const byTestId = page.locator(`[data-testid="model-switcher-${{slug}}"]`).first();
-  if (await byTestId.count() > 0) {{
-    await byTestId.click({{ timeout: 5000 }});
-  }} else {{
-    const menuItem = page.locator("[role='menuitem']").filter({{ hasText: new RegExp(slug.includes("thinking") ? "thinking" : slug.includes("pro") ? "pro" : slug.includes("instant") || slug.includes("5-3") ? "instant" : slug, "i") }}).first();
-    await menuItem.waitFor({{ state: "visible", timeout: 5000 }});
-    await menuItem.click({{ timeout: 5000 }});
+  if (await modelBtn.count() > 0) {{
+    await modelBtn.waitFor({{ state: "visible", timeout: 5000 }});
+    await modelBtn.click({{ timeout: 5000 }});
+    await page.waitForTimeout(500);
+    const currentModel = String((await modelBtn.innerText().catch(() => "")) || "")
+      .replace(/\s+/g, " ")
+      .trim();
+    const items = await page.locator("[role='menuitem'], [data-testid^='model-switcher-']").evaluateAll((nodes) => nodes.map((node) => {{
+      const text = String(node.textContent || "").replace(/\s+/g, " ").trim();
+      const testId = node.getAttribute("data-testid") || "";
+      return {{ text, haystack: `${{testId}} ${{text}}`.toLowerCase() }};
+    }}));
+    if (items.length > 0) {{
+      if (autoMode) {{
+        const ranked = items
+          .map((item) => {{
+            let score = 0;
+            if (/gpt[- ]?5/.test(item.haystack)) score += 100;
+            if (/\bpro\b/.test(item.haystack)) score += 90;
+            if (/thinking/.test(item.haystack)) score += 60;
+            if (/instant/.test(item.haystack) || /\b5[- ]?3\b/.test(item.haystack)) score += 30;
+            return {{ ...item, score }};
+          }})
+          .sort((left, right) => right.score - left.score || right.text.length - left.text.length);
+        if (ranked[0] && ranked[0].score > 0 && !currentModel.toLowerCase().includes(ranked[0].text.toLowerCase())) {{
+          await page.locator("[role='menuitem'], [data-testid^='model-switcher-']").filter({{ hasText: new RegExp(ranked[0].text.replace(/[.*+?^${{}}()|[\]\\]/g, "\\$&"), "i") }}).first().click({{ timeout: 5000 }});
+        }}
+      }} else {{
+        const slug = requested;
+        const byTestId = page.locator(`[data-testid="model-switcher-${{slug}}"]`).first();
+        if (await byTestId.count() > 0) {{
+          await byTestId.click({{ timeout: 5000 }});
+        }} else {{
+          const matcher = slug.includes("thinking")
+            ? "thinking"
+            : slug.includes("pro")
+              ? "pro"
+              : slug.includes("instant") || slug.includes("5-3")
+                ? "instant"
+                : slug;
+          if (!currentModel.toLowerCase().includes(matcher)) {{
+            const menuItem = page.locator("[role='menuitem'], [data-testid^='model-switcher-']").filter({{ hasText: new RegExp(matcher, "i") }}).first();
+            await menuItem.waitFor({{ state: "visible", timeout: 5000 }});
+            await menuItem.click({{ timeout: 5000 }});
+          }}
+        }}
+      }}
+    }} else if (!autoMode) {{
+      throw new Error(`model '${{requested}}' not found`);
+    }}
+  }} else if (!autoMode) {{
+    throw new Error("model selector button not found");
   }}
   await page.waitForTimeout(500);
 }}
@@ -1546,5 +1591,30 @@ mod tests {
             "expected a native binary name for the current platform"
         );
         assert!(name.unwrap().starts_with("dev-browser-"));
+    }
+
+    #[test]
+    fn command_is_available_accepts_existing_binary_even_with_non_zero_help_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = if cfg!(windows) {
+            dir.path().join("fake-dev-browser.cmd")
+        } else {
+            dir.path().join("fake-dev-browser")
+        };
+        let contents = if cfg!(windows) {
+            "@echo off\r\nexit /b 1\r\n"
+        } else {
+            "#!/bin/sh\nexit 1\n"
+        };
+        fs::write(&script, contents).unwrap();
+        #[cfg(not(windows))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(&script).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(&script, permissions).unwrap();
+        }
+
+        assert!(command_is_available(script.to_str().unwrap()));
     }
 }

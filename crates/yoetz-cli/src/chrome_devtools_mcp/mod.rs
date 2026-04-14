@@ -39,7 +39,27 @@ pub mod chatgpt;
 // shape (new_page → focus → upload → type → click → wait → extract) with
 // per-LLM selectors — trivial to add once the client plumbing is verified.
 
+use anyhow::{anyhow, Result};
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
+pub enum RecipeThreadMode {
+    #[default]
+    Fresh,
+    Reuse,
+}
+
+impl RecipeThreadMode {
+    pub fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.unwrap_or("fresh").trim().to_ascii_lowercase().as_str() {
+            "" | "fresh" => Ok(Self::Fresh),
+            "reuse" => Ok(Self::Reuse),
+            other => Err(anyhow!(
+                "unsupported `thread` value `{other}`; expected `fresh` or `reuse`"
+            )),
+        }
+    }
+}
 
 /// Context for any chrome-devtools-mcp recipe run. Threads the minimal config
 /// each recipe needs: CDP endpoint (attach-to-running-Chrome), bundle path for
@@ -71,6 +91,10 @@ pub struct DevtoolsMcpRecipeContext {
     /// User prompt to send alongside the bundle.
     pub prompt: String,
 
+    /// Whether the recipe should start a new conversation or reuse an
+    /// existing ChatGPT tab.
+    pub thread_mode: RecipeThreadMode,
+
     /// How long to wait for the full response before giving up, in ms.
     pub response_timeout_ms: u64,
 
@@ -86,6 +110,7 @@ impl Default for DevtoolsMcpRecipeContext {
             bundle_text: None,
             model: String::new(),
             prompt: String::new(),
+            thread_mode: RecipeThreadMode::Fresh,
             response_timeout_ms: 1_800_000, // 30 min default for ChatGPT Pro Extended
             show_approval_guidance: true,
         }

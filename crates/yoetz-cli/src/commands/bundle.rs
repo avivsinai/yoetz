@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 use crate::{maybe_write_output, render_bundle_md, resolve_prompt, AppContext, BundleArgs};
 use yoetz_core::bundle::{build_bundle, BundleOptions};
@@ -12,14 +12,12 @@ pub(crate) fn handle_bundle(
     format: OutputFormat,
 ) -> Result<()> {
     let prompt = resolve_prompt(args.prompt, args.prompt_file)?;
-    if args.files.is_empty() && !args.all {
-        return Err(anyhow!("--files is required unless --all is set"));
-    }
     let options = BundleOptions {
         include: args.files,
         exclude: args.exclude,
         max_file_bytes: args.max_file_bytes,
         max_total_bytes: args.max_total_bytes,
+        include_all: args.all,
         ..Default::default()
     };
 
