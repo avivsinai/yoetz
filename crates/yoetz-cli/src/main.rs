@@ -1457,6 +1457,7 @@ fn run_recipe_via_dev_browser(
             "dev-browser transport currently supports only the built-in `chatgpt` recipe"
         ));
     }
+    chatgpt_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
     if recipe_args.profile.is_some() {
         return Err(anyhow!(
             "dev-browser transport does not support `--profile`; use `--cdp` to target a specific Chrome instance/profile"
