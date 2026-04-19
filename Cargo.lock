@@ -3208,6 +3208,7 @@ dependencies = [
  "jsonschema",
  "litellm-rust",
  "predicates",
+ "rand",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -3216,6 +3217,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "toml",
  "yoetz-core",
 ]
 

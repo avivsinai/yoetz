@@ -23,17 +23,23 @@ use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
 use yoetz_core::paths::home_dir;
 
-use crate::browser;
+use crate::{browser, chatgpt_web};
 
 /// Cached dev-browser resolution.
 static DEV_BROWSER: OnceLock<String> = OnceLock::new();
+const DEV_BROWSER_INSTALL_GUIDANCE: &str = concat!(
+    "dev-browser not found in PATH or npm global prefix. Install it explicitly ",
+    "using a pinned, vetted binary/package, or set YOETZ_DEV_BROWSER_BIN to the ",
+    "exact executable to run."
+);
 
 /// Default timeout for dev-browser scripts in seconds.
 const DEFAULT_SCRIPT_TIMEOUT_SECS: u64 = 30;
@@ -45,12 +51,20 @@ const DEV_BROWSER_WAIT_POLL_MS: u64 = 100;
 const CHATGPT_POLL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
 const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 30_000;
 const CHATGPT_BROWSER_NAME: &str = "yoetz-chatgpt";
-const CHATGPT_PAGE_NAME: &str = "yoetz-chatgpt-main";
+const CHATGPT_AUTH_PROBE_PAGE_NAME: &str = "yoetz-chatgpt-main";
+const CHATGPT_RECIPE_PAGE_NAME_PREFIX: &str = "yoetz-chatgpt-run";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChatgptPollSettings {
     pub timeout_ms: u64,
     pub interval_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatgptRecipeRunResult {
+    pub response: String,
+    pub model_used: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 impl Default for ChatgptPollSettings {
@@ -193,9 +207,7 @@ fn npm_prefix_dev_browser_candidates(prefix: &Path, windows: bool) -> Vec<PathBu
 
 /// Resolve the dev-browser binary after installation has already been handled.
 fn resolve_dev_browser() -> Result<String> {
-    find_dev_browser()?.ok_or_else(|| {
-        anyhow!("dev-browser not found in PATH. Install manually: npm i -g dev-browser")
-    })
+    find_dev_browser()?.ok_or_else(missing_dev_browser_error)
 }
 
 /// Returns true if dev-browser is already available without side effects.
@@ -203,48 +215,16 @@ pub fn is_available() -> bool {
     find_dev_browser().is_ok_and(|bin| bin.is_some())
 }
 
-/// Ensure dev-browser is installed, auto-installing if needed.
+fn missing_dev_browser_error() -> anyhow::Error {
+    anyhow!(DEV_BROWSER_INSTALL_GUIDANCE)
+}
+
+/// Ensure dev-browser is already available without downloading code at runtime.
 pub fn ensure_installed() -> Result<()> {
     if find_dev_browser()?.is_some() {
         return Ok(());
     }
-
-    eprintln!("info: dev-browser not found, installing via npm...");
-    let output = Command::new("npm")
-        .args(["install", "-g", "dev-browser"])
-        .output()
-        .context("failed to run npm. Install dev-browser manually: npm i -g dev-browser")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            format!("exit code {:?}", output.status.code())
-        };
-        return Err(anyhow!(
-            "npm install -g dev-browser failed: {detail}. Install manually: npm i -g dev-browser"
-        ));
-    }
-
-    // After install, re-run full discovery (PATH + npm prefix fallback).
-    if let Some(bin) = find_dev_browser()? {
-        let _ = DEV_BROWSER.set(bin);
-        eprintln!("info: dev-browser installed successfully");
-        return Ok(());
-    }
-    let hint = if cfg!(target_os = "macos") {
-        " On Homebrew Node, npm may not create PATH symlinks. \
-         Fix: ln -sf \"$(npm prefix -g)/lib/node_modules/dev-browser/bin/dev-browser-darwin-\"* \"$(npm prefix -g)/bin/dev-browser\""
-    } else {
-        ""
-    };
-    Err(anyhow!(
-        "dev-browser installed but not discoverable in PATH or npm prefix.{hint}"
-    ))
+    Err(missing_dev_browser_error())
 }
 
 /// Stop the dev-browser daemon explicitly. Returns true when a running daemon
@@ -290,11 +270,25 @@ fn resolve_dev_browser_connect_endpoint(cdp_endpoint: Option<&str>) -> Result<Op
     let url = Url::parse(endpoint)
         .with_context(|| format!("invalid Chrome CDP endpoint `{endpoint}`"))?;
     match url.scheme() {
-        "http" | "https" | "ws" | "wss" => Ok(Some(endpoint.to_string())),
-        other => Err(anyhow!(
-            "unsupported Chrome CDP endpoint scheme `{other}` in `{endpoint}`"
-        )),
+        "http" | "https" | "ws" | "wss" => {}
+        other => {
+            return Err(anyhow!(
+                "unsupported Chrome CDP endpoint scheme `{other}` in `{endpoint}`"
+            ));
+        }
     }
+    // Default: only forward localhost CDP endpoints. A non-loopback host can
+    // bounce dev-browser onto an unrelated Chrome instance; set
+    // YOETZ_CDP_ALLOW_REMOTE=1 to opt in (review finding #5).
+    if !crate::chrome_devtools_mcp::client::is_loopback_host(url.host_str())
+        && !crate::chrome_devtools_mcp::client::cdp_remote_redirects_allowed()
+    {
+        return Err(anyhow!(
+            "Chrome CDP endpoint `{endpoint}` is not on localhost; set {}=1 to allow remote CDP targets",
+            crate::chrome_devtools_mcp::client::YOETZ_CDP_ALLOW_REMOTE_ENV
+        ));
+    }
+    Ok(Some(endpoint.to_string()))
 }
 
 fn connect_args(
@@ -515,7 +509,12 @@ pub fn check_connection_with_endpoint(cdp_endpoint: Option<&str>) -> Result<()> 
 const pages = await browser.listPages();
 console.log("ok:" + pages.length);
 "#;
-    match run_script_connect_with_endpoint(script, Some(10), cdp_endpoint) {
+    match run_script_connect_with_browser_and_endpoint(
+        script,
+        Some(10),
+        Some(CHATGPT_BROWSER_NAME),
+        cdp_endpoint,
+    ) {
         Ok(stdout) if stdout.trim().starts_with("ok:") => Ok(()),
         Ok(stdout) => Err(anyhow!("dev-browser connection check failed: {stdout}")),
         Err(first_err) => {
@@ -526,8 +525,13 @@ console.log("ok:" + pages.length);
             }
             eprintln!("info: dev-browser connection timed out, retrying with longer timeout");
             std::thread::sleep(std::time::Duration::from_secs(2));
-            let stdout = run_script_connect_with_endpoint(script, Some(45), cdp_endpoint)
-                .context("dev-browser connection check failed after retry")?;
+            let stdout = run_script_connect_with_browser_and_endpoint(
+                script,
+                Some(45),
+                Some(CHATGPT_BROWSER_NAME),
+                cdp_endpoint,
+            )
+            .context("dev-browser connection check failed after retry")?;
             if stdout.trim().starts_with("ok:") {
                 Ok(())
             } else {
@@ -537,35 +541,72 @@ console.log("ok:" + pages.length);
     }
 }
 
-pub fn check_chatgpt_auth_with_endpoint(cdp_endpoint: Option<&str>) -> Result<bool> {
-    let script = r#"
-const page = await browser.newPage();
-try {
-    await page.goto("https://chatgpt.com/");
-    await page.waitForTimeout(3000);
-    // Check for the composer textarea — the most reliable auth marker.
-    // Text markers like "new chat" / "send a message" drift with UI updates.
-    const authenticated = await page.evaluate(() => {
-        if (document.querySelector('#prompt-textarea')) return true;
-        const text = document.body.innerText.toLowerCase();
-        return text.includes("send a message") || text.includes("ask anything")
-            || text.includes("what are you working on") || text.includes("new chat");
-    });
-    console.log(JSON.stringify({ authenticated }));
-} finally {
-    await page.close().catch(() => {});
+fn build_chatgpt_auth_probe_script(page_name: &str) -> String {
+    let page_name_json = serde_json::to_string(page_name).expect("serialize page name");
+    let chatgpt_url_json = serde_json::to_string(chatgpt_web::CHATGPT_URL).unwrap();
+    format!(
+        r##"
+const PAGE_NAME = {page_name_json};
+const CHATGPT_URL = {chatgpt_url_json};
+const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+const pages = await browser.listPages();
+const chatgptPage =
+  pages.find((entry) => entry.name === PAGE_NAME) ||
+  pages.find((entry) => normalize(entry.url).toLowerCase().includes("chatgpt.com"));
+const page = chatgptPage
+  ? await browser.getPage(chatgptPage.name || chatgptPage.id)
+  : await browser.getPage(PAGE_NAME);
+const currentUrl = normalize(page.url()).toLowerCase();
+if (!currentUrl.includes("chatgpt.com")) {{
+  await page.goto(CHATGPT_URL, {{ waitUntil: "domcontentloaded" }});
+}}
+await page.waitForTimeout(1500);
+const pageState = await page.evaluate(() => {{
+  const composer = document.querySelector('#prompt-textarea, [role="textbox"]');
+  const title = document.title || "";
+  const bodyText = String(document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 400);
+  return {{
+    authenticated: !!composer,
+    url: window.location.href || "",
+    title,
+    bodyText,
+  }};
+}});
+console.log(JSON.stringify(pageState));
+"##,
+        chatgpt_url_json = chatgpt_url_json,
+    )
 }
-"#;
-    let stdout = run_script_connect_with_endpoint(script, Some(30), cdp_endpoint)?;
-    let result: Value = serde_json::from_str(stdout.trim())
+
+#[derive(Debug, serde::Deserialize)]
+struct ChatgptAuthProbeResult {
+    authenticated: bool,
+    url: String,
+    title: String,
+    #[serde(rename = "bodyText")]
+    body_text: String,
+}
+
+fn chatgpt_page_probe_haystack(url: &str, title: &str, body_text: &str) -> String {
+    format!("{url} {title} {body_text}")
+}
+
+fn check_chatgpt_auth_with_endpoint(cdp_endpoint: Option<&str>) -> Result<ChatgptAuthProbeResult> {
+    let script = build_chatgpt_auth_probe_script(CHATGPT_AUTH_PROBE_PAGE_NAME);
+    let stdout = run_script_connect_with_browser_and_endpoint(
+        &script,
+        Some(30),
+        Some(CHATGPT_BROWSER_NAME),
+        cdp_endpoint,
+    )?;
+    let result: ChatgptAuthProbeResult = serde_json::from_str(stdout.trim())
         .with_context(|| format!("check_chatgpt_auth: malformed script output: {stdout}"))?;
-    result["authenticated"]
-        .as_bool()
-        .ok_or_else(|| anyhow!("check_chatgpt_auth: missing 'authenticated' field in: {stdout}"))
+    Ok(result)
 }
 
 /// Ensure the connected Chrome session can reach an authenticated ChatGPT page.
-/// Opens a temporary page — use only when not immediately followed by a recipe.
+/// Reuses the shared ChatGPT dev-browser slot when available so repeated checks
+/// do not force a fresh Chrome live-attach handshake.
 pub fn ensure_chatgpt_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
     eprintln!("info: probing Chrome reachability via dev-browser");
     check_connection_with_endpoint(cdp_endpoint)
@@ -575,12 +616,20 @@ pub fn ensure_chatgpt_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&st
         )?;
 
     eprintln!("info: probing ChatGPT auth state via dev-browser");
-    if check_chatgpt_auth_with_endpoint(cdp_endpoint)? {
+    let probe = check_chatgpt_auth_with_endpoint(cdp_endpoint)?;
+    if probe.authenticated {
         return Ok(());
     }
 
+    let haystack = chatgpt_page_probe_haystack(&probe.url, &probe.title, &probe.body_text);
+    if let Some(issue) = chatgpt_web::detect_auth_issue_text(&haystack, true) {
+        return Err(anyhow!("{issue}"));
+    }
+
     Err(anyhow!(
-        "chatgpt login required in the attached Chrome session. Log in there and try again."
+        "ChatGPT did not finish loading the composer on {}. Title: {:?}",
+        probe.url,
+        probe.title
     ))
 }
 
@@ -603,6 +652,8 @@ pub struct DevBrowserRecipeContext {
     pub paste_mode: bool,
     /// Custom prompt text.
     pub prompt: String,
+    /// Marker for the yoetz-owned ChatGPT tab created for this run.
+    pub run_id: String,
     /// ChatGPT response polling settings.
     pub poll_settings: ChatgptPollSettings,
     /// Allow an empty assistant response to count as success.
@@ -620,6 +671,7 @@ impl Default for DevBrowserRecipeContext {
             bundle_text: None,
             model: String::new(),
             prompt: "Review the attached file and provide your analysis.".to_string(),
+            run_id: String::new(),
             disable_extended: false,
             paste_mode: false,
             poll_settings: ChatgptPollSettings::default(),
@@ -656,7 +708,7 @@ fn parse_positive_u64_var(vars: &BTreeMap<String, String>, key: &str) -> Result<
     Ok(Some(value))
 }
 
-fn looks_like_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
+pub(crate) fn is_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}").to_lowercase();
     (message.contains("connectovercdp")
         || message.contains("auto-connect")
@@ -667,7 +719,7 @@ fn looks_like_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
 }
 
 fn maybe_add_dev_browser_connect_guidance(err: anyhow::Error) -> anyhow::Error {
-    if looks_like_dev_browser_connect_failure(&err) {
+    if is_dev_browser_connect_failure(&err) {
         err.context(
             "dev-browser could not connect to Chrome. If Chrome is showing a remote debugging approval dialog, click Allow, then retry. If you recently upgraded yoetz, run `yoetz browser reset` once so the dev-browser daemon relaunches with the Chrome 147 compatibility flag. Raw transport error follows.",
         )
@@ -680,6 +732,77 @@ fn chatgpt_script_timeout_secs(poll_timeout_ms: u64) -> u64 {
     poll_timeout_ms.div_ceil(1000) + 60
 }
 
+fn chatgpt_wait_heartbeat_interval_ms(interval_ms: u64) -> u64 {
+    interval_ms.clamp(15_000, 60_000)
+}
+
+fn format_chatgpt_wait_duration(duration: Duration) -> String {
+    let total_secs = duration.as_secs();
+    let hours = total_secs / 3600;
+    let minutes = (total_secs % 3600) / 60;
+    let seconds = total_secs % 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn chatgpt_wait_progress_message(elapsed: Duration, poll_settings: ChatgptPollSettings) -> String {
+    format!(
+        "info: still waiting for the ChatGPT response (elapsed {}, timeout {}, poll every {}s)",
+        format_chatgpt_wait_duration(elapsed),
+        format_chatgpt_wait_duration(Duration::from_millis(poll_settings.timeout_ms)),
+        poll_settings.interval_ms / 1000
+    )
+}
+
+struct ChatgptWaitHeartbeat {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl ChatgptWaitHeartbeat {
+    fn start(poll_settings: ChatgptPollSettings) -> Self {
+        eprintln!(
+            "info: waiting for the ChatGPT response (timeout {}, poll every {}s)",
+            format_chatgpt_wait_duration(Duration::from_millis(poll_settings.timeout_ms)),
+            poll_settings.interval_ms / 1000
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop);
+        let started_at = Instant::now();
+        let heartbeat_interval = Duration::from_millis(chatgpt_wait_heartbeat_interval_ms(
+            poll_settings.interval_ms,
+        ));
+        let handle = thread::spawn(move || {
+            while !stop_flag.load(Ordering::Relaxed) {
+                thread::sleep(heartbeat_interval);
+                if stop_flag.load(Ordering::Relaxed) {
+                    break;
+                }
+                eprintln!(
+                    "{}",
+                    chatgpt_wait_progress_message(started_at.elapsed(), poll_settings)
+                );
+            }
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct ChatgptPrepareResult {
     status: String,
@@ -687,7 +810,12 @@ struct ChatgptPrepareResult {
     logged_in: bool,
     #[serde(rename = "composerReady")]
     composer_ready: bool,
+    #[serde(rename = "modelUsed")]
+    model_used: Option<String>,
     url: String,
+    title: String,
+    #[serde(rename = "bodyText")]
+    body_text: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -696,6 +824,8 @@ struct ChatgptSendResult {
     error: Option<String>,
     #[serde(rename = "assistantCountBeforeSend")]
     assistant_count_before_send: Option<usize>,
+    #[serde(rename = "assistantLastLenBeforeSend")]
+    assistant_last_len_before_send: Option<usize>,
     warning: Option<String>,
 }
 
@@ -704,40 +834,63 @@ fn parse_script_json<T: serde::de::DeserializeOwned>(label: &str, stdout: &str) 
         .with_context(|| format!("{label}: malformed script output: {stdout}"))
 }
 
-fn build_chatgpt_prepare_script(page_name: &str, model: &str) -> String {
+fn classify_dev_browser_page_issue(
+    url: &str,
+    title: &str,
+    body_text: &str,
+) -> Option<&'static str> {
+    let haystack = chatgpt_page_probe_haystack(url, title, body_text);
+    chatgpt_web::detect_auth_issue_text(&haystack, true)
+}
+
+fn build_chatgpt_prepare_script(page_name: &str, model: &str, run_id: &str) -> String {
     let page_name_json = serde_json::to_string(page_name).unwrap();
     let model_json = serde_json::to_string(model).unwrap();
+    let marked_url_json = serde_json::to_string(&chatgpt_web::mark_chatgpt_url(run_id)).unwrap();
+    let window_name_json =
+        serde_json::to_string(&format!("yoetz:{run_id}")).expect("serialize yoetz window name");
+    let model_selection_function_json =
+        serde_json::to_string(&chatgpt_web::build_model_selection_function(model)).unwrap();
+    let composer_selector_json = chatgpt_web::composer_selector_json();
     format!(
         r##"
 const PAGE_NAME = {page_name_json};
 const MODEL = {model_json};
-const page = await browser.getPage(PAGE_NAME);
-const CHATGPT_URL = "https://chatgpt.com/";
-const COMPOSER_SELECTOR = "#prompt-textarea, [role='textbox']";
+const MARKED_URL = {marked_url_json};
+const WINDOW_NAME = {window_name_json};
+const MODEL_SELECTION_FUNCTION_SOURCE = {model_selection_function_json};
+const COMPOSER_SELECTOR = {composer_selector_json};
 const ASSISTANT_SELECTOR = "[data-message-author-role='assistant']";
 const NEW_CHAT_SELECTOR = "[data-testid='new-chat-button']";
-await page.goto(CHATGPT_URL, {{ waitUntil: "domcontentloaded" }});
+const page = await browser.getPage(PAGE_NAME);
+await page.goto(MARKED_URL, {{ waitUntil: "domcontentloaded" }});
 await page.waitForTimeout(800);
+await page.evaluate((name) => {{
+  window.name = name;
+  return window.name;
+}}, WINDOW_NAME);
 const loggedIn = (await page.locator("[data-testid='login-button']").first().count()) === 0;
-// QuickJS: keep this helper small and let Rust own the broader orchestration.
-// Playwright's page.evaluate accepts exactly one arg after the function, so
-// the selectors are passed as a single object.
-const readState = async () => await page.evaluate(({{ composerSelector, assistantSelector }}) => {{
-  const composer = document.querySelector(composerSelector);
-  const assistantCount = document.querySelectorAll(assistantSelector).length;
+const readState = async () => await page.evaluate(() => {{
+  const composer = document.querySelector("#prompt-textarea, [role='textbox']");
+  const assistantCount = document.querySelectorAll("[data-message-author-role='assistant']").length;
   const pathname = window.location.pathname || "/";
+  const title = document.title || "";
+  const bodyText = String(document.body?.innerText || "").replace(/\s+/g, " ").trim().slice(0, 400);
   return {{
     url: window.location.href,
+    title,
+    bodyText,
     pathname,
     onConversationPath: pathname.startsWith("/c/"),
     assistantCount,
     composerVisible: !!composer,
   }};
-}}, {{ composerSelector: COMPOSER_SELECTOR, assistantSelector: ASSISTANT_SELECTOR }});
+}});
 let state = await readState();
-let composerReady =
-  loggedIn &&
-  state.composerVisible &&
+let composerReady = loggedIn && state.composerVisible;
+let selectedModel = null;
+composerReady =
+  composerReady &&
   state.assistantCount === 0 &&
   !state.onConversationPath;
 if (loggedIn && !composerReady) {{
@@ -751,8 +904,9 @@ if (loggedIn && !composerReady) {{
     }}
     await page.waitForTimeout(1000);
     state = await readState();
+    composerReady = state.composerVisible;
     composerReady =
-      state.composerVisible &&
+      composerReady &&
       state.assistantCount === 0 &&
       !state.onConversationPath;
   }}
@@ -765,73 +919,50 @@ if (loggedIn && composerReady) {{
   }}
 }}
 if (loggedIn && composerReady) {{
-  const requested = (MODEL || "").trim().toLowerCase();
-  const autoMode = !requested || requested === "auto";
-  const modelBtn = page.locator("[data-testid='model-switcher-dropdown-button'], button[aria-label='Model selector']").first();
-  if (await modelBtn.count() > 0) {{
-    await modelBtn.waitFor({{ state: "visible", timeout: 5000 }});
-    await modelBtn.click({{ timeout: 5000 }});
-    await page.waitForTimeout(500);
-    const currentModel = String((await modelBtn.innerText().catch(() => "")) || "")
-      .replace(/\s+/g, " ")
-      .trim();
-    const items = await page.locator("[role='menuitem'], [data-testid^='model-switcher-']").evaluateAll((nodes) => nodes.map((node) => {{
-      const text = String(node.textContent || "").replace(/\s+/g, " ").trim();
-      const testId = node.getAttribute("data-testid") || "";
-      return {{ text, haystack: `${{testId}} ${{text}}`.toLowerCase() }};
-    }}));
-    if (items.length > 0) {{
-      if (autoMode) {{
-        const ranked = items
-          .map((item) => {{
-            let score = 0;
-            if (/gpt[- ]?5/.test(item.haystack)) score += 100;
-            if (/\bpro\b/.test(item.haystack)) score += 90;
-            if (/thinking/.test(item.haystack)) score += 60;
-            if (/instant/.test(item.haystack) || /\b5[- ]?3\b/.test(item.haystack)) score += 30;
-            return {{ ...item, score }};
-          }})
-          .sort((left, right) => right.score - left.score || right.text.length - left.text.length);
-        if (ranked[0] && ranked[0].score > 0 && !currentModel.toLowerCase().includes(ranked[0].text.toLowerCase())) {{
-          await page.locator("[role='menuitem'], [data-testid^='model-switcher-']").filter({{ hasText: new RegExp(ranked[0].text.replace(/[.*+?^${{}}()|[\]\\]/g, "\\$&"), "i") }}).first().click({{ timeout: 5000 }});
-        }}
-      }} else {{
-        const slug = requested;
-        const byTestId = page.locator(`[data-testid="model-switcher-${{slug}}"]`).first();
-        if (await byTestId.count() > 0) {{
-          await byTestId.click({{ timeout: 5000 }});
-        }} else {{
-          const matcher = slug.includes("thinking")
-            ? "thinking"
-            : slug.includes("pro")
-              ? "pro"
-              : slug.includes("instant") || slug.includes("5-3")
-                ? "instant"
-                : slug;
-          if (!currentModel.toLowerCase().includes(matcher)) {{
-            const menuItem = page.locator("[role='menuitem'], [data-testid^='model-switcher-']").filter({{ hasText: new RegExp(matcher, "i") }}).first();
-            await menuItem.waitFor({{ state: "visible", timeout: 5000 }});
-            await menuItem.click({{ timeout: 5000 }});
-          }}
-        }}
-      }}
-    }} else if (!autoMode) {{
-      throw new Error(`model '${{requested}}' not found`);
+  const selection = await page.evaluate((functionSource) => {{
+    const fn = eval("(" + functionSource + ")");
+    return fn();
+  }}, MODEL_SELECTION_FUNCTION_SOURCE);
+  const selectionStatus = selection?.status || "unknown";
+  if (!["selected", "already-selected"].includes(selectionStatus)) {{
+    const diagnostics = JSON.stringify({{
+      status: selectionStatus,
+      requested: selection?.requested || MODEL || "",
+      selectedLabel: selection?.selectedLabel || "",
+      targetTestId: selection?.targetTestId || "",
+      availableItems: selection?.availableItems || [],
+      availableItemsAfter: selection?.availableItemsAfter || [],
+    }});
+    if (selectionStatus === "missing-selector") {{
+      throw new Error("model selector button not found (" + diagnostics + ")");
     }}
-  }} else if (!autoMode) {{
-    throw new Error("model selector button not found");
+    if (selectionStatus === "not-found") {{
+      throw new Error("requested model '" + (selection?.requested || MODEL || "") + "' not found (" + diagnostics + ")");
+    }}
+    if (selectionStatus === "selection-mismatch") {{
+      throw new Error("requested model '" + (selection?.requested || MODEL || "") + "' was not selected (" + diagnostics + ")");
+    }}
+    throw new Error("unexpected model selection status '" + selectionStatus + "' (" + diagnostics + ")");
   }}
+  selectedModel = selection?.targetTestId || selection?.modelUsed || selection?.selectedLabel || null;
   await page.waitForTimeout(500);
 }}
 console.log(JSON.stringify({{
   status: !loggedIn ? "login_required" : composerReady ? "ready" : "not_ready",
   loggedIn,
   composerReady,
+  modelUsed: selectedModel,
   url: state.url,
+  title: state.title,
+  bodyText: state.bodyText,
 }}));
 "##,
         page_name_json = page_name_json,
         model_json = model_json,
+        marked_url_json = marked_url_json,
+        window_name_json = window_name_json,
+        model_selection_function_json = model_selection_function_json,
+        composer_selector_json = composer_selector_json,
     )
 }
 
@@ -841,11 +972,22 @@ fn build_chatgpt_send_script(
     delivery_text: &str,
     file_on_clipboard: bool,
     disable_extended: bool,
+    bundle_file_name: Option<&str>,
 ) -> String {
     let page_name_json = serde_json::to_string(page_name).unwrap();
     let file_on_clipboard_json = serde_json::to_string(&file_on_clipboard).unwrap();
     let delivery_text_json = serde_json::to_string(delivery_text).unwrap();
     let prompt_json = serde_json::to_string(prompt).unwrap();
+    let bundle_file_name_json = serde_json::to_string(&bundle_file_name).unwrap();
+    let composer_selector_json = chatgpt_web::composer_selector_json();
+    let send_button_selector_json = chatgpt_web::send_button_selector_json();
+    let stop_button_selector_json = chatgpt_web::stop_button_selector_json();
+    let send_click_function_json =
+        serde_json::to_string(&chatgpt_web::build_send_button_click_function()).unwrap();
+    let attachment_probe_function_json = bundle_file_name.map(|file_name| {
+        serde_json::to_string(&chatgpt_web::build_attachment_probe_function(file_name).unwrap())
+            .unwrap()
+    });
     format!(
         r##"
 const PAGE_NAME = {page_name_json};
@@ -853,8 +995,29 @@ const FILE_ON_CLIPBOARD = {file_on_clipboard_json};
 const DELIVERY_TEXT = {delivery_text_json};
 const PROMPT = {prompt_json};
 const DISABLE_EXTENDED = {disable_extended};
+const BUNDLE_FILE_NAME = {bundle_file_name_json};
+const COMPOSER_SELECTOR = {composer_selector_json};
+const SEND_BUTTON_SELECTOR = {send_button_selector_json};
+const STOP_BUTTON_SELECTOR = {stop_button_selector_json};
+const SEND_CLICK_FUNCTION_SOURCE = {send_click_function_json};
+const ATTACHMENT_PROBE_FUNCTION_SOURCE = {attachment_probe_function_json};
 const page = await browser.getPage(PAGE_NAME);
 let warning = null;
+const waitForAttachmentReady = async () => {{
+  if (!ATTACHMENT_PROBE_FUNCTION_SOURCE) return true;
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {{
+    const state = await page.evaluate((functionSource) => {{
+      const fn = eval("(" + functionSource + ")");
+      return fn();
+    }}, ATTACHMENT_PROBE_FUNCTION_SOURCE);
+    if (state?.status === "done") {{
+      return true;
+    }}
+    await page.waitForTimeout(500);
+  }}
+  return false;
+}};
 if (DISABLE_EXTENDED) {{
   const extButton = page.locator("button[aria-label*='click to remove'][aria-label*='Extended'], button[aria-label*='remove'][aria-label*='Extended']").first();
   if (await extButton.count() > 0) {{
@@ -864,33 +1027,37 @@ if (DISABLE_EXTENDED) {{
     warning = "extended disable requested but toggle not found";
   }}
 }}
-const composer = page.locator("[role='textbox']").first();
+const composer = page.locator(COMPOSER_SELECTOR).first();
 if (FILE_ON_CLIPBOARD) {{
   await composer.waitFor({{ state: "visible", timeout: 15000 }});
   await composer.click();
   await page.keyboard.press("Meta+v");
-  await page.waitForTimeout(5000);
-  const attached = await page.evaluate(() => {{
-    return !!document.querySelector("[class*='file-tile'], [data-testid*='attachment']");
-  }});
+  const attached = await waitForAttachmentReady();
   if (!attached) {{
-    throw new Error("file not attached after clipboard paste");
+    throw new Error("file attachment did not finish uploading after clipboard paste");
   }}
 }}
 await composer.waitFor({{ state: "visible", timeout: 15000 }});
 await composer.click();
 await composer.pressSequentially(DELIVERY_TEXT, {{ delay: 15 }});
-const sendBtn = page.locator("[data-testid='send-button']").first();
-const readSendState = async () => await page.evaluate(() => {{
-  const send = document.querySelector("[data-testid='send-button']");
-  const composerEl = document.querySelector("#prompt-textarea, [role='textbox']");
+const sendBtn = page.locator(SEND_BUTTON_SELECTOR).first();
+const readSendState = async () => await page.evaluate((composerSelector, sendSelector, bundleFileName) => {{
+  const send = Array.from(document.querySelectorAll(sendSelector)).find((button) => {{
+    const rect = button.getBoundingClientRect();
+    const style = window.getComputedStyle(button);
+    return rect.width > 0 &&
+      rect.height > 0 &&
+      style.visibility !== "hidden" &&
+      style.display !== "none";
+  }}) || null;
+  const composerEl = document.querySelector(composerSelector);
   return {{
     sendButtonPresent: !!send,
     sendDisabled: send ? !!send.disabled : false,
     composerTextLength: (composerEl?.innerText || composerEl?.textContent || "").trim().length,
-    attachmentPresent: !!document.querySelector("[class*='file-tile'], [data-testid*='attachment']"),
+    attachmentPresent: !!bundleFileName,
   }};
-}});
+}}, COMPOSER_SELECTOR, SEND_BUTTON_SELECTOR, BUNDLE_FILE_NAME);
 const enableDeadline = Date.now() + 10000;
 let sendState = await readSendState();
 while (Date.now() < enableDeadline) {{
@@ -906,25 +1073,41 @@ if (await sendBtn.count() === 0 || !(await sendBtn.isEnabled())) {{
   }}));
   return;
 }}
-const assistantCountBeforeSend = await page.locator("[data-message-author-role='assistant']").count();
-await sendBtn.click();
+const sendClick = await page.evaluate((functionSource) => {{
+  const fn = eval("(" + functionSource + ")");
+  return fn();
+}}, SEND_CLICK_FUNCTION_SOURCE);
+if (sendClick?.status !== "sent") {{
+  console.log(JSON.stringify({{
+    status: "error",
+    error: "ChatGPT send click did not succeed: " + JSON.stringify(sendClick || null),
+    warning,
+  }}));
+  return;
+}}
 const transitionDeadline = Date.now() + 10000;
 let transitionState = null;
 while (Date.now() < transitionDeadline) {{
-  transitionState = await page.evaluate((baselineCount) => {{
-    const send = document.querySelector("[data-testid='send-button']");
-    const stopButton = document.querySelector("[data-testid='stop-button']");
+  transitionState = await page.evaluate((baselineCount, composerSelector, sendSelector, stopSelector, bundleFileName) => {{
+    const send = Array.from(document.querySelectorAll(sendSelector)).find((button) => {{
+      const rect = button.getBoundingClientRect();
+      const style = window.getComputedStyle(button);
+      return rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility !== "hidden" &&
+        style.display !== "none";
+    }}) || null;
+    const stopButton = document.querySelector(stopSelector);
     const assistantCount = document.querySelectorAll("[data-message-author-role='assistant']").length;
-    const composerEl = document.querySelector("#prompt-textarea, [role='textbox']");
+    const composerEl = document.querySelector(composerSelector);
     const composerText = (composerEl?.innerText || composerEl?.textContent || "").trim();
-    const attachmentPresent = !!document.querySelector("[class*='file-tile'], [data-testid*='attachment']");
     return {{
       sendButtonPresent: !!send,
       sendDisabled: send ? !!send.disabled : false,
       stopButtonPresent: !!stopButton,
       assistantCount,
       composerTextLength: composerText.length,
-      attachmentPresent,
+      attachmentPresent: !!bundleFileName,
       transitionObserved:
         !!stopButton ||
         assistantCount > baselineCount ||
@@ -932,7 +1115,7 @@ while (Date.now() < transitionDeadline) {{
         (!!send && !!send.disabled) ||
         composerText.length === 0,
     }};
-  }}, assistantCountBeforeSend);
+  }}, sendClick.assistantCountBeforeSend || 0, COMPOSER_SELECTOR, SEND_BUTTON_SELECTOR, STOP_BUTTON_SELECTOR, BUNDLE_FILE_NAME);
   if (transitionState.transitionObserved) break;
   await page.waitForTimeout(500);
 }}
@@ -940,14 +1123,16 @@ if (!transitionState || !transitionState.transitionObserved) {{
   console.log(JSON.stringify({{
     status: "error",
     error: "ChatGPT send click did not trigger a UI transition within 10s. " + JSON.stringify(transitionState || {{}}),
-    assistantCountBeforeSend,
+    assistantCountBeforeSend: sendClick.assistantCountBeforeSend || 0,
+    assistantLastLenBeforeSend: sendClick.assistantLastLenBeforeSend || 0,
     warning,
   }}));
   return;
 }}
 console.log(JSON.stringify({{
         status: "sent",
-        assistantCountBeforeSend,
+        assistantCountBeforeSend: sendClick.assistantCountBeforeSend || 0,
+        assistantLastLenBeforeSend: sendClick.assistantLastLenBeforeSend || 0,
         warning,
 }}));
 "##,
@@ -955,6 +1140,13 @@ console.log(JSON.stringify({{
         file_on_clipboard_json = file_on_clipboard_json,
         delivery_text_json = delivery_text_json,
         prompt_json = prompt_json,
+        bundle_file_name_json = bundle_file_name_json,
+        composer_selector_json = composer_selector_json,
+        send_button_selector_json = send_button_selector_json,
+        stop_button_selector_json = stop_button_selector_json,
+        send_click_function_json = send_click_function_json,
+        attachment_probe_function_json =
+            attachment_probe_function_json.unwrap_or_else(|| "null".to_string()),
         disable_extended = disable_extended,
     )
 }
@@ -1009,34 +1201,52 @@ fn set_file_on_clipboard(path: &Path) -> Result<()> {
 fn build_chatgpt_poll_script(
     page_name: &str,
     assistant_count_before_send: usize,
+    assistant_last_len_before_send: usize,
     poll_settings: ChatgptPollSettings,
     allow_empty_response: bool,
 ) -> String {
     let page_name_json = serde_json::to_string(page_name).unwrap();
+    let stable_idle_threshold_ms = chatgpt_web::stable_idle_threshold_ms(poll_settings.interval_ms);
     format!(
         r#"
 const PAGE_NAME = {page_name_json};
-const BASELINE = {assistant_count_before_send};
+const BASELINE_COUNT = {assistant_count_before_send};
+const BASELINE_LAST_LEN = {assistant_last_len_before_send};
 const POLL_TIMEOUT_MS = {poll_timeout_ms};
 const POLL_INTERVAL_MS = {poll_interval_ms};
+const STABLE_IDLE_THRESHOLD_MS = {stable_idle_threshold_ms};
 const ALLOW_EMPTY_RESPONSE = {allow_empty_response};
 const page = await browser.getPage(PAGE_NAME);
 const start = Date.now();
-let lastResponseText = null;
+let stableSince = null;
+let stableKey = null;
 while (Date.now() - start < POLL_TIMEOUT_MS) {{
-  const state = await page.evaluate((baselineCount) => {{
+  const state = await page.evaluate((baselineCount, baselineLastLen) => {{
     const errorEl = document.querySelector("[role='alert'], [data-testid*='error']");
     const hasThinkingIndicator = !!document.querySelector(".result-thinking, [data-testid*='thinking']");
-    const assistantMessages = Array.from(document.querySelectorAll("[data-message-author-role='assistant']")).slice(baselineCount);
-    const response = assistantMessages.map((message) => message.innerText).join("\n---\n").trim();
+    const allAssistantMessages = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
+    const assistantMessages = allAssistantMessages.slice(baselineCount);
+    const lastAssistantMessage = allAssistantMessages.length > 0 ? allAssistantMessages[allAssistantMessages.length - 1] : null;
+    const lastAssistantLen = (lastAssistantMessage?.innerText || "").length;
+    const newAssistantCount = assistantMessages.length;
+    const newMessage = allAssistantMessages.length > baselineCount;
+    const sameMessageGrew = allAssistantMessages.length === baselineCount && lastAssistantLen > baselineLastLen;
+    const response = (newMessage
+      ? assistantMessages.map((message) => message.innerText).join("\n---\n")
+      : (sameMessageGrew ? (lastAssistantMessage?.innerText || "") : "")
+    ).trim();
     return {{
       error: errorEl ? errorEl.innerText.slice(0, 200).trim() : null,
       hasThinkingIndicator,
       hasStopButton: !!document.querySelector("[data-testid='stop-button']"),
-      newAssistantCount: assistantMessages.length,
+      newAssistantCount,
+      assistantCount: allAssistantMessages.length,
+      lastAssistantLen,
+      newMessage,
+      sameMessageGrew,
       response,
     }};
-  }}, BASELINE);
+  }}, BASELINE_COUNT, BASELINE_LAST_LEN);
   if (state.error) {{
     console.log(JSON.stringify({{ status: "error", error: state.error }}));
     return;
@@ -1044,16 +1254,26 @@ while (Date.now() - start < POLL_TIMEOUT_MS) {{
   const completionCandidate =
     !state.hasStopButton &&
     !state.hasThinkingIndicator &&
-    state.newAssistantCount > 0 &&
-    (ALLOW_EMPTY_RESPONSE || state.response.length > 0);
+    ((state.newMessage && (ALLOW_EMPTY_RESPONSE || state.response.length > 0)) || state.sameMessageGrew);
   if (completionCandidate) {{
-    if (lastResponseText !== null && state.response === lastResponseText) {{
-      console.log(JSON.stringify({{ status: "ok", response: state.response }}));
-      return;
+    const responseKey = `${{state.assistantCount}}:${{state.lastAssistantLen}}:${{state.response.length}}`;
+    if (stableKey === responseKey) {{
+      if (stableSince !== null && (Date.now() - stableSince) >= STABLE_IDLE_THRESHOLD_MS) {{
+        console.log(JSON.stringify({{
+          status: "ok",
+          response: state.response,
+          stable_for_ms: Date.now() - stableSince,
+          stable_idle_threshold_ms: STABLE_IDLE_THRESHOLD_MS,
+        }}));
+        return;
+      }}
+    }} else {{
+      stableKey = responseKey;
+      stableSince = Date.now();
     }}
-    lastResponseText = state.response;
   }} else {{
-    lastResponseText = null;
+    stableKey = null;
+    stableSince = null;
   }}
   await page.waitForTimeout(POLL_INTERVAL_MS);
 }}
@@ -1064,8 +1284,10 @@ console.log(JSON.stringify({{
 "#,
         page_name_json = page_name_json,
         assistant_count_before_send = assistant_count_before_send,
+        assistant_last_len_before_send = assistant_last_len_before_send,
         poll_timeout_ms = poll_settings.timeout_ms,
         poll_interval_ms = poll_settings.interval_ms,
+        stable_idle_threshold_ms = stable_idle_threshold_ms,
         allow_empty_response = allow_empty_response,
     )
 }
@@ -1141,10 +1363,9 @@ fn parse_chatgpt_recipe_result(
 /// QuickJS/WASM sandboxes, and large scripts with many closures are prone to a
 /// GC assertion on disposal. Rust owns the orchestration; each script only does
 /// one browser phase and returns JSON over stdout.
-pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
-    let recipe_lock = browser::acquire_chatgpt_recipe_lock()?;
+pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipeRunResult> {
     let browser_name = CHATGPT_BROWSER_NAME.to_string();
-    let page_name = CHATGPT_PAGE_NAME.to_string();
+    let page_name = format!("{}-{}", CHATGPT_RECIPE_PAGE_NAME_PREFIX, ctx.run_id);
     let cdp_endpoint = ctx.cdp_endpoint.as_deref();
     let run_script = |script: &str, timeout_secs: Option<u64>| {
         run_script_connect_with_browser_and_endpoint(
@@ -1154,13 +1375,8 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
             cdp_endpoint,
         )
     };
-    if ctx.show_approval_guidance && recipe_lock.waited() {
-        eprintln!(
-            "info: another yoetz process is already using the shared ChatGPT dev-browser page; waiting for it to finish before reusing the tab"
-        );
-    }
 
-    let result = (|| -> Result<(String, Vec<String>)> {
+    let result = (|| -> Result<(String, Vec<String>, Option<String>)> {
         let mut warnings = Vec::new();
         let file_on_clipboard = if ctx.paste_mode {
             false
@@ -1184,7 +1400,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
             ctx.prompt.clone()
         };
 
-        let prepare_script = build_chatgpt_prepare_script(&page_name, &ctx.model);
+        let prepare_script = build_chatgpt_prepare_script(&page_name, &ctx.model, &ctx.run_id);
         let prepare_stdout = {
             let approval_lock = browser::acquire_chrome_approval_lock()?;
             if ctx.show_approval_guidance {
@@ -1201,17 +1417,30 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
         };
         let prepare: ChatgptPrepareResult =
             parse_script_json("parse chatgpt prepare result", &prepare_stdout)?;
+        let model_used = prepare
+            .model_used
+            .as_deref()
+            .and_then(chatgpt_web::canonical_chatgpt_model_slug);
+        let classified_issue =
+            classify_dev_browser_page_issue(&prepare.url, &prepare.title, &prepare.body_text);
         match prepare.status.as_str() {
             "ready" if prepare.logged_in && prepare.composer_ready => {}
             "login_required" => {
                 return Err(anyhow!(
-                    "chatgpt login required in the attached Chrome session. Log in there and try again."
+                    "{}",
+                    classified_issue.unwrap_or(
+                        "chatgpt login required in the attached Chrome session. Log in there and try again."
+                    )
                 ));
             }
             "not_ready" => {
+                if let Some(issue) = classified_issue {
+                    return Err(anyhow!("{issue}"));
+                }
                 return Err(anyhow!(
-                    "ChatGPT did not finish loading the composer on {}. Restart Chrome with chrome://inspect/#remote-debugging enabled and try again.",
-                    prepare.url
+                    "ChatGPT did not finish loading the composer on {} (title: {:?}). Restart Chrome with chrome://inspect/#remote-debugging enabled and try again.",
+                    prepare.url,
+                    prepare.title
                 ));
             }
             other => {
@@ -1228,6 +1457,10 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
             &delivery_text,
             file_on_clipboard,
             ctx.disable_extended,
+            ctx.bundle_path
+                .as_deref()
+                .and_then(|path| path.file_name())
+                .and_then(|value| value.to_str()),
         );
         let send_stdout = run_script(&send_script, Some(90))?;
         let send: ChatgptSendResult = parse_script_json("parse chatgpt send result", &send_stdout)?;
@@ -1250,24 +1483,37 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<String> {
         let poll_script = build_chatgpt_poll_script(
             &page_name,
             send.assistant_count_before_send.unwrap_or(0),
+            send.assistant_last_len_before_send.unwrap_or(0),
             ctx.poll_settings,
             ctx.allow_empty_response,
         );
-        let poll_stdout = run_script(
+        let wait_started_at = Instant::now();
+        let heartbeat = ChatgptWaitHeartbeat::start(ctx.poll_settings);
+        let poll_result = run_script(
             &poll_script,
             Some(chatgpt_script_timeout_secs(ctx.poll_settings.timeout_ms)),
-        )?;
+        );
+        heartbeat.stop();
+        let poll_stdout = poll_result?;
         let (response, mut poll_warnings) =
             parse_chatgpt_recipe_result(&poll_stdout, ctx.poll_settings.timeout_ms)?;
+        eprintln!(
+            "info: ChatGPT response completed after {}",
+            format_chatgpt_wait_duration(wait_started_at.elapsed())
+        );
         warnings.append(&mut poll_warnings);
-        Ok((response, warnings))
+        Ok((response, warnings, model_used))
     })();
 
-    let (response, warnings) = result?;
-    for warning in warnings {
+    let (response, warnings, model_used) = result?;
+    for warning in &warnings {
         eprintln!("warn: {warning}");
     }
-    Ok(response)
+    Ok(ChatgptRecipeRunResult {
+        response,
+        model_used,
+        warnings,
+    })
 }
 
 #[cfg(test)]
@@ -1341,10 +1587,10 @@ mod tests {
     fn looks_like_dev_browser_connect_failure_matches_connect_timeout() {
         let err =
             anyhow!("browser.newPage: Timeout 30000ms exceeded while waiting for connectOverCDP");
-        assert!(looks_like_dev_browser_connect_failure(&err));
+        assert!(is_dev_browser_connect_failure(&err));
 
         let other = anyhow!("ChatGPT response timed out after 900000ms");
-        assert!(!looks_like_dev_browser_connect_failure(&other));
+        assert!(!is_dev_browser_connect_failure(&other));
     }
 
     #[test]
@@ -1418,37 +1664,109 @@ mod tests {
             .unwrap(),
             Some("ws://127.0.0.1:9222/devtools/browser/test-browser-id".to_string())
         );
+        assert_eq!(
+            resolve_dev_browser_connect_endpoint(Some("http://localhost:9222")).unwrap(),
+            Some("http://localhost:9222".to_string())
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn resolve_dev_browser_connect_endpoint_rejects_remote_by_default() {
+        // Non-loopback CDP endpoints must be rejected unless the operator opts
+        // in via YOETZ_CDP_ALLOW_REMOTE=1 (review finding #5).
+        let previous =
+            std::env::var(crate::chrome_devtools_mcp::client::YOETZ_CDP_ALLOW_REMOTE_ENV).ok();
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var(crate::chrome_devtools_mcp::client::YOETZ_CDP_ALLOW_REMOTE_ENV);
+        }
+        let err = resolve_dev_browser_connect_endpoint(Some("http://attacker.example.com:9222"))
+            .expect_err("remote endpoints must be rejected by default");
+        let message = format!("{err:#}");
+        assert!(message.contains("not on localhost"));
+        assert!(message.contains(crate::chrome_devtools_mcp::client::YOETZ_CDP_ALLOW_REMOTE_ENV));
+        if let Some(value) = previous {
+            #[allow(unsafe_code)]
+            unsafe {
+                std::env::set_var(
+                    crate::chrome_devtools_mcp::client::YOETZ_CDP_ALLOW_REMOTE_ENV,
+                    value,
+                );
+            }
+        }
     }
 
     #[test]
     fn build_chatgpt_prepare_script_uses_named_page_and_login_check() {
-        let script = build_chatgpt_prepare_script("yoetz-chatgpt-test", "gpt-5-4-pro");
+        let script = build_chatgpt_prepare_script("yoetz-chatgpt-test", "gpt-5-4-pro", "run-123");
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
         assert!(script.contains("const MODEL = \"gpt-5-4-pro\";"));
-        assert!(script.contains("const page = await browser.getPage(PAGE_NAME);"));
+        assert!(script.contains("const MARKED_URL = \"https://chatgpt.com/?_yoetz=run-123\";"));
+        assert!(script.contains("const WINDOW_NAME = \"yoetz:run-123\";"));
         assert!(
-            script.contains("await page.goto(CHATGPT_URL, { waitUntil: \"domcontentloaded\" });")
+            script.contains("await page.goto(MARKED_URL, { waitUntil: \"domcontentloaded\" });")
         );
+        assert!(script.contains("window.name = name;"));
         assert!(script.contains("[data-testid='login-button']"));
         assert!(script.contains("const NEW_CHAT_SELECTOR = \"[data-testid='new-chat-button']\";"));
+        assert!(script.contains("const MODEL_SELECTION_FUNCTION_SOURCE ="));
         assert!(script.contains("const canUseNewChat = attempt === 0;"));
         assert!(script.contains("await page.reload({ waitUntil: \"domcontentloaded\" });"));
-        assert!(script.contains("page.evaluate(({ composerSelector, assistantSelector })"));
-        assert!(!script.contains("page.evaluate((composerSelector, assistantSelector)"));
+        assert!(script.contains("page.evaluate(() => {"));
         assert!(script.contains("state.assistantCount === 0"));
         assert!(script.contains("pathname.startsWith(\"/c/\")"));
+        assert!(script.contains("const selection = await page.evaluate((functionSource) => {"));
+        assert!(script.contains("\\\"gpt-5-pro\\\":\\\"gpt-5-4-pro\\\""));
+        assert!(!script.contains("\\\"gpt-5-3-pro\\\""));
+        assert!(script.contains(
+            "requested model '\" + (selection?.requested || MODEL || \"\") + \"' was not selected"
+        ));
+        assert!(script.contains("let selectedModel = null;"));
+        assert!(script.contains(
+            "selectedModel = selection?.targetTestId || selection?.modelUsed || selection?.selectedLabel || null;"
+        ));
+        assert!(script.contains("modelUsed: selectedModel,"));
+        assert!(script.contains("bodyText"));
         assert!(script.contains(
             "status: !loggedIn ? \"login_required\" : composerReady ? \"ready\" : \"not_ready\""
         ));
     }
 
     #[test]
+    fn build_chatgpt_prepare_script_marks_a_yoetz_owned_tab() {
+        let script = build_chatgpt_prepare_script("yoetz-chatgpt-test", "pro", "run-456");
+        assert!(script.contains("const MARKED_URL = \"https://chatgpt.com/?_yoetz=run-456\";"));
+        assert!(script.contains("const WINDOW_NAME = \"yoetz:run-456\";"));
+        assert!(
+            script.contains("await page.goto(MARKED_URL, { waitUntil: \"domcontentloaded\" });")
+        );
+        assert!(script.contains("window.name = name;"));
+    }
+
+    #[test]
+    fn chatgpt_auth_probe_script_reuses_named_page_and_existing_tabs() {
+        let script = build_chatgpt_auth_probe_script("yoetz-chatgpt-test");
+
+        assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
+        assert!(script.contains("const pages = await browser.listPages();"));
+        assert!(script.contains("pages.find((entry) => entry.name === PAGE_NAME)"));
+        assert!(script.contains("await browser.getPage(chatgptPage.name || chatgptPage.id)"));
+        assert!(script.contains("await browser.getPage(PAGE_NAME)"));
+        assert!(
+            script.contains("await page.goto(CHATGPT_URL, { waitUntil: \"domcontentloaded\" });")
+        );
+        assert!(script.contains("bodyText"));
+        assert!(!script.contains("browser.newPage()"));
+    }
+
+    #[test]
     fn chatgpt_recipe_uses_stable_browser_and_page_names() {
         assert_eq!(CHATGPT_BROWSER_NAME, "yoetz-chatgpt");
-        assert_eq!(CHATGPT_PAGE_NAME, "yoetz-chatgpt-main");
-        assert!(!CHATGPT_PAGE_NAME.contains("pid"));
-        assert!(!CHATGPT_PAGE_NAME.contains('_'));
+        assert_eq!(CHATGPT_AUTH_PROBE_PAGE_NAME, "yoetz-chatgpt-main");
+        assert_eq!(CHATGPT_RECIPE_PAGE_NAME_PREFIX, "yoetz-chatgpt-run");
+        assert!(!CHATGPT_AUTH_PROBE_PAGE_NAME.contains("pid"));
     }
 
     #[test]
@@ -1459,14 +1777,17 @@ mod tests {
             "Review this file.",
             true,
             true,
+            Some("bundle.txt"),
         );
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
         assert!(script.contains("const FILE_ON_CLIPBOARD = true;"));
         assert!(script.contains("await composer.waitFor({ state: \"visible\", timeout: 15000 });"));
         assert!(script.contains("await page.keyboard.press(\"Meta+v\");"));
-        assert!(script.contains("file not attached after clipboard paste"));
-        assert!(script.contains("[class*='file-tile'], [data-testid*='attachment']"));
+        assert!(script.contains("file attachment did not finish uploading after clipboard paste"));
+        assert!(script.contains("const ATTACHMENT_PROBE_FUNCTION_SOURCE ="));
+        assert!(script.contains("const SEND_CLICK_FUNCTION_SOURCE ="));
+        assert!(script.contains("assistantLastLenBeforeSend"));
         assert!(script.contains("pressSequentially(DELIVERY_TEXT, { delay: 15 })"));
         assert!(script.contains("status: \"sent\""));
     }
@@ -1475,13 +1796,18 @@ mod tests {
     fn parse_script_json_reads_prepare_result() {
         let result: ChatgptPrepareResult = parse_script_json(
             "prepare",
-            r#"{"status":"ready","loggedIn":true,"composerReady":true,"url":"https://chatgpt.com/"}"#,
+            r#"{"status":"ready","loggedIn":true,"composerReady":true,"modelUsed":"model-switcher-gpt-5-4-pro","url":"https://chatgpt.com/","title":"ChatGPT","bodyText":"Send a message"}"#,
         )
         .unwrap();
 
         assert_eq!(result.status, "ready");
         assert!(result.logged_in);
         assert!(result.composer_ready);
+        assert_eq!(
+            result.model_used.as_deref(),
+            Some("model-switcher-gpt-5-4-pro")
+        );
+        assert_eq!(result.title, "ChatGPT");
     }
 
     #[test]
@@ -1489,6 +1815,7 @@ mod tests {
         let script = build_chatgpt_poll_script(
             "yoetz-chatgpt-test",
             3,
+            120,
             ChatgptPollSettings {
                 timeout_ms: 900_000,
                 interval_ms: 45_000,
@@ -1497,18 +1824,63 @@ mod tests {
         );
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
-        assert!(script.contains("const BASELINE = 3;"));
+        assert!(script.contains("const BASELINE_COUNT = 3;"));
+        assert!(script.contains("const BASELINE_LAST_LEN = 120;"));
         assert!(script.contains("const POLL_TIMEOUT_MS = 900000;"));
         assert!(script.contains("const POLL_INTERVAL_MS = 45000;"));
+        assert!(script.contains("const STABLE_IDLE_THRESHOLD_MS = 135000;"));
         assert!(script.contains("const ALLOW_EMPTY_RESPONSE = false;"));
-        assert!(script.contains("let lastResponseText = null;"));
+        assert!(script.contains("let stableSince = null;"));
         assert!(script.contains(".result-thinking, [data-testid*='thinking']"));
         assert!(script.contains("[data-testid='stop-button']"));
         assert!(script.contains("[data-message-author-role='assistant']"));
-        assert!(script.contains("!state.hasThinkingIndicator"));
-        assert!(script.contains("state.response === lastResponseText"));
+        assert!(script.contains("sameMessageGrew"));
+        assert!(script.contains("stableKey === responseKey"));
         assert!(script.contains("status: \"ok\""));
         assert!(script.contains("status: \"timeout\""));
+    }
+
+    #[test]
+    fn classify_dev_browser_page_issue_matches_challenge_and_login_states() {
+        assert_eq!(
+            classify_dev_browser_page_issue(
+                "https://chatgpt.com/",
+                "Just a moment...",
+                "Verify you are human"
+            ),
+            Some(
+                "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again."
+            )
+        );
+        assert_eq!(
+            classify_dev_browser_page_issue(
+                "https://auth.openai.com/login",
+                "Log in",
+                "Continue with Google"
+            ),
+            Some("chatgpt login required in the attached Chrome session. Log in there and try again.")
+        );
+    }
+
+    #[test]
+    fn chatgpt_wait_heartbeat_interval_is_clamped() {
+        assert_eq!(chatgpt_wait_heartbeat_interval_ms(1_000), 15_000);
+        assert_eq!(chatgpt_wait_heartbeat_interval_ms(30_000), 30_000);
+        assert_eq!(chatgpt_wait_heartbeat_interval_ms(120_000), 60_000);
+    }
+
+    #[test]
+    fn chatgpt_wait_progress_message_is_human_readable() {
+        let message = chatgpt_wait_progress_message(
+            Duration::from_secs(95),
+            ChatgptPollSettings {
+                timeout_ms: 1_800_000,
+                interval_ms: 30_000,
+            },
+        );
+        assert!(message.contains("elapsed 1m 35s"));
+        assert!(message.contains("timeout 30m 0s"));
+        assert!(message.contains("poll every 30s"));
     }
 
     #[test]
@@ -1616,5 +1988,13 @@ mod tests {
         }
 
         assert!(command_is_available(script.to_str().unwrap()));
+    }
+
+    #[test]
+    fn missing_dev_browser_error_requires_explicit_install() {
+        let detail = missing_dev_browser_error().to_string();
+        assert!(detail.contains("Install it explicitly"));
+        assert!(detail.contains("YOETZ_DEV_BROWSER_BIN"));
+        assert!(!detail.contains("installing via npm"));
     }
 }

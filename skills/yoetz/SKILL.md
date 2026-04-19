@@ -258,11 +258,9 @@ yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 # can access, preferring GPT-5/Pro when available. Override it only if needed.
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var model=gpt-5-4-pro
 
-# Reuse the currently active ChatGPT tab/conversation for a follow-up turn
-# instead of opening a fresh one (default is "fresh" — a fresh conversation
-# per call; whether that is a new tab or same-tab navigation depends on the
-# transport/session state). Requires the attached tab to already be on chatgpt.com.
-yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var thread=reuse
+# Every request opens a fresh, yoetz-owned ChatGPT tab marked with ?_yoetz=<run-id>
+# so your own ChatGPT conversations are never touched. `--var thread=reuse` is
+# rejected — yoetz is always a fresh-tab consumer.
 ```
 
 The wait loop reports `completion_reason` in its JSON output:

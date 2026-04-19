@@ -23,7 +23,7 @@ use crate::browser::context::Context;
 use crate::util;
 use B::GetVersion;
 pub use B::GetVersionReturnObject;
-use Target::{CreateTarget, SetDiscoverTargets};
+use Target::{CreateTarget, FilterEntry, SetDiscoverTargets};
 
 #[cfg(feature = "fetch")]
 pub use fetcher::FetcherOptions;
@@ -170,7 +170,7 @@ impl Browser {
         trace!("Calling set discover");
         browser.call_method(SetDiscoverTargets {
             discover: true,
-            filter: None,
+            filter: Some(registerable_target_discovery_filter()),
         })?;
 
         Ok(browser)
@@ -287,9 +287,7 @@ impl Browser {
             .call_method(GetTargets { filter: None })?
             .target_infos
             .into_iter()
-            .find(|target| {
-                target.Type == "page" && target.target_id.as_str() == target_id
-            });
+            .find(|target| is_page_target(target) && target.target_id.as_str() == target_id);
 
         let Some(target) = target else {
             return Ok(None);
@@ -327,32 +325,59 @@ impl Browser {
         Ok(Context::new(self, context_id))
     }
 
+    pub fn get_targets(&self) -> Result<Vec<Target::TargetInfo>> {
+        Ok(self.call_method(GetTargets { filter: None })?.target_infos)
+    }
+
+    pub fn get_page_targets(&self) -> Result<Vec<Target::TargetInfo>> {
+        Ok(self
+            .get_targets()?
+            .into_iter()
+            .filter(is_page_target)
+            .collect())
+    }
+
+    pub fn attach_to_page_target(&self, target_id: &str) -> Result<Option<Arc<Tab>>> {
+        self.attach_tab_from_target_list(target_id)
+    }
+
     /// Adds tabs that have not been opened with new_tab to the list of tabs
     pub fn register_missing_tabs(&self) {
-        let targets = self.call_method(GetTargets { filter: None });
+        let Ok(targets) = self.call_method(GetTargets { filter: None }) else {
+            return;
+        };
 
         let mut tabs_lock = self.inner.tabs.lock().unwrap();
         let mut previous_target_id: String = String::default();
-        for target in targets.unwrap().target_infos {
-            let target_id = target.target_id.clone();
-
-            if tabs_lock
-                .iter()
-                .any(|t| t.get_target_id().clone() == target_id || !target.attached)
-            {
+        for target in targets.target_infos {
+            if !is_attachable_page_target(&target) {
                 previous_target_id = target.target_id;
                 continue;
             }
 
-            let tab = Tab::new(target, self.inner.transport.clone());
-            if let Ok(tab) = tab {
-                if let Some(index) = tabs_lock
-                    .iter()
-                    .position(|x| x.get_target_id().clone() == previous_target_id)
-                {
-                    tabs_lock.insert(index, Arc::new(tab));
-                } else {
-                    tabs_lock.push(Arc::new(tab));
+            let target_id = target.target_id.clone();
+
+            if tabs_lock.iter().any(|t| t.get_target_id().clone() == target_id) {
+                previous_target_id = target.target_id;
+                continue;
+            }
+
+            match Tab::new(target.clone(), self.inner.transport.clone()) {
+                Ok(tab) => {
+                    if let Some(index) = tabs_lock
+                        .iter()
+                        .position(|x| x.get_target_id().clone() == previous_target_id)
+                    {
+                        tabs_lock.insert(index, Arc::new(tab));
+                    } else {
+                        tabs_lock.push(Arc::new(tab));
+                    }
+                }
+                Err(err) => {
+                    emit_register_missing_tabs_debug(&format!(
+                        "failed to attach target {} ({}) while registering existing tabs: {err:#}",
+                        target.target_id, target.url
+                    ));
                 }
             }
 
@@ -386,8 +411,6 @@ impl Browser {
         idle_browser_timeout: Duration,
     ) {
         let tabs = Arc::clone(&self.inner.tabs);
-        let transport = Arc::clone(&self.inner.transport);
-
         std::thread::spawn(move || {
             trace!("Starting browser's event handling loop");
             loop {
@@ -423,52 +446,25 @@ impl Browser {
                                 // when Type == other and url == "" the next trigger would be AttachedToTarget
                                 // meaning the devtools has ben opened automatically..
                                 // for now ignoring devtools tabs to be in tabs..
-                                if target_info.Type == "page" {
-                                    if tabs
-                                        .lock()
-                                        .unwrap()
-                                        .iter()
-                                        .any(|tab| tab.get_target_id() == &target_info.target_id)
-                                    {
-                                        continue;
-                                    }
-                                    match Tab::new(target_info, Arc::clone(&transport)) {
-                                        Ok(new_tab) => {
-                                            let new_tab = Arc::new(new_tab);
-                                            let mut locked_tabs = tabs.lock().unwrap();
-                                            if locked_tabs.iter().any(|existing| {
-                                                existing.get_target_id() == new_tab.get_target_id()
-                                            }) {
-                                                continue;
-                                            }
-                                            locked_tabs.push(new_tab);
-                                        }
-                                        Err(_tab_creation_err) => {
-                                            info!("Failed to create a handle to new tab");
-                                            break;
-                                        }
-                                    }
+                                if let Some(existing_tab) = tabs
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .find(|tab| *tab.get_target_id() == target_info.target_id)
+                                    .cloned()
+                                {
+                                    existing_tab.update_target_info(target_info);
                                 }
                             }
                             Event::TargetInfoChanged(ev) => {
-                                let target_info = &ev.params.target_info;
+                                let target_info = ev.params.target_info;
                                 trace!("Target info changed: {target_info:?}");
-                                if target_info.Type == "page"
-                                    && !target_info.url.starts_with("devtools://")
+                                let locked_tabs = tabs.lock().unwrap();
+                                if let Some(updated_tab) = locked_tabs
+                                    .iter()
+                                    .find(|tab| *tab.get_target_id() == target_info.target_id)
                                 {
-                                    let locked_tabs = tabs.lock().unwrap();
-                                    if let Some(updated_tab) = locked_tabs
-                                        .iter()
-                                        .find(|tab| *tab.get_target_id() == target_info.target_id)
-                                    {
-                                        updated_tab.update_target_info(target_info.clone());
-                                    } else {
-                                        let raw_event = format!("{ev:?}");
-                                        trace!(
-                                            "Target info changed unhandled event: {}",
-                                            raw_event.chars().take(50).collect::<String>()
-                                        );
-                                    }
+                                    updated_tab.update_target_info(target_info.clone());
                                 }
                             }
                             Event::AttachedToTarget(ev) => {
@@ -518,6 +514,56 @@ impl Browser {
     pub(crate) fn process(&self) -> Option<&Process> {
         #[allow(clippy::used_underscore_binding)]
         self.inner.process.as_ref()
+    }
+}
+
+fn is_page_target(target: &Target::TargetInfo) -> bool {
+    matches!(target.Type.as_str(), "page" | "tab") && !target.url.starts_with("devtools://")
+}
+
+fn is_attachable_page_target(target: &Target::TargetInfo) -> bool {
+    // Discovery should still surface targets another frontend/client already
+    // attached to, but creating a new Tab handle for those targets is not
+    // reliable on modern Chrome: a second AttachToTarget can succeed while the
+    // first session-bound Page.enable immediately comes back as browser-level
+    // -32601 "method not found". Restrict auto-registration to unattached
+    // page/tab targets and leave already-attached targets visible only through
+    // get_page_targets()/GetTargets.
+    is_page_target(target) && !target.attached
+}
+
+fn registerable_target_discovery_filter() -> Target::TargetFilter {
+    vec![
+        FilterEntry {
+            exclude: Some(true),
+            Type: Some("browser".to_string()),
+        },
+        FilterEntry {
+            exclude: Some(false),
+            Type: Some("page".to_string()),
+        },
+        FilterEntry {
+            exclude: Some(false),
+            Type: Some("tab".to_string()),
+        },
+        FilterEntry {
+            exclude: Some(true),
+            Type: None,
+        },
+    ]
+}
+
+fn emit_register_missing_tabs_debug(message: &str) {
+    if std::env::var("YOETZ_DEBUG_CDP")
+        .map(|value| {
+            let trimmed = value.trim();
+            !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("0")
+                && !trimmed.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+    {
+        eprintln!("info: headless_chrome {message}");
     }
 }
 
@@ -614,6 +660,7 @@ pub fn default_executable() -> Result<std::path::PathBuf, String> {
 #[cfg(test)]
 mod test {
     use super::Browser;
+    use crate::protocol::cdp::Target::TargetInfo;
 
     fn is_sync<T>()
     where
@@ -624,5 +671,76 @@ mod test {
     #[test]
     fn test_if_browser_is_sync() {
         is_sync::<Browser>();
+    }
+
+    fn target_info(kind: &str, attached: bool) -> TargetInfo {
+        TargetInfo {
+            target_id: "target-1".to_string(),
+            Type: kind.to_string(),
+            title: String::new(),
+            url: String::new(),
+            attached,
+            opener_id: None,
+            can_access_opener: false,
+            opener_frame_id: None,
+            parent_frame_id: None,
+            browser_context_id: None,
+            subtype: None,
+        }
+    }
+
+    #[test]
+    fn page_target_includes_page_and_tab_regardless_of_attachment() {
+        assert!(super::is_page_target(&target_info("page", false)));
+        assert!(super::is_page_target(&target_info("page", true)));
+        assert!(super::is_page_target(&target_info("tab", false)));
+        assert!(super::is_page_target(&target_info("tab", true)));
+    }
+
+    #[test]
+    fn attachable_page_target_requires_unattached_targets() {
+        assert!(super::is_attachable_page_target(&target_info("page", false)));
+        assert!(super::is_attachable_page_target(&target_info("tab", false)));
+        assert!(!super::is_attachable_page_target(&target_info("page", true)));
+        assert!(!super::is_attachable_page_target(&target_info("tab", true)));
+    }
+
+    #[test]
+    fn registerable_page_target_ignores_background_and_worker_targets() {
+        assert!(!super::is_page_target(&target_info(
+            "background_page",
+            true
+        )));
+        assert!(!super::is_page_target(&target_info(
+            "service_worker",
+            false
+        )));
+    }
+
+    #[test]
+    fn registerable_page_target_ignores_devtools_urls() {
+        let mut page = target_info("page", false);
+        page.url = "devtools://devtools/bundled/inspector.html".to_string();
+        assert!(!super::is_page_target(&page));
+        assert!(!super::is_attachable_page_target(&page));
+
+        let mut tab = target_info("tab", false);
+        tab.url = "devtools://devtools/bundled/inspector.html".to_string();
+        assert!(!super::is_page_target(&tab));
+        assert!(!super::is_attachable_page_target(&tab));
+    }
+
+    #[test]
+    fn registerable_target_discovery_filter_includes_page_and_tab_targets() {
+        let filter = super::registerable_target_discovery_filter();
+        assert_eq!(filter.len(), 4);
+        assert_eq!(filter[0].Type.as_deref(), Some("browser"));
+        assert_eq!(filter[0].exclude, Some(true));
+        assert_eq!(filter[1].Type.as_deref(), Some("page"));
+        assert_eq!(filter[1].exclude, Some(false));
+        assert_eq!(filter[2].Type.as_deref(), Some("tab"));
+        assert_eq!(filter[2].exclude, Some(false));
+        assert_eq!(filter[3].Type, None);
+        assert_eq!(filter[3].exclude, Some(true));
     }
 }

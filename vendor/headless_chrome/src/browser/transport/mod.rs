@@ -7,7 +7,7 @@ use std::sync::mpsc::Sender;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 
 use thiserror::Error;
 
@@ -17,14 +17,16 @@ use url::Url;
 use waiting_call_registry::WaitingCallRegistry;
 use web_socket_connection::WebSocketConnection;
 
-use crate::protocol::cdp::{Target, types::Event, types::Method};
+use crate::protocol::cdp::types::{Event, Method};
 
-use crate::types::{CallId, Message, parse_raw_message, parse_response};
+use crate::types::{CallId, Message, RoutedMessage, parse_raw_message, parse_response};
 
 use crate::util;
 
 mod waiting_call_registry;
 mod web_socket_connection;
+
+const DEFAULT_CALL_METHOD_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct SessionId(String);
@@ -138,18 +140,13 @@ impl Transport {
 
         match destination {
             MethodDestination::Target(session_id) => {
-                let message = message_text.clone();
-                let target_method = Target::SendMessageToTarget {
-                    target_id: None,
-                    session_id: Some(session_id.0),
-                    message,
-                };
+                let message_text = add_session_id_to_message(&message_text, &session_id)?;
                 trace!(
                     "Msg to tab: {}",
                     message_text.chars().take(300).collect::<String>()
                 );
-                if let Err(e) = self.call_method_on_browser(target_method) {
-                    warn!("Failed to call method on browser: {e:?}");
+                if let Err(e) = self.web_socket_connection.send_message(&message_text) {
+                    warn!("Failed to call method on target: {e:?}");
                     self.waiting_call_registry.unregister_call(call.id);
                     trace!("Unregistered callback: {:?}", call.id);
                     return Err(e);
@@ -171,8 +168,9 @@ impl Transport {
             params_string.chars().take(400).collect::<String>()
         );
 
-        let response_result = util::Wait::new(self.idle_browser_timeout, Duration::from_millis(5))
-            .until(|| response_rx.try_recv().ok());
+        let response_result =
+            util::Wait::new(call_method_timeout(self.idle_browser_timeout), Duration::from_millis(5))
+                .until(|| response_rx.try_recv().ok());
         trace!("received response for: {} {:?}", &call_id, params_string);
         parse_response::<C::ReturnObject>((response_result?)?)
     }
@@ -222,7 +220,7 @@ impl Transport {
 
     #[allow(clippy::too_many_arguments)]
     fn handle_incoming_messages(
-        messages_rx: Receiver<Message>,
+        messages_rx: Receiver<RoutedMessage>,
         waiting_call_registry: Arc<WaitingCallRegistry>,
         listeners: Listeners,
         open: Arc<AtomicBool>,
@@ -260,7 +258,12 @@ impl Transport {
                         }
                         break;
                     }
-                    Ok(message) => match message {
+                    Ok(routed_message) => {
+                        let RoutedMessage {
+                            session_id,
+                            payload,
+                        } = routed_message;
+                        match payload {
                         Message::ConnectionShutdown => {
                             info!("Received shutdown message");
                             break;
@@ -277,7 +280,19 @@ impl Transport {
                             }
                         }
 
-                        Message::Event(browser_event) => match browser_event {
+                        Message::Event(browser_event) => {
+                            if let Some(session_id) = session_id {
+                                let session_id = SessionId::from(session_id);
+                                if let Some(tx) = listeners
+                                    .lock()
+                                    .unwrap()
+                                    .get(&ListenerId::SessionId(session_id))
+                                {
+                                    tx.send(browser_event)
+                                        .expect("Couldn't send event to listener");
+                                }
+                            } else {
+                                match browser_event {
                             Event::ReceivedMessageFromTarget(target_message_event) => {
                                 let session_id = target_message_event.params.session_id.into();
                                 let raw_message = target_message_event.params.message;
@@ -285,7 +300,13 @@ impl Transport {
                                 let msg_res = parse_raw_message(&raw_message);
                                 match msg_res {
                                     Ok(target_message) => match target_message {
-                                        Message::Event(target_event) => {
+                                        RoutedMessage {
+                                            session_id: nested_session_id,
+                                            payload: Message::Event(target_event),
+                                        } => {
+                                            let session_id = nested_session_id
+                                                .map(SessionId::from)
+                                                .unwrap_or(session_id);
                                             if let Some(tx) = listeners
                                                 .lock()
                                                 .unwrap()
@@ -296,7 +317,10 @@ impl Transport {
                                             }
                                         }
 
-                                        Message::Response(resp) => {
+                                        RoutedMessage {
+                                            payload: Message::Response(resp),
+                                            ..
+                                        } => {
                                             if waiting_call_registry.resolve_call(resp).is_err() {
                                                 warn!(
                                                     "The browser registered a call but then closed its receiving channel"
@@ -304,7 +328,10 @@ impl Transport {
                                                 break;
                                             }
                                         }
-                                        Message::ConnectionShutdown => {}
+                                        RoutedMessage {
+                                            payload: Message::ConnectionShutdown,
+                                            ..
+                                        } => {}
                                     },
                                     Err(e) => {
                                         trace!(
@@ -330,7 +357,10 @@ impl Transport {
                                     }
                                 }
                             }
-                        },
+                                }
+                            }
+                        }
+                        }
                     },
                 }
             }
@@ -349,8 +379,46 @@ impl Transport {
     }
 }
 
+fn add_session_id_to_message(message_text: &str, session_id: &SessionId) -> Result<String> {
+    let mut message_value: serde_json::Value = serde_json::from_str(message_text)?;
+    let Some(message_obj) = message_value.as_object_mut() else {
+        return Err(anyhow!("serialized CDP method call was not a JSON object"));
+    };
+    message_obj.insert(
+        "sessionId".to_string(),
+        serde_json::Value::String(session_id.as_str().to_string()),
+    );
+    Ok(serde_json::to_string(&message_value)?)
+}
+
 impl Drop for Transport {
     fn drop(&mut self) {
         info!("dropping transport");
+    }
+}
+
+fn call_method_timeout(idle_browser_timeout: Duration) -> Duration {
+    idle_browser_timeout.min(DEFAULT_CALL_METHOD_TIMEOUT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEFAULT_CALL_METHOD_TIMEOUT, call_method_timeout};
+    use std::time::Duration;
+
+    #[test]
+    fn call_method_timeout_caps_long_idle_sessions() {
+        assert_eq!(
+            call_method_timeout(Duration::from_secs(60 * 60)),
+            DEFAULT_CALL_METHOD_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn call_method_timeout_respects_shorter_idle_timeout() {
+        assert_eq!(
+            call_method_timeout(Duration::from_secs(30)),
+            Duration::from_secs(30)
+        );
     }
 }

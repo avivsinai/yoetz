@@ -39,25 +39,20 @@ pub mod chatgpt;
 // shape (new_page → focus → upload → type → click → wait → extract) with
 // per-LLM selectors — trivial to add once the client plumbing is verified.
 
-use anyhow::{anyhow, Result};
+use crate::chatgpt_web;
+use anyhow::Result;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum RecipeThreadMode {
     #[default]
     Fresh,
-    Reuse,
 }
 
 impl RecipeThreadMode {
     pub fn parse(raw: Option<&str>) -> Result<Self> {
-        match raw.unwrap_or("fresh").trim().to_ascii_lowercase().as_str() {
-            "" | "fresh" => Ok(Self::Fresh),
-            "reuse" => Ok(Self::Reuse),
-            other => Err(anyhow!(
-                "unsupported `thread` value `{other}`; expected `fresh` or `reuse`"
-            )),
-        }
+        chatgpt_web::validate_thread_mode(raw)?;
+        Ok(Self::Fresh)
     }
 }
 
@@ -91,12 +86,26 @@ pub struct DevtoolsMcpRecipeContext {
     /// User prompt to send alongside the bundle.
     pub prompt: String,
 
-    /// Whether the recipe should start a new conversation or reuse an
-    /// existing ChatGPT tab.
-    pub thread_mode: RecipeThreadMode,
+    /// Optional exact Chrome browser context ID to target. When set, yoetz
+    /// keeps all ChatGPT actions inside this live browserContextId.
+    pub browser_context_id: Option<String>,
+
+    /// Optional Chrome profile email selector. When set, yoetz resolves the
+    /// live Chrome browser context whose open tabs identify with this email
+    /// and keeps all ChatGPT actions inside that context.
+    pub profile_email: Option<String>,
+
+    /// Marker for the yoetz-owned ChatGPT tab created for this recipe run.
+    pub run_id: String,
 
     /// How long to wait for the full response before giving up, in ms.
     pub response_timeout_ms: u64,
+
+    /// Poll interval for stable-idle response detection, in ms.
+    pub response_poll_interval_ms: u64,
+
+    /// Whether to disable Extended Pro before sending.
+    pub disable_extended: bool,
 
     /// Whether to surface approval-dialog guidance to stderr in text mode.
     pub show_approval_guidance: bool,
@@ -110,8 +119,12 @@ impl Default for DevtoolsMcpRecipeContext {
             bundle_text: None,
             model: String::new(),
             prompt: String::new(),
-            thread_mode: RecipeThreadMode::Fresh,
+            browser_context_id: None,
+            profile_email: None,
+            run_id: String::new(),
             response_timeout_ms: 1_800_000, // 30 min default for ChatGPT Pro Extended
+            response_poll_interval_ms: 30_000,
+            disable_extended: false,
             show_approval_guidance: true,
         }
     }

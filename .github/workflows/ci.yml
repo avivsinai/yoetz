@@ -243,3 +243,46 @@ jobs:
           name: yoetz-${{ matrix.os }}
           path: target/release/yoetz.exe
           retention-days: 3
+
+  browser-integration:
+    name: Real-Browser Smoke (Chrome for Testing)
+    needs: changes
+    if: needs.changes.outputs.release_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install Chrome for Testing
+        id: install-chrome
+        uses: browser-actions/setup-chrome@c785b87e244131f27c9f19c1a33e2ead956ab7ce # v2
+        with:
+          chrome-version: stable
+      - name: Install host dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            jq \
+            libnss3 \
+            libatk-bridge2.0-0 \
+            libdrm2 \
+            libgbm1 \
+            libasound2t64 \
+            fonts-liberation \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libu2f-udev \
+            libvulkan1 \
+            xdg-utils
+      - name: Fake-ChatGPT fixture tests
+        env:
+          YOETZ_CHROME_BIN: ${{ steps.install-chrome.outputs.chrome-path }}
+        run: cargo test -p yoetz fake_chatgpt_fixture_ -- --ignored
+      - name: Build yoetz
+        run: cargo build --release --bin yoetz
+      - name: Real-browser smoke
+        env:
+          YOETZ_CHROME_BIN: ${{ steps.install-chrome.outputs.chrome-path }}
+        run: ./scripts/ci-real-browser-smoke.sh

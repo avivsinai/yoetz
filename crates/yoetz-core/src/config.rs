@@ -24,8 +24,6 @@ pub struct Defaults {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub max_output_tokens: Option<usize>,
-    pub browser_profile: Option<String>,
-    pub browser_cdp: Option<String>,
 }
 
 /// Configuration for a single LLM provider (base URL, API key, kind).
@@ -107,25 +105,33 @@ impl Config {
             }
         }
         if let Some(aliases) = other.aliases {
-            self.aliases.extend(aliases);
+            if trusted {
+                self.aliases.extend(aliases);
+            } else {
+                eprintln!(
+                    "warning: ignoring [aliases] from untrusted config {}",
+                    source.display()
+                );
+            }
         }
     }
 }
 
 fn sanitize_untrusted_defaults(mut defaults: Defaults, source: &Path) -> Defaults {
-    if defaults.browser_profile.take().is_some() {
-        eprintln!(
-            "warning: ignoring defaults.browser_profile from untrusted config {}",
-            source.display()
-        );
-    }
-    if defaults.browser_cdp.take().is_some() {
-        eprintln!(
-            "warning: ignoring defaults.browser_cdp from untrusted config {}",
-            source.display()
-        );
-    }
+    warn_and_clear_untrusted_default(&mut defaults.profile, "profile", source);
+    warn_and_clear_untrusted_default(&mut defaults.model, "model", source);
+    warn_and_clear_untrusted_default(&mut defaults.provider, "provider", source);
+    warn_and_clear_untrusted_default(&mut defaults.max_output_tokens, "max_output_tokens", source);
     defaults
+}
+
+fn warn_and_clear_untrusted_default<T>(slot: &mut Option<T>, field: &str, source: &Path) {
+    if slot.take().is_some() {
+        eprintln!(
+            "warning: ignoring defaults.{field} from untrusted config {}",
+            source.display()
+        );
+    }
 }
 
 fn load_config_file(path: &Path) -> Result<ConfigFile> {
@@ -194,12 +200,6 @@ fn merge_defaults(target: &mut Defaults, other: Defaults) {
     if other.max_output_tokens.is_some() {
         target.max_output_tokens = other.max_output_tokens;
     }
-    if other.browser_profile.is_some() {
-        target.browser_profile = other.browser_profile;
-    }
-    if other.browser_cdp.is_some() {
-        target.browser_cdp = other.browser_cdp;
-    }
 }
 
 #[cfg(test)]
@@ -207,37 +207,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_config_with_browser_cdp() {
-        let toml_str = r#"
-[defaults]
-browser_cdp = "http://127.0.0.1:9222"
-"#;
-        let file: ConfigFile = toml::from_str(toml_str).unwrap();
-        assert_eq!(
-            file.defaults.unwrap().browser_cdp.as_deref(),
-            Some("http://127.0.0.1:9222")
-        );
-    }
-
-    #[test]
-    fn parse_config_without_browser_cdp_defaults_to_none() {
+    fn parse_config_defaults_without_browser_fields() {
         let toml_str = r#"
 [defaults]
 model = "gpt-5-4-pro"
 "#;
         let file: ConfigFile = toml::from_str(toml_str).unwrap();
-        assert!(file.defaults.unwrap().browser_cdp.is_none());
-    }
-
-    #[test]
-    fn merge_defaults_browser_cdp() {
-        let mut target = Defaults::default();
-        let other = Defaults {
-            browser_cdp: Some("http://127.0.0.1:9222".to_string()),
-            ..Default::default()
-        };
-        merge_defaults(&mut target, other);
-        assert_eq!(target.browser_cdp.as_deref(), Some("http://127.0.0.1:9222"));
+        assert_eq!(file.defaults.unwrap().model.as_deref(), Some("gpt-5-4-pro"));
     }
 
     #[test]
@@ -245,10 +221,10 @@ model = "gpt-5-4-pro"
         let mut config = Config::default();
         let file = ConfigFile {
             defaults: Some(Defaults {
+                profile: Some("repo-profile".to_string()),
                 model: Some("gpt-5-4-pro".to_string()),
-                browser_profile: Some("/tmp/evil-profile".to_string()),
-                browser_cdp: Some("http://evil.example.com:9222".to_string()),
-                ..Default::default()
+                provider: Some("evil".to_string()),
+                max_output_tokens: Some(99_999),
             }),
             providers: Some(HashMap::from([(
                 "evil".to_string(),
@@ -268,14 +244,11 @@ model = "gpt-5-4-pro"
             )])),
         };
         config.merge(file, false, Path::new("./yoetz.toml"));
-        // Safe fields applied
-        assert_eq!(config.defaults.model.as_deref(), Some("gpt-5-4-pro"));
-        assert!(config.defaults.browser_profile.is_none());
-        assert!(config.defaults.browser_cdp.is_none());
-        assert_eq!(
-            config.aliases.get("fast").map(|s| s.as_str()),
-            Some("gpt-5-4-pro")
-        );
+        assert!(config.defaults.profile.is_none());
+        assert!(config.defaults.model.is_none());
+        assert!(config.defaults.provider.is_none());
+        assert!(config.defaults.max_output_tokens.is_none());
+        assert!(config.aliases.is_empty());
         // Restricted fields skipped
         assert!(config.providers.is_empty());
         assert!(config.registry.openrouter_models_url.is_none());
