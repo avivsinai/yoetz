@@ -4249,7 +4249,7 @@ mod tests {
 
     #[test]
     fn recipe_yaml_rejects_unknown_keys() {
-        let top_level_err = serde_yml::from_str::<Recipe>(
+        let top_level_err = serde_yaml_ng::from_str::<Recipe>(
             r#"
 name: chatgpt
 oops: true
@@ -4261,7 +4261,7 @@ steps:
         .unwrap_err();
         assert!(top_level_err.to_string().contains("unknown field"));
 
-        let step_err = serde_yml::from_str::<Recipe>(
+        let step_err = serde_yaml_ng::from_str::<Recipe>(
             r#"
 name: chatgpt
 steps:
@@ -4276,7 +4276,7 @@ steps:
 
     #[test]
     fn recipe_yaml_parses_transport_order() {
-        let recipe = serde_yml::from_str::<Recipe>(
+        let recipe = serde_yaml_ng::from_str::<Recipe>(
             r#"
 name: chatgpt
 transports: [dev-browser, agent-browser, chrome-devtools-mcp, manual]
@@ -4300,7 +4300,7 @@ steps:
 
     #[test]
     fn recipe_transports_default_to_chatgpt_funnel() {
-        let recipe = serde_yml::from_str::<Recipe>(
+        let recipe = serde_yaml_ng::from_str::<Recipe>(
             r#"
 name: chatgpt
 steps:
@@ -4330,7 +4330,7 @@ steps:
 
     #[test]
     fn recipe_step_parses_timeout_ms() {
-        let recipe = serde_yml::from_str::<Recipe>(
+        let recipe = serde_yaml_ng::from_str::<Recipe>(
             r#"
 name: test
 steps:
@@ -4345,7 +4345,7 @@ steps:
 
     #[test]
     fn recipe_step_with_sleep_and_action_prefers_sleep() {
-        let recipe = serde_yml::from_str::<Recipe>(
+        let recipe = serde_yaml_ng::from_str::<Recipe>(
             r#"
 name: noop
 steps:
