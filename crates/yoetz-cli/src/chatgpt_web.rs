@@ -1008,6 +1008,7 @@ mod tests {
     use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
     use serde_json::Value;
     use serial_test::serial;
+    use std::net::TcpListener;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::thread;
@@ -1323,9 +1324,15 @@ mod tests {
 "#
     }
 
+    fn reserve_loopback_debug_port() -> anyhow::Result<u16> {
+        let listener = TcpListener::bind(("127.0.0.1", 0))?;
+        Ok(listener.local_addr()?.port())
+    }
+
     fn launch_fake_chatgpt_fixture() -> anyhow::Result<(Browser, Arc<Tab>)> {
         let mut builder = LaunchOptionsBuilder::default();
         builder.headless(true);
+        builder.port(Some(reserve_loopback_debug_port()?));
         if let Some(path) = std::env::var_os("YOETZ_CHROME_BIN") {
             builder.path(Some(PathBuf::from(path)));
         }
