@@ -2243,7 +2243,7 @@ fn parse_media_inputs(
     let kind_label = media_type_label(&kind);
     let overrides = normalize_mime_overrides(values.len(), mimes, kind_label)?;
     let mut out = Vec::with_capacity(values.len());
-    for (value, mime) in values.iter().zip(overrides.into_iter()) {
+    for (value, mime) in values.iter().zip(overrides) {
         out.push(parse_media_input(value, mime.as_deref(), kind.clone())?);
     }
     Ok(out)

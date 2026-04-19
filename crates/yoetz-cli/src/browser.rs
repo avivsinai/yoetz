@@ -294,24 +294,25 @@ fn build_agent_browser_args(
             // For auto-connect, do NOT add --session. A managed session creates
             // an isolated context that can't see the real Chrome tabs/DOM.
             // Auto-connect should attach to the real browser directly.
-            if !args.iter().any(|a| a == "--auto-connect") {
+            let already_present = args.iter().any(|a| a == "--auto-connect");
+            if !already_present {
                 args.insert(0, "--auto-connect".to_string());
             }
         }
         Some(BrowserConnection::CookieState { state_file }) => {
-            if !args
+            let already_present = args
                 .iter()
-                .any(|a| a == "--state" || a.starts_with("--state="))
-            {
+                .any(|a| a == "--state" || a.starts_with("--state="));
+            if !already_present {
                 args.insert(0, state_file.to_string_lossy().to_string());
                 args.insert(0, "--state".to_string());
             }
         }
         Some(BrowserConnection::Profile { profile_dir }) => {
-            if !args
+            let already_present = args
                 .iter()
-                .any(|a| a == "--profile" || a.starts_with("--profile="))
-            {
+                .any(|a| a == "--profile" || a.starts_with("--profile="));
+            if !already_present {
                 args.insert(0, profile_dir.to_string_lossy().to_string());
                 args.insert(0, "--profile".to_string());
             }
@@ -1081,10 +1082,8 @@ fn parse_chatgpt_dom_state(raw: &str) -> Result<ChatgptDomState> {
             "lastlen" => {
                 assistant_last_len = value.parse().unwrap_or(0);
             }
-            "err" => {
-                if !value.is_empty() {
-                    error = value.to_string();
-                }
+            "err" if !value.is_empty() => {
+                error = value.to_string();
             }
             _ => {}
         }
