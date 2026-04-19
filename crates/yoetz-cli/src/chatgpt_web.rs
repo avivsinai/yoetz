@@ -1325,6 +1325,7 @@ mod tests {
     }
 
     fn reserve_loopback_debug_port() -> anyhow::Result<u16> {
+        // Intentionally drop the listener immediately so Chrome can rebind it.
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         Ok(listener.local_addr()?.port())
     }
