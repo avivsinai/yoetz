@@ -1330,10 +1330,22 @@ mod tests {
         Ok(listener.local_addr()?.port())
     }
 
+    fn should_disable_fixture_sandbox(is_linux: bool, is_ci: bool) -> bool {
+        is_linux && is_ci
+    }
+
     fn launch_fake_chatgpt_fixture() -> anyhow::Result<(Browser, Arc<Tab>)> {
         let mut builder = LaunchOptionsBuilder::default();
         builder.headless(true);
         builder.port(Some(reserve_loopback_debug_port()?));
+        if should_disable_fixture_sandbox(
+            cfg!(target_os = "linux"),
+            std::env::var_os("CI").is_some() || std::env::var_os("GITHUB_ACTIONS").is_some(),
+        ) {
+            // Chrome for Testing on hosted Linux runners can fail before
+            // exposing its DevTools websocket unless the sandbox is disabled.
+            builder.sandbox(false);
+        }
         if let Some(path) = std::env::var_os("YOETZ_CHROME_BIN") {
             builder.path(Some(PathBuf::from(path)));
         }
@@ -1430,5 +1442,13 @@ mod tests {
         let response = eval_fixture_function(&tab, &build_latest_response_probe_function())?;
         assert_eq!(response["response"], "Fixture assistant response");
         Ok(())
+    }
+
+    #[test]
+    fn fixture_sandbox_policy_only_disables_on_linux_ci() {
+        assert!(should_disable_fixture_sandbox(true, true));
+        assert!(!should_disable_fixture_sandbox(true, false));
+        assert!(!should_disable_fixture_sandbox(false, true));
+        assert!(!should_disable_fixture_sandbox(false, false));
     }
 }
