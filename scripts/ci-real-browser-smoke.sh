@@ -59,9 +59,17 @@ cleanup() {
 }
 trap cleanup EXIT
 
+chrome_extra_args=()
+if [[ "$(uname -s)" == "Linux" && ( -n "${CI:-}" || -n "${GITHUB_ACTIONS:-}" ) ]]; then
+  # Hosted Linux runners often install Chrome-for-Testing without a usable
+  # setuid sandbox helper, so headless launch fails unless we opt out here.
+  chrome_extra_args+=(--no-sandbox)
+fi
+
 echo "==> launching Chrome for Testing on port ${port}"
 "${chrome_bin}" \
   --headless=new \
+  "${chrome_extra_args[@]}" \
   --remote-debugging-port="${port}" \
   --user-data-dir="${data_dir}" \
   --no-first-run \
