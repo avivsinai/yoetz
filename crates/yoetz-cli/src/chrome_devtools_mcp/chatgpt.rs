@@ -549,6 +549,9 @@ async fn maybe_select_model(
         .get("status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
+    debug_phase(&format!(
+        "phase=select-model status={status} payload={selection}"
+    ));
     let model_used = chatgpt_web::select_reported_chatgpt_model(&selection, requested_model);
     match status {
         "selected" | "already-selected" => Ok(model_used),
