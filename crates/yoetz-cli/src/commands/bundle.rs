@@ -18,6 +18,7 @@ pub(crate) fn handle_bundle(
         max_file_bytes: args.max_file_bytes,
         max_total_bytes: args.max_total_bytes,
         include_all: args.all,
+        include_hidden: args.include_hidden || args.all,
         ..Default::default()
     };
 

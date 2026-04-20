@@ -193,9 +193,7 @@ const AGENT_BROWSER_INSTALL_GUIDANCE: &str = concat!(
     "binary/package, or set YOETZ_AGENT_BROWSER_BIN to the exact executable to run."
 );
 
-/// Returns true if dev-browser is the active browser backend.
-/// When dev-browser is available, it is the preferred backend for all browser
-/// operations.
+/// Returns true when the dev-browser backend is available locally.
 pub fn use_dev_browser() -> bool {
     crate::dev_browser::is_available()
 }

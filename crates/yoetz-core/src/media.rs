@@ -52,18 +52,22 @@ impl MediaInput {
     }
 
     pub fn from_path_with_mime(path: &Path, mime_override: Option<&str>) -> Result<Self> {
+        let metadata =
+            fs::metadata(path).with_context(|| format!("stat media input {}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(anyhow!("media input is not a file: {}", path.display()));
+        }
         let mime = if let Some(mime) = mime_override {
             mime.to_string()
         } else {
             guess_mime(path)?
         };
         let media_type = media_type_from_mime(&mime)?;
-        let size_bytes = fs::metadata(path).ok().map(|m| m.len());
         Ok(Self {
             source: MediaSource::File(path.to_path_buf()),
             media_type,
             mime_type: mime,
-            size_bytes,
+            size_bytes: Some(metadata.len()),
         })
     }
 
@@ -209,6 +213,30 @@ mod tests {
         assert_eq!(input.media_type, MediaType::Image);
         assert_eq!(input.mime_type, "image/png");
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn media_input_from_missing_path_errors() {
+        let path = temp_path("png");
+        let err = MediaInput::from_path(&path).unwrap_err();
+        assert!(err.to_string().contains("stat media input"));
+    }
+
+    #[test]
+    fn media_input_from_directory_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "yoetz_media_dir_test_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        let err = MediaInput::from_path(&path).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains(&format!("media input is not a file: {}", path.display())));
+        let _ = fs::remove_dir_all(path);
     }
 
     #[test]

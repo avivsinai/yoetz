@@ -195,6 +195,9 @@ struct BundleArgs {
 
     #[arg(long)]
     all: bool,
+
+    #[arg(long, help = "Include dotfiles and dot-directories; implied by --all")]
+    include_hidden: bool,
 }
 
 #[derive(Args)]

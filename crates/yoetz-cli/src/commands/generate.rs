@@ -15,6 +15,15 @@ use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::session::{create_session_dir, write_json as write_json_file};
 use yoetz_core::types::{ArtifactPaths, MediaGenerationResult, Usage};
 
+fn validate_video_generation_inputs(provider: &str, image_count: usize) -> Result<()> {
+    if provider == "openai" && image_count > 1 {
+        return Err(anyhow!(
+            "provider openai accepts at most one --image for video generation; got {image_count}"
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) async fn handle_generate(
     ctx: &AppContext,
     args: GenerateArgs,
@@ -60,6 +69,7 @@ async fn handle_generate_image(
     }
 
     let images = parse_media_inputs(&args.image, &args.image_mime, MediaType::Image)?;
+    validate_video_generation_inputs(&provider, images.len())?;
 
     let session = create_session_dir()?;
     let media_dir = args
@@ -164,6 +174,24 @@ async fn handle_generate_image(
             }
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_video_generation_inputs_rejects_multiple_openai_images() {
+        let err = validate_video_generation_inputs("openai", 2).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("provider openai accepts at most one --image"));
+    }
+
+    #[test]
+    fn validate_video_generation_inputs_allows_gemini_multi_image() {
+        validate_video_generation_inputs("gemini", 2).unwrap();
     }
 }
 

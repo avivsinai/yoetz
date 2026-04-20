@@ -221,7 +221,8 @@ fn bundle_help() {
         .args(["bundle", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--files"));
+        .stdout(predicate::str::contains("--files"))
+        .stdout(predicate::str::contains("--include-hidden"));
 }
 
 #[test]
@@ -394,6 +395,28 @@ fn bundle_prompt_file_without_files_succeeds() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"file_count\": 0"));
+}
+
+#[test]
+fn bundle_all_includes_hidden_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let workflows = dir.path().join(".github/workflows");
+    fs::create_dir_all(&workflows).unwrap();
+    fs::write(workflows.join("ci.yml"), "name: CI\n").unwrap();
+
+    yoetz()
+        .current_dir(dir.path())
+        .args([
+            "bundle",
+            "--prompt",
+            "review repo",
+            "--all",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".github/workflows/ci.yml"));
 }
 
 #[test]
