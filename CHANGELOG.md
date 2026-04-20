@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.54] - 2026-04-20
 ### Added
 
 - `yoetz browser verify-cdp --cdp <url>` — a thin CI-friendly smoke command
@@ -47,6 +48,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `yoetz browser recipe --recipe chatgpt` now reconnects once and reattaches to
   the same ChatGPT page target if Chrome drops the websocket during long
   stable-idle response polling, instead of failing the run immediately.
+- `yoetz browser recipe --recipe chatgpt` now prefers ChatGPT's visible tier
+  labels (`Pro`, `Thinking`, `Instant`) over stale `gpt-5-3-*` testid
+  suffixes when picking a model, and reopens the selector menu to verify the
+  radio state if the button label stays generic `ChatGPT`. Fixes `model=pro`
+  and `model=auto` falling back to Instant on the updated ChatGPT UI.
 - `scripts/setup-chatgpt-profile.sh` now prefers the repo-built yoetz binary,
   and the global config selector is `--config-profile`, avoiding collisions
   with browser subcommands that already use `--profile`.
@@ -56,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Untrusted repo-local config can no longer set global defaults or model
   aliases, and browser profile/CDP defaults remain restricted to trusted config
   paths only.
+
 
 ## [0.2.53] - 2026-04-14
 ### Fixed
