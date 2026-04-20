@@ -420,6 +420,37 @@ fn bundle_all_includes_hidden_paths() {
 }
 
 #[test]
+fn generate_video_openai_rejects_multiple_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let image_a = dir.path().join("a.png");
+    let image_b = dir.path().join("b.png");
+    fs::write(&image_a, [0u8, 1, 2, 3]).unwrap();
+    fs::write(&image_b, [0u8, 1, 2, 3]).unwrap();
+
+    yoetz()
+        .args([
+            "generate",
+            "video",
+            "--provider",
+            "openai",
+            "--model",
+            "sora-1",
+            "--prompt",
+            "animate this",
+            "--image",
+            image_a.to_str().unwrap(),
+            "--image",
+            image_b.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "provider openai accepts at most one --image for video generation",
+        ));
+}
+
+#[test]
 fn council_em_dash_in_prompt_parses() {
     let result = yoetz()
         .args([

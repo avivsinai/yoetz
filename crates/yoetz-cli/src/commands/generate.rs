@@ -69,7 +69,6 @@ async fn handle_generate_image(
     }
 
     let images = parse_media_inputs(&args.image, &args.image_mime, MediaType::Image)?;
-    validate_video_generation_inputs(&provider, images.len())?;
 
     let session = create_session_dir()?;
     let media_dir = args
@@ -249,6 +248,7 @@ async fn handle_generate_video(
     );
 
     let images = parse_media_inputs(&args.image, &args.image_mime, MediaType::Image)?;
+    validate_video_generation_inputs(&provider, images.len())?;
 
     let session = create_session_dir()?;
     let media_dir = args
