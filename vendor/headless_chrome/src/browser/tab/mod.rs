@@ -218,7 +218,7 @@ impl Tab {
         let session_id = transport
             .call_method_on_browser(AttachToTarget {
                 target_id: target_id.clone(),
-                flatten: None,
+                flatten: Some(true),
             })?
             .session_id
             .into();

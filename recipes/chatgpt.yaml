@@ -1,4 +1,9 @@
 name: chatgpt
+# Authoritative contract note:
+# The shared ChatGPT recipe request/output contract now lives in
+# `crates/yoetz-cli/src/chatgpt_recipe.rs`. This YAML still defines the
+# generic agent-browser action sequence, but MCP/dev-browser consume the same
+# typed Rust contract even when they do not execute these steps literally.
 # Transport order:
 #   1. chrome-devtools-mcp — direct CDP client against running Chrome 147+
 #      (uses vendored `headless_chrome`; NOT a bridge to the chrome-devtools-mcp
@@ -17,10 +22,15 @@ name: chatgpt
 #              best available model, preferring GPT-5/Pro when the account has it.
 #   extended — set to "false" to disable Extended Pro. Default: leave as-is.
 #   prompt   — prompt text to send with the attachment.
-#   thread   — "fresh" (default) opens a new ChatGPT conversation each call.
-#              "reuse" keeps the currently active ChatGPT tab/conversation so
-#              follow-up turns land in the same thread. Reuse requires the
-#              attached tab to already be on chatgpt.com.
+#   browser_context_id — exact Chrome `browserContextId` to target when multiple
+#              signed-in Chrome contexts are live in the same browser process.
+#   profile_email — signed-in Chrome profile email to target (for example
+#              `aviv.s@taboola.com`). Yoetz resolves this to a live
+#              `browserContextId` from the tabs currently open in Chrome.
+#   thread   — "fresh" (default). Every yoetz request opens a new ChatGPT tab
+#              marked with `?_yoetz=<run-id>` so the user's own ChatGPT tabs
+#              are never touched. Passing `thread=reuse` is rejected; parallel
+#              yoetz runs work automatically because each run owns its own tab.
 #   wait_timeout_ms  — overall response wait deadline in ms (default: 1800000 = 30min).
 #   wait_interval_ms — poll interval in ms (default: 30000 = 30s).
 
@@ -39,37 +49,27 @@ defaults:
   wait_interval_ms: "30000"
 
 steps:
-  # Step 1: navigate or stay put depending on `thread`.
-  # - thread=fresh (default): force a brand-new conversation by appending a
-  #   timestamp query param so the SPA router treats it as a real navigation
-  #   (otherwise it's a no-op and we'd reuse the old thread).
-  # - thread=reuse: stay on the current tab; fail-fast if it isn't chatgpt.com
-  #   so we don't accidentally type into some unrelated page.
-  - action: eval
-    args:
-      - |
-        (() => {
-          const thread = "{{thread}}";
-          if (thread === "reuse") {
-            if (location.host !== "chatgpt.com") {
-              throw new Error("thread=reuse requires the attached tab to be on chatgpt.com (current host: " + location.host + ")");
-            }
-            return "thread=reuse: staying on " + location.pathname;
-          }
-          window.location.href = 'https://chatgpt.com/?_yoetz=' + Date.now();
-          return "thread=fresh: navigating to new chat";
-        })()
+  # Step 1: always open a fresh yoetz-owned ChatGPT tab for this run.
+  - action: open
+    args: ["https://chatgpt.com/?_yoetz={{run_id}}"]
   - sleep_ms: 4000
 
-  # Step 2: safety net for thread=fresh — if we somehow landed on an existing
-  # conversation (URL contains /c/), click "New chat" to guarantee a clean
-  # slate. Skipped entirely when thread=reuse.
+  # Step 2: set a durable in-page backup marker before any recipe interaction.
   - action: eval
     args:
       - |
         (() => {
-          const thread = "{{thread}}";
-          if (thread === "reuse") return "skipped: thread=reuse";
+          window.name = "yoetz:{{run_id}}";
+          return "marked yoetz-owned chatgpt tab";
+        })()
+  - sleep_ms: 500
+
+  # Step 3: safety net — if we somehow landed on an existing conversation
+  # (URL contains /c/), click "New chat" to guarantee a clean slate.
+  - action: eval
+    args:
+      - |
+        (() => {
           if (!window.location.pathname.startsWith('/c/')) return "already new chat";
           const btn = document.querySelector(
             'a[href="/"], button[data-testid="create-new-chat-button"], nav a[class*="new"]'
@@ -80,91 +80,9 @@ steps:
         })()
   - sleep_ms: 2000
 
-  # Select model if --var model is provided.
-  # ChatGPT uses Radix UI for the dropdown — .click() alone does NOT open it.
-  # A full pointer event sequence (pointerdown→mousedown→pointerup→mouseup→click)
-  # is required, matching what a real mouse click dispatches.
-  - action: eval
-    args:
-      - |
-        (() => {
-          const raw = "{{model}}".trim();
-          const autoMode = !raw || raw.toLowerCase() === "auto";
-          const btn = document.querySelector(
-            '[data-testid="model-switcher-dropdown-button"], ' +
-            'button[aria-label="Model selector"]'
-          );
-          if (!btn) {
-            if (autoMode) return "kept current model: selector not found";
-            throw new Error("model selector button not found — ChatGPT may have changed their UI. Inspect the model picker for data-testid or aria-label attributes.");
-          }
-          btn.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true, pointerId: 1}));
-          btn.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
-          btn.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, cancelable: true, pointerId: 1}));
-          btn.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
-          btn.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-          return autoMode ? "opened model selector for auto selection" : "opened model selector";
-        })()
-  - sleep_ms: 1200
-  - action: eval
-    args:
-      - |
-        (() => {
-          const raw = "{{model}}".trim();
-          const slug = raw.toLowerCase();
-          const autoMode = !slug || slug === "auto";
-          function realClick(el) {
-            el.dispatchEvent(new PointerEvent('pointerdown', {bubbles: true, cancelable: true, pointerId: 1}));
-            el.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
-            el.dispatchEvent(new PointerEvent('pointerup', {bubbles: true, cancelable: true, pointerId: 1}));
-            el.dispatchEvent(new MouseEvent('mouseup', {bubbles: true, cancelable: true}));
-            el.dispatchEvent(new MouseEvent('click', {bubbles: true, cancelable: true}));
-          }
-          const items = Array.from(document.querySelectorAll('[role="menuitem"], [data-testid^="model-switcher-"]'))
-            .map((el) => {
-              const text = ((el.textContent || '').replace(/\s+/g, ' ').trim());
-              const testId = el.getAttribute('data-testid') || '';
-              return {el, text, haystack: (testId + ' ' + text).toLowerCase()};
-            })
-            .filter((item) => item.text || item.haystack);
-          if (items.length === 0) {
-            if (autoMode) return "kept current model: no menu items";
-            throw new Error("model selector opened but no model options were visible");
-          }
-          const currentLabel = (((document.querySelector('[data-testid="model-switcher-dropdown-button"], button[aria-label="Model selector"]') || {}).textContent) || '')
-            .replace(/\s+/g, ' ')
-            .trim()
-            .toLowerCase();
-          if (autoMode) {
-            const ranked = items
-              .map((item) => {
-                let score = 0;
-                if (/gpt[- ]?5/.test(item.haystack)) score += 100;
-                if (/\bpro\b/.test(item.haystack)) score += 90;
-                if (/thinking/.test(item.haystack)) score += 60;
-                if (/instant/.test(item.haystack) || /\b5[- ]?3\b/.test(item.haystack)) score += 30;
-                return {...item, score};
-              })
-              .sort((a, b) => b.score - a.score || b.text.length - a.text.length);
-            if (!ranked[0] || ranked[0].score <= 0) return "kept current model";
-            if (currentLabel && currentLabel.includes(ranked[0].text.toLowerCase())) {
-              return "kept current model: " + ranked[0].text;
-            }
-            realClick(ranked[0].el);
-            return "selected: " + ranked[0].text;
-          }
-          const names = {"gpt-5-4-pro":"pro","gpt-5-4-thinking":"thinking","gpt-5-3":"instant","pro":"pro","thinking":"thinking","instant":"instant"};
-          const target = names[slug] || slug;
-          const byTestId = document.querySelector('[data-testid="model-switcher-' + slug + '"]');
-          if (byTestId) { realClick(byTestId); return "selected: " + slug; }
-          const match = items.find(item => item.haystack.includes(target));
-          if (match) {
-            if (currentLabel && currentLabel.includes(target)) return "kept current model: " + match.text;
-            realClick(match.el);
-            return "selected: " + match.text;
-          }
-          throw new Error("model '" + slug + "' not found");
-        })()
+  # Model selection is handled by the built-in Rust action so MCP,
+  # dev-browser, and the generic browser transport share one selector.
+  - action: chatgpt_select_model
   - sleep_ms: 500
 
   # Disable Extended Pro only when explicitly requested (--var extended=false).
@@ -181,19 +99,8 @@ steps:
   - sleep_ms: 500
 
   # File attachment is the only delivery path.
-  # Open the attachment menu (button is "composer-plus-btn").
-  - action: eval
-    args:
-      - |
-        (() => {
-          const btn = document.querySelector(
-            'button[data-testid="composer-plus-btn"], ' +
-            'button[aria-label*="Attach"], button[aria-label*="attach"], button[data-testid*="attach"]'
-          );
-          if (!btn) return "skipped: attach button not found";
-          btn.click();
-          return "opened attachment UI";
-        })()
+  # Open the attachment menu.
+  - action: chatgpt_open_attachment_ui
   - sleep_ms: 500
 
   # Upload the bundle file.
@@ -225,24 +132,7 @@ steps:
   - sleep_ms: 500
 
   # Click send once the typed prompt has enabled the button.
-  - action: eval
-    args:
-      - |
-        (() => {
-          const btn = document.querySelector("button[data-testid='send-button']");
-          if (!btn) throw new Error("send button not found");
-          if (btn.disabled) {
-            const composerEl = document.querySelector("#prompt-textarea, [role='textbox']");
-            const state = {
-              url: window.location.href,
-              attachmentPresent: !!document.querySelector("[class*='file-tile'], [data-testid*='attachment']"),
-              composerTextLength: ((composerEl?.innerText || composerEl?.textContent || "").trim()).length,
-            };
-            throw new Error("send button disabled — page is likely recoverable: " + JSON.stringify(state));
-          }
-          btn.click();
-          return "sent";
-        })()
+  - action: chatgpt_send
 
   # Poll for response completion. Default 30min timeout for Extended Pro;
   # override with --var wait_timeout_ms=N or --var wait_interval_ms=N.

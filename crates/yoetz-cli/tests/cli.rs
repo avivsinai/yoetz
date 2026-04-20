@@ -221,7 +221,8 @@ fn bundle_help() {
         .args(["bundle", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--files"));
+        .stdout(predicate::str::contains("--files"))
+        .stdout(predicate::str::contains("--include-hidden"));
 }
 
 #[test]
@@ -394,6 +395,59 @@ fn bundle_prompt_file_without_files_succeeds() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"file_count\": 0"));
+}
+
+#[test]
+fn bundle_all_includes_hidden_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let workflows = dir.path().join(".github/workflows");
+    fs::create_dir_all(&workflows).unwrap();
+    fs::write(workflows.join("ci.yml"), "name: CI\n").unwrap();
+
+    yoetz()
+        .current_dir(dir.path())
+        .args([
+            "bundle",
+            "--prompt",
+            "review repo",
+            "--all",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(".github/workflows/ci.yml"));
+}
+
+#[test]
+fn generate_video_openai_rejects_multiple_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let image_a = dir.path().join("a.png");
+    let image_b = dir.path().join("b.png");
+    fs::write(&image_a, [0u8, 1, 2, 3]).unwrap();
+    fs::write(&image_b, [0u8, 1, 2, 3]).unwrap();
+
+    yoetz()
+        .args([
+            "generate",
+            "video",
+            "--provider",
+            "openai",
+            "--model",
+            "sora-1",
+            "--prompt",
+            "animate this",
+            "--image",
+            image_a.to_str().unwrap(),
+            "--image",
+            image_b.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "provider openai accepts at most one --image for video generation",
+        ));
 }
 
 #[test]

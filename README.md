@@ -14,7 +14,7 @@ Most LLM CLI tools focus on a single provider or a single workflow. yoetz is dif
 
 - **Multi-model council** — get consensus from multiple LLMs in one command, not sequential copy-paste between tabs
 - **Multimodal native** — text, images, and video as first-class inputs across providers
-- **Agent-first design** — structured JSON output, budget tracking, and agent skill integration out of the box
+- **Agent-first design** — structured JSON output, local budget tracking for ask/council/review, and agent skill integration out of the box
 - **Zero lock-in** — one config, any provider (OpenRouter, OpenAI, Gemini, LiteLLM), switch with a flag
 - **Bundle-aware** — package your codebase with gitignore-awareness for maximum LLM context
 

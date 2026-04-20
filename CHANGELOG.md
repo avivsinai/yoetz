@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `yoetz browser verify-cdp --cdp <url>` — a thin CI-friendly smoke command
+  that attaches to a given CDP endpoint and opens a throwaway tab, without
+  any ChatGPT auth probing. Backs the new real-browser CI lane that spins up
+  Chrome for Testing on every pull request.
+- Deterministic fake-ChatGPT fixture tests plus a gated
+  `scripts/chatgpt-browser-canary.sh` live canary so browser changes can be
+  exercised against both a scripted DOM and a real authenticated ChatGPT tab.
+
+### Changed
+
+- ChatGPT browser transports now share one typed request/output contract.
+  `chrome-devtools-mcp`, `dev-browser`, and the generic browser recipe all
+  return the same top-level JSON fields (`transport`, `backend`, `response`,
+  `model_used`, `warnings`, `fallback_used`, `delivery_mode`, and
+  `auto_paste_fallback`) instead of transport-specific shapes.
+- The generic `recipes/chatgpt.yaml` flow now delegates model selection,
+  attachment UI open, and send-button activation to shared Rust actions so the
+  transport-specific implementations stay aligned with the same DOM contract.
+
+### Removed
+
+- `--var thread=reuse` on `yoetz browser recipe --recipe chatgpt`. The reuse
+  mode introduced in 0.2.50 and updated in 0.2.53 had no safe path that
+  avoided hijacking an active ChatGPT Pro run. Every yoetz request now opens
+  a fresh, yoetz-owned ChatGPT tab marked with `?_yoetz=<run-id>`; passing
+  `thread=reuse` is rejected with a migration message pointing at this
+  behavior. Parallel yoetz runs continue to work because each run owns its
+  own tab.
+
+### Fixed
+
+- The vendored `headless_chrome` transport now uses flat CDP sessions and lazy
+  single-target attachment on modern Chrome, avoiding the `Page.enable`
+  `-32601` failures that showed up when a second client auto-attached existing
+  targets on Chrome 147.
+- `yoetz browser recipe --recipe chatgpt` now reconnects once and reattaches to
+  the same ChatGPT page target if Chrome drops the websocket during long
+  stable-idle response polling, instead of failing the run immediately.
+- `scripts/setup-chatgpt-profile.sh` now prefers the repo-built yoetz binary,
+  and the global config selector is `--config-profile`, avoiding collisions
+  with browser subcommands that already use `--profile`.
+
+### Security
+
+- Untrusted repo-local config can no longer set global defaults or model
+  aliases, and browser profile/CDP defaults remain restricted to trusted config
+  paths only.
+
 ## [0.2.53] - 2026-04-14
 ### Fixed
 

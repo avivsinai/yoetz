@@ -56,6 +56,21 @@ pub enum Message {
     ConnectionShutdown,
 }
 
+#[derive(Debug, Clone)]
+pub struct RoutedMessage {
+    pub session_id: Option<String>,
+    pub payload: Message,
+}
+
+impl RoutedMessage {
+    pub fn connection_shutdown() -> Self {
+        Self {
+            session_id: None,
+            payload: Message::ConnectionShutdown,
+        }
+    }
+}
+
 #[derive(Deserialize, Serialize, Debug)]
 pub struct TransferMode {
     mode: String,
@@ -116,8 +131,16 @@ pub struct PrintToPdfOptions {
     pub generate_tagged_pdf: Option<bool>,
 }
 
-pub fn parse_raw_message(raw_message: &str) -> Result<Message> {
-    Ok(serde_json::from_str::<Message>(raw_message)?)
+pub fn parse_raw_message(raw_message: &str) -> Result<RoutedMessage> {
+    let raw_value: Value = serde_json::from_str(raw_message)?;
+    let session_id = raw_value
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    Ok(RoutedMessage {
+        session_id,
+        payload: serde_json::from_value::<Message>(raw_value)?,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -371,7 +394,29 @@ mod tests {
         ];
 
         for msg_string in &example_message_strings {
-            let _message: super::Message = parse_raw_message(msg_string).unwrap();
+            let _message: super::RoutedMessage = parse_raw_message(msg_string).unwrap();
         }
+    }
+
+    #[test]
+    fn parse_flat_session_event_and_response() {
+        env_logger::try_init().unwrap_or(());
+
+        let flat_event = parse_raw_message(
+            "{\"method\":\"Runtime.executionContextCreated\",\"params\":{\"context\":{\"id\":1,\"origin\":\"https://chatgpt.com\",\"name\":\"\",\"uniqueId\":\"abc123\",\"auxData\":{\"frameId\":\"frame-1\",\"isDefault\":true,\"type\":\"default\"}}},\"sessionId\":\"session-flat\"}",
+        )
+        .unwrap();
+        assert_eq!(flat_event.session_id.as_deref(), Some("session-flat"));
+        assert!(matches!(
+            flat_event.payload,
+            Message::Event(Event::RuntimeExecutionContextCreated(_))
+        ));
+
+        let flat_response = parse_raw_message(
+            "{\"id\":7,\"result\":{\"identifier\":\"binding-id\"},\"sessionId\":\"session-flat\"}",
+        )
+        .unwrap();
+        assert_eq!(flat_response.session_id.as_deref(), Some("session-flat"));
+        assert!(matches!(flat_response.payload, Message::Response(_)));
     }
 }

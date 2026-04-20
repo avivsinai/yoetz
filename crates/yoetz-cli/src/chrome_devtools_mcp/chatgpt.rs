@@ -17,9 +17,8 @@
 //!
 //! - No Playwright `connectOverCDP` hang in the live-attach path
 //! - No QuickJS sandbox — `evaluate_script` runs plain JS in the page
-//! - `thread=fresh` can still use `new_page` for a blank conversation, while
-//!   `thread=reuse` reattaches to an existing ChatGPT tab instead of opening
-//!   another one
+//! - Every yoetz request opens a fresh yoetz-owned ChatGPT tab marked with a
+//!   run-specific `?_yoetz=` query param and matching `window.name`
 //! - First-class `upload_file` replaces the macOS clipboard-paste hack
 //!
 //! The one place we use `chrome-devtools-mcp`'s uid model is `upload_file`:
@@ -37,26 +36,20 @@
 //! auto-poll already uses.
 
 use anyhow::{anyhow, Context, Result};
+use std::io::IsTerminal;
 use std::time::Duration;
 
-use super::client::CdpMcpClient;
-use super::{DevtoolsMcpRecipeContext, RecipeThreadMode};
-
-const CHATGPT_URL: &str = "https://chatgpt.com/";
+use super::client::{is_external_create_target_block_error, CdpMcpClient};
+use super::DevtoolsMcpRecipeContext;
+use crate::chatgpt_web;
 
 /// Stable-idle polling parameters.
-const POLL_INTERVAL_MS: u64 = 5_000;
-/// Number of consecutive polls where (messageCount, textLength) must be
-/// unchanged before we declare the response complete. At 5s intervals, 4
-/// stable polls = 60s of genuinely idle generation. ChatGPT Pro can pause
-/// for tens of seconds while still thinking, so keep the quiet window long
-/// enough that we do not return the early "I'm tracing the patch..." preamble
-/// as if it were the final review.
 const STABLE_IDLE_CONSECUTIVE_POLLS: u32 = 12;
 const UPLOAD_INPUT_WAIT_MS: u64 = 5_000;
 const ATTACHMENT_VERIFY_WAIT_MS: u64 = 15_000;
-const WAIT_FOR_COMPOSER_JS: &str = r##"
-async (focusComposer = true) => {
+const WAIT_FOR_COMPOSER_JS_TEMPLATE: &str = r##"
+async () => {
+  const focusComposer = __YOETZ_FOCUS_COMPOSER__;
   const deadline = Date.now() + 20000;
   const clip = (value, max = 240) =>
     String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
@@ -96,10 +89,73 @@ async (focusComposer = true) => {
 }
 "##;
 
+fn build_wait_for_composer_script(focus_composer: bool) -> String {
+    WAIT_FOR_COMPOSER_JS_TEMPLATE.replace(
+        "__YOETZ_FOCUS_COMPOSER__",
+        if focus_composer { "true" } else { "false" },
+    )
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ChatgptRunResult {
     pub response: String,
     pub model_used: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct ResponseBaseline {
+    assistant_count: i64,
+    assistant_last_len: i64,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ResponsePollState {
+    assistant_count: i64,
+    assistant_last_len: i64,
+    text: String,
+    streaming: bool,
+    send_state: ResponseSendState,
+    has_stop_button: bool,
+    has_thinking_indicator: bool,
+    copy_button_count: usize,
+    error: String,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ResponseCompletionVerdict {
+    Generating,
+    CopyButton,
+    Idle,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ResponseSendState {
+    Enabled,
+    Disabled,
+    Missing,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum InitialPageOpenMode {
+    CreateTarget,
+    RecoverViaExistingAnchor,
+}
+
+impl InitialPageOpenMode {
+    fn debug_strategy(self) -> &'static str {
+        match self {
+            Self::CreateTarget => "create_target",
+            Self::RecoverViaExistingAnchor => "recover_via_existing_anchor",
+        }
+    }
+}
+
+fn retry_initial_page_open_mode() -> InitialPageOpenMode {
+    InitialPageOpenMode::RecoverViaExistingAnchor
+}
+
+fn should_recover_initial_page_open_after_reconnect(err: &anyhow::Error) -> bool {
+    should_retry_initial_new_page_after_reconnect(err) || is_external_create_target_block_error(err)
 }
 
 /// The full ChatGPT Pro recipe. Returns the assistant's final response text.
@@ -110,35 +166,87 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ChatgptRunResult> {
         ));
     }
 
-    // Step 0: attach directly to the user's running Chrome session.
-    // The Chrome "Allow remote debugging" dialog fires here, once per Chrome
-    // session. Every subsequent yoetz invocation in the same Chrome session
-    // should be silent.
-    if ctx.show_approval_guidance {
-        eprintln!(
-            "info: connecting to Chrome via chrome-devtools-mcp — if prompted, click Allow in Chrome's remote debugging dialog (one-time per Chrome session)"
-        );
-    }
-    let client = CdpMcpClient::connect_to_running_chrome(ctx.cdp_endpoint.as_deref())
+    run_attached_recipe_with_reconnect(ctx)
         .await
-        .map_err(cdp_attach_hint)?;
+        .map_err(crate::browser::mark_chatgpt_attached_page_error)
+}
 
-    // Step 1: either start a fresh conversation or reuse the user's current
-    // ChatGPT tab, depending on the documented `thread` recipe variable.
-    match ctx.thread_mode {
-        RecipeThreadMode::Fresh => {
-            client
-                .new_page(CHATGPT_URL, /* background */ false, 30_000)
+async fn run_attached_recipe_with_reconnect(
+    ctx: &DevtoolsMcpRecipeContext,
+) -> Result<ChatgptRunResult> {
+    let client = connect_client(ctx).await?;
+    match run_attached_recipe(client, ctx, InitialPageOpenMode::CreateTarget).await {
+        Ok(result) => Ok(result),
+        Err(err) if should_recover_initial_page_open_after_reconnect(&err) => {
+            emit_transport_retry_notice(ctx);
+            debug_phase(
+                "new_page transport failed during initial CreateTarget; reconnecting once and falling back to existing-anchor recovery",
+            );
+            let retry_client = connect_client(ctx).await?;
+            run_attached_recipe(retry_client, ctx, retry_initial_page_open_mode())
                 .await
-                .context("chrome-devtools-mcp new_page on chatgpt.com")?;
+                .context("retrying ChatGPT page open after reconnect")
+                .context(err)
         }
-        RecipeThreadMode::Reuse => {
-            client
-                .reuse_chatgpt_page(30_000)
-                .await
-                .context("chrome-devtools-mcp select existing ChatGPT tab")?;
-        }
+        Err(err) => Err(err),
     }
+}
+
+async fn connect_client(ctx: &DevtoolsMcpRecipeContext) -> Result<CdpMcpClient> {
+    // Step 0: attach directly to the user's running Chrome session.
+    // Chrome may show an "Allow remote debugging?" dialog here whenever it
+    // treats this as a new external attach request. Serialize only the attach
+    // itself so approval prompts do not race across yoetz processes.
+    let client = with_chrome_approval_lock(ctx.show_approval_guidance, || async {
+        CdpMcpClient::connect_to_running_chrome(ctx.cdp_endpoint.as_deref())
+            .await
+            .map_err(cdp_attach_hint)
+    })
+    .await?;
+    debug_phase("phase=attach ok");
+    Ok(client)
+}
+
+async fn run_attached_recipe(
+    mut client: CdpMcpClient,
+    ctx: &DevtoolsMcpRecipeContext,
+    page_open_mode: InitialPageOpenMode,
+) -> Result<ChatgptRunResult> {
+    let browser_context_id = client
+        .resolve_browser_context_id(
+            ctx.browser_context_id.as_deref(),
+            ctx.profile_email.as_deref(),
+        )
+        .with_context(|| match (
+            ctx.browser_context_id.as_deref(),
+            ctx.profile_email.as_deref(),
+        ) {
+            (Some(context_id), Some(email)) => format!(
+                "resolve Chrome browser context for browser_context_id `{context_id}` / profile_email `{email}`"
+            ),
+            (Some(context_id), None) => {
+                format!("resolve Chrome browser context for browser_context_id `{context_id}`")
+            }
+            (None, Some(email)) => {
+                format!("resolve Chrome browser context for profile_email `{email}`")
+            }
+            (None, None) => "resolve Chrome browser context".to_string(),
+        })?;
+
+    let marked_url = chatgpt_web::mark_chatgpt_url(&ctx.run_id);
+    let page_id = open_initial_chatgpt_page(
+        &client,
+        &marked_url,
+        browser_context_id.as_deref(),
+        page_open_mode,
+    )
+    .await
+    .with_context(|| format!("chrome-devtools-mcp new_page on `{marked_url}`"))?;
+    let set_window_name_js = chatgpt_web::build_set_window_name_js(&ctx.run_id);
+    client
+        .evaluate_script(&set_window_name_js, vec![])
+        .await
+        .context("mark yoetz-owned ChatGPT tab with window.name")?;
 
     // Step 2: wait for the composer to mount, then select the best model the
     // user can actually access. When `model` is `auto` or empty, prefer the
@@ -146,6 +254,9 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ChatgptRunResult> {
     // if the selector UI is unavailable.
     wait_for_composer_ready(&client, /* focus_composer */ true).await?;
     let model_used = maybe_select_model(&client, &ctx.model).await?;
+    if ctx.disable_extended {
+        maybe_disable_extended(&client).await?;
+    }
 
     // Step 3: upload the bundle if we have a path.
     //
@@ -172,15 +283,18 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ChatgptRunResult> {
 
     // Make sure the composer is still focused (upload step may have stolen
     // focus to the file picker).
-    let refocus_js = r##"
-() => {
-  const composer = document.querySelector("#prompt-textarea, div[contenteditable='true'][role='textbox']");
+    let composer_selector_json = chatgpt_web::composer_selector_json();
+    let refocus_js = format!(
+        r##"
+() => {{
+  const composer = document.querySelector({composer_selector_json});
   if (composer) composer.focus();
   return !!composer;
-}
-"##;
+}}
+"##
+    );
     let _ = client
-        .evaluate_script(refocus_js, vec![])
+        .evaluate_script(&refocus_js, vec![])
         .await
         .context("refocus composer after upload")?;
 
@@ -189,37 +303,22 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ChatgptRunResult> {
         .await
         .context("type_text into ChatGPT composer")?;
 
-    // Step 5: click the send button via JS (CSS selector).
-    //
-    // We match by data-testid with a fallback chain because the testid has
-    // bounced between `send-button` / `fruitjuice-send-button` / back. Also
-    // fall back to the last submit button in the composer form.
-    let click_send_js = r##"
-() => {
-  const candidates = [
-    "[data-testid='send-button']",
-    "[data-testid='fruitjuice-send-button']",
-    "form button[type='submit']:last-of-type",
-  ];
-  for (const sel of candidates) {
-    const btn = document.querySelector(sel);
-    if (btn && !btn.disabled) {
-      btn.click();
-      return sel;
-    }
-  }
-  return null;
-}
-"##;
+    let click_send_js = chatgpt_web::build_send_button_click_function();
     let clicked = client
-        .evaluate_script(click_send_js, vec![])
+        .evaluate_script(&click_send_js, vec![])
         .await
         .context("evaluate_script click send button")?;
-    if clicked == serde_json::Value::Null {
+    if clicked.get("status").and_then(serde_json::Value::as_str) != Some("sent") {
         return Err(anyhow!(
-            "could not find an enabled ChatGPT send button (tried data-testid='send-button', fruitjuice-send-button, form button[type='submit']:last-of-type)"
+            "could not find an enabled ChatGPT send button. diagnostics={}",
+            clicked
+                .get("diagnostics")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null)
         ));
     }
+    let response_baseline =
+        parse_response_baseline(&clicked).context("parse ChatGPT response baseline before send")?;
 
     // Step 6: stable-idle polling for response completion.
     //
@@ -230,9 +329,16 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ChatgptRunResult> {
     // This replaces the unreliable "Regenerate" button wait_for. Agent Y
     // research showed "Regenerate" is missing or inconsistently placed in
     // many ChatGPT flows (Custom GPT, Canvas, certain Pro modes).
-    let response_text = poll_for_stable_response(&client, ctx.response_timeout_ms)
-        .await
-        .context("stable-idle polling for ChatGPT response")?;
+    let response_text = poll_for_stable_response(
+        &mut client,
+        ctx,
+        &page_id,
+        response_baseline,
+        ctx.response_timeout_ms,
+        ctx.response_poll_interval_ms,
+    )
+    .await
+    .context("stable-idle polling for ChatGPT response")?;
 
     Ok(ChatgptRunResult {
         response: response_text,
@@ -240,22 +346,110 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ChatgptRunResult> {
     })
 }
 
-pub async fn check_auth(cdp_endpoint: Option<&str>) -> Result<()> {
-    let client = CdpMcpClient::connect_to_running_chrome(cdp_endpoint)
+async fn open_initial_chatgpt_page(
+    client: &CdpMcpClient,
+    marked_url: &str,
+    browser_context_id: Option<&str>,
+    mode: InitialPageOpenMode,
+) -> Result<String> {
+    debug_phase(&format!(
+        "phase=new_page strategy={} url={marked_url}",
+        mode.debug_strategy()
+    ));
+    let page = match mode {
+        InitialPageOpenMode::CreateTarget => {
+            client
+                .new_page(
+                    marked_url,
+                    /* background */ false,
+                    30_000,
+                    browser_context_id,
+                )
+                .await?
+        }
+        InitialPageOpenMode::RecoverViaExistingAnchor => {
+            client
+                .open_chatgpt_page_via_existing_anchor(
+                    marked_url,
+                    /* background */ false,
+                    30_000,
+                    browser_context_id,
+                )
+                .await
+                .with_context(|| format!("recover ChatGPT page open for `{marked_url}`"))?
+        }
+    };
+    debug_phase("phase=new_page ok");
+    Ok(page.page_id)
+}
+
+async fn open_page_via_blank_target(
+    client: &CdpMcpClient,
+    url: &str,
+    background: bool,
+    timeout_ms: u64,
+    browser_context_id: Option<&str>,
+) -> Result<()> {
+    // On Chrome builds where CreateTarget itself still works, opening
+    // `about:blank` first avoids touching user tabs and gives yoetz a clean
+    // anchor before navigating to ChatGPT. When Chrome blocks CreateTarget
+    // altogether, the recipe reconnect path recovers via existing anchors
+    // instead of looping on more CreateTarget calls.
+    client
+        .new_page("about:blank", background, timeout_ms, browser_context_id)
         .await
-        .map_err(cdp_attach_hint)?;
+        .context("create blank Chrome page before ChatGPT navigation")?;
+    client
+        .navigate_page(url, timeout_ms)
+        .await
+        .with_context(|| format!("navigate blank Chrome page to `{url}`"))?;
+    Ok(())
+}
+
+async fn open_initial_chatgpt_probe_page(
+    client: &CdpMcpClient,
+    url: &str,
+    timeout_ms: u64,
+) -> Result<()> {
+    match open_page_via_blank_target(client, url, /* background */ true, timeout_ms, None).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_external_create_target_block_error(&err) => client
+            .open_chatgpt_page_via_existing_anchor(
+                url, /* background */ true, timeout_ms, None,
+            )
+            .await
+            .with_context(|| format!("recover auth probe page open for `{url}`"))
+            .map(|_| ()),
+        Err(err) => Err(err),
+    }
+}
+
+pub async fn check_auth(cdp_endpoint: Option<&str>, show_approval_guidance: bool) -> Result<()> {
+    let client = with_chrome_approval_lock(show_approval_guidance, || async {
+        CdpMcpClient::connect_to_running_chrome(cdp_endpoint)
+            .await
+            .map_err(cdp_attach_hint)
+    })
+    .await?;
     let used_probe_page = client
         .select_chatgpt_page_for_probe(30_000)
         .await
         .context("select existing ChatGPT page for auth probe")?
         .is_none();
     if used_probe_page {
-        client
-            .new_page(CHATGPT_URL, /* background */ true, 30_000)
+        open_initial_chatgpt_probe_page(&client, chatgpt_web::CHATGPT_URL, 30_000)
             .await
-            .context("chrome-devtools-mcp new_page on chatgpt.com")?;
+            .context("chrome-devtools-mcp open auth probe on chatgpt.com")?;
     }
     let result = wait_for_composer_ready(&client, /* focus_composer */ false).await;
+    if !used_probe_page && result.is_err() {
+        open_initial_chatgpt_probe_page(&client, chatgpt_web::CHATGPT_URL, 30_000)
+            .await
+            .context("chrome-devtools-mcp probe retry on chatgpt.com")?;
+        let retry = wait_for_composer_ready(&client, /* focus_composer */ false).await;
+        let _ = client.close_selected_page(true);
+        return retry;
+    }
     if used_probe_page {
         let _ = client.close_selected_page(true);
     }
@@ -263,13 +457,7 @@ pub async fn check_auth(cdp_endpoint: Option<&str>) -> Result<()> {
 }
 
 async fn wait_for_composer_ready(client: &CdpMcpClient, focus_composer: bool) -> Result<()> {
-    let composer_state = client
-        .evaluate_script(
-            WAIT_FOR_COMPOSER_JS,
-            vec![serde_json::Value::Bool(focus_composer)],
-        )
-        .await
-        .context("evaluate_script wait-for-composer")?;
+    let composer_state = evaluate_wait_for_composer_state(client, focus_composer).await?;
     match composer_state
         .get("status")
         .and_then(serde_json::Value::as_str)
@@ -312,6 +500,42 @@ async fn wait_for_composer_ready(client: &CdpMcpClient, focus_composer: bool) ->
     }
 }
 
+async fn evaluate_wait_for_composer_state(
+    client: &CdpMcpClient,
+    focus_composer: bool,
+) -> Result<serde_json::Value> {
+    let script = build_wait_for_composer_script(focus_composer);
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match client.evaluate_script(&script, vec![]).await {
+            Ok(state) => return Ok(state),
+            Err(err) => {
+                let retryable = should_retry_wait_for_composer_error(&err);
+                last_err = Some(err);
+                if retryable && attempt < 2 {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                break;
+            }
+        }
+    }
+    Err(last_err.expect("wait-for-composer attempts should record an error"))
+        .context("evaluate_script wait-for-composer")
+}
+
+fn should_retry_wait_for_composer_error(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_ascii_lowercase();
+    message.contains("execution context")
+        || message.contains("context with specified id")
+        || message.contains("cannot find context")
+        || message.contains("cannot find object with id")
+        || message.contains("frame not found")
+        || message.contains("target closed")
+        || message.contains("session closed")
+        || message.contains("navigation")
+}
+
 async fn maybe_select_model(
     client: &CdpMcpClient,
     requested_model: &str,
@@ -325,18 +549,20 @@ async fn maybe_select_model(
         .get("status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    let model_used = selection
-        .get("modelUsed")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
+    let model_used = chatgpt_web::select_reported_chatgpt_model(&selection, requested_model);
     match status {
-        "selected" | "already-selected" | "kept-current" | "kept-current-no-selector" => {
-            Ok(model_used)
-        }
+        "selected" | "already-selected" => Ok(model_used),
         "missing-selector" => Err(anyhow!(
             "ChatGPT model selector button not found. {}",
+            format_page_probe_summary(&selection)
+        )),
+        "selection-mismatch" => Err(anyhow!(
+            "requested ChatGPT model `{}` was not actually selected.{} {}",
+            selection
+                .get("requested")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(requested_model),
+            format_model_selection_diagnostics(&selection),
             format_page_probe_summary(&selection)
         )),
         "not-found" => {
@@ -344,8 +570,21 @@ async fn maybe_select_model(
                 .get("requested")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or(requested_model);
+            let available = selection
+                .get("availableItems")
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(serde_json::Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty())
+                .map(|items| format!(" Available options: {}.", items.join(", ")))
+                .unwrap_or_default();
             Err(anyhow!(
-                "requested ChatGPT model `{requested}` was not available in the current session. {}",
+                "requested ChatGPT model `{requested}` was not available in the current session.{available} {}",
                 format_page_probe_summary(&selection)
             ))
         }
@@ -355,149 +594,102 @@ async fn maybe_select_model(
     }
 }
 
-fn build_model_selection_script(requested_model: &str) -> String {
-    let requested_model =
-        serde_json::to_string(requested_model).expect("serialize requested model");
+fn format_model_selection_diagnostics(selection: &serde_json::Value) -> String {
+    let selected_label = selection
+        .get("selectedLabel")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" selected_label={value:?};"))
+        .unwrap_or_default();
+    let target_test_id = selection
+        .get("targetTestId")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" target_testid={value:?};"))
+        .unwrap_or_default();
+    let target_checked = selection
+        .get("targetChecked")
+        .and_then(serde_json::Value::as_bool)
+        .map(|value| format!(" target_checked={value};"))
+        .unwrap_or_default();
+    let menu_reopen_attempts = selection
+        .get("menuReopenAttempts")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| format!(" menu_reopen_attempts={value};"))
+        .unwrap_or_default();
+    let selector_expanded = selection
+        .get("selectorExpanded")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| format!(" selector_expanded={value:?};"))
+        .unwrap_or_default();
+    let item_count = selection
+        .get("itemCount")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| format!(" item_count={value};"))
+        .unwrap_or_default();
+    let available_items = selection
+        .get("availableItemsAfter")
+        .and_then(serde_json::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|items| !items.is_empty())
+        .map(|items| format!(" available_after=[{}];", items.join(", ")))
+        .unwrap_or_default();
+
     format!(
-        r##"
-async () => {{
-  const requested = {requested_model};
-  const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-  const toHaystack = (value) => normalize(value).toLowerCase();
-  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const realClick = (el) => {{
-    el.dispatchEvent(new PointerEvent("pointerdown", {{ bubbles: true, cancelable: true, pointerId: 1 }}));
-    el.dispatchEvent(new MouseEvent("mousedown", {{ bubbles: true, cancelable: true }}));
-    el.dispatchEvent(new PointerEvent("pointerup", {{ bubbles: true, cancelable: true, pointerId: 1 }}));
-    el.dispatchEvent(new MouseEvent("mouseup", {{ bubbles: true, cancelable: true }}));
-    el.dispatchEvent(new MouseEvent("click", {{ bubbles: true, cancelable: true }}));
-  }};
-  const selectorButton = document.querySelector(
-    "[data-testid='model-switcher-dropdown-button'], button[aria-label='Model selector'], button[aria-label='Model selector menu']"
-  );
-  const currentLabel = normalize(
-    selectorButton?.querySelector?.("[data-testid='selected-model'], [data-testid='model-switcher-selected-model']")?.textContent ||
-    selectorButton?.innerText ||
-    selectorButton?.textContent ||
-    selectorButton?.getAttribute?.("aria-label") ||
-    ""
-  );
-  const responseBase = {{
-    requested,
-    currentLabel,
-    url: window.location.href || "",
-    title: document.title || "",
-    bodyText: normalize(document.body?.innerText || "").slice(0, 240),
-  }};
-  const requestedTrimmed = normalize(requested);
-  const requestedLower = requestedTrimmed.toLowerCase();
-  const autoMode = !requestedTrimmed || requestedLower === "auto";
-
-  if (!selectorButton) {{
-    return {{
-      ...responseBase,
-      status: autoMode ? "kept-current-no-selector" : "missing-selector",
-      modelUsed: currentLabel || null,
-    }};
-  }}
-
-  const readItems = () => Array.from(document.querySelectorAll("[role='menuitem'], [data-testid^='model-switcher-']"))
-    .map((el) => {{
-      const text = normalize(el.innerText || el.textContent || el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "");
-      const testId = normalize(el.getAttribute?.("data-testid") || "");
-      const haystack = `${{testId}} ${{text}}`.toLowerCase();
-      return {{ el, text, testId, haystack }};
-    }})
-    .filter((item) => item.text || item.testId);
-
-  let items = readItems();
-  if (items.length === 0) {{
-    realClick(selectorButton);
-    await wait(350);
-    items = readItems();
-  }}
-
-  if (items.length === 0) {{
-    return {{
-      ...responseBase,
-      status: autoMode ? "kept-current" : "not-found",
-      modelUsed: currentLabel || null,
-    }};
-  }}
-
-  const requestedNeedles = (() => {{
-    if (autoMode) return [];
-    const needles = new Set([requestedLower]);
-    if (requestedLower.includes("gpt-5")) {{
-      needles.add("gpt-5");
-      needles.add("gpt 5");
-    }}
-    if (requestedLower.includes("pro")) needles.add("pro");
-    if (requestedLower.includes("thinking")) needles.add("thinking");
-    if (requestedLower.includes("instant") || requestedLower.includes("5-3")) {{
-      needles.add("instant");
-      needles.add("5-3");
-    }}
-    return Array.from(needles);
-  }})();
-
-  const score = (haystack) => {{
-    let total = 0;
-    if (/gpt[- ]?5/.test(haystack)) total += 100;
-    if (/\bpro\b/.test(haystack)) total += 90;
-    if (/thinking/.test(haystack)) total += 60;
-    if (/instant/.test(haystack) || /\b5[- ]?3\b/.test(haystack)) total += 30;
-    return total;
-  }};
-
-  let target = null;
-  if (autoMode) {{
-    target = items
-      .map((item) => ({{ ...item, score: score(item.haystack) }}))
-      .sort((left, right) => right.score - left.score || right.text.length - left.text.length)[0];
-    if (!target || target.score <= 0) {{
-      return {{
-        ...responseBase,
-        status: "kept-current",
-        modelUsed: currentLabel || null,
-      }};
-    }}
-  }} else {{
-    target =
-      items.find((item) => item.testId.toLowerCase() === `model-switcher-${{requestedLower}}`) ||
-      items.find((item) => requestedNeedles.some((needle) => item.haystack.includes(needle))) ||
-      null;
-    if (!target) {{
-      return {{
-        ...responseBase,
-        status: "not-found",
-        modelUsed: currentLabel || null,
-      }};
-    }}
-  }}
-
-  const targetNeedles = autoMode
-    ? [target.haystack]
-    : requestedNeedles;
-  const currentHaystack = toHaystack(currentLabel);
-  if (currentHaystack && targetNeedles.some((needle) => needle && currentHaystack.includes(needle))) {{
-    return {{
-      ...responseBase,
-      status: "already-selected",
-      modelUsed: target.text || currentLabel || requestedTrimmed || null,
-    }};
-  }}
-
-  realClick(target.el);
-  await wait(300);
-  return {{
-    ...responseBase,
-    status: "selected",
-    modelUsed: target.text || requestedTrimmed || currentLabel || null,
-  }};
-}}
-"##,
+        "{}{}{}{}{}{}{}",
+        selected_label,
+        target_test_id,
+        target_checked,
+        menu_reopen_attempts,
+        selector_expanded,
+        item_count,
+        available_items
     )
+}
+
+async fn maybe_disable_extended(client: &CdpMcpClient) -> Result<()> {
+    let script = r##"
+() => {
+  const button = document.querySelector("button[aria-label*='click to remove'][aria-label*='Extended'], button[aria-label*='remove'][aria-label*='Extended']");
+  if (!button) return "already-off";
+  button.click();
+  return "disabled";
+}
+"##;
+    let _ = client
+        .evaluate_script(script, vec![])
+        .await
+        .context("evaluate_script disable Extended Pro")?;
+    Ok(())
+}
+
+fn parse_response_baseline(state: &serde_json::Value) -> Result<ResponseBaseline> {
+    let assistant_count = state
+        .get("assistantCountBeforeSend")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| anyhow!("missing assistantCountBeforeSend in send payload"))?;
+    let assistant_last_len = state
+        .get("assistantLastLenBeforeSend")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| anyhow!("missing assistantLastLenBeforeSend in send payload"))?;
+    Ok(ResponseBaseline {
+        assistant_count,
+        assistant_last_len,
+    })
+}
+
+fn build_model_selection_script(requested_model: &str) -> String {
+    chatgpt_web::build_model_selection_function(requested_model)
 }
 
 /// Rewrite a CDP attach failure with actionable guidance.
@@ -508,11 +700,35 @@ async () => {{
 /// Instead of leaking the raw reqwest error, point the user at the fix.
 fn cdp_attach_hint(err: anyhow::Error) -> anyhow::Error {
     let raw = format!("{err:#}");
+    let raw_lower = raw.to_lowercase();
     // Preserve approval-dialog errors verbatim so the outer fallback funnel can
     // classify them as "stop, user needs to click Allow" rather than
     // "transport broken, try the next one."
-    if raw.to_lowercase().contains("allow remote debugging") {
+    if raw_lower.contains("allow remote debugging") {
         return err.context("chrome-devtools-mcp attach to running Chrome");
+    }
+    if raw_lower.contains("timed out waiting for chrome websocket handshake")
+        || (raw_lower.contains("connecting to chrome websocket")
+            && raw_lower.contains("websocket handshake")
+            && raw_lower.contains("timed out"))
+    {
+        return anyhow!("{}", approval_wait_message())
+            .context("chrome-devtools-mcp attach to running Chrome")
+            .context(err);
+    }
+    if raw_lower.contains("resource temporarily unavailable")
+        && raw_lower.contains("connecting to chrome websocket")
+    {
+        return anyhow!("{}", approval_wait_message())
+            .context("chrome-devtools-mcp attach to running Chrome")
+            .context(err);
+    }
+    if raw_lower.contains("connecting to chrome websocket") && raw_lower.contains("403 forbidden") {
+        return anyhow!(
+            "Chrome rejected the remote debugging client (403 Forbidden). Chrome may still be showing an \"Allow remote debugging?\" dialog — click Allow and retry. If you intentionally blocked the dialog, re-enable remote debugging approval and try again."
+        )
+        .context("chrome-devtools-mcp attach to running Chrome")
+        .context(err);
     }
     err.context(
         "chrome-devtools-mcp could not reach Chrome's CDP endpoint. \
@@ -523,11 +739,119 @@ fn cdp_attach_hint(err: anyhow::Error) -> anyhow::Error {
     )
 }
 
+fn emit_stable_idle_warning(message: &str) {
+    if std::io::stderr().is_terminal() {
+        eprintln!("{message}");
+    }
+}
+
+fn approval_wait_message() -> String {
+    let timeout_secs = configured_ws_handshake_timeout_ms() / 1_000;
+    format!(
+        "live browser attach timed out ({timeout_secs}s). Chrome may be showing an \"Allow remote debugging?\" dialog — click Allow, then retry."
+    )
+}
+
+async fn with_chrome_approval_lock<T, F, Fut>(show_approval_guidance: bool, action: F) -> Result<T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    with_chrome_approval_lock_using(
+        show_approval_guidance,
+        crate::browser::acquire_chrome_approval_lock,
+        action,
+    )
+    .await
+}
+
+trait ApprovalLockState {
+    fn waited(&self) -> bool;
+}
+
+impl ApprovalLockState for crate::browser::ChromeApprovalLock {
+    fn waited(&self) -> bool {
+        self.waited()
+    }
+}
+
+async fn with_chrome_approval_lock_using<T, L, Acquire, F, Fut>(
+    show_approval_guidance: bool,
+    acquire_lock: Acquire,
+    action: F,
+) -> Result<T>
+where
+    L: ApprovalLockState,
+    Acquire: FnOnce() -> Result<L>,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let approval_lock = acquire_lock()?;
+    emit_chrome_approval_guidance(show_approval_guidance, approval_lock.waited());
+    let _approval_lock = approval_lock;
+    action().await
+}
+
+fn emit_chrome_approval_guidance(show_approval_guidance: bool, waited: bool) {
+    if !show_approval_guidance {
+        return;
+    }
+    if waited {
+        eprintln!(
+            "info: another yoetz process is already requesting Chrome approval; waiting for it to finish before trying the chrome-devtools-mcp transport"
+        );
+    }
+    eprintln!(
+        "info: connecting to Chrome via chrome-devtools-mcp — if prompted, click Allow in Chrome's remote debugging dialog"
+    );
+}
+
+fn configured_ws_handshake_timeout_ms() -> u64 {
+    std::env::var("YOETZ_CDP_WS_HANDSHAKE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30_000)
+}
+
+fn cdp_debug_enabled() -> bool {
+    std::env::var(super::client::YOETZ_DEBUG_CDP_ENV)
+        .map(|value| {
+            let trimmed = value.trim();
+            !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("0")
+                && !trimmed.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+}
+
+fn debug_phase(message: &str) {
+    if cdp_debug_enabled() {
+        eprintln!("info: chrome-devtools-mcp {message}");
+    }
+}
+
 fn is_closed_cdp_transport_error(err: &anyhow::Error) -> bool {
     let raw = format!("{err:#}").to_lowercase();
     raw.contains("underlying connection is closed")
         || raw.contains("connectionclosed")
         || raw.contains("received shutdown message")
+}
+
+fn should_retry_initial_new_page_after_reconnect(err: &anyhow::Error) -> bool {
+    let raw = format!("{err:#}");
+    is_closed_cdp_transport_error(err)
+        && !is_external_create_target_block_error(err)
+        && raw.contains("chrome-devtools-mcp new_page on")
+        && raw.contains("creating a new Chrome page for")
+}
+
+fn emit_transport_retry_notice(ctx: &DevtoolsMcpRecipeContext) {
+    if ctx.show_approval_guidance || std::io::stderr().is_terminal() {
+        eprintln!(
+            "info: Chrome dropped the initial CDP session while opening the ChatGPT tab; reconnecting once and falling back to existing-anchor recovery. Chrome may prompt again."
+        );
+    }
 }
 
 fn classify_live_chatgpt_page_issue(
@@ -710,14 +1034,32 @@ async fn try_upload_via_file_input(
 
 async fn wait_for_file_input_uid(client: &CdpMcpClient, timeout_ms: u64) -> Result<Option<String>> {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    let scope_script = chatgpt_web::build_scope_composer_file_input_function();
 
     loop {
-        let snapshot = client
-            .take_snapshot(false)
+        // Tag the composer-scoped file input with our marker before taking a
+        // snapshot. Without this scoping, a page-wide first-match walk can
+        // return an unrelated hidden file input (review finding #10) and we'd
+        // silently inject the bundle into the wrong element.
+        let scope_result = client
+            .evaluate_script(&scope_script, vec![])
             .await
-            .context("take snapshot while searching for file input")?;
-        if let Some(uid) = snapshot.find_file_input_uid() {
-            return Ok(Some(uid));
+            .context("scope composer file input before snapshot")?;
+        let scope_status = scope_result
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        if scope_status == "marked" {
+            let snapshot = client
+                .take_snapshot(false)
+                .await
+                .context("take snapshot while searching for marked file input")?;
+            if let Some(uid) =
+                snapshot.find_marked_file_input_uid(chatgpt_web::COMPOSER_FILE_INPUT_MARKER)
+            {
+                return Ok(Some(uid));
+            }
         }
 
         if std::time::Instant::now() >= deadline {
@@ -742,32 +1084,34 @@ async fn click_upload_candidate(client: &CdpMcpClient, candidate_id: &str) -> Re
 }
 
 async fn click_upload_menu_item(client: &CdpMcpClient) -> Result<bool> {
-    let script = r##"
-() => {
-  const selectors = ["[role='menuitem']", "button", "[role='button']", "label", "li"];
-  const nodes = Array.from(document.querySelectorAll(selectors.join(",")));
-  const target = nodes.find((el) => {
-    const text = `${el.innerText || ""} ${el.getAttribute?.("aria-label") || ""} ${el.getAttribute?.("title") || ""}`
-      .replace(/\s+/g, " ")
-      .trim()
-      .toLowerCase();
-    return /upload from computer|from computer|upload files|choose files|browse/i.test(text);
-  });
-  if (!target) return false;
-  target.click();
-  return true;
-}
-"##;
-
-    Ok(client.evaluate_script(script, vec![]).await? == serde_json::Value::Bool(true))
+    let script = chatgpt_web::build_upload_menu_item_click_function();
+    Ok(client
+        .evaluate_script(&script, vec![])
+        .await?
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        == Some("clicked"))
 }
 
 async fn collect_upload_diagnostics(client: &CdpMcpClient) -> Result<serde_json::Value> {
-    let script = r##"
+    let script = build_collect_upload_diagnostics_script();
+
+    client
+        .evaluate_script(&script, vec![])
+        .await
+        .context("evaluate upload diagnostics")
+}
+
+fn build_collect_upload_diagnostics_script() -> String {
+    r##"
 () => {
   const composer = document.querySelector("#prompt-textarea, div[contenteditable='true'][role='textbox']");
   const composerRect = composer?.getBoundingClientRect() || null;
   const composerForm = composer?.closest("form") || null;
+
+  document
+    .querySelectorAll("[data-yoetz-upload-candidate]")
+    .forEach((el) => el.removeAttribute("data-yoetz-upload-candidate"));
 
   const clip = (value, max = 160) =>
     String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
@@ -857,12 +1201,8 @@ async fn collect_upload_diagnostics(client: &CdpMcpClient) -> Result<serde_json:
     candidates,
   };
 }
-"##;
-
-    client
-        .evaluate_script(script, vec![])
-        .await
-        .context("evaluate upload diagnostics")
+"##
+    .to_string()
 }
 
 fn describe_upload_candidate(candidate: &serde_json::Value) -> String {
@@ -894,49 +1234,7 @@ fn format_upload_diagnostics(diagnostics: &serde_json::Value) -> String {
 }
 
 async fn wait_for_attachment_visible(client: &CdpMcpClient, file_name: &str) -> Result<()> {
-    let file_name_json = serde_json::to_string(file_name)?;
-    let file_stem = std::path::Path::new(file_name)
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or(file_name);
-    let file_stem_json = serde_json::to_string(file_stem)?;
-    let script = format!(
-        r#"
-async () => {{
-  const fileName = {file_name_json};
-  const fileStem = {file_stem_json};
-  const deadline = Date.now() + {ATTACHMENT_VERIFY_WAIT_MS};
-  const clip = (value, max = 120) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
-  while (Date.now() < deadline) {{
-    const visibleEvidence = Array.from(document.querySelectorAll("button, span, div, li"))
-      .map((el) => {{
-        const text = clip(el.innerText || el.textContent || "");
-        const ariaLabel = clip(el.getAttribute?.("aria-label") || "");
-        const title = clip(el.getAttribute?.("title") || "");
-        return {{ text, ariaLabel, title }};
-      }})
-      .filter((entry) => {{
-        const combined = `${{entry.text}} ${{entry.ariaLabel}} ${{entry.title}}`;
-        return combined.includes(fileName) || (fileStem && combined.includes(fileStem));
-      }})
-      .slice(0, 6);
-
-    if (visibleEvidence.length > 0) {{
-      return {{ ok: true, visibleEvidence }};
-    }}
-
-    await new Promise((resolve) => setTimeout(resolve, 250));
-  }}
-
-  const inputs = Array.from(document.querySelectorAll("input[type='file']")).map((input) => ({{
-    fileNames: Array.from(input.files || []).map((file) => file.name),
-    multiple: !!input.multiple,
-  }}));
-  return {{ ok: false, inputs }};
-}}
-"#
-    );
-
+    let script = build_wait_for_attachment_visible_script(file_name)?;
     let evidence = client
         .evaluate_script(&script, vec![])
         .await
@@ -951,62 +1249,47 @@ async () => {{
     ))
 }
 
+fn build_wait_for_attachment_visible_script(file_name: &str) -> Result<String> {
+    let probe_function_json =
+        serde_json::to_string(&chatgpt_web::build_attachment_probe_function(file_name)?)?;
+    Ok(format!(
+        r##"
+async () => {{
+  const probe = eval("(" + {probe_function_json} + ")");
+  const deadline = Date.now() + {ATTACHMENT_VERIFY_WAIT_MS};
+  while (Date.now() < deadline) {{
+    const state = probe();
+    if (state?.ok) {{
+      return state;
+    }}
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }}
+  return probe();
+}}
+"##,
+        probe_function_json = probe_function_json,
+    ))
+}
+
 /// Stable-idle polling for ChatGPT response completion.
 ///
-/// Ported from the v0.2.33 Pro Extended auto-poll heuristic. Returns the
-/// final assistant message text once the response has been idle for
-/// `STABLE_IDLE_CONSECUTIVE_POLLS * POLL_INTERVAL_MS` milliseconds.
+/// Returns the final assistant message text once a post-send assistant turn
+/// has been idle for the shared ChatGPT stable-idle threshold.
 async fn poll_for_stable_response(
-    client: &CdpMcpClient,
+    client: &mut CdpMcpClient,
+    ctx: &DevtoolsMcpRecipeContext,
+    page_id: &str,
+    baseline: ResponseBaseline,
     overall_timeout_ms: u64,
+    poll_interval_ms: u64,
 ) -> Result<String> {
-    let read_state_js = r##"
-() => {
-  const nodes = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
-  const stopSelectors = [
-    "[data-testid='stop-button']",
-    "[data-testid='fruitjuice-stop-button']",
-    "button[aria-label*='Stop']",
-    "button[aria-label*='stop']",
-  ];
-  const stopGenerating = stopSelectors.some((sel) => {
-    const el = document.querySelector(sel);
-    if (!el) return false;
-    const style = window.getComputedStyle(el);
-    return style.display !== "none" && style.visibility !== "hidden" && !el.disabled;
-  });
-  if (nodes.length === 0) {
-    return {
-      ready: false,
-      count: 0,
-      length: 0,
-      text: null,
-      streaming: stopGenerating,
-      stopGenerating,
-    };
-  }
-  const last = nodes[nodes.length - 1];
-  const streaming =
-    stopGenerating ||
-    !!last.querySelector(".result-streaming") ||
-    last.classList.contains("result-streaming");
-  const text = last.innerText || "";
-  return {
-    ready: !streaming && text.length > 0,
-    count: nodes.length,
-    length: text.length,
-    text,
-    streaming,
-    stopGenerating,
-  };
-}
-"##;
-
+    let read_state_js = response_poll_state_script();
     let start = std::time::Instant::now();
     let overall_timeout = Duration::from_millis(overall_timeout_ms);
-    let mut last_count: i64 = -1;
-    let mut last_length: i64 = -1;
-    let mut stable_polls: u32 = 0;
+    let stable_idle_threshold_ms = chatgpt_web::stable_idle_threshold_ms(poll_interval_ms);
+    let mut idle_since: Option<std::time::Instant> = None;
+    let mut idle_anchor: Option<(i64, i64)> = None;
+    let mut reconnect_used = false;
 
     loop {
         if start.elapsed() > overall_timeout {
@@ -1015,71 +1298,297 @@ async fn poll_for_stable_response(
             ));
         }
 
-        tokio::time::sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+        tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
 
-        let state = match client.evaluate_script(read_state_js, vec![]).await {
+        let state = match client.evaluate_script(&read_state_js, vec![]).await {
             Ok(state) => state,
             Err(err) => {
-                if is_closed_cdp_transport_error(&err) {
-                    return Err(err.context(
-                        "chrome-devtools-mcp lost the Chrome websocket while waiting for the ChatGPT response",
-                    ));
+                match classify_response_poll_eval_error(&err, reconnect_used) {
+                    ResponsePollEvalFailureAction::ReconnectAndRetry => {
+                        emit_stable_idle_warning(
+                            "warn: stable-idle poll lost the Chrome websocket; reconnecting once to the existing ChatGPT tab",
+                        );
+                        *client = reconnect_response_poll_client(ctx, page_id)
+                            .await
+                            .context("recover Chrome websocket during ChatGPT response wait")?;
+                        reconnect_used = true;
+                        continue;
+                    }
+                    ResponsePollEvalFailureAction::Fail => {
+                        return Err(err.context(
+                            "chrome-devtools-mcp lost the Chrome websocket while waiting for the ChatGPT response",
+                        ));
+                    }
+                    ResponsePollEvalFailureAction::RetrySameClient => {}
                 }
                 // Treat transient eval errors as non-fatal; keep polling.
-                eprintln!("warn: stable-idle poll eval failed ({err:#}), retrying");
+                emit_stable_idle_warning(&format!(
+                    "warn: stable-idle poll eval failed ({err:#}), retrying"
+                ));
                 continue;
             }
         };
 
         let Some(obj) = state.as_object() else {
-            eprintln!("warn: stable-idle poll returned non-object: {state}");
+            emit_stable_idle_warning(&format!(
+                "warn: stable-idle poll returned non-object: {state}"
+            ));
             continue;
         };
 
-        let ready = obj.get("ready").and_then(|v| v.as_bool()).unwrap_or(false);
-        let count = obj.get("count").and_then(|v| v.as_i64()).unwrap_or(0);
-        let length = obj.get("length").and_then(|v| v.as_i64()).unwrap_or(0);
-        let streaming = obj
-            .get("streaming")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-
-        if !ready || streaming {
-            // Reset stability counter; still streaming.
-            last_count = count;
-            last_length = length;
-            stable_polls = 0;
-            continue;
+        let poll_state = parse_response_poll_state(obj).context("parse stable-idle poll state")?;
+        if !poll_state.error.is_empty() {
+            return Err(anyhow!("ChatGPT error: {}", poll_state.error));
         }
-
-        // `ready == true && !streaming`: candidate complete. Check stability.
-        if count == last_count && length == last_length {
-            stable_polls += 1;
-            if stable_polls >= STABLE_IDLE_CONSECUTIVE_POLLS {
-                let text = obj
-                    .get("text")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if text.is_empty() {
-                    return Err(anyhow!(
-                        "stable-idle reached but assistant message text is empty"
-                    ));
-                }
-                return Ok(text);
+        match classify_response_completion(&poll_state, baseline) {
+            ResponseCompletionVerdict::Generating => {
+                idle_since = None;
+                idle_anchor = None;
             }
-        } else {
-            // State changed between polls — still technically streaming.
-            last_count = count;
-            last_length = length;
-            stable_polls = 1; // First stable observation at the new state
+            ResponseCompletionVerdict::CopyButton => {
+                if !poll_state.text.is_empty() {
+                    return Ok(poll_state.text);
+                }
+                let extracted = read_latest_assistant_text(client)
+                    .await
+                    .context("read latest assistant text after copy-button completion")?;
+                if !extracted.is_empty() {
+                    return Ok(extracted);
+                }
+                idle_since = Some(std::time::Instant::now());
+                idle_anchor = Some((poll_state.assistant_count, poll_state.assistant_last_len));
+            }
+            ResponseCompletionVerdict::Idle => {
+                let anchor = (poll_state.assistant_count, poll_state.assistant_last_len);
+                let stable_for_ms = match (idle_since, idle_anchor) {
+                    (Some(since), Some(previous_anchor)) if previous_anchor == anchor => {
+                        std::time::Instant::now()
+                            .duration_since(since)
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64
+                    }
+                    _ => {
+                        idle_since = Some(std::time::Instant::now());
+                        idle_anchor = Some(anchor);
+                        0
+                    }
+                };
+                if stable_for_ms >= stable_idle_threshold_ms {
+                    if poll_state.text.is_empty() {
+                        return Err(anyhow!(
+                            "stable-idle reached but assistant message text is empty"
+                        ));
+                    }
+                    return Ok(poll_state.text);
+                }
+            }
         }
     }
+}
+
+async fn reconnect_response_poll_client(
+    ctx: &DevtoolsMcpRecipeContext,
+    page_id: &str,
+) -> Result<CdpMcpClient> {
+    let client = connect_client(ctx)
+        .await
+        .context("reconnect Chrome websocket for stable-idle polling")?;
+    client
+        .select_page_target(page_id, 30_000)
+        .with_context(|| format!("reattach to ChatGPT page target `{page_id}` after reconnect"))?;
+    Ok(client)
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ResponsePollEvalFailureAction {
+    RetrySameClient,
+    ReconnectAndRetry,
+    Fail,
+}
+
+fn classify_response_poll_eval_error(
+    err: &anyhow::Error,
+    reconnect_used: bool,
+) -> ResponsePollEvalFailureAction {
+    if !is_closed_cdp_transport_error(err) {
+        return ResponsePollEvalFailureAction::RetrySameClient;
+    }
+    if reconnect_used {
+        ResponsePollEvalFailureAction::Fail
+    } else {
+        ResponsePollEvalFailureAction::ReconnectAndRetry
+    }
+}
+
+fn response_poll_state_script() -> String {
+    let send_button_selector_json = chatgpt_web::send_button_selector_json();
+    let stop_button_selector_json = chatgpt_web::stop_button_selector_json();
+    format!(
+        r##"
+() => {{
+  const nodes = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
+  const send = Array.from(document.querySelectorAll({send_button_selector_json})).find((button) => {{
+    const rect = button.getBoundingClientRect();
+    const style = window.getComputedStyle(button);
+    return rect.width > 0 &&
+      rect.height > 0 &&
+      style.visibility !== "hidden" &&
+      style.display !== "none";
+  }}) || null;
+  const stopButton = document.querySelector({stop_button_selector_json});
+  const stopGenerating = !!stopButton && !stopButton.disabled;
+  const thinking = document.querySelector(".result-thinking, [data-testid*='thinking'], [class*='thinking']");
+  if (nodes.length === 0) {{
+    return {{
+      ready: false,
+      count: 0,
+      length: 0,
+      text: null,
+      streaming: stopGenerating,
+      stopGenerating,
+      thinking: !!thinking,
+      copyButtons: 0,
+      sendState: !send ? "missing" : send.disabled ? "disabled" : "enabled",
+      error: "",
+    }};
+  }}
+  const last = nodes[nodes.length - 1];
+  const turnRoot =
+    last.closest(".agent-turn, [class*='agent-turn'], [class*='turn-messages']") ||
+    last.parentElement?.parentElement ||
+    last.parentElement ||
+    document;
+  const copyButtons = turnRoot.querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']").length;
+  const errEl = document.querySelector('[class*="error-toast"], [data-testid*="error"], [role="alert"]');
+  const errText = errEl ? (errEl.innerText || "").substring(0, 100).toLowerCase() : "";
+  const markers = ["network error","something went wrong","error generating","attachment failed","upload failed","too many requests"];
+  const error = markers.find((marker) => errText.includes(marker)) || "";
+  const streaming =
+    stopGenerating ||
+    !!last.querySelector(".result-streaming") ||
+    last.classList.contains("result-streaming");
+  const text = last.innerText || "";
+  return {{
+    count: nodes.length,
+    length: text.length,
+    text,
+    streaming,
+    sendState: !send ? "missing" : send.disabled ? "disabled" : "enabled",
+    hasStopButton: stopGenerating,
+    thinking: !!thinking,
+    copyButtons,
+    error,
+  }};
+}}
+"##,
+        send_button_selector_json = send_button_selector_json,
+        stop_button_selector_json = stop_button_selector_json,
+    )
+}
+
+fn parse_response_poll_state(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<ResponsePollState> {
+    Ok(ResponsePollState {
+        assistant_count: obj
+            .get("count")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+        assistant_last_len: obj
+            .get("length")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or(0),
+        text: obj
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        streaming: obj
+            .get("streaming")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(true),
+        send_state: match obj
+            .get("sendState")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("missing")
+        {
+            "enabled" => ResponseSendState::Enabled,
+            "disabled" => ResponseSendState::Disabled,
+            "missing" => ResponseSendState::Missing,
+            other => return Err(anyhow!("invalid send state `{other}`")),
+        },
+        has_stop_button: obj
+            .get("hasStopButton")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        has_thinking_indicator: obj
+            .get("thinking")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        copy_button_count: obj
+            .get("copyButtons")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize,
+        error: obj
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
+}
+
+fn classify_response_completion(
+    state: &ResponsePollState,
+    baseline: ResponseBaseline,
+) -> ResponseCompletionVerdict {
+    let composer_idle = matches!(
+        state.send_state,
+        ResponseSendState::Enabled | ResponseSendState::Missing
+    );
+    if state.streaming || !composer_idle || state.has_stop_button || state.has_thinking_indicator {
+        return ResponseCompletionVerdict::Generating;
+    }
+    let new_message = state.assistant_count > baseline.assistant_count;
+    if new_message && state.copy_button_count > 0 {
+        return ResponseCompletionVerdict::CopyButton;
+    }
+    // We intentionally treat only monotonic assistant growth as forward
+    // progress. If ChatGPT ever performs an in-place rewrite with the same
+    // message count and length, we keep waiting until the hard response timeout
+    // rather than risk classifying a stale pre-send turn as complete.
+    let same_message_grew = state.assistant_count == baseline.assistant_count
+        && state.assistant_last_len > baseline.assistant_last_len;
+    if (new_message && state.assistant_last_len > 0) || same_message_grew {
+        ResponseCompletionVerdict::Idle
+    } else {
+        ResponseCompletionVerdict::Generating
+    }
+}
+
+async fn read_latest_assistant_text(client: &CdpMcpClient) -> Result<String> {
+    let script = r##"
+() => {
+  const nodes = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
+  if (nodes.length === 0) return "";
+  return nodes[nodes.length - 1].innerText || "";
+}
+"##;
+    let value = client
+        .evaluate_script(script, vec![])
+        .await
+        .context("evaluate latest assistant text")?;
+    Ok(value
+        .as_str()
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     #[tokio::test]
     async fn run_errors_without_bundle() {
@@ -1100,10 +1609,45 @@ mod tests {
     // is already broken. We instead rely on the `const { }` block below,
     // which fails the build if any of these invariants regress.
     const _CONST_SANITY: () = {
-        assert!(POLL_INTERVAL_MS >= 1_000);
-        assert!(STABLE_IDLE_CONSECUTIVE_POLLS >= 2);
-        assert!(!CHATGPT_URL.is_empty());
+        assert!(chatgpt_web::STABLE_IDLE_FLOOR_MS >= 1_000);
+        assert!(chatgpt_web::STABLE_IDLE_INTERVAL_MULTIPLIER >= 2);
+        assert!(!chatgpt_web::CHATGPT_URL.is_empty());
     };
+
+    fn lock_env() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            match self.previous.as_deref() {
+                Some(value) => unsafe {
+                    std::env::set_var(self.key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(self.key);
+                },
+            }
+        }
+    }
 
     #[test]
     fn cdp_attach_hint_preserves_approval_dialog_errors() {
@@ -1120,6 +1664,46 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn approval_wait_message_uses_configured_handshake_timeout() {
+        let _guard = lock_env();
+        let _timeout = EnvVarGuard::set("YOETZ_CDP_WS_HANDSHAKE_TIMEOUT_MS", "120000");
+        assert!(approval_wait_message().contains("120s"));
+    }
+
+    #[tokio::test]
+    async fn with_chrome_approval_lock_acquires_before_running_action() {
+        #[derive(Clone, Copy)]
+        struct FakeLock;
+
+        impl ApprovalLockState for FakeLock {
+            fn waited(&self) -> bool {
+                false
+            }
+        }
+
+        let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let acquired_for_action = acquired.clone();
+
+        with_chrome_approval_lock_using(
+            false,
+            || {
+                acquired.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok::<FakeLock, anyhow::Error>(FakeLock)
+            },
+            || async move {
+                assert!(
+                    acquired_for_action.load(std::sync::atomic::Ordering::SeqCst),
+                    "approval lock should be acquired before the action runs"
+                );
+                Ok::<(), anyhow::Error>(())
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    #[test]
     fn cdp_attach_hint_wraps_other_errors_with_actionable_guidance() {
         let err =
             anyhow!("requesting `http://127.0.0.1:9222/json/version` failed: connection refused");
@@ -1129,6 +1713,30 @@ mod tests {
         assert!(msg.contains("Chrome 136+"));
         // Original error chain is preserved.
         assert!(msg.contains("connection refused"));
+    }
+
+    #[test]
+    fn cdp_attach_hint_rewrites_websocket_handshake_timeouts_as_approval_waits() {
+        let err = anyhow!(
+            "connecting to Chrome websocket `ws://127.0.0.1:9222/devtools/browser/test` failed: timed out waiting for Chrome websocket handshake"
+        );
+        let rewritten = cdp_attach_hint(err);
+        let msg = format!("{rewritten:#}");
+        assert!(msg.contains("Allow remote debugging"));
+        assert!(!msg.contains("chrome://inspect"));
+    }
+
+    #[test]
+    fn cdp_attach_hint_rewrites_forbidden_websocket_handshakes_with_block_guidance() {
+        let err = anyhow!(
+            "connecting to Chrome websocket `ws://127.0.0.1:9222/devtools/browser/test` failed: HTTP error: 403 Forbidden"
+        );
+        let rewritten = cdp_attach_hint(err);
+        let msg = format!("{rewritten:#}");
+        assert!(msg.contains("403 Forbidden"));
+        assert!(msg.contains("Chrome rejected the remote debugging client"));
+        assert!(msg.contains("click Allow"));
+        assert!(!msg.contains("chrome://inspect"));
     }
 
     #[test]
@@ -1173,6 +1781,32 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_composer_retry_classifier_matches_transient_eval_failures() {
+        assert!(should_retry_wait_for_composer_error(&anyhow!(
+            "Runtime.evaluate failed: Execution context was destroyed."
+        )));
+        assert!(should_retry_wait_for_composer_error(&anyhow!(
+            "Protocol error: Cannot find context with specified id"
+        )));
+        assert!(should_retry_wait_for_composer_error(&anyhow!(
+            "Target closed"
+        )));
+        assert!(!should_retry_wait_for_composer_error(&anyhow!(
+            "chatgpt login required in the attached Chrome session"
+        )));
+    }
+
+    #[test]
+    fn wait_for_composer_script_embeds_focus_flag_without_snapshot_args() {
+        let focused = build_wait_for_composer_script(true);
+        assert!(focused.contains("const focusComposer = true;"));
+        assert!(!focused.contains("async (focusComposer = true)"));
+
+        let unfocused = build_wait_for_composer_script(false);
+        assert!(unfocused.contains("const focusComposer = false;"));
+    }
+
+    #[test]
     fn closed_cdp_transport_errors_are_classified() {
         let err = anyhow!("Unable to make method calls because underlying connection is closed");
         assert!(is_closed_cdp_transport_error(&err));
@@ -1181,15 +1815,188 @@ mod tests {
     }
 
     #[test]
+    fn initial_new_page_closed_transport_errors_trigger_retry() {
+        let err = anyhow!(
+            "chrome-devtools-mcp new_page on `https://chatgpt.com/?_yoetz=test`: creating a new Chrome page for `https://chatgpt.com/?_yoetz=test` failed: Unable to make method calls because underlying connection is closed"
+        );
+        assert!(should_retry_initial_new_page_after_reconnect(&err));
+    }
+
+    #[test]
+    fn retry_classifier_ignores_non_new_page_closed_transport_errors() {
+        let err = anyhow!(
+            "mark yoetz-owned ChatGPT tab with window.name: Unable to make method calls because underlying connection is closed"
+        );
+        assert!(!should_retry_initial_new_page_after_reconnect(&err));
+    }
+
+    #[test]
+    fn retry_classifier_skips_external_create_target_block_errors() {
+        let err = anyhow!(
+            "chrome-devtools-mcp new_page on `https://chatgpt.com/?_yoetz=test`: creating a new Chrome page for `https://chatgpt.com/?_yoetz=test` failed: Chrome's default-profile CDP endpoint likely rejected external `Target.createTarget` while opening `https://chatgpt.com/?_yoetz=test`. Chrome 146+/147 can allow attach/read operations but close the session on new-tab creation for untrusted clients. First, open chrome://inspect/#remote-debugging, refresh Discover network targets (or Open dedicated DevTools for Node), and retry. If Chrome still closes the session, launch Chrome with `--remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug` and pass `--cdp`, or use Chrome for Testing. Unable to make method calls because underlying connection is closed"
+        );
+        assert!(!should_retry_initial_new_page_after_reconnect(&err));
+    }
+
+    #[test]
+    fn external_create_target_block_still_triggers_recovery_after_reconnect() {
+        let err = anyhow!(
+            "chrome-devtools-mcp new_page on `https://chatgpt.com/?_yoetz=test`: creating a new Chrome page for `https://chatgpt.com/?_yoetz=test` failed: Chrome's default-profile CDP endpoint likely rejected external `Target.createTarget` while opening `https://chatgpt.com/?_yoetz=test`. Chrome 146+/147 can allow attach/read operations but close the session on new-tab creation for untrusted clients. First, open chrome://inspect/#remote-debugging, refresh Discover network targets (or Open dedicated DevTools for Node), and retry. If Chrome still closes the session, launch Chrome with `--remote-debugging-port=9222 --user-data-dir=/tmp/chrome-debug` and pass `--cdp`, or use Chrome for Testing. Unable to make method calls because underlying connection is closed"
+        );
+        assert!(should_recover_initial_page_open_after_reconnect(&err));
+    }
+
+    #[test]
+    fn initial_page_retry_uses_existing_anchor_recovery() {
+        assert_eq!(
+            retry_initial_page_open_mode(),
+            InitialPageOpenMode::RecoverViaExistingAnchor
+        );
+        assert_eq!(
+            retry_initial_page_open_mode().debug_strategy(),
+            "recover_via_existing_anchor"
+        );
+    }
+
+    #[test]
+    fn response_poll_closed_transport_reconnects_only_once() {
+        let closed = anyhow!("Unable to make method calls because underlying connection is closed");
+        let other = anyhow!("Execution context was destroyed");
+
+        assert_eq!(
+            classify_response_poll_eval_error(&closed, false),
+            ResponsePollEvalFailureAction::ReconnectAndRetry
+        );
+        assert_eq!(
+            classify_response_poll_eval_error(&closed, true),
+            ResponsePollEvalFailureAction::Fail
+        );
+        assert_eq!(
+            classify_response_poll_eval_error(&other, false),
+            ResponsePollEvalFailureAction::RetrySameClient
+        );
+    }
+
+    #[test]
     fn model_selection_script_supports_auto_and_explicit_modes() {
         let auto_script = build_model_selection_script("auto");
         assert!(auto_script.contains(r#"const requested = "auto";"#));
-        assert!(auto_script.contains(r#"/gpt[- ]?5/"#));
-        assert!(auto_script.contains(r#""kept-current-no-selector""#));
+        assert!(!auto_script.contains(r#""kept-current-no-selector""#));
+        assert!(auto_script.contains("const deriveRequestedTier = (value) =>"));
+        assert!(auto_script.contains("const classifyTier = (item) =>"));
+        assert!(auto_script.contains("const buildTierRankings = (entries) =>"));
 
         let explicit_script = build_model_selection_script("gpt-5-4-pro");
         assert!(explicit_script.contains(r#"const requested = "gpt-5-4-pro";"#));
-        assert!(explicit_script.contains("requestedNeedles"));
-        assert!(explicit_script.contains("model-switcher-${requestedLower}"));
+        assert!(explicit_script.contains("\"gpt-5-pro\":\"gpt-5-4-pro\""));
+        assert!(!explicit_script.contains("\"gpt-5-3-pro\""));
+        assert!(explicit_script.contains("const selectBestTierItem = (entries, slug, rankings) =>"));
+        assert!(explicit_script.contains("availableItems"));
+    }
+
+    #[test]
+    fn classify_response_completion_rejects_stale_prior_response() {
+        let baseline = ResponseBaseline {
+            assistant_count: 2,
+            assistant_last_len: 120,
+        };
+        let stale = ResponsePollState {
+            assistant_count: 2,
+            assistant_last_len: 120,
+            text: "old answer".to_string(),
+            streaming: false,
+            send_state: ResponseSendState::Enabled,
+            has_stop_button: false,
+            has_thinking_indicator: false,
+            copy_button_count: 0,
+            error: String::new(),
+        };
+        assert_eq!(
+            classify_response_completion(&stale, baseline),
+            ResponseCompletionVerdict::Generating
+        );
+    }
+
+    #[test]
+    fn classify_response_completion_accepts_new_or_growing_post_send_response() {
+        let baseline = ResponseBaseline {
+            assistant_count: 2,
+            assistant_last_len: 120,
+        };
+        let new_message = ResponsePollState {
+            assistant_count: 3,
+            assistant_last_len: 18,
+            text: "new answer".to_string(),
+            streaming: false,
+            send_state: ResponseSendState::Enabled,
+            has_stop_button: false,
+            has_thinking_indicator: false,
+            copy_button_count: 0,
+            error: String::new(),
+        };
+        assert_eq!(
+            classify_response_completion(&new_message, baseline),
+            ResponseCompletionVerdict::Idle
+        );
+
+        let same_message_grew = ResponsePollState {
+            assistant_count: 2,
+            assistant_last_len: 140,
+            text: "expanded answer".to_string(),
+            streaming: false,
+            send_state: ResponseSendState::Enabled,
+            has_stop_button: false,
+            has_thinking_indicator: false,
+            copy_button_count: 0,
+            error: String::new(),
+        };
+        assert_eq!(
+            classify_response_completion(&same_message_grew, baseline),
+            ResponseCompletionVerdict::Idle
+        );
+    }
+
+    #[test]
+    fn classify_response_completion_accepts_copy_button_on_new_message() {
+        let baseline = ResponseBaseline {
+            assistant_count: 2,
+            assistant_last_len: 120,
+        };
+        let completed = ResponsePollState {
+            assistant_count: 3,
+            assistant_last_len: 0,
+            text: "done".to_string(),
+            streaming: false,
+            send_state: ResponseSendState::Missing,
+            has_stop_button: false,
+            has_thinking_indicator: false,
+            copy_button_count: 1,
+            error: String::new(),
+        };
+        assert_eq!(
+            classify_response_completion(&completed, baseline),
+            ResponseCompletionVerdict::CopyButton
+        );
+    }
+
+    #[test]
+    fn attachment_visibility_script_matches_file_name_variable() {
+        let script = build_wait_for_attachment_visible_script("bundle.txt").unwrap();
+        assert!(script.contains("name === fileName"));
+        assert!(!script.contains("exactName"));
+    }
+
+    #[test]
+    fn upload_diagnostics_script_cleans_previous_candidate_ids() {
+        let script = build_collect_upload_diagnostics_script();
+        assert!(script.contains("querySelectorAll(\"[data-yoetz-upload-candidate]\")"));
+        assert!(script.contains("removeAttribute(\"data-yoetz-upload-candidate\")"));
+    }
+
+    #[test]
+    fn response_poll_script_looks_for_copy_buttons_on_turn_root() {
+        let script = response_poll_state_script();
+        assert!(script.contains("last.closest(\".agent-turn"));
+        assert!(script.contains("turnRoot.querySelectorAll"));
     }
 }

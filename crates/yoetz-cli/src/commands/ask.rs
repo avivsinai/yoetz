@@ -16,6 +16,31 @@ use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::session::{create_session_dir, write_json as write_json_file, write_text};
 use yoetz_core::types::{ArtifactPaths, PricingEstimate, RunResult, Usage};
 
+fn enforce_multimodal_budget_support(
+    has_images: bool,
+    has_video: bool,
+    max_cost_usd: Option<f64>,
+    daily_budget_usd: Option<f64>,
+    pricing: &mut PricingEstimate,
+) -> Result<()> {
+    if !has_images && !has_video {
+        return Ok(());
+    }
+
+    pricing.warnings.push(
+        "multimodal input pricing is not estimated yet; preflight budget enforcement is unavailable"
+            .to_string(),
+    );
+
+    if max_cost_usd.is_some() || daily_budget_usd.is_some() {
+        return Err(anyhow!(
+            "--max-cost-usd and --daily-budget-usd are not supported with image/video inputs yet because yoetz cannot estimate multimodal input cost accurately before the provider call"
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn handle_ask(
     ctx: &AppContext,
     args: AskArgs,
@@ -124,6 +149,13 @@ pub(crate) async fn handle_ask(
         registry_model_id.as_deref(),
         !image_inputs.is_empty(),
         video_input.is_some(),
+        &mut pricing,
+    )?;
+    enforce_multimodal_budget_support(
+        !image_inputs.is_empty(),
+        video_input.is_some(),
+        args.max_cost_usd,
+        args.daily_budget_usd,
         &mut pricing,
     )?;
 
@@ -321,5 +353,29 @@ pub(crate) async fn handle_ask(
             println!("{}", result.content);
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn multimodal_budget_support_warns_without_budget_flags() {
+        let mut pricing = PricingEstimate::default();
+        enforce_multimodal_budget_support(true, false, None, None, &mut pricing).unwrap();
+        assert_eq!(pricing.warnings.len(), 1);
+        assert!(pricing.warnings[0].contains("preflight budget enforcement"));
+    }
+
+    #[test]
+    fn multimodal_budget_support_rejects_budget_flags() {
+        let mut pricing = PricingEstimate::default();
+        let err = enforce_multimodal_budget_support(true, false, Some(1.0), None, &mut pricing)
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("--max-cost-usd and --daily-budget-usd are not supported"));
+        assert_eq!(pricing.warnings.len(), 1);
     }
 }

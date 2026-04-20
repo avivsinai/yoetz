@@ -309,9 +309,11 @@ pub(crate) async fn handle_council(
         }
         if has_spend {
             if let Some(reservation) = budget_reservation {
-                let _ = reservation.commit(spend);
-            } else {
-                let _ = budget::record_spend_standalone(spend);
+                if let Err(e) = reservation.commit(spend) {
+                    eprintln!("warning: budget commit failed: {e}");
+                }
+            } else if let Err(e) = budget::record_spend_standalone(spend) {
+                eprintln!("warning: budget commit failed: {e}");
             }
         }
     }

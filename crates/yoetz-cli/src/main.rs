@@ -19,6 +19,8 @@ use std::time::Duration;
 
 mod browser;
 mod budget;
+mod chatgpt_recipe;
+mod chatgpt_web;
 mod chrome_devtools_mcp;
 mod commands;
 mod dev_browser;
@@ -60,8 +62,8 @@ struct Cli {
     #[arg(long, global = true)]
     output_schema: Option<PathBuf>,
 
-    #[arg(long, global = true)]
-    profile: Option<String>,
+    #[arg(long = "config-profile", global = true)]
+    config_profile: Option<String>,
 
     #[arg(long, global = true, default_value = "60")]
     timeout_secs: u64,
@@ -76,6 +78,7 @@ struct Cli {
 
 struct AppContext {
     config: Config,
+    browser_defaults: browser::BrowserDefaults,
     client: reqwest::Client,
     litellm: std::sync::Arc<LiteLLM>,
     output_final: Option<PathBuf>,
@@ -192,6 +195,9 @@ struct BundleArgs {
 
     #[arg(long)]
     all: bool,
+
+    #[arg(long, help = "Include dotfiles and dot-directories; implied by --all")]
+    include_hidden: bool,
 }
 
 #[derive(Args)]
@@ -211,6 +217,7 @@ enum BrowserCommand {
     Recipe(BrowserRecipeArgs),
     Login(BrowserLoginArgs),
     Check(BrowserCheckArgs),
+    Doctor(BrowserDoctorArgs),
     /// Explicitly reset browser automation daemons. Use this when recovery is
     /// needed; yoetz does not silently recycle live-attach daemons for you.
     Reset(BrowserResetArgs),
@@ -219,6 +226,11 @@ enum BrowserCommand {
     /// Attach to a running Chrome instance and verify authentication.
     /// Auto-discovers via chrome://inspect (Chrome 144+), or use --cdp for explicit endpoint.
     Attach(BrowserAttachArgs),
+    /// Thin CDP smoke-test for CI/integration: attaches to the given CDP
+    /// endpoint, opens an `about:blank` tab, and reports JSON success. Does
+    /// not navigate to ChatGPT, does not probe authentication — so it is
+    /// safe to run against a fresh throwaway Chrome for Testing instance.
+    VerifyCdp(BrowserVerifyCdpArgs),
 }
 
 #[derive(Args)]
@@ -242,6 +254,10 @@ struct BrowserRecipeArgs {
     #[arg(long)]
     cdp: Option<String>,
 
+    /// Select a local Chrome browser by its published `/devtools/browser/<id>` suffix.
+    #[arg(long)]
+    browser_id: Option<String>,
+
     #[arg(long = "var", value_name = "KEY=VALUE")]
     vars: Vec<String>,
 }
@@ -253,6 +269,9 @@ struct BrowserLoginArgs {
     /// Connect to Chrome via CDP (explicit only, no auto-discovery for login)
     #[arg(long)]
     cdp: Option<String>,
+    /// Select a local Chrome browser by its published `/devtools/browser/<id>` suffix.
+    #[arg(long)]
+    browser_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -263,6 +282,9 @@ struct BrowserCheckArgs {
     /// or config, then chrome://inspect auto-connect (Chrome 144+).
     #[arg(long)]
     cdp: Option<String>,
+    /// Select a local Chrome browser by its published `/devtools/browser/<id>` suffix.
+    #[arg(long)]
+    browser_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -271,6 +293,30 @@ struct BrowserAttachArgs {
     /// or config, then chrome://inspect auto-connect (Chrome 144+).
     #[arg(long)]
     cdp: Option<String>,
+    /// Select a local Chrome browser by its published `/devtools/browser/<id>` suffix.
+    #[arg(long)]
+    browser_id: Option<String>,
+}
+
+#[derive(Args)]
+struct BrowserVerifyCdpArgs {
+    /// CDP endpoint (e.g. http://127.0.0.1:9222). Required — this command
+    /// exists to verify CI-launched Chrome for Testing instances, so it does
+    /// not fall back to auto-discovery.
+    #[arg(long)]
+    cdp: String,
+    /// Verification page URL (default `about:blank`). Must be a
+    /// yoetz-safe / throwaway URL — this subcommand will navigate to it.
+    #[arg(long, default_value = "about:blank")]
+    url: String,
+}
+
+#[derive(Args)]
+struct BrowserDoctorArgs {
+    /// Perform a live auto-connect probe against Chrome. This may trigger
+    /// Chrome's remote-debugging approval dialog.
+    #[arg(long)]
+    live: bool,
 }
 
 #[derive(Args)]
@@ -683,7 +729,7 @@ struct ModelEstimate {
     estimate_usd: Option<f64>,
 }
 
-const PROTECTED_DOTENV_ENV_VARS: &[&str] = &[
+const BASE_PROTECTED_DOTENV_ENV_VARS: &[&str] = &[
     "YOETZ_AGENT_BROWSER_BIN",
     "YOETZ_DEV_BROWSER_BIN",
     "YOETZ_SCRIPTS_DIR",
@@ -697,16 +743,34 @@ const PROTECTED_DOTENV_ENV_VARS: &[&str] = &[
     "GEMINI_API_KEY",
     "OPENROUTER_API_KEY",
     "XAI_API_KEY",
+    "LITELLM_API_KEY",
 ];
 
-fn snapshot_protected_dotenv_env() -> Vec<(&'static str, Option<String>)> {
-    PROTECTED_DOTENV_ENV_VARS
+fn protected_dotenv_env_vars(config: &Config) -> Vec<String> {
+    let mut keys = BASE_PROTECTED_DOTENV_ENV_VARS
         .iter()
-        .map(|&key| (key, env::var(key).ok()))
+        .map(|key| (*key).to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+    for provider in config.providers.values() {
+        if let Some(key) = provider
+            .api_key_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            keys.insert(key.to_string());
+        }
+    }
+    keys.into_iter().collect()
+}
+
+fn snapshot_protected_dotenv_env(keys: &[String]) -> Vec<(String, Option<String>)> {
+    keys.iter()
+        .map(|key| (key.clone(), env::var(key).ok()))
         .collect()
 }
 
-fn restore_protected_dotenv_env(snapshot: &[(&str, Option<String>)]) {
+fn restore_protected_dotenv_env(snapshot: &[(String, Option<String>)]) {
     for (key, pre_value) in snapshot {
         let post_value = env::var(key).ok();
         if post_value != *pre_value {
@@ -721,29 +785,38 @@ fn restore_protected_dotenv_env(snapshot: &[(&str, Option<String>)]) {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let config = Config::load_with_profile(cli.config_profile.as_deref())?;
+    let browser_defaults =
+        browser::load_browser_defaults_with_profile(cli.config_profile.as_deref())?;
+
     // Capture security-sensitive env vars before dotenv loading.
     // CWD .env files must not override executable paths (supply-chain risk)
     // or redirect config, registry, browser targets, or API keys.
-    let protected_env = snapshot_protected_dotenv_env();
+    let protected_env_keys = protected_dotenv_env_vars(&config);
+    let protected_env = snapshot_protected_dotenv_env(&protected_env_keys);
 
     // Load environment files (.env.local takes precedence over .env)
     dotenvy::from_filename(".env.local").ok();
     dotenvy::dotenv().ok();
 
     restore_protected_dotenv_env(&protected_env);
-
-    let cli = Cli::parse();
     let format = resolve_format(cli.format.as_deref())?;
 
     if cli.debug {
         env::set_var("YOETZ_GEMINI_DEBUG", "1");
         env::set_var("LITELLM_GEMINI_DEBUG", "1");
+        // Unlock detailed CDP error rendering (inferred emails + sample tabs)
+        // when the user explicitly asks for debug output. Default remains
+        // redacted to avoid leaking browsing context in routine errors
+        // (review finding #9).
+        env::set_var(chrome_devtools_mcp::client::YOETZ_DEBUG_CDP_ENV, "1");
     }
-    let config = Config::load_with_profile(cli.profile.as_deref())?;
     let client = build_client(cli.timeout_secs)?;
     let litellm = std::sync::Arc::new(build_litellm(&config, client.clone())?);
     let ctx = AppContext {
         config,
+        browser_defaults,
         client,
         litellm,
         output_final: cli.output_final,
@@ -928,11 +1001,20 @@ fn recipe_should_stop_live_transport_fallback(
     err: &anyhow::Error,
     selected_cdp_target: Option<&browser::ResolvedCdpTarget>,
     transport: browser::RecipeTransport,
+    recipe_vars: &std::collections::BTreeMap<String, String>,
 ) -> bool {
     if browser::is_chrome_approval_wait_error(err) {
         return true;
     }
-    if is_thread_reuse_error(err) {
+    if browser::is_chatgpt_auth_issue_error(err) {
+        return true;
+    }
+    if recipe_uses_chatgpt_browser_context_selector(recipe_vars)
+        && browser::is_chatgpt_profile_selector_visibility_error(err)
+    {
+        return true;
+    }
+    if browser::is_chatgpt_attached_page_error(err) {
         return true;
     }
 
@@ -941,13 +1023,6 @@ fn recipe_should_stop_live_transport_fallback(
     // targets and auto-selected targets remain advisory.
     selected_cdp_target.is_some_and(browser::ResolvedCdpTarget::is_authoritative)
         && !matches!(transport, browser::RecipeTransport::Manual)
-}
-
-fn is_thread_reuse_error(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        let message = cause.to_string();
-        message.contains("thread=reuse")
-    })
 }
 
 /// A transport is "pure live-CDP" if its only way to drive the browser is
@@ -972,6 +1047,38 @@ fn is_live_cdp_only_transport(transport: browser::RecipeTransport) -> bool {
 /// managed profile without CDP).
 fn recipe_should_skip_remaining_live_cdp_transports(err: &anyhow::Error) -> bool {
     browser::is_chrome_cdp_unreachable_error(err)
+}
+
+fn recipe_uses_chatgpt_browser_context_selector(
+    recipe_vars: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    ["browser_context_id", "profile_email"]
+        .into_iter()
+        .any(|key| {
+            recipe_vars
+                .get(key)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
+}
+
+fn constrain_chatgpt_transports_for_browser_context_selector(
+    transports: Vec<browser::RecipeTransport>,
+    recipe_vars: &std::collections::BTreeMap<String, String>,
+    is_chatgpt: bool,
+) -> Vec<browser::RecipeTransport> {
+    if !is_chatgpt || !recipe_uses_chatgpt_browser_context_selector(recipe_vars) {
+        return transports;
+    }
+
+    transports
+        .into_iter()
+        .filter(|transport| {
+            matches!(
+                transport,
+                browser::RecipeTransport::ChromeDevtoolsMcp | browser::RecipeTransport::Manual
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1012,6 +1119,26 @@ fn browser_check_live_method(target: Option<&browser::ResolvedCdpTarget>) -> Str
     }
 }
 
+fn remember_browser_check_live_attach_failure(slot: &mut Option<String>, err: &anyhow::Error) {
+    if slot.is_none() && browser::is_chrome_cdp_unreachable_error(err) {
+        *slot = Some(format!("{err:#}"));
+    }
+}
+
+fn maybe_prefer_browser_check_live_attach_failure(
+    err: anyhow::Error,
+    prior_live_attach_failure: Option<&str>,
+) -> anyhow::Error {
+    if browser::is_chatgpt_auth_issue_error(&err) {
+        if let Some(prior) = prior_live_attach_failure {
+            return anyhow!(
+                "live Chrome attach failed before legacy fallback could verify ChatGPT auth.\n\nLive-attach error: {prior}\n\nLegacy fallback error: {err}"
+            );
+        }
+    }
+    err
+}
+
 fn maybe_print_auto_selected_cdp_target(
     target: Option<&browser::ResolvedCdpTarget>,
     format: OutputFormat,
@@ -1024,6 +1151,9 @@ fn maybe_print_auto_selected_cdp_target(
     };
     if target.is_auto_discovered() {
         eprintln!("info: {}", target.description);
+        if let Some(warning) = browser::auto_discovered_cdp_target_warning(target) {
+            eprintln!("warning: {warning}");
+        }
     }
 }
 
@@ -1071,8 +1201,14 @@ fn resolved_cdp_attach_failure(
     }
 }
 
-fn profile_forces_managed_browser(profile: Option<&Path>, cdp_override: Option<&str>) -> bool {
-    profile.is_some() && cdp_override.is_none()
+fn profile_forces_managed_browser(
+    profile: Option<&Path>,
+    cdp_override: Option<&str>,
+    browser_id: Option<&str>,
+) -> bool {
+    profile.is_some()
+        && cdp_override.is_none()
+        && browser_id.is_none_or(|value| value.trim().is_empty())
 }
 
 fn maybe_demote_auto_selected_cdp_target(
@@ -1086,7 +1222,7 @@ fn maybe_demote_auto_selected_cdp_target(
     if !selected.is_auto_discovered() {
         return;
     }
-    if browser::is_chrome_approval_wait_error(err) {
+    if !should_demote_auto_selected_cdp_target(err) {
         return;
     }
 
@@ -1099,6 +1235,27 @@ fn maybe_demote_auto_selected_cdp_target(
     if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
         eprintln!("info: {description} failed ({err}); continuing with fallback discovery");
     }
+}
+
+fn should_demote_auto_selected_cdp_target(err: &anyhow::Error) -> bool {
+    if browser::is_chrome_approval_wait_error(err) {
+        return false;
+    }
+    if browser::is_chatgpt_auth_issue_error(err) {
+        return false;
+    }
+    if browser::is_chrome_cdp_unreachable_error(err) {
+        return true;
+    }
+    let message = format!("{err:#}");
+    let message_lower = message.to_lowercase();
+    if message_lower.contains("could not reach chrome's cdp endpoint") {
+        return true;
+    }
+    if message.contains("selected running Chrome target failed") {
+        return true;
+    }
+    dev_browser::is_dev_browser_connect_failure(err)
 }
 
 fn maybe_remember_cdp_target(target: Option<&browser::ResolvedCdpTarget>, format: OutputFormat) {
@@ -1128,12 +1285,13 @@ fn default_daemon_recovery_error(original: Option<&anyhow::Error>) -> Option<any
 }
 
 async fn run_recipe_via_chrome_devtools_mcp(
+    ctx: &AppContext,
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
     cdp_endpoint: Option<&str>,
     format: OutputFormat,
     is_chatgpt: bool,
-) -> Result<()> {
+) -> Result<Value> {
     if !is_chatgpt {
         return Err(anyhow!(
             "chrome-devtools-mcp transport currently supports only the built-in `chatgpt` recipe; \
@@ -1160,68 +1318,149 @@ async fn run_recipe_via_chrome_devtools_mcp(
         ));
     }
 
-    // Use the existing dev-browser poll settings resolver so the response
-    // timeout env/recipe-var knobs stay symmetric with the dev-browser path.
-    let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
-    let thread_mode = chrome_devtools_mcp::RecipeThreadMode::parse(
-        recipe_vars.get("thread").map(String::as_str),
-    )?;
-
-    let ctx = chrome_devtools_mcp::DevtoolsMcpRecipeContext {
+    let recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
+    let recipe_ctx = chrome_devtools_mcp::DevtoolsMcpRecipeContext {
         cdp_endpoint: cdp_endpoint.map(str::to_owned),
-        bundle_path: recipe_args.bundle.clone(),
+        bundle_path: recipe_spec.bundle_path.clone(),
         bundle_text: None,
+        model: recipe_spec.model.clone(),
+        prompt: recipe_spec.prompt.clone(),
+        browser_context_id: recipe_spec.browser_context_id.clone(),
+        profile_email: recipe_spec.profile_email.clone(),
+        run_id: recipe_spec.run_id.clone(),
+        response_timeout_ms: recipe_spec.wait_timeout_ms,
+        response_poll_interval_ms: recipe_spec.wait_interval_ms,
+        disable_extended: recipe_spec.disable_extended,
+        show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
+    };
+
+    let response = chrome_devtools_mcp::chatgpt::run(&recipe_ctx).await?;
+    let payload = chatgpt_recipe::ChatgptRecipeOutput {
+        transport: "chrome-devtools-mcp".to_string(),
+        backend: "chrome-devtools-mcp".to_string(),
+        response: response.response,
+        model_used: response.model_used,
+        warnings: Vec::new(),
+        fallback_used: false,
+        delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
+        auto_paste_fallback: false,
+    }
+    .to_value();
+    maybe_write_output(ctx, &payload)?;
+
+    match format {
+        OutputFormat::Json => {
+            write_json(&payload)?;
+        }
+        OutputFormat::Jsonl => {
+            let event = chatgpt_recipe::ChatgptRecipeOutput {
+                transport: "chrome-devtools-mcp".to_string(),
+                backend: "chrome-devtools-mcp".to_string(),
+                response: payload["response"].as_str().unwrap_or_default().to_string(),
+                model_used: payload["model_used"].as_str().map(str::to_owned),
+                warnings: payload["warnings"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                fallback_used: false,
+                delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
+                auto_paste_fallback: false,
+            }
+            .to_recipe_complete_event();
+            write_jsonl("browser.recipe", &event)?;
+        }
+        OutputFormat::Text | OutputFormat::Markdown => {
+            println!("{}", payload["response"].as_str().unwrap_or_default());
+        }
+    }
+
+    Ok(payload)
+}
+
+fn build_chatgpt_recipe_spec(
+    recipe_args: &BrowserRecipeArgs,
+    recipe_vars: &BTreeMap<String, String>,
+) -> Result<chatgpt_recipe::ChatgptRecipeSpec> {
+    let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
+    chrome_devtools_mcp::RecipeThreadMode::parse(recipe_vars.get("thread").map(String::as_str))?;
+    Ok(chatgpt_recipe::ChatgptRecipeSpec {
+        bundle_path: recipe_args.bundle.clone(),
         model: recipe_vars.get("model").cloned().unwrap_or_default(),
         prompt: recipe_vars
             .get("prompt")
             .cloned()
             .unwrap_or_else(|| "Review the attached file and provide your analysis.".to_string()),
-        thread_mode,
-        response_timeout_ms: poll_settings.timeout_ms,
-        show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
+        browser_context_id: recipe_vars
+            .get("browser_context_id")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        profile_email: recipe_vars
+            .get("profile_email")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        run_id: recipe_vars.get("run_id").cloned().unwrap_or_default(),
+        wait_timeout_ms: poll_settings.timeout_ms,
+        wait_interval_ms: poll_settings.interval_ms,
+        disable_extended: recipe_vars
+            .get("extended")
+            .is_some_and(|value| value == "false"),
+    })
+}
+
+fn resolve_dev_browser_delivery_mode(
+    recipe_args: &BrowserRecipeArgs,
+    recipe_vars: &BTreeMap<String, String>,
+) -> Result<(bool, Option<String>, bool)> {
+    resolve_dev_browser_delivery_mode_for_platform(
+        cfg!(target_os = "macos"),
+        recipe_args,
+        recipe_vars,
+    )
+}
+
+fn resolve_dev_browser_delivery_mode_for_platform(
+    supports_clipboard_file_upload: bool,
+    recipe_args: &BrowserRecipeArgs,
+    recipe_vars: &BTreeMap<String, String>,
+) -> Result<(bool, Option<String>, bool)> {
+    let requested_paste_mode = recipe_vars
+        .get("paste")
+        .is_some_and(|value| value == "true");
+    let auto_paste_fallback =
+        !requested_paste_mode && recipe_args.bundle.is_some() && !supports_clipboard_file_upload;
+    let effective_paste_mode = requested_paste_mode || auto_paste_fallback;
+    let bundle_text = if effective_paste_mode {
+        recipe_args
+            .bundle
+            .as_ref()
+            .map(fs::read_to_string)
+            .transpose()?
+    } else {
+        None
     };
-
-    let response = chrome_devtools_mcp::chatgpt::run(&ctx).await?;
-
-    match format {
-        OutputFormat::Json => {
-            let payload = json!({
-                "status": "ok",
-                "backend": "chrome-devtools-mcp",
-                "response": response.response,
-                "model_used": response.model_used,
-            });
-            write_json(&payload)?;
-        }
-        OutputFormat::Jsonl => {
-            let payload = json!({
-                "type": "recipe_complete",
-                "backend": "chrome-devtools-mcp",
-                "response": response.response,
-                "model_used": response.model_used,
-            });
-            write_jsonl("browser.recipe", &payload)?;
-        }
-        OutputFormat::Text | OutputFormat::Markdown => {
-            println!("{}", response.response);
-        }
-    }
-
-    Ok(())
+    Ok((effective_paste_mode, bundle_text, auto_paste_fallback))
 }
 
 fn run_recipe_via_dev_browser(
+    ctx: &AppContext,
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
     cdp_endpoint: Option<&str>,
     format: OutputFormat,
     is_chatgpt: bool,
-) -> Result<()> {
+) -> Result<Value> {
     if !is_chatgpt {
         return Err(anyhow!(
             "dev-browser transport currently supports only the built-in `chatgpt` recipe"
         ));
     }
+    chatgpt_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
     if recipe_args.profile.is_some() {
         return Err(anyhow!(
             "dev-browser transport does not support `--profile`; use `--cdp` to target a specific Chrome instance/profile"
@@ -1233,32 +1472,26 @@ fn run_recipe_via_dev_browser(
     // named page. Avoid a separate pre-flight attach here because it can trigger
     // a fresh approval-gated CDP connection and block an otherwise working flow.
 
-    let paste_mode = recipe_vars
-        .get("paste")
-        .is_some_and(|value| value == "true");
-    let bundle_text = if paste_mode {
-        recipe_args
-            .bundle
-            .as_ref()
-            .map(fs::read_to_string)
-            .transpose()?
-    } else {
-        None
-    };
-    let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
+    let (paste_mode, bundle_text, auto_paste_fallback) =
+        resolve_dev_browser_delivery_mode(recipe_args, recipe_vars)?;
+    if auto_paste_fallback {
+        eprintln!(
+            "info: dev-browser clipboard file upload requires macOS; falling back to paste mode for this run"
+        );
+    }
+    let recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
     let recipe_ctx = dev_browser::DevBrowserRecipeContext {
-        bundle_path: recipe_args.bundle.clone(),
+        bundle_path: recipe_spec.bundle_path.clone(),
         bundle_text,
-        model: recipe_vars.get("model").cloned().unwrap_or_default(),
-        disable_extended: recipe_vars
-            .get("extended")
-            .is_some_and(|value| value == "false"),
+        model: recipe_spec.model.clone(),
+        disable_extended: recipe_spec.disable_extended,
         paste_mode,
-        prompt: recipe_vars
-            .get("prompt")
-            .cloned()
-            .unwrap_or_else(|| "Review the attached file and provide your analysis.".to_string()),
-        poll_settings,
+        prompt: recipe_spec.prompt.clone(),
+        run_id: recipe_spec.run_id.clone(),
+        poll_settings: dev_browser::ChatgptPollSettings {
+            timeout_ms: recipe_spec.wait_timeout_ms,
+            interval_ms: recipe_spec.wait_interval_ms,
+        },
         allow_empty_response: recipe_vars
             .get("allow_empty_response")
             .is_some_and(|value| value == "true"),
@@ -1267,32 +1500,40 @@ fn run_recipe_via_dev_browser(
     };
 
     let response = dev_browser::run_chatgpt_recipe(&recipe_ctx)?;
+    let output = chatgpt_recipe::ChatgptRecipeOutput {
+        transport: "dev-browser".to_string(),
+        backend: "dev-browser".to_string(),
+        response: response.response,
+        model_used: response.model_used,
+        warnings: response.warnings,
+        fallback_used: true,
+        delivery_mode: if paste_mode {
+            chatgpt_recipe::ChatgptDeliveryMode::Paste
+        } else {
+            chatgpt_recipe::ChatgptDeliveryMode::FileUpload
+        },
+        auto_paste_fallback,
+    };
+    let payload = output.to_value();
+    maybe_write_output(ctx, &payload)?;
     match format {
         OutputFormat::Json => {
-            let payload = json!({
-                "status": "ok",
-                "backend": "dev-browser",
-                "response": response,
-            });
             write_json(&payload)?;
         }
         OutputFormat::Jsonl => {
-            let payload = json!({
-                "type": "recipe_complete",
-                "backend": "dev-browser",
-                "response": response,
-            });
-            write_jsonl("browser.recipe", &payload)?;
+            let event = output.to_recipe_complete_event();
+            write_jsonl("browser.recipe", &event)?;
         }
         OutputFormat::Text | OutputFormat::Markdown => {
-            println!("{response}");
+            println!("{}", payload["response"].as_str().unwrap_or_default());
         }
     }
 
-    Ok(())
+    Ok(payload)
 }
 
 fn run_recipe_via_agent_browser(
+    ctx: &AppContext,
     recipe: browser::Recipe,
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: BTreeMap<String, String>,
@@ -1300,12 +1541,13 @@ fn run_recipe_via_agent_browser(
     format: OutputFormat,
     is_chatgpt: bool,
     selected_cdp_target: &mut Option<browser::ResolvedCdpTarget>,
-) -> Result<()> {
+) -> Result<Value> {
     let needs_auth = is_chatgpt;
     let live_connection = if needs_auth {
         if profile_forces_managed_browser(
             recipe_args.profile.as_deref(),
             recipe_args.cdp.as_deref(),
+            recipe_args.browser_id.as_deref(),
         ) {
             None
         } else {
@@ -1412,9 +1654,14 @@ fn run_recipe_via_agent_browser(
     };
 
     if let Some(connection) = live_connection {
-        browser::run_recipe_with_live_connection(recipe, recipe_ctx, &connection, format)
+        let payload =
+            browser::run_recipe_with_live_connection(recipe, recipe_ctx, &connection, format)?;
+        maybe_write_output(ctx, &payload)?;
+        Ok(payload)
     } else {
-        browser::run_recipe(recipe, recipe_ctx, format)
+        let payload = browser::run_recipe(recipe, recipe_ctx, format)?;
+        maybe_write_output(ctx, &payload)?;
+        Ok(payload)
     }
 }
 
@@ -1442,16 +1689,29 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
         }
         BrowserCommand::Login(login_args) => {
             let profile_dir =
-                browser::resolve_profile_dir(&ctx.config, login_args.profile.as_ref())?;
+                browser::resolve_profile_dir(&ctx.browser_defaults, login_args.profile.as_ref())?;
 
-            // If --cdp explicitly passed, try CDP first (login is conservative:
-            // no auto-discovery unless user explicitly requests it)
-            if let Some(ref cdp_url) = login_args.cdp {
-                match browser::try_cdp_attach(cdp_url, "https://chatgpt.com/") {
+            // If --cdp / --browser-id explicitly passed, try CDP first (login is
+            // conservative: no auto-discovery unless user explicitly requests it).
+            if let Some(explicit_target) = browser::resolve_cdp_target_with_selector(
+                login_args.cdp.as_deref(),
+                login_args.browser_id.as_deref(),
+                &ctx.browser_defaults,
+                false,
+            )? {
+                let cdp_url = explicit_target.endpoint.clone();
+                match browser::try_cdp_attach(&cdp_url, "https://chatgpt.com/") {
                     Ok(()) => {
                         let payload = json!({
                             "status": "ok",
-                            "method": "cdp_explicit",
+                            "method": if login_args.cdp.is_some() {
+                                "cdp_explicit".to_string()
+                            } else {
+                                format!(
+                                    "browser_id: {}",
+                                    login_args.browser_id.as_deref().unwrap_or_default()
+                                )
+                            },
                             "endpoint": cdp_url,
                             "profile": profile_dir.to_string_lossy(),
                         });
@@ -1540,37 +1800,65 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             let managed_profile_only = profile_forces_managed_browser(
                 check_args.profile.as_deref(),
                 check_args.cdp.as_deref(),
+                check_args.browser_id.as_deref(),
             );
-            let mut resolved_cdp_target = browser::resolve_cdp_target_with_implicit(
+            let explicit_browser_target =
+                check_args.cdp.is_some() || check_args.browser_id.is_some();
+            let mut resolved_cdp_target = browser::resolve_cdp_target_with_selector(
                 check_args.cdp.as_deref(),
-                &ctx.config,
+                check_args.browser_id.as_deref(),
+                &ctx.browser_defaults,
                 !managed_profile_only,
             )?;
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
-            if let Some(ref cdp_url) = check_args.cdp {
-                chrome_devtools_mcp::chatgpt::check_auth(Some(cdp_url))
+            let show_approval_guidance =
+                matches!(format, OutputFormat::Text | OutputFormat::Markdown);
+            if explicit_browser_target {
+                let cdp_url = resolved_cdp_target
+                    .as_ref()
+                    .map(|target| target.endpoint.as_str())
+                    .expect("explicit browser target should resolve");
+                chrome_devtools_mcp::chatgpt::check_auth(Some(cdp_url), show_approval_guidance)
                     .await
                     .map_err(explicit_cdp_attach_failure)?;
                 maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
                 let payload = json!({
                     "status": "ok",
-                    "method": format!("cdp: {cdp_url}"),
+                    "method": if check_args.cdp.is_some() {
+                        format!("cdp: {cdp_url}")
+                    } else {
+                        format!(
+                            "browser_id: {}",
+                            check_args.browser_id.as_deref().unwrap_or_default()
+                        )
+                    },
                     "transport": "chrome-devtools-mcp",
                 });
                 return match format {
                     OutputFormat::Json => write_json(&payload),
                     OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
                     OutputFormat::Text | OutputFormat::Markdown => {
-                        println!("Browser authenticated via cdp: {cdp_url} (chrome-devtools-mcp)");
+                        println!(
+                            "Browser authenticated via {} (chrome-devtools-mcp)",
+                            if check_args.cdp.is_some() {
+                                format!("cdp: {cdp_url}")
+                            } else {
+                                format!(
+                                    "browser_id {}",
+                                    check_args.browser_id.as_deref().unwrap_or_default()
+                                )
+                            }
+                        );
                         Ok(())
                     }
                 };
             }
 
             let profile_dir =
-                browser::resolve_profile_dir(&ctx.config, check_args.profile.as_ref())?;
+                browser::resolve_profile_dir(&ctx.browser_defaults, check_args.profile.as_ref())?;
             let transports =
                 browser_check_transports(browser::use_dev_browser(), managed_profile_only);
+            let mut prior_live_attach_failure: Option<String> = None;
 
             for transport in transports {
                 match transport {
@@ -1578,7 +1866,12 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         let cdp_endpoint = resolved_cdp_target
                             .as_ref()
                             .map(|target| target.endpoint.as_str());
-                        match chrome_devtools_mcp::chatgpt::check_auth(cdp_endpoint).await {
+                        match chrome_devtools_mcp::chatgpt::check_auth(
+                            cdp_endpoint,
+                            show_approval_guidance,
+                        )
+                        .await
+                        {
                             Ok(()) => {
                                 maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
                                 let method =
@@ -1605,6 +1898,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                 if browser::is_chrome_approval_wait_error(&e) {
                                     return Err(e);
                                 }
+                                remember_browser_check_live_attach_failure(
+                                    &mut prior_live_attach_failure,
+                                    &e,
+                                );
                                 if resolved_cdp_target
                                     .as_ref()
                                     .is_some_and(browser::ResolvedCdpTarget::is_authoritative)
@@ -1666,6 +1963,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                 if browser::is_chrome_approval_wait_error(&e) {
                                     return Err(e);
                                 }
+                                remember_browser_check_live_attach_failure(
+                                    &mut prior_live_attach_failure,
+                                    &e,
+                                );
                                 if resolved_cdp_target
                                     .as_ref()
                                     .is_some_and(browser::ResolvedCdpTarget::is_authoritative)
@@ -1700,7 +2001,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                 .as_ref()
                                 .map(|target| target.endpoint.as_str());
                             browser::resolve_browser_connection(
-                                &ctx.config,
+                                &ctx.browser_defaults,
                                 fallback_cdp.or(check_args.cdp.as_deref()),
                                 &profile_dir,
                                 "https://chatgpt.com/",
@@ -1709,7 +2010,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                 if let Some(recovery) = default_daemon_recovery_error(Some(&e)) {
                                     return recovery;
                                 }
-                                e
+                                maybe_prefer_browser_check_live_attach_failure(
+                                    e,
+                                    prior_live_attach_failure.as_deref(),
+                                )
                             })?
                         };
                         let method = match &connection {
@@ -1749,6 +2053,17 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
 
             unreachable!("browser check transport list must include a fallback transport")
         }
+        BrowserCommand::Doctor(args) => {
+            let report = browser::browser_doctor_report(args.live);
+            match format {
+                OutputFormat::Json => write_json(&json!({ "report": report })),
+                OutputFormat::Jsonl => write_jsonl("browser.doctor", &json!({ "report": report })),
+                OutputFormat::Text | OutputFormat::Markdown => {
+                    println!("{report}");
+                    Ok(())
+                }
+            }
+        }
         BrowserCommand::Reset(_) => {
             let dev_browser_stopped = if browser::use_dev_browser() {
                 dev_browser::stop_daemon()?
@@ -1782,7 +2097,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
         }
         BrowserCommand::SyncCookies(sync_args) => {
             let profile_dir =
-                browser::resolve_profile_dir(&ctx.config, sync_args.profile.as_ref())?;
+                browser::resolve_profile_dir(&ctx.browser_defaults, sync_args.profile.as_ref())?;
             if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
                 if let Some(guidance) = browser::cookie_sync_guidance() {
                     eprintln!("{guidance}");
@@ -1819,22 +2134,34 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 .with_context(|| format!("resolve recipe {:?}", recipe_args.recipe))?;
             let content = fs::read_to_string(&recipe_path)
                 .with_context(|| format!("read recipe {}", recipe_path.display()))?;
-            let recipe: browser::Recipe = serde_yml::from_str(&content)?;
-            let recipe_vars =
+            let recipe: browser::Recipe = serde_yaml_ng::from_str(&content)?;
+            let mut recipe_vars =
                 browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)?;
             let profile_dir =
-                browser::resolve_profile_dir(&ctx.config, recipe_args.profile.as_ref())?;
+                browser::resolve_profile_dir(&ctx.browser_defaults, recipe_args.profile.as_ref())?;
             let is_chatgpt = is_chatgpt_recipe(&recipe, &recipe_path);
-            let mut resolved_cdp_target = browser::resolve_cdp_target_with_implicit(
+            if is_chatgpt {
+                chatgpt_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
+                recipe_vars
+                    .entry("run_id".to_string())
+                    .or_insert_with(chatgpt_web::generate_run_id);
+            }
+            let mut resolved_cdp_target = browser::resolve_cdp_target_with_selector(
                 recipe_args.cdp.as_deref(),
-                &ctx.config,
+                recipe_args.browser_id.as_deref(),
+                &ctx.browser_defaults,
                 !profile_forces_managed_browser(
                     recipe_args.profile.as_deref(),
                     recipe_args.cdp.as_deref(),
+                    recipe_args.browser_id.as_deref(),
                 ),
             )?;
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
-            let transports = browser::recipe_transports(&recipe, is_chatgpt);
+            let transports = constrain_chatgpt_transports_for_browser_context_selector(
+                browser::recipe_transports(&recipe, is_chatgpt),
+                &recipe_vars,
+                is_chatgpt,
+            );
             let manual_fallback =
                 manual_browser_recipe_fallback(&recipe_path, recipe_args.bundle.as_deref());
             let mut transport_errors = Vec::new();
@@ -1860,6 +2187,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
 
                 let result = match transport {
                     browser::RecipeTransport::DevBrowser => run_recipe_via_dev_browser(
+                        ctx,
                         &recipe_args,
                         &recipe_vars,
                         cdp_endpoint.as_deref(),
@@ -1867,6 +2195,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         is_chatgpt,
                     ),
                     browser::RecipeTransport::AgentBrowser => run_recipe_via_agent_browser(
+                        ctx,
                         recipe.clone(),
                         &recipe_args,
                         recipe_vars.clone(),
@@ -1877,6 +2206,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     ),
                     browser::RecipeTransport::ChromeDevtoolsMcp => {
                         run_recipe_via_chrome_devtools_mcp(
+                            ctx,
                             &recipe_args,
                             &recipe_vars,
                             cdp_endpoint.as_deref(),
@@ -1889,7 +2219,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 };
 
                 match result {
-                    Ok(()) => {
+                    Ok(_payload) => {
                         if matches!(
                             transport,
                             browser::RecipeTransport::ChromeDevtoolsMcp
@@ -1915,6 +2245,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             &err,
                             resolved_cdp_target.as_ref(),
                             transport,
+                            &recipe_vars,
                         ) {
                             transport_errors.push((transport, recipe_transport_error_detail(&err)));
                             if recipe_has_remaining_manual_fallback(&transports, index) {
@@ -1943,8 +2274,14 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
         }
         BrowserCommand::Attach(attach_args) => {
             // Try explicit CDP first, then auto-connect. No cookie fallback for attach.
-            let mut resolved_cdp_target =
-                browser::resolve_cdp_target(attach_args.cdp.as_deref(), &ctx.config)?;
+            let explicit_browser_target =
+                attach_args.cdp.is_some() || attach_args.browser_id.is_some();
+            let mut resolved_cdp_target = browser::resolve_cdp_target_with_selector(
+                attach_args.cdp.as_deref(),
+                attach_args.browser_id.as_deref(),
+                &ctx.browser_defaults,
+                true,
+            )?;
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
             let cdp_endpoint = resolved_cdp_target
                 .as_ref()
@@ -1957,9 +2294,14 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         let payload = json!({
                             "status": "ok",
                             "method": if attach_args.cdp.is_some() {
-                                "cdp_explicit"
+                                "cdp_explicit".to_string()
+                            } else if attach_args.browser_id.is_some() {
+                                format!(
+                                    "browser_id: {}",
+                                    attach_args.browser_id.as_deref().unwrap_or_default()
+                                )
                             } else {
-                                "cdp_selected"
+                                "cdp_selected".to_string()
                             },
                             "endpoint": endpoint,
                         });
@@ -1967,12 +2309,27 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             OutputFormat::Json => write_json(&payload),
                             OutputFormat::Jsonl => write_jsonl("browser.attach", &payload),
                             OutputFormat::Text | OutputFormat::Markdown => {
-                                println!("Attached via CDP: {endpoint}");
+                                println!(
+                                    "Attached via {}",
+                                    if attach_args.cdp.is_some() {
+                                        format!("CDP: {endpoint}")
+                                    } else if attach_args.browser_id.is_some() {
+                                        format!(
+                                            "browser_id {} ({endpoint})",
+                                            attach_args.browser_id.as_deref().unwrap_or_default()
+                                        )
+                                    } else {
+                                        format!("CDP: {endpoint}")
+                                    }
+                                );
                                 Ok(())
                             }
                         };
                     }
-                    Err(e) if attach_args.cdp.is_some() => {
+                    Err(e) if explicit_browser_target => {
+                        if let Some(target) = resolved_cdp_target.as_ref() {
+                            return Err(resolved_cdp_attach_failure(e, target));
+                        }
                         return Err(explicit_cdp_attach_failure(e));
                     }
                     Err(e)
@@ -2028,6 +2385,39 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                  Note: since Chrome 136, --remote-debugging-port is ignored on the default profile.\n\
                  See: https://developer.chrome.com/blog/remote-debugging-port"
             ))
+        }
+        BrowserCommand::VerifyCdp(args) => {
+            // Thin CDP smoke: attach and open an `about:blank` tab. Used by
+            // the real-browser CI lane (review finding #13) against a fresh
+            // Chrome for Testing instance so the deeper `check` / `attach`
+            // auth-probe path is not exercised.
+            let client = chrome_devtools_mcp::client::CdpMcpClient::connect_to_running_chrome(
+                Some(&args.cdp),
+            )
+            .await
+            .with_context(|| format!("attaching to CDP endpoint `{}`", args.cdp))?;
+            let new_page = client
+                .new_page(&args.url, /* background */ true, 15_000, None)
+                .await
+                .with_context(|| format!("opening `{}` against `{}`", args.url, args.cdp))?;
+            let payload = json!({
+                "status": "ok",
+                "endpoint": args.cdp,
+                "url": args.url,
+                "page_id": new_page.page_id,
+            });
+            let _ = client.close_selected_page(true);
+            match format {
+                OutputFormat::Json => write_json(&payload),
+                OutputFormat::Jsonl => write_jsonl("browser.verify_cdp", &payload),
+                OutputFormat::Text | OutputFormat::Markdown => {
+                    println!(
+                        "verify-cdp ok: endpoint={} page={}",
+                        args.cdp, new_page.page_id
+                    );
+                    Ok(())
+                }
+            }
         }
     }
 }
@@ -2243,7 +2633,7 @@ fn parse_media_inputs(
     let kind_label = media_type_label(&kind);
     let overrides = normalize_mime_overrides(values.len(), mimes, kind_label)?;
     let mut out = Vec::with_capacity(values.len());
-    for (value, mime) in values.iter().zip(overrides.into_iter()) {
+    for (value, mime) in values.iter().zip(overrides) {
         out.push(parse_media_input(value, mime.as_deref(), kind.clone())?);
     }
     Ok(out)
@@ -2344,10 +2734,27 @@ fn markdown_fence(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn normalize_model_name(model: &str) -> String {
         normalize_model_name_with_aliases(model, &std::collections::HashMap::new())
+    }
+
+    fn test_app_context() -> AppContext {
+        let config = Config::default();
+        let client = build_client(1).expect("build reqwest client");
+        let litellm = Arc::new(build_litellm(&config, client.clone()).expect("build litellm"));
+        AppContext {
+            config,
+            browser_defaults: browser::BrowserDefaults::default(),
+            client,
+            litellm,
+            output_final: None,
+            output_schema: None,
+            debug: false,
+            allow_unknown: false,
+        }
     }
 
     fn temp_schema_path() -> PathBuf {
@@ -2356,6 +2763,14 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("yoetz_schema_{nanos}.json"))
+    }
+
+    fn temp_output_path(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}_{nanos}.json"))
     }
 
     #[test]
@@ -2397,6 +2812,27 @@ mod tests {
         let fmt = resolve_response_format(None, Some(path.clone()), None).unwrap();
         assert!(fmt.is_some());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn maybe_write_output_writes_output_final_json() {
+        let output_path = temp_output_path("yoetz_browser_recipe_output");
+        let mut ctx = test_app_context();
+        ctx.output_final = Some(output_path.clone());
+
+        let payload = json!({
+            "status": "ok",
+            "backend": "dev-browser",
+            "response": "review text",
+        });
+
+        maybe_write_output(&ctx, &payload).unwrap();
+
+        let written: Value =
+            serde_json::from_str(&fs::read_to_string(&output_path).unwrap()).unwrap();
+        assert_eq!(written, payload);
+
+        let _ = fs::remove_file(output_path);
     }
 
     #[test]
@@ -2511,12 +2947,30 @@ mod tests {
             "YOETZ_BROWSER_CDP",
             "YOETZ_BROWSER_TARGET_PATH",
             "YOETZ_BROWSER_PROFILE",
+            "LITELLM_API_KEY",
         ] {
             assert!(
-                PROTECTED_DOTENV_ENV_VARS.contains(&key),
+                BASE_PROTECTED_DOTENV_ENV_VARS.contains(&key),
                 "{key} must stay protected"
             );
         }
+    }
+
+    #[test]
+    fn protected_dotenv_env_vars_include_custom_provider_api_key_envs() {
+        let mut config = Config::default();
+        config.providers.insert(
+            "corp".to_string(),
+            yoetz_core::config::ProviderConfig {
+                api_key_env: Some("CORP_LLM_TOKEN".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let protected = protected_dotenv_env_vars(&config);
+
+        assert!(protected.iter().any(|key| key == "CORP_LLM_TOKEN"));
+        assert!(protected.iter().any(|key| key == "LITELLM_API_KEY"));
     }
 
     #[test]
@@ -2524,32 +2978,47 @@ mod tests {
         let err = anyhow!(
             "live browser attach timed out (30s). Chrome may be showing an \"Allow remote debugging?\" dialog — please click Allow in Chrome, then retry."
         );
+        let vars = std::collections::BTreeMap::new();
         assert!(recipe_should_stop_live_transport_fallback(
             &err,
             None,
-            browser::RecipeTransport::ChromeDevtoolsMcp
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            &vars,
         ));
     }
 
     #[test]
-    fn recipe_should_stop_live_transport_fallback_on_thread_reuse_errors() {
-        let err = anyhow!(
-            "thread=reuse found multiple ChatGPT tabs but could not identify a unique active tab"
+    fn recipe_should_stop_live_transport_fallback_on_chatgpt_page_errors() {
+        let model_mismatch = anyhow!(
+            "requested ChatGPT model `pro` was not actually selected. Current page: url=https://chatgpt.com/, title=\"ChatGPT\""
         );
+        let auth_issue = anyhow!(
+            "chatgpt login required in the attached Chrome session. Log in there and try again."
+        );
+        let vars = std::collections::BTreeMap::new();
         assert!(recipe_should_stop_live_transport_fallback(
-            &err,
+            &model_mismatch,
             None,
-            browser::RecipeTransport::ChromeDevtoolsMcp
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            &vars,
+        ));
+        assert!(recipe_should_stop_live_transport_fallback(
+            &auth_issue,
+            None,
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            &vars,
         ));
     }
 
     #[test]
     fn recipe_should_not_stop_live_transport_fallback_on_non_approval_error() {
         let err = anyhow!("chatgpt send button not found");
+        let vars = std::collections::BTreeMap::new();
         assert!(!recipe_should_stop_live_transport_fallback(
             &err,
             None,
-            browser::RecipeTransport::ChromeDevtoolsMcp
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            &vars,
         ));
     }
 
@@ -2558,14 +3027,33 @@ mod tests {
         let err = anyhow!("chrome-devtools-mcp new_page on chatgpt.com");
         let target = browser::resolve_cdp_target(
             Some("ws://127.0.0.1:9222/devtools/browser/example"),
-            &Config::default(),
+            &browser::BrowserDefaults::default(),
         )
         .unwrap()
         .unwrap();
+        let vars = std::collections::BTreeMap::new();
         assert!(recipe_should_stop_live_transport_fallback(
             &err,
             Some(&target),
-            browser::RecipeTransport::ChromeDevtoolsMcp
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            &vars,
+        ));
+    }
+
+    #[test]
+    fn recipe_should_stop_profile_email_fallback_on_visibility_errors() {
+        let err = anyhow!(
+            "profile_email `aviv.s@taboola.com` did not match any live Chrome browser context"
+        );
+        let vars = std::collections::BTreeMap::from([(
+            "profile_email".to_string(),
+            "aviv.s@taboola.com".to_string(),
+        )]);
+        assert!(recipe_should_stop_live_transport_fallback(
+            &err,
+            None,
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            &vars,
         ));
     }
 
@@ -2593,7 +3081,8 @@ mod tests {
         assert!(!recipe_should_stop_live_transport_fallback(
             &err,
             None,
-            browser::RecipeTransport::ChromeDevtoolsMcp
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            &std::collections::BTreeMap::new(),
         ));
     }
 
@@ -2657,6 +3146,73 @@ mod tests {
     }
 
     #[test]
+    fn recipe_uses_chatgpt_browser_context_selector_detects_email_and_context_id() {
+        let mut vars = std::collections::BTreeMap::new();
+        assert!(!recipe_uses_chatgpt_browser_context_selector(&vars));
+
+        vars.insert(
+            "profile_email".to_string(),
+            "avivsinai@gmail.com".to_string(),
+        );
+        assert!(recipe_uses_chatgpt_browser_context_selector(&vars));
+
+        vars.clear();
+        vars.insert("browser_context_id".to_string(), "ctx-123".to_string());
+        assert!(recipe_uses_chatgpt_browser_context_selector(&vars));
+    }
+
+    #[test]
+    fn constrain_chatgpt_transports_for_browser_context_selector_keeps_only_mcp_and_manual() {
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert(
+            "profile_email".to_string(),
+            "avivsinai@gmail.com".to_string(),
+        );
+        let transports = constrain_chatgpt_transports_for_browser_context_selector(
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::AgentBrowser,
+                browser::RecipeTransport::Manual,
+            ],
+            &vars,
+            true,
+        );
+        assert_eq!(
+            transports,
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::Manual
+            ]
+        );
+    }
+
+    #[test]
+    fn constrain_chatgpt_transports_for_exact_browser_context_id_keeps_only_mcp_and_manual() {
+        let vars = std::collections::BTreeMap::from([(
+            "browser_context_id".to_string(),
+            "ctx-123".to_string(),
+        )]);
+        let transports = constrain_chatgpt_transports_for_browser_context_selector(
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::AgentBrowser,
+                browser::RecipeTransport::Manual,
+            ],
+            &vars,
+            true,
+        );
+        assert_eq!(
+            transports,
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::Manual
+            ]
+        );
+    }
+
+    #[test]
     fn browser_check_prefers_cdp_before_other_transports() {
         assert_eq!(
             browser_check_transports(false, false),
@@ -2683,15 +3239,115 @@ mod tests {
     fn browser_check_live_method_uses_auto_connect_for_implicit_targets() {
         assert_eq!(browser_check_live_method(None), "auto_connect");
 
-        let mut config = Config::default();
-        config.defaults.browser_cdp = Some("ws://127.0.0.1:9222/devtools/browser/config".into());
-        let configured = browser::resolve_cdp_target(None, &config)
+        let browser_defaults = browser::BrowserDefaults {
+            cdp: Some("ws://127.0.0.1:9222/devtools/browser/config".into()),
+            ..Default::default()
+        };
+        let configured = browser::resolve_cdp_target(None, &browser_defaults)
             .unwrap()
             .expect("configured target");
         assert_eq!(
             browser_check_live_method(Some(&configured)),
             "cdp: ws://127.0.0.1:9222/devtools/browser/config"
         );
+    }
+
+    #[test]
+    fn browser_check_prefers_live_attach_failure_over_legacy_login_error() {
+        let err = maybe_prefer_browser_check_live_attach_failure(
+            anyhow!("chatgpt login required. Run `yoetz browser login` and try again."),
+            Some("dev-browser could not connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging"),
+        );
+        let message = err.to_string();
+        assert!(message.contains("live Chrome attach failed"));
+        assert!(message.contains("chrome://inspect/#remote-debugging"));
+        assert!(message.contains("chatgpt login required"));
+    }
+
+    #[test]
+    fn browser_check_keeps_legacy_error_without_prior_live_attach_failure() {
+        let err = maybe_prefer_browser_check_live_attach_failure(
+            anyhow!("chatgpt login required. Run `yoetz browser login` and try again."),
+            None,
+        );
+        assert_eq!(
+            err.to_string(),
+            "chatgpt login required. Run `yoetz browser login` and try again."
+        );
+    }
+
+    #[test]
+    fn auto_selected_cdp_target_is_not_demoted_for_chatgpt_ui_auth_issues() {
+        let login_err = anyhow!(
+            "chatgpt login required in the attached Chrome session. Log in there and try again."
+        );
+        let challenge_err = anyhow!(
+            "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again."
+        );
+        assert!(!should_demote_auto_selected_cdp_target(&login_err));
+        assert!(!should_demote_auto_selected_cdp_target(&challenge_err));
+    }
+
+    #[test]
+    fn auto_selected_cdp_target_is_demoted_for_transport_level_attach_failures() {
+        let cdp_err = anyhow!(
+            "chrome-devtools-mcp could not reach Chrome's CDP endpoint. request failed: connection refused"
+        );
+        let dev_browser_err =
+            anyhow!("browser.newPage: Timeout 30000ms exceeded while waiting for connectOverCDP");
+        assert!(should_demote_auto_selected_cdp_target(&cdp_err));
+        assert!(should_demote_auto_selected_cdp_target(&dev_browser_err));
+    }
+
+    #[test]
+    fn browser_sync_cookies_cli_accepts_profile_path() {
+        let cli = Cli::try_parse_from([
+            "yoetz",
+            "browser",
+            "sync-cookies",
+            "--profile",
+            "/tmp/yoetz-browser-profile",
+        ])
+        .expect("browser sync-cookies args should parse");
+
+        match cli.command {
+            Commands::Browser(BrowserArgs {
+                command: BrowserCommand::SyncCookies(args),
+            }) => {
+                assert_eq!(
+                    args.profile.as_deref(),
+                    Some(Path::new("/tmp/yoetz-browser-profile"))
+                );
+            }
+            _ => panic!("unexpected command parsed"),
+        }
+    }
+
+    #[test]
+    fn config_profile_and_browser_profile_flags_do_not_collide() {
+        let cli = Cli::try_parse_from([
+            "yoetz",
+            "--config-profile",
+            "work",
+            "browser",
+            "sync-cookies",
+            "--profile",
+            "/tmp/yoetz-browser-profile",
+        ])
+        .expect("config and browser profile args should parse together");
+
+        assert_eq!(cli.config_profile.as_deref(), Some("work"));
+        match cli.command {
+            Commands::Browser(BrowserArgs {
+                command: BrowserCommand::SyncCookies(args),
+            }) => {
+                assert_eq!(
+                    args.profile.as_deref(),
+                    Some(Path::new("/tmp/yoetz-browser-profile"))
+                );
+            }
+            _ => panic!("unexpected command parsed"),
+        }
     }
 
     #[tokio::test]
@@ -2704,10 +3360,12 @@ mod tests {
             bundle: None,
             profile: None,
             cdp: None,
+            browser_id: None,
             vars: vec![],
         };
         let recipe_vars = BTreeMap::new();
         let err = run_recipe_via_chrome_devtools_mcp(
+            &test_app_context(),
             &recipe_args,
             &recipe_vars,
             None,
@@ -2731,10 +3389,12 @@ mod tests {
             bundle: None,
             profile: Some(PathBuf::from("/tmp/ignored")),
             cdp: None,
+            browser_id: None,
             vars: vec![],
         };
         let recipe_vars = BTreeMap::new();
         let err = run_recipe_via_chrome_devtools_mcp(
+            &test_app_context(),
             &recipe_args,
             &recipe_vars,
             None,
@@ -2754,10 +3414,12 @@ mod tests {
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
+            browser_id: None,
             vars: vec![],
         };
         let recipe_vars = BTreeMap::from([("paste".to_string(), "true".to_string())]);
         let err = run_recipe_via_chrome_devtools_mcp(
+            &test_app_context(),
             &recipe_args,
             &recipe_vars,
             None,
@@ -2778,10 +3440,12 @@ mod tests {
             bundle: None,
             profile: None,
             cdp: None,
+            browser_id: None,
             vars: vec![],
         };
         let recipe_vars = BTreeMap::new();
         let err = run_recipe_via_chrome_devtools_mcp(
+            &test_app_context(),
             &recipe_args,
             &recipe_vars,
             None,
@@ -2802,10 +3466,12 @@ mod tests {
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
+            browser_id: None,
             vars: vec![],
         };
         let recipe_vars = BTreeMap::from([("thread".to_string(), "sideways".to_string())]);
         let err = run_recipe_via_chrome_devtools_mcp(
+            &test_app_context(),
             &recipe_args,
             &recipe_vars,
             None,
@@ -2817,7 +3483,161 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("thread"));
         assert!(msg.contains("fresh"));
-        assert!(msg.contains("reuse"));
+    }
+
+    #[tokio::test]
+    async fn run_recipe_via_chrome_devtools_mcp_rejects_thread_reuse() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::from([("thread".to_string(), "reuse".to_string())]);
+        let err = run_recipe_via_chrome_devtools_mcp(
+            &test_app_context(),
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ true,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("thread=reuse is no longer supported"));
+        assert!(msg.contains("fresh ChatGPT tab"));
+    }
+
+    #[test]
+    fn resolve_dev_browser_delivery_mode_falls_back_to_paste_when_clipboard_upload_is_unavailable()
+    {
+        let bundle_path = temp_output_path("yoetz_bundle_text");
+        fs::write(&bundle_path, "bundle body").unwrap();
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: Some(bundle_path.clone()),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::new();
+
+        let (paste_mode, bundle_text, auto_fallback) =
+            resolve_dev_browser_delivery_mode_for_platform(false, &recipe_args, &recipe_vars)
+                .unwrap();
+
+        assert!(paste_mode);
+        assert!(auto_fallback);
+        assert_eq!(bundle_text.as_deref(), Some("bundle body"));
+        let _ = fs::remove_file(bundle_path);
+    }
+
+    #[test]
+    fn build_chatgpt_recipe_spec_uses_shared_contract_fields() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::from([
+            ("model".to_string(), "pro".to_string()),
+            ("prompt".to_string(), "Review this repo".to_string()),
+            ("browser_context_id".to_string(), "ctx-123".to_string()),
+            ("profile_email".to_string(), "user@example.com".to_string()),
+            ("run_id".to_string(), "run-123".to_string()),
+            ("wait_timeout_ms".to_string(), "2400000".to_string()),
+            ("wait_interval_ms".to_string(), "45000".to_string()),
+            ("extended".to_string(), "false".to_string()),
+        ]);
+
+        let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
+        assert_eq!(spec.bundle_path, Some(PathBuf::from("/tmp/bundle.md")));
+        assert_eq!(spec.model, "pro");
+        assert_eq!(spec.prompt, "Review this repo");
+        assert_eq!(spec.browser_context_id.as_deref(), Some("ctx-123"));
+        assert_eq!(spec.profile_email.as_deref(), Some("user@example.com"));
+        assert_eq!(spec.run_id, "run-123");
+        assert_eq!(spec.wait_timeout_ms, 2_400_000);
+        assert_eq!(spec.wait_interval_ms, 45_000);
+        assert!(spec.disable_extended);
+    }
+
+    #[test]
+    fn chatgpt_recipe_output_contract_event_includes_divergence_metadata() {
+        let output = crate::chatgpt_recipe::ChatgptRecipeOutput {
+            transport: "dev-browser".to_string(),
+            backend: "dev-browser".to_string(),
+            response: "ok".to_string(),
+            model_used: Some("gpt-5-4-pro".to_string()),
+            warnings: vec!["clipboard fallback".to_string()],
+            fallback_used: true,
+            delivery_mode: crate::chatgpt_recipe::ChatgptDeliveryMode::Paste,
+            auto_paste_fallback: true,
+        };
+
+        let event = output.to_recipe_complete_event();
+        assert_eq!(event["type"], "recipe_complete");
+        assert_eq!(event["transport"], "dev-browser");
+        assert_eq!(event["delivery_mode"], "paste");
+        assert_eq!(event["auto_paste_fallback"], true);
+        assert_eq!(event["warnings"], json!(["clipboard fallback"]));
+    }
+
+    #[test]
+    fn run_recipe_via_dev_browser_rejects_invalid_thread_mode_before_install_check() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::from([("thread".to_string(), "sideways".to_string())]);
+        let err = run_recipe_via_dev_browser(
+            &test_app_context(),
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ true,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("thread"));
+        assert!(msg.contains("fresh"));
+    }
+
+    #[test]
+    fn run_recipe_via_dev_browser_rejects_thread_reuse_before_install_check() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::from([("thread".to_string(), "reuse".to_string())]);
+        let err = run_recipe_via_dev_browser(
+            &test_app_context(),
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            /* is_chatgpt */ true,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("thread=reuse is no longer supported"));
+        assert!(msg.contains("fresh ChatGPT tab"));
     }
 
     #[test]

@@ -69,7 +69,7 @@ This enables replay, debugging, and the `apply` command for code review suggesti
 
 ### Budget Tracking
 
-Daily spend is tracked in a local JSON file. The `--max-cost-usd` flag estimates cost before sending (using the pricing registry) and aborts if over budget. `--daily-budget-usd` accumulates across commands.
+Daily spend is tracked in a local JSON file. The `--max-cost-usd` flag estimates cost before sending (using the pricing registry) and aborts if over budget. `--daily-budget-usd` accumulates across `ask`, `council`, and `review`. Generation commands do not expose budget flags yet, and multimodal `ask` currently rejects strict preflight budget enforcement until media pricing can be estimated accurately.
 
 ### Browser Mode
 
@@ -77,9 +77,9 @@ For models without API access (e.g., ChatGPT Pro), yoetz bundles files into mark
 
 Browser integrations are extension-free by design. Yoetz prefers to act as a wrapper over the underlying transport rather than reimplementing transport logic itself:
 
-- `dev-browser` is the primary live-Chrome transport for ChatGPT recipes.
-- `agent-browser` remains the legacy fallback when `dev-browser` is unavailable or a non-ChatGPT path still depends on it.
-- `chrome-devtools-mcp` is an extension-free fallback candidate, but it is not integrated yet.
+- `chrome-devtools-mcp` is the primary live-Chrome transport for ChatGPT recipes.
+- `dev-browser` is the secondary live-Chrome transport.
+- `agent-browser` remains the tertiary / legacy fallback when the first two transports are unavailable or a non-ChatGPT path still depends on it.
 - Explicit CDP endpoints are forwarded to the transport unchanged; the transport owns `/json/version`, `DevToolsActivePort`, and related connection logic.
 
 Connection priority remains connect-first: explicit CDP endpoint > auto-connect > cookie state > profile fallback.

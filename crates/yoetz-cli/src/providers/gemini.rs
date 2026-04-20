@@ -195,12 +195,7 @@ pub async fn generate_video_veo(
 
     let uri =
         extract_video_uri(&response).ok_or_else(|| anyhow!("missing video uri in response"))?;
-    validate_gemini_url(&uri, &auth.base_url, "download generated video")?;
-    if uri.starts_with("gs://") {
-        return Err(anyhow!(
-            "video is stored in GCS at {uri}; yoetz cannot download gs:// URIs without GCS credentials. Download with gsutil or gcloud and retry"
-        ));
-    }
+    validate_generated_video_download_uri(&uri, &auth.base_url)?;
 
     // Maximum download size for video files (500 MiB).
     const MAX_VIDEO_DOWNLOAD_BYTES: usize = 500 * 1024 * 1024;
@@ -508,6 +503,15 @@ fn extract_video_uri(resp: &Value) -> Option<String> {
     None
 }
 
+fn validate_generated_video_download_uri(uri: &str, base_url: &str) -> Result<()> {
+    if uri.starts_with("gs://") {
+        return Err(anyhow!(
+            "video is stored in GCS at {uri}; yoetz cannot download gs:// URIs without GCS credentials. Download with gsutil or gcloud and retry"
+        ));
+    }
+    validate_gemini_url(uri, base_url, "download generated video")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -566,6 +570,19 @@ mod tests {
             extract_video_uri(&resp),
             Some("gs://bucket/video.mp4".to_string())
         );
+    }
+
+    #[test]
+    fn validate_generated_video_download_uri_prefers_gcs_guidance() {
+        let err = validate_generated_video_download_uri(
+            "gs://bucket/video.mp4",
+            "https://generativelanguage.googleapis.com/v1beta",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("video is stored in GCS"));
+        assert!(msg.contains("gs://bucket/video.mp4"));
+        assert!(!msg.contains("untrusted Gemini URL"));
     }
 
     #[test]

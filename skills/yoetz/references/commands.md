@@ -6,7 +6,7 @@
 |------|-------------|
 | `--format <json\|text>` | Output format (default: text) |
 | `--debug` | Print raw provider responses |
-| `--profile <name>` | Config profile to use |
+| `--config-profile <name>` | Config profile to use |
 | `--timeout-secs <N>` | Request timeout (default: 60) |
 | `--output-final <path>` | Write final output to file |
 | `--output-schema <path>` | JSON schema for structured output validation |

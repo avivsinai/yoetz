@@ -492,6 +492,37 @@ mod tests {
     }
 
     #[test]
+    fn bundle_walks_hidden_paths_when_requested() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("yoetz_hidden_test_{nanos}"));
+        let workflows = root.join(".github/workflows");
+        fs::create_dir_all(&workflows).unwrap();
+
+        fs::write(root.join("visible.txt"), "visible").unwrap();
+        fs::write(workflows.join("ci.yml"), "name: CI\n").unwrap();
+
+        let bundle = build_bundle(
+            "prompt",
+            BundleOptions {
+                root: root.clone(),
+                include_all: true,
+                include_hidden: true,
+                ..BundleOptions::default()
+            },
+        )
+        .unwrap();
+
+        let paths: Vec<_> = bundle.files.iter().map(|f| f.path.as_str()).collect();
+        assert!(paths.contains(&"visible.txt"));
+        assert!(paths.contains(&".github/workflows/ci.yml"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn bundle_dedups_same_file_across_direct_and_glob_inputs() {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
