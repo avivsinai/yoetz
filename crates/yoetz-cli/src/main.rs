@@ -1132,7 +1132,7 @@ fn maybe_prefer_browser_check_live_attach_failure(
     if browser::is_chatgpt_auth_issue_error(&err) {
         if let Some(prior) = prior_live_attach_failure {
             return anyhow!(
-                "live Chrome attach failed before legacy fallback could verify ChatGPT auth.\n\nLive-attach error: {prior}\n\nLegacy fallback error: {err}"
+                "live Chrome attach failed before managed fallback could verify ChatGPT auth.\n\nLive-attach error: {prior}\n\nManaged fallback error: {err}"
             );
         }
     }
@@ -1278,7 +1278,7 @@ fn default_daemon_recovery_error(original: Option<&anyhow::Error>) -> Option<any
             "Chrome may be showing an \"Allow remote debugging?\" dialog. Click Allow, then retry.{suffix}"
         )),
         browser::DaemonState::Stale => Some(anyhow!(
-            "The legacy agent-browser daemon looks stale. Run `yoetz browser reset` and retry.{suffix}"
+            "The agent-browser default daemon looks stale. Run `yoetz browser reset` and retry.{suffix}"
         )),
         browser::DaemonState::NoSocket | browser::DaemonState::Healthy => None,
     }
@@ -2072,12 +2072,12 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             };
             browser::close_live_attach_session()?;
             browser::close_browser()?;
-            let legacy_reset = browser::force_kill_stale_daemon();
+            let default_daemon_reset = browser::force_kill_stale_daemon();
 
             let payload = json!({
                 "status": "ok",
                 "dev_browser_daemon_stopped": dev_browser_stopped,
-                "agent_browser_default": format!("{legacy_reset:?}"),
+                "agent_browser_default": format!("{default_daemon_reset:?}"),
                 "agent_browser_cdp_session_closed": true,
             });
             match format {
@@ -2090,7 +2090,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         println!("dev-browser daemon was not running.");
                     }
                     println!("Closed agent-browser live-attach session.");
-                    println!("Reset agent-browser default daemon state: {legacy_reset:?}.");
+                    println!("Reset agent-browser default daemon state: {default_daemon_reset:?}.");
                     Ok(())
                 }
             }
@@ -3253,7 +3253,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_check_prefers_live_attach_failure_over_legacy_login_error() {
+    fn browser_check_prefers_live_attach_failure_over_managed_login_error() {
         let err = maybe_prefer_browser_check_live_attach_failure(
             anyhow!("chatgpt login required. Run `yoetz browser login` and try again."),
             Some("dev-browser could not connect to Chrome. Enable remote debugging: chrome://inspect/#remote-debugging"),
@@ -3265,7 +3265,7 @@ mod tests {
     }
 
     #[test]
-    fn browser_check_keeps_legacy_error_without_prior_live_attach_failure() {
+    fn browser_check_keeps_managed_error_without_prior_live_attach_failure() {
         let err = maybe_prefer_browser_check_live_attach_failure(
             anyhow!("chatgpt login required. Run `yoetz browser login` and try again."),
             None,
