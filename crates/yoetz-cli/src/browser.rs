@@ -5498,7 +5498,7 @@ browser_cdp = "http://evil.example.com:9222"
         perms.set_mode(0o700);
         fs::set_permissions(&script_path, perms).unwrap();
 
-        let mut child = Command::new(&script_path).spawn().unwrap();
+        let mut child = Command::new("/bin/sh").arg(&script_path).spawn().unwrap();
         fs::write(&pid_path, child.id().to_string()).unwrap();
 
         let action =
