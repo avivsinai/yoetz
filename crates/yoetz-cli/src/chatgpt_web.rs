@@ -281,6 +281,10 @@ async () => {{
       !isVersionedModelTestId(item.testId) &&
       needles.some((needle) => item.haystack.includes(needle))
     ) || null;
+  const hasExactTierLabel = (item, slug) => {{
+    const text = normalize(item?.text || "").toLowerCase();
+    return text === slug || text.startsWith(`${{slug}} `);
+  }};
   const deriveRequestedTier = (value) => {{
     if (!value) return null;
     if (/\bthinking\b/.test(value)) return "thinking";
@@ -323,7 +327,7 @@ async () => {{
   }};
   const hasConflictingTierHint = (item, slug) => {{
     const haystack = item?.haystack || "";
-    if (hasTrustedUserFacingTierLabel(item, slug)) return false;
+    if (hasTrustedUserFacingTierLabel(item, slug) || hasExactTierLabel(item, slug)) return false;
     if (slug === "pro") {{
       return /\b5[- .]?3\b|gpt-5[- .]?3-pro/.test(haystack);
     }}
@@ -341,6 +345,10 @@ async () => {{
       item.haystack.includes(slug) && !hasConflictingTierHint(item, slug)
     );
     return matches.length === 1 ? matches[0] : null;
+  }};
+  const findExactTierLabelItem = (entries, slug) => {{
+    if (!(slug === "pro" || slug === "thinking" || slug === "instant")) return null;
+    return entries.find((item) => hasExactTierLabel(item, slug) && !hasConflictingTierHint(item, slug)) || null;
   }};
   const buildTierRankings = (entries) => {{
     const tierMaxVersions = {{
@@ -471,6 +479,15 @@ async () => {{
     }}
     return openedItems;
   }};
+  const readSelectorLabel = () => {{
+    const liveSelectorButton = findSelectorButton();
+    return normalize(
+      liveSelectorButton?.querySelector?.("[data-testid='selected-model'], [data-testid='model-switcher-selected-model']")?.textContent ||
+      liveSelectorButton?.innerText ||
+      liveSelectorButton?.textContent ||
+      ""
+    ).toLowerCase();
+  }};
 
   let items = readItems();
   if (items.length === 0) {{
@@ -497,11 +514,21 @@ async () => {{
   let target = null;
   let selectionNeedles = [];
   if (autoMode) {{
-    target = items
-      .map((item) => ({{ item, meta: rankings.candidateScore(item) }}))
-      .filter(({{ item, meta }}) => !meta.tier || !hasConflictingTierHint(item, meta.tier))
-      .sort((left, right) => right.meta.score - left.meta.score || right.item.text.length - left.item.text.length)
-      .map(({{ item }}) => item)[0] || null;
+    target =
+      findExactTierLabelItem(items, "pro") ||
+      selectBestTierItem(items, "pro", rankings) ||
+      findSingleGenericTierItem(items, "pro") ||
+      findExactTierLabelItem(items, "thinking") ||
+      selectBestTierItem(items, "thinking", rankings) ||
+      findSingleGenericTierItem(items, "thinking") ||
+      findExactTierLabelItem(items, "instant") ||
+      selectBestTierItem(items, "instant", rankings) ||
+      findSingleGenericTierItem(items, "instant") ||
+      items
+        .map((item) => ({{ item, meta: rankings.candidateScore(item) }}))
+        .filter(({{ item, meta }}) => !meta.tier || !hasConflictingTierHint(item, meta.tier))
+        .sort((left, right) => right.meta.score - left.meta.score || right.item.text.length - left.item.text.length)
+        .map(({{ item }}) => item)[0] || null;
     if (!target || rankings.candidateScore(target).score <= 0) {{
       return {{
         ...responseBase,
@@ -522,12 +549,16 @@ async () => {{
     const fallbackNeedles = Array.from(new Set([
       requestedLower,
       requestedLower.replace(/-/g, " "),
+      ...(requestedGenericTier ? [requestedGenericTier] : []),
       ...requestedTestIds,
       ...requestedTestIds.map((value) => value.replace(/-/g, " ")),
       ...exactTestIds,
     ])).filter(Boolean);
     target = requestedGenericTier
-      ? selectBestTierItem(items, requestedGenericTier, rankings) || findSingleGenericTierItem(items, requestedGenericTier) || null
+      ? findExactTierLabelItem(items, requestedGenericTier) ||
+        selectBestTierItem(items, requestedGenericTier, rankings) ||
+        findSingleGenericTierItem(items, requestedGenericTier) ||
+        null
       : findPreferredTestIdItem(items, exactTestIds) ||
         findGenericNeedleItem(items, fallbackNeedles) ||
         null;
@@ -564,7 +595,8 @@ async () => {{
     await wait(250);
     const currentItems = readItems();
     let currentTarget = targetTierSlug
-      ? selectBestTierItem(currentItems, targetTierSlug, buildTierRankings(currentItems)) ||
+      ? findExactTierLabelItem(currentItems, targetTierSlug) ||
+        selectBestTierItem(currentItems, targetTierSlug, buildTierRankings(currentItems)) ||
         findSingleGenericTierItem(currentItems, targetTierSlug) ||
         null
       : targetTestId
@@ -596,7 +628,8 @@ async () => {{
       updatedItems = readItems();
       const updatedRankings = buildTierRankings(updatedItems);
       updatedTarget = targetTierSlug
-        ? selectBestTierItem(updatedItems, targetTierSlug, updatedRankings) ||
+        ? findExactTierLabelItem(updatedItems, targetTierSlug) ||
+          selectBestTierItem(updatedItems, targetTierSlug, updatedRankings) ||
           findSingleGenericTierItem(updatedItems, targetTierSlug) ||
           null
         : targetTestId
@@ -604,18 +637,12 @@ async () => {{
           : findGenericNeedleItem(updatedItems, selectionNeedles) || null;
       const targetNode = targetTestId
         ? document.querySelector(`[data-testid="${{targetTestId}}"]`)
-        : null;
+          : null;
       targetChecked = isCheckedState(
         normalize(targetNode?.getAttribute?.("aria-checked") || "").toLowerCase(),
         normalize(targetNode?.getAttribute?.("data-state") || "").toLowerCase(),
       ) || isCheckedState(updatedTarget?.ariaChecked || "", updatedTarget?.dataState || "");
-      const liveSelectorButton = findSelectorButton();
-      selectedLabel = normalize(
-        liveSelectorButton?.querySelector?.("[data-testid='selected-model'], [data-testid='model-switcher-selected-model']")?.textContent ||
-        liveSelectorButton?.innerText ||
-        liveSelectorButton?.textContent ||
-        ""
-      ).toLowerCase();
+      selectedLabel = readSelectorLabel();
       const effectiveTierSlug = targetTierSlug || classifyTier(updatedTarget || target);
       const trustedTierSelected = effectiveTierSlug && (
         hasTrustedUserFacingTierLabel(updatedTarget || target, effectiveTierSlug) ||
@@ -639,6 +666,55 @@ async () => {{
         menuReopenAttempts,
         selectorExpanded: normalize(findSelectorButton()?.getAttribute?.("aria-expanded") || "").toLowerCase(),
         availableItemsAfter: updatedItems.map((item) => item.text || item.testId).filter(Boolean).slice(0, 12),
+      }};
+    }}
+    const reopenedItems = await openSelectorMenu();
+    if (reopenedItems.length > 0) {{
+      menuReopenAttempts += 1;
+    }}
+    const reopenedRankings = buildTierRankings(reopenedItems);
+    const reopenedTarget = targetTierSlug
+      ? findExactTierLabelItem(reopenedItems, targetTierSlug) ||
+        selectBestTierItem(reopenedItems, targetTierSlug, reopenedRankings) ||
+        findSingleGenericTierItem(reopenedItems, targetTierSlug) ||
+        null
+      : targetTestId
+        ? findPreferredTestIdItem(reopenedItems, [targetTestId.toLowerCase()]) ||
+          findGenericNeedleItem(reopenedItems, selectionNeedles) ||
+          null
+        : findGenericNeedleItem(reopenedItems, selectionNeedles) || null;
+    const reopenedChecked = isCheckedState(
+      reopenedTarget?.ariaChecked || "",
+      reopenedTarget?.dataState || "",
+    );
+    const reopenedLabel = readSelectorLabel();
+    const reopenedEffectiveTierSlug = targetTierSlug || classifyTier(reopenedTarget || target);
+    const reopenedTrustedTierSelected = reopenedEffectiveTierSlug && (
+      hasTrustedUserFacingTierLabel(reopenedTarget || target, reopenedEffectiveTierSlug) ||
+      reopenedItems.some((item) => hasTrustedUserFacingTierLabel(item, reopenedEffectiveTierSlug))
+    );
+    if (
+      reopenedChecked ||
+      selectionNeedles.filter(Boolean).some((needle) => needle && reopenedLabel.includes(needle)) ||
+      reopenedTrustedTierSelected
+    ) {{
+      selectionConfirmed = true;
+      updatedItems = reopenedItems;
+      updatedTarget = reopenedTarget;
+      targetChecked = reopenedChecked;
+      selectedLabel = reopenedLabel;
+      return {{
+        ...responseBase,
+        status: "selected",
+        modelUsed: reopenedChecked
+          ? (reopenedTarget?.text || target.text || requestedTrimmed || currentLabel || null)
+          : (reopenedLabel || reopenedTarget?.text || target.text || requestedTrimmed || currentLabel || null),
+        selectedLabel: reopenedLabel || null,
+        targetTestId,
+        targetChecked: reopenedChecked,
+        menuReopenAttempts,
+        selectorExpanded: normalize(findSelectorButton()?.getAttribute?.("aria-expanded") || "").toLowerCase(),
+        availableItemsAfter: reopenedItems.map((item) => item.text || item.testId).filter(Boolean).slice(0, 12),
       }};
     }}
   }}
@@ -1153,6 +1229,43 @@ mod tests {
             script.contains("let verifyConfirmed = false;"),
             "verify confirmation flag missing"
         );
+    }
+
+    #[test]
+    fn model_selection_function_prefers_exact_tier_labels_before_fuzzy_matching() {
+        // Live ChatGPT currently exposes generic tier labels like
+        // `Pro Research-grade intelligence` while the selector button itself
+        // often stays labeled `ChatGPT`. The explicit-model branch must first
+        // match the visible tier label before falling back to broader haystack
+        // heuristics, otherwise `model=pro` can falsely report not-found.
+        let script = build_model_selection_function("gpt-5-4-pro");
+        assert!(script.contains("const findExactTierLabelItem = (entries, slug) =>"));
+        assert!(script.contains("text === slug || text.startsWith(`${slug} `)"));
+        assert!(script.contains("findExactTierLabelItem(items, requestedGenericTier) ||"));
+    }
+
+    #[test]
+    fn model_selection_function_exact_labels_override_stale_testid_conflicts() {
+        // Live ChatGPT currently exposes `Pro` / `Thinking` on menu items whose
+        // testids still look like `gpt-5-3-pro` / `gpt-5-3-thinking`. The
+        // visible tier label must win over the stale suffix or auto/pro
+        // selection falls back to Instant.
+        let script = build_model_selection_function("pro");
+        assert!(script.contains("const hasExactTierLabel = (item, slug) =>"));
+        assert!(script.contains(
+            "hasTrustedUserFacingTierLabel(item, slug) || hasExactTierLabel(item, slug)"
+        ));
+    }
+
+    #[test]
+    fn model_selection_function_reopens_menu_when_button_label_stays_generic() {
+        // Live ChatGPT can keep the selector button text at `ChatGPT` even
+        // after the right radio item is checked. Reopen the menu once more and
+        // inspect the visible checked state before returning mismatch.
+        let script = build_model_selection_function("auto");
+        assert!(script.contains("const reopenedItems = await openSelectorMenu();"));
+        assert!(script.contains("const reopenedChecked = isCheckedState("));
+        assert!(script.contains("const reopenedLabel = readSelectorLabel();"));
     }
 
     #[test]

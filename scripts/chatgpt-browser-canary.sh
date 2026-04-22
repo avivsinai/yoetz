@@ -20,7 +20,6 @@ yoetz_bin="${YOETZ_BIN:-${repo_root}/target/debug/yoetz}"
 [[ -x "${yoetz_bin}" ]] || die "yoetz binary not found or not executable: ${yoetz_bin}"
 
 cdp_endpoint="${YOETZ_CHATGPT_CDP:-${YOETZ_BROWSER_CDP:-}}"
-[[ -n "${cdp_endpoint}" ]] || die "set YOETZ_CHATGPT_CDP (or YOETZ_BROWSER_CDP) to the live Chrome CDP endpoint"
 
 command -v jq >/dev/null 2>&1 || die "required command not found: jq"
 
@@ -31,11 +30,22 @@ export YOETZ_ALLOW_USER_TAB_ANCHOR="${YOETZ_ALLOW_USER_TAB_ANCHOR:-1}"
 bundle_path="$("${yoetz_bin}" bundle -p 'Reply with exactly OK.' --format json | jq -r '.artifacts.bundle_md')"
 [[ -n "${bundle_path}" && -f "${bundle_path}" ]] || die "failed to create canary bundle"
 
+cdp_args=()
+if [[ -n "${cdp_endpoint}" ]]; then
+  cdp_args+=(--cdp "${cdp_endpoint}")
+fi
+
+profile_args=()
+if [[ -n "${YOETZ_CHATGPT_PROFILE_EMAIL:-}" ]]; then
+  profile_args+=(--var "profile_email=${YOETZ_CHATGPT_PROFILE_EMAIL}")
+fi
+
 echo "==> running live ChatGPT browser canary via ${yoetz_bin}"
 result="$("${yoetz_bin}" browser recipe \
   --recipe chatgpt \
   --bundle "${bundle_path}" \
-  --cdp "${cdp_endpoint}" \
+  "${cdp_args[@]}" \
+  "${profile_args[@]}" \
   --var model=pro \
   --var wait_timeout_ms="${YOETZ_CHATGPT_WAIT_TIMEOUT_MS:-2400000}" \
   --format json)"
