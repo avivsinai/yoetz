@@ -66,7 +66,7 @@ struct Cli {
     #[arg(long = "config-profile", global = true)]
     config_profile: Option<String>,
 
-    #[arg(long, global = true, default_value = "60")]
+    #[arg(long, global = true, default_value = "180")]
     timeout_secs: u64,
 
     /// Allow unrecognized model IDs (for self-hosted models not in the registry)
@@ -1185,13 +1185,24 @@ fn running_profile_recipe_transport_priority(transport: browser::RecipeTransport
 }
 
 fn prioritize_chatgpt_transports_for_running_profile_auto_connect(
-    mut transports: Vec<browser::RecipeTransport>,
+    transports: Vec<browser::RecipeTransport>,
     prefer_auto_connect: bool,
 ) -> Vec<browser::RecipeTransport> {
     if !prefer_auto_connect {
         return transports;
     }
 
+    let has_agent_browser = transports.contains(&browser::RecipeTransport::AgentBrowser);
+    let has_manual = transports.contains(&browser::RecipeTransport::Manual);
+    if has_agent_browser {
+        let mut constrained = vec![browser::RecipeTransport::AgentBrowser];
+        if has_manual {
+            constrained.push(browser::RecipeTransport::Manual);
+        }
+        return constrained;
+    }
+
+    let mut transports = transports;
     transports.sort_by_key(|transport| running_profile_recipe_transport_priority(*transport));
     transports
 }
@@ -1213,12 +1224,8 @@ fn browser_check_transports(
     }
 
     if prefer_auto_connect {
-        let mut transports = vec![BrowserCheckTransport::AgentBrowser];
-        if dev_browser_available {
-            transports.push(BrowserCheckTransport::DevBrowser);
-        }
-        transports.push(BrowserCheckTransport::ChromeDevtoolsMcp);
-        return transports;
+        let _ = dev_browser_available;
+        return vec![BrowserCheckTransport::AgentBrowser];
     }
 
     let mut transports = vec![BrowserCheckTransport::ChromeDevtoolsMcp];
@@ -1686,6 +1693,7 @@ fn run_recipe_via_agent_browser(
     profile_dir: PathBuf,
     format: OutputFormat,
     is_chatgpt: bool,
+    prefer_auto_connect: bool,
     selected_cdp_target: &mut Option<browser::ResolvedCdpTarget>,
 ) -> Result<Value> {
     let needs_auth = is_chatgpt;
@@ -1751,6 +1759,10 @@ fn run_recipe_via_agent_browser(
                             return Err(err);
                         } else if let Some(recovery) = default_daemon_recovery_error(Some(&err)) {
                             return Err(recovery);
+                        } else if prefer_auto_connect {
+                            return Err(anyhow!(
+                                "running-profile auto-connect was unavailable ({err}). yoetz will not fall back to a managed profile for this run."
+                            ));
                         } else {
                             eprintln!("info: auto-connect unavailable, falling back to profile");
                             None
@@ -2164,6 +2176,19 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     BrowserCheckTransport::AgentBrowser => {
                         let connection = if managed_profile_only {
                             browser::resolve_auth(&profile_dir, /* headed */ false)?
+                        } else if prefer_auto_connect {
+                            browser::try_auto_connect("https://chatgpt.com/").map_err(|e| {
+                                if let Some(recovery) = default_daemon_recovery_error(Some(&e)) {
+                                    return recovery;
+                                }
+                                maybe_prefer_browser_check_live_attach_failure(
+                                    anyhow!(
+                                        "running-profile auto-connect was unavailable ({e}). yoetz will not fall back to a managed profile for this check."
+                                    ),
+                                    prior_live_attach_failure.as_deref(),
+                                )
+                            })?;
+                            browser::BrowserConnection::AutoConnect
                         } else {
                             let fallback_cdp = resolved_cdp_target
                                 .as_ref()
@@ -2387,6 +2412,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         profile_dir.clone(),
                         format,
                         is_chatgpt,
+                        prefer_auto_connect,
                         &mut resolved_cdp_target,
                     ),
                     browser::RecipeTransport::ChromeDevtoolsMcp => {
@@ -3607,7 +3633,7 @@ mod tests {
     }
 
     #[test]
-    fn prioritize_chatgpt_transports_for_running_profile_moves_raw_cdp_last() {
+    fn prioritize_chatgpt_transports_for_running_profile_constrains_to_agent_browser_and_manual() {
         let transports = prioritize_chatgpt_transports_for_running_profile_auto_connect(
             vec![
                 browser::RecipeTransport::ChromeDevtoolsMcp,
@@ -3621,8 +3647,6 @@ mod tests {
             transports,
             vec![
                 browser::RecipeTransport::AgentBrowser,
-                browser::RecipeTransport::DevBrowser,
-                browser::RecipeTransport::ChromeDevtoolsMcp,
                 browser::RecipeTransport::Manual
             ]
         );
@@ -3681,11 +3705,7 @@ mod tests {
         );
         assert_eq!(
             browser_check_transports(true, false, true),
-            vec![
-                BrowserCheckTransport::AgentBrowser,
-                BrowserCheckTransport::DevBrowser,
-                BrowserCheckTransport::ChromeDevtoolsMcp,
-            ]
+            vec![BrowserCheckTransport::AgentBrowser]
         );
     }
 
