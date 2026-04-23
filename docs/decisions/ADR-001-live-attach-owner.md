@@ -1,0 +1,60 @@
+# ADR-001: Make `chrome-devtools-mcp` the Live Attach Owner
+
+## Status
+Accepted
+
+## Date
+2026-04-22
+
+## Context
+Yoetz had the right primitives for live Chrome work, but ownership was split:
+
+- `yoetz browser attach` used the older live-attach path in `browser.rs`
+- `yoetz browser check` partly used `chrome-devtools-mcp`
+- `yoetz browser recipe --recipe chatgpt` still opened its own fresh live attachment
+- ChatGPT auth probing still opened transient probe tabs instead of reusing one durable yoetz-owned tab
+- approval prompts and attach attempts were spread across multiple call sites
+
+That split increased reconnect churn and made the recurring Chrome "Allow remote debugging?" prompt worse than it needed to be.
+
+## Decision
+Make `chrome-devtools-mcp` the single yoetz-owned live-attach owner for ChatGPT-oriented live Chrome work.
+
+The concrete changes are:
+
+- add a daemon-backed owner in `crates/yoetz-cli/src/live_attach.rs`
+- route `attach`, the primary `check` path, and the ChatGPT `recipe` path through that owner
+- keep one durable yoetz-owned ChatGPT control tab per resolved browser context by persisting a stable `_yoetz=<run-id>` marker
+- reconnect from the logical target identity (`source-path`, `browser-id`, or implicit default discovery), not by blindly reusing the last websocket URL
+- preserve daemon metadata on bounded ping timeouts so a busy owner is not mistaken for a dead one, while `yoetz browser reset` still forcefully clears a wedged owner
+- keep `dev-browser` and `agent-browser` as fallback transports instead of peer live-session owners
+
+## Alternatives Considered
+
+### Keep three peer session owners
+- Pros: no refactor
+- Cons: repeated attach logic, repeated approval churn, transient probe tabs, unclear reset behavior
+- Rejected: this is the direct cause of the current fragmentation
+
+### Make `dev-browser` the live owner
+- Pros: existing named-page reuse
+- Cons: Playwright `connectOverCDP` remains the unstable transport on current Chrome default-profile flows
+- Rejected: wrong transport foundation for the default live path
+
+### Make `agent-browser` the live owner
+- Pros: existing daemon/session mechanics
+- Cons: the auto-connect path is intentionally not the canonical session owner for real-tab visibility, and managed/profile fallbacks are a different ownership model
+- Rejected: useful fallback, wrong primary owner
+
+### Build the full daemonized CDP supervisor now
+- Pros: closest to the final design
+- Cons: larger IPC and lifecycle change, higher regression risk, slower path to reducing actual churn
+- Rejected initially: the first safe step was to prove the owner boundary before pushing every flow onto it
+
+## Consequences
+
+- `attach`, `check`, and the ChatGPT `recipe` share one yoetz-owned CDP owner
+- repeated auth checks and recipe launches reuse the same control-tab identity for a resolved browser context instead of creating throwaway probe tabs
+- reconnect recovery now keeps the old `CreateTarget -> reconnect -> recover via existing anchor` behavior on the daemonized recipe path
+- a busy daemon times out cleanly instead of wedging `doctor`, `reset`, or later attach/check calls forever
+- `dev-browser` and `agent-browser` remain available, but only as fallback executors when the primary live owner is unavailable or unsuitable

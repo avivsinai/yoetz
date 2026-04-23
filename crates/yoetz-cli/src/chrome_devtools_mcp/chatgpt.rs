@@ -36,6 +36,7 @@
 //! auto-poll already uses.
 
 use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
 use std::io::IsTerminal;
 use std::time::Duration;
 
@@ -96,7 +97,7 @@ fn build_wait_for_composer_script(focus_composer: bool) -> String {
     )
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ChatgptRunResult {
     pub response: String,
     pub model_used: Option<String>,
@@ -136,7 +137,7 @@ enum ResponseSendState {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum InitialPageOpenMode {
+pub enum InitialPageOpenMode {
     CreateTarget,
     RecoverViaExistingAnchor,
 }
@@ -150,11 +151,11 @@ impl InitialPageOpenMode {
     }
 }
 
-fn retry_initial_page_open_mode() -> InitialPageOpenMode {
+pub fn retry_initial_page_open_mode() -> InitialPageOpenMode {
     InitialPageOpenMode::RecoverViaExistingAnchor
 }
 
-fn should_recover_initial_page_open_after_reconnect(err: &anyhow::Error) -> bool {
+pub fn should_recover_initial_page_open_after_reconnect(err: &anyhow::Error) -> bool {
     should_retry_initial_new_page_after_reconnect(err) || is_external_create_target_block_error(err)
 }
 
@@ -193,12 +194,19 @@ async fn run_attached_recipe_with_reconnect(
 }
 
 async fn connect_client(ctx: &DevtoolsMcpRecipeContext) -> Result<CdpMcpClient> {
+    connect_client_with_approval_lock(ctx.cdp_endpoint.as_deref(), ctx.show_approval_guidance).await
+}
+
+pub async fn connect_client_with_approval_lock(
+    cdp_endpoint: Option<&str>,
+    show_approval_guidance: bool,
+) -> Result<CdpMcpClient> {
     // Step 0: attach directly to the user's running Chrome session.
     // Chrome may show an "Allow remote debugging?" dialog here whenever it
     // treats this as a new external attach request. Serialize only the attach
     // itself so approval prompts do not race across yoetz processes.
-    let client = with_chrome_approval_lock(ctx.show_approval_guidance, || async {
-        CdpMcpClient::connect_to_running_chrome(ctx.cdp_endpoint.as_deref())
+    let client = with_chrome_approval_lock(show_approval_guidance, || async {
+        CdpMcpClient::connect_to_running_chrome(cdp_endpoint)
             .await
             .map_err(cdp_attach_hint)
     })
@@ -233,9 +241,41 @@ async fn run_attached_recipe(
             (None, None) => "resolve Chrome browser context".to_string(),
         })?;
 
+    run_attached_recipe_inner(&mut client, ctx, browser_context_id, page_open_mode).await
+}
+
+pub async fn run_with_client(
+    client: &mut CdpMcpClient,
+    ctx: &DevtoolsMcpRecipeContext,
+    browser_context_id: Option<String>,
+) -> Result<ChatgptRunResult> {
+    run_with_client_using_page_open_mode(
+        client,
+        ctx,
+        browser_context_id,
+        InitialPageOpenMode::CreateTarget,
+    )
+    .await
+}
+
+pub async fn run_with_client_using_page_open_mode(
+    client: &mut CdpMcpClient,
+    ctx: &DevtoolsMcpRecipeContext,
+    browser_context_id: Option<String>,
+    page_open_mode: InitialPageOpenMode,
+) -> Result<ChatgptRunResult> {
+    run_attached_recipe_inner(client, ctx, browser_context_id, page_open_mode).await
+}
+
+async fn run_attached_recipe_inner(
+    client: &mut CdpMcpClient,
+    ctx: &DevtoolsMcpRecipeContext,
+    browser_context_id: Option<String>,
+    page_open_mode: InitialPageOpenMode,
+) -> Result<ChatgptRunResult> {
     let marked_url = chatgpt_web::mark_chatgpt_url(&ctx.run_id);
     let page_id = open_initial_chatgpt_page(
-        &client,
+        client,
         &marked_url,
         browser_context_id.as_deref(),
         page_open_mode,
@@ -252,10 +292,10 @@ async fn run_attached_recipe(
     // user can actually access. When `model` is `auto` or empty, prefer the
     // strongest available Pro/GPT-5 option and fall back to the current model
     // if the selector UI is unavailable.
-    wait_for_composer_ready(&client, /* focus_composer */ true).await?;
-    let model_used = maybe_select_model(&client, &ctx.model).await?;
+    wait_for_composer_ready(client, /* focus_composer */ true).await?;
+    let model_used = maybe_select_model(client, &ctx.model).await?;
     if ctx.disable_extended {
-        maybe_disable_extended(&client).await?;
+        maybe_disable_extended(client).await?;
     }
 
     // Step 3: upload the bundle if we have a path.
@@ -271,7 +311,7 @@ async fn run_attached_recipe(
         .bundle_path
         .as_ref()
         .context("ChatGPT recipe requires a bundle file path")?;
-    try_upload_bundle(&client, bundle_path)
+    try_upload_bundle(client, bundle_path)
         .await
         .context("upload bundle to ChatGPT")?;
 
@@ -330,7 +370,7 @@ async fn run_attached_recipe(
     // research showed "Regenerate" is missing or inconsistently placed in
     // many ChatGPT flows (Custom GPT, Canvas, certain Pro modes).
     let response_text = poll_for_stable_response(
-        &mut client,
+        client,
         ctx,
         &page_id,
         response_baseline,
@@ -410,12 +450,24 @@ async fn open_initial_chatgpt_probe_page(
     client: &CdpMcpClient,
     url: &str,
     timeout_ms: u64,
+    browser_context_id: Option<&str>,
 ) -> Result<()> {
-    match open_page_via_blank_target(client, url, /* background */ true, timeout_ms, None).await {
+    match open_page_via_blank_target(
+        client,
+        url,
+        /* background */ true,
+        timeout_ms,
+        browser_context_id,
+    )
+    .await
+    {
         Ok(()) => Ok(()),
         Err(err) if is_external_create_target_block_error(&err) => client
             .open_chatgpt_page_via_existing_anchor(
-                url, /* background */ true, timeout_ms, None,
+                url,
+                /* background */ true,
+                timeout_ms,
+                browser_context_id,
             )
             .await
             .with_context(|| format!("recover auth probe page open for `{url}`"))
@@ -425,32 +477,63 @@ async fn open_initial_chatgpt_probe_page(
 }
 
 pub async fn check_auth(cdp_endpoint: Option<&str>, show_approval_guidance: bool) -> Result<()> {
-    let client = with_chrome_approval_lock(show_approval_guidance, || async {
-        CdpMcpClient::connect_to_running_chrome(cdp_endpoint)
+    check_auth_with_control_run_id(cdp_endpoint, show_approval_guidance, None).await
+}
+
+async fn open_chatgpt_auth_probe_page(
+    client: &CdpMcpClient,
+    browser_context_id: Option<&str>,
+    control_run_id: Option<&str>,
+    timeout_ms: u64,
+) -> Result<()> {
+    let url = control_run_id
+        .map(chatgpt_web::mark_chatgpt_url)
+        .unwrap_or_else(|| chatgpt_web::CHATGPT_URL.to_string());
+    open_initial_chatgpt_probe_page(client, &url, timeout_ms, browser_context_id)
+        .await
+        .with_context(|| format!("chrome-devtools-mcp open auth probe on `{url}`"))?;
+    if let Some(control_run_id) = control_run_id {
+        let set_window_name_js = chatgpt_web::build_set_window_name_js(control_run_id);
+        client
+            .evaluate_script(&set_window_name_js, vec![])
             .await
-            .map_err(cdp_attach_hint)
-    })
-    .await?;
-    let used_probe_page = client
-        .select_chatgpt_page_for_probe(30_000)
+            .context("mark ChatGPT control tab with window.name")?;
+    }
+    Ok(())
+}
+
+pub async fn check_auth_with_control_run_id(
+    cdp_endpoint: Option<&str>,
+    show_approval_guidance: bool,
+    control_run_id: Option<&str>,
+) -> Result<()> {
+    let client = connect_client_with_approval_lock(cdp_endpoint, show_approval_guidance).await?;
+    ensure_chatgpt_control_tab_ready(&client, None, control_run_id).await
+}
+
+pub async fn ensure_chatgpt_control_tab_ready(
+    client: &CdpMcpClient,
+    browser_context_id: Option<&str>,
+    control_run_id: Option<&str>,
+) -> Result<()> {
+    let reused_existing_page = client
+        .select_chatgpt_page_for_probe(30_000, browser_context_id, control_run_id)
         .await
         .context("select existing ChatGPT page for auth probe")?
-        .is_none();
-    if used_probe_page {
-        open_initial_chatgpt_probe_page(&client, chatgpt_web::CHATGPT_URL, 30_000)
-            .await
-            .context("chrome-devtools-mcp open auth probe on chatgpt.com")?;
+        .is_some();
+    if !reused_existing_page {
+        open_chatgpt_auth_probe_page(client, browser_context_id, control_run_id, 30_000).await?;
     }
-    let result = wait_for_composer_ready(&client, /* focus_composer */ false).await;
-    if !used_probe_page && result.is_err() {
-        open_initial_chatgpt_probe_page(&client, chatgpt_web::CHATGPT_URL, 30_000)
-            .await
-            .context("chrome-devtools-mcp probe retry on chatgpt.com")?;
-        let retry = wait_for_composer_ready(&client, /* focus_composer */ false).await;
-        let _ = client.close_selected_page(true);
+    let result = wait_for_composer_ready(client, /* focus_composer */ false).await;
+    if reused_existing_page && result.is_err() {
+        open_chatgpt_auth_probe_page(client, browser_context_id, control_run_id, 30_000).await?;
+        let retry = wait_for_composer_ready(client, /* focus_composer */ false).await;
+        if control_run_id.is_none() {
+            let _ = client.close_selected_page(true);
+        }
         return retry;
     }
-    if used_probe_page {
+    if !reused_existing_page && control_run_id.is_none() {
         let _ = client.close_selected_page(true);
     }
     result

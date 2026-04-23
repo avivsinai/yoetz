@@ -41,6 +41,7 @@ pub mod chatgpt;
 
 use crate::chatgpt_web;
 use anyhow::Result;
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
@@ -63,7 +64,7 @@ impl RecipeThreadMode {
 ///
 /// Construction of this struct is the boundary between yoetz-cli's `main.rs`
 /// dispatcher and the chrome_devtools_mcp recipe layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DevtoolsMcpRecipeContext {
     /// Explicit CDP endpoint (e.g. `http://127.0.0.1:9222`). `None` means
     /// "use the default localhost:9222 and resolve the browser websocket from
