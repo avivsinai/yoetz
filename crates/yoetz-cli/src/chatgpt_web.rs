@@ -181,11 +181,16 @@ pub fn select_reported_chatgpt_model(
     }
 
     let requested_model = requested_model.trim();
-    if requested_model.is_empty() || requested_model.eq_ignore_ascii_case("auto") {
+    if should_keep_current_chatgpt_model(requested_model) {
         None
     } else {
         canonical_chatgpt_model_slug(requested_model)
     }
+}
+
+pub fn should_keep_current_chatgpt_model(requested_model: &str) -> bool {
+    let requested_model = requested_model.trim();
+    requested_model.is_empty() || requested_model.eq_ignore_ascii_case("auto")
 }
 
 pub fn model_selector_button_selector_json() -> String {
@@ -993,26 +998,33 @@ pub fn build_chatgpt_dom_probe_function() -> String {
     format!(
         r##"
 () => {{
-  const send = Array.from(document.querySelectorAll({send_button_selector_json})).find((button) => {{
+  const isVisible = (button) => {{
     const rect = button.getBoundingClientRect();
     const style = window.getComputedStyle(button);
     return rect.width > 0 &&
       rect.height > 0 &&
       style.visibility !== "hidden" &&
       style.display !== "none";
-  }}) || null;
-  const stop = document.querySelector({stop_button_selector_json});
+  }};
+  const send = Array.from(document.querySelectorAll({send_button_selector_json})).find((button) => isVisible(button)) || null;
+  const stopButton = Array.from(document.querySelectorAll({stop_button_selector_json})).find((button) => isVisible(button)) || null;
+  const stopGenerating = !!stopButton && !stopButton.disabled;
   const thinking = document.querySelector(".result-thinking, [data-testid*='thinking'], [class*='thinking']");
   const msgs = document.querySelectorAll("[data-message-author-role='assistant']");
   const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
-  const copyButtons = lastMsg ? lastMsg.querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']").length : 0;
+  const turnRoot =
+    lastMsg?.closest(".agent-turn, [class*='agent-turn'], [class*='turn-messages']") ||
+    lastMsg?.parentElement?.parentElement ||
+    lastMsg?.parentElement ||
+    document;
+  const copyButtons = lastMsg ? turnRoot.querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']").length : 0;
   const lastLen = msgs.length > 0 ? msgs[msgs.length - 1].innerText.length : 0;
   const sendState = !send ? "missing" : send.disabled ? "disabled" : "enabled";
   const errEl = document.querySelector("[class*='error-toast'], [data-testid*='error'], [role='alert']");
   const errText = errEl ? errEl.innerText.substring(0, 100).toLowerCase() : "";
   const markers = ["network error","something went wrong","error generating","attachment failed","upload failed","too many requests"];
   const err = markers.find((marker) => errText.includes(marker)) || "";
-  return `send=${{sendState}}|stop=${{stop ? 1 : 0}}|thinking=${{thinking ? 1 : 0}}|copy=${{copyButtons}}|msgs=${{msgs.length}}|lastlen=${{lastLen}}|err=${{err}}`;
+  return `send=${{sendState}}|stop=${{stopGenerating ? 1 : 0}}|thinking=${{thinking ? 1 : 0}}|copy=${{copyButtons}}|msgs=${{msgs.length}}|lastlen=${{lastLen}}|err=${{err}}`;
 }}
 "##,
         send_button_selector_json = send_button_selector_json,
@@ -1151,6 +1163,14 @@ mod tests {
             select_reported_chatgpt_model(&selection, "pro"),
             Some("gpt-5-4-pro".to_string())
         );
+    }
+
+    #[test]
+    fn keep_current_chatgpt_model_detects_auto_and_empty_requests() {
+        assert!(should_keep_current_chatgpt_model(""));
+        assert!(should_keep_current_chatgpt_model("auto"));
+        assert!(should_keep_current_chatgpt_model(" AUTO "));
+        assert!(!should_keep_current_chatgpt_model("pro"));
     }
 
     #[test]
@@ -1311,6 +1331,8 @@ mod tests {
         let dom_probe = build_chatgpt_dom_probe_function();
         assert!(dom_probe.contains("send="));
         assert!(dom_probe.contains("copyButtons"));
+        assert!(dom_probe.contains("stopGenerating = !!stopButton && !stopButton.disabled"));
+        assert!(dom_probe.contains("turnRoot.querySelectorAll"));
 
         let latest_response = build_latest_response_probe_function();
         assert!(latest_response.contains("data-message-author-role"));

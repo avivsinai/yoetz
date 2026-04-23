@@ -526,6 +526,9 @@ pub async fn ensure_chatgpt_control_tab_ready(
     }
     let result = wait_for_composer_ready(client, /* focus_composer */ false).await;
     if reused_existing_page && result.is_err() {
+        if should_retire_failed_reused_control_tab(control_run_id, &result) {
+            let _ = client.close_selected_page(true);
+        }
         open_chatgpt_auth_probe_page(client, browser_context_id, control_run_id, 30_000).await?;
         let retry = wait_for_composer_ready(client, /* focus_composer */ false).await;
         if control_run_id.is_none() {
@@ -537,6 +540,13 @@ pub async fn ensure_chatgpt_control_tab_ready(
         let _ = client.close_selected_page(true);
     }
     result
+}
+
+fn should_retire_failed_reused_control_tab(
+    control_run_id: Option<&str>,
+    result: &Result<()>,
+) -> bool {
+    control_run_id.is_some() && result.is_err()
 }
 
 async fn wait_for_composer_ready(client: &CdpMcpClient, focus_composer: bool) -> Result<()> {
@@ -623,6 +633,7 @@ async fn maybe_select_model(
     client: &CdpMcpClient,
     requested_model: &str,
 ) -> Result<Option<String>> {
+    let keep_current_model = chatgpt_web::should_keep_current_chatgpt_model(requested_model);
     let script = build_model_selection_script(requested_model);
     let selection = client
         .evaluate_script(&script, vec![])
@@ -638,6 +649,7 @@ async fn maybe_select_model(
     let model_used = chatgpt_web::select_reported_chatgpt_model(&selection, requested_model);
     match status {
         "selected" | "already-selected" => Ok(model_used),
+        "missing-selector" | "not-found" if keep_current_model => Ok(model_used),
         "missing-selector" => Err(anyhow!(
             "ChatGPT model selector button not found. {}",
             format_page_probe_summary(&selection)
@@ -1787,6 +1799,20 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[test]
+    fn retire_failed_reused_control_tab_only_for_persistent_control_tabs() {
+        let err = Err(anyhow!("composer did not mount"));
+        assert!(should_retire_failed_reused_control_tab(
+            Some("control-run"),
+            &err
+        ));
+        assert!(!should_retire_failed_reused_control_tab(None, &err));
+        assert!(!should_retire_failed_reused_control_tab(
+            Some("control-run"),
+            &Ok(())
+        ));
     }
 
     #[test]

@@ -66,7 +66,7 @@ struct Cli {
     #[arg(long = "config-profile", global = true)]
     config_profile: Option<String>,
 
-    #[arg(long, global = true, default_value = "60")]
+    #[arg(long, global = true, default_value = "180")]
     timeout_secs: u64,
 
     /// Allow unrecognized model IDs (for self-hosted models not in the registry)
@@ -1016,15 +1016,36 @@ fn recipe_should_stop_live_transport_fallback(
         return true;
     }
     if browser::is_chatgpt_auth_issue_error(err) {
-        return true;
+        if recipe_uses_exact_browser_context_selector(recipe_vars) {
+            return true;
+        }
+        if selected_cdp_target.is_some_and(browser::ResolvedCdpTarget::is_authoritative) {
+            return true;
+        }
+        return !is_live_cdp_only_transport(transport);
     }
-    if recipe_uses_chatgpt_browser_context_selector(recipe_vars)
-        && browser::is_chatgpt_profile_selector_visibility_error(err)
-    {
-        return true;
+    if browser::is_chatgpt_profile_selector_visibility_error(err) {
+        if recipe_uses_exact_browser_context_selector(recipe_vars) {
+            return true;
+        }
+        if recipe_uses_profile_email_selector(recipe_vars) {
+            if selected_cdp_target.is_some_and(browser::ResolvedCdpTarget::is_authoritative) {
+                return true;
+            }
+            return !matches!(
+                transport,
+                browser::RecipeTransport::ChromeDevtoolsMcp | browser::RecipeTransport::DevBrowser
+            );
+        }
     }
     if browser::is_chatgpt_attached_page_error(err) {
-        return true;
+        if recipe_uses_exact_browser_context_selector(recipe_vars) {
+            return true;
+        }
+        if selected_cdp_target.is_some_and(browser::ResolvedCdpTarget::is_authoritative) {
+            return true;
+        }
+        return matches!(transport, browser::RecipeTransport::AgentBrowser);
     }
 
     // Once the user has explicitly pinned a specific live Chrome target, do not
@@ -1058,16 +1079,34 @@ fn recipe_should_skip_remaining_live_cdp_transports(err: &anyhow::Error) -> bool
     browser::is_chrome_cdp_unreachable_error(err)
 }
 
+fn recipe_var_present(
+    recipe_vars: &std::collections::BTreeMap<String, String>,
+) -> impl Fn(&str) -> bool + '_ {
+    move |key| {
+        recipe_vars
+            .get(key)
+            .is_some_and(|value| !value.trim().is_empty())
+    }
+}
+
+fn recipe_uses_exact_browser_context_selector(
+    recipe_vars: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    recipe_var_present(recipe_vars)("browser_context_id")
+}
+
+fn recipe_uses_profile_email_selector(
+    recipe_vars: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    recipe_var_present(recipe_vars)("profile_email")
+}
+
+#[cfg(test)]
 fn recipe_uses_chatgpt_browser_context_selector(
     recipe_vars: &std::collections::BTreeMap<String, String>,
 ) -> bool {
-    ["browser_context_id", "profile_email"]
-        .into_iter()
-        .any(|key| {
-            recipe_vars
-                .get(key)
-                .is_some_and(|value| !value.trim().is_empty())
-        })
+    recipe_uses_exact_browser_context_selector(recipe_vars)
+        || recipe_uses_profile_email_selector(recipe_vars)
 }
 
 fn constrain_chatgpt_transports_for_browser_context_selector(
@@ -1075,19 +1114,97 @@ fn constrain_chatgpt_transports_for_browser_context_selector(
     recipe_vars: &std::collections::BTreeMap<String, String>,
     is_chatgpt: bool,
 ) -> Vec<browser::RecipeTransport> {
-    if !is_chatgpt || !recipe_uses_chatgpt_browser_context_selector(recipe_vars) {
+    if !is_chatgpt {
         return transports;
     }
 
+    if recipe_uses_exact_browser_context_selector(recipe_vars) {
+        return transports
+            .into_iter()
+            .filter(|transport| {
+                matches!(
+                    transport,
+                    browser::RecipeTransport::ChromeDevtoolsMcp | browser::RecipeTransport::Manual
+                )
+            })
+            .collect();
+    }
+
+    if recipe_uses_profile_email_selector(recipe_vars) {
+        return transports
+            .into_iter()
+            .filter(|transport| {
+                matches!(
+                    transport,
+                    browser::RecipeTransport::ChromeDevtoolsMcp
+                        | browser::RecipeTransport::AgentBrowser
+                        | browser::RecipeTransport::Manual
+                )
+            })
+            .collect();
+    }
+
     transports
-        .into_iter()
-        .filter(|transport| {
-            matches!(
-                transport,
-                browser::RecipeTransport::ChromeDevtoolsMcp | browser::RecipeTransport::Manual
-            )
-        })
-        .collect()
+}
+
+fn live_attach_owner_present(summary: &live_attach::DaemonSummary) -> bool {
+    matches!(
+        summary.health,
+        live_attach::DaemonHealth::Healthy | live_attach::DaemonHealth::Busy
+    )
+}
+
+fn should_prefer_running_profile_auto_connect(
+    selected_cdp_target: Option<&browser::ResolvedCdpTarget>,
+    live_attach_owner_is_present: bool,
+) -> bool {
+    // No healthy raw CDP target was selected, so prefer the running-profile
+    // transports before asking Chrome for a fresh live attach, unless yoetz
+    // already has a live-attach owner for the implicit/default path.
+    selected_cdp_target.is_none() && !live_attach_owner_is_present
+}
+
+fn maybe_print_running_profile_auto_connect_preference(
+    prefer_auto_connect: bool,
+    format: OutputFormat,
+) {
+    if prefer_auto_connect && matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+        eprintln!(
+            "info: no healthy raw Chrome DevTools target was discovered; reusing the running-profile auto-connect path instead of requesting a new raw CDP attach"
+        );
+    }
+}
+
+fn running_profile_recipe_transport_priority(transport: browser::RecipeTransport) -> u8 {
+    match transport {
+        browser::RecipeTransport::AgentBrowser => 0,
+        browser::RecipeTransport::DevBrowser => 1,
+        browser::RecipeTransport::ChromeDevtoolsMcp => 2,
+        browser::RecipeTransport::Manual => 3,
+    }
+}
+
+fn prioritize_chatgpt_transports_for_running_profile_auto_connect(
+    transports: Vec<browser::RecipeTransport>,
+    prefer_auto_connect: bool,
+) -> Vec<browser::RecipeTransport> {
+    if !prefer_auto_connect {
+        return transports;
+    }
+
+    let has_agent_browser = transports.contains(&browser::RecipeTransport::AgentBrowser);
+    let has_manual = transports.contains(&browser::RecipeTransport::Manual);
+    if has_agent_browser {
+        let mut constrained = vec![browser::RecipeTransport::AgentBrowser];
+        if has_manual {
+            constrained.push(browser::RecipeTransport::Manual);
+        }
+        return constrained;
+    }
+
+    let mut transports = transports;
+    transports.sort_by_key(|transport| running_profile_recipe_transport_priority(*transport));
+    transports
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1100,8 +1217,14 @@ enum BrowserCheckTransport {
 fn browser_check_transports(
     dev_browser_available: bool,
     managed_profile_only: bool,
+    prefer_auto_connect: bool,
 ) -> Vec<BrowserCheckTransport> {
     if managed_profile_only {
+        return vec![BrowserCheckTransport::AgentBrowser];
+    }
+
+    if prefer_auto_connect {
+        let _ = dev_browser_available;
         return vec![BrowserCheckTransport::AgentBrowser];
     }
 
@@ -1257,7 +1380,13 @@ fn should_demote_auto_selected_cdp_target(err: &anyhow::Error) -> bool {
         return false;
     }
     if browser::is_chatgpt_auth_issue_error(err) {
-        return false;
+        return true;
+    }
+    if browser::is_chatgpt_profile_selector_visibility_error(err) {
+        return true;
+    }
+    if browser::is_chatgpt_attached_page_error(err) {
+        return true;
     }
     if browser::is_chrome_cdp_unreachable_error(err) {
         return true;
@@ -1564,6 +1693,7 @@ fn run_recipe_via_agent_browser(
     profile_dir: PathBuf,
     format: OutputFormat,
     is_chatgpt: bool,
+    prefer_auto_connect: bool,
     selected_cdp_target: &mut Option<browser::ResolvedCdpTarget>,
 ) -> Result<Value> {
     let needs_auth = is_chatgpt;
@@ -1629,6 +1759,10 @@ fn run_recipe_via_agent_browser(
                             return Err(err);
                         } else if let Some(recovery) = default_daemon_recovery_error(Some(&err)) {
                             return Err(recovery);
+                        } else if prefer_auto_connect {
+                            return Err(anyhow!(
+                                "running-profile auto-connect was unavailable ({err}). yoetz will not fall back to a managed profile for this run."
+                            ));
                         } else {
                             eprintln!("info: auto-connect unavailable, falling back to profile");
                             None
@@ -1886,8 +2020,19 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
 
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.browser_defaults, check_args.profile.as_ref())?;
-            let transports =
-                browser_check_transports(browser::use_dev_browser(), managed_profile_only);
+            let live_attach_owner_is_present =
+                live_attach_owner_present(&live_attach::inspect_daemon_sync());
+            let prefer_auto_connect = !managed_profile_only
+                && should_prefer_running_profile_auto_connect(
+                    resolved_cdp_target.as_ref(),
+                    live_attach_owner_is_present,
+                );
+            maybe_print_running_profile_auto_connect_preference(prefer_auto_connect, format);
+            let transports = browser_check_transports(
+                browser::use_dev_browser(),
+                managed_profile_only,
+                prefer_auto_connect,
+            );
             let mut prior_live_attach_failure: Option<String> = None;
 
             for transport in transports {
@@ -2031,6 +2176,19 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     BrowserCheckTransport::AgentBrowser => {
                         let connection = if managed_profile_only {
                             browser::resolve_auth(&profile_dir, /* headed */ false)?
+                        } else if prefer_auto_connect {
+                            browser::try_auto_connect("https://chatgpt.com/").map_err(|e| {
+                                if let Some(recovery) = default_daemon_recovery_error(Some(&e)) {
+                                    return recovery;
+                                }
+                                maybe_prefer_browser_check_live_attach_failure(
+                                    anyhow!(
+                                        "running-profile auto-connect was unavailable ({e}). yoetz will not fall back to a managed profile for this check."
+                                    ),
+                                    prior_live_attach_failure.as_deref(),
+                                )
+                            })?;
+                            browser::BrowserConnection::AutoConnect
                         } else {
                             let fallback_cdp = resolved_cdp_target
                                 .as_ref()
@@ -2177,6 +2335,11 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.browser_defaults, recipe_args.profile.as_ref())?;
             let is_chatgpt = is_chatgpt_recipe(&recipe, &recipe_path);
+            let managed_profile_only = profile_forces_managed_browser(
+                recipe_args.profile.as_deref(),
+                recipe_args.cdp.as_deref(),
+                recipe_args.browser_id.as_deref(),
+            );
             if is_chatgpt {
                 chatgpt_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
                 recipe_vars
@@ -2187,17 +2350,27 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 recipe_args.cdp.as_deref(),
                 recipe_args.browser_id.as_deref(),
                 &ctx.browser_defaults,
-                !profile_forces_managed_browser(
-                    recipe_args.profile.as_deref(),
-                    recipe_args.cdp.as_deref(),
-                    recipe_args.browser_id.as_deref(),
-                ),
+                !managed_profile_only,
             )?;
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
             let transports = constrain_chatgpt_transports_for_browser_context_selector(
                 browser::recipe_transports(&recipe, is_chatgpt),
                 &recipe_vars,
                 is_chatgpt,
+            );
+            let live_attach_owner_is_present =
+                live_attach_owner_present(&live_attach::inspect_daemon_sync());
+            let prefer_auto_connect = is_chatgpt
+                && !managed_profile_only
+                && !recipe_uses_exact_browser_context_selector(&recipe_vars)
+                && should_prefer_running_profile_auto_connect(
+                    resolved_cdp_target.as_ref(),
+                    live_attach_owner_is_present,
+                );
+            maybe_print_running_profile_auto_connect_preference(prefer_auto_connect, format);
+            let transports = prioritize_chatgpt_transports_for_running_profile_auto_connect(
+                transports,
+                prefer_auto_connect,
             );
             let manual_fallback =
                 manual_browser_recipe_fallback(&recipe_path, recipe_args.bundle.as_deref());
@@ -2239,6 +2412,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         profile_dir.clone(),
                         format,
                         is_chatgpt,
+                        prefer_auto_connect,
                         &mut resolved_cdp_target,
                     ),
                     browser::RecipeTransport::ChromeDevtoolsMcp => {
@@ -2325,7 +2499,6 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 .map(|target| target.endpoint.clone());
             let show_approval_guidance =
                 matches!(format, OutputFormat::Text | OutputFormat::Markdown);
-
             if resolved_cdp_target.is_some() {
                 match live_attach::ensure_chatgpt_session(
                     resolved_cdp_target.as_ref(),
@@ -2441,6 +2614,11 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             || browser::is_chatgpt_auth_issue_error(&err)
                         {
                             return Err(err);
+                        }
+                        if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+                            eprintln!(
+                                "info: live-attach owner setup failed ({err}); falling back to running-profile auto-connect"
+                            );
                         }
                     }
                 }
@@ -3091,13 +3269,19 @@ mod tests {
             "chatgpt login required in the attached Chrome session. Log in there and try again."
         );
         let vars = std::collections::BTreeMap::new();
-        assert!(recipe_should_stop_live_transport_fallback(
+        assert!(!recipe_should_stop_live_transport_fallback(
             &model_mismatch,
             None,
             browser::RecipeTransport::ChromeDevtoolsMcp,
             &vars,
         ));
         assert!(recipe_should_stop_live_transport_fallback(
+            &model_mismatch,
+            None,
+            browser::RecipeTransport::AgentBrowser,
+            &vars,
+        ));
+        assert!(!recipe_should_stop_live_transport_fallback(
             &auth_issue,
             None,
             browser::RecipeTransport::ChromeDevtoolsMcp,
@@ -3150,18 +3334,65 @@ mod tests {
     }
 
     #[test]
-    fn recipe_should_stop_profile_email_fallback_on_visibility_errors() {
+    fn recipe_should_stop_auth_issue_for_authoritative_target() {
         let err = anyhow!(
-            "profile_email `aviv.s@taboola.com` did not match any live Chrome browser context"
+            "chatgpt login required in the attached Chrome session. Log in there and try again."
         );
-        let vars = std::collections::BTreeMap::from([(
-            "profile_email".to_string(),
-            "aviv.s@taboola.com".to_string(),
+        let target = browser::resolve_cdp_target(
+            Some("ws://127.0.0.1:9222/devtools/browser/example"),
+            &browser::BrowserDefaults::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let vars = std::collections::BTreeMap::new();
+        assert!(recipe_should_stop_live_transport_fallback(
+            &err,
+            Some(&target),
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            &vars,
+        ));
+    }
+
+    #[test]
+    fn recipe_should_stop_attached_page_errors_for_authoritative_target_or_exact_context() {
+        let err = anyhow!(
+            "requested ChatGPT model `pro` was not actually selected. Current page: url=https://chatgpt.com/, title=\"ChatGPT\""
+        );
+        let target = browser::resolve_cdp_target(
+            Some("ws://127.0.0.1:9222/devtools/browser/example"),
+            &browser::BrowserDefaults::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let exact_context_vars = std::collections::BTreeMap::from([(
+            "browser_context_id".to_string(),
+            "ctx-123".to_string(),
         )]);
+        assert!(recipe_should_stop_live_transport_fallback(
+            &err,
+            Some(&target),
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            &std::collections::BTreeMap::new(),
+        ));
         assert!(recipe_should_stop_live_transport_fallback(
             &err,
             None,
             browser::RecipeTransport::ChromeDevtoolsMcp,
+            &exact_context_vars,
+        ));
+    }
+
+    #[test]
+    fn recipe_should_not_stop_dev_browser_page_errors_before_agent_browser() {
+        let err = anyhow!(
+            "{}",
+            r#"ChatGPT send button never became enabled after typing. {"send":"missing"}"#
+        );
+        let vars = std::collections::BTreeMap::new();
+        assert!(!recipe_should_stop_live_transport_fallback(
+            &err,
+            None,
+            browser::RecipeTransport::DevBrowser,
             &vars,
         ));
     }
@@ -3272,20 +3503,26 @@ mod tests {
     fn recipe_uses_chatgpt_browser_context_selector_detects_email_and_context_id() {
         let mut vars = std::collections::BTreeMap::new();
         assert!(!recipe_uses_chatgpt_browser_context_selector(&vars));
+        assert!(!recipe_uses_profile_email_selector(&vars));
+        assert!(!recipe_uses_exact_browser_context_selector(&vars));
 
         vars.insert(
             "profile_email".to_string(),
             "avivsinai@gmail.com".to_string(),
         );
         assert!(recipe_uses_chatgpt_browser_context_selector(&vars));
+        assert!(recipe_uses_profile_email_selector(&vars));
+        assert!(!recipe_uses_exact_browser_context_selector(&vars));
 
         vars.clear();
         vars.insert("browser_context_id".to_string(), "ctx-123".to_string());
         assert!(recipe_uses_chatgpt_browser_context_selector(&vars));
+        assert!(!recipe_uses_profile_email_selector(&vars));
+        assert!(recipe_uses_exact_browser_context_selector(&vars));
     }
 
     #[test]
-    fn constrain_chatgpt_transports_for_browser_context_selector_keeps_only_mcp_and_manual() {
+    fn constrain_chatgpt_transports_for_profile_email_keeps_agent_browser_available() {
         let mut vars = std::collections::BTreeMap::new();
         vars.insert(
             "profile_email".to_string(),
@@ -3305,6 +3542,7 @@ mod tests {
             transports,
             vec![
                 browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::AgentBrowser,
                 browser::RecipeTransport::Manual
             ]
         );
@@ -3336,16 +3574,125 @@ mod tests {
     }
 
     #[test]
-    fn browser_check_prefers_cdp_before_other_transports() {
+    fn recipe_should_not_stop_profile_email_fallback_on_advisory_live_target_visibility_errors() {
+        let err = anyhow!(
+            "profile_email `aviv.s@taboola.com` did not match any live Chrome browser context"
+        );
+        let vars = std::collections::BTreeMap::from([(
+            "profile_email".to_string(),
+            "aviv.s@taboola.com".to_string(),
+        )]);
+        assert!(!recipe_should_stop_live_transport_fallback(
+            &err,
+            None,
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            &vars,
+        ));
+    }
+
+    #[test]
+    fn prefer_running_profile_auto_connect_requires_implicit_target_and_no_live_owner() {
+        assert!(should_prefer_running_profile_auto_connect(None, false));
+        assert!(!should_prefer_running_profile_auto_connect(None, true));
+
+        let browser_defaults = browser::BrowserDefaults {
+            cdp: Some("ws://127.0.0.1:9222/devtools/browser/config".into()),
+            ..Default::default()
+        };
+        let configured = browser::resolve_cdp_target(None, &browser_defaults)
+            .unwrap()
+            .expect("configured target");
+        assert!(!should_prefer_running_profile_auto_connect(
+            Some(&configured),
+            false,
+        ));
+    }
+
+    #[test]
+    fn live_attach_owner_present_requires_healthy_or_busy_daemon() {
+        assert!(live_attach_owner_present(&live_attach::DaemonSummary {
+            health: live_attach::DaemonHealth::Healthy,
+            pid: Some(1),
+            session_count: 0,
+        }));
+        assert!(live_attach_owner_present(&live_attach::DaemonSummary {
+            health: live_attach::DaemonHealth::Healthy,
+            pid: Some(1),
+            session_count: 1,
+        }));
+        assert!(live_attach_owner_present(&live_attach::DaemonSummary {
+            health: live_attach::DaemonHealth::Busy,
+            pid: Some(1),
+            session_count: 0,
+        }));
+        assert!(!live_attach_owner_present(&live_attach::DaemonSummary {
+            health: live_attach::DaemonHealth::NotRunning,
+            pid: None,
+            session_count: 0,
+        }));
+    }
+
+    #[test]
+    fn prioritize_chatgpt_transports_for_running_profile_constrains_to_agent_browser_and_manual() {
+        let transports = prioritize_chatgpt_transports_for_running_profile_auto_connect(
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::AgentBrowser,
+                browser::RecipeTransport::Manual,
+            ],
+            true,
+        );
         assert_eq!(
-            browser_check_transports(false, false),
+            transports,
+            vec![
+                browser::RecipeTransport::AgentBrowser,
+                browser::RecipeTransport::Manual
+            ]
+        );
+    }
+
+    #[test]
+    fn prioritize_chatgpt_transports_for_running_profile_preserves_explicit_single_transport() {
+        let transports = prioritize_chatgpt_transports_for_running_profile_auto_connect(
+            vec![browser::RecipeTransport::ChromeDevtoolsMcp],
+            true,
+        );
+        assert_eq!(
+            transports,
+            vec![browser::RecipeTransport::ChromeDevtoolsMcp]
+        );
+    }
+
+    #[test]
+    fn prioritize_chatgpt_transports_for_running_profile_preserves_cdp_only_manual_fallback() {
+        let transports = prioritize_chatgpt_transports_for_running_profile_auto_connect(
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::Manual,
+            ],
+            true,
+        );
+        assert_eq!(
+            transports,
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::Manual
+            ]
+        );
+    }
+
+    #[test]
+    fn browser_check_orders_transports_by_mode() {
+        assert_eq!(
+            browser_check_transports(false, false, false),
             vec![
                 BrowserCheckTransport::ChromeDevtoolsMcp,
                 BrowserCheckTransport::AgentBrowser,
             ]
         );
         assert_eq!(
-            browser_check_transports(true, false),
+            browser_check_transports(true, false, false),
             vec![
                 BrowserCheckTransport::ChromeDevtoolsMcp,
                 BrowserCheckTransport::DevBrowser,
@@ -3353,7 +3700,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            browser_check_transports(true, true),
+            browser_check_transports(true, true, false),
+            vec![BrowserCheckTransport::AgentBrowser]
+        );
+        assert_eq!(
+            browser_check_transports(true, false, true),
             vec![BrowserCheckTransport::AgentBrowser]
         );
     }
@@ -3400,15 +3751,15 @@ mod tests {
     }
 
     #[test]
-    fn auto_selected_cdp_target_is_not_demoted_for_chatgpt_ui_auth_issues() {
+    fn auto_selected_cdp_target_is_demoted_for_chatgpt_ui_auth_issues() {
         let login_err = anyhow!(
             "chatgpt login required in the attached Chrome session. Log in there and try again."
         );
         let challenge_err = anyhow!(
             "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again."
         );
-        assert!(!should_demote_auto_selected_cdp_target(&login_err));
-        assert!(!should_demote_auto_selected_cdp_target(&challenge_err));
+        assert!(should_demote_auto_selected_cdp_target(&login_err));
+        assert!(should_demote_auto_selected_cdp_target(&challenge_err));
     }
 
     #[test]
@@ -3418,8 +3769,19 @@ mod tests {
         );
         let dev_browser_err =
             anyhow!("browser.newPage: Timeout 30000ms exceeded while waiting for connectOverCDP");
+        let profile_selector_err = anyhow!(
+            "profile_email `aviv.s@taboola.com` did not match any live Chrome browser context"
+        );
+        let page_err = anyhow!(
+            "{}",
+            r#"ChatGPT send button never became enabled after typing. {"send":"missing"}"#
+        );
         assert!(should_demote_auto_selected_cdp_target(&cdp_err));
         assert!(should_demote_auto_selected_cdp_target(&dev_browser_err));
+        assert!(should_demote_auto_selected_cdp_target(
+            &profile_selector_err
+        ));
+        assert!(should_demote_auto_selected_cdp_target(&page_err));
     }
 
     #[test]
