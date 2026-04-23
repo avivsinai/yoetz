@@ -483,10 +483,17 @@ impl CdpMcpClient {
                     .await
                 {
                     Ok(tab) => tab,
-                    Err(open_err) => self
-                        .reuse_page_target(&anchor, url, background, timeout_ms)
-                        .await
-                        .context(open_err)?,
+                    Err(open_err) => {
+                        if context_tab_navigation_reuse_rank(&anchor.url).is_some() {
+                            self.reuse_page_target(&anchor, url, background, timeout_ms)
+                                .await
+                                .context(open_err)?
+                        } else {
+                            return Err(open_err.context(
+                                "refusing to navigate an existing yoetz-owned ChatGPT tab as a recovery fallback",
+                            ));
+                        }
+                    }
                 }
             }
             ChatgptRecoveryStrategy::AnyUserPageAnchor => {
@@ -560,6 +567,13 @@ impl CdpMcpClient {
         }
 
         let tab = self.select_chatgpt_probe_target(candidates, timeout_ms)?;
+        if let Some(preferred_run_id) = preferred_run_id {
+            self.retire_duplicate_chatgpt_probe_tabs(
+                browser_context_id,
+                preferred_run_id,
+                tab.get_target_id(),
+            );
+        }
         configure_tab_timeout(&tab, timeout_ms);
         self.set_selected_tab(tab.clone());
 
@@ -864,6 +878,20 @@ impl CdpMcpClient {
             .map(|(_, target)| target))
     }
 
+    fn select_navigable_optional_context_target(
+        &self,
+        browser_context_id: Option<&str>,
+    ) -> Result<Option<TargetInfo>> {
+        Ok(self
+            .page_targets_in_optional_browser_context(browser_context_id)?
+            .into_iter()
+            .filter_map(|target| {
+                context_tab_navigation_reuse_rank(&target.url).map(|rank| (rank, target))
+            })
+            .min_by_key(|(rank, _)| *rank)
+            .map(|(_, target)| target))
+    }
+
     fn attach_page_target(&self, target_id: &str) -> Result<Arc<Tab>> {
         self.browser
             .attach_to_page_target(target_id)?
@@ -1033,6 +1061,27 @@ impl CdpMcpClient {
         self.attach_page_target(&candidates[index].target_id)
     }
 
+    fn retire_duplicate_chatgpt_probe_tabs(
+        &self,
+        browser_context_id: Option<&str>,
+        preferred_run_id: &str,
+        keep_target_id: &str,
+    ) {
+        let page_targets = self
+            .chatgpt_page_targets(browser_context_id)
+            .unwrap_or_default();
+        let duplicate_targets = duplicate_chatgpt_probe_target_ids_to_retire(
+            &page_targets,
+            preferred_run_id,
+            keep_target_id,
+        );
+        for target in duplicate_targets {
+            if let Ok(tab) = self.attach_page_target(&target) {
+                let _ = tab.close(true);
+            }
+        }
+    }
+
     fn probe_chatgpt_target(&self, target: &TargetInfo, timeout_ms: u64) -> ChatgptTabProbe {
         self.attach_page_target(&target.target_id)
             .map(|tab| probe_chatgpt_tab(&tab, timeout_ms))
@@ -1118,14 +1167,14 @@ fn choose_chatgpt_recovery_strategy(
     browser_context_id: Option<&str>,
     url: &str,
 ) -> Result<ChatgptRecoveryStrategy> {
-    if has_chatgpt_anchor {
-        if mutate_existing_chatgpt_tab_allowed() {
-            return Ok(ChatgptRecoveryStrategy::ReuseExistingChatgptTab);
-        }
-        return Ok(ChatgptRecoveryStrategy::ExistingChatgptAnchor);
+    if has_chatgpt_anchor && mutate_existing_chatgpt_tab_allowed() {
+        return Ok(ChatgptRecoveryStrategy::ReuseExistingChatgptTab);
     }
     if safe_anchor_url.is_some_and(|value| context_tab_reuse_rank(value).is_some()) {
         return Ok(ChatgptRecoveryStrategy::ExistingSafeAnchor);
+    }
+    if has_chatgpt_anchor && user_tab_anchor_allowed() {
+        return Ok(ChatgptRecoveryStrategy::ExistingChatgptAnchor);
     }
     if user_tab_anchor_allowed() {
         // Caller opted in via YOETZ_ALLOW_USER_TAB_ANCHOR=1. Use any existing
@@ -1163,10 +1212,10 @@ impl CdpMcpClient {
         browser_context_id: Option<&str>,
     ) -> Result<Arc<Tab>> {
         let target = self
-            .select_reusable_optional_context_target(browser_context_id)?
+            .select_navigable_optional_context_target(browser_context_id)?
             .with_context(|| {
                 format!(
-                    "there is no reusable blank or yoetz-owned tab in {} to navigate to `{url}`",
+                    "there is no reusable blank or new-tab page in {} to navigate to `{url}`",
                     browser_context_label(browser_context_id)
                 )
             })?;
@@ -1350,6 +1399,21 @@ fn choose_chatgpt_probe_index(probes: &[ChatgptTabProbe]) -> usize {
     }
 
     0
+}
+
+fn duplicate_chatgpt_probe_target_ids_to_retire(
+    targets: &[TargetInfo],
+    preferred_run_id: &str,
+    keep_target_id: &str,
+) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|target| {
+            yoetz_run_id_from_url(&target.url).as_deref() == Some(preferred_run_id)
+                && target.target_id != keep_target_id
+        })
+        .map(|target| target.target_id.clone())
+        .collect()
 }
 
 pub(crate) fn infer_email_hints(title: &str, url: &str) -> Vec<String> {
@@ -2139,25 +2203,31 @@ fn is_yoetz_owned_url(url: &str) -> bool {
 
 fn context_tab_reuse_rank(url: &str) -> Option<u8> {
     let normalized = url.trim().to_ascii_lowercase();
-    // Only reuse a ChatGPT tab if it is yoetz-owned (stamped with the
-    // `?_yoetz=<run-id>` or `&_yoetz=<run-id>` marker we apply to every
-    // fresh tab). Non-yoetz ChatGPT tabs are almost certainly an active
-    // user conversation and must not be hijacked by the reuse fallback
-    // (review finding #8 — fresh-tab contract).
-    if is_chatgpt_url(&normalized) {
-        if is_yoetz_owned_url(&normalized) {
-            Some(0)
-        } else {
-            None
-        }
-    } else if normalized.is_empty() || normalized == "about:blank" {
-        Some(1)
+    if normalized.is_empty() || normalized == "about:blank" {
+        Some(0)
     } else if normalized.starts_with("chrome://newtab")
         || normalized.starts_with("chrome://new-tab-page")
     {
-        Some(2)
+        Some(1)
+    } else if is_chatgpt_url(&normalized) {
+        // Yoetz-owned ChatGPT tabs are safe for `window.open(...)` anchors,
+        // but they are deliberately ranked behind disposable blank/new-tab
+        // pages so recovery preserves per-run tab isolation when possible.
+        if is_yoetz_owned_url(&normalized) {
+            Some(2)
+        } else {
+            None
+        }
     } else {
         None
+    }
+}
+
+fn context_tab_navigation_reuse_rank(url: &str) -> Option<u8> {
+    if is_chatgpt_url(url) {
+        None
+    } else {
+        context_tab_reuse_rank(url)
     }
 }
 
@@ -2935,27 +3005,89 @@ mod tests {
     }
 
     #[test]
-    fn context_tab_reuse_rank_prefers_yoetz_owned_then_blank_tabs() {
-        // yoetz-owned ChatGPT tabs (`?_yoetz=` marker) are the only ChatGPT
-        // tabs we may reuse — any other ChatGPT tab may be a live user
-        // conversation and must be left alone (review finding #8).
+    fn context_tab_reuse_rank_prefers_disposable_tabs_before_yoetz_owned_chatgpt() {
+        // Default recovery should prefer disposable pages before touching an
+        // existing yoetz-owned ChatGPT tab from another run. Non-yoetz ChatGPT
+        // tabs remain completely ineligible.
         assert_eq!(
             context_tab_reuse_rank("https://chatgpt.com/?_yoetz=20260418T073330Z_abc"),
-            Some(0)
+            Some(2)
         );
         assert_eq!(
             context_tab_reuse_rank("https://chatgpt.com/c/xyz?foo=bar&_yoetz=run-abc"),
-            Some(0)
+            Some(2)
         );
         assert_eq!(context_tab_reuse_rank("https://chatgpt.com/c/abc"), None);
         assert_eq!(context_tab_reuse_rank("https://chatgpt.com/"), None);
-        assert_eq!(context_tab_reuse_rank("about:blank"), Some(1));
-        assert_eq!(context_tab_reuse_rank("chrome://newtab/"), Some(2));
+        assert_eq!(context_tab_reuse_rank("about:blank"), Some(0));
+        assert_eq!(context_tab_reuse_rank("chrome://newtab/"), Some(1));
         assert_eq!(context_tab_reuse_rank("https://calendar.google.com"), None);
     }
 
     #[test]
-    fn recovery_opens_fresh_tab_via_existing_chatgpt_anchor_when_create_target_blocked() {
+    fn context_tab_navigation_reuse_rank_rejects_chatgpt_tabs() {
+        assert_eq!(
+            context_tab_navigation_reuse_rank("https://chatgpt.com/?_yoetz=run-abc"),
+            None
+        );
+        assert_eq!(context_tab_navigation_reuse_rank("about:blank"), Some(0));
+        assert_eq!(
+            context_tab_navigation_reuse_rank("chrome://newtab/"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn duplicate_chatgpt_probe_target_ids_to_retire_keeps_only_selected_run_tab() {
+        let targets = vec![
+            TargetInfo {
+                target_id: "target-1".to_string(),
+                Type: "page".to_string(),
+                title: "ChatGPT".to_string(),
+                url: "https://chatgpt.com/?_yoetz=run-abc".to_string(),
+                attached: false,
+                opener_id: None,
+                can_access_opener: false,
+                opener_frame_id: None,
+                parent_frame_id: None,
+                browser_context_id: Some("ctx-personal".to_string()),
+                subtype: None,
+            },
+            TargetInfo {
+                target_id: "target-2".to_string(),
+                Type: "page".to_string(),
+                title: "ChatGPT".to_string(),
+                url: "https://chatgpt.com/c/xyz?_yoetz=run-abc".to_string(),
+                attached: false,
+                opener_id: None,
+                can_access_opener: false,
+                opener_frame_id: None,
+                parent_frame_id: None,
+                browser_context_id: Some("ctx-personal".to_string()),
+                subtype: None,
+            },
+            TargetInfo {
+                target_id: "target-3".to_string(),
+                Type: "page".to_string(),
+                title: "ChatGPT".to_string(),
+                url: "https://chatgpt.com/?_yoetz=run-other".to_string(),
+                attached: false,
+                opener_id: None,
+                can_access_opener: false,
+                opener_frame_id: None,
+                parent_frame_id: None,
+                browser_context_id: Some("ctx-personal".to_string()),
+                subtype: None,
+            },
+        ];
+        assert_eq!(
+            duplicate_chatgpt_probe_target_ids_to_retire(&targets, "run-abc", "target-2"),
+            vec!["target-1".to_string()]
+        );
+    }
+
+    #[test]
+    fn recovery_prefers_safe_anchor_before_existing_chatgpt_tab() {
         assert_eq!(
             choose_chatgpt_recovery_strategy(
                 true,
@@ -2964,7 +3096,7 @@ mod tests {
                 "https://chatgpt.com/?_yoetz=test"
             )
             .unwrap(),
-            ChatgptRecoveryStrategy::ExistingChatgptAnchor
+            ChatgptRecoveryStrategy::ExistingSafeAnchor
         );
     }
 
@@ -2998,6 +3130,34 @@ mod tests {
             }
         }
         assert_eq!(strategy, ChatgptRecoveryStrategy::ReuseExistingChatgptTab);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn recovery_uses_existing_chatgpt_anchor_only_with_user_tab_opt_in() {
+        let previous = std::env::var(YOETZ_ALLOW_USER_TAB_ANCHOR_ENV).ok();
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(YOETZ_ALLOW_USER_TAB_ANCHOR_ENV, "1");
+        }
+        let strategy =
+            choose_chatgpt_recovery_strategy(true, None, None, "https://chatgpt.com/?_yoetz=test")
+                .unwrap();
+        match previous {
+            Some(value) => {
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::env::set_var(YOETZ_ALLOW_USER_TAB_ANCHOR_ENV, value);
+                }
+            }
+            None => {
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::env::remove_var(YOETZ_ALLOW_USER_TAB_ANCHOR_ENV);
+                }
+            }
+        }
+        assert_eq!(strategy, ChatgptRecoveryStrategy::ExistingChatgptAnchor);
     }
 
     #[test]

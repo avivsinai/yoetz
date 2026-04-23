@@ -856,6 +856,7 @@ fn build_chatgpt_prepare_script(page_name: &str, model: &str, run_id: &str) -> S
         r##"
 const PAGE_NAME = {page_name_json};
 const MODEL = {model_json};
+const AUTO_MODEL = !String(MODEL || "").trim() || String(MODEL || "").trim().toLowerCase() === "auto";
 const MARKED_URL = {marked_url_json};
 const WINDOW_NAME = {window_name_json};
 const MODEL_SELECTION_FUNCTION_SOURCE = {model_selection_function_json};
@@ -924,7 +925,8 @@ if (loggedIn && composerReady) {{
     return fn();
   }}, MODEL_SELECTION_FUNCTION_SOURCE);
   const selectionStatus = selection?.status || "unknown";
-  if (!["selected", "already-selected"].includes(selectionStatus)) {{
+  const keepCurrentModel = AUTO_MODEL && ["missing-selector", "not-found"].includes(selectionStatus);
+  if (!["selected", "already-selected"].includes(selectionStatus) && !keepCurrentModel) {{
     const diagnostics = JSON.stringify({{
       status: selectionStatus,
       requested: selection?.requested || MODEL || "",
@@ -944,7 +946,12 @@ if (loggedIn && composerReady) {{
     }}
     throw new Error("unexpected model selection status '" + selectionStatus + "' (" + diagnostics + ")");
   }}
-  selectedModel = selection?.targetTestId || selection?.modelUsed || selection?.selectedLabel || null;
+  selectedModel =
+    selection?.targetTestId ||
+    selection?.modelUsed ||
+    selection?.selectedLabel ||
+    selection?.currentLabel ||
+    null;
   await page.waitForTimeout(500);
 }}
 console.log(JSON.stringify({{
@@ -1703,6 +1710,9 @@ mod tests {
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
         assert!(script.contains("const MODEL = \"gpt-5-4-pro\";"));
+        assert!(script.contains(
+            "const AUTO_MODEL = !String(MODEL || \"\").trim() || String(MODEL || \"\").trim().toLowerCase() === \"auto\";"
+        ));
         assert!(script.contains("const MARKED_URL = \"https://chatgpt.com/?_yoetz=run-123\";"));
         assert!(script.contains("const WINDOW_NAME = \"yoetz:run-123\";"));
         assert!(
@@ -1725,8 +1735,10 @@ mod tests {
         ));
         assert!(script.contains("let selectedModel = null;"));
         assert!(script.contains(
-            "selectedModel = selection?.targetTestId || selection?.modelUsed || selection?.selectedLabel || null;"
+            "const keepCurrentModel = AUTO_MODEL && [\"missing-selector\", \"not-found\"].includes(selectionStatus);"
         ));
+        assert!(script.contains("selectedModel ="));
+        assert!(script.contains("selection?.currentLabel ||"));
         assert!(script.contains("modelUsed: selectedModel,"));
         assert!(script.contains("bodyText"));
         assert!(script.contains(

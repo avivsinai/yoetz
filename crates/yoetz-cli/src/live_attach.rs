@@ -169,7 +169,6 @@ enum DaemonResponse {
 struct DaemonSession {
     target: LiveAttachTarget,
     client: CdpMcpClient,
-    selector_cache: BTreeMap<String, Option<String>>,
 }
 
 struct LiveAttachDaemon {
@@ -377,11 +376,7 @@ impl LiveAttachDaemon {
         target.browser_id = browser_id_from_ws_endpoint(&actual_endpoint).or(target.browser_id);
         target.endpoint = Some(actual_endpoint);
 
-        Ok(DaemonSession {
-            target,
-            client,
-            selector_cache: BTreeMap::new(),
-        })
+        Ok(DaemonSession { target, client })
     }
 
     async fn reconnect_session_in_place(&mut self, session: &mut DaemonSession) -> Result<()> {
@@ -395,8 +390,9 @@ impl LiveAttachDaemon {
         explicit_context_id: Option<&str>,
         profile_email: Option<&str>,
     ) -> Result<(Option<String>, String)> {
-        let browser_context_id =
-            resolve_cached_browser_context_id(session, explicit_context_id, profile_email)?;
+        let browser_context_id = session
+            .client
+            .resolve_browser_context_id(explicit_context_id, profile_email)?;
         let control_run_id =
             self.control_run_id_for(&session.target.key, browser_context_id.as_deref());
         chatgpt::ensure_chatgpt_control_tab_ready(
@@ -632,24 +628,6 @@ fn daemon_rpc_timeout_error(addr: &str, timeout: Duration) -> anyhow::Error {
         "yoetz live-attach daemon at {addr} timed out after {}ms waiting for a response",
         timeout.as_millis()
     )
-}
-
-fn resolve_cached_browser_context_id(
-    session: &mut DaemonSession,
-    explicit_context_id: Option<&str>,
-    profile_email: Option<&str>,
-) -> Result<Option<String>> {
-    let selector_key = selector_cache_key(explicit_context_id, profile_email);
-    if let Some(cached) = session.selector_cache.get(&selector_key) {
-        return Ok(cached.clone());
-    }
-    let resolved = session
-        .client
-        .resolve_browser_context_id(explicit_context_id, profile_email)?;
-    session
-        .selector_cache
-        .insert(selector_key, resolved.clone());
-    Ok(resolved)
 }
 
 fn resolve_connect_endpoint(target: &LiveAttachTarget) -> Option<String> {
@@ -1181,14 +1159,6 @@ fn remove_if_exists(path: &Path) -> Result<()> {
     }
 }
 
-fn selector_cache_key(explicit_context_id: Option<&str>, profile_email: Option<&str>) -> String {
-    format!(
-        "ctx={}|email={}",
-        explicit_context_id.unwrap_or_default(),
-        profile_email.unwrap_or_default()
-    )
-}
-
 fn context_storage_key(browser_context_id: Option<&str>) -> String {
     browser_context_id
         .unwrap_or(DEFAULT_CONTEXT_KEY)
@@ -1300,15 +1270,6 @@ mod tests {
         assert!(target.implicit_default);
         assert_eq!(target.source_path, None);
         assert_eq!(target.browser_id, None);
-    }
-
-    #[test]
-    fn selector_cache_key_distinguishes_context_and_email() {
-        assert_eq!(
-            selector_cache_key(Some("ctx-1"), Some("user@example.com")),
-            "ctx=ctx-1|email=user@example.com"
-        );
-        assert_eq!(selector_cache_key(None, None), "ctx=|email=");
     }
 
     #[test]
