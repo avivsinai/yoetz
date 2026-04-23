@@ -21,7 +21,7 @@ workspace = true
 
 [dependencies]
 yoetz-core = { path = "../yoetz-core" }
-litellm-rust = { git = "https://github.com/avivsinai/litellm-rust", rev = "a147cfefdda4e3740b632c79dc71723468bdb3b1" }
+litellm-rust = { git = "https://github.com/avivsinai/litellm-rust", tag = "v0.1.2" }
 
 anyhow.workspace = true
 dotenvy.workspace = true

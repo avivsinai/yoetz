@@ -1264,7 +1264,7 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 [[package]]
 name = "litellm-rust"
 version = "0.1.2"
-source = "git+https://github.com/avivsinai/litellm-rust?rev=a147cfefdda4e3740b632c79dc71723468bdb3b1#a147cfefdda4e3740b632c79dc71723468bdb3b1"
+source = "git+https://github.com/avivsinai/litellm-rust?tag=v0.1.2#acf0514edf6b0fe1905970356091b8f63c3f40a9"
 dependencies = [
  "anyhow",
  "async-stream",
