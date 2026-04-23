@@ -979,20 +979,6 @@ fn recipe_transport_error_detail(err: &anyhow::Error) -> String {
     format!("{err:#}")
 }
 
-fn print_recipe_chrome_approval_message(transport: browser::RecipeTransport) {
-    eprintln!(
-        "info: connecting to Chrome via {} — if prompted, click Allow in Chrome's remote debugging dialog",
-        recipe_transport_name(transport)
-    );
-}
-
-fn print_recipe_chrome_approval_lock_wait_message(transport: browser::RecipeTransport) {
-    eprintln!(
-        "info: another yoetz process is already requesting Chrome approval; waiting for it to finish before trying the {} transport",
-        recipe_transport_name(transport)
-    );
-}
-
 fn recipe_has_remaining_manual_fallback(
     transports: &[browser::RecipeTransport],
     current_index: usize,
@@ -1148,10 +1134,8 @@ fn constrain_chatgpt_transports_for_browser_context_selector(
 }
 
 fn live_attach_owner_present(summary: &live_attach::DaemonSummary) -> bool {
-    matches!(
-        summary.health,
-        live_attach::DaemonHealth::Healthy | live_attach::DaemonHealth::Busy
-    )
+    matches!(summary.health, live_attach::DaemonHealth::Busy)
+        || matches!(summary.health, live_attach::DaemonHealth::Healthy) && summary.session_count > 0
 }
 
 fn should_prefer_running_profile_auto_connect(
@@ -1192,8 +1176,16 @@ fn prioritize_chatgpt_transports_for_running_profile_auto_connect(
         return transports;
     }
 
+    let has_dev_browser = transports.contains(&browser::RecipeTransport::DevBrowser);
     let has_agent_browser = transports.contains(&browser::RecipeTransport::AgentBrowser);
     let has_manual = transports.contains(&browser::RecipeTransport::Manual);
+    if has_dev_browser {
+        let mut constrained = vec![browser::RecipeTransport::DevBrowser];
+        if has_manual {
+            constrained.push(browser::RecipeTransport::Manual);
+        }
+        return constrained;
+    }
     if has_agent_browser {
         let mut constrained = vec![browser::RecipeTransport::AgentBrowser];
         if has_manual {
@@ -1224,7 +1216,9 @@ fn browser_check_transports(
     }
 
     if prefer_auto_connect {
-        let _ = dev_browser_available;
+        if dev_browser_available {
+            return vec![BrowserCheckTransport::DevBrowser];
+        }
         return vec![BrowserCheckTransport::AgentBrowser];
     }
 
@@ -1704,72 +1698,16 @@ fn run_recipe_via_agent_browser(
             recipe_args.browser_id.as_deref(),
         ) {
             None
+        } else if let Some(target) = selected_cdp_target.as_ref().cloned() {
+            Some(browser::BrowserConnection::Cdp {
+                endpoint: target.endpoint,
+            })
+        } else if prefer_auto_connect {
+            // Avoid a separate auto-connect probe here. The recipe run should
+            // establish the single running-profile live session we keep.
+            Some(browser::BrowserConnection::AutoConnect)
         } else {
-            let mut selected_live_connection = None;
-            if let Some(target) = selected_cdp_target.as_ref().cloned() {
-                let endpoint = target.endpoint.clone();
-                let approval_lock = browser::acquire_chrome_approval_lock()?;
-                if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
-                    if approval_lock.waited() {
-                        print_recipe_chrome_approval_lock_wait_message(
-                            browser::RecipeTransport::AgentBrowser,
-                        );
-                    }
-                    print_recipe_chrome_approval_message(browser::RecipeTransport::AgentBrowser);
-                }
-                match browser::try_cdp_attach_lite(&endpoint) {
-                    Ok(()) => {
-                        selected_live_connection =
-                            Some(browser::BrowserConnection::Cdp { endpoint });
-                    }
-                    Err(e) => {
-                        if browser::is_chrome_approval_wait_error(&e) {
-                            return Err(anyhow!(
-                                "Chrome may be showing an \"Allow remote debugging?\" dialog. Click Allow, then retry."
-                            ));
-                        } else if target.is_authoritative() {
-                            return Err(resolved_cdp_attach_failure(e, &target));
-                        }
-                        maybe_demote_auto_selected_cdp_target(selected_cdp_target, format, &e);
-                    }
-                }
-            }
-
-            if let Some(connection) = selected_live_connection {
-                Some(connection)
-            } else {
-                let approval_lock = browser::acquire_chrome_approval_lock()?;
-                let should_warn_about_approval = !browser::is_daemon_healthy();
-                if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
-                    if approval_lock.waited() {
-                        print_recipe_chrome_approval_lock_wait_message(
-                            browser::RecipeTransport::AgentBrowser,
-                        );
-                    }
-                    if should_warn_about_approval {
-                        print_recipe_chrome_approval_message(
-                            browser::RecipeTransport::AgentBrowser,
-                        );
-                    }
-                }
-                match browser::try_auto_connect_lite() {
-                    Ok(()) => Some(browser::BrowserConnection::AutoConnect),
-                    Err(err) => {
-                        if browser::is_chrome_approval_wait_error(&err) {
-                            return Err(err);
-                        } else if let Some(recovery) = default_daemon_recovery_error(Some(&err)) {
-                            return Err(recovery);
-                        } else if prefer_auto_connect {
-                            return Err(anyhow!(
-                                "running-profile auto-connect was unavailable ({err}). yoetz will not fall back to a managed profile for this run."
-                            ));
-                        } else {
-                            eprintln!("info: auto-connect unavailable, falling back to profile");
-                            None
-                        }
-                    }
-                }
-            }
+            None
         }
     } else {
         None
@@ -2499,6 +2437,13 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 .map(|target| target.endpoint.clone());
             let show_approval_guidance =
                 matches!(format, OutputFormat::Text | OutputFormat::Markdown);
+            let live_attach_owner_is_present =
+                live_attach_owner_present(&live_attach::inspect_daemon_sync());
+            let prefer_auto_connect = should_prefer_running_profile_auto_connect(
+                resolved_cdp_target.as_ref(),
+                live_attach_owner_is_present,
+            );
+            maybe_print_running_profile_auto_connect_preference(prefer_auto_connect, format);
             if resolved_cdp_target.is_some() {
                 match live_attach::ensure_chatgpt_session(
                     resolved_cdp_target.as_ref(),
@@ -2581,7 +2526,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 }
             }
 
-            if resolved_cdp_target.is_none() {
+            if resolved_cdp_target.is_none() && !prefer_auto_connect {
                 match live_attach::ensure_chatgpt_session(None, None, None, show_approval_guidance)
                     .await
                 {
@@ -3609,8 +3554,8 @@ mod tests {
     }
 
     #[test]
-    fn live_attach_owner_present_requires_healthy_or_busy_daemon() {
-        assert!(live_attach_owner_present(&live_attach::DaemonSummary {
+    fn live_attach_owner_present_requires_attached_session_or_busy_daemon() {
+        assert!(!live_attach_owner_present(&live_attach::DaemonSummary {
             health: live_attach::DaemonHealth::Healthy,
             pid: Some(1),
             session_count: 0,
@@ -3633,7 +3578,8 @@ mod tests {
     }
 
     #[test]
-    fn prioritize_chatgpt_transports_for_running_profile_constrains_to_agent_browser_and_manual() {
+    fn prioritize_chatgpt_transports_for_running_profile_prefers_dev_browser_and_drops_other_live_owners(
+    ) {
         let transports = prioritize_chatgpt_transports_for_running_profile_auto_connect(
             vec![
                 browser::RecipeTransport::ChromeDevtoolsMcp,
@@ -3646,7 +3592,27 @@ mod tests {
         assert_eq!(
             transports,
             vec![
-                browser::RecipeTransport::AgentBrowser,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::Manual
+            ]
+        );
+    }
+
+    #[test]
+    fn prioritize_chatgpt_transports_for_running_profile_falls_back_to_dev_browser_when_agent_browser_is_unavailable(
+    ) {
+        let transports = prioritize_chatgpt_transports_for_running_profile_auto_connect(
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::Manual,
+            ],
+            true,
+        );
+        assert_eq!(
+            transports,
+            vec![
+                browser::RecipeTransport::DevBrowser,
                 browser::RecipeTransport::Manual
             ]
         );
@@ -3705,6 +3671,10 @@ mod tests {
         );
         assert_eq!(
             browser_check_transports(true, false, true),
+            vec![BrowserCheckTransport::DevBrowser]
+        );
+        assert_eq!(
+            browser_check_transports(false, false, true),
             vec![BrowserCheckTransport::AgentBrowser]
         );
     }
