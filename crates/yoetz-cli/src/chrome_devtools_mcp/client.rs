@@ -92,6 +92,7 @@ const EMAIL_INFERENCE_TRUSTED_ORIGINS: &[&str] = &[
 pub struct CdpMcpClient {
     browser: Browser,
     selected_tab: Mutex<Option<Arc<Tab>>>,
+    ws_endpoint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -326,7 +327,12 @@ impl CdpMcpClient {
         Ok(Self {
             browser,
             selected_tab: Mutex::new(None),
+            ws_endpoint,
         })
+    }
+
+    pub fn ws_endpoint(&self) -> &str {
+        &self.ws_endpoint
     }
 
     pub async fn new_page(
@@ -523,19 +529,28 @@ impl CdpMcpClient {
     pub async fn select_chatgpt_page_for_probe(
         &self,
         timeout_ms: u64,
+        browser_context_id: Option<&str>,
+        preferred_run_id: Option<&str>,
     ) -> Result<Option<ReusedPageResult>> {
-        let candidates = if mutate_existing_chatgpt_tab_allowed() {
+        let candidates = if let Some(preferred_run_id) = preferred_run_id {
+            self.chatgpt_page_targets(browser_context_id)?
+                .into_iter()
+                .filter(|target| {
+                    yoetz_run_id_from_url(&target.url).as_deref() == Some(preferred_run_id)
+                })
+                .collect::<Vec<_>>()
+        } else if mutate_existing_chatgpt_tab_allowed() {
             // Explicit operator opt-in: auth probing may attach to an existing
             // user-owned ChatGPT tab instead of requiring a yoetz-owned probe
             // tab. This avoids fighting Chrome's new-target restrictions on
             // logged-in default profiles.
-            self.chatgpt_page_targets(None)?
+            self.chatgpt_page_targets(browser_context_id)?
         } else {
             // Default: only reuse a ChatGPT tab that yoetz itself stamped with
             // `?_yoetz=<run-id>`. Touching a user-owned ChatGPT conversation —
             // even just for a read-only probe — violates the fresh-tab contract
             // and can surface yoetz's automation on an in-flight chat.
-            self.chatgpt_page_targets(None)?
+            self.chatgpt_page_targets(browser_context_id)?
                 .into_iter()
                 .filter(|target| is_yoetz_owned_url(&target.url))
                 .collect::<Vec<_>>()
@@ -1126,7 +1141,7 @@ fn choose_chatgpt_recovery_strategy(
     );
 }
 
-fn is_closed_cdp_transport_error(err: &anyhow::Error) -> bool {
+pub fn is_closed_cdp_transport_error(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}").to_ascii_lowercase();
     message.contains("underlying connection is closed")
         || message.contains("connectionclosed")
@@ -2105,14 +2120,21 @@ fn is_chatgpt_url(url: &str) -> bool {
     )
 }
 
+fn yoetz_run_id_from_url(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    parsed
+        .query_pairs()
+        .find(|(key, _)| key.eq_ignore_ascii_case("_yoetz"))
+        .map(|(_, value)| value.into_owned())
+}
+
 /// A yoetz-owned tab is one whose URL carries the `?_yoetz=<run-id>` or
 /// `&_yoetz=<run-id>` marker yoetz stamps on every fresh tab it creates.
 /// yoetz MUST NOT `evaluate`, `navigate`, or otherwise mutate any tab that
 /// does not pass this check — doing so risks leaking automation into a user
 /// conversation (see review finding #8 and the Meet-tab near-miss).
 fn is_yoetz_owned_url(url: &str) -> bool {
-    let normalized = url.trim().to_ascii_lowercase();
-    normalized.contains("?_yoetz=") || normalized.contains("&_yoetz=")
+    yoetz_run_id_from_url(url).is_some()
 }
 
 fn context_tab_reuse_rank(url: &str) -> Option<u8> {
@@ -2894,6 +2916,22 @@ mod tests {
         assert!(!is_yoetz_owned_url("https://notes.example/_yoetz"));
         assert!(!is_yoetz_owned_url("about:blank"));
         assert!(!is_yoetz_owned_url(""));
+    }
+
+    #[test]
+    fn yoetz_run_id_from_url_extracts_exact_marker_value() {
+        assert_eq!(
+            yoetz_run_id_from_url("https://chatgpt.com/?_yoetz=run-123").as_deref(),
+            Some("run-123")
+        );
+        assert_eq!(
+            yoetz_run_id_from_url("https://chatgpt.com/c/abc?foo=bar&_yoetz=run-456").as_deref(),
+            Some("run-456")
+        );
+        assert_eq!(
+            yoetz_run_id_from_url("https://chatgpt.com/c/abc?foo=_yoetz=run-789").as_deref(),
+            None
+        );
     }
 
     #[test]

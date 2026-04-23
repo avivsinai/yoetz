@@ -175,8 +175,22 @@ impl ResolvedCdpTarget {
         matches!(self.source, ResolvedCdpTargetSource::Flag)
     }
 
+    pub fn live_attach_target_key(&self) -> String {
+        if let Some(source_path) = &self.source_path {
+            return format!("source-path:{}", source_path.display());
+        }
+        if let Some(browser_id) = browser_id_from_ws_endpoint(&self.endpoint) {
+            return format!("browser-id:{browser_id}");
+        }
+        format!("endpoint:{}", self.endpoint)
+    }
+
     pub fn selected_running_target(&self) -> Option<&RunningChromeTarget> {
         self.selected_target.as_ref()
+    }
+
+    pub fn source_path(&self) -> Option<&Path> {
+        self.source_path.as_deref()
     }
 }
 
@@ -940,6 +954,7 @@ struct BrowserHelperProcessSummary {
 struct BrowserDoctorHelpers {
     agent_browser_default: DaemonState,
     agent_browser_default_pid: Option<u32>,
+    live_attach_daemon: crate::live_attach::DaemonSummary,
     dev_browser_processes: Vec<BrowserHelperProcessSummary>,
     external_mcp_processes: Vec<BrowserHelperProcessSummary>,
     recommended_actions: Vec<String>,
@@ -2044,6 +2059,15 @@ fn render_daemon_state(state: DaemonState) -> &'static str {
     }
 }
 
+fn render_live_attach_daemon_health(health: crate::live_attach::DaemonHealth) -> &'static str {
+    match health {
+        crate::live_attach::DaemonHealth::NotRunning => "not running",
+        crate::live_attach::DaemonHealth::Healthy => "healthy",
+        crate::live_attach::DaemonHealth::Busy => "busy",
+        crate::live_attach::DaemonHealth::Stale => "stale",
+    }
+}
+
 fn inspect_browser_helpers() -> BrowserDoctorHelpers {
     let helper_processes = discover_browser_helper_processes();
     let dev_browser_processes = helper_processes
@@ -2064,12 +2088,15 @@ fn inspect_browser_helpers() -> BrowserDoctorHelpers {
         .collect::<Vec<_>>();
     let agent_browser_default = inspect_default_daemon();
     let agent_browser_default_pid = default_daemon_pid();
+    let live_attach_daemon = crate::live_attach::inspect_daemon_sync();
 
     BrowserDoctorHelpers {
         agent_browser_default,
         agent_browser_default_pid,
+        live_attach_daemon: live_attach_daemon.clone(),
         recommended_actions: browser_doctor_recommended_actions(
             agent_browser_default,
+            &live_attach_daemon,
             &dev_browser_processes,
             &external_mcp_processes,
         ),
@@ -2080,11 +2107,20 @@ fn inspect_browser_helpers() -> BrowserDoctorHelpers {
 
 fn browser_doctor_recommended_actions(
     agent_browser_default: DaemonState,
+    live_attach_daemon: &crate::live_attach::DaemonSummary,
     dev_browser_processes: &[BrowserHelperProcessSummary],
     external_mcp_processes: &[BrowserHelperProcessSummary],
 ) -> Vec<String> {
     let mut actions = Vec::new();
 
+    if matches!(
+        live_attach_daemon.health,
+        crate::live_attach::DaemonHealth::Stale
+    ) {
+        actions.push(
+            "The yoetz live-attach daemon looks stale. Run `yoetz browser reset` before the next attach/check/recipe so the primary CDP owner restarts cleanly.".to_string(),
+        );
+    }
     if matches!(agent_browser_default, DaemonState::Stale) {
         actions.push(
             "Run `yoetz browser reset` before `yoetz browser attach`, `yoetz browser check`, or `yoetz browser recipe` to clear stale yoetz-owned helpers.".to_string(),
@@ -2955,6 +2991,31 @@ fn browser_doctor_report_with_discovery(
             .unwrap_or_default()
     ));
     lines.push("    note: only the default agent-browser session is inspected.".to_string());
+    lines.push(format!(
+        "  - yoetz live-attach daemon: {}{}",
+        render_live_attach_daemon_health(helpers.live_attach_daemon.health),
+        helpers
+            .live_attach_daemon
+            .pid
+            .map(|pid| format!(
+                " (pid {pid}, sessions {})",
+                helpers.live_attach_daemon.session_count
+            ))
+            .unwrap_or_default()
+    ));
+    lines.push(
+        "    note: this is the primary chrome-devtools-mcp owner for yoetz attach/check/chatgpt recipe flows."
+            .to_string(),
+    );
+    if matches!(
+        helpers.live_attach_daemon.health,
+        crate::live_attach::DaemonHealth::Busy
+    ) {
+        lines.push(
+            "    note: status ping timed out while the owner was busy; this is expected during long-running attach/check/recipe work."
+                .to_string(),
+        );
+    }
 
     if helpers.dev_browser_processes.is_empty() {
         lines.push("  - dev-browser daemon: not running".to_string());
@@ -4155,6 +4216,14 @@ mod tests {
         }
     }
 
+    fn no_live_attach_daemon() -> crate::live_attach::DaemonSummary {
+        crate::live_attach::DaemonSummary {
+            health: crate::live_attach::DaemonHealth::NotRunning,
+            pid: None,
+            session_count: 0,
+        }
+    }
+
     #[test]
     fn mark_probe_url_appends_param_without_existing_query() {
         let marked = mark_probe_url("https://chatgpt.com/", "run-abc");
@@ -4725,6 +4794,7 @@ browser_cdp = "http://evil.example.com:9222"
             &BrowserDoctorHelpers {
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
+                live_attach_daemon: no_live_attach_daemon(),
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -4758,6 +4828,7 @@ browser_cdp = "http://evil.example.com:9222"
             &BrowserDoctorHelpers {
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
+                live_attach_daemon: no_live_attach_daemon(),
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -4791,6 +4862,7 @@ browser_cdp = "http://evil.example.com:9222"
             &BrowserDoctorHelpers {
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
+                live_attach_daemon: no_live_attach_daemon(),
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -4817,6 +4889,7 @@ browser_cdp = "http://evil.example.com:9222"
             &BrowserDoctorHelpers {
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
+                live_attach_daemon: no_live_attach_daemon(),
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -4850,6 +4923,7 @@ browser_cdp = "http://evil.example.com:9222"
             &BrowserDoctorHelpers {
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
+                live_attach_daemon: no_live_attach_daemon(),
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -4884,6 +4958,7 @@ browser_cdp = "http://evil.example.com:9222"
             &BrowserDoctorHelpers {
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
+                live_attach_daemon: no_live_attach_daemon(),
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -4908,6 +4983,7 @@ browser_cdp = "http://evil.example.com:9222"
             &BrowserDoctorHelpers {
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
+                live_attach_daemon: no_live_attach_daemon(),
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -4928,6 +5004,11 @@ browser_cdp = "http://evil.example.com:9222"
             &BrowserDoctorHelpers {
                 agent_browser_default: DaemonState::Stale,
                 agent_browser_default_pid: Some(1234),
+                live_attach_daemon: crate::live_attach::DaemonSummary {
+                    health: crate::live_attach::DaemonHealth::Stale,
+                    pid: Some(4444),
+                    session_count: 0,
+                },
                 dev_browser_processes: vec![BrowserHelperProcessSummary {
                     pid: 2222,
                     kind: BrowserHelperProcessKind::DevBrowserDaemon,
@@ -4958,6 +5039,31 @@ browser_cdp = "http://evil.example.com:9222"
         assert!(report.contains("chrome-devtools-mcp watchdog (pid 3334)"));
         assert!(report.contains("Run `yoetz browser reset`"));
         assert!(report.contains("will not stop them"));
+    }
+
+    #[test]
+    fn browser_doctor_report_marks_busy_live_attach_daemon_without_reset_guidance() {
+        let report = browser_doctor_report_with_discovery(
+            &[],
+            &[],
+            &[],
+            &AutoConnectDoctorStatus::Unavailable("probe failed".to_string()),
+            &BrowserDoctorHelpers {
+                agent_browser_default: DaemonState::Healthy,
+                agent_browser_default_pid: Some(1234),
+                live_attach_daemon: crate::live_attach::DaemonSummary {
+                    health: crate::live_attach::DaemonHealth::Busy,
+                    pid: Some(4444),
+                    session_count: 0,
+                },
+                dev_browser_processes: vec![],
+                external_mcp_processes: vec![],
+                recommended_actions: vec!["None required.".to_string()],
+            },
+        );
+        assert!(report.contains("yoetz live-attach daemon: busy (pid 4444, sessions 0)"));
+        assert!(report.contains("status ping timed out while the owner was busy"));
+        assert!(!report.contains("looks stale"));
     }
 
     #[test]

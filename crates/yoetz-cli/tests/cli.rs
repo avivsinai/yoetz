@@ -287,11 +287,8 @@ fn browser_recipe_help_shows_cdp_flag() {
 
 #[test]
 fn browser_attach_explicit_cdp_failure_does_not_fallback() {
-    let (_dir, bin) = fake_agent_browser_failure_bin("connectOverCDP blew up");
-
     yoetz()
-        .args(["browser", "attach", "--cdp", "http://127.0.0.1:9222"])
-        .env("YOETZ_AGENT_BROWSER_BIN", &bin)
+        .args(["browser", "attach", "--cdp", "http://127.0.0.1:1"])
         .env("YOETZ_DEV_BROWSER_BIN", "/definitely/missing")
         .assert()
         .failure()
