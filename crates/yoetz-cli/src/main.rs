@@ -1271,6 +1271,36 @@ fn maybe_prefer_browser_check_live_attach_failure(
     err
 }
 
+fn browser_check_exhausted_error(
+    errors: &[(BrowserCheckTransport, String)],
+    prior_live_attach_failure: Option<&str>,
+) -> anyhow::Error {
+    let attempted = errors
+        .iter()
+        .map(|(transport, detail)| {
+            format!("{}: {detail}", browser_check_transport_name(*transport))
+        })
+        .collect::<Vec<_>>();
+    let attempted = if attempted.is_empty() {
+        "none".to_string()
+    } else {
+        attempted.join("\n- ")
+    };
+
+    if let Some(prior) = prior_live_attach_failure {
+        return anyhow!(
+            "browser check failed; no browser check transport succeeded.\n\n\
+             Live-attach error: {prior}\n\n\
+             Attempted transports:\n- {attempted}"
+        );
+    }
+
+    anyhow!(
+        "browser check failed; no browser check transport succeeded.\n\n\
+         Attempted transports:\n- {attempted}"
+    )
+}
+
 fn maybe_print_auto_selected_cdp_target(
     target: Option<&browser::ResolvedCdpTarget>,
     format: OutputFormat,
@@ -1972,6 +2002,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 prefer_auto_connect,
             );
             let mut prior_live_attach_failure: Option<String> = None;
+            let mut check_errors: Vec<(BrowserCheckTransport, String)> = Vec::new();
 
             for transport in transports {
                 match transport {
@@ -2043,6 +2074,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                     "info: {} auth check failed ({e}), trying next transport",
                                     browser_check_transport_name(transport)
                                 );
+                                check_errors.push((transport, format!("{e:#}")));
                             }
                         }
                     }
@@ -2108,6 +2140,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                     "info: {} auth check failed ({e}), trying next transport",
                                     browser_check_transport_name(transport)
                                 );
+                                check_errors.push((transport, format!("{e:#}")));
                             }
                         }
                     }
@@ -2182,7 +2215,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 }
             }
 
-            unreachable!("browser check transport list must include a fallback transport")
+            Err(browser_check_exhausted_error(
+                &check_errors,
+                prior_live_attach_failure.as_deref(),
+            ))
         }
         BrowserCommand::Doctor(args) => {
             let report = browser::browser_doctor_report(args.live);
@@ -3718,6 +3754,24 @@ mod tests {
             err.to_string(),
             "chatgpt login required. Run `yoetz browser login` and try again."
         );
+    }
+
+    #[test]
+    fn browser_check_exhaustion_reports_dev_browser_failure() {
+        let errors = vec![(
+            BrowserCheckTransport::DevBrowser,
+            "dev-browser connection check failed: Target.setAutoAttach connection closed"
+                .to_string(),
+        )];
+        let err = browser_check_exhausted_error(
+            &errors,
+            Some("dev-browser could not connect to Chrome before managed fallback"),
+        );
+        let message = format!("{err:#}");
+        assert!(message.contains("browser check failed"));
+        assert!(message.contains("dev-browser"));
+        assert!(message.contains("Target.setAutoAttach connection closed"));
+        assert!(message.contains("dev-browser could not connect to Chrome"));
     }
 
     #[test]
