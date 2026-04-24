@@ -2077,9 +2077,8 @@ pub fn acquire_chrome_approval_lock() -> Result<ChromeApprovalLock> {
 }
 
 pub fn is_chrome_approval_wait_error(err: &anyhow::Error) -> bool {
-    format!("{err:#}")
-        .to_lowercase()
-        .contains("allow remote debugging")
+    let message = format!("{err:#}").to_lowercase();
+    message.contains("allow remote debugging") || message.contains("remote-debugging consent")
 }
 
 /// Detect the actionable "Chrome CDP unreachable" error produced by
@@ -4010,7 +4009,8 @@ fn looks_like_timeout(err: &anyhow::Error) -> bool {
 }
 
 fn allow_dialog_error(err: &anyhow::Error) -> bool {
-    err.to_string().contains("Allow remote debugging")
+    let message = err.to_string();
+    message.contains("Allow remote debugging") || message.contains("remote-debugging consent")
 }
 
 fn live_attach_approval_wait_error(timeout_ms: u64) -> anyhow::Error {
@@ -5964,6 +5964,16 @@ browser_cdp = "http://evil.example.com:9222"
     fn is_chrome_approval_wait_error_rejects_non_approval_timeouts() {
         let err = anyhow!("ChatGPT response timed out after 900000ms");
         assert!(!is_chrome_approval_wait_error(&err));
+    }
+
+    #[test]
+    fn is_chrome_approval_wait_error_matches_live_cdp_consent_phrase() {
+        let err = anyhow!(
+            "Timed out after 5000ms initializing live CDP browser during Target.getTargets. \
+             Chrome may be waiting for remote-debugging consent or a target may be unresponsive."
+        );
+        assert!(is_chrome_approval_wait_error(&err));
+        assert!(allow_dialog_error(&err));
     }
 
     #[test]

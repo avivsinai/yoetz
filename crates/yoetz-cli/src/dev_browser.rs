@@ -707,7 +707,11 @@ pub(crate) fn is_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
         || message.contains("auto connect")
         || message.contains("could not connect to chrome")
         || message.contains("browser.getversion")
-        || message.contains("target.setautoattach");
+        || message.contains("target.setautoattach")
+        || message.contains("target.gettargets")
+        || message.contains("initializing live cdp browser")
+        || message.contains("initializing live cdp targets")
+        || message.contains("remote-debugging consent");
     let has_connection_failure = message.contains("timed out")
         || message.contains("timeout")
         || message.contains("connectionclosed")
@@ -1621,6 +1625,26 @@ mod tests {
         let other = anyhow!("ChatGPT response timed out after 900000ms");
         assert!(!is_dev_browser_connect_failure(&other));
         assert!(!should_retry_dev_browser_connect_failure(&other));
+    }
+
+    #[test]
+    fn is_dev_browser_connect_failure_matches_live_cdp_daemon_timeouts() {
+        let get_targets = anyhow!(
+            "Timed out after 5000ms initializing live CDP browser during Target.getTargets. \
+             Chrome may be waiting for remote-debugging consent or a target may be unresponsive."
+        );
+        assert!(is_dev_browser_connect_failure(&get_targets));
+        assert!(should_retry_dev_browser_connect_failure(&get_targets));
+
+        let target_init = anyhow!(
+            "Timed out after 5000ms initializing live CDP targets during Page.enable"
+        );
+        assert!(is_dev_browser_connect_failure(&target_init));
+
+        let consent_wait = anyhow!(
+            "Target.getTargets timed out; Chrome may be waiting for remote-debugging consent"
+        );
+        assert!(is_dev_browser_connect_failure(&consent_wait));
     }
 
     #[test]
