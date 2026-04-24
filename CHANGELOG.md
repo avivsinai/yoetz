@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.56] - 2026-04-24
 ### Added
 
 - Yoetz-owned live-CDP Node daemon bundled into the yoetz binary as
@@ -53,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `remote-debugging consent` timeouts — retrying a human-consent wait
   was re-triggering the Chrome "Allow remote debugging?" popup while
   the original dialog was still open.
+
 
 ## [0.2.55] - 2026-04-24
 ### Fixed
