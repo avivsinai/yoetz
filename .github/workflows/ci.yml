@@ -109,6 +109,8 @@ jobs:
       - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
         with:
           node-version: 24
+      - name: Verify live-CDP daemon bundle
+        run: ./scripts/build-live-cdp-daemon.sh --check
       - run: npm ci --prefix scripts --omit=dev --ignore-scripts
       - name: Verify sweet-cookie exports
         working-directory: scripts

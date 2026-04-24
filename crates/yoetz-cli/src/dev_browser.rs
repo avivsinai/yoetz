@@ -112,12 +112,12 @@ fn configured_dev_browser_bin() -> Result<Option<String>> {
 }
 
 fn find_dev_browser() -> Result<Option<String>> {
-    if let Some(bin) = DEV_BROWSER.get() {
-        return Ok(Some(bin.clone()));
-    }
     if let Some(bin) = configured_dev_browser_bin()? {
         let _ = DEV_BROWSER.set(bin.clone());
         return Ok(Some(bin));
+    }
+    if let Some(bin) = DEV_BROWSER.get() {
+        return Ok(Some(bin.clone()));
     }
     if command_is_available("dev-browser") {
         let bin = "dev-browser".to_string();
@@ -215,11 +215,18 @@ pub fn is_available() -> bool {
     find_dev_browser().is_ok_and(|bin| bin.is_some())
 }
 
+/// Returns true when yoetz can execute dev-browser-style scripts through any
+/// supported backend, including the bundled live-CDP compatibility daemon.
+pub fn has_any_backend() -> bool {
+    is_available() || crate::live_cdp_daemon::is_available()
+}
+
 fn missing_dev_browser_error() -> anyhow::Error {
     anyhow!(DEV_BROWSER_INSTALL_GUIDANCE)
 }
 
 /// Ensure dev-browser is already available without downloading code at runtime.
+#[allow(dead_code)]
 pub fn ensure_installed() -> Result<()> {
     if find_dev_browser()?.is_some() {
         return Ok(());
@@ -230,27 +237,51 @@ pub fn ensure_installed() -> Result<()> {
 /// Stop the dev-browser daemon explicitly. Returns true when a running daemon
 /// was asked to stop, false when no daemon was running.
 pub fn stop_daemon() -> Result<bool> {
-    let bin = resolve_dev_browser()?;
-    let output = dev_browser_command(&bin)
-        .arg("stop")
-        .output()
-        .with_context(|| format!("failed to run dev-browser stop (via {bin})"))?;
+    let external_result = find_dev_browser();
+    let live_cdp_stopped = crate::live_cdp_daemon::stop_live_cdp_daemon()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            format!("exit code {:?}", output.status.code())
+    let external_bin = match external_result {
+        Ok(bin) => bin,
+        Err(error) if live_cdp_stopped => {
+            eprintln!("warning: could not resolve dev-browser while stopping daemons: {error}");
+            return Ok(true);
+        }
+        Err(error) => return Err(error),
+    };
+
+    let external_stopped = if let Some(bin) = external_bin {
+        let output = dev_browser_command(&bin).arg("stop").output();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) if live_cdp_stopped => {
+                eprintln!("warning: failed to run dev-browser stop (via {bin}): {error}");
+                return Ok(true);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to run dev-browser stop (via {bin})"));
+            }
         };
-        return Err(anyhow!("dev-browser stop failed: {detail}"));
-    }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(!stdout.to_lowercase().contains("not running"))
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("exit code {:?}", output.status.code())
+            };
+            return Err(anyhow!("dev-browser stop failed: {detail}"));
+        }
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        !stdout.to_lowercase().contains("not running")
+    } else {
+        false
+    };
+    Ok(external_stopped || live_cdp_stopped)
 }
 
 /// Run a dev-browser script against a live Chrome instance (auto-connect).
@@ -316,9 +347,18 @@ fn run_script_connect_with_browser_and_endpoint(
     browser_name: Option<&str>,
     cdp_endpoint: Option<&str>,
 ) -> Result<String> {
-    let bin = resolve_dev_browser()?;
     let timeout = timeout_secs.unwrap_or(DEFAULT_SCRIPT_TIMEOUT_SECS);
     let resolved_endpoint = resolve_dev_browser_connect_endpoint(cdp_endpoint)?;
+    if crate::live_cdp_daemon::is_available() {
+        return crate::live_cdp_daemon::run_script_connect(
+            script,
+            timeout,
+            browser_name,
+            resolved_endpoint.as_deref(),
+        );
+    }
+
+    let bin = resolve_dev_browser()?;
     let args = connect_args(timeout, browser_name, resolved_endpoint.as_deref());
 
     let mut child = dev_browser_command(&bin)
@@ -1548,6 +1588,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::ffi::{OsStr, OsString};
 
     #[test]
     fn test_dev_browser_tmp_dir() {
@@ -1775,6 +1816,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn live_cdp_disable_falls_through_to_external_dev_browser_resolution() {
+        let _live_disabled = EnvVarGuard::set(
+            crate::live_cdp_daemon::YOETZ_LIVE_CDP_DAEMON_ENV,
+            OsStr::new("0"),
+        );
+        let _external_missing = EnvVarGuard::set(
+            "YOETZ_DEV_BROWSER_BIN",
+            OsStr::new("/definitely/missing/dev-browser"),
+        );
+
+        let err = run_script_connect_with_endpoint("console.log('ok')", Some(1), None)
+            .expect_err("disabled bundled daemon should fall through to external dev-browser");
+        let message = format!("{err:#}");
+        assert!(message.contains("YOETZ_DEV_BROWSER_BIN points to"));
+        assert!(!message.contains("yoetz live-CDP daemon is disabled"));
     }
 
     #[test]
@@ -2081,5 +2141,34 @@ mod tests {
         assert!(detail.contains("Install it explicitly"));
         assert!(detail.contains("YOETZ_DEV_BROWSER_BIN"));
         assert!(!detail.contains("installing via npm"));
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &OsStr) -> Self {
+            let previous = env::var_os(key);
+            #[allow(unsafe_code)]
+            unsafe {
+                env::set_var(key, value);
+            }
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            #[allow(unsafe_code)]
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    env::set_var(self.key, previous);
+                } else {
+                    env::remove_var(self.key);
+                }
+            }
+        }
     }
 }
