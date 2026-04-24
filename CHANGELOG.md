@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Yoetz-owned live-CDP Node daemon bundled into the yoetz binary as
+  `~/.yoetz/live-cdp-daemon.mjs`, communicating with the Rust side via
+  JSONL over a Unix socket / named pipe. Used automatically for
+  dev-browser script execution against a live Chrome attach (Chrome 147
+  default profile + `chrome://inspect` remote debugging). Avoids the
+  Playwright `Target.setAutoAttach` hang that the upstream dev-browser
+  daemon still trips on Chrome 147. External dev-browser remains the
+  managed/profile path. New `YOETZ_LIVE_CDP_DAEMON=0` env var disables
+  the bundled daemon for forced fallback.
+- Embedded-bundle SHA256 version handshake between the Rust side and the
+  running daemon — on version mismatch `ensure_daemon` auto-stops and
+  respawns the daemon so upgraded yoetz binaries never drive a stale
+  daemon build. Spawn is serialized behind an advisory lockfile at
+  `~/.yoetz/live-cdp-daemon.lock`, so concurrent yoetz invocations do
+  not race to unlink each other's socket.
+- `yoetz browser doctor --live` now surfaces the yoetz live-CDP daemon
+  as its own entry alongside upstream dev-browser and agent-browser,
+  and `yoetz browser reset` cleans up both daemons.
+- `scripts/build-live-cdp-daemon.sh` plus pinned
+  `crates/yoetz-cli/assets/live-cdp-daemon-src/{package.json,package-lock.json,build.mjs}`
+  reproduce the committed daemon bundle from its TypeScript sources. CI
+  runs `./scripts/build-live-cdp-daemon.sh --check` so the committed
+  `.mjs` cannot drift from the sources.
+
+### Fixed
+
+- Widened the error classifiers used by the Chrome 147 transport
+  waterfall so the bundled live-CDP daemon's error strings land in the
+  right code paths. `is_dev_browser_connect_failure` now recognizes
+  `Target.getTargets`, `initializing live CDP browser`,
+  `initializing live CDP targets`, and `remote-debugging consent`
+  alongside the existing `connectOverCDP` / `Target.setAutoAttach` /
+  `auto-connect` tokens.
+- `is_chrome_approval_wait_error` and `allow_dialog_error` now also
+  match `remote-debugging consent` and `remote debugging consent` so
+  approval-pending errors from the bundled daemon still route to the
+  "click Allow" fallthrough instead of a generic transport failure.
+  `allow_dialog_error` now reads the full anyhow chain and matches
+  case-insensitively so approval errors nested under context wrappers
+  or emitted with mixed case are still detected.
+- `should_retry_dev_browser_connect_failure` no longer retries
+  `remote-debugging consent` timeouts — retrying a human-consent wait
+  was re-triggering the Chrome "Allow remote debugging?" popup while
+  the original dialog was still open.
+
 ## [0.2.55] - 2026-04-24
 ### Fixed
 
