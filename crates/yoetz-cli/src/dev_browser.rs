@@ -1636,9 +1636,8 @@ mod tests {
         assert!(is_dev_browser_connect_failure(&get_targets));
         assert!(should_retry_dev_browser_connect_failure(&get_targets));
 
-        let target_init = anyhow!(
-            "Timed out after 5000ms initializing live CDP targets during Page.enable"
-        );
+        let target_init =
+            anyhow!("Timed out after 5000ms initializing live CDP targets during Page.enable");
         assert!(is_dev_browser_connect_failure(&target_init));
 
         let consent_wait = anyhow!(
