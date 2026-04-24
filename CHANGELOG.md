@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Running-profile ChatGPT recipe and `yoetz browser check` no longer trigger
+  multiple Chrome "Allow remote debugging?" approval popups on Chrome 147
+  default profile. `chrome-devtools-mcp` is now preferred first when
+  `prefer_auto_connect=true` (it is the only transport that works against a
+  logged-in Chrome 147 default profile; Playwright-based `dev-browser` hangs
+  on root `Target.setAutoAttach` and `agent-browser` inherits the same gating
+  today). `dev-browser` remains available as a fallback for Chrome ≤146 and
+  Chrome for Testing. Classify `Target.setAutoAttach` timeouts as connect
+  failures that are *not* retryable so we stop firing a second
+  `connectOverCDP` and triggering a second approval popup.
+- `yoetz browser check` now surfaces a structured
+  `browser_check_exhausted_error` when every attempted transport fails,
+  replacing an `unreachable!` panic that could fire after the running-profile
+  transport set was narrowed.
+- `live_attach_owner_present` no longer counts a Healthy daemon with zero
+  sessions as an owner — only `Busy`, or `Healthy + session_count > 0`. This
+  stops the implicit `browser attach` / recipe fallbacks from assuming an
+  owner is holding a Chrome approval when no live session exists.
+- `BrowserCommand::Attach`'s implicit `ensure_chatgpt_session(None, ...)` is
+  now gated behind `!prefer_auto_connect`, so it only runs when there is an
+  existing live-attach owner to refresh, not as the first raw-attach
+  fallback.
+- Remove the agent-browser recipe path's `try_cdp_attach_lite` /
+  `try_auto_connect_lite` probe subprocesses, approval locks, and per-recipe
+  approval prints. Approval messaging now flows through the daemon layer so
+  duplicate prompts do not stack.
+- Narrow the dev-browser ChatGPT auth probe to the exact named page instead
+  of searching all pages for `chatgpt.com`, preventing reuse of a user-owned
+  tab and the associated transport fanout.
+
 ## [0.2.54] - 2026-04-20
 ### Added
 
