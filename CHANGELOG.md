@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.55] - 2026-04-24
 ### Fixed
 
 - Running-profile ChatGPT recipe and `yoetz browser check` no longer trigger
@@ -38,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Narrow the dev-browser ChatGPT auth probe to the exact named page instead
   of searching all pages for `chatgpt.com`, preventing reuse of a user-owned
   tab and the associated transport fanout.
+
 
 ## [0.2.54] - 2026-04-20
 ### Added
