@@ -211,7 +211,7 @@ const AGENT_BROWSER_INSTALL_GUIDANCE: &str = concat!(
 
 /// Returns true when the dev-browser backend is available locally.
 pub fn use_dev_browser() -> bool {
-    crate::dev_browser::is_available()
+    crate::dev_browser::has_any_backend()
 }
 
 pub fn recipe_transports(recipe: &Recipe, is_chatgpt: bool) -> Vec<RecipeTransport> {
@@ -935,6 +935,7 @@ enum AutoConnectDoctorStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum BrowserHelperProcessKind {
     DevBrowserDaemon,
+    YoetzLiveCdpDaemon,
     ChromeDevtoolsMcp,
     ChromeDevtoolsMcpWatchdog,
 }
@@ -943,6 +944,7 @@ impl BrowserHelperProcessKind {
     fn label(&self) -> &'static str {
         match self {
             Self::DevBrowserDaemon => "dev-browser daemon",
+            Self::YoetzLiveCdpDaemon => "yoetz live-CDP daemon",
             Self::ChromeDevtoolsMcp => "chrome-devtools-mcp",
             Self::ChromeDevtoolsMcpWatchdog => "chrome-devtools-mcp watchdog",
         }
@@ -961,6 +963,7 @@ struct BrowserDoctorHelpers {
     agent_browser_default: DaemonState,
     agent_browser_default_pid: Option<u32>,
     live_attach_daemon: crate::live_attach::DaemonSummary,
+    yoetz_live_cdp_processes: Vec<BrowserHelperProcessSummary>,
     dev_browser_processes: Vec<BrowserHelperProcessSummary>,
     external_mcp_processes: Vec<BrowserHelperProcessSummary>,
     recommended_actions: Vec<String>,
@@ -2306,6 +2309,11 @@ fn inspect_browser_helpers() -> BrowserDoctorHelpers {
         .filter(|process| matches!(process.kind, BrowserHelperProcessKind::DevBrowserDaemon))
         .cloned()
         .collect::<Vec<_>>();
+    let yoetz_live_cdp_processes = helper_processes
+        .iter()
+        .filter(|process| matches!(process.kind, BrowserHelperProcessKind::YoetzLiveCdpDaemon))
+        .cloned()
+        .collect::<Vec<_>>();
     let external_mcp_processes = helper_processes
         .iter()
         .filter(|process| {
@@ -2328,9 +2336,11 @@ fn inspect_browser_helpers() -> BrowserDoctorHelpers {
         recommended_actions: browser_doctor_recommended_actions(
             agent_browser_default,
             &live_attach_daemon,
+            &yoetz_live_cdp_processes,
             &dev_browser_processes,
             &external_mcp_processes,
         ),
+        yoetz_live_cdp_processes,
         dev_browser_processes,
         external_mcp_processes,
     }
@@ -2339,6 +2349,7 @@ fn inspect_browser_helpers() -> BrowserDoctorHelpers {
 fn browser_doctor_recommended_actions(
     agent_browser_default: DaemonState,
     live_attach_daemon: &crate::live_attach::DaemonSummary,
+    yoetz_live_cdp_processes: &[BrowserHelperProcessSummary],
     dev_browser_processes: &[BrowserHelperProcessSummary],
     external_mcp_processes: &[BrowserHelperProcessSummary],
 ) -> Vec<String> {
@@ -2365,6 +2376,11 @@ fn browser_doctor_recommended_actions(
     if !dev_browser_processes.is_empty() {
         actions.push(
             "A dev-browser daemon is still running. If you want a clean yoetz-owned attach retry, run `yoetz browser reset` first.".to_string(),
+        );
+    }
+    if !yoetz_live_cdp_processes.is_empty() {
+        actions.push(
+            "A yoetz live-CDP daemon is still running. If you want a clean bundled dev-browser attach retry, run `yoetz browser reset` first.".to_string(),
         );
     }
     if !external_mcp_processes.is_empty() {
@@ -2418,6 +2434,10 @@ fn parse_browser_helper_process_line(line: &str) -> Option<BrowserHelperProcessS
     let command = trimmed[first_whitespace..].trim().to_string();
     let kind = if command.contains(".dev-browser/daemon.mjs") {
         BrowserHelperProcessKind::DevBrowserDaemon
+    } else if command.contains(".yoetz/live-cdp-daemon.mjs")
+        || command.contains(".yoetz\\live-cdp-daemon.mjs")
+    {
+        BrowserHelperProcessKind::YoetzLiveCdpDaemon
     } else if command.contains("chrome-devtools-mcp")
         && command.contains("telemetry/watchdog/main.js")
     {
@@ -3267,6 +3287,29 @@ fn browser_doctor_report_with_discovery(
             lines.push(format!(
                 "    - … and {} more",
                 helpers.dev_browser_processes.len() - 3
+            ));
+        }
+    }
+
+    if helpers.yoetz_live_cdp_processes.is_empty() {
+        lines.push("  - yoetz live-CDP daemon: not running".to_string());
+    } else {
+        lines.push(format!(
+            "  - yoetz live-CDP daemon: running ({} process{})",
+            helpers.yoetz_live_cdp_processes.len(),
+            if helpers.yoetz_live_cdp_processes.len() == 1 {
+                ""
+            } else {
+                "es"
+            }
+        ));
+        for process in helpers.yoetz_live_cdp_processes.iter().take(3) {
+            lines.push(format!("    - pid {}: {}", process.pid, process.command));
+        }
+        if helpers.yoetz_live_cdp_processes.len() > 3 {
+            lines.push(format!(
+                "    - … and {} more",
+                helpers.yoetz_live_cdp_processes.len() - 3
             ));
         }
     }
@@ -4961,6 +5004,7 @@ browser_cdp = "http://evil.example.com:9222"
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
                 live_attach_daemon: no_live_attach_daemon(),
+                yoetz_live_cdp_processes: vec![],
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -4976,6 +5020,7 @@ browser_cdp = "http://evil.example.com:9222"
         assert!(report.contains("Browser helpers:"));
         assert!(report.contains("agent-browser default daemon: not running"));
         assert!(report.contains("dev-browser daemon: not running"));
+        assert!(report.contains("yoetz live-CDP daemon: not running"));
         assert!(report.contains("external cdp clients: none detected"));
         assert!(report.contains("Recommended actions:"));
         assert!(report.contains("None required."));
@@ -4995,6 +5040,7 @@ browser_cdp = "http://evil.example.com:9222"
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
                 live_attach_daemon: no_live_attach_daemon(),
+                yoetz_live_cdp_processes: vec![],
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -5029,6 +5075,7 @@ browser_cdp = "http://evil.example.com:9222"
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
                 live_attach_daemon: no_live_attach_daemon(),
+                yoetz_live_cdp_processes: vec![],
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -5056,6 +5103,7 @@ browser_cdp = "http://evil.example.com:9222"
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
                 live_attach_daemon: no_live_attach_daemon(),
+                yoetz_live_cdp_processes: vec![],
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -5090,6 +5138,7 @@ browser_cdp = "http://evil.example.com:9222"
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
                 live_attach_daemon: no_live_attach_daemon(),
+                yoetz_live_cdp_processes: vec![],
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -5125,6 +5174,7 @@ browser_cdp = "http://evil.example.com:9222"
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
                 live_attach_daemon: no_live_attach_daemon(),
+                yoetz_live_cdp_processes: vec![],
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -5150,6 +5200,7 @@ browser_cdp = "http://evil.example.com:9222"
                 agent_browser_default: DaemonState::NoSocket,
                 agent_browser_default_pid: None,
                 live_attach_daemon: no_live_attach_daemon(),
+                yoetz_live_cdp_processes: vec![],
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -5175,6 +5226,11 @@ browser_cdp = "http://evil.example.com:9222"
                     pid: Some(4444),
                     session_count: 0,
                 },
+                yoetz_live_cdp_processes: vec![BrowserHelperProcessSummary {
+                    pid: 2223,
+                    kind: BrowserHelperProcessKind::YoetzLiveCdpDaemon,
+                    command: "node /Users/test/.yoetz/live-cdp-daemon.mjs".to_string(),
+                }],
                 dev_browser_processes: vec![BrowserHelperProcessSummary {
                     pid: 2222,
                     kind: BrowserHelperProcessKind::DevBrowserDaemon,
@@ -5194,12 +5250,14 @@ browser_cdp = "http://evil.example.com:9222"
                 ],
                 recommended_actions: vec![
                     "Run `yoetz browser reset` before `yoetz browser attach`, `yoetz browser check`, or `yoetz browser recipe` to clear stale yoetz-owned helpers.".to_string(),
+                    "A yoetz live-CDP daemon is still running. If you want a clean bundled dev-browser attach retry, run `yoetz browser reset` first.".to_string(),
                     "External chrome-devtools-mcp processes are still running (pid 3333, 3334). If they are not actively in use, close the owning tool/process first; `yoetz browser reset` will not stop them.".to_string(),
                 ],
             },
         );
         assert!(report.contains("agent-browser default daemon: stale (pid 1234)"));
         assert!(report.contains("dev-browser daemon: running (1 process)"));
+        assert!(report.contains("yoetz live-CDP daemon: running (1 process)"));
         assert!(report.contains("external cdp clients: 2 detected"));
         assert!(report.contains("chrome-devtools-mcp (pid 3333)"));
         assert!(report.contains("chrome-devtools-mcp watchdog (pid 3334)"));
@@ -5222,6 +5280,7 @@ browser_cdp = "http://evil.example.com:9222"
                     pid: Some(4444),
                     session_count: 0,
                 },
+                yoetz_live_cdp_processes: vec![],
                 dev_browser_processes: vec![],
                 external_mcp_processes: vec![],
                 recommended_actions: vec!["None required.".to_string()],
@@ -5239,6 +5298,14 @@ browser_cdp = "http://evil.example.com:9222"
                 .expect("dev-browser helper");
         assert_eq!(dev.pid, 10060);
         assert_eq!(dev.kind, BrowserHelperProcessKind::DevBrowserDaemon);
+
+        let yoetz_live_cdp =
+            parse_browser_helper_process_line("10061 node /Users/test/.yoetz/live-cdp-daemon.mjs")
+                .expect("yoetz live-CDP helper");
+        assert_eq!(
+            yoetz_live_cdp.kind,
+            BrowserHelperProcessKind::YoetzLiveCdpDaemon
+        );
 
         let mcp = parse_browser_helper_process_line(
             "19608 npm exec chrome-devtools-mcp@latest --autoConnect --slim",

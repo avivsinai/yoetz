@@ -27,6 +27,7 @@ mod dev_browser;
 mod fuzzy;
 mod http;
 mod live_attach;
+mod live_cdp_daemon;
 mod providers;
 mod registry;
 
@@ -1656,10 +1657,11 @@ fn run_recipe_via_dev_browser(
         ));
     }
 
-    dev_browser::ensure_installed()?;
     // The recipe prepare micro-script already verifies ChatGPT login state on the
     // named page. Avoid a separate pre-flight attach here because it can trigger
     // a fresh approval-gated CDP connection and block an otherwise working flow.
+    // The script runner chooses between bundled live-CDP and external
+    // dev-browser at execution time, so do not force an external binary probe.
 
     let (paste_mode, bundle_text, auto_paste_fallback) =
         resolve_dev_browser_delivery_mode(recipe_args, recipe_vars)?;
@@ -4117,7 +4119,7 @@ mod tests {
     }
 
     #[test]
-    fn run_recipe_via_dev_browser_rejects_invalid_thread_mode_before_install_check() {
+    fn run_recipe_via_dev_browser_rejects_invalid_thread_mode_before_delivery_resolution() {
         let recipe_args = BrowserRecipeArgs {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
@@ -4142,7 +4144,7 @@ mod tests {
     }
 
     #[test]
-    fn run_recipe_via_dev_browser_rejects_thread_reuse_before_install_check() {
+    fn run_recipe_via_dev_browser_rejects_thread_reuse_before_delivery_resolution() {
         let recipe_args = BrowserRecipeArgs {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
