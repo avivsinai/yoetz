@@ -2078,7 +2078,9 @@ pub fn acquire_chrome_approval_lock() -> Result<ChromeApprovalLock> {
 
 pub fn is_chrome_approval_wait_error(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}").to_lowercase();
-    message.contains("allow remote debugging") || message.contains("remote-debugging consent")
+    message.contains("allow remote debugging")
+        || message.contains("remote-debugging consent")
+        || message.contains("remote debugging consent")
 }
 
 /// Detect the actionable "Chrome CDP unreachable" error produced by
@@ -4009,8 +4011,10 @@ fn looks_like_timeout(err: &anyhow::Error) -> bool {
 }
 
 fn allow_dialog_error(err: &anyhow::Error) -> bool {
-    let message = err.to_string();
-    message.contains("Allow remote debugging") || message.contains("remote-debugging consent")
+    let message = format!("{err:#}").to_lowercase();
+    message.contains("allow remote debugging")
+        || message.contains("remote-debugging consent")
+        || message.contains("remote debugging consent")
 }
 
 fn live_attach_approval_wait_error(timeout_ms: u64) -> anyhow::Error {
@@ -5974,6 +5978,26 @@ browser_cdp = "http://evil.example.com:9222"
         );
         assert!(is_chrome_approval_wait_error(&err));
         assert!(allow_dialog_error(&err));
+    }
+
+    #[test]
+    fn is_chrome_approval_wait_error_matches_consent_space_variant() {
+        let err = anyhow!("Chrome is waiting for remote debugging consent");
+        assert!(is_chrome_approval_wait_error(&err));
+        assert!(allow_dialog_error(&err));
+    }
+
+    #[test]
+    fn allow_dialog_error_is_case_insensitive_and_reads_full_chain() {
+        let err = anyhow!("waiting for Allow Remote Debugging consent dialog")
+            .context("connecting to Chrome");
+        assert!(
+            allow_dialog_error(&err),
+            "mixed-case dialog phrase in chain should still match"
+        );
+
+        let not_approval = anyhow!("connection refused");
+        assert!(!allow_dialog_error(&not_approval));
     }
 
     #[test]

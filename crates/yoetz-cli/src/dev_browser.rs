@@ -728,8 +728,15 @@ fn is_dev_browser_target_auto_attach_failure(err: &anyhow::Error) -> bool {
         .contains("target.setautoattach")
 }
 
+fn is_dev_browser_remote_debugging_consent_wait(err: &anyhow::Error) -> bool {
+    let message = format!("{err:#}").to_lowercase();
+    message.contains("remote-debugging consent") || message.contains("remote debugging consent")
+}
+
 fn should_retry_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
-    is_dev_browser_connect_failure(err) && !is_dev_browser_target_auto_attach_failure(err)
+    is_dev_browser_connect_failure(err)
+        && !is_dev_browser_target_auto_attach_failure(err)
+        && !is_dev_browser_remote_debugging_consent_wait(err)
 }
 
 fn maybe_add_dev_browser_connect_guidance(err: anyhow::Error) -> anyhow::Error {
@@ -1628,22 +1635,42 @@ mod tests {
     }
 
     #[test]
-    fn is_dev_browser_connect_failure_matches_live_cdp_daemon_timeouts() {
-        let get_targets = anyhow!(
-            "Timed out after 5000ms initializing live CDP browser during Target.getTargets. \
-             Chrome may be waiting for remote-debugging consent or a target may be unresponsive."
-        );
-        assert!(is_dev_browser_connect_failure(&get_targets));
-        assert!(should_retry_dev_browser_connect_failure(&get_targets));
+    fn is_dev_browser_connect_failure_matches_target_gettargets_token_alone() {
+        let err = anyhow!("Timed out after 5000ms during Target.getTargets");
+        assert!(is_dev_browser_connect_failure(&err));
+        assert!(should_retry_dev_browser_connect_failure(&err));
+    }
 
-        let target_init =
+    #[test]
+    fn is_dev_browser_connect_failure_matches_initializing_live_cdp_browser_token_alone() {
+        let err = anyhow!("Timed out after 5000ms initializing live CDP browser");
+        assert!(is_dev_browser_connect_failure(&err));
+        assert!(should_retry_dev_browser_connect_failure(&err));
+    }
+
+    #[test]
+    fn is_dev_browser_connect_failure_matches_initializing_live_cdp_targets_token_alone() {
+        let err =
             anyhow!("Timed out after 5000ms initializing live CDP targets during Page.enable");
-        assert!(is_dev_browser_connect_failure(&target_init));
+        assert!(is_dev_browser_connect_failure(&err));
+        assert!(should_retry_dev_browser_connect_failure(&err));
+    }
 
-        let consent_wait = anyhow!(
-            "Target.getTargets timed out; Chrome may be waiting for remote-debugging consent"
+    #[test]
+    fn is_dev_browser_connect_failure_matches_remote_debugging_consent_token_alone() {
+        let err =
+            anyhow!("Timed out after 5000ms; Chrome may be waiting for remote-debugging consent");
+        assert!(is_dev_browser_connect_failure(&err));
+        assert!(
+            !should_retry_dev_browser_connect_failure(&err),
+            "consent waits must not retry — would re-trigger the Allow popup"
         );
-        assert!(is_dev_browser_connect_failure(&consent_wait));
+    }
+
+    #[test]
+    fn is_dev_browser_connect_failure_requires_connection_failure_gate() {
+        let hint_without_timeout = anyhow!("Chrome may be waiting for remote-debugging consent");
+        assert!(!is_dev_browser_connect_failure(&hint_without_timeout));
     }
 
     #[test]
