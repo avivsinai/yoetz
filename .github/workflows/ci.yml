@@ -18,6 +18,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  CARGO_INCREMENTAL: 0
 
 jobs:
   check-skills:
@@ -38,11 +39,11 @@ jobs:
           echo "✓ Skill symlinks valid"
 
   changes:
-    name: Detect Release-Only Changes
+    name: Detect Light-Only Changes
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      release_only: ${{ steps.detect.outputs.release_only }}
+      light_only: ${{ steps.detect.outputs.light_only }}
     env:
       PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
       PR_TITLE: ${{ github.event.pull_request.title }}
@@ -59,49 +60,66 @@ jobs:
             pull_request)
               base="${{ github.event.pull_request.base.sha }}"
               head="${{ github.event.pull_request.head.sha }}"
-              if [[ ! "${PR_HEAD_REF}" =~ ^release/ ]] && [[ ! "${PR_TITLE}" =~ ^chore\(release\):[[:space:]]v?[0-9] ]]; then
-                echo "release_only=false" >> "$GITHUB_OUTPUT"
-                exit 0
-              fi
               ;;
-            push)
-              echo "release_only=false" >> "$GITHUB_OUTPUT"
-              exit 0
-              ;;
-            *)
-              echo "release_only=false" >> "$GITHUB_OUTPUT"
+            push|*)
+              echo "light_only=false" >> "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
 
-          if [[ -z "$base" || "$base" == "0000000000000000000000000000000000000000" ]]; then
-            echo "release_only=false" >> "$GITHUB_OUTPUT"
+          if [[ -z "${base:-}" || "$base" == "0000000000000000000000000000000000000000" ]]; then
+            echo "light_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           mapfile -t files < <(git diff --name-only "$base" "$head")
           if ((${#files[@]} == 0)); then
-            echo "release_only=false" >> "$GITHUB_OUTPUT"
+            echo "light_only=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          release_only=true
+          # A PR is "light-only" when every changed file matches one of these
+          # categories:
+          #   - release bookkeeping: Cargo.toml/lock, CHANGELOG.md, plugin /
+          #     skill manifests.
+          #   - documentation: any *.md, anything under docs/, README*.
+          #   - repo infrastructure: anything under .github/, .gitignore,
+          #     .gitleaks.toml, LICENSE*.
+          #
+          # Light-only PRs skip the heavy build / test / browser jobs. The
+          # required checks (Format, Clippy, Test) still RUN to keep the
+          # GitHub "required status checks" list satisfied without needing
+          # admin-bypass, but they short-circuit after checkout to keep the
+          # whole PR under a minute. See clippy / test jobs below.
+          # Bash case-pattern `*` matches any characters including `/`, so
+          # `docs/*` covers any depth under `docs/`.
+          light_only=true
           for file in "${files[@]}"; do
+            matched=false
             case "$file" in
-              Cargo.toml|Cargo.lock|CHANGELOG.md|.claude-plugin/plugin.json|.codex-plugin/plugin.json|skills/*/SKILL.md) ;;
-              *)
-                release_only=false
-                break
-                ;;
+              Cargo.toml|Cargo.lock) matched=true ;;
+              CHANGELOG.md) matched=true ;;
+              .claude-plugin/plugin.json|.codex-plugin/plugin.json) matched=true ;;
+              skills/*/SKILL.md) matched=true ;;
+              *.md) matched=true ;;
+              docs/*) matched=true ;;
+              README*) matched=true ;;
+              .github/*) matched=true ;;
+              .gitignore|.gitleaks.toml) matched=true ;;
+              LICENSE*) matched=true ;;
             esac
+            if [[ "$matched" != "true" ]]; then
+              light_only=false
+              break
+            fi
           done
 
-          echo "release_only=$release_only" >> "$GITHUB_OUTPUT"
+          echo "light_only=$light_only" >> "$GITHUB_OUTPUT"
 
   browser-scripts:
     name: Browser Scripts
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
+    if: needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -139,33 +157,51 @@ jobs:
   clippy:
     name: Clippy
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Light-only short-circuit
+        if: needs.changes.outputs.light_only == 'true'
+        run: |
+          echo "Skipping Clippy because this PR only touches docs / changelog / workflow files."
+          echo "See the 'Detect Light-Only Changes' job for the file set that triggered the fast path."
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: needs.changes.outputs.light_only != 'true'
         with:
           components: clippy
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: needs.changes.outputs.light_only != 'true'
+        with:
+          shared-key: rust-stable-${{ runner.os }}
       - run: cargo clippy --workspace --all-targets -- -D warnings
+        if: needs.changes.outputs.light_only != 'true'
 
   test:
     name: Test
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - name: Light-only short-circuit
+        if: needs.changes.outputs.light_only == 'true'
+        run: |
+          echo "Skipping Test because this PR only touches docs / changelog / workflow files."
+          echo "See the 'Detect Light-Only Changes' job for the file set that triggered the fast path."
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        if: needs.changes.outputs.light_only != 'true'
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        if: needs.changes.outputs.light_only != 'true'
+        with:
+          shared-key: rust-stable-${{ runner.os }}
       - run: cargo test --workspace
+        if: needs.changes.outputs.light_only != 'true'
 
   msrv:
     name: MSRV (1.88)
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
+    if: needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -174,18 +210,22 @@ jobs:
         with:
           toolchain: 1.88.0
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: rust-msrv-1.88-${{ runner.os }}
       - run: cargo check --workspace
 
   doc:
     name: Documentation
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
+    if: needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: rust-stable-${{ runner.os }}
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
@@ -193,7 +233,7 @@ jobs:
   deny:
     name: Cargo Deny
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
+    if: needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -207,7 +247,7 @@ jobs:
   gitleaks:
     name: Gitleaks
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
+    if: needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -222,7 +262,7 @@ jobs:
   build:
     name: Build (${{ matrix.os }})
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
+    if: needs.changes.outputs.light_only != 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -232,6 +272,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: rust-stable-${{ runner.os }}
       - run: cargo build --release --workspace
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.os != 'windows-latest'
@@ -249,13 +291,15 @@ jobs:
   browser-integration:
     name: Real-Browser Smoke (Chrome for Testing)
     needs: changes
-    if: needs.changes.outputs.release_only != 'true'
+    if: needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: rust-stable-${{ runner.os }}
       - name: Install Chrome for Testing
         id: install-chrome
         uses: browser-actions/setup-chrome@4f8e94349a351df0f048634f25fec36c3c91eded # v2
