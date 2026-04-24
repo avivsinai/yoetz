@@ -518,12 +518,10 @@ console.log("ok:" + pages.length);
         Ok(stdout) if stdout.trim().starts_with("ok:") => Ok(()),
         Ok(stdout) => Err(anyhow!("dev-browser connection check failed: {stdout}")),
         Err(first_err) => {
-            let msg = format!("{first_err:#}");
-            let is_timeout = msg.contains("Timeout") || msg.contains("timed out");
-            if !is_timeout {
+            if !should_retry_dev_browser_connect_failure(&first_err) {
                 return Err(first_err.context("dev-browser connection check failed"));
             }
-            eprintln!("info: dev-browser connection timed out, retrying with longer timeout");
+            eprintln!("info: dev-browser connection check failed, retrying with longer timeout");
             std::thread::sleep(std::time::Duration::from_secs(2));
             let stdout = run_script_connect_with_browser_and_endpoint(
                 script,
@@ -549,13 +547,7 @@ fn build_chatgpt_auth_probe_script(page_name: &str) -> String {
 const PAGE_NAME = {page_name_json};
 const CHATGPT_URL = {chatgpt_url_json};
 const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-const pages = await browser.listPages();
-const chatgptPage =
-  pages.find((entry) => entry.name === PAGE_NAME) ||
-  pages.find((entry) => normalize(entry.url).toLowerCase().includes("chatgpt.com"));
-const page = chatgptPage
-  ? await browser.getPage(chatgptPage.name || chatgptPage.id)
-  : await browser.getPage(PAGE_NAME);
+const page = await browser.getPage(PAGE_NAME);
 const currentUrl = normalize(page.url()).toLowerCase();
 if (!currentUrl.includes("chatgpt.com")) {{
   await page.goto(CHATGPT_URL, {{ waitUntil: "domcontentloaded" }});
@@ -710,12 +702,30 @@ fn parse_positive_u64_var(vars: &BTreeMap<String, String>, key: &str) -> Result<
 
 pub(crate) fn is_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}").to_lowercase();
-    (message.contains("connectovercdp")
+    let has_connect_hint = message.contains("connectovercdp")
         || message.contains("auto-connect")
         || message.contains("auto connect")
         || message.contains("could not connect to chrome")
-        || message.contains("browser.getversion"))
-        && (message.contains("timed out") || message.contains("timeout"))
+        || message.contains("browser.getversion")
+        || message.contains("target.setautoattach");
+    let has_connection_failure = message.contains("timed out")
+        || message.contains("timeout")
+        || message.contains("connectionclosed")
+        || message.contains("underlying connection is closed")
+        || message.contains("connection refused")
+        || message.contains("socket hang up")
+        || message.contains("closed");
+    has_connect_hint && has_connection_failure
+}
+
+fn is_dev_browser_target_auto_attach_failure(err: &anyhow::Error) -> bool {
+    format!("{err:#}")
+        .to_lowercase()
+        .contains("target.setautoattach")
+}
+
+fn should_retry_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
+    is_dev_browser_connect_failure(err) && !is_dev_browser_target_auto_attach_failure(err)
 }
 
 fn maybe_add_dev_browser_connect_guidance(err: anyhow::Error) -> anyhow::Error {
@@ -1595,9 +1605,22 @@ mod tests {
         let err =
             anyhow!("browser.newPage: Timeout 30000ms exceeded while waiting for connectOverCDP");
         assert!(is_dev_browser_connect_failure(&err));
+        assert!(should_retry_dev_browser_connect_failure(&err));
+
+        let without_timeout = anyhow!(
+            "browserType.connectOverCDP: connection closed while waiting for connectOverCDP"
+        );
+        assert!(is_dev_browser_connect_failure(&without_timeout));
+        assert!(should_retry_dev_browser_connect_failure(&without_timeout));
+
+        let auto_attach_hang =
+            anyhow!("browserType.connectOverCDP: Target.setAutoAttach timed out after 30000ms");
+        assert!(is_dev_browser_connect_failure(&auto_attach_hang));
+        assert!(!should_retry_dev_browser_connect_failure(&auto_attach_hang));
 
         let other = anyhow!("ChatGPT response timed out after 900000ms");
         assert!(!is_dev_browser_connect_failure(&other));
+        assert!(!should_retry_dev_browser_connect_failure(&other));
     }
 
     #[test]
@@ -1758,19 +1781,19 @@ mod tests {
     }
 
     #[test]
-    fn chatgpt_auth_probe_script_reuses_named_page_and_existing_tabs() {
+    fn chatgpt_auth_probe_script_uses_exact_named_page_only() {
         let script = build_chatgpt_auth_probe_script("yoetz-chatgpt-test");
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
-        assert!(script.contains("const pages = await browser.listPages();"));
-        assert!(script.contains("pages.find((entry) => entry.name === PAGE_NAME)"));
-        assert!(script.contains("await browser.getPage(chatgptPage.name || chatgptPage.id)"));
         assert!(script.contains("await browser.getPage(PAGE_NAME)"));
         assert!(
             script.contains("await page.goto(CHATGPT_URL, { waitUntil: \"domcontentloaded\" });")
         );
         assert!(script.contains("bodyText"));
         assert!(!script.contains("browser.newPage()"));
+        assert!(!script.contains(
+            "pages.find((entry) => normalize(entry.url).toLowerCase().includes(\"chatgpt.com\"))"
+        ));
     }
 
     #[test]

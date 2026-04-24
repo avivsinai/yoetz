@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, IsTerminal, Read};
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
@@ -3597,98 +3597,6 @@ pub fn try_auto_connect(target_url: &str) -> Result<()> {
     verify_auth_cdp(target_url, &connection)
 }
 
-pub fn try_cdp_attach_lite(endpoint: &str) -> Result<()> {
-    let connection = BrowserConnection::Cdp {
-        endpoint: endpoint.to_string(),
-    };
-    probe_live_attach_connection(&connection).map_err(|e| {
-        if allow_dialog_error(&e) {
-            e
-        } else if should_attach_chrome136_warning(endpoint, &e) {
-            e.context(chrome136_cdp_warning(endpoint))
-        } else {
-            e
-        }
-    })
-}
-
-/// Lightweight auto-connect check: verifies Chrome is reachable via
-/// auto-connect without opening new tabs. Used by the recipe path where
-/// the recipe itself handles navigation and auth detection.
-///
-/// Returns immediately if an existing daemon is healthy. Otherwise spawns
-/// a bounded probe so the CLI does not hang indefinitely on approval-gated
-/// CDP connections.
-pub fn try_auto_connect_lite() -> Result<()> {
-    if is_daemon_healthy() {
-        return Ok(());
-    }
-    let connection = BrowserConnection::AutoConnect;
-    probe_live_attach_connection(&connection)
-}
-
-fn probe_live_attach_connection(connection: &BrowserConnection) -> Result<()> {
-    if !connection.is_live_attach() {
-        return Err(anyhow!(
-            "probe_live_attach_connection requires a live browser connection"
-        ));
-    }
-    let (bin, prefix_args) = resolve_agent_browser()?;
-    let args = build_agent_browser_args(
-        vec!["snapshot".to_string(), "-c".to_string()],
-        OutputFormat::Text,
-        Some(connection),
-        /* use_stealth */ false,
-        /* headed */ false,
-    );
-    let mut all_args = prefix_args;
-    all_args.extend(args);
-
-    let mut child = Command::new(&bin)
-        .args(&all_args)
-        .env("AGENT_BROWSER_DEFAULT_TIMEOUT", "10000")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .with_context(|| format!("failed to spawn agent-browser (via {bin})"))?;
-
-    let timeout = Duration::from_secs(15);
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                if status.success() {
-                    return Ok(());
-                }
-                let stderr = child
-                    .stderr
-                    .as_mut()
-                    .map(|stream| {
-                        let mut buf = String::new();
-                        let _ = stream.read_to_string(&mut buf);
-                        buf
-                    })
-                    .unwrap_or_default();
-                return Err(anyhow!("live browser reachability probe failed: {stderr}"));
-            }
-            Ok(None) => {
-                if start.elapsed() > timeout {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(anyhow!(
-                        "live browser reachability probe timed out ({}s). \
-                         Chrome may be showing an \"Allow remote debugging?\" dialog — \
-                         please click Allow in Chrome to authorize the connection",
-                        timeout.as_secs()
-                    ));
-                }
-                thread::sleep(Duration::from_millis(200));
-            }
-            Err(err) => return Err(anyhow!("live browser reachability probe error: {err}")),
-        }
-    }
-}
-
 fn clear_browser_target_state() -> Result<()> {
     let path = browser_target_state_path();
     match fs::remove_file(&path) {
@@ -4105,14 +4013,18 @@ fn allow_dialog_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("Allow remote debugging")
 }
 
+fn live_attach_approval_wait_error(timeout_ms: u64) -> anyhow::Error {
+    anyhow!(
+        "live browser attach timed out ({}s). Chrome may be showing an \"Allow remote debugging?\" dialog — please click Allow in Chrome, then retry.",
+        timeout_ms / 1000
+    )
+}
+
 fn rewrite_live_attach_timeout(err: anyhow::Error) -> anyhow::Error {
     if !looks_like_timeout(&err) {
         return err;
     }
-    anyhow!(
-        "live browser attach timed out ({}s). Chrome may be showing an \"Allow remote debugging?\" dialog — please click Allow in Chrome, then retry.",
-        LIVE_ATTACH_COMMAND_TIMEOUT_MS / 1000
-    )
+    live_attach_approval_wait_error(LIVE_ATTACH_COMMAND_TIMEOUT_MS)
 }
 
 fn auth_check_timeout_ms(connection: &BrowserConnection) -> u64 {
