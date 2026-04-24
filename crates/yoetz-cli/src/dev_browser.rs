@@ -518,7 +518,7 @@ console.log("ok:" + pages.length);
         Ok(stdout) if stdout.trim().starts_with("ok:") => Ok(()),
         Ok(stdout) => Err(anyhow!("dev-browser connection check failed: {stdout}")),
         Err(first_err) => {
-            if !is_dev_browser_connect_failure(&first_err) {
+            if !should_retry_dev_browser_connect_failure(&first_err) {
                 return Err(first_err.context("dev-browser connection check failed"));
             }
             eprintln!("info: dev-browser connection check failed, retrying with longer timeout");
@@ -716,6 +716,16 @@ pub(crate) fn is_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
         || message.contains("socket hang up")
         || message.contains("closed");
     has_connect_hint && has_connection_failure
+}
+
+fn is_dev_browser_target_auto_attach_failure(err: &anyhow::Error) -> bool {
+    format!("{err:#}")
+        .to_lowercase()
+        .contains("target.setautoattach")
+}
+
+fn should_retry_dev_browser_connect_failure(err: &anyhow::Error) -> bool {
+    is_dev_browser_connect_failure(err) && !is_dev_browser_target_auto_attach_failure(err)
 }
 
 fn maybe_add_dev_browser_connect_guidance(err: anyhow::Error) -> anyhow::Error {
@@ -1595,14 +1605,22 @@ mod tests {
         let err =
             anyhow!("browser.newPage: Timeout 30000ms exceeded while waiting for connectOverCDP");
         assert!(is_dev_browser_connect_failure(&err));
+        assert!(should_retry_dev_browser_connect_failure(&err));
 
         let without_timeout = anyhow!(
             "browserType.connectOverCDP: connection closed while waiting for connectOverCDP"
         );
         assert!(is_dev_browser_connect_failure(&without_timeout));
+        assert!(should_retry_dev_browser_connect_failure(&without_timeout));
+
+        let auto_attach_hang =
+            anyhow!("browserType.connectOverCDP: Target.setAutoAttach timed out after 30000ms");
+        assert!(is_dev_browser_connect_failure(&auto_attach_hang));
+        assert!(!should_retry_dev_browser_connect_failure(&auto_attach_hang));
 
         let other = anyhow!("ChatGPT response timed out after 900000ms");
         assert!(!is_dev_browser_connect_failure(&other));
+        assert!(!should_retry_dev_browser_connect_failure(&other));
     }
 
     #[test]

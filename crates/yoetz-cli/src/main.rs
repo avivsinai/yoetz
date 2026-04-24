@@ -1161,9 +1161,9 @@ fn maybe_print_running_profile_auto_connect_preference(
 
 fn running_profile_recipe_transport_priority(transport: browser::RecipeTransport) -> u8 {
     match transport {
-        browser::RecipeTransport::AgentBrowser => 0,
+        browser::RecipeTransport::ChromeDevtoolsMcp => 0,
         browser::RecipeTransport::DevBrowser => 1,
-        browser::RecipeTransport::ChromeDevtoolsMcp => 2,
+        browser::RecipeTransport::AgentBrowser => 2,
         browser::RecipeTransport::Manual => 3,
     }
 }
@@ -1177,8 +1177,19 @@ fn prioritize_chatgpt_transports_for_running_profile_auto_connect(
     }
 
     let has_dev_browser = transports.contains(&browser::RecipeTransport::DevBrowser);
+    let has_chrome_devtools_mcp = transports.contains(&browser::RecipeTransport::ChromeDevtoolsMcp);
     let has_agent_browser = transports.contains(&browser::RecipeTransport::AgentBrowser);
     let has_manual = transports.contains(&browser::RecipeTransport::Manual);
+    if has_chrome_devtools_mcp {
+        let mut constrained = vec![browser::RecipeTransport::ChromeDevtoolsMcp];
+        if has_dev_browser {
+            constrained.push(browser::RecipeTransport::DevBrowser);
+        }
+        if has_manual {
+            constrained.push(browser::RecipeTransport::Manual);
+        }
+        return constrained;
+    }
     if has_dev_browser {
         let mut constrained = vec![browser::RecipeTransport::DevBrowser];
         if has_manual {
@@ -1216,10 +1227,11 @@ fn browser_check_transports(
     }
 
     if prefer_auto_connect {
+        let mut transports = vec![BrowserCheckTransport::ChromeDevtoolsMcp];
         if dev_browser_available {
-            return vec![BrowserCheckTransport::DevBrowser];
+            transports.push(BrowserCheckTransport::DevBrowser);
         }
-        return vec![BrowserCheckTransport::AgentBrowser];
+        return transports;
     }
 
     let mut transports = vec![BrowserCheckTransport::ChromeDevtoolsMcp];
@@ -3614,7 +3626,7 @@ mod tests {
     }
 
     #[test]
-    fn prioritize_chatgpt_transports_for_running_profile_prefers_dev_browser_and_drops_other_live_owners(
+    fn prioritize_chatgpt_transports_for_running_profile_prefers_mcp_then_dev_browser_and_drops_agent_browser(
     ) {
         let transports = prioritize_chatgpt_transports_for_running_profile_auto_connect(
             vec![
@@ -3628,6 +3640,7 @@ mod tests {
         assert_eq!(
             transports,
             vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
                 browser::RecipeTransport::DevBrowser,
                 browser::RecipeTransport::Manual
             ]
@@ -3635,7 +3648,7 @@ mod tests {
     }
 
     #[test]
-    fn prioritize_chatgpt_transports_for_running_profile_falls_back_to_dev_browser_when_agent_browser_is_unavailable(
+    fn prioritize_chatgpt_transports_for_running_profile_keeps_mcp_before_dev_browser_when_agent_browser_is_unavailable(
     ) {
         let transports = prioritize_chatgpt_transports_for_running_profile_auto_connect(
             vec![
@@ -3648,6 +3661,7 @@ mod tests {
         assert_eq!(
             transports,
             vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
                 browser::RecipeTransport::DevBrowser,
                 browser::RecipeTransport::Manual
             ]
@@ -3707,11 +3721,14 @@ mod tests {
         );
         assert_eq!(
             browser_check_transports(true, false, true),
-            vec![BrowserCheckTransport::DevBrowser]
+            vec![
+                BrowserCheckTransport::ChromeDevtoolsMcp,
+                BrowserCheckTransport::DevBrowser
+            ]
         );
         assert_eq!(
             browser_check_transports(false, false, true),
-            vec![BrowserCheckTransport::AgentBrowser]
+            vec![BrowserCheckTransport::ChromeDevtoolsMcp]
         );
     }
 
