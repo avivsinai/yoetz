@@ -36,6 +36,10 @@ The concrete changes are:
 - open ChatGPT recipe tabs from the durable yoetz-owned control tab after the
   daemon is attached, rather than issuing a fresh browser-level
   `Target.createTarget` for every recipe run
+- forbid automatic CDP reconnect inside daemon-owned ChatGPT flows after the
+  first approved websocket exists. A closed websocket is terminal for the
+  current request and requires an explicit `yoetz browser reset` before any new
+  attach attempt.
 
 ## Alternatives Considered
 
@@ -63,10 +67,30 @@ The concrete changes are:
 
 - `attach`, `check`, and the ChatGPT `recipe` share one yoetz-owned CDP owner
 - repeated auth checks and recipe launches reuse the same control-tab identity for a resolved browser context instead of creating throwaway probe tabs
-- reconnect recovery now keeps the old `CreateTarget -> reconnect -> recover via existing anchor` behavior on the daemonized recipe path
+- daemonized ChatGPT requests fail closed on transport loss instead of creating
+  a second CDP websocket that could trigger another Chrome approval dialog
 - Chrome still requires the first native approval after Chrome starts. Yoetz
   cannot persist or bypass that browser consent; the invariant is that the
   daemon keeps one approved websocket alive so subsequent ChatGPT recipe runs
   do not create new attach prompts until Chrome or the daemon is restarted
 - a busy daemon times out cleanly instead of wedging `doctor`, `reset`, or later attach/check calls forever
 - `dev-browser` and `agent-browser` remain available, but only as fallback executors when the primary live owner is unavailable or unsuitable
+
+## 2026-05-02 Amendment: No Hidden Reattach
+
+The live-attach daemon is an owner, not a retry wrapper. Once Chrome has
+approved the daemon's websocket, daemon-owned code must not create another CDP
+websocket as hidden recovery for `ensure-session`, recipe page-open, or
+stable-idle polling failures.
+
+When the approved websocket closes, the daemon records the target as degraded,
+blocks automatic reattach for that target, and returns an error telling the
+operator to run `yoetz browser reset` before reattaching. Standalone
+non-daemon recipe code may keep its explicitly scoped one-retry fallback, but
+the daemon path always passes a no-reconnect policy to the recipe engine.
+
+If a daemon restarts while persisted live-attach state still says a target was
+previously attached, recipe requests also fail closed instead of creating a new
+websocket from that stale state. A new owner may be established only through an
+explicit `yoetz browser attach` flow or by clearing the stale state with
+`yoetz browser reset`.

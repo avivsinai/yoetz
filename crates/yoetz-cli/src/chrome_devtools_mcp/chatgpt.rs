@@ -142,6 +142,12 @@ pub enum InitialPageOpenMode {
     RecoverViaExistingAnchor,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ReconnectPolicy {
+    Never,
+    OneStandaloneRetry,
+}
+
 impl InitialPageOpenMode {
     fn debug_strategy(self) -> &'static str {
         match self {
@@ -241,7 +247,14 @@ async fn run_attached_recipe(
             (None, None) => "resolve Chrome browser context".to_string(),
         })?;
 
-    run_attached_recipe_inner(&mut client, ctx, browser_context_id, page_open_mode).await
+    run_attached_recipe_inner(
+        &mut client,
+        ctx,
+        browser_context_id,
+        page_open_mode,
+        ReconnectPolicy::OneStandaloneRetry,
+    )
+    .await
 }
 
 pub async fn run_with_client(
@@ -264,7 +277,31 @@ pub async fn run_with_client_using_page_open_mode(
     browser_context_id: Option<String>,
     page_open_mode: InitialPageOpenMode,
 ) -> Result<ChatgptRunResult> {
-    run_attached_recipe_inner(client, ctx, browser_context_id, page_open_mode).await
+    run_with_client_using_page_open_mode_and_reconnect_policy(
+        client,
+        ctx,
+        browser_context_id,
+        page_open_mode,
+        ReconnectPolicy::OneStandaloneRetry,
+    )
+    .await
+}
+
+pub async fn run_with_client_using_page_open_mode_and_reconnect_policy(
+    client: &mut CdpMcpClient,
+    ctx: &DevtoolsMcpRecipeContext,
+    browser_context_id: Option<String>,
+    page_open_mode: InitialPageOpenMode,
+    reconnect_policy: ReconnectPolicy,
+) -> Result<ChatgptRunResult> {
+    run_attached_recipe_inner(
+        client,
+        ctx,
+        browser_context_id,
+        page_open_mode,
+        reconnect_policy,
+    )
+    .await
 }
 
 async fn run_attached_recipe_inner(
@@ -272,6 +309,7 @@ async fn run_attached_recipe_inner(
     ctx: &DevtoolsMcpRecipeContext,
     browser_context_id: Option<String>,
     page_open_mode: InitialPageOpenMode,
+    reconnect_policy: ReconnectPolicy,
 ) -> Result<ChatgptRunResult> {
     let marked_url = chatgpt_web::mark_chatgpt_url(&ctx.run_id);
     let page_id = open_initial_chatgpt_page(
@@ -376,6 +414,7 @@ async fn run_attached_recipe_inner(
         response_baseline,
         ctx.response_timeout_ms,
         ctx.response_poll_interval_ms,
+        reconnect_policy,
     )
     .await
     .context("stable-idle polling for ChatGPT response")?;
@@ -1380,6 +1419,7 @@ async fn poll_for_stable_response(
     baseline: ResponseBaseline,
     overall_timeout_ms: u64,
     poll_interval_ms: u64,
+    reconnect_policy: ReconnectPolicy,
 ) -> Result<String> {
     let read_state_js = response_poll_state_script();
     let start = std::time::Instant::now();
@@ -1401,7 +1441,7 @@ async fn poll_for_stable_response(
         let state = match client.evaluate_script(&read_state_js, vec![]).await {
             Ok(state) => state,
             Err(err) => {
-                match classify_response_poll_eval_error(&err, reconnect_used) {
+                match classify_response_poll_eval_error(&err, reconnect_used, reconnect_policy) {
                     ResponsePollEvalFailureAction::ReconnectAndRetry => {
                         emit_stable_idle_warning(
                             "warn: stable-idle poll lost the Chrome websocket; reconnecting once to the existing ChatGPT tab",
@@ -1507,9 +1547,13 @@ enum ResponsePollEvalFailureAction {
 fn classify_response_poll_eval_error(
     err: &anyhow::Error,
     reconnect_used: bool,
+    reconnect_policy: ReconnectPolicy,
 ) -> ResponsePollEvalFailureAction {
     if !is_closed_cdp_transport_error(err) {
         return ResponsePollEvalFailureAction::RetrySameClient;
+    }
+    if reconnect_policy == ReconnectPolicy::Never {
+        return ResponsePollEvalFailureAction::Fail;
     }
     if reconnect_used {
         ResponsePollEvalFailureAction::Fail
@@ -1976,16 +2020,26 @@ mod tests {
         let other = anyhow!("Execution context was destroyed");
 
         assert_eq!(
-            classify_response_poll_eval_error(&closed, false),
+            classify_response_poll_eval_error(&closed, false, ReconnectPolicy::OneStandaloneRetry),
             ResponsePollEvalFailureAction::ReconnectAndRetry
         );
         assert_eq!(
-            classify_response_poll_eval_error(&closed, true),
+            classify_response_poll_eval_error(&closed, true, ReconnectPolicy::OneStandaloneRetry),
             ResponsePollEvalFailureAction::Fail
         );
         assert_eq!(
-            classify_response_poll_eval_error(&other, false),
+            classify_response_poll_eval_error(&other, false, ReconnectPolicy::OneStandaloneRetry),
             ResponsePollEvalFailureAction::RetrySameClient
+        );
+    }
+
+    #[test]
+    fn daemon_response_poll_closed_transport_fails_without_reconnect() {
+        let closed = anyhow!("Unable to make method calls because underlying connection is closed");
+
+        assert_eq!(
+            classify_response_poll_eval_error(&closed, false, ReconnectPolicy::Never),
+            ResponsePollEvalFailureAction::Fail
         );
     }
 
