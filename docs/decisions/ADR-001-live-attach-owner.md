@@ -28,6 +28,14 @@ The concrete changes are:
 - reconnect from the logical target identity (`source-path`, `browser-id`, or implicit default discovery), not by blindly reusing the last websocket URL
 - preserve daemon metadata on bounded ping timeouts so a busy owner is not mistaken for a dead one, while `yoetz browser reset` still forcefully clears a wedged owner
 - keep `dev-browser` and `agent-browser` as fallback transports instead of peer live-session owners
+- treat Chrome's approval-only remote debugging mode as a browser-websocket-only
+  mode: `/json/*` endpoints may be unavailable before approval, so
+  `DevToolsActivePort` discovery must not require `/json/version` before the
+  first attach; it may accept the endpoint only when the listening localhost
+  port is owned by a local Chromium process
+- open ChatGPT recipe tabs from the durable yoetz-owned control tab after the
+  daemon is attached, rather than issuing a fresh browser-level
+  `Target.createTarget` for every recipe run
 
 ## Alternatives Considered
 
@@ -56,5 +64,9 @@ The concrete changes are:
 - `attach`, `check`, and the ChatGPT `recipe` share one yoetz-owned CDP owner
 - repeated auth checks and recipe launches reuse the same control-tab identity for a resolved browser context instead of creating throwaway probe tabs
 - reconnect recovery now keeps the old `CreateTarget -> reconnect -> recover via existing anchor` behavior on the daemonized recipe path
+- Chrome still requires the first native approval after Chrome starts. Yoetz
+  cannot persist or bypass that browser consent; the invariant is that the
+  daemon keeps one approved websocket alive so subsequent ChatGPT recipe runs
+  do not create new attach prompts until Chrome or the daemon is restarted
 - a busy daemon times out cleanly instead of wedging `doctor`, `reset`, or later attach/check calls forever
 - `dev-browser` and `agent-browser` remain available, but only as fallback executors when the primary live owner is unavailable or unsuitable

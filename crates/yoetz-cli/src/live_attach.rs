@@ -8,9 +8,11 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as AsyncBufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::browser::ResolvedCdpTarget;
 use crate::chatgpt_web;
@@ -34,7 +36,10 @@ const DEFAULT_CONTEXT_KEY: &str = "__default__";
 const DAEMON_START_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_START_POLL_MS: u64 = 100;
 const DAEMON_HEALTH_RPC_TIMEOUT: Duration = Duration::from_secs(5);
-const DAEMON_ENSURE_SESSION_TIMEOUT: Duration = Duration::from_secs(75);
+// The first live attach can block on Chrome's native "Allow remote debugging?"
+// dialog. Give an operator several minutes to approve it; after that the daemon
+// keeps the approved websocket open and later recipe runs should not prompt.
+const DAEMON_ENSURE_SESSION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const DAEMON_RECIPE_RPC_GRACE: Duration = Duration::from_secs(120);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -305,10 +310,11 @@ impl LiveAttachDaemon {
             )
             .await?;
         recipe_ctx.cdp_endpoint = Some(session.client.ws_endpoint().to_string());
-        let result = match chatgpt::run_with_client(
+        let result = match chatgpt::run_with_client_using_page_open_mode(
             &mut session.client,
             recipe_ctx,
             browser_context_id.clone(),
+            live_attach_recipe_page_open_mode(),
         )
         .await
         {
@@ -480,6 +486,15 @@ impl LiveAttachDaemon {
     }
 }
 
+fn live_attach_recipe_page_open_mode() -> chatgpt::InitialPageOpenMode {
+    // The daemon has already created or reused a stable yoetz-owned ChatGPT
+    // control tab in this browser context. Open recipe tabs from that anchor
+    // instead of issuing Target.createTarget for each run, because current
+    // default-profile Chrome builds can close the approved CDP websocket on
+    // external new-target creation and force another consent dialog.
+    chatgpt::retry_initial_page_open_mode()
+}
+
 pub async fn ensure_chatgpt_session(
     cdp_target: Option<&ResolvedCdpTarget>,
     browser_context_id: Option<&str>,
@@ -559,15 +574,23 @@ pub async fn serve_daemon() -> Result<()> {
     };
     save_daemon_metadata(&metadata)?;
     let _metadata_guard = DaemonMetadataGuard;
-    let mut daemon = LiveAttachDaemon::load()?;
+    let daemon = Arc::new(AsyncMutex::new(LiveAttachDaemon::load()?));
+    let shutdown = Arc::new(Notify::new());
 
     loop {
-        let (socket, _) = listener
-            .accept()
-            .await
-            .context("accept yoetz live-attach client")?;
-        if handle_daemon_connection(socket, &metadata.token, &mut daemon).await? {
-            break;
+        tokio::select! {
+            _ = shutdown.notified() => break,
+            accepted = listener.accept() => {
+                let (socket, _) = accepted.context("accept yoetz live-attach client")?;
+                let token = metadata.token.clone();
+                let daemon = Arc::clone(&daemon);
+                let shutdown = Arc::clone(&shutdown);
+                tokio::spawn(async move {
+                    if let Err(err) = handle_daemon_connection(socket, &token, daemon, shutdown).await {
+                        eprintln!("warn: yoetz live-attach daemon connection failed: {err:#}");
+                    }
+                });
+            }
         }
     }
 
@@ -775,8 +798,9 @@ async fn healthy_daemon_metadata_with_timeout(timeout: Duration) -> Result<Optio
 async fn handle_daemon_connection(
     socket: TcpStream,
     token: &str,
-    daemon: &mut LiveAttachDaemon,
-) -> Result<bool> {
+    daemon: Arc<AsyncMutex<LiveAttachDaemon>>,
+    shutdown: Arc<Notify>,
+) -> Result<()> {
     let mut reader = AsyncBufReader::new(socket);
     let mut line = String::new();
     reader
@@ -786,12 +810,15 @@ async fn handle_daemon_connection(
 
     let request = serde_json::from_str::<DaemonRequest>(line.trim_end())
         .context("parse yoetz live-attach request")?;
-    let shutdown = matches!(request, DaemonRequest::Shutdown { .. });
-    let response = match dispatch_daemon_request(request, token, daemon).await {
+    let (response, shutdown_requested) = match dispatch_daemon_request(request, token, daemon).await
+    {
         Ok(response) => response,
-        Err(err) => DaemonResponse::Error {
-            message: format!("{err:#}"),
-        },
+        Err(err) => (
+            DaemonResponse::Error {
+                message: format!("{err:#}"),
+            },
+            false,
+        ),
     };
 
     let socket = reader.get_mut();
@@ -804,10 +831,41 @@ async fn handle_daemon_connection(
         .await
         .context("flush yoetz live-attach response")?;
 
-    Ok(shutdown)
+    if shutdown_requested {
+        shutdown.notify_one();
+    }
+
+    Ok(())
 }
 
 async fn dispatch_daemon_request(
+    request: DaemonRequest,
+    token: &str,
+    daemon: Arc<AsyncMutex<LiveAttachDaemon>>,
+) -> Result<(DaemonResponse, bool)> {
+    match request {
+        DaemonRequest::Ping {
+            token: request_token,
+        } => {
+            ensure_token(token, &request_token)?;
+            Ok((DaemonResponse::Pong, false))
+        }
+        DaemonRequest::Shutdown {
+            token: request_token,
+        } => {
+            ensure_token(token, &request_token)?;
+            Ok((DaemonResponse::Pong, true))
+        }
+        request => {
+            let mut daemon = daemon.lock().await;
+            dispatch_daemon_request_locked(request, token, &mut daemon)
+                .await
+                .map(|response| (response, false))
+        }
+    }
+}
+
+async fn dispatch_daemon_request_locked(
     request: DaemonRequest,
     token: &str,
     daemon: &mut LiveAttachDaemon,
@@ -1279,6 +1337,14 @@ mod tests {
     }
 
     #[test]
+    fn live_attach_recipe_page_open_mode_reuses_existing_anchor() {
+        assert_eq!(
+            live_attach_recipe_page_open_mode(),
+            chatgpt::retry_initial_page_open_mode()
+        );
+    }
+
+    #[test]
     #[serial]
     fn reset_removes_state_and_daemon_metadata_files() {
         let _guard = lock_env();
@@ -1498,6 +1564,51 @@ mod tests {
 
         let _ = shutdown_tx.send(());
         let _ = handle.join();
+    }
+
+    #[test]
+    fn shutdown_request_bypasses_busy_daemon_lock() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let daemon = Arc::new(AsyncMutex::new(LiveAttachDaemon {
+                state: LiveAttachState::default(),
+                sessions: BTreeMap::new(),
+            }));
+            let _busy = daemon.lock().await;
+            let shutdown = Arc::new(Notify::new());
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server_daemon = Arc::clone(&daemon);
+            let server_shutdown = Arc::clone(&shutdown);
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                handle_daemon_connection(socket, "token", server_daemon, server_shutdown)
+                    .await
+                    .unwrap();
+            });
+
+            let mut stream = TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(br#"{"type":"shutdown","token":"token"}"#)
+                .await
+                .unwrap();
+            stream.write_all(b"\n").await.unwrap();
+            let mut reader = AsyncBufReader::new(stream);
+            let mut line = String::new();
+            tokio::time::timeout(DAEMON_HEALTH_RPC_TIMEOUT, reader.read_line(&mut line))
+                .await
+                .expect("shutdown response should not wait for the daemon work lock")
+                .unwrap();
+
+            match serde_json::from_str::<DaemonResponse>(line.trim_end()).unwrap() {
+                DaemonResponse::Pong => {}
+                other => panic!("expected shutdown Pong, got {other:?}"),
+            }
+            tokio::time::timeout(DAEMON_HEALTH_RPC_TIMEOUT, shutdown.notified())
+                .await
+                .expect("shutdown notify should be sent after the response is flushed");
+            server.await.unwrap();
+        });
     }
 
     #[test]
