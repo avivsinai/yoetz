@@ -14,7 +14,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{Read, Write},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -1286,23 +1286,9 @@ pub fn discover_running_chrome_targets() -> Vec<RunningChromeTarget> {
 pub fn discover_devtools_active_port_files() -> Vec<DevtoolsActivePortFile> {
     let mut files = Vec::new();
     for path in devtools_active_port_candidates() {
-        let Ok(contents) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let modified_at = std::fs::metadata(&path)
-            .ok()
-            .and_then(|metadata| metadata.modified().ok());
-        let ws_endpoint = parse_devtools_active_port(&contents, None);
-        let healthy = ws_endpoint
-            .as_deref()
-            .and_then(|endpoint| describe_running_chrome_target(endpoint, &path, modified_at))
-            .is_some();
-        files.push(DevtoolsActivePortFile {
-            path,
-            ws_endpoint,
-            modified_at,
-            healthy,
-        });
+        if let Some(file) = devtools_active_port_file_from_path(&path) {
+            files.push(file);
+        }
     }
     files
 }
@@ -1768,17 +1754,64 @@ fn resolve_devtools_active_port_ws(endpoint: &Url) -> Option<String> {
 }
 
 fn resolve_any_devtools_active_port_ws() -> Option<String> {
-    devtools_active_port_candidates()
-        .into_iter()
-        .find_map(|path| {
-            let contents = std::fs::read_to_string(&path).ok()?;
-            let ws_endpoint = parse_devtools_active_port(&contents, None)?;
-            let modified_at = std::fs::metadata(&path)
-                .ok()
-                .and_then(|metadata| metadata.modified().ok());
-            describe_running_chrome_target(&ws_endpoint, &path, modified_at)
-                .map(|target| target.ws_endpoint)
+    resolve_any_devtools_active_port_ws_from_candidates(&devtools_active_port_candidates())
+}
+
+fn resolve_any_devtools_active_port_ws_from_candidates(candidates: &[PathBuf]) -> Option<String> {
+    resolve_any_devtools_active_port_ws_from_candidates_with_approval_probe(
+        candidates,
+        &devtools_approval_mode_endpoint_is_reachable,
+    )
+}
+
+fn resolve_any_devtools_active_port_ws_from_candidates_with_approval_probe(
+    candidates: &[PathBuf],
+    approval_mode_probe: &dyn Fn(&Path, &str) -> bool,
+) -> Option<String> {
+    let mut entries = candidates
+        .iter()
+        .filter_map(|path| {
+            devtools_active_port_file_from_path_with_approval_probe(path, approval_mode_probe)
         })
+        .filter(|file| file.healthy)
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        browser_family_priority(&right.path)
+            .cmp(&browser_family_priority(&left.path))
+            .then_with(|| {
+                modified_sort_key(right.modified_at).cmp(&modified_sort_key(left.modified_at))
+            })
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    entries.into_iter().find_map(|file| file.ws_endpoint)
+}
+
+fn devtools_active_port_file_from_path(path: &Path) -> Option<DevtoolsActivePortFile> {
+    devtools_active_port_file_from_path_with_approval_probe(
+        path,
+        &devtools_approval_mode_endpoint_is_reachable,
+    )
+}
+
+fn devtools_active_port_file_from_path_with_approval_probe(
+    path: &Path,
+    approval_mode_probe: &dyn Fn(&Path, &str) -> bool,
+) -> Option<DevtoolsActivePortFile> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let modified_at = std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok());
+    let ws_endpoint = parse_devtools_active_port(&contents, None);
+    let healthy = ws_endpoint.as_deref().is_some_and(|endpoint| {
+        describe_running_chrome_target(endpoint, path, modified_at).is_some()
+            || approval_mode_probe(path, endpoint)
+    });
+    Some(DevtoolsActivePortFile {
+        path: path.to_path_buf(),
+        ws_endpoint,
+        modified_at,
+        healthy,
+    })
 }
 
 fn describe_running_chrome_target(
@@ -1836,6 +1869,113 @@ fn fetch_target_list_summary(ws_endpoint: &str) -> Option<TargetListSummary> {
         page_target_count: page_entries.len(),
         page_samples,
     })
+}
+
+fn devtools_approval_mode_endpoint_is_reachable(source_path: &Path, ws_endpoint: &str) -> bool {
+    let Some((host, port)) = local_devtools_ws_endpoint_parts(ws_endpoint) else {
+        return false;
+    };
+    if !devtools_port_has_chromium_listener(source_path, port) {
+        return false;
+    }
+    let Ok(addrs) = (host.as_str(), port).to_socket_addrs() else {
+        return false;
+    };
+    addrs.into_iter().any(|addr| {
+        TcpStream::connect_timeout(&addr, Duration::from_millis(DISCOVERY_HTTP_TIMEOUT_MS)).is_ok()
+    })
+}
+
+fn local_devtools_ws_endpoint_parts(ws_endpoint: &str) -> Option<(String, u16)> {
+    let Ok(url) = Url::parse(ws_endpoint) else {
+        return None;
+    };
+    if !matches!(url.scheme(), "ws" | "wss") || !is_localhost_host(&url) {
+        return None;
+    }
+    let host = url.host_str()?.to_string();
+    let port = url.port_or_known_default()?;
+    Some((host, port))
+}
+
+fn devtools_port_has_chromium_listener(source_path: &Path, port: u16) -> bool {
+    let owner_pids = local_tcp_listener_pids(port);
+    if owner_pids.is_empty() {
+        return false;
+    }
+
+    discover_local_chromium_processes()
+        .into_iter()
+        .any(|process| {
+            owner_pids.contains(&process.pid)
+                && chromium_process_matches_active_port_path(&process, source_path)
+        })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn local_tcp_listener_pids(port: u16) -> BTreeSet<u32> {
+    let Ok(output) = Command::new("lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-Fp"])
+        .output()
+    else {
+        return BTreeSet::new();
+    };
+    if !output.status.success() {
+        return BTreeSet::new();
+    }
+    parse_lsof_pid_output(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn local_tcp_listener_pids(_port: u16) -> BTreeSet<u32> {
+    BTreeSet::new()
+}
+
+fn parse_lsof_pid_output(output: &str) -> BTreeSet<u32> {
+    output
+        .lines()
+        .filter_map(|line| line.strip_prefix('p'))
+        .filter_map(|pid| pid.trim().parse::<u32>().ok())
+        .collect()
+}
+
+fn chromium_process_matches_active_port_path(
+    process: &ChromiumProcessSummary,
+    source_path: &Path,
+) -> bool {
+    let Some(user_data_dir) = process.user_data_dir.as_deref() else {
+        return true;
+    };
+    let Some(active_port_dir) = source_path.parent() else {
+        return false;
+    };
+    paths_equivalent(active_port_dir, Path::new(user_data_dir))
+}
+
+fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    let left = std::fs::canonicalize(left).unwrap_or_else(|_| left.to_path_buf());
+    let right = std::fs::canonicalize(right).unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+fn browser_family_priority(source_path: &Path) -> u8 {
+    match browser_name_from_source_path(source_path).as_str() {
+        "Chrome" | "Chrome for Testing" => 4,
+        "Chrome Beta" => 3,
+        "Chrome Canary" => 2,
+        "Chromium" => 1,
+        _ => 0,
+    }
+}
+
+fn modified_sort_key(modified_at: Option<SystemTime>) -> u128 {
+    modified_at
+        .and_then(|time| time.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
 }
 
 fn summarize_page_target(entry: &DevtoolsTargetListEntry) -> Option<String> {
@@ -2601,6 +2741,16 @@ mod tests {
     }
 
     fn spawn_fake_devtools_server() -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        spawn_http_devtools_server(true)
+    }
+
+    fn spawn_approval_mode_devtools_server() -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
+        spawn_http_devtools_server(false)
+    }
+
+    fn spawn_http_devtools_server(
+        expose_json: bool,
+    ) -> (u16, Arc<AtomicBool>, thread::JoinHandle<()>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener
             .set_nonblocking(true)
@@ -2615,9 +2765,9 @@ mod tests {
                         let mut request = [0_u8; 2048];
                         let _ = stream.read(&mut request);
                         let request = String::from_utf8_lossy(&request);
-                        let body = if request.starts_with("GET /json/version ") {
+                        let body = if expose_json && request.starts_with("GET /json/version ") {
                             r#"{"Browser":"Chrome/147.0.0.0"}"#
-                        } else if request.starts_with("GET /json/list ") {
+                        } else if expose_json && request.starts_with("GET /json/list ") {
                             r#"[{"type":"page","url":"https://chatgpt.com/c/123","title":"ChatGPT - New chat"}]"#
                         } else {
                             ""
@@ -3423,6 +3573,68 @@ mod tests {
             parsed.as_deref(),
             Some("ws://127.0.0.1:9333/devtools/browser/from-active-port")
         );
+    }
+
+    #[test]
+    fn devtools_active_port_file_is_healthy_when_approval_mode_hides_json() {
+        let dir = tempdir().unwrap();
+        let active_port = dir.path().join("Google/Chrome/DevToolsActivePort");
+        let (port, shutdown, handle) = spawn_approval_mode_devtools_server();
+        write_devtools_active_port(&active_port, port, "approval-mode");
+
+        let file =
+            devtools_active_port_file_from_path_with_approval_probe(&active_port, &|_, _| true)
+                .unwrap();
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+
+        let expected = format!("ws://127.0.0.1:{port}/devtools/browser/approval-mode");
+        assert_eq!(file.ws_endpoint.as_deref(), Some(expected.as_str()));
+        assert!(
+            file.healthy,
+            "approval-mode Chrome hides /json endpoints but the browser websocket is still attachable after user approval"
+        );
+    }
+
+    #[test]
+    fn devtools_active_port_file_rejects_non_chromium_tcp_listener() {
+        let dir = tempdir().unwrap();
+        let active_port = dir.path().join("Google/Chrome/DevToolsActivePort");
+        let (port, shutdown, handle) = spawn_approval_mode_devtools_server();
+        write_devtools_active_port(&active_port, port, "not-chrome");
+
+        let file = devtools_active_port_file_from_path(&active_port).unwrap();
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+
+        let expected = format!("ws://127.0.0.1:{port}/devtools/browser/not-chrome");
+        assert_eq!(file.ws_endpoint.as_deref(), Some(expected.as_str()));
+        assert!(
+            !file.healthy,
+            "a stale DevToolsActivePort file must not become healthy just because another localhost process reused the port"
+        );
+    }
+
+    #[test]
+    fn resolve_any_devtools_active_port_ws_accepts_approval_mode_endpoint() {
+        let home = tempdir().unwrap();
+        let (stale_path, healthy_path) = devtools_active_port_test_paths(home.path());
+        let (port, shutdown, handle) = spawn_approval_mode_devtools_server();
+        write_devtools_active_port(&stale_path, port + 1, "stale");
+        write_devtools_active_port(&healthy_path, port, "approval-mode");
+
+        let resolved = resolve_any_devtools_active_port_ws_from_candidates_with_approval_probe(
+            &[stale_path.clone(), healthy_path.clone()],
+            &|_, endpoint| endpoint.ends_with("/approval-mode"),
+        );
+
+        shutdown.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+
+        let expected = format!("ws://127.0.0.1:{port}/devtools/browser/approval-mode");
+        assert_eq!(resolved.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
