@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -48,6 +48,137 @@ pub enum LiveAttachStatus {
     Attached,
     AwaitingApproval,
     Degraded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+struct EndpointKey(String);
+
+impl EndpointKey {
+    fn from_ws_endpoint(endpoint: &str) -> Option<Self> {
+        if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+            Some(Self(endpoint.to_string()))
+        } else {
+            None
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+struct TargetAlias(String);
+
+impl TargetAlias {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for TargetAlias {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct BrowserFingerprint {
+    ws_endpoint: String,
+    browser_id: Option<String>,
+    source_path: Option<PathBuf>,
+    listener_pid: Option<u32>,
+    listener_started_at: Option<u64>,
+    user_data_dir: Option<PathBuf>,
+}
+
+impl BrowserFingerprint {
+    fn from_target_and_endpoint(target: &LiveAttachTarget, ws_endpoint: &str) -> Self {
+        Self {
+            ws_endpoint: ws_endpoint.to_string(),
+            browser_id: browser_id_from_ws_endpoint(ws_endpoint)
+                .or_else(|| target.browser_id.clone()),
+            source_path: target.source_path.clone(),
+            listener_pid: None,
+            listener_started_at: None,
+            user_data_dir: target
+                .source_path
+                .as_ref()
+                .and_then(|path| path.parent().map(Path::to_path_buf)),
+        }
+    }
+}
+
+// TODO(stage-b-slice-2): Wire the remaining terminal states directly from typed
+// CDP failures and panic boundaries instead of only using Approved/TransportClosed.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "kebab-case")]
+enum SessionState {
+    NoSession,
+    Attaching,
+    Approved {
+        fingerprint: BrowserFingerprint,
+        connected_at_unix_ms: u64,
+    },
+    Busy {
+        fingerprint: BrowserFingerprint,
+        request_id: String,
+    },
+    TargetCreateDenied {
+        fingerprint: BrowserFingerprint,
+        denied_at_unix_ms: u64,
+        last_error: String,
+    },
+    TransportClosed {
+        fingerprint: BrowserFingerprint,
+        closed_at_unix_ms: u64,
+        last_error: String,
+    },
+    ChromeRestarted {
+        previous: BrowserFingerprint,
+        current: Option<BrowserFingerprint>,
+        detected_at_unix_ms: u64,
+    },
+    Poisoned {
+        fingerprint: Option<BrowserFingerprint>,
+        poisoned_at_unix_ms: u64,
+        last_error: String,
+    },
+}
+
+impl SessionState {
+    fn is_terminal_for_automatic_reattach(&self) -> bool {
+        matches!(
+            self,
+            Self::TransportClosed { .. } | Self::ChromeRestarted { .. } | Self::Poisoned { .. }
+        )
+    }
+
+    fn is_persisted_owner_state(&self) -> bool {
+        !matches!(self, Self::NoSession)
+    }
+
+    fn last_error(&self) -> Option<&str> {
+        match self {
+            Self::TargetCreateDenied { last_error, .. }
+            | Self::TransportClosed { last_error, .. }
+            | Self::Poisoned { last_error, .. } => Some(last_error),
+            Self::ChromeRestarted { .. } => Some("Chrome browser process changed"),
+            _ => None,
+        }
+    }
+}
+
+// TODO(stage-b-slice-3): Persist and consult create-target capability after
+// typed Target.createTarget failures replace string-matched transport errors.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum TargetCreatePolicy {
+    #[default]
+    Unknown,
+    Allowed,
+    Denied,
+    NeverForDefaultProfile,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,9 +256,112 @@ struct PersistedTargetState {
     contexts: BTreeMap<String, PersistedContextState>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistedAliasState {
+    endpoint_key: Option<EndpointKey>,
+    source_path: Option<PathBuf>,
+    browser_id: Option<String>,
+    #[serde(default)]
+    implicit_default: bool,
+    last_status: Option<LiveAttachStatus>,
+    last_error: Option<String>,
+    #[serde(default)]
+    automatic_reattach_blocked: bool,
+    updated_at_unix_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PersistedEndpointState {
+    fingerprint: BrowserFingerprint,
+    session_state: SessionState,
+    #[serde(default)]
+    target_create_policy: TargetCreatePolicy,
+    contexts: BTreeMap<String, PersistedContextState>,
+    updated_at_unix_ms: u64,
+}
+
 #[derive(Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 struct LiveAttachState {
+    #[serde(default)]
+    aliases: BTreeMap<TargetAlias, PersistedAliasState>,
+    #[serde(default)]
+    endpoints: BTreeMap<EndpointKey, PersistedEndpointState>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     sessions: BTreeMap<String, PersistedTargetState>,
+}
+
+impl LiveAttachState {
+    fn migrate_legacy_sessions(&mut self) {
+        let legacy_sessions = std::mem::take(&mut self.sessions);
+        for (alias_key, legacy) in legacy_sessions {
+            let alias = TargetAlias(alias_key.clone());
+            let endpoint_key = legacy
+                .endpoint
+                .as_deref()
+                .and_then(EndpointKey::from_ws_endpoint);
+            self.aliases
+                .entry(alias.clone())
+                .or_insert_with(|| PersistedAliasState {
+                    endpoint_key: endpoint_key.clone(),
+                    source_path: None,
+                    browser_id: legacy
+                        .endpoint
+                        .as_deref()
+                        .and_then(browser_id_from_ws_endpoint),
+                    implicit_default: alias_key == IMPLICIT_TARGET_KEY,
+                    last_status: legacy.status,
+                    last_error: legacy.last_error.clone(),
+                    automatic_reattach_blocked: legacy.automatic_reattach_blocked
+                        && endpoint_key.is_none(),
+                    updated_at_unix_ms: legacy.updated_at_unix_ms.unwrap_or_default(),
+                });
+
+            let Some(endpoint_key) = endpoint_key else {
+                continue;
+            };
+            let endpoint = legacy
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| endpoint_key.0.clone());
+            let fingerprint = BrowserFingerprint {
+                ws_endpoint: endpoint,
+                browser_id: legacy
+                    .endpoint
+                    .as_deref()
+                    .and_then(browser_id_from_ws_endpoint),
+                source_path: None,
+                listener_pid: None,
+                listener_started_at: None,
+                user_data_dir: None,
+            };
+            let updated_at_unix_ms = legacy.updated_at_unix_ms.unwrap_or_default();
+            let session_state = if legacy.automatic_reattach_blocked {
+                SessionState::TransportClosed {
+                    fingerprint: fingerprint.clone(),
+                    closed_at_unix_ms: updated_at_unix_ms,
+                    last_error: legacy.last_error.unwrap_or_else(|| {
+                        "approved Chrome websocket is no longer usable".to_string()
+                    }),
+                }
+            } else if legacy.status == Some(LiveAttachStatus::Attached) {
+                SessionState::Approved {
+                    fingerprint: fingerprint.clone(),
+                    connected_at_unix_ms: updated_at_unix_ms,
+                }
+            } else {
+                SessionState::NoSession
+            };
+            self.endpoints
+                .entry(endpoint_key)
+                .or_insert_with(|| PersistedEndpointState {
+                    fingerprint,
+                    session_state,
+                    target_create_policy: TargetCreatePolicy::Unknown,
+                    contexts: legacy.contexts,
+                    updated_at_unix_ms,
+                });
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -174,8 +408,12 @@ enum DaemonResponse {
 }
 
 struct DaemonSession {
+    endpoint_key: EndpointKey,
+    aliases: BTreeSet<TargetAlias>,
     target: LiveAttachTarget,
     client: CdpMcpClient,
+    fingerprint: BrowserFingerprint,
+    state: SessionState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -186,16 +424,27 @@ enum InitialAttachPolicy {
 
 struct LiveAttachDaemon {
     state: LiveAttachState,
-    sessions: BTreeMap<String, DaemonSession>,
-    session_key_by_alias: BTreeMap<String, String>,
+    sessions_by_endpoint: BTreeMap<EndpointKey, DaemonSession>,
+    endpoint_by_alias: BTreeMap<TargetAlias, EndpointKey>,
 }
 
 impl LiveAttachDaemon {
     fn load() -> Result<Self> {
+        let state = load_state()?;
+        let endpoint_by_alias = state
+            .aliases
+            .iter()
+            .filter_map(|(alias, state)| {
+                state
+                    .endpoint_key
+                    .as_ref()
+                    .map(|endpoint_key| (alias.clone(), endpoint_key.clone()))
+            })
+            .collect();
         Ok(Self {
-            state: load_state()?,
-            sessions: BTreeMap::new(),
-            session_key_by_alias: BTreeMap::new(),
+            state,
+            sessions_by_endpoint: BTreeMap::new(),
+            endpoint_by_alias,
         })
     }
 
@@ -220,7 +469,11 @@ impl LiveAttachDaemon {
             }
             Err(err) if is_closed_cdp_transport_error(&err) => {
                 let err = single_approval_transport_closed_error(err);
-                self.record_session_terminal_error(&target_key, &session, &err)?;
+                self.record_session_terminal_error(
+                    &TargetAlias(target_key.clone()),
+                    &session,
+                    &err,
+                )?;
                 Err(err)
             }
             Err(err) => {
@@ -241,12 +494,7 @@ impl LiveAttachDaemon {
             .ensure_chatgpt_control_tab_for_selectors(session, explicit_context_id, profile_email)
             .await?;
 
-        self.record_target_success(
-            &session.target.key,
-            Some(session.client.ws_endpoint()),
-            browser_context_id.as_deref(),
-            &control_run_id,
-        )?;
+        self.record_session_success(session, browser_context_id.as_deref(), &control_run_id)?;
         session.target.endpoint = Some(session.client.ws_endpoint().to_string());
 
         Ok(LiveAttachSession {
@@ -282,7 +530,11 @@ impl LiveAttachDaemon {
             }
             Err(err) if is_closed_cdp_transport_error(&err) => {
                 let err = single_approval_transport_closed_error(err);
-                self.record_session_terminal_error(&target_key, &session, &err)?;
+                self.record_session_terminal_error(
+                    &TargetAlias(target_key.clone()),
+                    &session,
+                    &err,
+                )?;
                 Err(err)
             }
             Err(err) => {
@@ -315,12 +567,7 @@ impl LiveAttachDaemon {
         )
         .await?;
 
-        self.record_target_success(
-            &session.target.key,
-            Some(session.client.ws_endpoint()),
-            browser_context_id.as_deref(),
-            &control_run_id,
-        )?;
+        self.record_session_success(session, browser_context_id.as_deref(), &control_run_id)?;
         session.target.endpoint = Some(session.client.ws_endpoint().to_string());
 
         Ok(result)
@@ -331,16 +578,19 @@ impl LiveAttachDaemon {
         target: LiveAttachTarget,
         initial_attach_policy: InitialAttachPolicy,
     ) -> Result<DaemonSession> {
-        let target_key = target.key.clone();
-        for session_key in self.session_lookup_keys(&target) {
-            let Some(mut session) = self.sessions.remove(&session_key) else {
+        let target_alias = target_alias_for_target(&target);
+        for endpoint_key in self.session_lookup_keys(&target) {
+            let Some(mut session) = self.sessions_by_endpoint.remove(&endpoint_key) else {
                 continue;
             };
             if let Err(err) = session.client.probe_liveness(750) {
                 let err = single_approval_transport_closed_error(err);
-                self.record_session_terminal_error(&target_key, &session, &err)?;
+                self.record_session_terminal_error(&target_alias, &session, &err)?;
                 return Err(err);
             }
+            session.aliases.insert(target_alias.clone());
+            self.endpoint_by_alias
+                .insert(target_alias, session.endpoint_key.clone());
             session.target = session_target_for_alias(target, &session);
             return Ok(session);
         }
@@ -357,43 +607,61 @@ impl LiveAttachDaemon {
         self.connect_session(target).await
     }
 
-    fn session_lookup_keys(&self, target: &LiveAttachTarget) -> Vec<String> {
+    fn session_lookup_keys(&self, target: &LiveAttachTarget) -> Vec<EndpointKey> {
         let mut keys = Vec::new();
-        push_unique(
-            &mut keys,
-            self.session_key_by_alias.get(&target.key).cloned(),
-        );
-        push_unique(&mut keys, session_key_for_target(target));
+        let alias = target_alias_for_target(target);
+        push_unique(&mut keys, self.endpoint_by_alias.get(&alias).cloned());
         push_unique(
             &mut keys,
             self.state
-                .sessions
-                .get(&target.key)
-                .and_then(|state| state.endpoint.as_deref())
-                .map(endpoint_session_key),
+                .aliases
+                .get(&alias)
+                .and_then(|state| state.endpoint_key.clone()),
         );
-        push_unique(&mut keys, Some(target.key.clone()));
+        push_unique(&mut keys, endpoint_key_for_target(target));
         keys
     }
 
     fn store_session(&mut self, alias_key: String, session: DaemonSession) {
-        let session_key = session_key_for_session(&session);
-        self.session_key_by_alias
-            .insert(alias_key, session_key.clone());
-        self.session_key_by_alias
-            .insert(session.target.key.clone(), session_key.clone());
-        self.sessions.insert(session_key, session);
+        let mut session = session;
+        // Checkout can rebind a live endpoint from one selector to another, so
+        // keep both the original request alias and the session's current alias.
+        session.aliases.insert(TargetAlias(alias_key));
+        session
+            .aliases
+            .insert(target_alias_for_target(&session.target));
+        for alias in &session.aliases {
+            self.endpoint_by_alias
+                .insert(alias.clone(), session.endpoint_key.clone());
+        }
+        self.sessions_by_endpoint
+            .insert(session.endpoint_key.clone(), session);
     }
 
     async fn connect_session(&mut self, mut target: LiveAttachTarget) -> Result<DaemonSession> {
         let endpoint = resolve_connect_endpoint(&target);
         let client = chatgpt::connect_client_with_approval_lock(endpoint.as_deref(), false).await?;
         let actual_endpoint = client.ws_endpoint().to_string();
-        self.ensure_target_record(&target.key).endpoint = Some(actual_endpoint.clone());
+        let endpoint_key = EndpointKey::from_ws_endpoint(&actual_endpoint)
+            .unwrap_or_else(|| EndpointKey(actual_endpoint.clone()));
+        let alias = target_alias_for_target(&target);
         target.browser_id = browser_id_from_ws_endpoint(&actual_endpoint).or(target.browser_id);
-        target.endpoint = Some(actual_endpoint);
+        target.endpoint = Some(actual_endpoint.clone());
+        let fingerprint = BrowserFingerprint::from_target_and_endpoint(&target, &actual_endpoint);
+        let state = SessionState::Approved {
+            fingerprint: fingerprint.clone(),
+            connected_at_unix_ms: unix_ms_now(),
+        };
+        self.record_alias_binding(&alias, &target, Some(endpoint_key.clone()), None);
 
-        Ok(DaemonSession { target, client })
+        Ok(DaemonSession {
+            endpoint_key,
+            aliases: BTreeSet::from([alias]),
+            target,
+            client,
+            fingerprint,
+            state,
+        })
     }
 
     async fn ensure_chatgpt_control_tab_for_selectors(
@@ -406,7 +674,7 @@ impl LiveAttachDaemon {
             .client
             .resolve_browser_context_id(explicit_context_id, profile_email)?;
         let control_run_id =
-            self.control_run_id_for(&session.target.key, browser_context_id.as_deref());
+            self.control_run_id_for(&session.endpoint_key, browser_context_id.as_deref());
         chatgpt::ensure_chatgpt_control_tab_ready(
             &session.client,
             browser_context_id.as_deref(),
@@ -416,47 +684,127 @@ impl LiveAttachDaemon {
         Ok((browser_context_id, control_run_id))
     }
 
-    fn ensure_target_record(&mut self, target_key: &str) -> &mut PersistedTargetState {
-        self.state
-            .sessions
-            .entry(target_key.to_string())
-            .or_default()
+    fn record_alias_binding(
+        &mut self,
+        alias: &TargetAlias,
+        target: &LiveAttachTarget,
+        endpoint_key: Option<EndpointKey>,
+        last_error: Option<String>,
+    ) {
+        let now = unix_ms_now();
+        let alias_state = self.state.aliases.entry(alias.clone()).or_default();
+        alias_state.endpoint_key = endpoint_key
+            .clone()
+            .or_else(|| alias_state.endpoint_key.clone());
+        alias_state.source_path = target
+            .source_path
+            .clone()
+            .or_else(|| alias_state.source_path.clone());
+        alias_state.browser_id = target
+            .browser_id
+            .clone()
+            .or_else(|| alias_state.browser_id.clone());
+        alias_state.implicit_default = target.implicit_default;
+        alias_state.last_error = last_error;
+        if alias_state.last_error.is_none() {
+            alias_state.automatic_reattach_blocked = false;
+        }
+        alias_state.updated_at_unix_ms = now;
+        if let Some(endpoint_key) = endpoint_key {
+            self.endpoint_by_alias.insert(alias.clone(), endpoint_key);
+        }
     }
 
-    fn control_run_id_for(&mut self, target_key: &str, browser_context_id: Option<&str>) -> String {
-        let context_key = context_storage_key(browser_context_id);
-        let target = self.ensure_target_record(target_key);
+    fn ensure_endpoint_record(
+        &mut self,
+        endpoint_key: &EndpointKey,
+        fingerprint: BrowserFingerprint,
+    ) -> &mut PersistedEndpointState {
         let now = unix_ms_now();
-        let context = target
-            .contexts
-            .entry(context_key)
-            .or_insert_with(|| PersistedContextState {
-                browser_context_id: browser_context_id.map(str::to_owned),
-                control_run_id: chatgpt_web::generate_run_id(),
+        self.state
+            .endpoints
+            .entry(endpoint_key.clone())
+            .or_insert_with(|| PersistedEndpointState {
+                fingerprint,
+                session_state: SessionState::NoSession,
+                target_create_policy: TargetCreatePolicy::Unknown,
+                contexts: BTreeMap::new(),
                 updated_at_unix_ms: now,
+            })
+    }
+
+    fn control_run_id_for(
+        &mut self,
+        endpoint_key: &EndpointKey,
+        browser_context_id: Option<&str>,
+    ) -> String {
+        let context_key = context_storage_key(browser_context_id);
+        let fingerprint = self
+            .state
+            .endpoints
+            .get(endpoint_key)
+            .map(|state| state.fingerprint.clone())
+            .unwrap_or_else(|| BrowserFingerprint {
+                ws_endpoint: endpoint_key.as_str().to_string(),
+                browser_id: browser_id_from_ws_endpoint(endpoint_key.as_str()),
+                source_path: None,
+                listener_pid: None,
+                listener_started_at: None,
+                user_data_dir: None,
             });
+        let endpoint = self.ensure_endpoint_record(endpoint_key, fingerprint);
+        let now = unix_ms_now();
+        let context =
+            endpoint
+                .contexts
+                .entry(context_key)
+                .or_insert_with(|| PersistedContextState {
+                    browser_context_id: browser_context_id.map(str::to_owned),
+                    control_run_id: chatgpt_web::generate_run_id(),
+                    updated_at_unix_ms: now,
+                });
         context.browser_context_id = browser_context_id.map(str::to_owned);
         context.updated_at_unix_ms = now;
         context.control_run_id.clone()
     }
 
-    fn record_target_success(
+    fn record_session_success(
         &mut self,
-        target_key: &str,
-        endpoint: Option<&str>,
+        session: &DaemonSession,
         browser_context_id: Option<&str>,
         control_run_id: &str,
     ) -> Result<()> {
         let now = unix_ms_now();
-        let target = self.ensure_target_record(target_key);
-        target.endpoint = endpoint
-            .map(str::to_owned)
-            .or_else(|| target.endpoint.clone());
-        target.status = Some(LiveAttachStatus::Attached);
-        target.updated_at_unix_ms = Some(now);
-        target.last_error = None;
-        target.automatic_reattach_blocked = false;
-        target
+        let mut aliases = session.aliases.clone();
+        aliases.insert(target_alias_for_target(&session.target));
+        for alias in aliases {
+            self.record_alias_binding(
+                &alias,
+                &session.target,
+                Some(session.endpoint_key.clone()),
+                None,
+            );
+            if let Some(alias_state) = self.state.aliases.get_mut(&alias) {
+                alias_state.last_status = Some(LiveAttachStatus::Attached);
+            }
+        }
+
+        let connected_at_unix_ms = match &session.state {
+            SessionState::Approved {
+                connected_at_unix_ms,
+                ..
+            } => *connected_at_unix_ms,
+            _ => now,
+        };
+        let endpoint =
+            self.ensure_endpoint_record(&session.endpoint_key, session.fingerprint.clone());
+        endpoint.fingerprint = session.fingerprint.clone();
+        endpoint.session_state = SessionState::Approved {
+            fingerprint: session.fingerprint.clone(),
+            connected_at_unix_ms,
+        };
+        endpoint.updated_at_unix_ms = now;
+        endpoint
             .contexts
             .entry(context_storage_key(browser_context_id))
             .and_modify(|context| {
@@ -478,73 +826,108 @@ impl LiveAttachDaemon {
         endpoint: Option<&str>,
         err: &anyhow::Error,
     ) -> Result<()> {
-        let target = self.ensure_target_record(target_key);
-        target.endpoint = endpoint
-            .map(str::to_owned)
-            .or_else(|| target.endpoint.clone());
-        target.status = Some(if crate::browser::is_chrome_approval_wait_error(err) {
+        let alias = TargetAlias(target_key.to_string());
+        let status = if crate::browser::is_chrome_approval_wait_error(err) {
             LiveAttachStatus::AwaitingApproval
         } else {
             LiveAttachStatus::Degraded
-        });
-        target.updated_at_unix_ms = Some(unix_ms_now());
-        target.last_error = Some(format!("{err:#}"));
+        };
+        let endpoint_key = endpoint.and_then(EndpointKey::from_ws_endpoint);
+        let alias_state = self.state.aliases.entry(alias.clone()).or_default();
+        alias_state.endpoint_key = endpoint_key
+            .clone()
+            .or_else(|| alias_state.endpoint_key.clone());
+        alias_state.last_status = Some(status);
+        alias_state.last_error = Some(format!("{err:#}"));
+        alias_state.automatic_reattach_blocked = false;
+        alias_state.updated_at_unix_ms = unix_ms_now();
+        if let Some(endpoint_key) = endpoint_key {
+            self.endpoint_by_alias.insert(alias, endpoint_key);
+        }
         save_state(&self.state)
     }
 
     fn record_target_terminal_error(
         &mut self,
-        target_key: &str,
+        alias: &TargetAlias,
         endpoint: Option<&str>,
+        fingerprint: BrowserFingerprint,
         err: &anyhow::Error,
     ) -> Result<()> {
-        let target = self.ensure_target_record(target_key);
-        target.endpoint = endpoint
-            .map(str::to_owned)
-            .or_else(|| target.endpoint.clone());
-        target.status = Some(LiveAttachStatus::Degraded);
-        target.updated_at_unix_ms = Some(unix_ms_now());
-        target.last_error = Some(format!("{err:#}"));
-        target.automatic_reattach_blocked = true;
+        let now = unix_ms_now();
+        let endpoint_key = endpoint
+            .and_then(EndpointKey::from_ws_endpoint)
+            .or_else(|| self.endpoint_by_alias.get(alias).cloned())
+            .or_else(|| {
+                self.state
+                    .aliases
+                    .get(alias)
+                    .and_then(|state| state.endpoint_key.clone())
+            });
+        let alias_only_blocked = endpoint_key.is_none();
+        let alias_state = self.state.aliases.entry(alias.clone()).or_default();
+        alias_state.endpoint_key = endpoint_key
+            .clone()
+            .or_else(|| alias_state.endpoint_key.clone());
+        alias_state.last_status = Some(LiveAttachStatus::Degraded);
+        alias_state.last_error = Some(format!("{err:#}"));
+        alias_state.automatic_reattach_blocked = alias_only_blocked;
+        alias_state.updated_at_unix_ms = now;
+        if let Some(endpoint_key) = endpoint_key {
+            self.endpoint_by_alias
+                .insert(alias.clone(), endpoint_key.clone());
+            let endpoint_state = self.ensure_endpoint_record(&endpoint_key, fingerprint.clone());
+            endpoint_state.fingerprint = fingerprint.clone();
+            endpoint_state.session_state = SessionState::TransportClosed {
+                fingerprint,
+                closed_at_unix_ms: now,
+                last_error: format!("{err:#}"),
+            };
+            endpoint_state.updated_at_unix_ms = now;
+        }
         save_state(&self.state)
     }
 
     fn record_session_terminal_error(
         &mut self,
-        target_key: &str,
+        target_alias: &TargetAlias,
         session: &DaemonSession,
         err: &anyhow::Error,
     ) -> Result<()> {
-        let session_key = session_key_for_session(session);
         let endpoint = session
             .target
             .endpoint
             .clone()
             .unwrap_or_else(|| session.client.ws_endpoint().to_string());
-        let mut aliases = vec![target_key.to_string(), session.target.key.clone()];
+        let mut aliases = session.aliases.clone();
+        aliases.insert(target_alias.clone());
+        aliases.insert(target_alias_for_target(&session.target));
         aliases.extend(
-            self.session_key_by_alias
+            self.endpoint_by_alias
                 .iter()
-                .filter(|(_, key)| *key == &session_key)
+                .filter(|(_, endpoint_key)| *endpoint_key == &session.endpoint_key)
                 .map(|(alias, _)| alias.clone()),
         );
-        aliases.sort();
-        aliases.dedup();
+        aliases.extend(
+            self.state
+                .aliases
+                .iter()
+                .filter(|(_, state)| state.endpoint_key.as_ref() == Some(&session.endpoint_key))
+                .map(|(alias, _)| alias.clone()),
+        );
         for alias in aliases {
-            self.record_target_terminal_error(&alias, Some(&endpoint), err)?;
+            self.record_target_terminal_error(
+                &alias,
+                Some(&endpoint),
+                session.fingerprint.clone(),
+                err,
+            )?;
         }
         Ok(())
     }
 
     fn automatic_reattach_blocked_error(&self, target_key: &str) -> Option<anyhow::Error> {
-        if let Some(err) = self.automatic_reattach_blocked_error_for_alias(target_key) {
-            return Some(err);
-        }
-        let session_key = self.session_key_by_alias.get(target_key)?;
-        self.session_key_by_alias
-            .iter()
-            .filter(|(_, key)| *key == session_key)
-            .find_map(|(alias, _)| self.automatic_reattach_blocked_error_for_alias(alias))
+        self.automatic_reattach_blocked_error_for_alias(&TargetAlias(target_key.to_string()))
     }
 
     fn automatic_reattach_blocked_error_for_target(
@@ -554,27 +937,54 @@ impl LiveAttachDaemon {
         if let Some(err) = self.automatic_reattach_blocked_error(&target.key) {
             return Some(err);
         }
-        let (alias, state) = self.persisted_state_for_target(target)?;
-        if state.automatic_reattach_blocked {
-            return self.automatic_reattach_blocked_error_for_alias(alias);
+        let (alias, _, endpoint_state) = self.persisted_endpoint_state_for_target(target)?;
+        if endpoint_state
+            .session_state
+            .is_terminal_for_automatic_reattach()
+        {
+            return self.automatic_reattach_blocked_error_for_alias(&alias);
         }
         None
     }
 
     fn automatic_reattach_blocked_error_for_alias(
         &self,
-        target_key: &str,
+        alias: &TargetAlias,
     ) -> Option<anyhow::Error> {
-        let target = self.state.sessions.get(target_key)?;
-        if !target.automatic_reattach_blocked {
+        if let Some(alias_state) = self.state.aliases.get(alias) {
+            if alias_state.automatic_reattach_blocked {
+                let last_error = alias_state
+                    .last_error
+                    .as_deref()
+                    .unwrap_or("the approved Chrome websocket is no longer usable");
+                return Some(anyhow!(
+                    "automatic Chrome reattach is disabled for live-attach target `{}` because the previous owner failed before a reusable endpoint was recorded: {last_error}\nRun `yoetz browser reset` before reattaching so any new Chrome remote-debugging approval is explicit.",
+                    alias.as_str()
+                ));
+            }
+        }
+
+        let endpoint_key = self.endpoint_by_alias.get(alias).cloned().or_else(|| {
+            self.state
+                .aliases
+                .get(alias)
+                .and_then(|state| state.endpoint_key.clone())
+        })?;
+        let endpoint_state = self.state.endpoints.get(&endpoint_key)?;
+        if !endpoint_state
+            .session_state
+            .is_terminal_for_automatic_reattach()
+        {
             return None;
         }
-        let last_error = target
-            .last_error
-            .as_deref()
+        let last_error = endpoint_state
+            .session_state
+            .last_error()
             .unwrap_or("the approved Chrome websocket is no longer usable");
         Some(anyhow!(
-            "automatic Chrome reattach is disabled for live-attach target `{target_key}` because the previously approved websocket failed: {last_error}\nRun `yoetz browser reset` before reattaching so any new Chrome remote-debugging approval is explicit."
+            "automatic Chrome reattach is disabled for live-attach target `{}` because endpoint `{}` previously failed: {last_error}\nRun `yoetz browser reset` before reattaching so any new Chrome remote-debugging approval is explicit.",
+            alias.as_str(),
+            endpoint_key.as_str()
         ))
     }
 
@@ -586,8 +996,19 @@ impl LiveAttachDaemon {
         if initial_attach_policy == InitialAttachPolicy::Allow {
             return None;
         }
-        let (alias, state) = self.persisted_state_for_target(target)?;
-        if state.endpoint.is_none() && state.status != Some(LiveAttachStatus::Attached) {
+        let direct_alias = target_alias_for_target(target);
+        if let Some(alias_state) = self.state.aliases.get(&direct_alias) {
+            if alias_state.endpoint_key.is_none()
+                && alias_state.last_status == Some(LiveAttachStatus::Attached)
+            {
+                return Some(anyhow!(
+                    "no live approved Chrome websocket is available for live-attach target `{}`. Persisted target `{direct_alias}` was owned by a previous live-attach daemon, and yoetz will not create a new Chrome CDP websocket from a recipe because that can trigger another remote-debugging approval prompt. Run `yoetz browser attach` to reapprove explicitly, or run `yoetz browser reset` to clear the stale owner state.",
+                    target.key
+                ));
+            }
+        }
+        let (alias, _, endpoint_state) = self.persisted_endpoint_state_for_target(target)?;
+        if !endpoint_state.session_state.is_persisted_owner_state() {
             return None;
         }
         Some(anyhow!(
@@ -596,26 +1017,36 @@ impl LiveAttachDaemon {
         ))
     }
 
-    fn persisted_state_for_target(
+    fn persisted_endpoint_state_for_target(
         &self,
         target: &LiveAttachTarget,
-    ) -> Option<(&str, &PersistedTargetState)> {
-        if let Some((alias, state)) = self.state.sessions.get_key_value(&target.key) {
-            return Some((alias.as_str(), state));
+    ) -> Option<(TargetAlias, EndpointKey, &PersistedEndpointState)> {
+        let alias = target_alias_for_target(target);
+        if let Some(endpoint_key) = self.endpoint_by_alias.get(&alias).cloned().or_else(|| {
+            self.state
+                .aliases
+                .get(&alias)
+                .and_then(|state| state.endpoint_key.clone())
+        }) {
+            let endpoint_state = self.state.endpoints.get(&endpoint_key)?;
+            return Some((alias, endpoint_key, endpoint_state));
         }
-        let session_key = session_key_for_target(target)?;
-        self.state
-            .sessions
-            .iter()
-            .find(|(_, state)| {
-                state
-                    .endpoint
-                    .as_deref()
-                    .map(endpoint_session_key)
-                    .as_deref()
-                    == Some(session_key.as_str())
-            })
-            .map(|(alias, state)| (alias.as_str(), state))
+        let endpoint_key = endpoint_key_for_target(target)?;
+        if let Some(found) = self.state.aliases.iter().find_map(|(alias, alias_state)| {
+            let alias_endpoint_key = alias_state.endpoint_key.as_ref()?;
+            if alias_endpoint_key == &endpoint_key {
+                let endpoint_state = self.state.endpoints.get(alias_endpoint_key)?;
+                Some((alias.clone(), alias_endpoint_key.clone(), endpoint_state))
+            } else {
+                None
+            }
+        }) {
+            return Some(found);
+        }
+        if let Some(endpoint_state) = self.state.endpoints.get(&endpoint_key) {
+            return Some((alias, endpoint_key, endpoint_state));
+        }
+        None
     }
 }
 
@@ -625,40 +1056,20 @@ fn single_approval_transport_closed_error(err: anyhow::Error) -> anyhow::Error {
     )
 }
 
-fn endpoint_session_key(endpoint: &str) -> String {
-    format!("endpoint:{endpoint}")
+fn target_alias_for_target(target: &LiveAttachTarget) -> TargetAlias {
+    TargetAlias(target.key.clone())
 }
 
-fn session_key_for_target(target: &LiveAttachTarget) -> Option<String> {
+fn endpoint_key_for_target(target: &LiveAttachTarget) -> Option<EndpointKey> {
     resolve_connect_endpoint(target)
         .as_deref()
-        .and_then(canonical_endpoint_session_key)
+        .and_then(EndpointKey::from_ws_endpoint)
         .or_else(|| {
             target
                 .endpoint
                 .as_deref()
-                .and_then(canonical_endpoint_session_key)
+                .and_then(EndpointKey::from_ws_endpoint)
         })
-}
-
-fn session_key_for_session(session: &DaemonSession) -> String {
-    canonical_endpoint_session_key(session.client.ws_endpoint())
-        .or_else(|| {
-            session
-                .target
-                .endpoint
-                .as_deref()
-                .and_then(canonical_endpoint_session_key)
-        })
-        .unwrap_or_else(|| session.target.key.clone())
-}
-
-fn canonical_endpoint_session_key(endpoint: &str) -> Option<String> {
-    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
-        Some(endpoint_session_key(endpoint))
-    } else {
-        None
-    }
 }
 
 fn session_target_for_alias(
@@ -676,7 +1087,10 @@ fn session_target_for_alias(
     target
 }
 
-fn push_unique(values: &mut Vec<String>, value: Option<String>) {
+fn push_unique<T>(values: &mut Vec<T>, value: Option<T>)
+where
+    T: Eq,
+{
     let Some(value) = value else {
         return;
     };
@@ -1085,7 +1499,7 @@ async fn dispatch_daemon_request_locked(
         } => {
             ensure_token(token, &request_token)?;
             Ok(DaemonResponse::Status {
-                session_count: daemon.sessions.len(),
+                session_count: daemon.sessions_by_endpoint.len(),
             })
         }
         DaemonRequest::Shutdown {
@@ -1360,8 +1774,11 @@ fn load_state() -> Result<LiveAttachState> {
     }
 
     let content = fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-    match serde_json::from_str(&content) {
-        Ok(state) => Ok(state),
+    match serde_json::from_str::<LiveAttachState>(&content) {
+        Ok(mut state) => {
+            state.migrate_legacy_sessions();
+            Ok(state)
+        }
         Err(_) => {
             let _ = fs::remove_file(&path);
             Ok(LiveAttachState::default())
@@ -1522,6 +1939,39 @@ mod tests {
         }
     }
 
+    fn empty_daemon() -> LiveAttachDaemon {
+        LiveAttachDaemon {
+            state: LiveAttachState::default(),
+            sessions_by_endpoint: BTreeMap::new(),
+            endpoint_by_alias: BTreeMap::new(),
+        }
+    }
+
+    fn test_fingerprint(endpoint: &str) -> BrowserFingerprint {
+        BrowserFingerprint {
+            ws_endpoint: endpoint.to_string(),
+            browser_id: browser_id_from_ws_endpoint(endpoint),
+            source_path: None,
+            listener_pid: None,
+            listener_started_at: None,
+            user_data_dir: None,
+        }
+    }
+
+    fn approved_endpoint_state(endpoint: &str) -> PersistedEndpointState {
+        let fingerprint = test_fingerprint(endpoint);
+        PersistedEndpointState {
+            fingerprint: fingerprint.clone(),
+            session_state: SessionState::Approved {
+                fingerprint,
+                connected_at_unix_ms: 1,
+            },
+            target_create_policy: TargetCreatePolicy::Unknown,
+            contexts: BTreeMap::new(),
+            updated_at_unix_ms: 1,
+        }
+    }
+
     #[test]
     fn live_attach_target_uses_implicit_key_without_resolved_target() {
         let target = LiveAttachTarget::from_resolved(None);
@@ -1562,19 +2012,22 @@ mod tests {
         let dir = tempdir().unwrap();
         let state_path = dir.path().join("live-attach.json");
         let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
-        let mut daemon = LiveAttachDaemon {
-            state: LiveAttachState::default(),
-            sessions: BTreeMap::new(),
-            session_key_by_alias: BTreeMap::new(),
-        };
+        let mut daemon = empty_daemon();
         let target_key = "implicit-default";
         let endpoint = "ws://127.0.0.1:9222/devtools/browser/test";
+        let endpoint_key = EndpointKey::from_ws_endpoint(endpoint).unwrap();
+        let fingerprint = test_fingerprint(endpoint);
         let err = single_approval_transport_closed_error(anyhow!(
             "Unable to make method calls because underlying connection is closed"
         ));
 
         daemon
-            .record_target_terminal_error(target_key, Some(endpoint), &err)
+            .record_target_terminal_error(
+                &TargetAlias(target_key.to_string()),
+                Some(endpoint),
+                fingerprint.clone(),
+                &err,
+            )
             .unwrap();
         let blocked = daemon
             .automatic_reattach_blocked_error(target_key)
@@ -1584,8 +2037,9 @@ mod tests {
         assert!(blocked.contains("yoetz browser reset"));
 
         daemon
-            .record_target_success(target_key, Some(endpoint), None, "control-run")
-            .unwrap();
+            .state
+            .endpoints
+            .insert(endpoint_key, approved_endpoint_state(endpoint));
         assert!(
             daemon
                 .automatic_reattach_blocked_error(target_key)
@@ -1595,54 +2049,137 @@ mod tests {
     }
 
     #[test]
-    fn persisted_target_state_defaults_reattach_block_to_false() {
-        let state: PersistedTargetState = serde_json::from_str(
+    fn persisted_alias_state_defaults_to_non_implicit_without_endpoint() {
+        let state: PersistedAliasState = serde_json::from_str(
             r#"{
-                "endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
-                "status": "attached",
-                "updated_at_unix_ms": 1,
+                "endpoint_key": null,
+                "source_path": null,
+                "browser_id": null,
+                "last_status": "attached",
                 "last_error": null,
-                "contexts": {}
+                "updated_at_unix_ms": 1
             }"#,
         )
         .unwrap();
 
+        assert!(!state.implicit_default);
+        assert_eq!(state.endpoint_key, None);
         assert!(!state.automatic_reattach_blocked);
     }
 
     #[test]
+    fn legacy_target_state_migrates_to_endpoint_alias_state() {
+        let mut state: LiveAttachState = serde_json::from_str(
+            r#"{
+                "sessions": {
+                    "implicit-default": {
+                        "endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+                        "status": "attached",
+                        "updated_at_unix_ms": 7,
+                        "last_error": null,
+                        "contexts": {
+                            "__default__": {
+                                "browser_context_id": null,
+                                "control_run_id": "control-run",
+                                "updated_at_unix_ms": 7
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        state.migrate_legacy_sessions();
+
+        let alias = TargetAlias(IMPLICIT_TARGET_KEY.to_string());
+        let endpoint_key =
+            EndpointKey::from_ws_endpoint("ws://127.0.0.1:9222/devtools/browser/test").unwrap();
+        let alias_state = state.aliases.get(&alias).unwrap();
+        assert_eq!(alias_state.endpoint_key, Some(endpoint_key.clone()));
+        assert!(alias_state.implicit_default);
+        assert_eq!(alias_state.last_status, Some(LiveAttachStatus::Attached));
+        let endpoint_state = state.endpoints.get(&endpoint_key).unwrap();
+        assert!(matches!(
+            endpoint_state.session_state,
+            SessionState::Approved { .. }
+        ));
+        assert_eq!(
+            endpoint_state
+                .contexts
+                .get(DEFAULT_CONTEXT_KEY)
+                .unwrap()
+                .control_run_id,
+            "control-run"
+        );
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn legacy_blocked_without_endpoint_preserves_alias_only_reattach_block() {
+        let mut state: LiveAttachState = serde_json::from_str(
+            r#"{
+                "sessions": {
+                    "implicit-default": {
+                        "endpoint": null,
+                        "status": "degraded",
+                        "updated_at_unix_ms": 7,
+                        "last_error": "closed before endpoint was recorded",
+                        "automatic_reattach_blocked": true,
+                        "contexts": {}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        state.migrate_legacy_sessions();
+
+        let alias = TargetAlias(IMPLICIT_TARGET_KEY.to_string());
+        let alias_state = state.aliases.get(&alias).unwrap();
+        assert_eq!(alias_state.endpoint_key, None);
+        assert!(alias_state.automatic_reattach_blocked);
+        assert!(state.endpoints.is_empty());
+        assert!(state.sessions.is_empty());
+
+        let mut daemon = empty_daemon();
+        daemon.state = state;
+        let err = daemon
+            .automatic_reattach_blocked_error(IMPLICIT_TARGET_KEY)
+            .expect("alias-only legacy block should survive migration");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("previous owner failed before a reusable endpoint"));
+        assert!(msg.contains("yoetz browser reset"));
+    }
+
+    #[test]
     fn session_lookup_prefers_alias_binding_to_endpoint_key() {
-        let mut daemon = LiveAttachDaemon {
-            state: LiveAttachState::default(),
-            sessions: BTreeMap::new(),
-            session_key_by_alias: BTreeMap::from([(
-                IMPLICIT_TARGET_KEY.to_string(),
-                "endpoint:ws://127.0.0.1:9222/devtools/browser/test".to_string(),
-            )]),
-        };
-        daemon.state.sessions.insert(
-            IMPLICIT_TARGET_KEY.to_string(),
-            PersistedTargetState {
-                endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
-                status: Some(LiveAttachStatus::Attached),
-                updated_at_unix_ms: Some(1),
-                last_error: None,
-                automatic_reattach_blocked: false,
-                contexts: BTreeMap::new(),
+        let endpoint = "ws://127.0.0.1:9222/devtools/browser/test";
+        let endpoint_key = EndpointKey::from_ws_endpoint(endpoint).unwrap();
+        let mut daemon = empty_daemon();
+        daemon.endpoint_by_alias.insert(
+            TargetAlias(IMPLICIT_TARGET_KEY.to_string()),
+            endpoint_key.clone(),
+        );
+        daemon.state.aliases.insert(
+            TargetAlias(IMPLICIT_TARGET_KEY.to_string()),
+            PersistedAliasState {
+                endpoint_key: Some(endpoint_key.clone()),
+                implicit_default: true,
+                last_status: Some(LiveAttachStatus::Attached),
+                updated_at_unix_ms: 1,
+                ..Default::default()
             },
         );
 
         assert_eq!(
             daemon.session_lookup_keys(&LiveAttachTarget::from_resolved(None)),
-            vec![
-                "endpoint:ws://127.0.0.1:9222/devtools/browser/test".to_string(),
-                IMPLICIT_TARGET_KEY.to_string()
-            ]
+            vec![endpoint_key]
         );
     }
 
     #[test]
-    fn session_key_for_target_uses_canonical_ws_endpoint_not_alias() {
+    fn endpoint_key_for_target_uses_canonical_ws_endpoint_not_alias() {
         let target = LiveAttachTarget {
             key: "endpoint:http://127.0.0.1:9222".to_string(),
             connect_endpoint: Some("http://127.0.0.1:9222".to_string()),
@@ -1653,31 +2190,52 @@ mod tests {
         };
 
         assert_eq!(
-            session_key_for_target(&target),
-            Some("endpoint:ws://127.0.0.1:9222/devtools/browser/test".to_string())
+            endpoint_key_for_target(&target),
+            Some(EndpointKey(
+                "ws://127.0.0.1:9222/devtools/browser/test".to_string()
+            ))
         );
     }
 
     #[test]
     fn automatic_reattach_block_applies_to_endpoint_aliases() {
-        let endpoint_key = "endpoint:ws://127.0.0.1:9222/devtools/browser/test".to_string();
-        let mut daemon = LiveAttachDaemon {
-            state: LiveAttachState::default(),
-            sessions: BTreeMap::new(),
-            session_key_by_alias: BTreeMap::from([
-                ("source-path:/tmp/chrome".to_string(), endpoint_key.clone()),
-                ("browser-id:test".to_string(), endpoint_key),
-            ]),
-        };
-        daemon.state.sessions.insert(
-            "source-path:/tmp/chrome".to_string(),
-            PersistedTargetState {
-                endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
-                status: Some(LiveAttachStatus::Degraded),
-                updated_at_unix_ms: Some(1),
+        let endpoint = "ws://127.0.0.1:9222/devtools/browser/test";
+        let endpoint_key = EndpointKey::from_ws_endpoint(endpoint).unwrap();
+        let mut daemon = empty_daemon();
+        daemon.endpoint_by_alias.extend([
+            (
+                TargetAlias("source-path:/tmp/chrome".to_string()),
+                endpoint_key.clone(),
+            ),
+            (
+                TargetAlias("browser-id:test".to_string()),
+                endpoint_key.clone(),
+            ),
+        ]);
+        daemon.state.aliases.insert(
+            TargetAlias("source-path:/tmp/chrome".to_string()),
+            PersistedAliasState {
+                endpoint_key: Some(endpoint_key.clone()),
+                source_path: Some(PathBuf::from("/tmp/chrome")),
+                last_status: Some(LiveAttachStatus::Degraded),
                 last_error: Some("closed transport".to_string()),
-                automatic_reattach_blocked: true,
+                updated_at_unix_ms: 1,
+                ..Default::default()
+            },
+        );
+        let fingerprint = test_fingerprint(endpoint);
+        daemon.state.endpoints.insert(
+            endpoint_key,
+            PersistedEndpointState {
+                fingerprint: fingerprint.clone(),
+                session_state: SessionState::TransportClosed {
+                    fingerprint,
+                    closed_at_unix_ms: 1,
+                    last_error: "closed transport".to_string(),
+                },
+                target_create_policy: TargetCreatePolicy::Unknown,
                 contexts: BTreeMap::new(),
+                updated_at_unix_ms: 1,
             },
         );
 
@@ -1685,32 +2243,38 @@ mod tests {
             .automatic_reattach_blocked_error("browser-id:test")
             .expect("endpoint alias should inherit the terminal reattach block");
         let msg = format!("{err:#}");
-        assert!(msg.contains("source-path:/tmp/chrome"));
+        assert!(msg.contains("browser-id:test"));
+        assert!(msg.contains(endpoint));
         assert!(msg.contains("yoetz browser reset"));
     }
 
     #[test]
     fn recipe_attach_policy_blocks_persisted_owner_after_daemon_restart() {
-        let mut daemon = LiveAttachDaemon {
-            state: LiveAttachState::default(),
-            sessions: BTreeMap::new(),
-            session_key_by_alias: BTreeMap::new(),
-        };
-        daemon.state.sessions.insert(
-            "source-path:/tmp/chrome".to_string(),
-            PersistedTargetState {
-                endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
-                status: Some(LiveAttachStatus::Attached),
-                updated_at_unix_ms: Some(1),
-                last_error: None,
-                automatic_reattach_blocked: false,
-                contexts: BTreeMap::new(),
+        let endpoint = "ws://127.0.0.1:9222/devtools/browser/test";
+        let endpoint_key = EndpointKey::from_ws_endpoint(endpoint).unwrap();
+        let mut daemon = empty_daemon();
+        daemon.state.aliases.insert(
+            TargetAlias("source-path:/tmp/chrome".to_string()),
+            PersistedAliasState {
+                endpoint_key: Some(endpoint_key.clone()),
+                source_path: Some(PathBuf::from("/tmp/chrome")),
+                last_status: Some(LiveAttachStatus::Attached),
+                updated_at_unix_ms: 1,
+                ..Default::default()
             },
+        );
+        daemon
+            .state
+            .endpoints
+            .insert(endpoint_key.clone(), approved_endpoint_state(endpoint));
+        daemon.endpoint_by_alias.insert(
+            TargetAlias("source-path:/tmp/chrome".to_string()),
+            endpoint_key,
         );
         let target = LiveAttachTarget {
             key: "browser-id:test".to_string(),
-            connect_endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
-            endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
+            connect_endpoint: Some(endpoint.to_string()),
+            endpoint: Some(endpoint.to_string()),
             source_path: None,
             browser_id: Some("test".to_string()),
             implicit_default: false,
@@ -1724,6 +2288,7 @@ mod tests {
             .expect("recipe should not auto-reattach after daemon restart");
         let msg = format!("{err:#}");
         assert!(msg.contains("previous live-attach daemon"), "{msg}");
+        assert!(msg.contains("source-path:/tmp/chrome"), "{msg}");
         assert!(msg.contains("yoetz browser attach"), "{msg}");
         assert!(
             daemon
@@ -1743,18 +2308,21 @@ mod tests {
         let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
         let _daemon = EnvVarGuard::set("YOETZ_LIVE_ATTACH_DAEMON_PATH", &daemon_path);
 
+        let endpoint = "ws://127.0.0.1:9222/devtools/browser/test";
+        let endpoint_key = EndpointKey::from_ws_endpoint(endpoint).unwrap();
         save_state(&LiveAttachState {
-            sessions: BTreeMap::from([(
-                "implicit-default".to_string(),
-                PersistedTargetState {
-                    endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
-                    status: Some(LiveAttachStatus::Attached),
-                    updated_at_unix_ms: Some(unix_ms_now()),
-                    last_error: None,
-                    automatic_reattach_blocked: false,
-                    contexts: BTreeMap::new(),
+            aliases: BTreeMap::from([(
+                TargetAlias(IMPLICIT_TARGET_KEY.to_string()),
+                PersistedAliasState {
+                    endpoint_key: Some(endpoint_key.clone()),
+                    implicit_default: true,
+                    last_status: Some(LiveAttachStatus::Attached),
+                    updated_at_unix_ms: unix_ms_now(),
+                    ..Default::default()
                 },
             )]),
+            endpoints: BTreeMap::from([(endpoint_key, approved_endpoint_state(endpoint))]),
+            sessions: BTreeMap::new(),
         })
         .unwrap();
         save_daemon_metadata(&DaemonMetadata {
@@ -1782,6 +2350,8 @@ mod tests {
         fs::write(&state_path, "{not-json").unwrap();
         let state = load_state().unwrap();
 
+        assert!(state.aliases.is_empty());
+        assert!(state.endpoints.is_empty());
         assert!(state.sessions.is_empty());
         assert!(!state_path.exists());
     }
@@ -1962,8 +2532,8 @@ mod tests {
         runtime.block_on(async {
             let daemon = Arc::new(AsyncMutex::new(LiveAttachDaemon {
                 state: LiveAttachState::default(),
-                sessions: BTreeMap::new(),
-                session_key_by_alias: BTreeMap::new(),
+                sessions_by_endpoint: BTreeMap::new(),
+                endpoint_by_alias: BTreeMap::new(),
             }));
             let _busy = daemon.lock().await;
             let shutdown = Arc::new(Notify::new());

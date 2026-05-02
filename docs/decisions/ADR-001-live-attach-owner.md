@@ -94,3 +94,16 @@ previously attached, recipe requests also fail closed instead of creating a new
 websocket from that stale state. A new owner may be established only through an
 explicit `yoetz browser attach` flow or by clearing the stale state with
 `yoetz browser reset`.
+
+## 2026-05-02 Amendment: Endpoint-Owned State
+
+`LiveAttachTarget.key` is a target alias, not the CDP session key. The daemon
+keys live sessions and persisted owner state by the approved canonical browser
+websocket endpoint, and keeps a separate alias map for selectors such as
+`source-path:*`, `browser-id:*`, and `implicit-default`.
+
+Persisted live-attach state is split into alias records and endpoint records.
+Endpoint records carry a `SessionState` and browser fingerprint so terminal
+states such as transport closure, Chrome restart, and poisoning are represented
+as owner state rather than inferred from target aliases. Older v0.2.58
+target-keyed state is migrated on load.
