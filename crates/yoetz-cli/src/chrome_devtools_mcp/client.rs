@@ -17,7 +17,8 @@ use std::{
     net::{TcpStream, ToSocketAddrs},
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
+    thread,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -333,6 +334,24 @@ impl CdpMcpClient {
 
     pub fn ws_endpoint(&self) -> &str {
         &self.ws_endpoint
+    }
+
+    pub fn probe_liveness(&self, timeout_ms: u64) -> Result<()> {
+        let browser = self.browser.clone();
+        let timeout = Duration::from_millis(timeout_ms.max(1));
+        let (tx, rx) = mpsc::sync_channel(1);
+        thread::Builder::new()
+            .name("yoetz-cdp-liveness-probe".to_string())
+            .spawn(move || {
+                let result = browser
+                    .get_page_targets()
+                    .map(|_| ())
+                    .context("probe Chrome CDP session liveness");
+                let _ = tx.send(result);
+            })
+            .context("spawn Chrome CDP session liveness probe")?;
+
+        receive_liveness_probe_result(rx, timeout)
     }
 
     pub async fn new_page(
@@ -1227,6 +1246,19 @@ impl CdpMcpClient {
                     browser_context_label(browser_context_id)
                 )
             })
+    }
+}
+
+fn receive_liveness_probe_result(rx: mpsc::Receiver<Result<()>>, timeout: Duration) -> Result<()> {
+    match rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(anyhow!(
+            "probe Chrome CDP session liveness timed out after {}ms",
+            timeout.as_millis()
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow!("probe Chrome CDP session liveness worker exited"))
+        }
     }
 }
 
@@ -2897,6 +2929,16 @@ mod tests {
         ];
 
         assert_eq!(choose_chatgpt_probe_index(&probes), 0);
+    }
+
+    #[test]
+    fn liveness_probe_receiver_honors_timeout() {
+        let (_tx, rx) = std::sync::mpsc::sync_channel(1);
+
+        let err = receive_liveness_probe_result(rx, Duration::from_millis(1))
+            .expect_err("empty liveness probe channel should time out");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("timed out after 1ms"), "{msg}");
     }
 
     #[test]

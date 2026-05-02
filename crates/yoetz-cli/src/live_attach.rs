@@ -120,6 +120,8 @@ struct PersistedTargetState {
     status: Option<LiveAttachStatus>,
     updated_at_unix_ms: Option<u64>,
     last_error: Option<String>,
+    #[serde(default)]
+    automatic_reattach_blocked: bool,
     contexts: BTreeMap<String, PersistedContextState>,
 }
 
@@ -176,9 +178,16 @@ struct DaemonSession {
     client: CdpMcpClient,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialAttachPolicy {
+    Allow,
+    RequireLiveSessionIfPersisted,
+}
+
 struct LiveAttachDaemon {
     state: LiveAttachState,
     sessions: BTreeMap<String, DaemonSession>,
+    session_key_by_alias: BTreeMap<String, String>,
 }
 
 impl LiveAttachDaemon {
@@ -186,6 +195,7 @@ impl LiveAttachDaemon {
         Ok(Self {
             state: load_state()?,
             sessions: BTreeMap::new(),
+            session_key_by_alias: BTreeMap::new(),
         })
     }
 
@@ -196,36 +206,27 @@ impl LiveAttachDaemon {
         profile_email: Option<&str>,
     ) -> Result<LiveAttachSession> {
         let target_key = target.key.clone();
-        let mut session = self.take_or_connect_session(target).await?;
-        let mut reconnect_used = false;
+        let mut session = self
+            .take_or_connect_session(target, InitialAttachPolicy::Allow)
+            .await?;
 
-        loop {
-            let result = self
-                .ensure_chatgpt_session_with_session(
-                    &mut session,
-                    explicit_context_id,
-                    profile_email,
-                )
-                .await;
-
-            match result {
-                Ok(session_info) => {
-                    self.sessions.insert(target_key.clone(), session);
-                    return Ok(session_info);
-                }
-                Err(err) if !reconnect_used && is_closed_cdp_transport_error(&err) => {
-                    reconnect_used = true;
-                    self.reconnect_session_in_place(&mut session).await?;
-                }
-                Err(err) => {
-                    self.record_target_error(
-                        &target_key,
-                        session.target.endpoint.as_deref(),
-                        &err,
-                    )?;
-                    self.sessions.insert(target_key.clone(), session);
-                    return Err(err);
-                }
+        match self
+            .ensure_chatgpt_session_with_session(&mut session, explicit_context_id, profile_email)
+            .await
+        {
+            Ok(session_info) => {
+                self.store_session(target_key.clone(), session);
+                Ok(session_info)
+            }
+            Err(err) if is_closed_cdp_transport_error(&err) => {
+                let err = single_approval_transport_closed_error(err);
+                self.record_session_terminal_error(&target_key, &session, &err)?;
+                Err(err)
+            }
+            Err(err) => {
+                self.record_target_error(&target_key, session.target.endpoint.as_deref(), &err)?;
+                self.store_session(target_key.clone(), session);
+                Err(err)
             }
         }
     }
@@ -263,36 +264,31 @@ impl LiveAttachDaemon {
         mut recipe_ctx: chrome_devtools_mcp::DevtoolsMcpRecipeContext,
     ) -> Result<ChatgptRunResult> {
         let target_key = target.key.clone();
-        let mut session = self.take_or_connect_session(target).await?;
-        let mut reconnect_used = false;
+        let mut session = self
+            .take_or_connect_session(target, InitialAttachPolicy::RequireLiveSessionIfPersisted)
+            .await?;
 
         if recipe_ctx.run_id.trim().is_empty() {
             recipe_ctx.run_id = chatgpt_web::generate_run_id();
         }
 
-        loop {
-            let result = self
-                .run_chatgpt_recipe_with_session(&mut session, &mut recipe_ctx)
-                .await;
-
-            match result {
-                Ok(result) => {
-                    self.sessions.insert(target_key.clone(), session);
-                    return Ok(result);
-                }
-                Err(err) if !reconnect_used && is_closed_cdp_transport_error(&err) => {
-                    reconnect_used = true;
-                    self.reconnect_session_in_place(&mut session).await?;
-                }
-                Err(err) => {
-                    self.record_target_error(
-                        &target_key,
-                        session.target.endpoint.as_deref(),
-                        &err,
-                    )?;
-                    self.sessions.insert(target_key.clone(), session);
-                    return Err(err);
-                }
+        match self
+            .run_chatgpt_recipe_with_session(&mut session, &mut recipe_ctx)
+            .await
+        {
+            Ok(result) => {
+                self.store_session(target_key.clone(), session);
+                Ok(result)
+            }
+            Err(err) if is_closed_cdp_transport_error(&err) => {
+                let err = single_approval_transport_closed_error(err);
+                self.record_session_terminal_error(&target_key, &session, &err)?;
+                Err(err)
+            }
+            Err(err) => {
+                self.record_target_error(&target_key, session.target.endpoint.as_deref(), &err)?;
+                self.store_session(target_key.clone(), session);
+                Err(err)
             }
         }
     }
@@ -310,50 +306,14 @@ impl LiveAttachDaemon {
             )
             .await?;
         recipe_ctx.cdp_endpoint = Some(session.client.ws_endpoint().to_string());
-        let result = match chatgpt::run_with_client_using_page_open_mode(
+        let result = chatgpt::run_with_client_using_page_open_mode_and_reconnect_policy(
             &mut session.client,
             recipe_ctx,
             browser_context_id.clone(),
             live_attach_recipe_page_open_mode(),
+            live_attach_recipe_reconnect_policy(),
         )
-        .await
-        {
-            Ok(result) => result,
-            Err(err) if chatgpt::should_recover_initial_page_open_after_reconnect(&err) => {
-                if recipe_ctx.show_approval_guidance {
-                    eprintln!(
-                        "info: chrome-devtools-mcp lost the first ChatGPT page open; reconnecting once and retrying via an existing yoetz-owned anchor"
-                    );
-                }
-                self.reconnect_session_in_place(session).await?;
-                let (retry_browser_context_id, retry_control_run_id) = self
-                    .ensure_chatgpt_control_tab_for_selectors(
-                        session,
-                        recipe_ctx.browser_context_id.as_deref(),
-                        recipe_ctx.profile_email.as_deref(),
-                    )
-                    .await?;
-                recipe_ctx.cdp_endpoint = Some(session.client.ws_endpoint().to_string());
-                let retry_result = chatgpt::run_with_client_using_page_open_mode(
-                    &mut session.client,
-                    recipe_ctx,
-                    retry_browser_context_id.clone(),
-                    chatgpt::retry_initial_page_open_mode(),
-                )
-                .await
-                .context("retrying ChatGPT page open after reconnect")
-                .context(err)?;
-                self.record_target_success(
-                    &session.target.key,
-                    Some(session.client.ws_endpoint()),
-                    retry_browser_context_id.as_deref(),
-                    &retry_control_run_id,
-                )?;
-                session.target.endpoint = Some(session.client.ws_endpoint().to_string());
-                return Ok(retry_result);
-            }
-            Err(err) => return Err(err),
-        };
+        .await?;
 
         self.record_target_success(
             &session.target.key,
@@ -366,12 +326,63 @@ impl LiveAttachDaemon {
         Ok(result)
     }
 
-    async fn take_or_connect_session(&mut self, target: LiveAttachTarget) -> Result<DaemonSession> {
-        if let Some(session) = self.sessions.remove(&target.key) {
+    async fn take_or_connect_session(
+        &mut self,
+        target: LiveAttachTarget,
+        initial_attach_policy: InitialAttachPolicy,
+    ) -> Result<DaemonSession> {
+        let target_key = target.key.clone();
+        for session_key in self.session_lookup_keys(&target) {
+            let Some(mut session) = self.sessions.remove(&session_key) else {
+                continue;
+            };
+            if let Err(err) = session.client.probe_liveness(750) {
+                let err = single_approval_transport_closed_error(err);
+                self.record_session_terminal_error(&target_key, &session, &err)?;
+                return Err(err);
+            }
+            session.target = session_target_for_alias(target, &session);
             return Ok(session);
         }
 
+        if let Some(err) = self.automatic_reattach_blocked_error_for_target(&target) {
+            return Err(err);
+        }
+
+        if let Some(err) = self.hidden_initial_attach_blocked_error(&target, initial_attach_policy)
+        {
+            return Err(err);
+        }
+
         self.connect_session(target).await
+    }
+
+    fn session_lookup_keys(&self, target: &LiveAttachTarget) -> Vec<String> {
+        let mut keys = Vec::new();
+        push_unique(
+            &mut keys,
+            self.session_key_by_alias.get(&target.key).cloned(),
+        );
+        push_unique(&mut keys, session_key_for_target(target));
+        push_unique(
+            &mut keys,
+            self.state
+                .sessions
+                .get(&target.key)
+                .and_then(|state| state.endpoint.as_deref())
+                .map(endpoint_session_key),
+        );
+        push_unique(&mut keys, Some(target.key.clone()));
+        keys
+    }
+
+    fn store_session(&mut self, alias_key: String, session: DaemonSession) {
+        let session_key = session_key_for_session(&session);
+        self.session_key_by_alias
+            .insert(alias_key, session_key.clone());
+        self.session_key_by_alias
+            .insert(session.target.key.clone(), session_key.clone());
+        self.sessions.insert(session_key, session);
     }
 
     async fn connect_session(&mut self, mut target: LiveAttachTarget) -> Result<DaemonSession> {
@@ -383,11 +394,6 @@ impl LiveAttachDaemon {
         target.endpoint = Some(actual_endpoint);
 
         Ok(DaemonSession { target, client })
-    }
-
-    async fn reconnect_session_in_place(&mut self, session: &mut DaemonSession) -> Result<()> {
-        *session = self.connect_session(session.target.clone()).await?;
-        Ok(())
     }
 
     async fn ensure_chatgpt_control_tab_for_selectors(
@@ -449,6 +455,7 @@ impl LiveAttachDaemon {
         target.status = Some(LiveAttachStatus::Attached);
         target.updated_at_unix_ms = Some(now);
         target.last_error = None;
+        target.automatic_reattach_blocked = false;
         target
             .contexts
             .entry(context_storage_key(browser_context_id))
@@ -484,6 +491,198 @@ impl LiveAttachDaemon {
         target.last_error = Some(format!("{err:#}"));
         save_state(&self.state)
     }
+
+    fn record_target_terminal_error(
+        &mut self,
+        target_key: &str,
+        endpoint: Option<&str>,
+        err: &anyhow::Error,
+    ) -> Result<()> {
+        let target = self.ensure_target_record(target_key);
+        target.endpoint = endpoint
+            .map(str::to_owned)
+            .or_else(|| target.endpoint.clone());
+        target.status = Some(LiveAttachStatus::Degraded);
+        target.updated_at_unix_ms = Some(unix_ms_now());
+        target.last_error = Some(format!("{err:#}"));
+        target.automatic_reattach_blocked = true;
+        save_state(&self.state)
+    }
+
+    fn record_session_terminal_error(
+        &mut self,
+        target_key: &str,
+        session: &DaemonSession,
+        err: &anyhow::Error,
+    ) -> Result<()> {
+        let session_key = session_key_for_session(session);
+        let endpoint = session
+            .target
+            .endpoint
+            .clone()
+            .unwrap_or_else(|| session.client.ws_endpoint().to_string());
+        let mut aliases = vec![target_key.to_string(), session.target.key.clone()];
+        aliases.extend(
+            self.session_key_by_alias
+                .iter()
+                .filter(|(_, key)| *key == &session_key)
+                .map(|(alias, _)| alias.clone()),
+        );
+        aliases.sort();
+        aliases.dedup();
+        for alias in aliases {
+            self.record_target_terminal_error(&alias, Some(&endpoint), err)?;
+        }
+        Ok(())
+    }
+
+    fn automatic_reattach_blocked_error(&self, target_key: &str) -> Option<anyhow::Error> {
+        if let Some(err) = self.automatic_reattach_blocked_error_for_alias(target_key) {
+            return Some(err);
+        }
+        let session_key = self.session_key_by_alias.get(target_key)?;
+        self.session_key_by_alias
+            .iter()
+            .filter(|(_, key)| *key == session_key)
+            .find_map(|(alias, _)| self.automatic_reattach_blocked_error_for_alias(alias))
+    }
+
+    fn automatic_reattach_blocked_error_for_target(
+        &self,
+        target: &LiveAttachTarget,
+    ) -> Option<anyhow::Error> {
+        if let Some(err) = self.automatic_reattach_blocked_error(&target.key) {
+            return Some(err);
+        }
+        let (alias, state) = self.persisted_state_for_target(target)?;
+        if state.automatic_reattach_blocked {
+            return self.automatic_reattach_blocked_error_for_alias(alias);
+        }
+        None
+    }
+
+    fn automatic_reattach_blocked_error_for_alias(
+        &self,
+        target_key: &str,
+    ) -> Option<anyhow::Error> {
+        let target = self.state.sessions.get(target_key)?;
+        if !target.automatic_reattach_blocked {
+            return None;
+        }
+        let last_error = target
+            .last_error
+            .as_deref()
+            .unwrap_or("the approved Chrome websocket is no longer usable");
+        Some(anyhow!(
+            "automatic Chrome reattach is disabled for live-attach target `{target_key}` because the previously approved websocket failed: {last_error}\nRun `yoetz browser reset` before reattaching so any new Chrome remote-debugging approval is explicit."
+        ))
+    }
+
+    fn hidden_initial_attach_blocked_error(
+        &self,
+        target: &LiveAttachTarget,
+        initial_attach_policy: InitialAttachPolicy,
+    ) -> Option<anyhow::Error> {
+        if initial_attach_policy == InitialAttachPolicy::Allow {
+            return None;
+        }
+        let (alias, state) = self.persisted_state_for_target(target)?;
+        if state.endpoint.is_none() && state.status != Some(LiveAttachStatus::Attached) {
+            return None;
+        }
+        Some(anyhow!(
+            "no live approved Chrome websocket is available for live-attach target `{}`. Persisted target `{alias}` was owned by a previous live-attach daemon, and yoetz will not create a new Chrome CDP websocket from a recipe because that can trigger another remote-debugging approval prompt. Run `yoetz browser attach` to reapprove explicitly, or run `yoetz browser reset` to clear the stale owner state.",
+            target.key
+        ))
+    }
+
+    fn persisted_state_for_target(
+        &self,
+        target: &LiveAttachTarget,
+    ) -> Option<(&str, &PersistedTargetState)> {
+        if let Some((alias, state)) = self.state.sessions.get_key_value(&target.key) {
+            return Some((alias.as_str(), state));
+        }
+        let session_key = session_key_for_target(target)?;
+        self.state
+            .sessions
+            .iter()
+            .find(|(_, state)| {
+                state
+                    .endpoint
+                    .as_deref()
+                    .map(endpoint_session_key)
+                    .as_deref()
+                    == Some(session_key.as_str())
+            })
+            .map(|(alias, state)| (alias.as_str(), state))
+    }
+}
+
+fn single_approval_transport_closed_error(err: anyhow::Error) -> anyhow::Error {
+    err.context(
+        "approved Chrome CDP websocket closed; yoetz live-attach will not reconnect automatically because that can trigger another Chrome remote-debugging approval prompt. Run `yoetz browser reset` before reattaching",
+    )
+}
+
+fn endpoint_session_key(endpoint: &str) -> String {
+    format!("endpoint:{endpoint}")
+}
+
+fn session_key_for_target(target: &LiveAttachTarget) -> Option<String> {
+    resolve_connect_endpoint(target)
+        .as_deref()
+        .and_then(canonical_endpoint_session_key)
+        .or_else(|| {
+            target
+                .endpoint
+                .as_deref()
+                .and_then(canonical_endpoint_session_key)
+        })
+}
+
+fn session_key_for_session(session: &DaemonSession) -> String {
+    canonical_endpoint_session_key(session.client.ws_endpoint())
+        .or_else(|| {
+            session
+                .target
+                .endpoint
+                .as_deref()
+                .and_then(canonical_endpoint_session_key)
+        })
+        .unwrap_or_else(|| session.target.key.clone())
+}
+
+fn canonical_endpoint_session_key(endpoint: &str) -> Option<String> {
+    if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+        Some(endpoint_session_key(endpoint))
+    } else {
+        None
+    }
+}
+
+fn session_target_for_alias(
+    mut target: LiveAttachTarget,
+    session: &DaemonSession,
+) -> LiveAttachTarget {
+    let endpoint = Some(session.client.ws_endpoint().to_string());
+    target.endpoint = endpoint.clone();
+    target.browser_id =
+        browser_id_from_ws_endpoint(session.client.ws_endpoint()).or(target.browser_id);
+    target.connect_endpoint = target
+        .connect_endpoint
+        .or_else(|| session.target.connect_endpoint.clone())
+        .or(endpoint);
+    target
+}
+
+fn push_unique(values: &mut Vec<String>, value: Option<String>) {
+    let Some(value) = value else {
+        return;
+    };
+    if !values.contains(&value) {
+        values.push(value);
+    }
 }
 
 fn live_attach_recipe_page_open_mode() -> chatgpt::InitialPageOpenMode {
@@ -493,6 +692,10 @@ fn live_attach_recipe_page_open_mode() -> chatgpt::InitialPageOpenMode {
     // default-profile Chrome builds can close the approved CDP websocket on
     // external new-target creation and force another consent dialog.
     chatgpt::retry_initial_page_open_mode()
+}
+
+fn live_attach_recipe_reconnect_policy() -> chatgpt::ReconnectPolicy {
+    chatgpt::ReconnectPolicy::Never
 }
 
 pub async fn ensure_chatgpt_session(
@@ -1345,6 +1548,192 @@ mod tests {
     }
 
     #[test]
+    fn live_attach_recipe_disables_hidden_reconnects() {
+        assert_eq!(
+            live_attach_recipe_reconnect_policy(),
+            chatgpt::ReconnectPolicy::Never
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn terminal_transport_error_blocks_automatic_reattach_until_success() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("live-attach.json");
+        let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
+        let mut daemon = LiveAttachDaemon {
+            state: LiveAttachState::default(),
+            sessions: BTreeMap::new(),
+            session_key_by_alias: BTreeMap::new(),
+        };
+        let target_key = "implicit-default";
+        let endpoint = "ws://127.0.0.1:9222/devtools/browser/test";
+        let err = single_approval_transport_closed_error(anyhow!(
+            "Unable to make method calls because underlying connection is closed"
+        ));
+
+        daemon
+            .record_target_terminal_error(target_key, Some(endpoint), &err)
+            .unwrap();
+        let blocked = daemon
+            .automatic_reattach_blocked_error(target_key)
+            .expect("terminal transport error should block automatic reattach");
+        let blocked = format!("{blocked:#}");
+        assert!(blocked.contains("automatic Chrome reattach is disabled"));
+        assert!(blocked.contains("yoetz browser reset"));
+
+        daemon
+            .record_target_success(target_key, Some(endpoint), None, "control-run")
+            .unwrap();
+        assert!(
+            daemon
+                .automatic_reattach_blocked_error(target_key)
+                .is_none(),
+            "successful explicit attach should clear the reattach block"
+        );
+    }
+
+    #[test]
+    fn persisted_target_state_defaults_reattach_block_to_false() {
+        let state: PersistedTargetState = serde_json::from_str(
+            r#"{
+                "endpoint": "ws://127.0.0.1:9222/devtools/browser/test",
+                "status": "attached",
+                "updated_at_unix_ms": 1,
+                "last_error": null,
+                "contexts": {}
+            }"#,
+        )
+        .unwrap();
+
+        assert!(!state.automatic_reattach_blocked);
+    }
+
+    #[test]
+    fn session_lookup_prefers_alias_binding_to_endpoint_key() {
+        let mut daemon = LiveAttachDaemon {
+            state: LiveAttachState::default(),
+            sessions: BTreeMap::new(),
+            session_key_by_alias: BTreeMap::from([(
+                IMPLICIT_TARGET_KEY.to_string(),
+                "endpoint:ws://127.0.0.1:9222/devtools/browser/test".to_string(),
+            )]),
+        };
+        daemon.state.sessions.insert(
+            IMPLICIT_TARGET_KEY.to_string(),
+            PersistedTargetState {
+                endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
+                status: Some(LiveAttachStatus::Attached),
+                updated_at_unix_ms: Some(1),
+                last_error: None,
+                automatic_reattach_blocked: false,
+                contexts: BTreeMap::new(),
+            },
+        );
+
+        assert_eq!(
+            daemon.session_lookup_keys(&LiveAttachTarget::from_resolved(None)),
+            vec![
+                "endpoint:ws://127.0.0.1:9222/devtools/browser/test".to_string(),
+                IMPLICIT_TARGET_KEY.to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn session_key_for_target_uses_canonical_ws_endpoint_not_alias() {
+        let target = LiveAttachTarget {
+            key: "endpoint:http://127.0.0.1:9222".to_string(),
+            connect_endpoint: Some("http://127.0.0.1:9222".to_string()),
+            endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
+            source_path: None,
+            browser_id: None,
+            implicit_default: false,
+        };
+
+        assert_eq!(
+            session_key_for_target(&target),
+            Some("endpoint:ws://127.0.0.1:9222/devtools/browser/test".to_string())
+        );
+    }
+
+    #[test]
+    fn automatic_reattach_block_applies_to_endpoint_aliases() {
+        let endpoint_key = "endpoint:ws://127.0.0.1:9222/devtools/browser/test".to_string();
+        let mut daemon = LiveAttachDaemon {
+            state: LiveAttachState::default(),
+            sessions: BTreeMap::new(),
+            session_key_by_alias: BTreeMap::from([
+                ("source-path:/tmp/chrome".to_string(), endpoint_key.clone()),
+                ("browser-id:test".to_string(), endpoint_key),
+            ]),
+        };
+        daemon.state.sessions.insert(
+            "source-path:/tmp/chrome".to_string(),
+            PersistedTargetState {
+                endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
+                status: Some(LiveAttachStatus::Degraded),
+                updated_at_unix_ms: Some(1),
+                last_error: Some("closed transport".to_string()),
+                automatic_reattach_blocked: true,
+                contexts: BTreeMap::new(),
+            },
+        );
+
+        let err = daemon
+            .automatic_reattach_blocked_error("browser-id:test")
+            .expect("endpoint alias should inherit the terminal reattach block");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("source-path:/tmp/chrome"));
+        assert!(msg.contains("yoetz browser reset"));
+    }
+
+    #[test]
+    fn recipe_attach_policy_blocks_persisted_owner_after_daemon_restart() {
+        let mut daemon = LiveAttachDaemon {
+            state: LiveAttachState::default(),
+            sessions: BTreeMap::new(),
+            session_key_by_alias: BTreeMap::new(),
+        };
+        daemon.state.sessions.insert(
+            "source-path:/tmp/chrome".to_string(),
+            PersistedTargetState {
+                endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
+                status: Some(LiveAttachStatus::Attached),
+                updated_at_unix_ms: Some(1),
+                last_error: None,
+                automatic_reattach_blocked: false,
+                contexts: BTreeMap::new(),
+            },
+        );
+        let target = LiveAttachTarget {
+            key: "browser-id:test".to_string(),
+            connect_endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
+            endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
+            source_path: None,
+            browser_id: Some("test".to_string()),
+            implicit_default: false,
+        };
+
+        let err = daemon
+            .hidden_initial_attach_blocked_error(
+                &target,
+                InitialAttachPolicy::RequireLiveSessionIfPersisted,
+            )
+            .expect("recipe should not auto-reattach after daemon restart");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("previous live-attach daemon"), "{msg}");
+        assert!(msg.contains("yoetz browser attach"), "{msg}");
+        assert!(
+            daemon
+                .hidden_initial_attach_blocked_error(&target, InitialAttachPolicy::Allow)
+                .is_none(),
+            "explicit attach flow may establish a new approved owner"
+        );
+    }
+
+    #[test]
     #[serial]
     fn reset_removes_state_and_daemon_metadata_files() {
         let _guard = lock_env();
@@ -1362,6 +1751,7 @@ mod tests {
                     status: Some(LiveAttachStatus::Attached),
                     updated_at_unix_ms: Some(unix_ms_now()),
                     last_error: None,
+                    automatic_reattach_blocked: false,
                     contexts: BTreeMap::new(),
                 },
             )]),
@@ -1573,6 +1963,7 @@ mod tests {
             let daemon = Arc::new(AsyncMutex::new(LiveAttachDaemon {
                 state: LiveAttachState::default(),
                 sessions: BTreeMap::new(),
+                session_key_by_alias: BTreeMap::new(),
             }));
             let _busy = daemon.lock().await;
             let shutdown = Arc::new(Notify::new());
