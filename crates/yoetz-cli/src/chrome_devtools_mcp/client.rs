@@ -9,7 +9,7 @@ use headless_chrome::{
 };
 use reqwest::Url;
 use serde::de::DeserializeOwned;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -94,6 +94,35 @@ pub struct CdpMcpClient {
     browser: Browser,
     selected_tab: Mutex<Option<Arc<Tab>>>,
     ws_endpoint: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BrowserFingerprint {
+    pub ws_endpoint: String,
+    pub browser_id: Option<String>,
+    pub source_path: Option<PathBuf>,
+    pub listener_pid: Option<u32>,
+    pub listener_started_at: Option<u64>,
+    pub user_data_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum CdpFailure {
+    #[error("Chrome transport closed")]
+    TransportClosed { source: anyhow::Error },
+
+    #[error("Chrome default-profile rejected Target.createTarget")]
+    TargetCreateDenied {
+        url: String,
+        transport_closed: bool,
+        source: anyhow::Error,
+    },
+
+    #[error("Chrome browser process changed")]
+    ChromeRestarted {
+        previous: Box<BrowserFingerprint>,
+        current: Box<BrowserFingerprint>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -318,7 +347,7 @@ struct BrowserContextPage {
 
 impl CdpMcpClient {
     pub async fn connect_to_running_chrome(cdp_endpoint: Option<&str>) -> Result<Self> {
-        let ws_endpoint = resolve_connect_ws_endpoint(cdp_endpoint)?;
+        let ws_endpoint = resolve_canonical_ws_endpoint(cdp_endpoint)?;
         let browser = Browser::connect_with_timeout(
             ws_endpoint.clone(),
             Duration::from_secs(CDP_SESSION_IDLE_TIMEOUT_SECS),
@@ -351,7 +380,7 @@ impl CdpMcpClient {
             })
             .context("spawn Chrome CDP session liveness probe")?;
 
-        receive_liveness_probe_result(rx, timeout)
+        receive_liveness_probe_result(rx, timeout).map_err(classify_transport_closed_error)
     }
 
     pub async fn new_page(
@@ -399,9 +428,14 @@ impl CdpMcpClient {
                 let err = anyhow!(err);
                 let err = if should_classify_external_create_target_block(&err, browser_context_id)
                 {
-                    err.context(external_create_target_block_guidance(url))
+                    anyhow!(CdpFailure::TargetCreateDenied {
+                        url: url.to_string(),
+                        transport_closed: has_closed_cdp_transport_message(&err),
+                        source: err,
+                    })
+                    .context(external_create_target_block_guidance(url))
                 } else {
-                    err
+                    classify_transport_closed_error(err)
                 };
                 return Err(err)
                     .with_context(|| format!("creating a new Chrome page for `{url}` failed"));
@@ -1126,6 +1160,12 @@ enum ChatgptRecoveryStrategy {
 }
 
 pub(crate) fn is_external_create_target_block_error(err: &anyhow::Error) -> bool {
+    if matches!(
+        err.downcast_ref::<CdpFailure>(),
+        Some(CdpFailure::TargetCreateDenied { .. })
+    ) {
+        return true;
+    }
     let message = format!("{err:#}").to_ascii_lowercase();
     message.contains("target.createtarget")
         && message.contains("chrome://inspect/#remote-debugging")
@@ -1210,10 +1250,71 @@ fn choose_chatgpt_recovery_strategy(
 }
 
 pub fn is_closed_cdp_transport_error(err: &anyhow::Error) -> bool {
+    if let Some(failure) = err.downcast_ref::<CdpFailure>() {
+        return match failure {
+            CdpFailure::TransportClosed { .. } => true,
+            CdpFailure::TargetCreateDenied {
+                transport_closed, ..
+            } => *transport_closed,
+            CdpFailure::ChromeRestarted { .. } => false,
+        };
+    }
+    has_closed_cdp_transport_message(err)
+}
+
+fn has_closed_cdp_transport_message(err: &anyhow::Error) -> bool {
     let message = format!("{err:#}").to_ascii_lowercase();
     message.contains("underlying connection is closed")
         || message.contains("connectionclosed")
         || message.contains("received shutdown message")
+}
+
+pub fn cdp_failure_from_error(err: &anyhow::Error) -> Option<&CdpFailure> {
+    err.downcast_ref::<CdpFailure>()
+}
+
+pub fn classify_cdp_failure(err: anyhow::Error) -> anyhow::Error {
+    if cdp_failure_from_error(&err).is_some() {
+        return err;
+    }
+    if is_external_create_target_block_error(&err) {
+        return anyhow!(CdpFailure::TargetCreateDenied {
+            url: target_create_denied_url_from_error(&err)
+                .unwrap_or_else(|| "<unknown>".to_string()),
+            transport_closed: has_closed_cdp_transport_message(&err),
+            source: err,
+        });
+    }
+    classify_transport_closed_error(err)
+}
+
+pub fn is_terminal_cdp_failure(err: &anyhow::Error) -> bool {
+    matches!(
+        cdp_failure_from_error(err),
+        Some(CdpFailure::TransportClosed { .. })
+            | Some(CdpFailure::ChromeRestarted { .. })
+            | Some(CdpFailure::TargetCreateDenied {
+                transport_closed: true,
+                ..
+            })
+    )
+}
+
+fn classify_transport_closed_error(err: anyhow::Error) -> anyhow::Error {
+    if has_closed_cdp_transport_message(&err) {
+        anyhow!(CdpFailure::TransportClosed { source: err })
+    } else {
+        err
+    }
+}
+
+fn target_create_denied_url_from_error(err: &anyhow::Error) -> Option<String> {
+    let message = format!("{err:#}");
+    let marker = "while opening `";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    let end = rest.find('`')?;
+    Some(rest[..end].to_string())
 }
 
 fn external_create_target_block_guidance(url: &str) -> String {
@@ -1268,7 +1369,7 @@ fn browser_context_label(browser_context_id: Option<&str>) -> String {
         .unwrap_or_else(|| "the default browser context".to_string())
 }
 
-fn resolve_connect_ws_endpoint(cdp_endpoint: Option<&str>) -> Result<String> {
+pub fn resolve_canonical_ws_endpoint(cdp_endpoint: Option<&str>) -> Result<String> {
     match cdp_endpoint {
         Some(endpoint) => {
             let parsed = Url::parse(endpoint)
@@ -1283,6 +1384,17 @@ fn resolve_connect_ws_endpoint(cdp_endpoint: Option<&str>) -> Result<String> {
                 .expect("DEFAULT_LOCAL_CDP_ENDPOINT must be a valid URL");
             resolve_browser_websocket(&parsed)
         }
+    }
+}
+
+pub fn fingerprint_for_ws_endpoint(ws_endpoint: &str) -> BrowserFingerprint {
+    BrowserFingerprint {
+        ws_endpoint: ws_endpoint.to_string(),
+        browser_id: browser_id_from_ws_endpoint(ws_endpoint),
+        source_path: None,
+        listener_pid: None,
+        listener_started_at: None,
+        user_data_dir: None,
     }
 }
 
