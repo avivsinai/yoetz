@@ -3609,21 +3609,33 @@ mod tests {
             health: live_attach::DaemonHealth::Healthy,
             pid: Some(1),
             session_count: 0,
+            endpoint_session_count: 0,
+            target_alias_count: 0,
+            poisoned_count: 0,
         }));
         assert!(live_attach_owner_present(&live_attach::DaemonSummary {
             health: live_attach::DaemonHealth::Healthy,
             pid: Some(1),
             session_count: 1,
+            endpoint_session_count: 1,
+            target_alias_count: 1,
+            poisoned_count: 0,
         }));
         assert!(live_attach_owner_present(&live_attach::DaemonSummary {
             health: live_attach::DaemonHealth::Busy,
             pid: Some(1),
             session_count: 0,
+            endpoint_session_count: 0,
+            target_alias_count: 0,
+            poisoned_count: 0,
         }));
         assert!(!live_attach_owner_present(&live_attach::DaemonSummary {
             health: live_attach::DaemonHealth::NotRunning,
             pid: None,
             session_count: 0,
+            endpoint_session_count: 0,
+            target_alias_count: 0,
+            poisoned_count: 0,
         }));
     }
 

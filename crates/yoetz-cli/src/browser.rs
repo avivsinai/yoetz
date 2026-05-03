@@ -3250,8 +3250,10 @@ fn browser_doctor_report_with_discovery(
             .live_attach_daemon
             .pid
             .map(|pid| format!(
-                " (pid {pid}, sessions {})",
-                helpers.live_attach_daemon.session_count
+                " (pid {pid}, endpoints {}, aliases {}, poisoned {})",
+                helpers.live_attach_daemon.endpoint_session_count,
+                helpers.live_attach_daemon.target_alias_count,
+                helpers.live_attach_daemon.poisoned_count
             ))
             .unwrap_or_default()
     ));
@@ -4434,6 +4436,9 @@ mod tests {
             health: crate::live_attach::DaemonHealth::NotRunning,
             pid: None,
             session_count: 0,
+            endpoint_session_count: 0,
+            target_alias_count: 0,
+            poisoned_count: 0,
         }
     }
 
@@ -5229,6 +5234,9 @@ browser_cdp = "http://evil.example.com:9222"
                     health: crate::live_attach::DaemonHealth::Stale,
                     pid: Some(4444),
                     session_count: 0,
+                    endpoint_session_count: 0,
+                    target_alias_count: 0,
+                    poisoned_count: 0,
                 },
                 yoetz_live_cdp_processes: vec![BrowserHelperProcessSummary {
                     pid: 2223,
@@ -5283,6 +5291,9 @@ browser_cdp = "http://evil.example.com:9222"
                     health: crate::live_attach::DaemonHealth::Busy,
                     pid: Some(4444),
                     session_count: 0,
+                    endpoint_session_count: 0,
+                    target_alias_count: 0,
+                    poisoned_count: 0,
                 },
                 yoetz_live_cdp_processes: vec![],
                 dev_browser_processes: vec![],
@@ -5290,7 +5301,9 @@ browser_cdp = "http://evil.example.com:9222"
                 recommended_actions: vec!["None required.".to_string()],
             },
         );
-        assert!(report.contains("yoetz live-attach daemon: busy (pid 4444, sessions 0)"));
+        assert!(report.contains(
+            "yoetz live-attach daemon: busy (pid 4444, endpoints 0, aliases 0, poisoned 0)"
+        ));
         assert!(report.contains("status ping timed out while the owner was busy"));
         assert!(!report.contains("looks stale"));
     }
