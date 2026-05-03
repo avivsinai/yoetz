@@ -3198,6 +3198,7 @@ dependencies = [
  "clap",
  "dotenvy",
  "fs2",
+ "futures-util",
  "headless_chrome",
  "hex",
  "jsonschema",

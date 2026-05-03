@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Context, Result};
 use fs2::FileExt;
+use futures_util::FutureExt;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -109,7 +111,7 @@ impl BrowserFingerprint {
     }
 }
 
-// TODO(stage-b-slice-2): Wire the remaining terminal states directly from typed
+// TODO(stage-b-slice-3): Wire the remaining terminal states directly from typed
 // CDP failures and panic boundaries instead of only using Approved/TransportClosed.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "kebab-case")]
@@ -411,9 +413,175 @@ struct DaemonSession {
     endpoint_key: EndpointKey,
     aliases: BTreeSet<TargetAlias>,
     target: LiveAttachTarget,
-    client: CdpMcpClient,
+    client: DaemonSessionClient,
     fingerprint: BrowserFingerprint,
     state: SessionState,
+    contexts: BTreeMap<String, PersistedContextState>,
+}
+
+struct RuntimeSession {
+    endpoint_key: EndpointKey,
+    inner: AsyncMutex<Option<DaemonSession>>,
+}
+
+impl RuntimeSession {
+    fn new(session: DaemonSession) -> Self {
+        Self {
+            endpoint_key: session.endpoint_key.clone(),
+            inner: AsyncMutex::new(Some(session)),
+        }
+    }
+}
+
+struct SessionLease {
+    target_alias: TargetAlias,
+    target_key: String,
+    target: LiveAttachTarget,
+    runtime: Arc<RuntimeSession>,
+}
+
+#[derive(Clone)]
+struct DaemonSessionSnapshot {
+    endpoint_key: EndpointKey,
+    aliases: BTreeSet<TargetAlias>,
+    target: LiveAttachTarget,
+    endpoint: String,
+    fingerprint: BrowserFingerprint,
+    state: SessionState,
+    contexts: BTreeMap<String, PersistedContextState>,
+}
+
+impl DaemonSessionSnapshot {
+    fn from_session(session: &DaemonSession) -> Self {
+        Self {
+            endpoint_key: session.endpoint_key.clone(),
+            aliases: session.aliases.clone(),
+            target: session.target.clone(),
+            endpoint: session
+                .target
+                .endpoint
+                .clone()
+                .unwrap_or_else(|| session.client.ws_endpoint().to_string()),
+            fingerprint: session.fingerprint.clone(),
+            state: session.state.clone(),
+            contexts: session.contexts.clone(),
+        }
+    }
+}
+
+enum DaemonSessionClient {
+    Real(CdpMcpClient),
+    #[cfg(test)]
+    Test(TestSessionClient),
+}
+
+impl DaemonSessionClient {
+    fn ws_endpoint(&self) -> &str {
+        match self {
+            Self::Real(client) => client.ws_endpoint(),
+            #[cfg(test)]
+            Self::Test(client) => &client.ws_endpoint,
+        }
+    }
+
+    fn probe_liveness(&self, timeout_ms: u64) -> Result<()> {
+        match self {
+            Self::Real(client) => client.probe_liveness(timeout_ms),
+            #[cfg(test)]
+            Self::Test(_) => Ok(()),
+        }
+    }
+
+    fn resolve_browser_context_id(
+        &self,
+        explicit_context_id: Option<&str>,
+        profile_email: Option<&str>,
+    ) -> Result<Option<String>> {
+        match self {
+            Self::Real(client) => {
+                client.resolve_browser_context_id(explicit_context_id, profile_email)
+            }
+            #[cfg(test)]
+            Self::Test(_) => Ok(explicit_context_id.map(str::to_owned)),
+        }
+    }
+
+    async fn ensure_chatgpt_control_tab_ready(
+        &self,
+        browser_context_id: Option<&str>,
+        control_run_id: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Real(client) => {
+                chatgpt::ensure_chatgpt_control_tab_ready(
+                    client,
+                    browser_context_id,
+                    Some(control_run_id),
+                )
+                .await
+            }
+            #[cfg(test)]
+            Self::Test(_) => Ok(()),
+        }
+    }
+
+    async fn run_chatgpt_recipe(
+        &mut self,
+        recipe_ctx: &chrome_devtools_mcp::DevtoolsMcpRecipeContext,
+        browser_context_id: Option<String>,
+    ) -> Result<ChatgptRunResult> {
+        match self {
+            Self::Real(client) => {
+                chatgpt::run_with_client_using_page_open_mode_and_reconnect_policy(
+                    client,
+                    recipe_ctx,
+                    browser_context_id,
+                    live_attach_recipe_page_open_mode(),
+                    live_attach_recipe_reconnect_policy(),
+                )
+                .await
+            }
+            #[cfg(test)]
+            Self::Test(client) => client.run_chatgpt_recipe().await,
+        }
+    }
+}
+
+#[cfg(test)]
+struct TestSessionClient {
+    ws_endpoint: String,
+    recipe_behavior: TestRecipeBehavior,
+}
+
+#[cfg(test)]
+enum TestRecipeBehavior {
+    Succeed,
+    Panic(String),
+    Block {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+    },
+}
+
+#[cfg(test)]
+impl TestSessionClient {
+    async fn run_chatgpt_recipe(&mut self) -> Result<ChatgptRunResult> {
+        match &self.recipe_behavior {
+            TestRecipeBehavior::Succeed => Ok(ChatgptRunResult {
+                response: "ok".to_string(),
+                model_used: None,
+            }),
+            TestRecipeBehavior::Panic(message) => panic!("{message}"),
+            TestRecipeBehavior::Block { started, release } => {
+                started.notify_one();
+                release.notified().await;
+                Ok(ChatgptRunResult {
+                    response: "ok".to_string(),
+                    model_used: None,
+                })
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -424,7 +592,7 @@ enum InitialAttachPolicy {
 
 struct LiveAttachDaemon {
     state: LiveAttachState,
-    sessions_by_endpoint: BTreeMap<EndpointKey, DaemonSession>,
+    sessions_by_endpoint: BTreeMap<EndpointKey, Arc<RuntimeSession>>,
     endpoint_by_alias: BTreeMap<TargetAlias, EndpointKey>,
 }
 
@@ -448,163 +616,52 @@ impl LiveAttachDaemon {
         })
     }
 
-    async fn ensure_chatgpt_session(
-        &mut self,
-        target: LiveAttachTarget,
-        explicit_context_id: Option<&str>,
-        profile_email: Option<&str>,
-    ) -> Result<LiveAttachSession> {
-        let target_key = target.key.clone();
-        let mut session = self
-            .take_or_connect_session(target, InitialAttachPolicy::Allow)
-            .await?;
-
-        match self
-            .ensure_chatgpt_session_with_session(&mut session, explicit_context_id, profile_email)
-            .await
-        {
-            Ok(session_info) => {
-                self.store_session(target_key.clone(), session);
-                Ok(session_info)
-            }
-            Err(err) if is_closed_cdp_transport_error(&err) => {
-                let err = single_approval_transport_closed_error(err);
-                self.record_session_terminal_error(
-                    &TargetAlias(target_key.clone()),
-                    &session,
-                    &err,
-                )?;
-                Err(err)
-            }
-            Err(err) => {
-                self.record_target_error(&target_key, session.target.endpoint.as_deref(), &err)?;
-                self.store_session(target_key.clone(), session);
-                Err(err)
-            }
-        }
-    }
-
-    async fn ensure_chatgpt_session_with_session(
-        &mut self,
-        session: &mut DaemonSession,
-        explicit_context_id: Option<&str>,
-        profile_email: Option<&str>,
-    ) -> Result<LiveAttachSession> {
-        let (browser_context_id, control_run_id) = self
-            .ensure_chatgpt_control_tab_for_selectors(session, explicit_context_id, profile_email)
-            .await?;
-
-        self.record_session_success(session, browser_context_id.as_deref(), &control_run_id)?;
-        session.target.endpoint = Some(session.client.ws_endpoint().to_string());
-
-        Ok(LiveAttachSession {
-            target_key: session.target.key.clone(),
-            control_run_id,
-            browser_context_id,
-            status: LiveAttachStatus::Attached,
-            endpoint: session.target.endpoint.clone(),
-        })
-    }
-
-    async fn run_chatgpt_recipe(
-        &mut self,
-        target: LiveAttachTarget,
-        mut recipe_ctx: chrome_devtools_mcp::DevtoolsMcpRecipeContext,
-    ) -> Result<ChatgptRunResult> {
-        let target_key = target.key.clone();
-        let mut session = self
-            .take_or_connect_session(target, InitialAttachPolicy::RequireLiveSessionIfPersisted)
-            .await?;
-
-        if recipe_ctx.run_id.trim().is_empty() {
-            recipe_ctx.run_id = chatgpt_web::generate_run_id();
-        }
-
-        match self
-            .run_chatgpt_recipe_with_session(&mut session, &mut recipe_ctx)
-            .await
-        {
-            Ok(result) => {
-                self.store_session(target_key.clone(), session);
-                Ok(result)
-            }
-            Err(err) if is_closed_cdp_transport_error(&err) => {
-                let err = single_approval_transport_closed_error(err);
-                self.record_session_terminal_error(
-                    &TargetAlias(target_key.clone()),
-                    &session,
-                    &err,
-                )?;
-                Err(err)
-            }
-            Err(err) => {
-                self.record_target_error(&target_key, session.target.endpoint.as_deref(), &err)?;
-                self.store_session(target_key.clone(), session);
-                Err(err)
-            }
-        }
-    }
-
-    async fn run_chatgpt_recipe_with_session(
-        &mut self,
-        session: &mut DaemonSession,
-        recipe_ctx: &mut chrome_devtools_mcp::DevtoolsMcpRecipeContext,
-    ) -> Result<ChatgptRunResult> {
-        let (browser_context_id, control_run_id) = self
-            .ensure_chatgpt_control_tab_for_selectors(
-                session,
-                recipe_ctx.browser_context_id.as_deref(),
-                recipe_ctx.profile_email.as_deref(),
-            )
-            .await?;
-        recipe_ctx.cdp_endpoint = Some(session.client.ws_endpoint().to_string());
-        let result = chatgpt::run_with_client_using_page_open_mode_and_reconnect_policy(
-            &mut session.client,
-            recipe_ctx,
-            browser_context_id.clone(),
-            live_attach_recipe_page_open_mode(),
-            live_attach_recipe_reconnect_policy(),
-        )
-        .await?;
-
-        self.record_session_success(session, browser_context_id.as_deref(), &control_run_id)?;
-        session.target.endpoint = Some(session.client.ws_endpoint().to_string());
-
-        Ok(result)
-    }
-
-    async fn take_or_connect_session(
+    async fn checkout_session(
         &mut self,
         target: LiveAttachTarget,
         initial_attach_policy: InitialAttachPolicy,
-    ) -> Result<DaemonSession> {
+    ) -> Result<SessionLease> {
         let target_alias = target_alias_for_target(&target);
         for endpoint_key in self.session_lookup_keys(&target) {
-            let Some(mut session) = self.sessions_by_endpoint.remove(&endpoint_key) else {
+            let Some(runtime) = self.sessions_by_endpoint.get(&endpoint_key).cloned() else {
                 continue;
             };
-            if let Err(err) = session.client.probe_liveness(750) {
-                let err = single_approval_transport_closed_error(err);
-                self.record_session_terminal_error(&target_alias, &session, &err)?;
+            self.endpoint_by_alias
+                .insert(target_alias.clone(), runtime.endpoint_key.clone());
+            return Ok(SessionLease {
+                target_alias,
+                target_key: target.key.clone(),
+                target,
+                runtime,
+            });
+        }
+
+        if initial_attach_policy == InitialAttachPolicy::RequireLiveSessionIfPersisted {
+            if let Some(err) = self.automatic_reattach_blocked_error_for_target(&target) {
                 return Err(err);
             }
-            session.aliases.insert(target_alias.clone());
-            self.endpoint_by_alias
-                .insert(target_alias, session.endpoint_key.clone());
-            session.target = session_target_for_alias(target, &session);
-            return Ok(session);
+            if let Some(err) =
+                self.hidden_initial_attach_blocked_error(&target, initial_attach_policy)
+            {
+                return Err(err);
+            }
         }
 
-        if let Some(err) = self.automatic_reattach_blocked_error_for_target(&target) {
-            return Err(err);
-        }
-
-        if let Some(err) = self.hidden_initial_attach_blocked_error(&target, initial_attach_policy)
-        {
-            return Err(err);
-        }
-
-        self.connect_session(target).await
+        let target_key = target.key.clone();
+        let session = self.connect_session(target).await?;
+        let lease_target = session.target.clone();
+        let endpoint_key = session.endpoint_key.clone();
+        let runtime = Arc::new(RuntimeSession::new(session));
+        self.sessions_by_endpoint
+            .insert(endpoint_key.clone(), Arc::clone(&runtime));
+        self.endpoint_by_alias
+            .insert(target_alias.clone(), endpoint_key);
+        Ok(SessionLease {
+            target_alias,
+            target_key,
+            target: lease_target,
+            runtime,
+        })
     }
 
     fn session_lookup_keys(&self, target: &LiveAttachTarget) -> Vec<EndpointKey> {
@@ -622,22 +679,6 @@ impl LiveAttachDaemon {
         keys
     }
 
-    fn store_session(&mut self, alias_key: String, session: DaemonSession) {
-        let mut session = session;
-        // Checkout can rebind a live endpoint from one selector to another, so
-        // keep both the original request alias and the session's current alias.
-        session.aliases.insert(TargetAlias(alias_key));
-        session
-            .aliases
-            .insert(target_alias_for_target(&session.target));
-        for alias in &session.aliases {
-            self.endpoint_by_alias
-                .insert(alias.clone(), session.endpoint_key.clone());
-        }
-        self.sessions_by_endpoint
-            .insert(session.endpoint_key.clone(), session);
-    }
-
     async fn connect_session(&mut self, mut target: LiveAttachTarget) -> Result<DaemonSession> {
         let endpoint = resolve_connect_endpoint(&target);
         let client = chatgpt::connect_client_with_approval_lock(endpoint.as_deref(), false).await?;
@@ -653,35 +694,22 @@ impl LiveAttachDaemon {
             connected_at_unix_ms: unix_ms_now(),
         };
         self.record_alias_binding(&alias, &target, Some(endpoint_key.clone()), None);
+        let contexts = self
+            .state
+            .endpoints
+            .get(&endpoint_key)
+            .map(|endpoint| endpoint.contexts.clone())
+            .unwrap_or_default();
 
         Ok(DaemonSession {
             endpoint_key,
             aliases: BTreeSet::from([alias]),
             target,
-            client,
+            client: DaemonSessionClient::Real(client),
             fingerprint,
             state,
+            contexts,
         })
-    }
-
-    async fn ensure_chatgpt_control_tab_for_selectors(
-        &mut self,
-        session: &mut DaemonSession,
-        explicit_context_id: Option<&str>,
-        profile_email: Option<&str>,
-    ) -> Result<(Option<String>, String)> {
-        let browser_context_id = session
-            .client
-            .resolve_browser_context_id(explicit_context_id, profile_email)?;
-        let control_run_id =
-            self.control_run_id_for(&session.endpoint_key, browser_context_id.as_deref());
-        chatgpt::ensure_chatgpt_control_tab_ready(
-            &session.client,
-            browser_context_id.as_deref(),
-            Some(&control_run_id),
-        )
-        .await?;
-        Ok((browser_context_id, control_run_id))
     }
 
     fn record_alias_binding(
@@ -733,47 +761,7 @@ impl LiveAttachDaemon {
             })
     }
 
-    fn control_run_id_for(
-        &mut self,
-        endpoint_key: &EndpointKey,
-        browser_context_id: Option<&str>,
-    ) -> String {
-        let context_key = context_storage_key(browser_context_id);
-        let fingerprint = self
-            .state
-            .endpoints
-            .get(endpoint_key)
-            .map(|state| state.fingerprint.clone())
-            .unwrap_or_else(|| BrowserFingerprint {
-                ws_endpoint: endpoint_key.as_str().to_string(),
-                browser_id: browser_id_from_ws_endpoint(endpoint_key.as_str()),
-                source_path: None,
-                listener_pid: None,
-                listener_started_at: None,
-                user_data_dir: None,
-            });
-        let endpoint = self.ensure_endpoint_record(endpoint_key, fingerprint);
-        let now = unix_ms_now();
-        let context =
-            endpoint
-                .contexts
-                .entry(context_key)
-                .or_insert_with(|| PersistedContextState {
-                    browser_context_id: browser_context_id.map(str::to_owned),
-                    control_run_id: chatgpt_web::generate_run_id(),
-                    updated_at_unix_ms: now,
-                });
-        context.browser_context_id = browser_context_id.map(str::to_owned);
-        context.updated_at_unix_ms = now;
-        context.control_run_id.clone()
-    }
-
-    fn record_session_success(
-        &mut self,
-        session: &DaemonSession,
-        browser_context_id: Option<&str>,
-        control_run_id: &str,
-    ) -> Result<()> {
+    fn record_session_success(&mut self, session: &DaemonSessionSnapshot) -> Result<()> {
         let now = unix_ms_now();
         let mut aliases = session.aliases.clone();
         aliases.insert(target_alias_for_target(&session.target));
@@ -804,19 +792,7 @@ impl LiveAttachDaemon {
             connected_at_unix_ms,
         };
         endpoint.updated_at_unix_ms = now;
-        endpoint
-            .contexts
-            .entry(context_storage_key(browser_context_id))
-            .and_modify(|context| {
-                context.browser_context_id = browser_context_id.map(str::to_owned);
-                context.control_run_id = control_run_id.to_string();
-                context.updated_at_unix_ms = now;
-            })
-            .or_insert_with(|| PersistedContextState {
-                browser_context_id: browser_context_id.map(str::to_owned),
-                control_run_id: control_run_id.to_string(),
-                updated_at_unix_ms: now,
-            });
+        endpoint.contexts.extend(session.contexts.clone());
         save_state(&self.state)
     }
 
@@ -891,14 +867,9 @@ impl LiveAttachDaemon {
     fn record_session_terminal_error(
         &mut self,
         target_alias: &TargetAlias,
-        session: &DaemonSession,
+        session: &DaemonSessionSnapshot,
         err: &anyhow::Error,
     ) -> Result<()> {
-        let endpoint = session
-            .target
-            .endpoint
-            .clone()
-            .unwrap_or_else(|| session.client.ws_endpoint().to_string());
         let mut aliases = session.aliases.clone();
         aliases.insert(target_alias.clone());
         aliases.insert(target_alias_for_target(&session.target));
@@ -918,12 +889,71 @@ impl LiveAttachDaemon {
         for alias in aliases {
             self.record_target_terminal_error(
                 &alias,
-                Some(&endpoint),
+                Some(&session.endpoint),
                 session.fingerprint.clone(),
                 err,
             )?;
         }
         Ok(())
+    }
+
+    fn record_session_poisoned(
+        &mut self,
+        target_alias: &TargetAlias,
+        session: &DaemonSessionSnapshot,
+        panic_message: &str,
+    ) -> Result<()> {
+        let now = unix_ms_now();
+        let mut aliases = session.aliases.clone();
+        aliases.insert(target_alias.clone());
+        aliases.insert(target_alias_for_target(&session.target));
+        aliases.extend(
+            self.endpoint_by_alias
+                .iter()
+                .filter(|(_, endpoint_key)| *endpoint_key == &session.endpoint_key)
+                .map(|(alias, _)| alias.clone()),
+        );
+        aliases.extend(
+            self.state
+                .aliases
+                .iter()
+                .filter(|(_, state)| state.endpoint_key.as_ref() == Some(&session.endpoint_key))
+                .map(|(alias, _)| alias.clone()),
+        );
+
+        for alias in aliases {
+            let alias_state = self.state.aliases.entry(alias.clone()).or_default();
+            alias_state.endpoint_key = Some(session.endpoint_key.clone());
+            alias_state.source_path = session
+                .target
+                .source_path
+                .clone()
+                .or_else(|| alias_state.source_path.clone());
+            alias_state.browser_id = session
+                .target
+                .browser_id
+                .clone()
+                .or_else(|| alias_state.browser_id.clone());
+            alias_state.implicit_default = session.target.implicit_default;
+            alias_state.last_status = Some(LiveAttachStatus::Degraded);
+            alias_state.last_error = Some(panic_message.to_string());
+            alias_state.automatic_reattach_blocked = false;
+            alias_state.updated_at_unix_ms = now;
+            self.endpoint_by_alias
+                .insert(alias, session.endpoint_key.clone());
+        }
+
+        let endpoint =
+            self.ensure_endpoint_record(&session.endpoint_key, session.fingerprint.clone());
+        endpoint.fingerprint = session.fingerprint.clone();
+        endpoint.session_state = SessionState::Poisoned {
+            fingerprint: Some(session.fingerprint.clone()),
+            poisoned_at_unix_ms: now,
+            last_error: panic_message.to_string(),
+        };
+        endpoint.contexts.extend(session.contexts.clone());
+        endpoint.updated_at_unix_ms = now;
+        save_state(&self.state)
     }
 
     fn automatic_reattach_blocked_error(&self, target_key: &str) -> Option<anyhow::Error> {
@@ -1427,16 +1457,7 @@ async fn handle_daemon_connection(
 
     let request = serde_json::from_str::<DaemonRequest>(line.trim_end())
         .context("parse yoetz live-attach request")?;
-    let (response, shutdown_requested) = match dispatch_daemon_request(request, token, daemon).await
-    {
-        Ok(response) => response,
-        Err(err) => (
-            DaemonResponse::Error {
-                message: format!("{err:#}"),
-            },
-            false,
-        ),
-    };
+    let (response, shutdown_requested) = daemon_response_for_request(request, token, daemon).await;
 
     let socket = reader.get_mut();
     socket
@@ -1453,6 +1474,331 @@ async fn handle_daemon_connection(
     }
 
     Ok(())
+}
+
+enum SessionRequest {
+    EnsureSession {
+        browser_context_id: Option<String>,
+        profile_email: Option<String>,
+    },
+    RunRecipe {
+        recipe_ctx: chrome_devtools_mcp::DevtoolsMcpRecipeContext,
+    },
+}
+
+struct SessionExecutionSuccess {
+    response: DaemonResponse,
+    snapshot: DaemonSessionSnapshot,
+}
+
+enum SessionExecutionError {
+    TransportClosed {
+        err: anyhow::Error,
+        target_alias: TargetAlias,
+        snapshot: Box<DaemonSessionSnapshot>,
+    },
+    Other {
+        err: anyhow::Error,
+        target_key: String,
+        endpoint: Option<String>,
+    },
+}
+
+async fn run_session_request(
+    daemon: Arc<AsyncMutex<LiveAttachDaemon>>,
+    lease: SessionLease,
+    request: SessionRequest,
+) -> Result<DaemonResponse> {
+    let runtime = Arc::clone(&lease.runtime);
+    // This boundary catches panics that bubble through the awaited session
+    // future. The production ChatGPT recipe path should not detach unguarded
+    // `tokio::spawn` work underneath it; any future spawned task needs its own
+    // panic guard or an awaited JoinHandle whose panic is converted here.
+    let caught = AssertUnwindSafe(run_session_request_locked(&lease, request))
+        .catch_unwind()
+        .await;
+
+    match caught {
+        Ok(Ok(success)) => {
+            let mut daemon = daemon.lock().await;
+            daemon.record_session_success(&success.snapshot)?;
+            Ok(success.response)
+        }
+        Ok(Err(SessionExecutionError::TransportClosed {
+            err,
+            target_alias,
+            snapshot,
+        })) => {
+            let mut daemon = daemon.lock().await;
+            daemon.record_session_terminal_error(&target_alias, &snapshot, &err)?;
+            daemon.sessions_by_endpoint.remove(&snapshot.endpoint_key);
+            Err(err)
+        }
+        Ok(Err(SessionExecutionError::Other {
+            err,
+            target_key,
+            endpoint,
+        })) => {
+            let mut daemon = daemon.lock().await;
+            daemon.record_target_error(&target_key, endpoint.as_deref(), &err)?;
+            Err(err)
+        }
+        Err(payload) => {
+            let panic_message = format!("panic: {}", panic_payload_to_string(payload));
+            let snapshot = poison_runtime_session(&runtime, &panic_message).await;
+            let mut daemon = daemon.lock().await;
+            if let Some(snapshot) = snapshot {
+                daemon.record_session_poisoned(&lease.target_alias, &snapshot, &panic_message)?;
+                daemon.sessions_by_endpoint.remove(&snapshot.endpoint_key);
+            } else {
+                daemon.sessions_by_endpoint.remove(&runtime.endpoint_key);
+                let err = anyhow!(panic_message.clone());
+                daemon.record_target_error(&lease.target_key, None, &err)?;
+            }
+            Err(anyhow!(
+                "live-attach session panicked and was poisoned: {panic_message}. Run `yoetz browser reset` before reattaching"
+            ))
+        }
+    }
+}
+
+async fn run_session_request_locked(
+    lease: &SessionLease,
+    mut request: SessionRequest,
+) -> std::result::Result<SessionExecutionSuccess, SessionExecutionError> {
+    let mut guard = lease.runtime.inner.lock().await;
+    let Some(session) = guard.as_mut() else {
+        return Err(SessionExecutionError::Other {
+            err: anyhow!("live-attach session is no longer available"),
+            target_key: lease.target_key.clone(),
+            endpoint: None,
+        });
+    };
+
+    session.aliases.insert(lease.target_alias.clone());
+    session
+        .aliases
+        .insert(target_alias_for_target(&session.target));
+    session.target = session_target_for_alias(lease.target.clone(), session);
+
+    if let Err(err) = session.client.probe_liveness(750) {
+        let err = single_approval_transport_closed_error(err);
+        session.state = SessionState::TransportClosed {
+            fingerprint: session.fingerprint.clone(),
+            closed_at_unix_ms: unix_ms_now(),
+            last_error: format!("{err:#}"),
+        };
+        let snapshot = DaemonSessionSnapshot::from_session(session);
+        *guard = None;
+        return Err(SessionExecutionError::TransportClosed {
+            err,
+            target_alias: lease.target_alias.clone(),
+            snapshot: Box::new(snapshot),
+        });
+    }
+
+    let connected_at_unix_ms = match &session.state {
+        SessionState::Approved {
+            connected_at_unix_ms,
+            ..
+        } => *connected_at_unix_ms,
+        _ => unix_ms_now(),
+    };
+    let request_id = match &mut request {
+        SessionRequest::EnsureSession { .. } => format!("ensure:{}", lease.target_alias.as_str()),
+        SessionRequest::RunRecipe { recipe_ctx } => {
+            if recipe_ctx.run_id.trim().is_empty() {
+                recipe_ctx.run_id = chatgpt_web::generate_run_id();
+            }
+            recipe_ctx.run_id.clone()
+        }
+    };
+    session.state = SessionState::Busy {
+        fingerprint: session.fingerprint.clone(),
+        request_id,
+    };
+
+    let response = match request {
+        SessionRequest::EnsureSession {
+            browser_context_id,
+            profile_email,
+        } => ensure_chatgpt_session_with_session(
+            session,
+            browser_context_id.as_deref(),
+            profile_email.as_deref(),
+        )
+        .await
+        .map(|session| DaemonResponse::Session { session }),
+        SessionRequest::RunRecipe { mut recipe_ctx } => {
+            run_chatgpt_recipe_with_session(session, &mut recipe_ctx)
+                .await
+                .map(|result| DaemonResponse::Recipe { result })
+        }
+    };
+
+    match response {
+        Ok(response) => {
+            session.state = SessionState::Approved {
+                fingerprint: session.fingerprint.clone(),
+                connected_at_unix_ms,
+            };
+            Ok(SessionExecutionSuccess {
+                response,
+                snapshot: DaemonSessionSnapshot::from_session(session),
+            })
+        }
+        Err(err) if is_closed_cdp_transport_error(&err) => {
+            let err = single_approval_transport_closed_error(err);
+            session.state = SessionState::TransportClosed {
+                fingerprint: session.fingerprint.clone(),
+                closed_at_unix_ms: unix_ms_now(),
+                last_error: format!("{err:#}"),
+            };
+            let snapshot = DaemonSessionSnapshot::from_session(session);
+            *guard = None;
+            Err(SessionExecutionError::TransportClosed {
+                err,
+                target_alias: lease.target_alias.clone(),
+                snapshot: Box::new(snapshot),
+            })
+        }
+        Err(err) => {
+            let snapshot = DaemonSessionSnapshot::from_session(session);
+            session.state = SessionState::Approved {
+                fingerprint: session.fingerprint.clone(),
+                connected_at_unix_ms,
+            };
+            Err(SessionExecutionError::Other {
+                err,
+                target_key: lease.target_key.clone(),
+                endpoint: Some(snapshot.endpoint),
+            })
+        }
+    }
+}
+
+async fn poison_runtime_session(
+    runtime: &RuntimeSession,
+    panic_message: &str,
+) -> Option<DaemonSessionSnapshot> {
+    let mut guard = runtime.inner.lock().await;
+    let mut session = guard.take()?;
+    session.state = SessionState::Poisoned {
+        fingerprint: Some(session.fingerprint.clone()),
+        poisoned_at_unix_ms: unix_ms_now(),
+        last_error: panic_message.to_string(),
+    };
+    Some(DaemonSessionSnapshot::from_session(&session))
+}
+
+async fn ensure_chatgpt_session_with_session(
+    session: &mut DaemonSession,
+    explicit_context_id: Option<&str>,
+    profile_email: Option<&str>,
+) -> Result<LiveAttachSession> {
+    let (browser_context_id, control_run_id) =
+        ensure_chatgpt_control_tab_for_selectors(session, explicit_context_id, profile_email)
+            .await?;
+    session.target.endpoint = Some(session.client.ws_endpoint().to_string());
+
+    Ok(LiveAttachSession {
+        target_key: session.target.key.clone(),
+        control_run_id,
+        browser_context_id,
+        status: LiveAttachStatus::Attached,
+        endpoint: session.target.endpoint.clone(),
+    })
+}
+
+async fn run_chatgpt_recipe_with_session(
+    session: &mut DaemonSession,
+    recipe_ctx: &mut chrome_devtools_mcp::DevtoolsMcpRecipeContext,
+) -> Result<ChatgptRunResult> {
+    let (browser_context_id, _) = ensure_chatgpt_control_tab_for_selectors(
+        session,
+        recipe_ctx.browser_context_id.as_deref(),
+        recipe_ctx.profile_email.as_deref(),
+    )
+    .await?;
+    recipe_ctx.cdp_endpoint = Some(session.client.ws_endpoint().to_string());
+    let result = session
+        .client
+        .run_chatgpt_recipe(recipe_ctx, browser_context_id)
+        .await?;
+    session.target.endpoint = Some(session.client.ws_endpoint().to_string());
+    Ok(result)
+}
+
+async fn ensure_chatgpt_control_tab_for_selectors(
+    session: &mut DaemonSession,
+    explicit_context_id: Option<&str>,
+    profile_email: Option<&str>,
+) -> Result<(Option<String>, String)> {
+    let browser_context_id = session
+        .client
+        .resolve_browser_context_id(explicit_context_id, profile_email)?;
+    let control_run_id = control_run_id_for_session(session, browser_context_id.as_deref());
+    session
+        .client
+        .ensure_chatgpt_control_tab_ready(browser_context_id.as_deref(), &control_run_id)
+        .await?;
+    Ok((browser_context_id, control_run_id))
+}
+
+fn control_run_id_for_session(
+    session: &mut DaemonSession,
+    browser_context_id: Option<&str>,
+) -> String {
+    let now = unix_ms_now();
+    let context = session
+        .contexts
+        .entry(context_storage_key(browser_context_id))
+        .or_insert_with(|| PersistedContextState {
+            browser_context_id: browser_context_id.map(str::to_owned),
+            control_run_id: chatgpt_web::generate_run_id(),
+            updated_at_unix_ms: now,
+        });
+    context.browser_context_id = browser_context_id.map(str::to_owned);
+    context.updated_at_unix_ms = now;
+    context.control_run_id.clone()
+}
+
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => match payload.downcast::<&'static str>() {
+            Ok(message) => (*message).to_string(),
+            Err(_) => "unknown panic payload".to_string(),
+        },
+    }
+}
+
+async fn daemon_response_for_request(
+    request: DaemonRequest,
+    token: &str,
+    daemon: Arc<AsyncMutex<LiveAttachDaemon>>,
+) -> (DaemonResponse, bool) {
+    match AssertUnwindSafe(dispatch_daemon_request(request, token, daemon))
+        .catch_unwind()
+        .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(err)) => (
+            DaemonResponse::Error {
+                message: format!("{err:#}"),
+            },
+            false,
+        ),
+        Err(payload) => (
+            DaemonResponse::Error {
+                message: format!(
+                    "live-attach daemon request panicked: {}",
+                    panic_payload_to_string(payload)
+                ),
+            },
+            false,
+        ),
+    }
 }
 
 async fn dispatch_daemon_request(
@@ -1473,40 +1819,17 @@ async fn dispatch_daemon_request(
             ensure_token(token, &request_token)?;
             Ok((DaemonResponse::Pong, true))
         }
-        request => {
-            let mut daemon = daemon.lock().await;
-            dispatch_daemon_request_locked(request, token, &mut daemon)
-                .await
-                .map(|response| (response, false))
-        }
-    }
-}
-
-async fn dispatch_daemon_request_locked(
-    request: DaemonRequest,
-    token: &str,
-    daemon: &mut LiveAttachDaemon,
-) -> Result<DaemonResponse> {
-    match request {
-        DaemonRequest::Ping {
-            token: request_token,
-        } => {
-            ensure_token(token, &request_token)?;
-            Ok(DaemonResponse::Pong)
-        }
         DaemonRequest::Status {
             token: request_token,
         } => {
             ensure_token(token, &request_token)?;
-            Ok(DaemonResponse::Status {
-                session_count: daemon.sessions_by_endpoint.len(),
-            })
-        }
-        DaemonRequest::Shutdown {
-            token: request_token,
-        } => {
-            ensure_token(token, &request_token)?;
-            Ok(DaemonResponse::Pong)
+            let daemon = daemon.lock().await;
+            Ok((
+                DaemonResponse::Status {
+                    session_count: daemon.sessions_by_endpoint.len(),
+                },
+                false,
+            ))
         }
         DaemonRequest::EnsureSession {
             token: request_token,
@@ -1515,14 +1838,22 @@ async fn dispatch_daemon_request_locked(
             profile_email,
         } => {
             ensure_token(token, &request_token)?;
-            let session = daemon
-                .ensure_chatgpt_session(
-                    target,
-                    browser_context_id.as_deref(),
-                    profile_email.as_deref(),
-                )
-                .await?;
-            Ok(DaemonResponse::Session { session })
+            let lease = {
+                let mut daemon = daemon.lock().await;
+                daemon
+                    .checkout_session(target, InitialAttachPolicy::Allow)
+                    .await?
+            };
+            let response = run_session_request(
+                Arc::clone(&daemon),
+                lease,
+                SessionRequest::EnsureSession {
+                    browser_context_id,
+                    profile_email,
+                },
+            )
+            .await?;
+            Ok((response, false))
         }
         DaemonRequest::RunRecipe {
             token: request_token,
@@ -1530,8 +1861,19 @@ async fn dispatch_daemon_request_locked(
             recipe_ctx,
         } => {
             ensure_token(token, &request_token)?;
-            let result = daemon.run_chatgpt_recipe(target, recipe_ctx).await?;
-            Ok(DaemonResponse::Recipe { result })
+            let lease = {
+                let mut daemon = daemon.lock().await;
+                daemon
+                    .checkout_session(target, InitialAttachPolicy::RequireLiveSessionIfPersisted)
+                    .await?
+            };
+            let response = run_session_request(
+                Arc::clone(&daemon),
+                lease,
+                SessionRequest::RunRecipe { recipe_ctx },
+            )
+            .await?;
+            Ok((response, false))
         }
     }
 }
@@ -1972,6 +2314,117 @@ mod tests {
         }
     }
 
+    fn test_target(alias: &str, endpoint: &str) -> LiveAttachTarget {
+        LiveAttachTarget {
+            key: alias.to_string(),
+            connect_endpoint: Some(endpoint.to_string()),
+            endpoint: Some(endpoint.to_string()),
+            source_path: None,
+            browser_id: browser_id_from_ws_endpoint(endpoint),
+            implicit_default: false,
+        }
+    }
+
+    fn insert_test_runtime_session(
+        daemon: &mut LiveAttachDaemon,
+        target: LiveAttachTarget,
+        behavior: TestRecipeBehavior,
+        bind_alias: bool,
+    ) -> EndpointKey {
+        let endpoint = target.endpoint.clone().unwrap();
+        let fingerprint = test_fingerprint(&endpoint);
+        insert_test_runtime_session_with_fingerprint(
+            daemon,
+            target,
+            behavior,
+            bind_alias,
+            fingerprint,
+        )
+    }
+
+    fn insert_test_runtime_session_with_fingerprint(
+        daemon: &mut LiveAttachDaemon,
+        target: LiveAttachTarget,
+        behavior: TestRecipeBehavior,
+        bind_alias: bool,
+        fingerprint: BrowserFingerprint,
+    ) -> EndpointKey {
+        let endpoint = target.endpoint.clone().unwrap();
+        let endpoint_key = EndpointKey::from_ws_endpoint(&endpoint).unwrap();
+        let alias = target_alias_for_target(&target);
+        let session = DaemonSession {
+            endpoint_key: endpoint_key.clone(),
+            aliases: BTreeSet::from([alias.clone()]),
+            target,
+            client: DaemonSessionClient::Test(TestSessionClient {
+                ws_endpoint: endpoint,
+                recipe_behavior: behavior,
+            }),
+            fingerprint: fingerprint.clone(),
+            state: SessionState::Approved {
+                fingerprint,
+                connected_at_unix_ms: 1,
+            },
+            contexts: BTreeMap::new(),
+        };
+        if bind_alias {
+            daemon.endpoint_by_alias.insert(alias, endpoint_key.clone());
+        }
+        daemon
+            .sessions_by_endpoint
+            .insert(endpoint_key.clone(), Arc::new(RuntimeSession::new(session)));
+        endpoint_key
+    }
+
+    fn poison_persisted_endpoint(daemon: &mut LiveAttachDaemon, alias: &str, endpoint: &str) {
+        let endpoint_key = EndpointKey::from_ws_endpoint(endpoint).unwrap();
+        let fingerprint = test_fingerprint(endpoint);
+        daemon
+            .endpoint_by_alias
+            .insert(TargetAlias(alias.to_string()), endpoint_key.clone());
+        daemon.state.aliases.insert(
+            TargetAlias(alias.to_string()),
+            PersistedAliasState {
+                endpoint_key: Some(endpoint_key.clone()),
+                last_status: Some(LiveAttachStatus::Degraded),
+                last_error: Some("panic: boom".to_string()),
+                updated_at_unix_ms: 1,
+                ..Default::default()
+            },
+        );
+        daemon.state.endpoints.insert(
+            endpoint_key,
+            PersistedEndpointState {
+                fingerprint: fingerprint.clone(),
+                session_state: SessionState::Poisoned {
+                    fingerprint: Some(fingerprint.clone()),
+                    poisoned_at_unix_ms: 1,
+                    last_error: "panic: boom".to_string(),
+                },
+                target_create_policy: TargetCreatePolicy::Unknown,
+                contexts: BTreeMap::new(),
+                updated_at_unix_ms: 1,
+            },
+        );
+    }
+
+    fn recipe_request(target: LiveAttachTarget) -> DaemonRequest {
+        DaemonRequest::RunRecipe {
+            token: "token".to_string(),
+            target,
+            recipe_ctx: chrome_devtools_mcp::DevtoolsMcpRecipeContext::default(),
+        }
+    }
+
+    fn ensure_request(target: LiveAttachTarget) -> DaemonRequest {
+        DaemonRequest::EnsureSession {
+            token: "token".to_string(),
+            target,
+            browser_context_id: None,
+            profile_email: None,
+        }
+    }
+
     #[test]
     fn live_attach_target_uses_implicit_key_without_resolved_target() {
         let target = LiveAttachTarget::from_resolved(None);
@@ -2296,6 +2749,337 @@ mod tests {
                 .is_none(),
             "explicit attach flow may establish a new approved owner"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn panic_marks_endpoint_session_poisoned_and_releases_registry() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("live-attach.json");
+        let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let endpoint = "ws://127.0.0.1:9222/devtools/browser/panic";
+            let target = test_target("browser-id:panic", endpoint);
+            let mut daemon = empty_daemon();
+            let endpoint_key = insert_test_runtime_session(
+                &mut daemon,
+                target.clone(),
+                TestRecipeBehavior::Panic("recipe exploded".to_string()),
+                true,
+            );
+            let daemon = Arc::new(AsyncMutex::new(daemon));
+
+            let (response, shutdown) = daemon_response_for_request(
+                recipe_request(target.clone()),
+                "token",
+                daemon.clone(),
+            )
+            .await;
+
+            assert!(!shutdown);
+            match response {
+                DaemonResponse::Error { message } => {
+                    assert!(message.contains("panic: recipe exploded"), "{message}");
+                    assert!(message.contains("yoetz browser reset"), "{message}");
+                }
+                other => panic!("expected daemon Error response, got {other:?}"),
+            }
+
+            {
+                let daemon = daemon.lock().await;
+                assert!(
+                    !daemon.sessions_by_endpoint.contains_key(&endpoint_key),
+                    "poisoned runtime session should be removed from the registry"
+                );
+                let alias_state = daemon
+                    .state
+                    .aliases
+                    .get(&TargetAlias("browser-id:panic".to_string()))
+                    .expect("alias should be preserved");
+                assert_eq!(alias_state.last_status, Some(LiveAttachStatus::Degraded));
+                assert_eq!(
+                    alias_state.last_error.as_deref(),
+                    Some("panic: recipe exploded")
+                );
+                assert!(matches!(
+                    daemon
+                        .state
+                        .endpoints
+                        .get(&endpoint_key)
+                        .unwrap()
+                        .session_state,
+                    SessionState::Poisoned { .. }
+                ));
+            }
+
+            let (response, _) =
+                daemon_response_for_request(recipe_request(target), "token", daemon.clone()).await;
+            match response {
+                DaemonResponse::Error { message } => {
+                    assert!(
+                        message.contains("automatic Chrome reattach is disabled"),
+                        "{message}"
+                    );
+                    assert!(message.contains("panic: recipe exploded"), "{message}");
+                }
+                other => panic!("expected poisoned follow-up to fail, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn status_request_responds_during_busy_recipe() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("live-attach.json");
+        let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let endpoint = "ws://127.0.0.1:9222/devtools/browser/busy";
+            let target = test_target("browser-id:busy", endpoint);
+            let mut daemon = empty_daemon();
+            insert_test_runtime_session(
+                &mut daemon,
+                target.clone(),
+                TestRecipeBehavior::Block {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                },
+                true,
+            );
+            let daemon = Arc::new(AsyncMutex::new(daemon));
+            let run_daemon = Arc::clone(&daemon);
+            let run = tokio::spawn(async move {
+                daemon_response_for_request(recipe_request(target), "token", run_daemon).await
+            });
+            tokio::time::timeout(DAEMON_HEALTH_RPC_TIMEOUT, started.notified())
+                .await
+                .expect("recipe should enter the fake busy section");
+
+            let start = Instant::now();
+            let (response, shutdown) = daemon_response_for_request(
+                DaemonRequest::Status {
+                    token: "token".to_string(),
+                },
+                "token",
+                Arc::clone(&daemon),
+            )
+            .await;
+            assert!(!shutdown);
+            assert!(
+                start.elapsed() < DAEMON_HEALTH_RPC_TIMEOUT,
+                "status should not wait for the busy session lock"
+            );
+            assert!(matches!(
+                response,
+                DaemonResponse::Status { session_count: 1 }
+            ));
+
+            release.notify_one();
+            let (response, _) = run.await.unwrap();
+            assert!(matches!(response, DaemonResponse::Recipe { .. }));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn ensure_session_request_responds_for_different_endpoint_during_busy_recipe() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("live-attach.json");
+        let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let started = Arc::new(Notify::new());
+            let release = Arc::new(Notify::new());
+            let endpoint_a = "ws://127.0.0.1:9222/devtools/browser/busy-a";
+            let endpoint_b = "ws://127.0.0.1:9333/devtools/browser/idle-b";
+            let target_a = test_target("browser-id:busy-a", endpoint_a);
+            let target_b = test_target("browser-id:idle-b", endpoint_b);
+            let mut daemon = empty_daemon();
+            insert_test_runtime_session(
+                &mut daemon,
+                target_a.clone(),
+                TestRecipeBehavior::Block {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                },
+                true,
+            );
+            insert_test_runtime_session(
+                &mut daemon,
+                target_b.clone(),
+                TestRecipeBehavior::Succeed,
+                true,
+            );
+            let daemon = Arc::new(AsyncMutex::new(daemon));
+            let run_daemon = Arc::clone(&daemon);
+            let run = tokio::spawn(async move {
+                daemon_response_for_request(recipe_request(target_a), "token", run_daemon).await
+            });
+            tokio::time::timeout(DAEMON_HEALTH_RPC_TIMEOUT, started.notified())
+                .await
+                .expect("recipe should enter the fake busy section");
+
+            let start = Instant::now();
+            let (response, _) =
+                daemon_response_for_request(ensure_request(target_b), "token", Arc::clone(&daemon))
+                    .await;
+            assert!(
+                start.elapsed() < DAEMON_HEALTH_RPC_TIMEOUT,
+                "endpoint B should not queue behind endpoint A's session lock"
+            );
+            match response {
+                DaemonResponse::Session { session } => {
+                    assert_eq!(session.target_key, "browser-id:idle-b");
+                    assert_eq!(session.status, LiveAttachStatus::Attached);
+                }
+                other => panic!("expected endpoint B ensure success, got {other:?}"),
+            }
+
+            release.notify_one();
+            let (response, _) = run.await.unwrap();
+            assert!(matches!(response, DaemonResponse::Recipe { .. }));
+        });
+    }
+
+    #[test]
+    fn poisoned_session_blocks_silent_reattach() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let endpoint = "ws://127.0.0.1:9222/devtools/browser/poisoned";
+            let target = test_target("browser-id:poisoned", endpoint);
+            let mut daemon = empty_daemon();
+            poison_persisted_endpoint(&mut daemon, "browser-id:poisoned", endpoint);
+            let daemon = Arc::new(AsyncMutex::new(daemon));
+
+            let (response, _) =
+                daemon_response_for_request(recipe_request(target), "token", daemon).await;
+            match response {
+                DaemonResponse::Error { message } => {
+                    assert!(
+                        message.contains("automatic Chrome reattach is disabled"),
+                        "{message}"
+                    );
+                    assert!(message.contains("panic: boom"), "{message}");
+                }
+                other => panic!("expected poisoned session to block recipe, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_attach_at_new_endpoint_supersedes_poisoned_record() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("live-attach.json");
+        let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let alias = "browser-id:restarted";
+            let old_endpoint = "ws://127.0.0.1:9222/devtools/browser/old";
+            let new_endpoint = "ws://127.0.0.1:9333/devtools/browser/new";
+            let target = test_target(alias, new_endpoint);
+            let mut daemon = empty_daemon();
+            poison_persisted_endpoint(&mut daemon, alias, old_endpoint);
+            insert_test_runtime_session(
+                &mut daemon,
+                target.clone(),
+                TestRecipeBehavior::Succeed,
+                false,
+            );
+            let daemon = Arc::new(AsyncMutex::new(daemon));
+
+            let (response, _) =
+                daemon_response_for_request(ensure_request(target), "token", Arc::clone(&daemon))
+                    .await;
+            match response {
+                DaemonResponse::Session { session } => {
+                    assert_eq!(session.status, LiveAttachStatus::Attached);
+                    assert_eq!(session.endpoint.as_deref(), Some(new_endpoint));
+                }
+                other => panic!("expected explicit attach on restarted endpoint, got {other:?}"),
+            }
+
+            let daemon = daemon.lock().await;
+            let new_endpoint_key = EndpointKey::from_ws_endpoint(new_endpoint).unwrap();
+            assert!(matches!(
+                daemon
+                    .state
+                    .endpoints
+                    .get(&new_endpoint_key)
+                    .unwrap()
+                    .session_state,
+                SessionState::Approved { .. }
+            ));
+            assert_eq!(
+                daemon
+                    .endpoint_by_alias
+                    .get(&TargetAlias(alias.to_string())),
+                Some(&new_endpoint_key)
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_attach_with_new_fingerprint_supersedes_same_endpoint_poisoned_record() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("live-attach.json");
+        let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let alias = "browser-id:same-endpoint";
+            let endpoint = "ws://127.0.0.1:9222/devtools/browser/same";
+            let target = test_target(alias, endpoint);
+            let mut daemon = empty_daemon();
+            poison_persisted_endpoint(&mut daemon, alias, endpoint);
+
+            let mut new_fingerprint = test_fingerprint(endpoint);
+            new_fingerprint.listener_pid = Some(4242);
+            insert_test_runtime_session_with_fingerprint(
+                &mut daemon,
+                target.clone(),
+                TestRecipeBehavior::Succeed,
+                true,
+                new_fingerprint.clone(),
+            );
+            let daemon = Arc::new(AsyncMutex::new(daemon));
+
+            let (response, _) =
+                daemon_response_for_request(ensure_request(target), "token", Arc::clone(&daemon))
+                    .await;
+            match response {
+                DaemonResponse::Session { session } => {
+                    assert_eq!(session.status, LiveAttachStatus::Attached);
+                    assert_eq!(session.endpoint.as_deref(), Some(endpoint));
+                }
+                other => panic!("expected explicit attach with new fingerprint, got {other:?}"),
+            }
+
+            let daemon = daemon.lock().await;
+            let endpoint_key = EndpointKey::from_ws_endpoint(endpoint).unwrap();
+            let endpoint_state = daemon.state.endpoints.get(&endpoint_key).unwrap();
+            assert_eq!(endpoint_state.fingerprint, new_fingerprint);
+            assert!(matches!(
+                endpoint_state.session_state,
+                SessionState::Approved { .. }
+            ));
+            let alias_state = daemon
+                .state
+                .aliases
+                .get(&TargetAlias(alias.to_string()))
+                .unwrap();
+            assert_eq!(alias_state.last_status, Some(LiveAttachStatus::Attached));
+            assert_eq!(alias_state.last_error, None);
+        });
     }
 
     #[test]
