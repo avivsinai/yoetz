@@ -1243,7 +1243,7 @@ fn choose_chatgpt_recovery_strategy(
         return Ok(ChatgptRecoveryStrategy::AnyUserPageAnchor);
     }
     bail!(
-        "Chrome rejected {} for direct target creation, and there is no existing ChatGPT tab or yoetz-safe (blank or yoetz-owned) tab in that context to open `{url}` from without touching user tabs. Set {}=1 to explicitly allow yoetz to use any existing tab as the window.open anchor (the anchor itself is not navigated).",
+        "There is no existing ChatGPT tab or yoetz-safe (blank or yoetz-owned) tab in {} to open `{url}` from without touching user tabs. To preserve the single-approval invariant, yoetz will not create another Chrome target or use a user tab anchor automatically. Set {}=1 to explicitly allow yoetz to use any existing tab as the window.open anchor (the anchor itself is not navigated).",
         browser_context_label(browser_context_id),
         YOETZ_ALLOW_USER_TAB_ANCHOR_ENV
     );

@@ -490,18 +490,34 @@ async fn open_initial_chatgpt_probe_page(
     url: &str,
     timeout_ms: u64,
     browser_context_id: Option<&str>,
+    page_open_mode: InitialPageOpenMode,
 ) -> Result<()> {
-    match open_page_via_blank_target(
-        client,
-        url,
-        /* background */ true,
-        timeout_ms,
-        browser_context_id,
-    )
-    .await
-    {
-        Ok(()) => Ok(()),
-        Err(err) if is_external_create_target_block_error(&err) => client
+    match page_open_mode {
+        InitialPageOpenMode::CreateTarget => {
+            match open_page_via_blank_target(
+                client,
+                url,
+                /* background */ true,
+                timeout_ms,
+                browser_context_id,
+            )
+            .await
+            {
+                Ok(()) => Ok(()),
+                Err(err) if is_external_create_target_block_error(&err) => client
+                    .open_chatgpt_page_via_existing_anchor(
+                        url,
+                        /* background */ true,
+                        timeout_ms,
+                        browser_context_id,
+                    )
+                    .await
+                    .with_context(|| format!("recover auth probe page open for `{url}`"))
+                    .map(|_| ()),
+                Err(err) => Err(err),
+            }
+        }
+        InitialPageOpenMode::RecoverViaExistingAnchor => client
             .open_chatgpt_page_via_existing_anchor(
                 url,
                 /* background */ true,
@@ -509,9 +525,12 @@ async fn open_initial_chatgpt_probe_page(
                 browser_context_id,
             )
             .await
-            .with_context(|| format!("recover auth probe page open for `{url}`"))
+            .with_context(|| {
+                format!(
+                    "open ChatGPT control tab for `{url}` from an existing safe anchor without Target.createTarget"
+                )
+            })
             .map(|_| ()),
-        Err(err) => Err(err),
     }
 }
 
@@ -524,11 +543,12 @@ async fn open_chatgpt_auth_probe_page(
     browser_context_id: Option<&str>,
     control_run_id: Option<&str>,
     timeout_ms: u64,
+    page_open_mode: InitialPageOpenMode,
 ) -> Result<()> {
     let url = control_run_id
         .map(chatgpt_web::mark_chatgpt_url)
         .unwrap_or_else(|| chatgpt_web::CHATGPT_URL.to_string());
-    open_initial_chatgpt_probe_page(client, &url, timeout_ms, browser_context_id)
+    open_initial_chatgpt_probe_page(client, &url, timeout_ms, browser_context_id, page_open_mode)
         .await
         .with_context(|| format!("chrome-devtools-mcp open auth probe on `{url}`"))?;
     if let Some(control_run_id) = control_run_id {
@@ -555,20 +575,49 @@ pub async fn ensure_chatgpt_control_tab_ready(
     browser_context_id: Option<&str>,
     control_run_id: Option<&str>,
 ) -> Result<()> {
+    ensure_chatgpt_control_tab_ready_with_open_mode(
+        client,
+        browser_context_id,
+        control_run_id,
+        InitialPageOpenMode::CreateTarget,
+    )
+    .await
+}
+
+pub async fn ensure_chatgpt_control_tab_ready_with_open_mode(
+    client: &CdpMcpClient,
+    browser_context_id: Option<&str>,
+    control_run_id: Option<&str>,
+    page_open_mode: InitialPageOpenMode,
+) -> Result<()> {
     let reused_existing_page = client
         .select_chatgpt_page_for_probe(30_000, browser_context_id, control_run_id)
         .await
         .context("select existing ChatGPT page for auth probe")?
         .is_some();
     if !reused_existing_page {
-        open_chatgpt_auth_probe_page(client, browser_context_id, control_run_id, 30_000).await?;
+        open_chatgpt_auth_probe_page(
+            client,
+            browser_context_id,
+            control_run_id,
+            30_000,
+            page_open_mode,
+        )
+        .await?;
     }
     let result = wait_for_composer_ready(client, /* focus_composer */ false).await;
     if reused_existing_page && result.is_err() {
         if should_retire_failed_reused_control_tab(control_run_id, &result) {
             let _ = client.close_selected_page(true);
         }
-        open_chatgpt_auth_probe_page(client, browser_context_id, control_run_id, 30_000).await?;
+        open_chatgpt_auth_probe_page(
+            client,
+            browser_context_id,
+            control_run_id,
+            30_000,
+            page_open_mode,
+        )
+        .await?;
         let retry = wait_for_composer_ready(client, /* focus_composer */ false).await;
         if control_run_id.is_none() {
             let _ = client.close_selected_page(true);
