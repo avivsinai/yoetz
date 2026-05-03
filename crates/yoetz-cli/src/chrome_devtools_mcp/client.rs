@@ -90,7 +90,7 @@ const EMAIL_INFERENCE_TRUSTED_ORIGINS: &[&str] = &[
     "platform.openai.com",
 ];
 
-pub struct CdpMcpClient {
+pub struct ChromeCdpClient {
     browser: Browser,
     selected_tab: Mutex<Option<Arc<Tab>>>,
     ws_endpoint: String,
@@ -345,7 +345,7 @@ struct BrowserContextPage {
     url: String,
 }
 
-impl CdpMcpClient {
+impl ChromeCdpClient {
     pub async fn connect_to_running_chrome(cdp_endpoint: Option<&str>) -> Result<Self> {
         let ws_endpoint = resolve_canonical_ws_endpoint(cdp_endpoint)?;
         let browser = Browser::connect_with_timeout(
@@ -1323,7 +1323,7 @@ fn external_create_target_block_guidance(url: &str) -> String {
     )
 }
 
-impl CdpMcpClient {
+impl ChromeCdpClient {
     async fn reuse_existing_optional_context_tab(
         &self,
         url: &str,
@@ -3801,11 +3801,12 @@ mod tests {
             .build()
             .expect("tokio runtime");
         let started = Instant::now();
-        let err =
-            match runtime.block_on(CdpMcpClient::connect_to_running_chrome(Some(&ws_endpoint))) {
-                Ok(_) => panic!("stalled websocket handshake should time out"),
-                Err(err) => err,
-            };
+        let err = match runtime.block_on(ChromeCdpClient::connect_to_running_chrome(Some(
+            &ws_endpoint,
+        ))) {
+            Ok(_) => panic!("stalled websocket handshake should time out"),
+            Err(err) => err,
+        };
         let elapsed = started.elapsed();
 
         shutdown.store(true, Ordering::Relaxed);

@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use std::io::IsTerminal;
 use std::time::Duration;
 
-use super::client::{is_external_create_target_block_error, CdpMcpClient};
+use super::client::{is_external_create_target_block_error, ChromeCdpClient};
 use super::DevtoolsMcpRecipeContext;
 use crate::chatgpt_web;
 
@@ -199,20 +199,21 @@ async fn run_attached_recipe_with_reconnect(
     }
 }
 
-async fn connect_client(ctx: &DevtoolsMcpRecipeContext) -> Result<CdpMcpClient> {
-    connect_client_with_approval_lock(ctx.cdp_endpoint.as_deref(), ctx.show_approval_guidance).await
+async fn connect_client(ctx: &DevtoolsMcpRecipeContext) -> Result<ChromeCdpClient> {
+    connect_client_with_attach_attempt_lock(ctx.cdp_endpoint.as_deref(), ctx.show_approval_guidance)
+        .await
 }
 
-pub async fn connect_client_with_approval_lock(
+pub async fn connect_client_with_attach_attempt_lock(
     cdp_endpoint: Option<&str>,
     show_approval_guidance: bool,
-) -> Result<CdpMcpClient> {
+) -> Result<ChromeCdpClient> {
     // Step 0: attach directly to the user's running Chrome session.
     // Chrome may show an "Allow remote debugging?" dialog here whenever it
     // treats this as a new external attach request. Serialize only the attach
     // itself so approval prompts do not race across yoetz processes.
-    let client = with_chrome_approval_lock(show_approval_guidance, || async {
-        CdpMcpClient::connect_to_running_chrome(cdp_endpoint)
+    let client = with_attach_attempt_lock(show_approval_guidance, || async {
+        ChromeCdpClient::connect_to_running_chrome(cdp_endpoint)
             .await
             .map_err(cdp_attach_hint)
     })
@@ -222,7 +223,7 @@ pub async fn connect_client_with_approval_lock(
 }
 
 async fn run_attached_recipe(
-    mut client: CdpMcpClient,
+    mut client: ChromeCdpClient,
     ctx: &DevtoolsMcpRecipeContext,
     page_open_mode: InitialPageOpenMode,
 ) -> Result<ChatgptRunResult> {
@@ -258,7 +259,7 @@ async fn run_attached_recipe(
 }
 
 pub async fn run_with_client(
-    client: &mut CdpMcpClient,
+    client: &mut ChromeCdpClient,
     ctx: &DevtoolsMcpRecipeContext,
     browser_context_id: Option<String>,
 ) -> Result<ChatgptRunResult> {
@@ -272,7 +273,7 @@ pub async fn run_with_client(
 }
 
 pub async fn run_with_client_using_page_open_mode(
-    client: &mut CdpMcpClient,
+    client: &mut ChromeCdpClient,
     ctx: &DevtoolsMcpRecipeContext,
     browser_context_id: Option<String>,
     page_open_mode: InitialPageOpenMode,
@@ -288,7 +289,7 @@ pub async fn run_with_client_using_page_open_mode(
 }
 
 pub async fn run_with_client_using_page_open_mode_and_reconnect_policy(
-    client: &mut CdpMcpClient,
+    client: &mut ChromeCdpClient,
     ctx: &DevtoolsMcpRecipeContext,
     browser_context_id: Option<String>,
     page_open_mode: InitialPageOpenMode,
@@ -305,7 +306,7 @@ pub async fn run_with_client_using_page_open_mode_and_reconnect_policy(
 }
 
 async fn run_attached_recipe_inner(
-    client: &mut CdpMcpClient,
+    client: &mut ChromeCdpClient,
     ctx: &DevtoolsMcpRecipeContext,
     browser_context_id: Option<String>,
     page_open_mode: InitialPageOpenMode,
@@ -426,7 +427,7 @@ async fn run_attached_recipe_inner(
 }
 
 async fn open_initial_chatgpt_page(
-    client: &CdpMcpClient,
+    client: &ChromeCdpClient,
     marked_url: &str,
     browser_context_id: Option<&str>,
     mode: InitialPageOpenMode,
@@ -463,7 +464,7 @@ async fn open_initial_chatgpt_page(
 }
 
 async fn open_page_via_blank_target(
-    client: &CdpMcpClient,
+    client: &ChromeCdpClient,
     url: &str,
     background: bool,
     timeout_ms: u64,
@@ -486,7 +487,7 @@ async fn open_page_via_blank_target(
 }
 
 async fn open_initial_chatgpt_probe_page(
-    client: &CdpMcpClient,
+    client: &ChromeCdpClient,
     url: &str,
     timeout_ms: u64,
     browser_context_id: Option<&str>,
@@ -539,7 +540,7 @@ pub async fn check_auth(cdp_endpoint: Option<&str>, show_approval_guidance: bool
 }
 
 async fn open_chatgpt_auth_probe_page(
-    client: &CdpMcpClient,
+    client: &ChromeCdpClient,
     browser_context_id: Option<&str>,
     control_run_id: Option<&str>,
     timeout_ms: u64,
@@ -566,12 +567,13 @@ pub async fn check_auth_with_control_run_id(
     show_approval_guidance: bool,
     control_run_id: Option<&str>,
 ) -> Result<()> {
-    let client = connect_client_with_approval_lock(cdp_endpoint, show_approval_guidance).await?;
+    let client =
+        connect_client_with_attach_attempt_lock(cdp_endpoint, show_approval_guidance).await?;
     ensure_chatgpt_control_tab_ready(&client, None, control_run_id).await
 }
 
 pub async fn ensure_chatgpt_control_tab_ready(
-    client: &CdpMcpClient,
+    client: &ChromeCdpClient,
     browser_context_id: Option<&str>,
     control_run_id: Option<&str>,
 ) -> Result<()> {
@@ -585,7 +587,7 @@ pub async fn ensure_chatgpt_control_tab_ready(
 }
 
 pub async fn ensure_chatgpt_control_tab_ready_with_open_mode(
-    client: &CdpMcpClient,
+    client: &ChromeCdpClient,
     browser_context_id: Option<&str>,
     control_run_id: Option<&str>,
     page_open_mode: InitialPageOpenMode,
@@ -637,7 +639,7 @@ fn should_retire_failed_reused_control_tab(
     control_run_id.is_some() && result.is_err()
 }
 
-async fn wait_for_composer_ready(client: &CdpMcpClient, focus_composer: bool) -> Result<()> {
+async fn wait_for_composer_ready(client: &ChromeCdpClient, focus_composer: bool) -> Result<()> {
     let composer_state = evaluate_wait_for_composer_state(client, focus_composer).await?;
     match composer_state
         .get("status")
@@ -682,7 +684,7 @@ async fn wait_for_composer_ready(client: &CdpMcpClient, focus_composer: bool) ->
 }
 
 async fn evaluate_wait_for_composer_state(
-    client: &CdpMcpClient,
+    client: &ChromeCdpClient,
     focus_composer: bool,
 ) -> Result<serde_json::Value> {
     let script = build_wait_for_composer_script(focus_composer);
@@ -718,7 +720,7 @@ fn should_retry_wait_for_composer_error(err: &anyhow::Error) -> bool {
 }
 
 async fn maybe_select_model(
-    client: &CdpMcpClient,
+    client: &ChromeCdpClient,
     requested_model: &str,
 ) -> Result<Option<String>> {
     let keep_current_model = chatgpt_web::should_keep_current_chatgpt_model(requested_model);
@@ -843,7 +845,7 @@ fn format_model_selection_diagnostics(selection: &serde_json::Value) -> String {
     )
 }
 
-async fn maybe_disable_extended(client: &CdpMcpClient) -> Result<()> {
+async fn maybe_disable_extended(client: &ChromeCdpClient) -> Result<()> {
     let script = r##"
 () => {
   const button = document.querySelector("button[aria-label*='click to remove'][aria-label*='Extended'], button[aria-label*='remove'][aria-label*='Extended']");
@@ -938,53 +940,53 @@ fn approval_wait_message() -> String {
     )
 }
 
-async fn with_chrome_approval_lock<T, F, Fut>(show_approval_guidance: bool, action: F) -> Result<T>
+async fn with_attach_attempt_lock<T, F, Fut>(show_approval_guidance: bool, action: F) -> Result<T>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    with_chrome_approval_lock_using(
+    with_attach_attempt_lock_using(
         show_approval_guidance,
-        crate::browser::acquire_chrome_approval_lock,
+        crate::browser::acquire_attach_attempt_lock,
         action,
     )
     .await
 }
 
-trait ApprovalLockState {
+trait AttachAttemptLockState {
     fn waited(&self) -> bool;
 }
 
-impl ApprovalLockState for crate::browser::ChromeApprovalLock {
+impl AttachAttemptLockState for crate::browser::AttachAttemptLock {
     fn waited(&self) -> bool {
         self.waited()
     }
 }
 
-async fn with_chrome_approval_lock_using<T, L, Acquire, F, Fut>(
+async fn with_attach_attempt_lock_using<T, L, Acquire, F, Fut>(
     show_approval_guidance: bool,
     acquire_lock: Acquire,
     action: F,
 ) -> Result<T>
 where
-    L: ApprovalLockState,
+    L: AttachAttemptLockState,
     Acquire: FnOnce() -> Result<L>,
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = Result<T>>,
 {
-    let approval_lock = acquire_lock()?;
-    emit_chrome_approval_guidance(show_approval_guidance, approval_lock.waited());
-    let _approval_lock = approval_lock;
+    let attach_attempt_lock = acquire_lock()?;
+    emit_chrome_attach_attempt_guidance(show_approval_guidance, attach_attempt_lock.waited());
+    let _attach_attempt_lock = attach_attempt_lock;
     action().await
 }
 
-fn emit_chrome_approval_guidance(show_approval_guidance: bool, waited: bool) {
+fn emit_chrome_attach_attempt_guidance(show_approval_guidance: bool, waited: bool) {
     if !show_approval_guidance {
         return;
     }
     if waited {
         eprintln!(
-            "info: another yoetz process is already requesting Chrome approval; waiting for it to finish before trying the chrome-devtools-mcp transport"
+            "info: another yoetz process is already starting a Chrome attach attempt; waiting for it to finish before trying the chrome-devtools-mcp transport"
         );
     }
     eprintln!(
@@ -1032,7 +1034,7 @@ fn should_retry_initial_new_page_after_reconnect(err: &anyhow::Error) -> bool {
 fn emit_transport_retry_notice(ctx: &DevtoolsMcpRecipeContext) {
     if ctx.show_approval_guidance || std::io::stderr().is_terminal() {
         eprintln!(
-            "info: Chrome dropped the initial CDP session while opening the ChatGPT tab; reconnecting once and falling back to existing-anchor recovery. Chrome may prompt again."
+            "info: Chrome dropped the initial CDP session while opening the ChatGPT tab; this standalone flow reconnects once and falls back to existing-anchor recovery. Daemon-owned live attach is not reconnecting to preserve the single-approval invariant."
         );
     }
 }
@@ -1107,7 +1109,7 @@ fn format_page_probe_summary(state: &serde_json::Value) -> String {
 /// `upload_file`. `upload_file` accepts either the file input itself or the
 /// element that opens the file chooser, so prefer visible menu items/buttons
 /// over guessing a hidden input uid.
-async fn try_upload_bundle(client: &CdpMcpClient, bundle_path: &std::path::Path) -> Result<()> {
+async fn try_upload_bundle(client: &ChromeCdpClient, bundle_path: &std::path::Path) -> Result<()> {
     let file_name = bundle_path
         .file_name()
         .and_then(|value| value.to_str())
@@ -1191,7 +1193,7 @@ async fn try_upload_bundle(client: &CdpMcpClient, bundle_path: &std::path::Path)
 }
 
 async fn try_upload_via_file_input(
-    client: &CdpMcpClient,
+    client: &ChromeCdpClient,
     bundle_path: &std::path::Path,
     file_name: &str,
 ) -> Result<bool> {
@@ -1215,7 +1217,10 @@ async fn try_upload_via_file_input(
     Ok(true)
 }
 
-async fn wait_for_file_input_uid(client: &CdpMcpClient, timeout_ms: u64) -> Result<Option<String>> {
+async fn wait_for_file_input_uid(
+    client: &ChromeCdpClient,
+    timeout_ms: u64,
+) -> Result<Option<String>> {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
     let scope_script = chatgpt_web::build_scope_composer_file_input_function();
 
@@ -1253,7 +1258,7 @@ async fn wait_for_file_input_uid(client: &CdpMcpClient, timeout_ms: u64) -> Resu
     }
 }
 
-async fn click_upload_candidate(client: &CdpMcpClient, candidate_id: &str) -> Result<bool> {
+async fn click_upload_candidate(client: &ChromeCdpClient, candidate_id: &str) -> Result<bool> {
     let candidate_json = serde_json::to_string(candidate_id)?;
     let script = format!(
         r#"() => {{
@@ -1266,7 +1271,7 @@ async fn click_upload_candidate(client: &CdpMcpClient, candidate_id: &str) -> Re
     Ok(client.evaluate_script(&script, vec![]).await? == serde_json::Value::Bool(true))
 }
 
-async fn click_upload_menu_item(client: &CdpMcpClient) -> Result<bool> {
+async fn click_upload_menu_item(client: &ChromeCdpClient) -> Result<bool> {
     let script = chatgpt_web::build_upload_menu_item_click_function();
     Ok(client
         .evaluate_script(&script, vec![])
@@ -1276,7 +1281,7 @@ async fn click_upload_menu_item(client: &CdpMcpClient) -> Result<bool> {
         == Some("clicked"))
 }
 
-async fn collect_upload_diagnostics(client: &CdpMcpClient) -> Result<serde_json::Value> {
+async fn collect_upload_diagnostics(client: &ChromeCdpClient) -> Result<serde_json::Value> {
     let script = build_collect_upload_diagnostics_script();
 
     client
@@ -1416,7 +1421,7 @@ fn format_upload_diagnostics(diagnostics: &serde_json::Value) -> String {
     serde_json::to_string_pretty(diagnostics).unwrap_or_else(|_| diagnostics.to_string())
 }
 
-async fn wait_for_attachment_visible(client: &CdpMcpClient, file_name: &str) -> Result<()> {
+async fn wait_for_attachment_visible(client: &ChromeCdpClient, file_name: &str) -> Result<()> {
     let script = build_wait_for_attachment_visible_script(file_name)?;
     let evidence = client
         .evaluate_script(&script, vec![])
@@ -1459,7 +1464,7 @@ async () => {{
 /// Returns the final assistant message text once a post-send assistant turn
 /// has been idle for the shared ChatGPT stable-idle threshold.
 async fn poll_for_stable_response(
-    client: &mut CdpMcpClient,
+    client: &mut ChromeCdpClient,
     ctx: &DevtoolsMcpRecipeContext,
     page_id: &str,
     baseline: ResponseBaseline,
@@ -1573,7 +1578,7 @@ async fn poll_for_stable_response(
 async fn reconnect_response_poll_client(
     ctx: &DevtoolsMcpRecipeContext,
     page_id: &str,
-) -> Result<CdpMcpClient> {
+) -> Result<ChromeCdpClient> {
     let client = connect_client(ctx)
         .await
         .context("reconnect Chrome websocket for stable-idle polling")?;
@@ -1753,7 +1758,7 @@ fn classify_response_completion(
     }
 }
 
-async fn read_latest_assistant_text(client: &CdpMcpClient) -> Result<String> {
+async fn read_latest_assistant_text(client: &ChromeCdpClient) -> Result<String> {
     let script = r##"
 () => {
   const nodes = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
@@ -1860,11 +1865,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_chrome_approval_lock_acquires_before_running_action() {
+    async fn with_attach_attempt_lock_acquires_before_running_action() {
         #[derive(Clone, Copy)]
         struct FakeLock;
 
-        impl ApprovalLockState for FakeLock {
+        impl AttachAttemptLockState for FakeLock {
             fn waited(&self) -> bool {
                 false
             }
@@ -1873,7 +1878,7 @@ mod tests {
         let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let acquired_for_action = acquired.clone();
 
-        with_chrome_approval_lock_using(
+        with_attach_attempt_lock_using(
             false,
             || {
                 acquired.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1882,7 +1887,7 @@ mod tests {
             || async move {
                 assert!(
                     acquired_for_action.load(std::sync::atomic::Ordering::SeqCst),
-                    "approval lock should be acquired before the action runs"
+                    "attach attempt lock should be acquired before the action runs"
                 );
                 Ok::<(), anyhow::Error>(())
             },
