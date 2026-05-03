@@ -969,10 +969,7 @@ fn debug_phase(message: &str) {
 }
 
 fn is_closed_cdp_transport_error(err: &anyhow::Error) -> bool {
-    let raw = format!("{err:#}").to_lowercase();
-    raw.contains("underlying connection is closed")
-        || raw.contains("connectionclosed")
-        || raw.contains("received shutdown message")
+    super::client::is_closed_cdp_transport_error(err)
 }
 
 fn should_retry_initial_new_page_after_reconnect(err: &anyhow::Error) -> bool {
