@@ -47,6 +47,7 @@ tempfile = "3.27"
 jsonschema = "0.45"
 fs2 = "0.4"
 headless_chrome = "1.0.21"
+futures-util = "0.3"
 
 [dev-dependencies]
 serial_test = "3.4"
