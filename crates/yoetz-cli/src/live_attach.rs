@@ -217,6 +217,9 @@ pub struct DaemonSummary {
     pub health: DaemonHealth,
     pub pid: Option<u32>,
     pub session_count: usize,
+    pub endpoint_session_count: usize,
+    pub target_alias_count: usize,
+    pub poisoned_count: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -248,6 +251,8 @@ struct PersistedAliasState {
     last_error: Option<String>,
     #[serde(default)]
     automatic_reattach_blocked: bool,
+    #[serde(default)]
+    contexts: BTreeMap<String, PersistedContextState>,
     updated_at_unix_ms: u64,
 }
 
@@ -294,6 +299,7 @@ impl LiveAttachState {
                     last_error: legacy.last_error.clone(),
                     automatic_reattach_blocked: legacy.automatic_reattach_blocked
                         && endpoint_key.is_none(),
+                    contexts: legacy.contexts.clone(),
                     updated_at_unix_ms: legacy.updated_at_unix_ms.unwrap_or_default(),
                 });
 
@@ -382,10 +388,24 @@ enum DaemonRequest {
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum DaemonResponse {
     Pong,
-    Status { session_count: usize },
-    Session { session: LiveAttachSession },
-    Recipe { result: ChatgptRunResult },
-    Error { message: String },
+    Status {
+        session_count: usize,
+        #[serde(default)]
+        endpoint_session_count: usize,
+        #[serde(default)]
+        target_alias_count: usize,
+        #[serde(default)]
+        poisoned_count: usize,
+    },
+    Session {
+        session: LiveAttachSession,
+    },
+    Recipe {
+        result: ChatgptRunResult,
+    },
+    Error {
+        message: String,
+    },
 }
 
 struct DaemonSession {
@@ -542,18 +562,23 @@ impl DaemonSessionClient {
         browser_context_id: Option<&str>,
         control_run_id: &str,
     ) -> Result<()> {
+        let page_open_mode = live_attach_control_tab_open_mode();
         match self {
             Self::Real(client) => {
                 chatgpt::ensure_chatgpt_control_tab_ready_with_open_mode(
                     client,
                     browser_context_id,
                     Some(control_run_id),
-                    live_attach_control_tab_open_mode(),
+                    page_open_mode,
                 )
                 .await
             }
             #[cfg(test)]
-            Self::Test(_) => Ok(()),
+            Self::Test(client) => {
+                client
+                    .ensure_chatgpt_control_tab_ready(page_open_mode)
+                    .await
+            }
         }
     }
 
@@ -640,7 +665,11 @@ struct TestSessionClient {
     ws_endpoint: String,
     recipe_behavior: Arc<StdMutex<TestRecipeBehavior>>,
     probe_behavior: Arc<StdMutex<TestProbeBehavior>>,
+    control_tab_behavior: Arc<StdMutex<TestControlTabBehavior>>,
+    control_tab_open_modes: Arc<StdMutex<Vec<chatgpt::InitialPageOpenMode>>>,
     probe_count: Arc<AtomicUsize>,
+    new_page_count: Arc<AtomicUsize>,
+    user_window_open_count: Arc<AtomicUsize>,
 }
 
 #[cfg(test)]
@@ -665,19 +694,46 @@ enum TestProbeBehavior {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+enum TestControlTabBehavior {
+    Succeed,
+    NoSafeAnchorOnlyUserTabs,
+}
+
+#[cfg(test)]
 impl TestSessionClient {
     fn new(ws_endpoint: String, recipe_behavior: TestRecipeBehavior) -> Self {
         Self {
             ws_endpoint,
             recipe_behavior: Arc::new(StdMutex::new(recipe_behavior)),
             probe_behavior: Arc::new(StdMutex::new(TestProbeBehavior::Succeed)),
+            control_tab_behavior: Arc::new(StdMutex::new(TestControlTabBehavior::Succeed)),
+            control_tab_open_modes: Arc::new(StdMutex::new(Vec::new())),
             probe_count: Arc::new(AtomicUsize::new(0)),
+            new_page_count: Arc::new(AtomicUsize::new(0)),
+            user_window_open_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
     fn set_probe_behavior(&self, behavior: TestProbeBehavior) {
         self.probe_count.store(0, Ordering::SeqCst);
         *self.probe_behavior.lock().unwrap() = behavior;
+    }
+
+    fn set_control_tab_behavior(&self, behavior: TestControlTabBehavior) {
+        *self.control_tab_behavior.lock().unwrap() = behavior;
+    }
+
+    fn new_page_count(&self) -> usize {
+        self.new_page_count.load(Ordering::SeqCst)
+    }
+
+    fn user_window_open_count(&self) -> usize {
+        self.user_window_open_count.load(Ordering::SeqCst)
+    }
+
+    fn control_tab_open_modes(&self) -> Vec<chatgpt::InitialPageOpenMode> {
+        self.control_tab_open_modes.lock().unwrap().clone()
     }
 
     fn probe_liveness(&self) -> Result<()> {
@@ -699,6 +755,26 @@ impl TestSessionClient {
                     }))
                 }
             }
+        }
+    }
+
+    async fn ensure_chatgpt_control_tab_ready(
+        &self,
+        page_open_mode: chatgpt::InitialPageOpenMode,
+    ) -> Result<()> {
+        self.control_tab_open_modes
+            .lock()
+            .unwrap()
+            .push(page_open_mode);
+        if page_open_mode == chatgpt::InitialPageOpenMode::CreateTarget {
+            self.new_page_count.fetch_add(1, Ordering::SeqCst);
+        }
+
+        match self.control_tab_behavior.lock().unwrap().clone() {
+            TestControlTabBehavior::Succeed => Ok(()),
+            TestControlTabBehavior::NoSafeAnchorOnlyUserTabs => Err(anyhow!(
+                "Chrome accepted the CDP attach but yoetz has no safe tab anchor to open a fresh ChatGPT tab without using `Target.createTarget`. To preserve the single-approval invariant, yoetz will not reattach automatically. Open a blank tab or ChatGPT tab in this Chrome profile and rerun, or explicitly allow user-tab anchoring with `YOETZ_ALLOW_USER_TAB_ANCHOR=1`."
+            )),
         }
     }
 
@@ -1255,10 +1331,16 @@ impl LiveAttachDaemon {
             })
     }
 
-    fn record_session_success(&mut self, session: &DaemonSessionSnapshot) -> Result<()> {
+    fn record_session_success(
+        &mut self,
+        session: &DaemonSessionSnapshot,
+        target_alias: &TargetAlias,
+        target_alias_contexts: &BTreeMap<String, PersistedContextState>,
+    ) -> Result<()> {
         let now = unix_ms_now();
+        let session_target_alias = target_alias_for_target(&session.target);
         let mut aliases = session.aliases.clone();
-        aliases.insert(target_alias_for_target(&session.target));
+        aliases.insert(session_target_alias.clone());
         for alias in aliases {
             self.record_alias_binding(
                 &alias,
@@ -1268,6 +1350,9 @@ impl LiveAttachDaemon {
             );
             if let Some(alias_state) = self.state.aliases.get_mut(&alias) {
                 alias_state.last_status = Some(LiveAttachStatus::Attached);
+                if &alias == target_alias || alias == session_target_alias {
+                    alias_state.contexts.extend(target_alias_contexts.clone());
+                }
             }
         }
 
@@ -1851,6 +1936,9 @@ pub fn inspect_daemon_sync() -> DaemonSummary {
             health: DaemonHealth::NotRunning,
             pid: None,
             session_count: 0,
+            endpoint_session_count: 0,
+            target_alias_count: 0,
+            poisoned_count: 0,
         };
     };
 
@@ -1860,20 +1948,41 @@ pub fn inspect_daemon_sync() -> DaemonSummary {
             token: metadata.token.clone(),
         },
     ) {
-        Ok(DaemonResponse::Status { session_count }) => DaemonSummary {
-            health: DaemonHealth::Healthy,
-            pid: Some(metadata.pid),
+        Ok(DaemonResponse::Status {
             session_count,
-        },
+            endpoint_session_count,
+            target_alias_count,
+            poisoned_count,
+        }) => {
+            let endpoint_session_count = if endpoint_session_count == 0 {
+                session_count
+            } else {
+                endpoint_session_count
+            };
+            DaemonSummary {
+                health: DaemonHealth::Healthy,
+                pid: Some(metadata.pid),
+                session_count,
+                endpoint_session_count,
+                target_alias_count,
+                poisoned_count,
+            }
+        }
         Err(err) if is_daemon_rpc_timeout_error(&err) => DaemonSummary {
             health: DaemonHealth::Busy,
             pid: Some(metadata.pid),
             session_count: 0,
+            endpoint_session_count: 0,
+            target_alias_count: 0,
+            poisoned_count: 0,
         },
         _ => DaemonSummary {
             health: DaemonHealth::Stale,
             pid: Some(metadata.pid),
             session_count: 0,
+            endpoint_session_count: 0,
+            target_alias_count: 0,
+            poisoned_count: 0,
         },
     }
 }
@@ -2090,6 +2199,8 @@ enum SessionRequest {
 struct SessionExecutionSuccess {
     response: DaemonResponse,
     snapshot: DaemonSessionSnapshot,
+    target_alias: TargetAlias,
+    target_alias_contexts: BTreeMap<String, PersistedContextState>,
 }
 
 enum SessionExecutionError {
@@ -2122,7 +2233,11 @@ async fn run_session_request(
     match caught {
         Ok(Ok(success)) => {
             let mut daemon = daemon.lock().await;
-            daemon.record_session_success(&success.snapshot)?;
+            daemon.record_session_success(
+                &success.snapshot,
+                &success.target_alias,
+                &success.target_alias_contexts,
+            )?;
             Ok(success.response)
         }
         Ok(Err(SessionExecutionError::TransportClosed {
@@ -2226,16 +2341,31 @@ async fn run_session_request_locked(
             profile_email.as_deref(),
         )
         .await
-        .map(|session| DaemonResponse::Session { session }),
+        .map(|live_session| {
+            let target_alias_contexts = contexts_for_browser_context_id(
+                session,
+                live_session.browser_context_id.as_deref(),
+            );
+            (
+                DaemonResponse::Session {
+                    session: live_session,
+                },
+                target_alias_contexts,
+            )
+        }),
         SessionRequest::RunRecipe { mut recipe_ctx } => {
             run_chatgpt_recipe_with_session(session, &mut recipe_ctx)
                 .await
-                .map(|result| DaemonResponse::Recipe { result })
+                .map(|(result, browser_context_id)| {
+                    let target_alias_contexts =
+                        contexts_for_browser_context_id(session, browser_context_id.as_deref());
+                    (DaemonResponse::Recipe { result }, target_alias_contexts)
+                })
         }
     };
 
     match response {
-        Ok(response) => {
+        Ok((response, target_alias_contexts)) => {
             if let Err(err) = session.client.probe_liveness(750) {
                 let err = single_approval_transport_closed_error(err);
                 session.state = terminal_session_state_from_error(
@@ -2258,6 +2388,8 @@ async fn run_session_request_locked(
             Ok(SessionExecutionSuccess {
                 response,
                 snapshot: DaemonSessionSnapshot::from_session(session),
+                target_alias: lease.target_alias.clone(),
+                target_alias_contexts,
             })
         }
         Err(err) => {
@@ -2327,7 +2459,7 @@ async fn ensure_chatgpt_session_with_session(
 async fn run_chatgpt_recipe_with_session(
     session: &mut DaemonSession,
     recipe_ctx: &mut chrome_devtools_mcp::DevtoolsMcpRecipeContext,
-) -> Result<ChatgptRunResult> {
+) -> Result<(ChatgptRunResult, Option<String>)> {
     let (browser_context_id, _) = ensure_chatgpt_control_tab_for_selectors(
         session,
         recipe_ctx.browser_context_id.as_deref(),
@@ -2337,10 +2469,10 @@ async fn run_chatgpt_recipe_with_session(
     recipe_ctx.cdp_endpoint = Some(session.client.ws_endpoint().to_string());
     let result = session
         .client
-        .run_chatgpt_recipe(recipe_ctx, browser_context_id)
+        .run_chatgpt_recipe(recipe_ctx, browser_context_id.clone())
         .await?;
     session.target.endpoint = Some(session.client.ws_endpoint().to_string());
-    Ok(result)
+    Ok((result, browser_context_id))
 }
 
 async fn ensure_chatgpt_control_tab_for_selectors(
@@ -2375,6 +2507,18 @@ fn control_run_id_for_session(
     context.browser_context_id = browser_context_id.map(str::to_owned);
     context.updated_at_unix_ms = now;
     context.control_run_id.clone()
+}
+
+fn contexts_for_browser_context_id(
+    session: &DaemonSession,
+    browser_context_id: Option<&str>,
+) -> BTreeMap<String, PersistedContextState> {
+    let key = context_storage_key(browser_context_id);
+    session
+        .contexts
+        .get(&key)
+        .map(|context| BTreeMap::from([(key, context.clone())]))
+        .unwrap_or_default()
 }
 
 fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -2438,9 +2582,19 @@ async fn dispatch_daemon_request(
         } => {
             ensure_token(token, &request_token)?;
             let daemon = daemon.lock().await;
+            let endpoint_session_count = daemon.sessions_by_endpoint.len();
+            let poisoned_count = daemon
+                .state
+                .endpoints
+                .values()
+                .filter(|endpoint| matches!(endpoint.session_state, SessionState::Poisoned { .. }))
+                .count();
             Ok((
                 DaemonResponse::Status {
-                    session_count: daemon.sessions_by_endpoint.len(),
+                    session_count: endpoint_session_count,
+                    endpoint_session_count,
+                    target_alias_count: daemon.endpoint_by_alias.len(),
+                    poisoned_count,
                 },
                 false,
             ))
@@ -3045,10 +3199,17 @@ mod tests {
     }
 
     fn ensure_request(target: LiveAttachTarget) -> DaemonRequest {
+        ensure_request_with_context(target, None)
+    }
+
+    fn ensure_request_with_context(
+        target: LiveAttachTarget,
+        browser_context_id: Option<&str>,
+    ) -> DaemonRequest {
         DaemonRequest::EnsureSession {
             token: "token".to_string(),
             target,
-            browser_context_id: None,
+            browser_context_id: browser_context_id.map(str::to_owned),
             profile_email: None,
         }
     }
@@ -3070,6 +3231,51 @@ mod tests {
         let session = guard.as_ref().expect("test session should be live");
         match &session.client {
             DaemonSessionClient::Test(client) => client.set_probe_behavior(behavior),
+            DaemonSessionClient::Real(_) => panic!("expected test session client"),
+        }
+    }
+
+    async fn set_test_session_control_tab_behavior(
+        daemon: &Arc<AsyncMutex<LiveAttachDaemon>>,
+        endpoint_key: &EndpointKey,
+        behavior: TestControlTabBehavior,
+    ) {
+        let runtime = {
+            let daemon = daemon.lock().await;
+            daemon
+                .sessions_by_endpoint
+                .get(endpoint_key)
+                .cloned()
+                .expect("test runtime session should exist")
+        };
+        let guard = runtime.inner.lock().await;
+        let session = guard.as_ref().expect("test session should be live");
+        match &session.client {
+            DaemonSessionClient::Test(client) => client.set_control_tab_behavior(behavior),
+            DaemonSessionClient::Real(_) => panic!("expected test session client"),
+        }
+    }
+
+    async fn test_session_control_tab_counts(
+        daemon: &Arc<AsyncMutex<LiveAttachDaemon>>,
+        endpoint_key: &EndpointKey,
+    ) -> (usize, usize, Vec<chatgpt::InitialPageOpenMode>) {
+        let runtime = {
+            let daemon = daemon.lock().await;
+            daemon
+                .sessions_by_endpoint
+                .get(endpoint_key)
+                .cloned()
+                .expect("test runtime session should exist")
+        };
+        let guard = runtime.inner.lock().await;
+        let session = guard.as_ref().expect("test session should be live");
+        match &session.client {
+            DaemonSessionClient::Test(client) => (
+                client.new_page_count(),
+                client.user_window_open_count(),
+                client.control_tab_open_modes(),
+            ),
             DaemonSessionClient::Real(_) => panic!("expected test session client"),
         }
     }
@@ -3108,13 +3314,115 @@ mod tests {
     }
 
     #[test]
-    fn live_attach_control_tab_bootstrap_reuses_existing_anchor() {
-        // TODO(stage-b-pr-b): add a call-site test that the daemon never invokes
-        // Target.createTarget while bootstrapping the ChatGPT control tab.
-        assert_eq!(
-            live_attach_control_tab_open_mode(),
-            chatgpt::InitialPageOpenMode::RecoverViaExistingAnchor
-        );
+    #[serial]
+    fn daemon_page_open_policy_never_calls_create_target() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("live-attach.json");
+        let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let endpoint = "ws://127.0.0.1:9222/devtools/browser/control-policy";
+            let target = test_target("browser-id:control-policy", endpoint);
+            let mut daemon = empty_daemon();
+            let endpoint_key = insert_test_runtime_session(
+                &mut daemon,
+                target.clone(),
+                TestRecipeBehavior::Succeed,
+                true,
+            );
+            let daemon = Arc::new(AsyncMutex::new(daemon));
+
+            let (response, _) =
+                daemon_response_for_request(ensure_request(target), "token", Arc::clone(&daemon))
+                    .await;
+
+            assert!(matches!(response, DaemonResponse::Session { .. }));
+            let (new_page_count, user_window_open_count, open_modes) =
+                test_session_control_tab_counts(&daemon, &endpoint_key).await;
+            assert_eq!(
+                new_page_count, 0,
+                "daemon control-tab path must not call new_page"
+            );
+            assert_eq!(
+                user_window_open_count, 0,
+                "daemon control-tab path must not execute window.open in user tabs"
+            );
+            assert!(
+                open_modes
+                    .iter()
+                    .all(|mode| *mode != chatgpt::InitialPageOpenMode::CreateTarget),
+                "daemon control-tab path must never request CreateTarget: {open_modes:?}"
+            );
+            assert!(
+                open_modes.contains(&chatgpt::InitialPageOpenMode::RecoverViaExistingAnchor),
+                "daemon control-tab path should use anchor recovery: {open_modes:?}"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn no_safe_anchor_errors_without_touching_user_tabs() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("live-attach.json");
+        let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let endpoint = "ws://127.0.0.1:9222/devtools/browser/no-safe-anchor";
+            let target = test_target("browser-id:no-safe-anchor", endpoint);
+            let mut daemon = empty_daemon();
+            let endpoint_key = insert_test_runtime_session(
+                &mut daemon,
+                target.clone(),
+                TestRecipeBehavior::Succeed,
+                true,
+            );
+            let daemon = Arc::new(AsyncMutex::new(daemon));
+            set_test_session_control_tab_behavior(
+                &daemon,
+                &endpoint_key,
+                TestControlTabBehavior::NoSafeAnchorOnlyUserTabs,
+            )
+            .await;
+
+            let (response, _) =
+                daemon_response_for_request(ensure_request(target), "token", Arc::clone(&daemon))
+                    .await;
+
+            match response {
+                DaemonResponse::Error { message } => {
+                    assert!(message.contains("safe tab anchor"), "{message}");
+                    assert!(message.contains("single-approval invariant"), "{message}");
+                    assert!(
+                        message.contains("YOETZ_ALLOW_USER_TAB_ANCHOR=1"),
+                        "{message}"
+                    );
+                }
+                other => panic!("expected no-safe-anchor error, got {other:?}"),
+            }
+            let (new_page_count, user_window_open_count, open_modes) =
+                test_session_control_tab_counts(&daemon, &endpoint_key).await;
+            assert_eq!(
+                new_page_count, 0,
+                "daemon must not fall back to Target.createTarget"
+            );
+            assert_eq!(
+                user_window_open_count, 0,
+                "daemon must not run window.open from a user tab unless explicitly opted in"
+            );
+            assert!(
+                open_modes
+                    .iter()
+                    .all(|mode| *mode != chatgpt::InitialPageOpenMode::CreateTarget),
+                "daemon must not request CreateTarget after no-safe-anchor failure: {open_modes:?}"
+            );
+            assert!(
+                open_modes.contains(&chatgpt::InitialPageOpenMode::RecoverViaExistingAnchor),
+                "daemon should try anchor recovery before failing: {open_modes:?}"
+            );
+        });
     }
 
     #[test]
@@ -3177,6 +3485,23 @@ mod tests {
         assert!(!state.implicit_default);
         assert_eq!(state.endpoint_key, None);
         assert!(!state.automatic_reattach_blocked);
+        assert!(state.contexts.is_empty());
+    }
+
+    #[test]
+    fn status_response_deserializes_legacy_session_count_only_payload() {
+        let response: DaemonResponse =
+            serde_json::from_str(r#"{"type":"status","session_count":2}"#).unwrap();
+
+        assert!(matches!(
+            response,
+            DaemonResponse::Status {
+                session_count: 2,
+                endpoint_session_count: 0,
+                target_alias_count: 0,
+                poisoned_count: 0
+            }
+        ));
     }
 
     #[test]
@@ -3211,6 +3536,14 @@ mod tests {
         assert_eq!(alias_state.endpoint_key, Some(endpoint_key.clone()));
         assert!(alias_state.implicit_default);
         assert_eq!(alias_state.last_status, Some(LiveAttachStatus::Attached));
+        assert_eq!(
+            alias_state
+                .contexts
+                .get(DEFAULT_CONTEXT_KEY)
+                .unwrap()
+                .control_run_id,
+            "control-run"
+        );
         let endpoint_state = state.endpoints.get(&endpoint_key).unwrap();
         assert!(matches!(
             endpoint_state.session_state,
@@ -3724,6 +4057,113 @@ mod tests {
 
     #[test]
     #[serial]
+    fn per_alias_context_state_survives_endpoint_dedup() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("live-attach.json");
+        let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let endpoint = "ws://127.0.0.1:9222/devtools/browser/alias-context";
+            let mut source_target = test_target("source-path:/tmp/chrome-devtools", endpoint);
+            source_target.source_path = Some(PathBuf::from("/tmp/chrome-devtools"));
+            source_target.browser_id = None;
+            let browser_target = test_target("browser-id:alias-context", endpoint);
+            let mut daemon = empty_daemon();
+            let endpoint_key = insert_test_runtime_session(
+                &mut daemon,
+                source_target.clone(),
+                TestRecipeBehavior::Succeed,
+                true,
+            );
+            let daemon = Arc::new(AsyncMutex::new(daemon));
+
+            let (source_response, _) = daemon_response_for_request(
+                ensure_request_with_context(source_target.clone(), Some("ctx-source")),
+                "token",
+                Arc::clone(&daemon),
+            )
+            .await;
+            let source_control_run_id = match source_response {
+                DaemonResponse::Session { session } => session.control_run_id,
+                other => panic!("expected source alias session, got {other:?}"),
+            };
+
+            let (browser_response, _) = daemon_response_for_request(
+                ensure_request_with_context(browser_target.clone(), Some("ctx-browser")),
+                "token",
+                Arc::clone(&daemon),
+            )
+            .await;
+            let browser_control_run_id = match browser_response {
+                DaemonResponse::Session { session } => session.control_run_id,
+                other => panic!("expected browser alias session, got {other:?}"),
+            };
+
+            let daemon = daemon.lock().await;
+            assert_eq!(daemon.sessions_by_endpoint.len(), 1);
+            assert_eq!(
+                daemon
+                    .endpoint_by_alias
+                    .get(&target_alias_for_target(&source_target)),
+                Some(&endpoint_key)
+            );
+            assert_eq!(
+                daemon
+                    .endpoint_by_alias
+                    .get(&target_alias_for_target(&browser_target)),
+                Some(&endpoint_key)
+            );
+            let source_alias = daemon
+                .state
+                .aliases
+                .get(&target_alias_for_target(&source_target))
+                .expect("source alias state should persist");
+            let browser_alias = daemon
+                .state
+                .aliases
+                .get(&target_alias_for_target(&browser_target))
+                .expect("browser alias state should persist");
+            assert_eq!(
+                source_alias
+                    .contexts
+                    .get("ctx-source")
+                    .expect("source context should survive")
+                    .control_run_id,
+                source_control_run_id
+            );
+            assert_eq!(
+                browser_alias
+                    .contexts
+                    .get("ctx-browser")
+                    .expect("browser context should survive")
+                    .control_run_id,
+                browser_control_run_id
+            );
+            assert!(
+                source_alias.contexts.contains_key("ctx-source"),
+                "second alias checkout must not clobber first alias context"
+            );
+            assert!(
+                !source_alias.contexts.contains_key("ctx-browser"),
+                "source alias must not inherit browser alias context state"
+            );
+            assert!(
+                !browser_alias.contexts.contains_key("ctx-source"),
+                "browser alias must not inherit source alias context state"
+            );
+            let endpoint_state = daemon
+                .state
+                .endpoints
+                .get(&endpoint_key)
+                .expect("endpoint state should persist");
+            assert!(endpoint_state.contexts.contains_key("ctx-source"));
+            assert!(endpoint_state.contexts.contains_key("ctx-browser"));
+        });
+    }
+
+    #[test]
+    #[serial]
     fn chrome_restart_at_new_endpoint_allows_one_new_attach() {
         let _guard = lock_env();
         let dir = tempdir().unwrap();
@@ -4041,12 +4481,56 @@ mod tests {
             );
             assert!(matches!(
                 response,
-                DaemonResponse::Status { session_count: 1 }
+                DaemonResponse::Status {
+                    session_count: 1,
+                    endpoint_session_count: 1,
+                    target_alias_count: 1,
+                    poisoned_count: 0
+                }
             ));
 
             release.notify_one();
             let (response, _) = run.await.unwrap();
             assert!(matches!(response, DaemonResponse::Recipe { .. }));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn status_request_reports_endpoint_alias_and_poisoned_counts() {
+        let _guard = lock_env();
+        let dir = tempdir().unwrap();
+        let state_path = dir.path().join("live-attach.json");
+        let _state = EnvVarGuard::set("YOETZ_LIVE_ATTACH_STATE_PATH", &state_path);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let live_endpoint = "ws://127.0.0.1:9222/devtools/browser/live";
+            let poisoned_endpoint = "ws://127.0.0.1:9333/devtools/browser/poisoned";
+            let target = test_target("browser-id:live", live_endpoint);
+            let mut daemon = empty_daemon();
+            insert_test_runtime_session(&mut daemon, target, TestRecipeBehavior::Succeed, true);
+            poison_persisted_endpoint(&mut daemon, "browser-id:poisoned", poisoned_endpoint);
+            let daemon = Arc::new(AsyncMutex::new(daemon));
+
+            let (response, shutdown) = daemon_response_for_request(
+                DaemonRequest::Status {
+                    token: "token".to_string(),
+                },
+                "token",
+                Arc::clone(&daemon),
+            )
+            .await;
+
+            assert!(!shutdown);
+            assert!(matches!(
+                response,
+                DaemonResponse::Status {
+                    session_count: 1,
+                    endpoint_session_count: 1,
+                    target_alias_count: 2,
+                    poisoned_count: 1
+                }
+            ));
         });
     }
 
@@ -4580,6 +5064,9 @@ mod tests {
                 health: DaemonHealth::Busy,
                 pid: Some(1234),
                 session_count: 0,
+                endpoint_session_count: 0,
+                target_alias_count: 0,
+                poisoned_count: 0,
             }
         );
         assert!(
