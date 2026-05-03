@@ -23,7 +23,7 @@
 //!
 //! ## Module layout
 //!
-//! - [`client`] — `CdpMcpClient`: direct `headless_chrome` browser/tab client
+//! - [`client`] — `ChromeCdpClient`: direct `headless_chrome` browser/tab client
 //!   with a small compatibility surface for the recipe layer.
 //! - [`chatgpt`] — seven-step ChatGPT Pro recipe: navigate → snapshot → upload
 //!   → snapshot → type → click → wait → evaluate.

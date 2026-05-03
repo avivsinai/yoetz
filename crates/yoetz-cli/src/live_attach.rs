@@ -31,7 +31,7 @@ use crate::chrome_devtools_mcp::{
         browser_id_from_ws_endpoint, cdp_failure_from_error, classify_cdp_failure,
         discover_devtools_active_port_files, discover_running_chrome_targets,
         is_terminal_cdp_failure, resolve_canonical_ws_endpoint, BrowserFingerprint, CdpFailure,
-        CdpMcpClient, DevtoolsActivePortFile, RunningChromeTarget,
+        ChromeCdpClient, DevtoolsActivePortFile, RunningChromeTarget,
     },
 };
 use yoetz_core::paths::home_dir;
@@ -172,7 +172,8 @@ pub enum DaemonHealth {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LiveAttachTarget {
-    pub key: String,
+    #[serde(rename = "key")]
+    pub target_alias: String,
     pub connect_endpoint: Option<String>,
     pub endpoint: Option<String>,
     pub source_path: Option<PathBuf>,
@@ -184,7 +185,7 @@ impl LiveAttachTarget {
     pub fn from_resolved(target: Option<&ResolvedCdpTarget>) -> Self {
         match target {
             Some(target) => Self {
-                key: target.live_attach_target_key(),
+                target_alias: target.live_attach_target_alias(),
                 connect_endpoint: Some(target.endpoint.clone()),
                 endpoint: Some(target.endpoint.clone()),
                 source_path: target.source_path().map(Path::to_path_buf),
@@ -192,7 +193,7 @@ impl LiveAttachTarget {
                 implicit_default: false,
             },
             None => Self {
-                key: IMPLICIT_TARGET_KEY.to_string(),
+                target_alias: IMPLICIT_TARGET_KEY.to_string(),
                 connect_endpoint: None,
                 endpoint: None,
                 source_path: None,
@@ -408,11 +409,11 @@ enum DaemonResponse {
     },
 }
 
-struct DaemonSession {
+struct EndpointSession {
     endpoint_key: EndpointKey,
     aliases: BTreeSet<TargetAlias>,
     target: LiveAttachTarget,
-    client: DaemonSessionClient,
+    client: EndpointSessionClient,
     fingerprint: BrowserFingerprint,
     state: SessionState,
     contexts: BTreeMap<String, PersistedContextState>,
@@ -420,11 +421,11 @@ struct DaemonSession {
 
 struct RuntimeSession {
     endpoint_key: EndpointKey,
-    inner: AsyncMutex<Option<DaemonSession>>,
+    inner: AsyncMutex<Option<EndpointSession>>,
 }
 
 impl RuntimeSession {
-    fn new(session: DaemonSession) -> Self {
+    fn new(session: EndpointSession) -> Self {
         Self {
             endpoint_key: session.endpoint_key.clone(),
             inner: AsyncMutex::new(Some(session)),
@@ -447,7 +448,7 @@ struct PendingInitialConnect {
     endpoint_key: EndpointKey,
     endpoint_connect: Arc<PendingEndpointConnect>,
     contexts: BTreeMap<String, PersistedContextState>,
-    client_factory: Arc<dyn CdpMcpClientFactory>,
+    client_factory: Arc<dyn ChromeCdpClientFactory>,
 }
 
 struct PendingEndpointConnect {
@@ -492,7 +493,7 @@ enum CheckoutDecision {
 }
 
 #[derive(Clone)]
-struct DaemonSessionSnapshot {
+struct EndpointSessionSnapshot {
     endpoint_key: EndpointKey,
     aliases: BTreeSet<TargetAlias>,
     target: LiveAttachTarget,
@@ -502,8 +503,8 @@ struct DaemonSessionSnapshot {
     contexts: BTreeMap<String, PersistedContextState>,
 }
 
-impl DaemonSessionSnapshot {
-    fn from_session(session: &DaemonSession) -> Self {
+impl EndpointSessionSnapshot {
+    fn from_session(session: &EndpointSession) -> Self {
         Self {
             endpoint_key: session.endpoint_key.clone(),
             aliases: session.aliases.clone(),
@@ -520,13 +521,13 @@ impl DaemonSessionSnapshot {
     }
 }
 
-enum DaemonSessionClient {
-    Real(CdpMcpClient),
+enum EndpointSessionClient {
+    Real(ChromeCdpClient),
     #[cfg(test)]
     Test(TestSessionClient),
 }
 
-impl DaemonSessionClient {
+impl EndpointSessionClient {
     fn ws_endpoint(&self) -> &str {
         match self {
             Self::Real(client) => client.ws_endpoint(),
@@ -604,9 +605,10 @@ impl DaemonSessionClient {
     }
 }
 
-type CdpFactoryFuture<'a> = Pin<Box<dyn Future<Output = Result<DaemonSessionClient>> + Send + 'a>>;
+type CdpFactoryFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<EndpointSessionClient>> + Send + 'a>>;
 
-trait CdpMcpClientFactory: Send + Sync {
+trait ChromeCdpClientFactory: Send + Sync {
     fn connect<'a>(
         &'a self,
         endpoint: Option<&'a str>,
@@ -614,18 +616,18 @@ trait CdpMcpClientFactory: Send + Sync {
     ) -> CdpFactoryFuture<'a>;
 }
 
-struct ProductionCdpMcpClientFactory;
+struct ProductionChromeCdpClientFactory;
 
-impl CdpMcpClientFactory for ProductionCdpMcpClientFactory {
+impl ChromeCdpClientFactory for ProductionChromeCdpClientFactory {
     fn connect<'a>(
         &'a self,
         endpoint: Option<&'a str>,
         show_approval_guidance: bool,
     ) -> CdpFactoryFuture<'a> {
         Box::pin(async move {
-            chatgpt::connect_client_with_approval_lock(endpoint, show_approval_guidance)
+            chatgpt::connect_client_with_attach_attempt_lock(endpoint, show_approval_guidance)
                 .await
-                .map(DaemonSessionClient::Real)
+                .map(EndpointSessionClient::Real)
         })
     }
 }
@@ -813,7 +815,7 @@ impl TestSessionClient {
 
 #[cfg(test)]
 #[derive(Clone)]
-struct TestCdpMcpClientFactory {
+struct TestChromeCdpClientFactory {
     connect_count: Arc<AtomicUsize>,
     recipe_behaviors: Arc<StdMutex<VecDeque<TestRecipeBehavior>>>,
     connect_gate: Arc<StdMutex<Option<TestConnectGate>>>,
@@ -827,7 +829,7 @@ struct TestConnectGate {
 }
 
 #[cfg(test)]
-impl Default for TestCdpMcpClientFactory {
+impl Default for TestChromeCdpClientFactory {
     fn default() -> Self {
         Self {
             connect_count: Arc::new(AtomicUsize::new(0)),
@@ -838,7 +840,7 @@ impl Default for TestCdpMcpClientFactory {
 }
 
 #[cfg(test)]
-impl TestCdpMcpClientFactory {
+impl TestChromeCdpClientFactory {
     fn push_recipe_behavior(&self, behavior: TestRecipeBehavior) {
         self.recipe_behaviors.lock().unwrap().push_back(behavior);
     }
@@ -853,7 +855,7 @@ impl TestCdpMcpClientFactory {
 }
 
 #[cfg(test)]
-impl CdpMcpClientFactory for TestCdpMcpClientFactory {
+impl ChromeCdpClientFactory for TestChromeCdpClientFactory {
     fn connect<'a>(
         &'a self,
         endpoint: Option<&'a str>,
@@ -875,7 +877,7 @@ impl CdpMcpClientFactory for TestCdpMcpClientFactory {
                 .unwrap()
                 .pop_front()
                 .unwrap_or(TestRecipeBehavior::Succeed);
-            Ok(DaemonSessionClient::Test(TestSessionClient::new(
+            Ok(EndpointSessionClient::Test(TestSessionClient::new(
                 ws_endpoint,
                 behavior,
             )))
@@ -918,20 +920,31 @@ impl CdpEndpointResolver for TestCdpEndpointResolver {
         &self,
         target: &LiveAttachTarget,
     ) -> Result<ResolvedEndpointIdentity> {
-        if let Some(fingerprint) = self.fingerprints.lock().unwrap().get(&target.key).cloned() {
+        if let Some(fingerprint) = self
+            .fingerprints
+            .lock()
+            .unwrap()
+            .get(&target.target_alias)
+            .cloned()
+        {
             return Ok(ResolvedEndpointIdentity {
                 ws_endpoint: fingerprint.ws_endpoint.clone(),
                 fingerprint,
             });
         }
-        let ws_endpoint =
-            if let Some(endpoint) = self.endpoints.lock().unwrap().get(&target.key).cloned() {
-                endpoint
-            } else if let Some(endpoint) = self.default_endpoint.lock().unwrap().clone() {
-                endpoint
-            } else {
-                resolve_canonical_ws_endpoint(resolve_connect_endpoint(target).as_deref())?
-            };
+        let ws_endpoint = if let Some(endpoint) = self
+            .endpoints
+            .lock()
+            .unwrap()
+            .get(&target.target_alias)
+            .cloned()
+        {
+            endpoint
+        } else if let Some(endpoint) = self.default_endpoint.lock().unwrap().clone() {
+            endpoint
+        } else {
+            resolve_canonical_ws_endpoint(resolve_connect_endpoint(target).as_deref())?
+        };
         Ok(ResolvedEndpointIdentity {
             fingerprint: browser_fingerprint_from_target_and_endpoint(target, &ws_endpoint),
             ws_endpoint,
@@ -950,7 +963,7 @@ struct LiveAttachDaemon {
     sessions_by_endpoint: BTreeMap<EndpointKey, Arc<RuntimeSession>>,
     endpoint_by_alias: BTreeMap<TargetAlias, EndpointKey>,
     connecting_by_endpoint: BTreeMap<EndpointKey, Arc<PendingEndpointConnect>>,
-    client_factory: Arc<dyn CdpMcpClientFactory>,
+    client_factory: Arc<dyn ChromeCdpClientFactory>,
     endpoint_resolver: Arc<dyn CdpEndpointResolver>,
 }
 
@@ -972,7 +985,7 @@ impl LiveAttachDaemon {
             sessions_by_endpoint: BTreeMap::new(),
             endpoint_by_alias,
             connecting_by_endpoint: BTreeMap::new(),
-            client_factory: Arc::new(ProductionCdpMcpClientFactory),
+            client_factory: Arc::new(ProductionChromeCdpClientFactory),
             endpoint_resolver: Arc::new(ProductionCdpEndpointResolver),
         })
     }
@@ -1031,7 +1044,7 @@ impl LiveAttachDaemon {
             self.bind_alias_to_runtime(&target_alias, &runtime);
             return Ok(CheckoutDecision::Ready(SessionLease {
                 target_alias,
-                target_key: target.key.clone(),
+                target_key: target.target_alias.clone(),
                 target,
                 runtime,
             }));
@@ -1063,7 +1076,7 @@ impl LiveAttachDaemon {
                 self.bind_alias_to_runtime(&target_alias, &runtime);
                 return Ok(CheckoutDecision::Ready(SessionLease {
                     target_alias,
-                    target_key: target.key.clone(),
+                    target_key: target.target_alias.clone(),
                     target,
                     runtime,
                 }));
@@ -1080,7 +1093,7 @@ impl LiveAttachDaemon {
             });
         }
 
-        let target_key = target.key.clone();
+        let target_key = target.target_alias.clone();
         let endpoint_connect = Arc::new(PendingEndpointConnect::new());
         self.connecting_by_endpoint
             .insert(endpoint_key.clone(), Arc::clone(&endpoint_connect));
@@ -1128,7 +1141,7 @@ impl LiveAttachDaemon {
         self.bind_alias_to_runtime(&target_alias, &runtime);
         Some(SessionLease {
             target_alias,
-            target_key: target.key.clone(),
+            target_key: target.target_alias.clone(),
             target: target.clone(),
             runtime,
         })
@@ -1161,7 +1174,7 @@ impl LiveAttachDaemon {
             current: Some(current.clone()),
             detected_at_unix_ms: unix_ms_now(),
         };
-        let snapshot = DaemonSessionSnapshot::from_session(session);
+        let snapshot = EndpointSessionSnapshot::from_session(session);
         *guard = None;
         drop(guard);
         let err = anyhow!(CdpFailure::ChromeRestarted {
@@ -1189,7 +1202,7 @@ impl LiveAttachDaemon {
     fn finish_initial_connect(
         &mut self,
         pending: PendingInitialConnect,
-        result: Result<DaemonSession>,
+        result: Result<EndpointSession>,
     ) -> Result<SessionLease> {
         match result {
             Ok(session) => {
@@ -1333,7 +1346,7 @@ impl LiveAttachDaemon {
 
     fn record_session_success(
         &mut self,
-        session: &DaemonSessionSnapshot,
+        session: &EndpointSessionSnapshot,
         target_alias: &TargetAlias,
         target_alias_contexts: &BTreeMap<String, PersistedContextState>,
     ) -> Result<()> {
@@ -1446,7 +1459,7 @@ impl LiveAttachDaemon {
     fn record_session_terminal_error(
         &mut self,
         target_alias: &TargetAlias,
-        session: &DaemonSessionSnapshot,
+        session: &EndpointSessionSnapshot,
         err: &anyhow::Error,
     ) -> Result<()> {
         let mut aliases = session.aliases.clone();
@@ -1479,7 +1492,7 @@ impl LiveAttachDaemon {
     fn record_session_poisoned(
         &mut self,
         target_alias: &TargetAlias,
-        session: &DaemonSessionSnapshot,
+        session: &EndpointSessionSnapshot,
         panic_message: &str,
     ) -> Result<()> {
         let now = unix_ms_now();
@@ -1543,7 +1556,7 @@ impl LiveAttachDaemon {
         &self,
         target: &LiveAttachTarget,
     ) -> Option<anyhow::Error> {
-        if let Some(err) = self.automatic_reattach_blocked_error(&target.key) {
+        if let Some(err) = self.automatic_reattach_blocked_error(&target.target_alias) {
             return Some(err);
         }
         let (alias, _, endpoint_state) = self.persisted_endpoint_state_for_target(target)?;
@@ -1612,7 +1625,7 @@ impl LiveAttachDaemon {
             {
                 return Some(anyhow!(
                     "no live approved Chrome websocket is available for live-attach target `{}`. Persisted target `{direct_alias}` was owned by a previous live-attach daemon, and yoetz will not create a new Chrome CDP websocket from a recipe because that can trigger another remote-debugging approval prompt. Run `yoetz browser attach` to reapprove explicitly, or run `yoetz browser reset` to clear the stale owner state.",
-                    target.key
+                    target.target_alias
                 ));
             }
         }
@@ -1622,7 +1635,7 @@ impl LiveAttachDaemon {
         }
         Some(anyhow!(
             "no live approved Chrome websocket is available for live-attach target `{}`. Persisted target `{alias}` was owned by a previous live-attach daemon, and yoetz will not create a new Chrome CDP websocket from a recipe because that can trigger another remote-debugging approval prompt. Run `yoetz browser attach` to reapprove explicitly, or run `yoetz browser reset` to clear the stale owner state.",
-            target.key
+            target.target_alias
         ))
     }
 
@@ -1659,7 +1672,7 @@ impl LiveAttachDaemon {
     }
 }
 
-async fn connect_initial_session(pending: &PendingInitialConnect) -> Result<DaemonSession> {
+async fn connect_initial_session(pending: &PendingInitialConnect) -> Result<EndpointSession> {
     let identity = pending.identity.clone();
     let mut target = pending.target.clone();
     let client = pending
@@ -1682,7 +1695,7 @@ async fn connect_initial_session(pending: &PendingInitialConnect) -> Result<Daem
         connected_at_unix_ms: unix_ms_now(),
     };
 
-    Ok(DaemonSession {
+    Ok(EndpointSession {
         endpoint_key,
         aliases: BTreeSet::from([alias]),
         target,
@@ -1724,7 +1737,7 @@ fn terminal_session_state_from_error(
 }
 
 fn target_alias_for_target(target: &LiveAttachTarget) -> TargetAlias {
-    TargetAlias(target.key.clone())
+    TargetAlias(target.target_alias.clone())
 }
 
 fn endpoint_key_for_target(target: &LiveAttachTarget) -> Option<EndpointKey> {
@@ -1783,7 +1796,7 @@ fn optional_fingerprint_field_matches<T: PartialEq>(
 
 fn session_target_for_alias(
     mut target: LiveAttachTarget,
-    session: &DaemonSession,
+    session: &EndpointSession,
 ) -> LiveAttachTarget {
     let endpoint = Some(session.client.ws_endpoint().to_string());
     target.endpoint = endpoint.clone();
@@ -2198,7 +2211,7 @@ enum SessionRequest {
 
 struct SessionExecutionSuccess {
     response: DaemonResponse,
-    snapshot: DaemonSessionSnapshot,
+    snapshot: EndpointSessionSnapshot,
     target_alias: TargetAlias,
     target_alias_contexts: BTreeMap<String, PersistedContextState>,
 }
@@ -2207,7 +2220,7 @@ enum SessionExecutionError {
     TransportClosed {
         err: anyhow::Error,
         target_alias: TargetAlias,
-        snapshot: Box<DaemonSessionSnapshot>,
+        snapshot: Box<EndpointSessionSnapshot>,
     },
     Other {
         err: anyhow::Error,
@@ -2301,7 +2314,7 @@ async fn run_session_request_locked(
         let err = single_approval_transport_closed_error(err);
         session.state =
             terminal_session_state_from_error(session.fingerprint.clone(), &err, unix_ms_now());
-        let snapshot = DaemonSessionSnapshot::from_session(session);
+        let snapshot = EndpointSessionSnapshot::from_session(session);
         *guard = None;
         return Err(SessionExecutionError::TransportClosed {
             err,
@@ -2373,7 +2386,7 @@ async fn run_session_request_locked(
                     &err,
                     unix_ms_now(),
                 );
-                let snapshot = DaemonSessionSnapshot::from_session(session);
+                let snapshot = EndpointSessionSnapshot::from_session(session);
                 *guard = None;
                 return Err(SessionExecutionError::TransportClosed {
                     err,
@@ -2387,7 +2400,7 @@ async fn run_session_request_locked(
             };
             Ok(SessionExecutionSuccess {
                 response,
-                snapshot: DaemonSessionSnapshot::from_session(session),
+                snapshot: EndpointSessionSnapshot::from_session(session),
                 target_alias: lease.target_alias.clone(),
                 target_alias_contexts,
             })
@@ -2401,7 +2414,7 @@ async fn run_session_request_locked(
                     &err,
                     unix_ms_now(),
                 );
-                let snapshot = DaemonSessionSnapshot::from_session(session);
+                let snapshot = EndpointSessionSnapshot::from_session(session);
                 *guard = None;
                 return Err(SessionExecutionError::TransportClosed {
                     err,
@@ -2409,7 +2422,7 @@ async fn run_session_request_locked(
                     snapshot: Box::new(snapshot),
                 });
             }
-            let snapshot = DaemonSessionSnapshot::from_session(session);
+            let snapshot = EndpointSessionSnapshot::from_session(session);
             session.state = SessionState::Approved {
                 fingerprint: session.fingerprint.clone(),
                 connected_at_unix_ms,
@@ -2426,7 +2439,7 @@ async fn run_session_request_locked(
 async fn poison_runtime_session(
     runtime: &RuntimeSession,
     panic_message: &str,
-) -> Option<DaemonSessionSnapshot> {
+) -> Option<EndpointSessionSnapshot> {
     let mut guard = runtime.inner.lock().await;
     let mut session = guard.take()?;
     session.state = SessionState::Poisoned {
@@ -2434,11 +2447,11 @@ async fn poison_runtime_session(
         poisoned_at_unix_ms: unix_ms_now(),
         last_error: panic_message.to_string(),
     };
-    Some(DaemonSessionSnapshot::from_session(&session))
+    Some(EndpointSessionSnapshot::from_session(&session))
 }
 
 async fn ensure_chatgpt_session_with_session(
-    session: &mut DaemonSession,
+    session: &mut EndpointSession,
     explicit_context_id: Option<&str>,
     profile_email: Option<&str>,
 ) -> Result<LiveAttachSession> {
@@ -2448,7 +2461,7 @@ async fn ensure_chatgpt_session_with_session(
     session.target.endpoint = Some(session.client.ws_endpoint().to_string());
 
     Ok(LiveAttachSession {
-        target_key: session.target.key.clone(),
+        target_key: session.target.target_alias.clone(),
         control_run_id,
         browser_context_id,
         status: LiveAttachStatus::Attached,
@@ -2457,7 +2470,7 @@ async fn ensure_chatgpt_session_with_session(
 }
 
 async fn run_chatgpt_recipe_with_session(
-    session: &mut DaemonSession,
+    session: &mut EndpointSession,
     recipe_ctx: &mut chrome_devtools_mcp::DevtoolsMcpRecipeContext,
 ) -> Result<(ChatgptRunResult, Option<String>)> {
     let (browser_context_id, _) = ensure_chatgpt_control_tab_for_selectors(
@@ -2476,7 +2489,7 @@ async fn run_chatgpt_recipe_with_session(
 }
 
 async fn ensure_chatgpt_control_tab_for_selectors(
-    session: &mut DaemonSession,
+    session: &mut EndpointSession,
     explicit_context_id: Option<&str>,
     profile_email: Option<&str>,
 ) -> Result<(Option<String>, String)> {
@@ -2492,7 +2505,7 @@ async fn ensure_chatgpt_control_tab_for_selectors(
 }
 
 fn control_run_id_for_session(
-    session: &mut DaemonSession,
+    session: &mut EndpointSession,
     browser_context_id: Option<&str>,
 ) -> String {
     let now = unix_ms_now();
@@ -2510,7 +2523,7 @@ fn control_run_id_for_session(
 }
 
 fn contexts_for_browser_context_id(
-    session: &DaemonSession,
+    session: &EndpointSession,
     browser_context_id: Option<&str>,
 ) -> BTreeMap<String, PersistedContextState> {
     let key = context_storage_key(browser_context_id);
@@ -3055,13 +3068,13 @@ mod tests {
             sessions_by_endpoint: BTreeMap::new(),
             endpoint_by_alias: BTreeMap::new(),
             connecting_by_endpoint: BTreeMap::new(),
-            client_factory: Arc::new(TestCdpMcpClientFactory::default()),
+            client_factory: Arc::new(TestChromeCdpClientFactory::default()),
             endpoint_resolver: Arc::new(TestCdpEndpointResolver::default()),
         }
     }
 
     fn daemon_with_test_factory(
-        factory: TestCdpMcpClientFactory,
+        factory: TestChromeCdpClientFactory,
         resolver: TestCdpEndpointResolver,
     ) -> LiveAttachDaemon {
         LiveAttachDaemon {
@@ -3101,7 +3114,7 @@ mod tests {
 
     fn test_target(alias: &str, endpoint: &str) -> LiveAttachTarget {
         LiveAttachTarget {
-            key: alias.to_string(),
+            target_alias: alias.to_string(),
             connect_endpoint: Some(endpoint.to_string()),
             endpoint: Some(endpoint.to_string()),
             source_path: None,
@@ -3137,11 +3150,11 @@ mod tests {
         let endpoint = target.endpoint.clone().unwrap();
         let endpoint_key = EndpointKey::from_ws_endpoint(&endpoint).unwrap();
         let alias = target_alias_for_target(&target);
-        let session = DaemonSession {
+        let session = EndpointSession {
             endpoint_key: endpoint_key.clone(),
             aliases: BTreeSet::from([alias.clone()]),
             target,
-            client: DaemonSessionClient::Test(TestSessionClient::new(endpoint, behavior)),
+            client: EndpointSessionClient::Test(TestSessionClient::new(endpoint, behavior)),
             fingerprint: fingerprint.clone(),
             state: SessionState::Approved {
                 fingerprint,
@@ -3230,8 +3243,8 @@ mod tests {
         let guard = runtime.inner.lock().await;
         let session = guard.as_ref().expect("test session should be live");
         match &session.client {
-            DaemonSessionClient::Test(client) => client.set_probe_behavior(behavior),
-            DaemonSessionClient::Real(_) => panic!("expected test session client"),
+            EndpointSessionClient::Test(client) => client.set_probe_behavior(behavior),
+            EndpointSessionClient::Real(_) => panic!("expected test session client"),
         }
     }
 
@@ -3251,8 +3264,8 @@ mod tests {
         let guard = runtime.inner.lock().await;
         let session = guard.as_ref().expect("test session should be live");
         match &session.client {
-            DaemonSessionClient::Test(client) => client.set_control_tab_behavior(behavior),
-            DaemonSessionClient::Real(_) => panic!("expected test session client"),
+            EndpointSessionClient::Test(client) => client.set_control_tab_behavior(behavior),
+            EndpointSessionClient::Real(_) => panic!("expected test session client"),
         }
     }
 
@@ -3271,19 +3284,19 @@ mod tests {
         let guard = runtime.inner.lock().await;
         let session = guard.as_ref().expect("test session should be live");
         match &session.client {
-            DaemonSessionClient::Test(client) => (
+            EndpointSessionClient::Test(client) => (
                 client.new_page_count(),
                 client.user_window_open_count(),
                 client.control_tab_open_modes(),
             ),
-            DaemonSessionClient::Real(_) => panic!("expected test session client"),
+            EndpointSessionClient::Real(_) => panic!("expected test session client"),
         }
     }
 
     #[test]
-    fn live_attach_target_uses_implicit_key_without_resolved_target() {
+    fn live_attach_target_uses_implicit_alias_without_resolved_target() {
         let target = LiveAttachTarget::from_resolved(None);
-        assert_eq!(target.key, IMPLICIT_TARGET_KEY);
+        assert_eq!(target.target_alias, IMPLICIT_TARGET_KEY);
         assert_eq!(target.connect_endpoint, None);
         assert_eq!(target.endpoint, None);
         assert!(target.implicit_default);
@@ -3626,7 +3639,7 @@ mod tests {
     #[test]
     fn endpoint_key_for_target_uses_canonical_ws_endpoint_not_alias() {
         let target = LiveAttachTarget {
-            key: "endpoint:http://127.0.0.1:9222".to_string(),
+            target_alias: "endpoint:http://127.0.0.1:9222".to_string(),
             connect_endpoint: Some("http://127.0.0.1:9222".to_string()),
             endpoint: Some("ws://127.0.0.1:9222/devtools/browser/test".to_string()),
             source_path: None,
@@ -3704,12 +3717,12 @@ mod tests {
         runtime.block_on(async {
             let endpoint = "ws://127.0.0.1:9222/devtools/browser/same";
             let target = test_target("browser-id:same", endpoint);
-            let factory = TestCdpMcpClientFactory::default();
+            let factory = TestChromeCdpClientFactory::default();
             factory.push_recipe_behavior(TestRecipeBehavior::Error(
                 "Unable to make method calls because underlying connection is closed".to_string(),
             ));
             let resolver = TestCdpEndpointResolver::default();
-            resolver.set_endpoint(&target.key, endpoint);
+            resolver.set_endpoint(&target.target_alias, endpoint);
             let daemon = Arc::new(AsyncMutex::new(daemon_with_test_factory(
                 factory.clone(),
                 resolver,
@@ -3755,10 +3768,10 @@ mod tests {
         runtime.block_on(async {
             let endpoint = "ws://127.0.0.1:9222/devtools/browser/create-denied";
             let target = test_target("browser-id:create-denied", endpoint);
-            let factory = TestCdpMcpClientFactory::default();
+            let factory = TestChromeCdpClientFactory::default();
             factory.push_recipe_behavior(TestRecipeBehavior::CdpTargetCreateDeniedClosed);
             let resolver = TestCdpEndpointResolver::default();
-            resolver.set_endpoint(&target.key, endpoint);
+            resolver.set_endpoint(&target.target_alias, endpoint);
             let daemon = Arc::new(AsyncMutex::new(daemon_with_test_factory(
                 factory.clone(),
                 resolver,
@@ -3891,13 +3904,13 @@ mod tests {
             let endpoint = "ws://127.0.0.1:9222/devtools/browser/race";
             let target_a = test_target("browser-id:race-a", endpoint);
             let target_b = test_target("browser-id:race-b", endpoint);
-            let factory = TestCdpMcpClientFactory::default();
+            let factory = TestChromeCdpClientFactory::default();
             let connect_started = Arc::new(Notify::new());
             let connect_release = Arc::new(Notify::new());
             factory.block_next_connect(Arc::clone(&connect_started), Arc::clone(&connect_release));
             let resolver = TestCdpEndpointResolver::default();
-            resolver.set_endpoint(&target_a.key, endpoint);
-            resolver.set_endpoint(&target_b.key, endpoint);
+            resolver.set_endpoint(&target_a.target_alias, endpoint);
+            resolver.set_endpoint(&target_b.target_alias, endpoint);
             let daemon = Arc::new(AsyncMutex::new(daemon_with_test_factory(
                 factory.clone(),
                 resolver,
@@ -3985,7 +3998,7 @@ mod tests {
             let endpoint = "ws://127.0.0.1:9222/devtools/browser/shared";
             let source_path = dir.path().join("DevToolsActivePort");
             let source_target = LiveAttachTarget {
-                key: format!("source-path:{}", source_path.display()),
+                target_alias: format!("source-path:{}", source_path.display()),
                 connect_endpoint: Some("http://127.0.0.1:9222".to_string()),
                 endpoint: None,
                 source_path: Some(source_path),
@@ -3994,11 +4007,11 @@ mod tests {
             };
             let browser_target = test_target("browser-id:shared", endpoint);
             let implicit_target = LiveAttachTarget::from_resolved(None);
-            let factory = TestCdpMcpClientFactory::default();
+            let factory = TestChromeCdpClientFactory::default();
             let resolver = TestCdpEndpointResolver::default();
-            resolver.set_endpoint(&source_target.key, endpoint);
-            resolver.set_endpoint(&browser_target.key, endpoint);
-            resolver.set_endpoint(&implicit_target.key, endpoint);
+            resolver.set_endpoint(&source_target.target_alias, endpoint);
+            resolver.set_endpoint(&browser_target.target_alias, endpoint);
+            resolver.set_endpoint(&implicit_target.target_alias, endpoint);
             let daemon = Arc::new(AsyncMutex::new(daemon_with_test_factory(
                 factory.clone(),
                 resolver,
@@ -4175,7 +4188,7 @@ mod tests {
             let old_endpoint = "ws://127.0.0.1:9222/devtools/browser/old";
             let new_endpoint = "ws://127.0.0.1:9333/devtools/browser/new";
             let mut target = test_target(alias, old_endpoint);
-            let factory = TestCdpMcpClientFactory::default();
+            let factory = TestChromeCdpClientFactory::default();
             let resolver = TestCdpEndpointResolver::default();
             resolver.set_endpoint(alias, old_endpoint);
             let daemon = Arc::new(AsyncMutex::new(daemon_with_test_factory(
@@ -4248,7 +4261,7 @@ mod tests {
             let alias = "browser-id:same-endpoint-restarted";
             let endpoint = "ws://127.0.0.1:9222/devtools/browser/same";
             let target = test_target(alias, endpoint);
-            let factory = TestCdpMcpClientFactory::default();
+            let factory = TestChromeCdpClientFactory::default();
             let resolver = TestCdpEndpointResolver::default();
             let mut old_fingerprint = test_fingerprint(endpoint);
             old_fingerprint.listener_pid = Some(1111);
@@ -4329,7 +4342,7 @@ mod tests {
             endpoint_key,
         );
         let target = LiveAttachTarget {
-            key: "browser-id:test".to_string(),
+            target_alias: "browser-id:test".to_string(),
             connect_endpoint: Some(endpoint.to_string()),
             endpoint: Some(endpoint.to_string()),
             source_path: None,
@@ -4807,7 +4820,7 @@ mod tests {
     fn resolve_connect_endpoint_prefers_fresh_source_path_over_stale_endpoint() {
         let source_path = PathBuf::from("/tmp/yoetz-profile");
         let target = LiveAttachTarget {
-            key: "source-path:/tmp/yoetz-profile".to_string(),
+            target_alias: "source-path:/tmp/yoetz-profile".to_string(),
             connect_endpoint: Some("http://127.0.0.1:9222".to_string()),
             endpoint: Some("ws://127.0.0.1:9222/devtools/browser/stale".to_string()),
             source_path: Some(source_path.clone()),
@@ -4833,7 +4846,7 @@ mod tests {
     #[test]
     fn resolve_connect_endpoint_prefers_fresh_browser_id_over_stale_endpoint() {
         let target = LiveAttachTarget {
-            key: "browser-id:browser-123".to_string(),
+            target_alias: "browser-id:browser-123".to_string(),
             connect_endpoint: Some("http://127.0.0.1:9222".to_string()),
             endpoint: Some("ws://127.0.0.1:9222/devtools/browser/browser-123".to_string()),
             source_path: None,
@@ -4859,7 +4872,7 @@ mod tests {
     #[test]
     fn resolve_connect_endpoint_implicit_default_ignores_persisted_endpoint() {
         let target = LiveAttachTarget {
-            key: IMPLICIT_TARGET_KEY.to_string(),
+            target_alias: IMPLICIT_TARGET_KEY.to_string(),
             connect_endpoint: Some("http://127.0.0.1:9222".to_string()),
             endpoint: Some("ws://127.0.0.1:9222/devtools/browser/stale".to_string()),
             source_path: None,
@@ -4876,7 +4889,7 @@ mod tests {
     #[test]
     fn resolve_connect_endpoint_prefers_original_http_connect_endpoint() {
         let target = LiveAttachTarget {
-            key: "endpoint:http://127.0.0.1:9222".to_string(),
+            target_alias: "endpoint:http://127.0.0.1:9222".to_string(),
             connect_endpoint: Some("http://127.0.0.1:9222".to_string()),
             endpoint: Some("ws://127.0.0.1:9222/devtools/browser/stale".to_string()),
             source_path: None,
@@ -4967,7 +4980,7 @@ mod tests {
                 sessions_by_endpoint: BTreeMap::new(),
                 endpoint_by_alias: BTreeMap::new(),
                 connecting_by_endpoint: BTreeMap::new(),
-                client_factory: Arc::new(TestCdpMcpClientFactory::default()),
+                client_factory: Arc::new(TestChromeCdpClientFactory::default()),
                 endpoint_resolver: Arc::new(TestCdpEndpointResolver::default()),
             }));
             let _busy = daemon.lock().await;

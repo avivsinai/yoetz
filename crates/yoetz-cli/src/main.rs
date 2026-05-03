@@ -2659,7 +2659,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             // the real-browser CI lane (review finding #13) against a fresh
             // Chrome for Testing instance so the deeper `check` / `attach`
             // auth-probe path is not exercised.
-            let client = chrome_devtools_mcp::client::CdpMcpClient::connect_to_running_chrome(
+            let client = chrome_devtools_mcp::client::ChromeCdpClient::connect_to_running_chrome(
                 Some(&args.cdp),
             )
             .await

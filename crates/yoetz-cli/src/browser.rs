@@ -47,7 +47,9 @@ const CHATGPT_SEND_ENABLE_POLL_INTERVAL_MS: u64 = 250;
 const DAEMON_APPROVAL_GRACE_WINDOW: Duration = Duration::from_secs(30);
 const LIVE_ATTACH_COMMAND_TIMEOUT_MS: u64 = 30_000;
 const CDP_SESSION_NAME: &str = "yoetz-cdp";
-const CHROME_APPROVAL_LOCK_FILENAME: &str = "chrome-approval.lock";
+// Keep the legacy filename for local compatibility; the lock only serializes
+// attach attempts and does not represent persisted Chrome approval.
+const CHROME_ATTACH_ATTEMPT_LOCK_FILENAME: &str = "chrome-approval.lock";
 const BROWSER_TARGET_STATE_FILENAME: &str = "browser-target.json";
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 const COOKIE_SYNC_NODE_MIN_VERSION: NodeVersion = NodeVersion {
@@ -177,7 +179,7 @@ impl ResolvedCdpTarget {
         matches!(self.source, ResolvedCdpTargetSource::Flag)
     }
 
-    pub fn live_attach_target_key(&self) -> String {
+    pub fn live_attach_target_alias(&self) -> String {
         if let Some(source_path) = &self.source_path {
             return format!("source-path:{}", source_path.display());
         }
@@ -2024,12 +2026,12 @@ pub enum DaemonState {
 }
 
 #[derive(Debug)]
-pub struct ChromeApprovalLock {
+pub struct AttachAttemptLock {
     _lock_file: File,
     waited: bool,
 }
 
-impl ChromeApprovalLock {
+impl AttachAttemptLock {
     pub fn waited(&self) -> bool {
         self.waited
     }
@@ -2069,11 +2071,11 @@ fn acquire_waitable_lock(lock_path: &Path, action: &str) -> Result<(File, bool)>
     Ok((file, waited))
 }
 
-pub fn acquire_chrome_approval_lock() -> Result<ChromeApprovalLock> {
-    let lock_path = yoetz_lock_path(CHROME_APPROVAL_LOCK_FILENAME);
-    let (file, waited) = acquire_waitable_lock(&lock_path, "browser approval lock")?;
+pub fn acquire_attach_attempt_lock() -> Result<AttachAttemptLock> {
+    let lock_path = yoetz_lock_path(CHROME_ATTACH_ATTEMPT_LOCK_FILENAME);
+    let (file, waited) = acquire_waitable_lock(&lock_path, "browser attach attempt lock")?;
 
-    Ok(ChromeApprovalLock {
+    Ok(AttachAttemptLock {
         _lock_file: file,
         waited,
     })

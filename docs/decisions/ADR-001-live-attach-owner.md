@@ -97,7 +97,7 @@ explicit `yoetz browser attach` flow or by clearing the stale state with
 
 ## 2026-05-02 Amendment: Endpoint-Owned State
 
-`LiveAttachTarget.key` is a target alias, not the CDP session key. The daemon
+`LiveAttachTarget.target_alias` is a target alias, not the CDP session key. The daemon
 keys live sessions and persisted owner state by the approved canonical browser
 websocket endpoint, and keeps a separate alias map for selectors such as
 `source-path:*`, `browser-id:*`, and `implicit-default`.

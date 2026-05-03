@@ -1470,11 +1470,11 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
 
         let prepare_script = build_chatgpt_prepare_script(&page_name, &ctx.model, &ctx.run_id);
         let prepare_stdout = {
-            let approval_lock = browser::acquire_chrome_approval_lock()?;
+            let attach_attempt_lock = browser::acquire_attach_attempt_lock()?;
             if ctx.show_approval_guidance {
-                if approval_lock.waited() {
+                if attach_attempt_lock.waited() {
                     eprintln!(
-                        "info: another yoetz process is already requesting Chrome approval; waiting for it to finish before trying the dev-browser transport"
+                        "info: another yoetz process is already starting a Chrome attach attempt; waiting for it to finish before trying the dev-browser transport"
                     );
                 }
                 eprintln!(
