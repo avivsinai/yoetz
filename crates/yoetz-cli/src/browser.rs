@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::chatgpt_recipe;
+use crate::chatgpt_recipe::{self, AnyhowResultExt};
 use crate::chatgpt_web;
 use crate::chrome_devtools_mcp::client::{
     browser_id_from_ws_endpoint, discover_devtools_active_port_files,
@@ -35,13 +35,14 @@ const CHATGPT_WAIT_ACTION: &str = "chatgpt_wait_response";
 const CHATGPT_WAIT_UPLOAD_ACTION: &str = "chatgpt_wait_upload";
 const CHATGPT_SELECT_MODEL_ACTION: &str = "chatgpt_select_model";
 const CHATGPT_OPEN_ATTACHMENT_UI_ACTION: &str = "chatgpt_open_attachment_ui";
+const CHATGPT_UPLOAD_BUNDLE_ACTION: &str = "chatgpt_upload_bundle";
 const CHATGPT_SEND_ACTION: &str = "chatgpt_send";
 const CHATGPT_POLL_ATTEMPTS_DEFAULT: usize = 60;
 const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 30_000;
 const CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
 const CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT: u64 = 10_000;
-const CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT: usize = 30;
-const CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT: u64 = 1_000;
+const CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT: usize = 60;
+const CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT: u64 = 2_000;
 const CHATGPT_SEND_ENABLE_TIMEOUT_MS: u64 = 10_000;
 const CHATGPT_SEND_ENABLE_POLL_INTERVAL_MS: u64 = 250;
 const DAEMON_APPROVAL_GRACE_WINDOW: Duration = Duration::from_secs(30);
@@ -103,6 +104,7 @@ pub struct RecipeContext {
     pub bundle_text: Option<String>,
     pub profile_dir: Option<PathBuf>,
     pub profile_mode: BrowserProfileMode,
+    pub fallback_used: bool,
     pub use_stealth: bool,
     pub headed: bool,
     pub vars: BTreeMap<String, String>,
@@ -137,7 +139,10 @@ pub enum BrowserProfileMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BrowserConnection {
     /// Connected to a live Chrome instance via CDP with explicit endpoint.
-    Cdp { endpoint: String },
+    Cdp {
+        endpoint: String,
+        run_id: Option<String>,
+    },
     /// Connected via agent-browser auto-discovery to a live Chrome instance.
     AutoConnect,
     /// Cookie-extracted Playwright storageState file.
@@ -314,12 +319,16 @@ fn build_agent_browser_args(
     }
 
     match connection {
-        Some(BrowserConnection::Cdp { endpoint }) => {
+        Some(BrowserConnection::Cdp { endpoint, run_id }) => {
             if !args
                 .iter()
                 .any(|a| a == "--session" || a.starts_with("--session="))
             {
-                args.insert(0, CDP_SESSION_NAME.to_string());
+                let session_name = run_id
+                    .as_deref()
+                    .map(live_cdp_session_name_for_run)
+                    .unwrap_or_else(|| CDP_SESSION_NAME.to_string());
+                args.insert(0, session_name);
                 args.insert(0, "--session".to_string());
             }
             if !args.iter().any(|a| a == "--cdp" || a.starts_with("--cdp=")) {
@@ -504,6 +513,8 @@ fn run_recipe_with_connection(
     let mut events: Vec<Value> = Vec::new();
     let mut headed = ctx.headed;
     let mut pending_chatgpt_send_baseline: Option<ChatgptResponseBaseline> = None;
+    let mut chatgpt_stage = ChatgptRecipeStage::Idle;
+    let mut chatgpt_focus_cache = ChatgptRunTabFocusCache::default();
 
     if let Some(connection) = connection {
         if connection.is_live_attach() {
@@ -524,13 +535,38 @@ fn run_recipe_with_connection(
     for (idx, step) in recipe.steps.iter().enumerate() {
         // Evaluate skip_if before anything else (including sleep).
         if let Some(expr) = &step.skip_if {
+            if let Some(action) = step.action.as_deref() {
+                focus_chatgpt_run_tab_before_recipe_action(
+                    is_chatgpt_recipe,
+                    action,
+                    connection,
+                    &ctx,
+                    headed,
+                    step.timeout_ms
+                        .unwrap_or(CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT),
+                    Some(&mut chatgpt_focus_cache),
+                )
+                .map_err(|err| {
+                    mark_chatgpt_error_after_side_effect(err, chatgpt_stage.terminal_phase(action))
+                })
+                .with_context(|| {
+                    format!("recipe step {idx} ({action}) target focus before skip_if failed")
+                })?;
+            }
             let result = run_agent_browser_with_connection(
                 vec!["eval".to_string(), expr.clone()],
                 OutputFormat::Text,
                 connection,
                 ctx.use_stealth,
                 headed,
-            )?;
+            )
+            .map_err(|err| {
+                let phase = step
+                    .action
+                    .as_deref()
+                    .and_then(|action| chatgpt_stage.terminal_phase(action));
+                mark_chatgpt_error_after_side_effect(err, phase)
+            })?;
             let trimmed = result.trim().trim_matches('"');
             if !trimmed.is_empty()
                 && trimmed != "false"
@@ -553,6 +589,21 @@ fn run_recipe_with_connection(
             return Err(anyhow!("recipe step {idx} missing action"));
         };
 
+        focus_chatgpt_run_tab_before_recipe_action(
+            is_chatgpt_recipe,
+            action,
+            connection,
+            &ctx,
+            headed,
+            step.timeout_ms
+                .unwrap_or(CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT),
+            Some(&mut chatgpt_focus_cache),
+        )
+        .map_err(|err| {
+            mark_chatgpt_error_after_side_effect(err, chatgpt_stage.terminal_phase(action))
+        })
+        .with_context(|| format!("recipe step {idx} ({action}) target focus failed"))?;
+
         if action == CHATGPT_WAIT_ACTION {
             // Interpolate recipe vars (e.g. {{wait_timeout_ms}}) in args before parsing.
             let interpolated_args: Option<Vec<String>> = step
@@ -564,6 +615,7 @@ fn run_recipe_with_connection(
                         .collect::<Result<Vec<_>>>()
                 })
                 .transpose()
+                .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::WaitResponse)
                 .with_context(|| format!("recipe step {idx} ({action}) var interpolation"))?;
             let stdout = run_chatgpt_wait_response(
                 interpolated_args.as_deref(),
@@ -574,6 +626,7 @@ fn run_recipe_with_connection(
                 ctx.use_stealth,
                 headed,
             )
+            .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::WaitResponse)
             .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
 
             if wants_json || wants_jsonl {
@@ -600,6 +653,9 @@ fn run_recipe_with_connection(
 
         if action == CHATGPT_SELECT_MODEL_ACTION {
             let stdout = run_chatgpt_select_model(&ctx, connection, ctx.use_stealth, headed)
+                .map_err(|err| {
+                    mark_chatgpt_error_after_side_effect(err, chatgpt_stage.terminal_phase(action))
+                })
                 .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
 
             if wants_json || wants_jsonl {
@@ -626,6 +682,37 @@ fn run_recipe_with_connection(
 
         if action == CHATGPT_OPEN_ATTACHMENT_UI_ACTION {
             let stdout = run_chatgpt_open_attachment_ui(connection, ctx.use_stealth, headed)
+                .map_err(|err| {
+                    mark_chatgpt_error_after_side_effect(err, chatgpt_stage.terminal_phase(action))
+                })
+                .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+
+            if wants_json || wants_jsonl {
+                let stdout_value =
+                    parse_stdout_json(&stdout).unwrap_or(Value::String(stdout.clone()));
+                let event = json!({
+                    "type": "browser_step",
+                    "index": idx,
+                    "action": action,
+                    "args": step.args,
+                    "stdout": stdout_value,
+                });
+                if wants_jsonl {
+                    write_jsonl_event(&event)?;
+                }
+                if collect_step_events {
+                    events.push(event);
+                }
+            } else {
+                print!("{stdout}");
+            }
+            continue;
+        }
+
+        if action == CHATGPT_UPLOAD_BUNDLE_ACTION {
+            chatgpt_stage.mark_upload_started();
+            let stdout = run_chatgpt_upload_bundle(&ctx, connection, ctx.use_stealth, headed)
+                .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Upload)
                 .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
 
             if wants_json || wants_jsonl {
@@ -652,8 +739,10 @@ fn run_recipe_with_connection(
 
         if action == CHATGPT_SEND_ACTION {
             let stdout = run_chatgpt_send(connection, ctx.use_stealth, headed)
+                .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send)
                 .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
             pending_chatgpt_send_baseline = parse_chatgpt_send_baseline_from_stdout(&stdout);
+            chatgpt_stage.mark_send_succeeded();
 
             if wants_json || wants_jsonl {
                 let stdout_value =
@@ -678,6 +767,7 @@ fn run_recipe_with_connection(
         }
 
         if action == CHATGPT_WAIT_UPLOAD_ACTION {
+            chatgpt_stage.mark_upload_started();
             let stdout = run_chatgpt_wait_upload(
                 &ctx,
                 step.args.as_deref(),
@@ -685,6 +775,7 @@ fn run_recipe_with_connection(
                 ctx.use_stealth,
                 headed,
             )
+            .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Upload)
             .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
 
             if wants_json || wants_jsonl {
@@ -709,7 +800,17 @@ fn run_recipe_with_connection(
             continue;
         }
 
-        let commands = expand_step(action, step.args.as_deref(), &ctx)?;
+        if is_chatgpt_recipe && action == "upload" {
+            chatgpt_stage.mark_upload_started();
+        }
+        let action_terminal_phase = if is_chatgpt_recipe {
+            chatgpt_stage.terminal_phase(action)
+        } else {
+            None
+        };
+        let commands = expand_step(action, step.args.as_deref(), &ctx)
+            .map_err(|err| mark_chatgpt_error_after_side_effect(err, action_terminal_phase))
+            .with_context(|| format!("recipe step {idx} ({action}) expand failed"))?;
 
         for args in commands {
             let stdout = match run_agent_browser_with_connection_timeout(
@@ -740,7 +841,10 @@ fn run_recipe_with_connection(
                         &ctx.target_url,
                         headed,
                         snapshot.as_deref(),
-                    )? {
+                    )
+                    .map_err(|err| {
+                        mark_chatgpt_error_after_side_effect(err, action_terminal_phase)
+                    })? {
                         headed = true;
                         run_agent_browser_with_connection_timeout(
                             args.clone(),
@@ -749,9 +853,15 @@ fn run_recipe_with_connection(
                             ctx.use_stealth,
                             headed,
                             step.timeout_ms,
-                        )?
+                        )
+                        .map_err(|err| {
+                            mark_chatgpt_error_after_side_effect(err, action_terminal_phase)
+                        })?
                     } else {
-                        return Err(err.context(format!("recipe step {idx} ({action}) failed")));
+                        return Err(mark_chatgpt_error_after_side_effect(
+                            err.context(format!("recipe step {idx} ({action}) failed")),
+                            action_terminal_phase,
+                        ));
                     }
                 }
             };
@@ -779,7 +889,7 @@ fn run_recipe_with_connection(
     }
 
     let payload = if is_chatgpt_recipe {
-        chatgpt_recipe_payload_from_steps(&events)
+        chatgpt_recipe_payload_from_steps(&events, ctx.fallback_used)
     } else {
         json!({
             "name": recipe.name,
@@ -799,11 +909,15 @@ fn run_recipe_with_connection(
             "backend": "agent-browser",
             "response": payload.get("response").cloned().unwrap_or(Value::Null),
             "model_used": payload.get("model_used").cloned().unwrap_or(Value::Null),
+            "model_selection_status": payload
+                .get("model_selection_status")
+                .cloned()
+                .unwrap_or(Value::Null),
             "warnings": payload
                 .get("warnings")
                 .cloned()
                 .unwrap_or_else(|| Value::Array(Vec::new())),
-            "fallback_used": true,
+            "fallback_used": ctx.fallback_used,
             "delivery_mode": payload.get("delivery_mode").cloned().unwrap_or(Value::Null),
             "auto_paste_fallback": payload
                 .get("auto_paste_fallback")
@@ -816,9 +930,10 @@ fn run_recipe_with_connection(
     Ok(payload)
 }
 
-fn chatgpt_recipe_payload_from_steps(steps: &[Value]) -> Value {
+fn chatgpt_recipe_payload_from_steps(steps: &[Value], fallback_used: bool) -> Value {
     let mut response = Value::Null;
     let mut model_used = Value::Null;
+    let mut model_selection_status = chatgpt_recipe::ChatgptModelSelectionStatus::Unavailable;
     let mut warnings: Vec<String> = Vec::new();
 
     for step in steps {
@@ -830,6 +945,11 @@ fn chatgpt_recipe_payload_from_steps(steps: &[Value]) -> Value {
         if action == CHATGPT_SELECT_MODEL_ACTION {
             if let Some(value) = stdout.get("model_used").cloned() {
                 model_used = value;
+            }
+            if let Some(value) = stdout.get("model_selection_status").cloned() {
+                if let Ok(status) = serde_json::from_value(value) {
+                    model_selection_status = status;
+                }
             }
         }
         if action == CHATGPT_WAIT_ACTION {
@@ -853,8 +973,9 @@ fn chatgpt_recipe_payload_from_steps(steps: &[Value]) -> Value {
         backend: "agent-browser".to_string(),
         response: response.as_str().unwrap_or_default().to_string(),
         model_used: model_used.as_str().map(str::to_owned),
+        model_selection_status,
         warnings,
-        fallback_used: true,
+        fallback_used,
         delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
         auto_paste_fallback: false,
     };
@@ -863,6 +984,77 @@ fn chatgpt_recipe_payload_from_steps(steps: &[Value]) -> Value {
         object.insert("steps".to_string(), json!(steps));
     }
     payload
+}
+
+fn focus_chatgpt_run_tab_before_recipe_action(
+    is_chatgpt_recipe: bool,
+    action: &str,
+    connection: Option<&BrowserConnection>,
+    ctx: &RecipeContext,
+    headed: bool,
+    timeout_ms: u64,
+    focus_cache: Option<&mut ChatgptRunTabFocusCache>,
+) -> Result<()> {
+    if !is_chatgpt_recipe || action == "open" {
+        return Ok(());
+    }
+    let Some(connection) = connection.filter(|connection| connection.is_live_attach()) else {
+        return Ok(());
+    };
+
+    focus_chatgpt_run_tab_for_live_attach_cached(
+        Some(connection),
+        ctx.vars.get("run_id").map(String::as_str),
+        ctx.use_stealth,
+        headed,
+        timeout_ms,
+        focus_cache,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ChatgptRecipeStage {
+    Idle,
+    UploadStarted,
+    SendSucceeded,
+}
+
+impl ChatgptRecipeStage {
+    fn mark_upload_started(&mut self) {
+        if *self == Self::Idle {
+            *self = Self::UploadStarted;
+        }
+    }
+
+    fn mark_send_succeeded(&mut self) {
+        *self = Self::SendSucceeded;
+    }
+
+    fn terminal_phase(self, action: &str) -> Option<chatgpt_recipe::ChatgptTransportPhase> {
+        if self == Self::SendSucceeded {
+            return Some(chatgpt_recipe::ChatgptTransportPhase::WaitResponse);
+        }
+
+        match action {
+            CHATGPT_WAIT_ACTION => Some(chatgpt_recipe::ChatgptTransportPhase::WaitResponse),
+            CHATGPT_SEND_ACTION => Some(chatgpt_recipe::ChatgptTransportPhase::Send),
+            CHATGPT_WAIT_UPLOAD_ACTION | CHATGPT_UPLOAD_BUNDLE_ACTION | "upload" => {
+                Some(chatgpt_recipe::ChatgptTransportPhase::Upload)
+            }
+            _ if self == Self::UploadStarted => Some(chatgpt_recipe::ChatgptTransportPhase::Upload),
+            _ => None,
+        }
+    }
+}
+
+fn mark_chatgpt_error_after_side_effect(
+    err: anyhow::Error,
+    phase: Option<chatgpt_recipe::ChatgptTransportPhase>,
+) -> anyhow::Error {
+    match phase {
+        Some(phase) => chatgpt_recipe::mark_terminal_fallback_phase(err, phase),
+        None => err,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -993,18 +1185,20 @@ fn run_chatgpt_wait_response(
     use_stealth: bool,
     headed: bool,
 ) -> Result<String> {
-    let options = parse_chatgpt_poll_args(args)?;
+    let options = parse_chatgpt_poll_args(CHATGPT_WAIT_ACTION, args)?;
     let command_timeout_ms = timeout_ms.unwrap_or(CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT);
     let started_at = Instant::now();
     let deadline = started_at + Duration::from_millis(options.timeout_ms);
+    let mut focus_cache = ChatgptRunTabFocusCache::default();
     // Prefer the exact pre-send assistant counters returned by
     // `chatgpt_send`; otherwise fall back to a fresh DOM baseline.
-    focus_chatgpt_run_tab_for_auto_connect(
+    focus_chatgpt_run_tab_for_live_attach_cached(
         connection,
         run_id,
         use_stealth,
         headed,
         command_timeout_ms,
+        Some(&mut focus_cache),
     )?;
     let baseline_dom = match baseline {
         Some(baseline) => baseline_dom_state(baseline),
@@ -1045,12 +1239,13 @@ fn run_chatgpt_wait_response(
 
         completed_polls = attempt;
 
-        focus_chatgpt_run_tab_for_auto_connect(
+        focus_chatgpt_run_tab_for_live_attach_cached(
             connection,
             run_id,
             use_stealth,
             headed,
             command_timeout_ms,
+            Some(&mut focus_cache),
         )?;
         let dom = inspect_chatgpt_dom_state(connection, use_stealth, headed, command_timeout_ms)?;
         if !dom.error.is_empty() {
@@ -1061,12 +1256,13 @@ fn run_chatgpt_wait_response(
         match classify_chatgpt_completion(&dom, &baseline_dom) {
             CompletionVerdict::CopyButton => {
                 let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                focus_chatgpt_run_tab_for_auto_connect(
+                focus_chatgpt_run_tab_for_live_attach_cached(
                     connection,
                     run_id,
                     use_stealth,
                     headed,
                     command_timeout_ms,
+                    Some(&mut focus_cache),
                 )?;
                 let response = read_latest_chatgpt_response(
                     connection,
@@ -1112,12 +1308,13 @@ fn run_chatgpt_wait_response(
                 if stable_for_ms >= stable_idle_threshold_ms {
                     let elapsed_ms =
                         started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
-                    focus_chatgpt_run_tab_for_auto_connect(
+                    focus_chatgpt_run_tab_for_live_attach_cached(
                         connection,
                         run_id,
                         use_stealth,
                         headed,
                         command_timeout_ms,
+                        Some(&mut focus_cache),
                     )?;
                     let response = read_latest_chatgpt_response(
                         connection,
@@ -1190,40 +1387,86 @@ fn chatgpt_wait_probe_delay(
     }
 }
 
-fn focus_chatgpt_run_tab_for_auto_connect(
+#[derive(Debug, Default)]
+struct ChatgptRunTabFocusCache {
+    run_id: Option<String>,
+    tab_index: Option<usize>,
+}
+
+fn focus_chatgpt_run_tab_for_live_attach_cached(
     connection: Option<&BrowserConnection>,
     run_id: Option<&str>,
     use_stealth: bool,
     headed: bool,
     timeout_ms: u64,
+    mut cache: Option<&mut ChatgptRunTabFocusCache>,
 ) -> Result<()> {
-    let Some(connection @ BrowserConnection::AutoConnect) = connection else {
+    let Some(connection) = connection.filter(|connection| connection.is_live_attach()) else {
         return Ok(());
     };
     let Some(run_id) = run_id.map(str::trim).filter(|run_id| !run_id.is_empty()) else {
         return Ok(());
     };
+    let encoded_marker_param = chatgpt_web::chatgpt_run_url_marker(run_id);
+    let raw_marker_param = format!("_yoetz={run_id}");
+    let url_has_run_marker =
+        |url: &str| url.contains(&encoded_marker_param) || url.contains(&raw_marker_param);
+    let run_marker = format!("yoetz:{run_id}");
+
+    if let Some(cache_ref) = cache.as_deref_mut() {
+        if cache_ref.run_id.as_deref() == Some(run_id) {
+            if let Some(index) = cache_ref.tab_index {
+                if select_live_attach_tab(connection, index, use_stealth, headed, timeout_ms)
+                    .is_ok()
+                {
+                    let identity = inspect_current_live_attach_tab_identity(
+                        connection,
+                        use_stealth,
+                        headed,
+                        timeout_ms,
+                    )?;
+                    if identity.window_name == run_marker || url_has_run_marker(&identity.url) {
+                        return Ok(());
+                    }
+                }
+                cache_ref.tab_index = None;
+            }
+        } else {
+            cache_ref.run_id = Some(run_id.to_string());
+            cache_ref.tab_index = None;
+        }
+    }
 
     let tabs = list_live_attach_tabs(connection, use_stealth, headed, Some(timeout_ms))
         .with_context(|| format!("list Chrome tabs while tracking yoetz run `{run_id}`"))?;
-    let marker_param = format!("_yoetz={run_id}");
-    if tabs
+    if let Some(tab) = tabs
         .iter()
-        .any(|tab| tab.active && tab.url.contains(&marker_param))
+        .find(|tab| tab.active && url_has_run_marker(&tab.url))
     {
+        if let Some(cache_ref) = cache.as_deref_mut() {
+            cache_ref.run_id = Some(run_id.to_string());
+            cache_ref.tab_index = Some(tab.index);
+        }
         return Ok(());
     }
-    if let Some(tab) = tabs.iter().find(|tab| tab.url.contains(&marker_param)) {
+    if let Some(tab) = tabs.iter().find(|tab| url_has_run_marker(&tab.url)) {
         select_live_attach_tab(connection, tab.index, use_stealth, headed, timeout_ms)?;
+        if let Some(cache_ref) = cache.as_deref_mut() {
+            cache_ref.run_id = Some(run_id.to_string());
+            cache_ref.tab_index = Some(tab.index);
+        }
         return Ok(());
     }
 
-    let run_marker = format!("yoetz:{run_id}");
     for tab in chatgpt_run_tab_candidates(&tabs) {
         select_live_attach_tab(connection, tab.index, use_stealth, headed, timeout_ms)?;
         let identity =
             inspect_current_live_attach_tab_identity(connection, use_stealth, headed, timeout_ms)?;
-        if identity.window_name == run_marker || identity.url.contains(&marker_param) {
+        if identity.window_name == run_marker || url_has_run_marker(&identity.url) {
+            if let Some(cache_ref) = cache.as_deref_mut() {
+                cache_ref.run_id = Some(run_id.to_string());
+                cache_ref.tab_index = Some(tab.index);
+            }
             return Ok(());
         }
     }
@@ -1307,7 +1550,7 @@ fn inspect_current_live_attach_tab_identity(
 /// `display: none` when done) has disappeared inside the file tile.
 fn parse_upload_poll_options(args: Option<&[String]>) -> Result<ChatgptPollOptions> {
     match args {
-        Some(a) if !a.is_empty() => parse_chatgpt_poll_args(Some(a)),
+        Some(a) if !a.is_empty() => parse_chatgpt_poll_args(CHATGPT_WAIT_UPLOAD_ACTION, Some(a)),
         _ => Ok(ChatgptPollOptions {
             attempts: CHATGPT_UPLOAD_POLL_ATTEMPTS_DEFAULT,
             interval_ms: CHATGPT_UPLOAD_POLL_INTERVAL_MS_DEFAULT,
@@ -1346,11 +1589,14 @@ fn run_chatgpt_select_model(
         .and_then(Value::as_str)
         .unwrap_or("unknown");
     let model_used = chatgpt_web::select_reported_chatgpt_model(&selection, requested_model);
+    let model_selection_status =
+        chatgpt_web::chatgpt_model_selection_status(&selection, requested_model);
     match status {
         "selected" | "already-selected" => {
             Ok(json!({
                 "status": "ok",
                 "model_used": model_used,
+                "model_selection_status": model_selection_status,
             })
             .to_string())
         }
@@ -1358,6 +1604,7 @@ fn run_chatgpt_select_model(
             Ok(json!({
                 "status": "ok",
                 "model_used": model_used,
+                "model_selection_status": model_selection_status,
             })
             .to_string())
         }
@@ -1442,6 +1689,102 @@ fn run_chatgpt_open_attachment_ui(
     }
 }
 
+fn run_chatgpt_upload_bundle(
+    ctx: &RecipeContext,
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<String> {
+    let bundle_path = ctx
+        .bundle_path
+        .as_deref()
+        .context("ChatGPT upload requires `bundle_path` in the recipe context")?;
+    let marker_selector = format!(
+        "input[type='file'][title='{}']",
+        chatgpt_web::COMPOSER_FILE_INPUT_MARKER
+    );
+    let scope_expression = build_chatgpt_upload_scope_with_nudges_expression()?;
+
+    let scope_result = eval_chatgpt_upload_scope(
+        &scope_expression,
+        connection,
+        use_stealth,
+        headed,
+        CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT,
+    )?;
+    if !chatgpt_upload_scope_is_marked(&scope_result) {
+        return Err(anyhow!(
+            "composer-scoped ChatGPT file input was not available for upload: {}",
+            scope_result
+        ));
+    }
+
+    run_agent_browser_with_connection_timeout(
+        vec![
+            "upload".to_string(),
+            marker_selector.clone(),
+            bundle_path.to_string(),
+        ],
+        OutputFormat::Text,
+        connection,
+        use_stealth,
+        headed,
+        Some(CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT),
+    )
+    .with_context(|| format!("upload `{bundle_path}` through {marker_selector}"))?;
+
+    Ok(json!({"status": "ok", "selector": marker_selector}).to_string())
+}
+
+fn build_chatgpt_upload_scope_with_nudges_expression() -> Result<String> {
+    let scope_function_json =
+        serde_json::to_string(&chatgpt_web::build_scope_composer_file_input_function())?;
+    let open_function_json =
+        serde_json::to_string(&chatgpt_web::build_open_attachment_ui_function())?;
+    let menu_function_json =
+        serde_json::to_string(&chatgpt_web::build_upload_menu_item_click_function())?;
+    chatgpt_web::wrap_function_source_for_json_eval(&format!(
+        r#"
+async () => {{
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const run = (source) => eval("(" + source + ")")();
+  let state = await run({scope_function_json});
+  if (state?.status === "marked") return state;
+  await run({open_function_json}).catch(() => null);
+  await wait(300);
+  state = await run({scope_function_json});
+  if (state?.status === "marked") return state;
+  await run({menu_function_json}).catch(() => null);
+  await wait(300);
+  return await run({scope_function_json});
+}}
+"#
+    ))
+}
+
+fn eval_chatgpt_upload_scope(
+    scope_expression: &str,
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+    timeout_ms: u64,
+) -> Result<Value> {
+    let stdout = run_agent_browser_with_connection_timeout(
+        vec!["eval".to_string(), scope_expression.to_string()],
+        OutputFormat::Text,
+        connection,
+        use_stealth,
+        headed,
+        Some(timeout_ms),
+    )?;
+    parse_stdout_json(&stdout)
+        .with_context(|| format!("parse ChatGPT upload scope result: {stdout}"))
+}
+
+fn chatgpt_upload_scope_is_marked(result: &Value) -> bool {
+    result.get("status").and_then(Value::as_str) == Some("marked")
+}
+
 fn run_chatgpt_wait_upload(
     ctx: &RecipeContext,
     args: Option<&[String]>,
@@ -1490,7 +1833,19 @@ fn run_chatgpt_wait_upload(
 
         match status {
             "done" => {
-                return Ok(json!({"status": "ok", "polls": attempt}).to_string());
+                let stable_ready_count = probe
+                    .get("stableReadyCount")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                if stable_ready_count >= chatgpt_web::CHATGPT_UPLOAD_STABLE_POLLS {
+                    return Ok(json!({"status": "ok", "polls": attempt}).to_string());
+                }
+            }
+            "failed" => {
+                return Err(anyhow!(
+                    "attachment upload for `{file_name}` failed: {}",
+                    probe
+                ));
             }
             "no_tile" if attempt > 5 => {
                 return Err(anyhow!(
@@ -1650,7 +2005,10 @@ fn read_latest_chatgpt_response(
         .to_string())
 }
 
-fn parse_chatgpt_poll_args(args: Option<&[String]>) -> Result<ChatgptPollOptions> {
+fn parse_chatgpt_poll_args(
+    action_name: &str,
+    args: Option<&[String]>,
+) -> Result<ChatgptPollOptions> {
     let mut options = ChatgptPollOptions {
         attempts: CHATGPT_POLL_ATTEMPTS_DEFAULT,
         interval_ms: CHATGPT_POLL_INTERVAL_MS_DEFAULT,
@@ -1685,7 +2043,7 @@ fn parse_chatgpt_poll_args(args: Option<&[String]>) -> Result<ChatgptPollOptions
                     .parse()
                     .with_context(|| format!("invalid --timeout-ms value `{raw}`"))?;
             }
-            other => return Err(anyhow!("unsupported {CHATGPT_WAIT_ACTION} arg `{other}`")),
+            other => return Err(anyhow!("unsupported {action_name} arg `{other}`")),
         }
     }
     if options.interval_ms == 0 {
@@ -1988,10 +2346,14 @@ pub fn close_browser() -> Result<()> {
 }
 
 pub fn close_live_attach_session() -> Result<()> {
+    close_live_attach_session_name(CDP_SESSION_NAME)
+}
+
+fn close_live_attach_session_name(session_name: &str) -> Result<()> {
     let (bin, prefix_args) = resolve_agent_browser()?;
     let mut cmd = Command::new(bin);
     cmd.args(prefix_args);
-    match cmd.args(["--session", CDP_SESSION_NAME, "close"]).output() {
+    match cmd.args(["--session", session_name, "close"]).output() {
         Ok(output) if !output.status.success() => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             eprintln!("warning: session close failed: {stderr}");
@@ -2003,10 +2365,38 @@ pub fn close_live_attach_session() -> Result<()> {
 }
 
 pub fn close_browser_for_connection(connection: &BrowserConnection) -> Result<()> {
-    if connection.is_live_attach() {
-        return close_live_attach_session();
+    match connection {
+        BrowserConnection::AutoConnect => return close_live_attach_session(),
+        BrowserConnection::Cdp { run_id, .. } => {
+            let session_name = run_id
+                .as_deref()
+                .map(live_cdp_session_name_for_run)
+                .unwrap_or_else(|| CDP_SESSION_NAME.to_string());
+            return close_live_attach_session_name(&session_name);
+        }
+        BrowserConnection::CookieState { .. } | BrowserConnection::Profile { .. } => {}
     }
     close_browser_daemon()
+}
+
+pub fn live_cdp_session_name_for_run(run_id: &str) -> String {
+    let mut suffix = run_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    suffix.truncate(50);
+    let suffix = suffix.trim_matches('-');
+    if suffix.is_empty() {
+        CDP_SESSION_NAME.to_string()
+    } else {
+        format!("{CDP_SESSION_NAME}-{suffix}")
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3533,7 +3923,12 @@ pub fn resolve_browser_connection(
 ) -> Result<BrowserConnection> {
     if let Some(endpoint) = resolve_cdp_endpoint(cdp_override, browser_defaults) {
         match try_cdp_attach(&endpoint, target_url) {
-            Ok(()) => return Ok(BrowserConnection::Cdp { endpoint }),
+            Ok(()) => {
+                return Ok(BrowserConnection::Cdp {
+                    endpoint,
+                    run_id: None,
+                })
+            }
             Err(err) if should_stop_live_attach_fallback(&err) => {
                 return Err(err);
             }
@@ -3555,6 +3950,7 @@ pub fn resolve_browser_connection(
 pub fn try_cdp_attach(endpoint: &str, target_url: &str) -> Result<()> {
     let connection = BrowserConnection::Cdp {
         endpoint: endpoint.to_string(),
+        run_id: None,
     };
     verify_auth_cdp(target_url, &connection).map_err(|e| {
         if allow_dialog_error(&e) {
@@ -4519,6 +4915,7 @@ mod tests {
             bundle_text: Some("hello world".to_string()),
             profile_dir: None,
             profile_mode: BrowserProfileMode::ProfileOnly,
+            fallback_used: false,
             use_stealth: true,
             headed: false,
             target_url: CHATGPT_URL.to_string(),
@@ -4644,6 +5041,76 @@ mod tests {
         .clone()
     }
 
+    fn fake_agent_browser_focus_bin() -> PathBuf {
+        static BIN: TestOnceLock<PathBuf> = TestOnceLock::new();
+        BIN.get_or_init(|| {
+            let dir = unique_test_dir("fake_agent_browser_focus");
+            let bin = command_path(&dir, "fake-agent-browser-focus");
+            write_executable_script(
+                &bin,
+                r#"#!/bin/sh
+printf '%s\n' "$*" >> "$LOG_PATH"
+case "$*" in
+  *"tab list --json"*)
+    printf '{"success":true,"data":{"tabs":[{"active":true,"index":1,"title":"Docs","url":"https://docs.example.com/"},{"active":false,"index":4,"title":"ChatGPT","url":"https://chatgpt.com/?_yoetz=run-focus"}]}}'
+    ;;
+  *" eval "*)
+    case "$*" in
+      *"windowName"*)
+        printf '{"windowName":"yoetz:run-focus","url":"https://chatgpt.com/?_yoetz=run-focus"}'
+        exit 0
+        ;;
+    esac
+    count=0
+    if [ -f "$EVAL_COUNT_PATH" ]; then count=$(cat "$EVAL_COUNT_PATH"); fi
+    count=$((count + 1))
+    printf '%s' "$count" > "$EVAL_COUNT_PATH"
+    if [ "$count" = "1" ]; then
+      printf '{"status":"already-selected","currentLabel":"GPT-5 Pro"}'
+    elif [ "$count" = "2" ]; then
+      printf '{"status":"marked"}'
+    else
+      printf '{"status":"sent","assistantCountBeforeSend":0,"assistantLastLenBeforeSend":0}'
+    fi
+    ;;
+esac
+"#,
+                r#"@echo off
+setlocal enabledelayedexpansion
+echo %*>> "%LOG_PATH%"
+echo %* | findstr /c:"tab list --json" >nul
+if %errorlevel%==0 (
+  echo {"success":true,"data":{"tabs":[{"active":true,"index":1,"title":"Docs","url":"https://docs.example.com/"},{"active":false,"index":4,"title":"ChatGPT","url":"https://chatgpt.com/?_yoetz=run-focus"}]}}
+  exit /b 0
+)
+echo %* | findstr /c:" eval " >nul
+if %errorlevel%==0 (
+  echo %* | findstr /c:"windowName" >nul
+  if !errorlevel!==0 (
+    echo {"windowName":"yoetz:run-focus","url":"https://chatgpt.com/?_yoetz=run-focus"}
+    exit /b 0
+  )
+  set count=0
+  if exist "%EVAL_COUNT_PATH%" (
+    set /p count=<"%EVAL_COUNT_PATH%"
+  )
+  set /a count=count+1
+  > "%EVAL_COUNT_PATH%" echo !count!
+  if "!count!"=="1" (
+    echo {"status":"already-selected","currentLabel":"GPT-5 Pro"}
+  ) else if "!count!"=="2" (
+    echo {"status":"marked"}
+  ) else (
+    echo {"status":"sent","assistantCountBeforeSend":0,"assistantLastLenBeforeSend":0}
+  )
+)
+"#,
+            );
+            bin
+        })
+        .clone()
+    }
+
     #[test]
     fn detect_agent_browser_in_path_does_not_fall_back_to_npx() {
         let _guard = lock_env();
@@ -4746,6 +5213,7 @@ mod tests {
     fn browser_connection_live_attach_detection() {
         assert!(BrowserConnection::Cdp {
             endpoint: "http://127.0.0.1:9222".to_string(),
+            run_id: None,
         }
         .is_live_attach());
         assert!(BrowserConnection::AutoConnect.is_live_attach());
@@ -5622,6 +6090,7 @@ browser_cdp = "http://evil.example.com:9222"
             OutputFormat::Json,
             Some(&BrowserConnection::Cdp {
                 endpoint: "http://127.0.0.1:9222".to_string(),
+                run_id: None,
             }),
             /* use_stealth */ true,
             /* headed */ true,
@@ -5632,6 +6101,29 @@ browser_cdp = "http://evil.example.com:9222"
         assert!(args.iter().any(|arg| arg == "http://127.0.0.1:9222"));
         assert!(!args.iter().any(|arg| arg == "--headed"));
         assert!(!args.iter().any(|arg| arg == "--user-agent"));
+    }
+
+    #[test]
+    fn build_agent_browser_args_uses_run_scoped_cdp_session_name() {
+        let args = build_agent_browser_args(
+            vec!["snapshot".to_string()],
+            OutputFormat::Json,
+            Some(&BrowserConnection::Cdp {
+                endpoint: "http://127.0.0.1:9222".to_string(),
+                run_id: Some("run:abc/123".to_string()),
+            }),
+            /* use_stealth */ true,
+            /* headed */ true,
+        );
+
+        assert!(args.iter().any(|arg| arg == "yoetz-cdp-run-abc-123"));
+        assert!(!args.iter().any(|arg| arg == CDP_SESSION_NAME));
+    }
+
+    #[test]
+    fn live_cdp_session_name_leaves_agent_browser_length_headroom() {
+        let name = live_cdp_session_name_for_run(&"a".repeat(200));
+        assert_eq!(name.len(), "yoetz-cdp-".len() + 50);
     }
 
     #[test]
@@ -5646,6 +6138,105 @@ browser_cdp = "http://evil.example.com:9222"
         assert!(args.iter().any(|arg| arg == "--auto-connect"));
         assert!(!args.iter().any(|arg| arg == "--session"));
         assert!(!args.iter().any(|arg| arg == CDP_SESSION_NAME));
+    }
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn live_attach_chatgpt_steps_focus_run_tab_before_built_in_and_generic_actions() {
+        fn assert_action_was_focused(lines: &[&str], needle: &str) {
+            let action_idx = lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("expected `{needle}` in log:\n{}", lines.join("\n")));
+            assert!(
+                lines[..action_idx]
+                    .iter()
+                    .rev()
+                    .any(|line| line.contains(" tab 4")),
+                "expected tab 4 selection before `{needle}` in log:\n{}",
+                lines.join("\n")
+            );
+        }
+
+        fn run_case(label: &str, connection: BrowserConnection, expected_connection_arg: &str) {
+            let log_dir = unique_test_dir(label);
+            let log_path = log_dir.join("agent-browser.log");
+            let eval_count_path = log_dir.join("eval-count");
+            let bin = fake_agent_browser_focus_bin();
+            let _bin_env = EnvVarGuard::set("YOETZ_AGENT_BROWSER_BIN", &bin);
+            let _log_env = EnvVarGuard::set("LOG_PATH", &log_path);
+            let _eval_env = EnvVarGuard::set("EVAL_COUNT_PATH", &eval_count_path);
+            let mut ctx = recipe_context();
+            ctx.use_stealth = false;
+            ctx.vars.insert("model".to_string(), "auto".to_string());
+            ctx.vars.insert("prompt".to_string(), "Review".to_string());
+            ctx.vars
+                .insert("run_id".to_string(), "run-focus".to_string());
+            let recipe = serde_yaml_ng::from_str::<Recipe>(
+                r##"
+name: chatgpt
+steps:
+  - action: open
+    args: ["https://chatgpt.com/?_yoetz={{run_id}}"]
+  - action: chatgpt_select_model
+  - action: chatgpt_upload_bundle
+  - action: type
+    args: ["#prompt-textarea", "{{prompt}}"]
+  - action: chatgpt_send
+"##,
+            )
+            .unwrap();
+
+            run_recipe_with_connection(recipe, ctx, Some(&connection), OutputFormat::Text).unwrap();
+
+            let logged = fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(
+                logged.contains(expected_connection_arg),
+                "expected `{expected_connection_arg}` in log:\n{logged}"
+            );
+            let lines = logged.lines().collect::<Vec<_>>();
+            let eval_indices = lines
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, line)| {
+                    (line.contains(" eval ") && !line.contains("windowName")).then_some(idx)
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                eval_indices.len() >= 3,
+                "expected model-selection, upload-scope, and send evals:\n{logged}"
+            );
+            for idx in eval_indices {
+                assert!(
+                    lines[..idx]
+                        .iter()
+                        .rev()
+                        .any(|line| line.contains(" tab 4")),
+                    "expected run-tab focus before eval line `{}`:\n{logged}",
+                    lines[idx]
+                );
+            }
+            assert_action_was_focused(
+                &lines,
+                " upload input[type='file'][title='yoetz-upload-target'] /tmp/bundle.md",
+            );
+            assert_action_was_focused(&lines, " type #prompt-textarea Review");
+        }
+
+        let _guard = lock_env();
+        run_case(
+            "focus_auto_connect",
+            BrowserConnection::AutoConnect,
+            "--auto-connect",
+        );
+        run_case(
+            "focus_cdp",
+            BrowserConnection::Cdp {
+                endpoint: "http://127.0.0.1:9222".to_string(),
+                run_id: Some("run-focus".to_string()),
+            },
+            "--cdp http://127.0.0.1:9222 --session yoetz-cdp-run-focus",
+        );
     }
 
     #[test]
@@ -5680,6 +6271,7 @@ browser_cdp = "http://evil.example.com:9222"
         assert_eq!(
             auth_check_timeout_ms(&BrowserConnection::Cdp {
                 endpoint: "http://127.0.0.1:9222".to_string(),
+                run_id: None,
             }),
             LIVE_ATTACH_AUTH_CHECK_TIMEOUT_MS
         );
@@ -5734,6 +6326,7 @@ browser_cdp = "http://evil.example.com:9222"
             r#"{"text":"Verify you are human"}"#,
             Some(&BrowserConnection::Cdp {
                 endpoint: "http://127.0.0.1:9222".to_string(),
+                run_id: None,
             }),
         );
         assert_eq!(
@@ -5800,6 +6393,7 @@ browser_cdp = "http://evil.example.com:9222"
             BrowserConnection::AutoConnect,
             BrowserConnection::Cdp {
                 endpoint: "http://127.0.0.1:9222".to_string(),
+                run_id: None,
             },
         ];
         for connection in live_cases {
@@ -6209,7 +6803,7 @@ browser_cdp = "http://evil.example.com:9222"
 
     #[test]
     fn parse_chatgpt_poll_args_defaults() {
-        let options = parse_chatgpt_poll_args(None).unwrap();
+        let options = parse_chatgpt_poll_args(CHATGPT_WAIT_ACTION, None).unwrap();
         assert_eq!(options.interval_ms, CHATGPT_POLL_INTERVAL_MS_DEFAULT);
         assert_eq!(options.timeout_ms, CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT);
         // attempts derived from ceil(timeout / interval) when not explicit.
@@ -6226,7 +6820,7 @@ browser_cdp = "http://evil.example.com:9222"
             "--interval-ms".to_string(),
             "10000".to_string(),
         ];
-        let options = parse_chatgpt_poll_args(Some(&args)).unwrap();
+        let options = parse_chatgpt_poll_args(CHATGPT_WAIT_ACTION, Some(&args)).unwrap();
         // ceil(600000 / 10000) = 60
         assert_eq!(options.attempts, 60);
     }
@@ -6241,7 +6835,7 @@ browser_cdp = "http://evil.example.com:9222"
             "--interval-ms".to_string(),
             "10000".to_string(),
         ];
-        let options = parse_chatgpt_poll_args(Some(&args)).unwrap();
+        let options = parse_chatgpt_poll_args(CHATGPT_WAIT_ACTION, Some(&args)).unwrap();
         // Explicit --attempts should be preserved, not derived.
         assert_eq!(options.attempts, 5);
     }
@@ -6256,7 +6850,7 @@ browser_cdp = "http://evil.example.com:9222"
             "--timeout-ms".to_string(),
             "42000".to_string(),
         ];
-        let options = parse_chatgpt_poll_args(Some(&args)).unwrap();
+        let options = parse_chatgpt_poll_args(CHATGPT_WAIT_ACTION, Some(&args)).unwrap();
         assert_eq!(
             options,
             ChatgptPollOptions {
@@ -6270,14 +6864,22 @@ browser_cdp = "http://evil.example.com:9222"
     #[test]
     fn parse_chatgpt_poll_args_rejects_unknown_flag() {
         let args = vec!["--nope".to_string()];
-        let err = parse_chatgpt_poll_args(Some(&args)).unwrap_err();
+        let err = parse_chatgpt_poll_args(CHATGPT_WAIT_ACTION, Some(&args)).unwrap_err();
         assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn parse_upload_poll_options_labels_unknown_args_as_upload_wait() {
+        let args = vec!["--nope".to_string()];
+        let err = parse_upload_poll_options(Some(&args)).unwrap_err();
+        assert!(err.to_string().contains(CHATGPT_WAIT_UPLOAD_ACTION));
+        assert!(!err.to_string().contains(CHATGPT_WAIT_ACTION));
     }
 
     #[test]
     fn parse_chatgpt_poll_args_rejects_zero_timeout() {
         let args = vec!["--timeout-ms".to_string(), "0".to_string()];
-        let err = parse_chatgpt_poll_args(Some(&args)).unwrap_err();
+        let err = parse_chatgpt_poll_args(CHATGPT_WAIT_ACTION, Some(&args)).unwrap_err();
         assert!(err.to_string().contains("--timeout-ms"));
     }
 
@@ -6289,7 +6891,8 @@ browser_cdp = "http://evil.example.com:9222"
                 "action": CHATGPT_SELECT_MODEL_ACTION,
                 "stdout": {
                     "status": "ok",
-                    "model_used": "gpt-5-4-pro"
+                    "model_used": "gpt-5-4-pro",
+                    "model_selection_status": "selected"
                 }
             }),
             json!({
@@ -6303,16 +6906,20 @@ browser_cdp = "http://evil.example.com:9222"
             }),
         ];
 
-        let payload = chatgpt_recipe_payload_from_steps(&steps);
+        let payload = chatgpt_recipe_payload_from_steps(&steps, true);
         assert_eq!(payload["transport"], "agent-browser");
         assert_eq!(payload["backend"], "agent-browser");
         assert_eq!(payload["response"], "final answer");
         assert_eq!(payload["model_used"], "gpt-5-4-pro");
+        assert_eq!(payload["model_selection_status"], "selected");
         assert_eq!(payload["fallback_used"], true);
         assert_eq!(payload["warnings"], json!(["used paste fallback"]));
         assert_eq!(payload["delivery_mode"], "file_upload");
         assert_eq!(payload["auto_paste_fallback"], false);
         assert_eq!(payload["steps"], json!(steps));
+
+        let primary_payload = chatgpt_recipe_payload_from_steps(&steps, false);
+        assert_eq!(primary_payload["fallback_used"], false);
     }
 
     fn dom(send: ChatgptSendState, stop: bool, thinking: bool, copy: usize) -> ChatgptDomState {

@@ -18,7 +18,6 @@ use reqwest::Url;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::env;
-#[cfg(test)]
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -31,7 +30,8 @@ use std::time::{Duration, Instant};
 #[cfg(test)]
 use yoetz_core::paths::home_dir;
 
-use crate::{browser, chatgpt_web};
+use crate::chatgpt_recipe::AnyhowResultExt;
+use crate::{browser, chatgpt_recipe, chatgpt_web};
 
 /// Cached dev-browser resolution.
 static DEV_BROWSER: OnceLock<String> = OnceLock::new();
@@ -50,6 +50,7 @@ const DEV_BROWSER_WAIT_POLL_MS: u64 = 100;
 /// Extended timeout for ChatGPT response polling (30 minutes by default).
 const CHATGPT_POLL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
 const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 30_000;
+const CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 const CHATGPT_BROWSER_NAME: &str = "yoetz-chatgpt";
 const CHATGPT_AUTH_PROBE_PAGE_NAME: &str = "yoetz-chatgpt-main";
 const CHATGPT_RECIPE_PAGE_NAME_PREFIX: &str = "yoetz-chatgpt-run";
@@ -64,6 +65,7 @@ pub struct ChatgptPollSettings {
 pub struct ChatgptRecipeRunResult {
     pub response: String,
     pub model_used: Option<String>,
+    pub model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus,
     pub warnings: Vec<String>,
 }
 
@@ -672,7 +674,7 @@ pub fn ensure_chatgpt_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&st
 /// split into micro-scripts with JSON stdout handoffs instead of generating one
 /// large helper-heavy script.
 pub struct DevBrowserRecipeContext {
-    /// Path to the bundle file on disk (used for macOS clipboard file upload).
+    /// Path to the bundle file on disk (used for composer-scoped file upload).
     pub bundle_path: Option<PathBuf>,
     /// Bundle text content (for paste mode).
     pub bundle_text: Option<String>,
@@ -688,6 +690,8 @@ pub struct DevBrowserRecipeContext {
     pub run_id: String,
     /// ChatGPT response polling settings.
     pub poll_settings: ChatgptPollSettings,
+    /// Maximum time to wait for a file attachment to finish uploading.
+    pub upload_timeout_ms: u64,
     /// Allow an empty assistant response to count as success.
     pub allow_empty_response: bool,
     /// Optional explicit CDP endpoint for selecting a specific Chrome instance.
@@ -707,6 +711,7 @@ impl Default for DevBrowserRecipeContext {
             disable_extended: false,
             paste_mode: false,
             poll_settings: ChatgptPollSettings::default(),
+            upload_timeout_ms: CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT,
             allow_empty_response: false,
             cdp_endpoint: None,
             show_approval_guidance: false,
@@ -725,6 +730,34 @@ pub fn resolve_chatgpt_poll_settings(
         settings.interval_ms = interval_ms;
     }
     Ok(settings)
+}
+
+pub fn resolve_chatgpt_upload_timeout_ms(
+    vars: &BTreeMap<String, String>,
+    bundle_path: Option<&Path>,
+) -> Result<u64> {
+    let base_timeout_ms = parse_positive_u64_var(vars, "upload_timeout_ms")?
+        .unwrap_or(CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT);
+    let Some(bundle_path) = bundle_path else {
+        return Ok(base_timeout_ms);
+    };
+    let Ok(metadata) = fs::metadata(bundle_path) else {
+        return Ok(base_timeout_ms);
+    };
+    Ok(scale_chatgpt_upload_timeout_ms(
+        base_timeout_ms,
+        metadata.len(),
+    ))
+}
+
+fn scale_chatgpt_upload_timeout_ms(base_timeout_ms: u64, file_size_bytes: u64) -> u64 {
+    const BYTES_PER_MIB: u64 = 1024 * 1024;
+    const EXTRA_MS_PER_MIB: u64 = 5_000;
+    const MAX_UPLOAD_TIMEOUT_MS: u64 = 3_600_000;
+
+    let mib = file_size_bytes.div_ceil(BYTES_PER_MIB);
+    let scaled = base_timeout_ms.saturating_add(mib.saturating_mul(EXTRA_MS_PER_MIB));
+    scaled.min(MAX_UPLOAD_TIMEOUT_MS)
 }
 
 fn parse_positive_u64_var(vars: &BTreeMap<String, String>, key: &str) -> Result<Option<u64>> {
@@ -873,6 +906,8 @@ struct ChatgptPrepareResult {
     composer_ready: bool,
     #[serde(rename = "modelUsed")]
     model_used: Option<String>,
+    #[serde(rename = "modelSelection")]
+    model_selection: Option<Value>,
     url: String,
     title: String,
     #[serde(rename = "bodyText")]
@@ -917,7 +952,9 @@ fn build_chatgpt_prepare_script(page_name: &str, model: &str, run_id: &str) -> S
         r##"
 const PAGE_NAME = {page_name_json};
 const MODEL = {model_json};
-const AUTO_MODEL = !String(MODEL || "").trim() || String(MODEL || "").trim().toLowerCase() === "auto";
+const MODEL_TRIMMED = String(MODEL || "").trim();
+const MODEL_LOWER = MODEL_TRIMMED.toLowerCase();
+const KEEP_CURRENT_MODEL = !MODEL_TRIMMED || MODEL_LOWER === "current" || MODEL_LOWER === "keep-current";
 const MARKED_URL = {marked_url_json};
 const WINDOW_NAME = {window_name_json};
 const MODEL_SELECTION_FUNCTION_SOURCE = {model_selection_function_json};
@@ -951,6 +988,7 @@ const readState = async () => await page.evaluate(() => {{
 let state = await readState();
 let composerReady = loggedIn && state.composerVisible;
 let selectedModel = null;
+let modelSelection = null;
 composerReady =
   composerReady &&
   state.assistantCount === 0 &&
@@ -986,7 +1024,8 @@ if (loggedIn && composerReady) {{
     return fn();
   }}, MODEL_SELECTION_FUNCTION_SOURCE);
   const selectionStatus = selection?.status || "unknown";
-  const keepCurrentModel = AUTO_MODEL && ["missing-selector", "not-found"].includes(selectionStatus);
+  modelSelection = selection || null;
+  const keepCurrentModel = KEEP_CURRENT_MODEL && ["missing-selector", "not-found"].includes(selectionStatus);
   if (!["selected", "already-selected"].includes(selectionStatus) && !keepCurrentModel) {{
     const diagnostics = JSON.stringify({{
       status: selectionStatus,
@@ -1020,6 +1059,7 @@ console.log(JSON.stringify({{
   loggedIn,
   composerReady,
   modelUsed: selectedModel,
+  modelSelection,
   url: state.url,
   title: state.title,
   bodyText: state.bodyText,
@@ -1038,12 +1078,13 @@ fn build_chatgpt_send_script(
     page_name: &str,
     prompt: &str,
     delivery_text: &str,
-    file_on_clipboard: bool,
+    file_upload_path: Option<&str>,
+    upload_timeout_ms: u64,
     disable_extended: bool,
     bundle_file_name: Option<&str>,
 ) -> String {
     let page_name_json = serde_json::to_string(page_name).unwrap();
-    let file_on_clipboard_json = serde_json::to_string(&file_on_clipboard).unwrap();
+    let file_upload_path_json = serde_json::to_string(&file_upload_path).unwrap();
     let delivery_text_json = serde_json::to_string(delivery_text).unwrap();
     let prompt_json = serde_json::to_string(prompt).unwrap();
     let bundle_file_name_json = serde_json::to_string(&bundle_file_name).unwrap();
@@ -1052,6 +1093,14 @@ fn build_chatgpt_send_script(
     let stop_button_selector_json = chatgpt_web::stop_button_selector_json();
     let send_click_function_json =
         serde_json::to_string(&chatgpt_web::build_send_button_click_function()).unwrap();
+    let open_attachment_ui_function_json =
+        serde_json::to_string(&chatgpt_web::build_open_attachment_ui_function()).unwrap();
+    let upload_menu_item_click_function_json =
+        serde_json::to_string(&chatgpt_web::build_upload_menu_item_click_function()).unwrap();
+    let scope_file_input_function_json =
+        serde_json::to_string(&chatgpt_web::build_scope_composer_file_input_function()).unwrap();
+    let composer_file_input_marker_json =
+        serde_json::to_string(chatgpt_web::COMPOSER_FILE_INPUT_MARKER).unwrap();
     let attachment_probe_function_json = bundle_file_name.map(|file_name| {
         serde_json::to_string(&chatgpt_web::build_attachment_probe_function(file_name).unwrap())
             .unwrap()
@@ -1059,7 +1108,8 @@ fn build_chatgpt_send_script(
     format!(
         r##"
 const PAGE_NAME = {page_name_json};
-const FILE_ON_CLIPBOARD = {file_on_clipboard_json};
+const FILE_UPLOAD_PATH = {file_upload_path_json};
+const UPLOAD_TIMEOUT_MS = {upload_timeout_ms};
 const DELIVERY_TEXT = {delivery_text_json};
 const PROMPT = {prompt_json};
 const DISABLE_EXTENDED = {disable_extended};
@@ -1068,18 +1118,55 @@ const COMPOSER_SELECTOR = {composer_selector_json};
 const SEND_BUTTON_SELECTOR = {send_button_selector_json};
 const STOP_BUTTON_SELECTOR = {stop_button_selector_json};
 const SEND_CLICK_FUNCTION_SOURCE = {send_click_function_json};
+const OPEN_ATTACHMENT_UI_FUNCTION_SOURCE = {open_attachment_ui_function_json};
+const UPLOAD_MENU_ITEM_CLICK_FUNCTION_SOURCE = {upload_menu_item_click_function_json};
+const SCOPE_FILE_INPUT_FUNCTION_SOURCE = {scope_file_input_function_json};
+const COMPOSER_FILE_INPUT_MARKER = {composer_file_input_marker_json};
 const ATTACHMENT_PROBE_FUNCTION_SOURCE = {attachment_probe_function_json};
+const CHATGPT_UPLOAD_STABLE_POLLS = {upload_stable_polls};
 const page = await browser.getPage(PAGE_NAME);
 let warning = null;
+const runPageFunction = async (functionSource) => await page.evaluate((source) => {{
+  const fn = eval("(" + source + ")");
+  return fn();
+}}, functionSource);
+const waitForScopedFileInput = async () => {{
+  const deadline = Date.now() + 15000;
+  let lastState = null;
+  while (Date.now() < deadline) {{
+    lastState = await runPageFunction(SCOPE_FILE_INPUT_FUNCTION_SOURCE);
+    if (lastState?.status === "marked") {{
+      return {{ ok: true, state: lastState }};
+    }}
+    await page.waitForTimeout(250);
+  }}
+  return {{ ok: false, state: lastState }};
+}};
+const markedFileInputSelector = () => `input[type='file'][title='${{COMPOSER_FILE_INPUT_MARKER}}']`;
+const trySetInputFiles = async () => {{
+  const attempts = [];
+  for (const selector of [markedFileInputSelector()]) {{
+    try {{
+      await page.setInputFiles(selector, FILE_UPLOAD_PATH);
+      return {{ ok: true, selector, attempts }};
+    }} catch (error) {{
+      attempts.push({{ selector, error: String(error?.message || error) }});
+    }}
+  }}
+  return {{ ok: false, attempts }};
+}};
 const waitForAttachmentReady = async () => {{
   if (!ATTACHMENT_PROBE_FUNCTION_SOURCE) return true;
-  const deadline = Date.now() + 30000;
+  const deadline = Date.now() + UPLOAD_TIMEOUT_MS;
   while (Date.now() < deadline) {{
     const state = await page.evaluate((functionSource) => {{
       const fn = eval("(" + functionSource + ")");
       return fn();
     }}, ATTACHMENT_PROBE_FUNCTION_SOURCE);
-    if (state?.status === "done") {{
+    if (state?.status === "failed") {{
+      throw new Error("file attachment upload failed: " + JSON.stringify(state));
+    }}
+    if (state?.status === "done" && Number(state?.stableReadyCount || 0) >= CHATGPT_UPLOAD_STABLE_POLLS) {{
       return true;
     }}
     await page.waitForTimeout(500);
@@ -1096,29 +1183,46 @@ if (DISABLE_EXTENDED) {{
   }}
 }}
 const composer = page.locator(COMPOSER_SELECTOR).first();
-if (FILE_ON_CLIPBOARD) {{
+if (FILE_UPLOAD_PATH !== null) {{
   await composer.waitFor({{ state: "visible", timeout: 15000 }});
-  await composer.click();
-  await page.keyboard.press("Meta+v");
+  let inputState = await waitForScopedFileInput();
+  if (!inputState.ok) {{
+    await runPageFunction(OPEN_ATTACHMENT_UI_FUNCTION_SOURCE);
+    await page.waitForTimeout(300);
+    inputState = await waitForScopedFileInput();
+  }}
+  if (!inputState.ok) {{
+    await runPageFunction(UPLOAD_MENU_ITEM_CLICK_FUNCTION_SOURCE);
+    await page.waitForTimeout(300);
+    inputState = await waitForScopedFileInput();
+  }}
+  let uploadResult = await trySetInputFiles();
+  if (!uploadResult.ok) {{
+    await runPageFunction(UPLOAD_MENU_ITEM_CLICK_FUNCTION_SOURCE);
+    await page.waitForTimeout(300);
+    inputState = await waitForScopedFileInput();
+    uploadResult = await trySetInputFiles();
+  }}
+  if (!uploadResult.ok) {{
+    throw new Error("could not set ChatGPT upload input files: " + JSON.stringify({{
+      scopeState: inputState.state || null,
+      attempts: uploadResult.attempts || [],
+    }}));
+  }}
   const attached = await waitForAttachmentReady();
   if (!attached) {{
-    throw new Error("file attachment did not finish uploading after clipboard paste");
+    throw new Error("file attachment did not finish uploading after setInputFiles");
   }}
 }}
 await composer.waitFor({{ state: "visible", timeout: 15000 }});
 await composer.click();
 await composer.pressSequentially(DELIVERY_TEXT, {{ delay: 15 }});
-const sendBtn = page.locator(SEND_BUTTON_SELECTOR).first();
 const readSendState = async () => await page.evaluate((composerSelector, sendSelector, bundleFileName) => {{
-  const send = Array.from(document.querySelectorAll(sendSelector)).find((button) => {{
-    const rect = button.getBoundingClientRect();
-    const style = window.getComputedStyle(button);
-    return rect.width > 0 &&
-      rect.height > 0 &&
-      style.visibility !== "hidden" &&
-      style.display !== "none";
-  }}) || null;
-  const composerEl = document.querySelector(composerSelector);
+  const COMPOSER_SELECTOR = composerSelector;
+{visibility_helpers}
+{composer_scope_helpers}
+  const {{ composerEl, roots }} = getComposerScope();
+  const send = roots.flatMap((root) => Array.from(root.querySelectorAll(sendSelector))).find((button) => isVisible(button)) || null;
   return {{
     sendButtonPresent: !!send,
     sendDisabled: send ? !!send.disabled : false,
@@ -1129,11 +1233,11 @@ const readSendState = async () => await page.evaluate((composerSelector, sendSel
 const enableDeadline = Date.now() + 10000;
 let sendState = await readSendState();
 while (Date.now() < enableDeadline) {{
-  if (await sendBtn.count() > 0 && await sendBtn.isEnabled()) break;
+  if (sendState.sendButtonPresent && !sendState.sendDisabled) break;
   await page.waitForTimeout(500);
   sendState = await readSendState();
 }}
-if (await sendBtn.count() === 0 || !(await sendBtn.isEnabled())) {{
+if (!sendState.sendButtonPresent || sendState.sendDisabled) {{
   console.log(JSON.stringify({{
     status: "error",
     error: "ChatGPT send button never became enabled after typing; this usually means dev-browser is still on the broken Playwright live-attach path. If you upgraded yoetz, run `yoetz browser reset` once so the dev-browser daemon restarts with the Chrome 147 compatibility flag. " + JSON.stringify(sendState),
@@ -1157,17 +1261,17 @@ const transitionDeadline = Date.now() + 10000;
 let transitionState = null;
 while (Date.now() < transitionDeadline) {{
   transitionState = await page.evaluate((baselineCount, composerSelector, sendSelector, stopSelector, bundleFileName) => {{
-    const send = Array.from(document.querySelectorAll(sendSelector)).find((button) => {{
-      const rect = button.getBoundingClientRect();
-      const style = window.getComputedStyle(button);
-      return rect.width > 0 &&
-        rect.height > 0 &&
-        style.visibility !== "hidden" &&
-        style.display !== "none";
-    }}) || null;
-    const stopButton = document.querySelector(stopSelector);
+    const COMPOSER_SELECTOR = composerSelector;
+{visibility_helpers}
+{composer_scope_helpers}
+{turn_root_helpers}
+    const {{ composerEl, roots }} = getComposerScope();
+    const send = roots.flatMap((root) => Array.from(root.querySelectorAll(sendSelector))).find((button) => isVisible(button)) || null;
     const assistantCount = document.querySelectorAll("[data-message-author-role='assistant']").length;
-    const composerEl = document.querySelector(composerSelector);
+    const lastAssistant = Array.from(document.querySelectorAll("[data-message-author-role='assistant']")).at(-1) || null;
+    const turnRoot = latestAssistantTurn(lastAssistant);
+    const stopButton = (turnRoot ? findVisible(turnRoot, stopSelector) : null) ||
+      (!turnRoot && findVisible(document, stopSelector));
     const composerText = (composerEl?.innerText || composerEl?.textContent || "").trim();
     return {{
       sendButtonPresent: !!send,
@@ -1205,7 +1309,8 @@ console.log(JSON.stringify({{
 }}));
 "##,
         page_name_json = page_name_json,
-        file_on_clipboard_json = file_on_clipboard_json,
+        file_upload_path_json = file_upload_path_json,
+        upload_timeout_ms = upload_timeout_ms,
         delivery_text_json = delivery_text_json,
         prompt_json = prompt_json,
         bundle_file_name_json = bundle_file_name_json,
@@ -1213,57 +1318,18 @@ console.log(JSON.stringify({{
         send_button_selector_json = send_button_selector_json,
         stop_button_selector_json = stop_button_selector_json,
         send_click_function_json = send_click_function_json,
+        open_attachment_ui_function_json = open_attachment_ui_function_json,
+        upload_menu_item_click_function_json = upload_menu_item_click_function_json,
+        scope_file_input_function_json = scope_file_input_function_json,
+        composer_file_input_marker_json = composer_file_input_marker_json,
         attachment_probe_function_json =
             attachment_probe_function_json.unwrap_or_else(|| "null".to_string()),
         disable_extended = disable_extended,
+        upload_stable_polls = chatgpt_web::CHATGPT_UPLOAD_STABLE_POLLS,
+        visibility_helpers = chatgpt_web::JS_VISIBILITY_HELPERS,
+        composer_scope_helpers = chatgpt_web::JS_COMPOSER_SCOPE_HELPERS,
+        turn_root_helpers = chatgpt_web::JS_TURN_ROOT_HELPERS,
     )
-}
-
-fn set_file_on_clipboard(path: &Path) -> Result<()> {
-    let canonical_path = path
-        .canonicalize()
-        .with_context(|| format!("resolve bundle path: {}", path.display()))?;
-
-    #[cfg(target_os = "macos")]
-    {
-        let output = Command::new("osascript")
-            .args([
-                "-e",
-                "on run argv",
-                "-e",
-                "set the clipboard to (POSIX file (item 1 of argv))",
-                "-e",
-                "end run",
-            ])
-            .arg(&canonical_path)
-            .output()
-            .context("failed to run osascript for ChatGPT file upload")?;
-        if output.status.success() {
-            return Ok(());
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() {
-            stderr
-        } else if !stdout.is_empty() {
-            stdout
-        } else {
-            format!("exit code {:?}", output.status.code())
-        };
-        Err(anyhow!(
-            "failed to set macOS clipboard to bundle file `{}`: {detail}",
-            canonical_path.display()
-        ))
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = canonical_path;
-        Err(anyhow!(
-            "dev-browser file upload via clipboard currently requires macOS"
-        ))
-    }
 }
 
 fn build_chatgpt_poll_script(
@@ -1290,41 +1356,54 @@ let stableSince = null;
 let stableKey = null;
 while (Date.now() - start < POLL_TIMEOUT_MS) {{
   const state = await page.evaluate((baselineCount, baselineLastLen) => {{
-    const errorEl = document.querySelector("[role='alert'], [data-testid*='error']");
-    const hasThinkingIndicator = !!document.querySelector(".result-thinking, [data-testid*='thinking']");
+{visibility_helpers}
+{turn_root_helpers}
+      const errorEl = document.querySelector("[role='alert'], [data-testid*='error']");
     const allAssistantMessages = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
     const assistantMessages = allAssistantMessages.slice(baselineCount);
     const lastAssistantMessage = allAssistantMessages.length > 0 ? allAssistantMessages[allAssistantMessages.length - 1] : null;
+    const turnRoot = latestAssistantTurn(lastAssistantMessage);
+    const stopButton = (turnRoot ? findVisible(turnRoot, "[data-testid='stop-button']") : null) ||
+      (!turnRoot ? findVisible(document, "[data-testid='stop-button']") : null);
+    const thinkingSelector = ".result-thinking, [data-testid*='thinking']";
+    const hasThinkingIndicator = !!((turnRoot ? findVisible(turnRoot, thinkingSelector) : null) ||
+      (!turnRoot ? findVisible(document, thinkingSelector) : null));
     const lastAssistantLen = (lastAssistantMessage?.innerText || "").length;
     const newAssistantCount = assistantMessages.length;
     const newMessage = allAssistantMessages.length > baselineCount;
     const sameMessageGrew = allAssistantMessages.length === baselineCount && lastAssistantLen > baselineLastLen;
-    const response = (newMessage
-      ? assistantMessages.map((message) => message.innerText).join("\n---\n")
-      : (sameMessageGrew ? (lastAssistantMessage?.innerText || "") : "")
-    ).trim();
-    return {{
+      const response = (newMessage
+        ? assistantMessages.map((message) => message.innerText).join("\n---\n")
+        : (sameMessageGrew ? (lastAssistantMessage?.innerText || "") : "")
+      ).trim();
+      const responseReady =
+        !stopButton &&
+        !hasThinkingIndicator &&
+        ((newMessage && (ALLOW_EMPTY_RESPONSE || response.length > 0)) || sameMessageGrew);
+      return {{
       error: errorEl ? errorEl.innerText.slice(0, 200).trim() : null,
       hasThinkingIndicator,
-      hasStopButton: !!document.querySelector("[data-testid='stop-button']"),
+      hasStopButton: !!stopButton,
       newAssistantCount,
       assistantCount: allAssistantMessages.length,
       lastAssistantLen,
       newMessage,
       sameMessageGrew,
-      response,
-    }};
+        responseLength: response.length,
+        responseTail: response.slice(-256),
+        response: responseReady ? response : "",
+      }};
   }}, BASELINE_COUNT, BASELINE_LAST_LEN);
   if (state.error) {{
     console.log(JSON.stringify({{ status: "error", error: state.error }}));
     return;
   }}
   const completionCandidate =
-    !state.hasStopButton &&
-    !state.hasThinkingIndicator &&
-    ((state.newMessage && (ALLOW_EMPTY_RESPONSE || state.response.length > 0)) || state.sameMessageGrew);
-  if (completionCandidate) {{
-    const responseKey = `${{state.assistantCount}}:${{state.lastAssistantLen}}:${{state.response.length}}`;
+      !state.hasStopButton &&
+      !state.hasThinkingIndicator &&
+      ((state.newMessage && (ALLOW_EMPTY_RESPONSE || state.responseLength > 0)) || state.sameMessageGrew);
+    if (completionCandidate) {{
+      const responseKey = `${{state.assistantCount}}:${{state.lastAssistantLen}}:${{state.responseLength}}:${{state.responseTail}}`;
     if (stableKey === responseKey) {{
       if (stableSince !== null && (Date.now() - stableSince) >= STABLE_IDLE_THRESHOLD_MS) {{
         console.log(JSON.stringify({{
@@ -1357,6 +1436,8 @@ console.log(JSON.stringify({{
         poll_interval_ms = poll_settings.interval_ms,
         stable_idle_threshold_ms = stable_idle_threshold_ms,
         allow_empty_response = allow_empty_response,
+        visibility_helpers = chatgpt_web::JS_VISIBILITY_HELPERS,
+        turn_root_helpers = chatgpt_web::JS_TURN_ROOT_HELPERS,
     )
 }
 
@@ -1444,19 +1525,36 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
         )
     };
 
-    let result = (|| -> Result<(String, Vec<String>, Option<String>)> {
+    let result = (|| -> Result<(
+        String,
+        Vec<String>,
+        Option<String>,
+        chatgpt_recipe::ChatgptModelSelectionStatus,
+    )> {
         let mut warnings = Vec::new();
-        let file_on_clipboard = if ctx.paste_mode {
-            false
+        let file_upload_path = if ctx.paste_mode {
+            None
         } else if let Some(bundle_path) = &ctx.bundle_path {
-            set_file_on_clipboard(bundle_path)?;
-            true
+            let canonical_path = bundle_path
+                .canonicalize()
+                .with_context(|| format!("resolve bundle path: {}", bundle_path.display()))?;
+            Some(
+                canonical_path
+                    .to_str()
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "bundle path is not valid UTF-8: {}",
+                            canonical_path.display()
+                        )
+                    })?
+                    .to_string(),
+            )
         } else if ctx.bundle_text.is_some() {
             return Err(anyhow!(
                 "dev-browser file upload requires a bundle path on disk; use `--var paste=true` for text-only delivery"
             ));
         } else {
-            false
+            None
         };
         let delivery_text = if ctx.paste_mode {
             format!(
@@ -1485,10 +1583,22 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
         };
         let prepare: ChatgptPrepareResult =
             parse_script_json("parse chatgpt prepare result", &prepare_stdout)?;
+        let model_selection = prepare
+            .model_selection
+            .clone()
+            .unwrap_or_else(|| serde_json::json!({"status": "unknown"}));
         let model_used = prepare
             .model_used
             .as_deref()
-            .and_then(chatgpt_web::canonical_chatgpt_model_slug);
+            .and_then(chatgpt_web::canonical_chatgpt_model_slug)
+            .or_else(|| {
+                prepare
+                    .model_selection
+                    .as_ref()
+                    .and_then(|selection| chatgpt_web::select_reported_chatgpt_model(selection, &ctx.model))
+            });
+        let model_selection_status =
+            chatgpt_web::chatgpt_model_selection_status(&model_selection, &ctx.model);
         let classified_issue =
             classify_dev_browser_page_issue(&prepare.url, &prepare.title, &prepare.body_text);
         match prepare.status.as_str() {
@@ -1523,14 +1633,20 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
             &page_name,
             &ctx.prompt,
             &delivery_text,
-            file_on_clipboard,
+            file_upload_path.as_deref(),
+            ctx.upload_timeout_ms,
             ctx.disable_extended,
-            ctx.bundle_path
+            file_upload_path
                 .as_deref()
+                .map(Path::new)
                 .and_then(|path| path.file_name())
                 .and_then(|value| value.to_str()),
         );
-        let send_stdout = run_script(&send_script, Some(90))?;
+        let send_stdout = run_script(
+            &send_script,
+            Some(chatgpt_script_timeout_secs(ctx.upload_timeout_ms)),
+        )
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Upload)?;
         let send: ChatgptSendResult = parse_script_json("parse chatgpt send result", &send_stdout)?;
         match send.status.as_str() {
             "sent" => {}
@@ -1538,10 +1654,13 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
                 let detail = send
                     .error
                     .unwrap_or_else(|| "ChatGPT send phase failed".to_string());
-                return Err(anyhow!("{detail}"));
+                let phase = chatgpt_recipe::classify_terminal_fallback_phase_message(&detail)
+                    .unwrap_or(chatgpt_recipe::ChatgptTransportPhase::Send);
+                return Err(anyhow!("{detail}")).with_chatgpt_phase(phase);
             }
             other => {
-                return Err(anyhow!("unexpected ChatGPT send status `{other}`"));
+                return Err(anyhow!("unexpected ChatGPT send status `{other}`"))
+                    .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send);
             }
         }
         if let Some(warning) = send.warning {
@@ -1562,24 +1681,27 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
             Some(chatgpt_script_timeout_secs(ctx.poll_settings.timeout_ms)),
         );
         heartbeat.stop();
-        let poll_stdout = poll_result?;
+        let poll_stdout =
+            poll_result.with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::WaitResponse)?;
         let (response, mut poll_warnings) =
-            parse_chatgpt_recipe_result(&poll_stdout, ctx.poll_settings.timeout_ms)?;
+            parse_chatgpt_recipe_result(&poll_stdout, ctx.poll_settings.timeout_ms)
+                .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::WaitResponse)?;
         eprintln!(
             "info: ChatGPT response completed after {}",
             format_chatgpt_wait_duration(wait_started_at.elapsed())
         );
         warnings.append(&mut poll_warnings);
-        Ok((response, warnings, model_used))
+        Ok((response, warnings, model_used, model_selection_status))
     })();
 
-    let (response, warnings, model_used) = result?;
+    let (response, warnings, model_used, model_selection_status) = result?;
     for warning in &warnings {
         eprintln!("warn: {warning}");
     }
     Ok(ChatgptRecipeRunResult {
         response,
         model_used,
+        model_selection_status,
         warnings,
     })
 }
@@ -1645,6 +1767,35 @@ mod tests {
         let vars = BTreeMap::from([("wait_interval_ms".to_string(), "0".to_string())]);
         let err = resolve_chatgpt_poll_settings(&vars).unwrap_err();
         assert!(err.to_string().contains("wait_interval_ms"));
+    }
+
+    #[test]
+    fn resolve_chatgpt_upload_timeout_ms_accepts_recipe_var() {
+        let vars = BTreeMap::from([("upload_timeout_ms".to_string(), "180000".to_string())]);
+
+        assert_eq!(
+            resolve_chatgpt_upload_timeout_ms(&vars, None).unwrap(),
+            180_000
+        );
+        assert_eq!(
+            resolve_chatgpt_upload_timeout_ms(&BTreeMap::new(), None).unwrap(),
+            CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT
+        );
+    }
+
+    #[test]
+    fn resolve_chatgpt_upload_timeout_ms_scales_with_bundle_size() {
+        let dir =
+            env::temp_dir().join(format!("yoetz-upload-timeout-scale-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bundle_path = dir.join("large-bundle.md");
+        fs::write(&bundle_path, vec![b'x'; 3 * 1024 * 1024 + 1]).unwrap();
+
+        let timeout =
+            resolve_chatgpt_upload_timeout_ms(&BTreeMap::new(), Some(&bundle_path)).unwrap();
+
+        assert_eq!(timeout, CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT + 20_000);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -1844,7 +1995,7 @@ mod tests {
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
         assert!(script.contains("const MODEL = \"gpt-5-4-pro\";"));
         assert!(script.contains(
-            "const AUTO_MODEL = !String(MODEL || \"\").trim() || String(MODEL || \"\").trim().toLowerCase() === \"auto\";"
+            "const KEEP_CURRENT_MODEL = !MODEL_TRIMMED || MODEL_LOWER === \"current\" || MODEL_LOWER === \"keep-current\";"
         ));
         assert!(script.contains("const MARKED_URL = \"https://chatgpt.com/?_yoetz=run-123\";"));
         assert!(script.contains("const WINDOW_NAME = \"yoetz:run-123\";"));
@@ -1867,12 +2018,17 @@ mod tests {
             "requested model '\" + (selection?.requested || MODEL || \"\") + \"' was not selected"
         ));
         assert!(script.contains("let selectedModel = null;"));
+        assert!(script.contains("let modelSelection = null;"));
         assert!(script.contains(
-            "const keepCurrentModel = AUTO_MODEL && [\"missing-selector\", \"not-found\"].includes(selectionStatus);"
+            "const keepCurrentModel = KEEP_CURRENT_MODEL && [\"missing-selector\", \"not-found\"].includes(selectionStatus);"
         ));
+        assert!(script.contains("modelSelection = selection || null;"));
+        assert!(!script.contains("modelSelectionStatus ="));
+        assert!(!script.contains("? (KEEP_CURRENT_MODEL ? \"kept_current\" : \"selected\")"));
         assert!(script.contains("selectedModel ="));
         assert!(script.contains("selection?.currentLabel ||"));
         assert!(script.contains("modelUsed: selectedModel,"));
+        assert!(script.contains("modelSelection,"));
         assert!(script.contains("bodyText"));
         assert!(script.contains(
             "status: !loggedIn ? \"login_required\" : composerReady ? \"ready\" : \"not_ready\""
@@ -1915,33 +2071,44 @@ mod tests {
     }
 
     #[test]
-    fn build_chatgpt_send_script_uses_clipboard_upload_and_press_sequentially() {
+    fn build_chatgpt_send_script_uses_file_input_upload_and_press_sequentially() {
         let script = build_chatgpt_send_script(
             "yoetz-chatgpt-test",
             "Review this file.",
             "Review this file.",
-            true,
+            Some("/tmp/bundle.txt"),
+            180_000,
             true,
             Some("bundle.txt"),
         );
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
-        assert!(script.contains("const FILE_ON_CLIPBOARD = true;"));
+        assert!(script.contains("const FILE_UPLOAD_PATH = \"/tmp/bundle.txt\";"));
+        assert!(script.contains("if (FILE_UPLOAD_PATH !== null)"));
+        assert!(script.contains("const UPLOAD_TIMEOUT_MS = 180000;"));
         assert!(script.contains("await composer.waitFor({ state: \"visible\", timeout: 15000 });"));
-        assert!(script.contains("await page.keyboard.press(\"Meta+v\");"));
-        assert!(script.contains("file attachment did not finish uploading after clipboard paste"));
+        assert!(script.contains("const COMPOSER_FILE_INPUT_MARKER = \"yoetz-upload-target\";"));
+        assert!(script.contains("for (const selector of [markedFileInputSelector()])"));
+        assert!(!script.contains("#upload-files"));
+        assert!(script.contains("await page.setInputFiles(selector, FILE_UPLOAD_PATH);"));
+        assert!(script.contains("could not set ChatGPT upload input files"));
+        assert!(script.contains("file attachment did not finish uploading after setInputFiles"));
+        assert!(script.contains("const OPEN_ATTACHMENT_UI_FUNCTION_SOURCE ="));
+        assert!(script.contains("const UPLOAD_MENU_ITEM_CLICK_FUNCTION_SOURCE ="));
+        assert!(script.contains("const SCOPE_FILE_INPUT_FUNCTION_SOURCE ="));
         assert!(script.contains("const ATTACHMENT_PROBE_FUNCTION_SOURCE ="));
         assert!(script.contains("const SEND_CLICK_FUNCTION_SOURCE ="));
         assert!(script.contains("assistantLastLenBeforeSend"));
         assert!(script.contains("pressSequentially(DELIVERY_TEXT, { delay: 15 })"));
         assert!(script.contains("status: \"sent\""));
+        assert!(!script.contains("Meta+v"));
     }
 
     #[test]
     fn parse_script_json_reads_prepare_result() {
         let result: ChatgptPrepareResult = parse_script_json(
             "prepare",
-            r#"{"status":"ready","loggedIn":true,"composerReady":true,"modelUsed":"model-switcher-gpt-5-4-pro","url":"https://chatgpt.com/","title":"ChatGPT","bodyText":"Send a message"}"#,
+            r#"{"status":"ready","loggedIn":true,"composerReady":true,"modelUsed":"model-switcher-gpt-5-4-pro","modelSelection":{"status":"selected"},"url":"https://chatgpt.com/","title":"ChatGPT","bodyText":"Send a message"}"#,
         )
         .unwrap();
 
@@ -1951,6 +2118,14 @@ mod tests {
         assert_eq!(
             result.model_used.as_deref(),
             Some("model-switcher-gpt-5-4-pro")
+        );
+        assert_eq!(
+            result
+                .model_selection
+                .as_ref()
+                .and_then(|selection| selection.get("status"))
+                .and_then(Value::as_str),
+            Some("selected")
         );
         assert_eq!(result.title, "ChatGPT");
     }

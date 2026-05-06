@@ -980,6 +980,27 @@ fn recipe_transport_error_detail(err: &anyhow::Error) -> String {
     format!("{err:#}")
 }
 
+fn recipe_transport_error_detail_for_recipe(
+    err: &anyhow::Error,
+    recipe_vars: &BTreeMap<String, String>,
+) -> String {
+    let mut detail = recipe_transport_error_detail(err);
+    if chatgpt_recipe::terminal_fallback_phase(err).is_some() {
+        if let Some(run_id) = recipe_vars
+            .get("run_id")
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let marked_url = chatgpt_web::mark_chatgpt_url(run_id);
+            detail.push_str(&format!(
+                "\nManual recovery: continue in the yoetz-owned ChatGPT tab for run `{run_id}` ({marked_url}, window.name `yoetz:{run_id}`). The request may already be uploaded or sent; do not rerun automatically unless you intend a duplicate submission."
+            ));
+        }
+    }
+    detail
+}
+
 fn recipe_has_remaining_manual_fallback(
     transports: &[browser::RecipeTransport],
     current_index: usize,
@@ -1000,6 +1021,9 @@ fn recipe_should_stop_live_transport_fallback(
         return true;
     }
     if browser::is_chrome_approval_wait_error(err) {
+        return true;
+    }
+    if chatgpt_recipe::terminal_fallback_phase(err).is_some() {
         return true;
     }
     if browser::is_chatgpt_auth_issue_error(err) {
@@ -1472,6 +1496,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
     selected_cdp_target: Option<&browser::ResolvedCdpTarget>,
     format: OutputFormat,
     is_chatgpt: bool,
+    fallback_used: bool,
 ) -> Result<Value> {
     if !is_chatgpt {
         return Err(anyhow!(
@@ -1511,6 +1536,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
         run_id: recipe_spec.run_id.clone(),
         response_timeout_ms: recipe_spec.wait_timeout_ms,
         response_poll_interval_ms: recipe_spec.wait_interval_ms,
+        upload_timeout_ms: recipe_spec.upload_timeout_ms,
         disable_extended: recipe_spec.disable_extended,
         show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
     };
@@ -1521,13 +1547,15 @@ async fn run_recipe_via_chrome_devtools_mcp(
         matches!(format, OutputFormat::Text | OutputFormat::Markdown),
     )
     .await?;
+    let model_selection_status = response.model_selection_status;
     let payload = chatgpt_recipe::ChatgptRecipeOutput {
         transport: "chrome-devtools-mcp".to_string(),
         backend: "chrome-devtools-mcp".to_string(),
         response: response.response,
         model_used: response.model_used,
+        model_selection_status,
         warnings: Vec::new(),
-        fallback_used: false,
+        fallback_used,
         delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
         auto_paste_fallback: false,
     }
@@ -1544,6 +1572,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
                 backend: "chrome-devtools-mcp".to_string(),
                 response: payload["response"].as_str().unwrap_or_default().to_string(),
                 model_used: payload["model_used"].as_str().map(str::to_owned),
+                model_selection_status,
                 warnings: payload["warnings"]
                     .as_array()
                     .map(|items| {
@@ -1554,7 +1583,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default(),
-                fallback_used: false,
+                fallback_used,
                 delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
                 auto_paste_fallback: false,
             }
@@ -1574,6 +1603,8 @@ fn build_chatgpt_recipe_spec(
     recipe_vars: &BTreeMap<String, String>,
 ) -> Result<chatgpt_recipe::ChatgptRecipeSpec> {
     let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
+    let upload_timeout_ms =
+        dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, recipe_args.bundle.as_deref())?;
     chrome_devtools_mcp::RecipeThreadMode::parse(recipe_vars.get("thread").map(String::as_str))?;
     Ok(chatgpt_recipe::ChatgptRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
@@ -1597,6 +1628,7 @@ fn build_chatgpt_recipe_spec(
             .unwrap_or_else(chatgpt_web::generate_run_id),
         wait_timeout_ms: poll_settings.timeout_ms,
         wait_interval_ms: poll_settings.interval_ms,
+        upload_timeout_ms,
         disable_extended: recipe_vars
             .get("extended")
             .is_some_and(|value| value == "false"),
@@ -1607,25 +1639,17 @@ fn resolve_dev_browser_delivery_mode(
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
 ) -> Result<(bool, Option<String>, bool)> {
-    resolve_dev_browser_delivery_mode_for_platform(
-        cfg!(target_os = "macos"),
-        recipe_args,
-        recipe_vars,
-    )
+    resolve_dev_browser_delivery_mode_for_platform(recipe_args, recipe_vars)
 }
 
 fn resolve_dev_browser_delivery_mode_for_platform(
-    supports_clipboard_file_upload: bool,
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
 ) -> Result<(bool, Option<String>, bool)> {
     let requested_paste_mode = recipe_vars
         .get("paste")
         .is_some_and(|value| value == "true");
-    let auto_paste_fallback =
-        !requested_paste_mode && recipe_args.bundle.is_some() && !supports_clipboard_file_upload;
-    let effective_paste_mode = requested_paste_mode || auto_paste_fallback;
-    let bundle_text = if effective_paste_mode {
+    let bundle_text = if requested_paste_mode {
         recipe_args
             .bundle
             .as_ref()
@@ -1634,7 +1658,7 @@ fn resolve_dev_browser_delivery_mode_for_platform(
     } else {
         None
     };
-    Ok((effective_paste_mode, bundle_text, auto_paste_fallback))
+    Ok((requested_paste_mode, bundle_text, false))
 }
 
 fn run_recipe_via_dev_browser(
@@ -1644,6 +1668,7 @@ fn run_recipe_via_dev_browser(
     cdp_endpoint: Option<&str>,
     format: OutputFormat,
     is_chatgpt: bool,
+    fallback_used: bool,
 ) -> Result<Value> {
     if !is_chatgpt {
         return Err(anyhow!(
@@ -1665,11 +1690,6 @@ fn run_recipe_via_dev_browser(
 
     let (paste_mode, bundle_text, auto_paste_fallback) =
         resolve_dev_browser_delivery_mode(recipe_args, recipe_vars)?;
-    if auto_paste_fallback {
-        eprintln!(
-            "info: dev-browser clipboard file upload requires macOS; falling back to paste mode for this run"
-        );
-    }
     let recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
     let recipe_ctx = dev_browser::DevBrowserRecipeContext {
         bundle_path: recipe_spec.bundle_path.clone(),
@@ -1688,6 +1708,7 @@ fn run_recipe_via_dev_browser(
             .is_some_and(|value| value == "true"),
         cdp_endpoint: cdp_endpoint.map(str::to_owned),
         show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
+        upload_timeout_ms: recipe_spec.upload_timeout_ms,
     };
 
     let response = dev_browser::run_chatgpt_recipe(&recipe_ctx)?;
@@ -1696,8 +1717,9 @@ fn run_recipe_via_dev_browser(
         backend: "dev-browser".to_string(),
         response: response.response,
         model_used: response.model_used,
+        model_selection_status: response.model_selection_status,
         warnings: response.warnings,
-        fallback_used: true,
+        fallback_used,
         delivery_mode: if paste_mode {
             chatgpt_recipe::ChatgptDeliveryMode::Paste
         } else {
@@ -1731,6 +1753,7 @@ fn run_recipe_via_agent_browser(
     profile_dir: PathBuf,
     format: OutputFormat,
     is_chatgpt: bool,
+    fallback_used: bool,
     prefer_auto_connect: bool,
     selected_cdp_target: &mut Option<browser::ResolvedCdpTarget>,
 ) -> Result<Value> {
@@ -1745,6 +1768,7 @@ fn run_recipe_via_agent_browser(
         } else if let Some(target) = selected_cdp_target.as_ref().cloned() {
             Some(browser::BrowserConnection::Cdp {
                 endpoint: target.endpoint,
+                run_id: recipe_vars.get("run_id").cloned(),
             })
         } else if prefer_auto_connect {
             // Avoid a separate auto-connect probe here. The recipe run should
@@ -1787,6 +1811,7 @@ fn run_recipe_via_agent_browser(
         bundle_text,
         profile_dir: Some(profile_dir),
         profile_mode,
+        fallback_used,
         use_stealth: needs_auth,
         headed: needs_auth,
         target_url: browser::CHATGPT_URL.to_string(),
@@ -2195,7 +2220,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             })?
                         };
                         let method = match &connection {
-                            browser::BrowserConnection::Cdp { endpoint } => {
+                            browser::BrowserConnection::Cdp { endpoint, .. } => {
                                 format!("cdp: {endpoint}")
                             }
                             browser::BrowserConnection::AutoConnect => "auto_connect".to_string(),
@@ -2330,9 +2355,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             );
             if is_chatgpt {
                 chatgpt_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
-                recipe_vars
+                let run_id = recipe_vars
                     .entry("run_id".to_string())
                     .or_insert_with(chatgpt_web::generate_run_id);
+                chatgpt_web::validate_run_id(run_id)?;
             }
             let mut resolved_cdp_target = browser::resolve_cdp_target_with_selector(
                 recipe_args.cdp.as_deref(),
@@ -2366,6 +2392,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
 
             let mut skip_remaining_live_cdp = false;
             for (index, transport) in transports.iter().copied().enumerate() {
+                let fallback_used = index > 0;
                 let cdp_endpoint = resolved_cdp_target
                     .as_ref()
                     .map(|target| target.endpoint.clone());
@@ -2391,6 +2418,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         cdp_endpoint.as_deref(),
                         format,
                         is_chatgpt,
+                        fallback_used,
                     ),
                     browser::RecipeTransport::AgentBrowser => run_recipe_via_agent_browser(
                         ctx,
@@ -2400,6 +2428,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         profile_dir.clone(),
                         format,
                         is_chatgpt,
+                        fallback_used,
                         prefer_auto_connect,
                         &mut resolved_cdp_target,
                     ),
@@ -2411,6 +2440,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             resolved_cdp_target.as_ref(),
                             format,
                             is_chatgpt,
+                            fallback_used,
                         )
                         .await
                     }
@@ -2446,7 +2476,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             transport,
                             &recipe_vars,
                         ) {
-                            transport_errors.push((transport, recipe_transport_error_detail(&err)));
+                            transport_errors.push((
+                                transport,
+                                recipe_transport_error_detail_for_recipe(&err, &recipe_vars),
+                            ));
                             if recipe_has_remaining_manual_fallback(&transports, index) {
                                 transport_errors.push((
                                     browser::RecipeTransport::Manual,
@@ -2464,7 +2497,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                 recipe_transport_name(transport)
                             );
                         }
-                        transport_errors.push((transport, recipe_transport_error_detail(&err)));
+                        transport_errors.push((
+                            transport,
+                            recipe_transport_error_detail_for_recipe(&err, &recipe_vars),
+                        ));
                     }
                 }
             }
@@ -3285,6 +3321,28 @@ mod tests {
     }
 
     #[test]
+    fn recipe_should_stop_live_transport_fallback_on_terminal_chatgpt_phases() {
+        let vars = std::collections::BTreeMap::new();
+        let typed_send = chatgpt_recipe::mark_terminal_fallback_phase(
+            anyhow!("send click returned a transport error"),
+            chatgpt_recipe::ChatgptTransportPhase::Send,
+        );
+        let upload = anyhow!("recipe step 7 (upload) failed: agent-browser failed");
+        let wait = anyhow!(
+            "recipe step 10 (chatgpt_wait_response) failed: timed out waiting for ChatGPT response"
+        );
+
+        for err in [&typed_send, &upload, &wait] {
+            assert!(recipe_should_stop_live_transport_fallback(
+                err,
+                None,
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                &vars,
+            ));
+        }
+    }
+
+    #[test]
     fn recipe_should_stop_live_transport_fallback_on_live_attach_daemon_timeout() {
         let err = anyhow!(
             "yoetz live-attach daemon at 127.0.0.1:45555 timed out after 75000ms waiting for a response"
@@ -3300,7 +3358,7 @@ mod tests {
 
     #[test]
     fn recipe_should_not_stop_live_transport_fallback_on_non_approval_error() {
-        let err = anyhow!("chatgpt send button not found");
+        let err = anyhow!("browser executable was not found before the recipe opened ChatGPT");
         let vars = std::collections::BTreeMap::new();
         assert!(!recipe_should_stop_live_transport_fallback(
             &err,
@@ -3378,13 +3436,13 @@ mod tests {
     }
 
     #[test]
-    fn recipe_should_not_stop_dev_browser_page_errors_before_agent_browser() {
+    fn recipe_should_stop_dev_browser_send_errors_before_agent_browser() {
         let err = anyhow!(
             "{}",
             r#"ChatGPT send button never became enabled after typing. {"send":"missing"}"#
         );
         let vars = std::collections::BTreeMap::new();
-        assert!(!recipe_should_stop_live_transport_fallback(
+        assert!(recipe_should_stop_live_transport_fallback(
             &err,
             None,
             browser::RecipeTransport::DevBrowser,
@@ -3911,6 +3969,7 @@ mod tests {
             None,
             OutputFormat::Text,
             /* is_chatgpt */ false,
+            /* fallback_used */ false,
         )
         .await
         .unwrap_err();
@@ -3940,6 +3999,7 @@ mod tests {
             None,
             OutputFormat::Text,
             /* is_chatgpt */ true,
+            /* fallback_used */ false,
         )
         .await
         .unwrap_err();
@@ -3965,6 +4025,7 @@ mod tests {
             None,
             OutputFormat::Text,
             /* is_chatgpt */ true,
+            /* fallback_used */ false,
         )
         .await
         .unwrap_err();
@@ -3991,6 +4052,7 @@ mod tests {
             None,
             OutputFormat::Text,
             /* is_chatgpt */ true,
+            /* fallback_used */ false,
         )
         .await
         .unwrap_err();
@@ -4017,6 +4079,7 @@ mod tests {
             None,
             OutputFormat::Text,
             /* is_chatgpt */ true,
+            /* fallback_used */ false,
         )
         .await
         .unwrap_err();
@@ -4043,6 +4106,7 @@ mod tests {
             None,
             OutputFormat::Text,
             /* is_chatgpt */ true,
+            /* fallback_used */ false,
         )
         .await
         .unwrap_err();
@@ -4052,8 +4116,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_dev_browser_delivery_mode_falls_back_to_paste_when_clipboard_upload_is_unavailable()
-    {
+    fn resolve_dev_browser_delivery_mode_uses_file_upload_by_default() {
         let bundle_path = temp_output_path("yoetz_bundle_text");
         fs::write(&bundle_path, "bundle body").unwrap();
         let recipe_args = BrowserRecipeArgs {
@@ -4067,11 +4130,33 @@ mod tests {
         let recipe_vars = BTreeMap::new();
 
         let (paste_mode, bundle_text, auto_fallback) =
-            resolve_dev_browser_delivery_mode_for_platform(false, &recipe_args, &recipe_vars)
-                .unwrap();
+            resolve_dev_browser_delivery_mode_for_platform(&recipe_args, &recipe_vars).unwrap();
+
+        assert!(!paste_mode);
+        assert!(!auto_fallback);
+        assert_eq!(bundle_text.as_deref(), None);
+        let _ = fs::remove_file(bundle_path);
+    }
+
+    #[test]
+    fn resolve_dev_browser_delivery_mode_honors_explicit_paste() {
+        let bundle_path = temp_output_path("yoetz_bundle_text_paste");
+        fs::write(&bundle_path, "bundle body").unwrap();
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            bundle: Some(bundle_path.clone()),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::from([("paste".to_string(), "true".to_string())]);
+
+        let (paste_mode, bundle_text, auto_fallback) =
+            resolve_dev_browser_delivery_mode_for_platform(&recipe_args, &recipe_vars).unwrap();
 
         assert!(paste_mode);
-        assert!(auto_fallback);
+        assert!(!auto_fallback);
         assert_eq!(bundle_text.as_deref(), Some("bundle body"));
         let _ = fs::remove_file(bundle_path);
     }
@@ -4094,6 +4179,7 @@ mod tests {
             ("run_id".to_string(), "run-123".to_string()),
             ("wait_timeout_ms".to_string(), "2400000".to_string()),
             ("wait_interval_ms".to_string(), "45000".to_string()),
+            ("upload_timeout_ms".to_string(), "180000".to_string()),
             ("extended".to_string(), "false".to_string()),
         ]);
 
@@ -4106,6 +4192,7 @@ mod tests {
         assert_eq!(spec.run_id, "run-123");
         assert_eq!(spec.wait_timeout_ms, 2_400_000);
         assert_eq!(spec.wait_interval_ms, 45_000);
+        assert_eq!(spec.upload_timeout_ms, 180_000);
         assert!(spec.disable_extended);
     }
 
@@ -4116,6 +4203,7 @@ mod tests {
             backend: "dev-browser".to_string(),
             response: "ok".to_string(),
             model_used: Some("gpt-5-4-pro".to_string()),
+            model_selection_status: crate::chatgpt_recipe::ChatgptModelSelectionStatus::Selected,
             warnings: vec!["clipboard fallback".to_string()],
             fallback_used: true,
             delivery_mode: crate::chatgpt_recipe::ChatgptDeliveryMode::Paste,
@@ -4125,6 +4213,7 @@ mod tests {
         let event = output.to_recipe_complete_event();
         assert_eq!(event["type"], "recipe_complete");
         assert_eq!(event["transport"], "dev-browser");
+        assert_eq!(event["model_selection_status"], "selected");
         assert_eq!(event["delivery_mode"], "paste");
         assert_eq!(event["auto_paste_fallback"], true);
         assert_eq!(event["warnings"], json!(["clipboard fallback"]));
@@ -4148,6 +4237,7 @@ mod tests {
             None,
             OutputFormat::Text,
             /* is_chatgpt */ true,
+            /* fallback_used */ false,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -4173,6 +4263,7 @@ mod tests {
             None,
             OutputFormat::Text,
             /* is_chatgpt */ true,
+            /* fallback_used */ false,
         )
         .unwrap_err();
         let msg = err.to_string();
@@ -4187,6 +4278,23 @@ mod tests {
         let detail = recipe_transport_error_detail(&err);
         assert!(detail.contains("dev-browser could not connect to Chrome"));
         assert!(detail.contains("browserType.connectOverCDP: Timeout 30000ms exceeded"));
+    }
+
+    #[test]
+    fn recipe_transport_error_detail_for_terminal_phase_includes_manual_recovery_run_id() {
+        let err = chatgpt_recipe::mark_terminal_fallback_phase(
+            anyhow::anyhow!("send click did not trigger a UI transition"),
+            chatgpt_recipe::ChatgptTransportPhase::Send,
+        );
+        let vars = BTreeMap::from([("run_id".to_string(), "run-123".to_string())]);
+
+        let detail = recipe_transport_error_detail_for_recipe(&err, &vars);
+
+        assert!(detail.contains("Manual recovery"));
+        assert!(detail.contains("run `run-123`"));
+        assert!(detail.contains("https://chatgpt.com/?_yoetz=run-123"));
+        assert!(detail.contains("window.name `yoetz:run-123`"));
+        assert!(detail.contains("duplicate submission"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ name: chatgpt
 # Variables:
 #   model    — model slug (e.g., "gpt-5-4-pro"). Default: "auto" selects the
 #              best available model, preferring GPT-5/Pro when the account has it.
+#              Set to "" or "current" to keep the current ChatGPT selector state.
 #   extended — set to "false" to disable Extended Pro. Default: leave as-is.
 #   prompt   — prompt text to send with the attachment.
 #   browser_context_id — exact Chrome `browserContextId` to target when multiple
@@ -33,6 +34,8 @@ name: chatgpt
 #              yoetz runs work automatically because each run owns its own tab.
 #   wait_timeout_ms  — overall response wait deadline in ms (default: 1800000 = 30min).
 #   wait_interval_ms — poll interval in ms (default: 30000 = 30s).
+#   upload_timeout_ms  — attachment upload deadline in ms (default: 120000 = 2min).
+#   upload_interval_ms — attachment upload poll interval in ms (default: 2000 = 2s).
 
 transports:
   - chrome-devtools-mcp
@@ -45,6 +48,8 @@ defaults:
   model: "auto"
   extended: ""
   thread: "fresh"
+  upload_timeout_ms: "120000"
+  upload_interval_ms: "2000"
   wait_timeout_ms: "1800000"
   wait_interval_ms: "30000"
 
@@ -103,14 +108,13 @@ steps:
   - action: chatgpt_open_attachment_ui
   - sleep_ms: 500
 
-  # Upload the bundle file.
-  - action: upload
-    args: ["#upload-files", "{{bundle_path}}"]
+  # Upload the bundle file through the composer-scoped file input.
+  - action: chatgpt_upload_bundle
 
   # Poll until the upload spinner disappears. Short-burst Rust-side polling
   # keeps each eval under the agent-browser IPC ceiling (25s).
   - action: chatgpt_wait_upload
-    args: ["--attempts", "30", "--interval-ms", "1000"]
+    args: ["--interval-ms", "{{upload_interval_ms}}", "--timeout-ms", "{{upload_timeout_ms}}"]
 
   # Click back into the composer so the next step uses real keyboard input
   # against ProseMirror after the attachment flow completes.

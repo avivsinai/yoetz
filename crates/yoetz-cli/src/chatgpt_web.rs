@@ -1,8 +1,12 @@
+//! Shared ChatGPT web contracts and DOM-script builders used by browser transports.
+
 use anyhow::{anyhow, Result};
 use rand::random;
 use std::collections::BTreeMap;
 use std::path::Path;
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime};
+
+use crate::chatgpt_recipe::ChatgptModelSelectionStatus;
 
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 pub const COMPOSER_SELECTOR: &str =
@@ -18,6 +22,46 @@ pub const UPLOAD_MENU_TEXT_PATTERN: &str =
     "upload from computer|from computer|upload files|choose files|browse";
 pub const STABLE_IDLE_FLOOR_MS: u64 = 90_000;
 pub const STABLE_IDLE_INTERVAL_MULTIPLIER: u64 = 3;
+pub(crate) const CHATGPT_UPLOAD_STABLE_POLLS: u64 = 2;
+pub(crate) const JS_VISIBILITY_HELPERS: &str = r#"
+  const isVisible = (el) => {
+    if (!el) return false;
+    const rect = el.getBoundingClientRect();
+    const style = window.getComputedStyle(el);
+    return rect.width > 0 &&
+      rect.height > 0 &&
+      style.visibility !== "hidden" &&
+      style.display !== "none";
+  };
+  const findVisible = (root, selector) =>
+    Array.from((root || document).querySelectorAll(selector)).find((el) => isVisible(el)) || null;
+"#;
+pub(crate) const JS_COMPOSER_SCOPE_HELPERS: &str = r#"
+  const COMPOSER_ROOT_SELECTOR = "[data-testid*='composer'], [class*='composer'], main, [role='main']";
+  const getComposerScope = (composerEl = document.querySelector(COMPOSER_SELECTOR)) => {
+    const composerForm = composerEl?.closest("form") || null;
+    const composerRoot = composerForm ||
+      composerEl?.closest(COMPOSER_ROOT_SELECTOR) ||
+      composerEl?.parentElement ||
+      null;
+    const seenRoots = new Set();
+    const roots = [];
+    [composerForm, composerRoot, document].forEach((root) => {
+      if (root && !seenRoots.has(root)) {
+        seenRoots.add(root);
+        roots.push(root);
+      }
+    });
+    return { composerEl, composerForm, composerRoot, roots };
+  };
+"#;
+pub(crate) const JS_TURN_ROOT_HELPERS: &str = r#"
+  const latestAssistantTurn = (msg) =>
+    msg?.closest(".agent-turn, [class*='agent-turn'], [class*='turn-messages']") ||
+    msg?.parentElement?.parentElement ||
+    msg?.parentElement ||
+    null;
+"#;
 static RUN_ID_TS_FORMAT: &[FormatItem<'static>] =
     format_description!("[year][month][day]T[hour][minute][second]Z");
 const AUTH_MARKERS: &[&str] = &[
@@ -66,6 +110,21 @@ pub fn generate_run_id() -> String {
     format!("{ts}_{suffix}")
 }
 
+pub fn validate_run_id(run_id: &str) -> Result<()> {
+    let valid = !run_id.is_empty()
+        && run_id.len() <= 128
+        && run_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'.' | b'-'));
+    if valid {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "invalid `run_id`: expected 1-128 ASCII letters, digits, `_`, `:`, `.`, or `-`"
+        ))
+    }
+}
+
 pub fn validate_thread_mode(raw: Option<&str>) -> Result<()> {
     match raw.unwrap_or("fresh").trim().to_ascii_lowercase().as_str() {
         "" | "fresh" => Ok(()),
@@ -79,7 +138,23 @@ pub fn validate_thread_mode(raw: Option<&str>) -> Result<()> {
 }
 
 pub fn mark_chatgpt_url(run_id: &str) -> String {
-    format!("{CHATGPT_URL}?_yoetz={run_id}")
+    format!("{CHATGPT_URL}?{}", chatgpt_run_url_marker(run_id))
+}
+
+pub(crate) fn chatgpt_run_url_marker(run_id: &str) -> String {
+    format!("_yoetz={}", percent_encode_query_component(run_id))
+}
+
+fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 pub fn build_set_window_name_js(run_id: &str) -> String {
@@ -190,7 +265,28 @@ pub fn select_reported_chatgpt_model(
 
 pub fn should_keep_current_chatgpt_model(requested_model: &str) -> bool {
     let requested_model = requested_model.trim();
-    requested_model.is_empty() || requested_model.eq_ignore_ascii_case("auto")
+    requested_model.is_empty()
+        || requested_model.eq_ignore_ascii_case("current")
+        || requested_model.eq_ignore_ascii_case("keep-current")
+}
+
+pub(crate) fn chatgpt_model_selection_status(
+    selection: &serde_json::Value,
+    requested_model: &str,
+) -> ChatgptModelSelectionStatus {
+    let status = selection
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let keep_current_model = should_keep_current_chatgpt_model(requested_model);
+    match status {
+        "selected" => ChatgptModelSelectionStatus::Selected,
+        "already-selected" if keep_current_model => ChatgptModelSelectionStatus::KeptCurrent,
+        "already-selected" => ChatgptModelSelectionStatus::Selected,
+        "missing-selector" | "not-found" => ChatgptModelSelectionStatus::Unavailable,
+        "selection-mismatch" => ChatgptModelSelectionStatus::Mismatch,
+        _ => ChatgptModelSelectionStatus::Unavailable,
+    }
 }
 
 pub fn model_selector_button_selector_json() -> String {
@@ -253,14 +349,45 @@ async () => {{
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const isCheckedState = (ariaChecked, dataState) => ariaChecked === "true" || dataState === "checked";
-  const isVisible = (el) => {{
-    if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 &&
-      rect.height > 0 &&
-      style.visibility !== "hidden" &&
-      style.display !== "none";
+  const hasSelectedCurrentMarker = (ariaSelected, ariaCurrent, dataSelected, dataCurrent) =>
+    ariaSelected === "true" ||
+    dataSelected === "true" ||
+    (!!ariaCurrent && ariaCurrent !== "false") ||
+    (!!dataCurrent && dataCurrent !== "false");
+    const itemIsSelected = (item) => !!item && (
+      isCheckedState(item.ariaChecked || "", item.dataState || "") ||
+      hasSelectedCurrentMarker(item.ariaSelected || "", item.ariaCurrent || "", item.dataSelected || "", item.dataCurrent || "")
+    );
+{visibility_helpers}
+    const slugify = (value) => normalize(value).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  const isLowSignalSelectorLabel = (value) => {{
+    const key = slugify(value);
+    return !key || key === "chatgpt" || key === "chat-gpt" || key === "openai" || key === "model-selector" || key === "selected-model";
+  }};
+  const selectorLabelMatchesTarget = (label, item, tierSlug, targetTestId, candidateTestIds) => {{
+    const labelText = normalize(label).toLowerCase();
+    const labelSlug = slugify(labelText);
+    if (isLowSignalSelectorLabel(labelText)) return false;
+    const candidates = [];
+    const add = (value) => {{
+      const raw = normalize(value || "");
+      const key = slugify(raw);
+      if (!key || isLowSignalSelectorLabel(raw)) return;
+      candidates.push({{ raw: raw.toLowerCase(), key }});
+    }};
+    add(tierSlug);
+    add(item?.text || "");
+    add((item?.testId || "").replace(/^model-switcher-/, ""));
+    add((targetTestId || "").replace(/^model-switcher-/, ""));
+    (candidateTestIds || []).forEach((value) => add(value));
+    return candidates.some((candidate) => {{
+      if (candidate.key === labelSlug) return true;
+      if (tierSlug && candidate.key === slugify(tierSlug)) {{
+        const escaped = candidate.raw.replace(/[.*+?^$()|[\]\\]/g, "\\$&");
+        return new RegExp(`(^|[^a-z0-9])${{escaped}}([^a-z0-9]|$)`).test(labelText);
+      }}
+      return candidate.key.length >= 4 && labelSlug.includes(candidate.key);
+    }});
   }};
   const realClick = (el) => {{
     el.dispatchEvent(new PointerEvent("pointerdown", {{ bubbles: true, cancelable: true, pointerId: 1 }}));
@@ -402,8 +529,18 @@ async () => {{
   }};
   const requestedTrimmed = normalize(requested);
   const requestedLower = requestedTrimmed.toLowerCase();
-  const autoMode = !requestedTrimmed || requestedLower === "auto";
+  const keepCurrentMode = !requestedTrimmed || requestedLower === "current" || requestedLower === "keep-current";
+  const autoMode = requestedLower === "auto";
   const requestedGenericTier = deriveRequestedTier(requestedLower);
+
+  if (keepCurrentMode) {{
+    return {{
+      ...responseBase,
+      status: "already-selected",
+      modelUsed: currentLabel || null,
+      keepCurrent: true,
+    }};
+  }}
 
   if (!selectorButton) {{
     return {{
@@ -455,6 +592,10 @@ async () => {{
           haystack,
           ariaChecked: normalize(el.getAttribute?.("aria-checked") || "").toLowerCase(),
           dataState: normalize(el.getAttribute?.("data-state") || "").toLowerCase(),
+          ariaSelected: normalize(el.getAttribute?.("aria-selected") || "").toLowerCase(),
+          ariaCurrent: normalize(el.getAttribute?.("aria-current") || "").toLowerCase(),
+          dataSelected: normalize(el.getAttribute?.("data-selected") || "").toLowerCase(),
+          dataCurrent: normalize(el.getAttribute?.("data-current") || "").toLowerCase(),
         }};
       }})
       .filter((item) => item && (item.text || item.testId));
@@ -518,6 +659,7 @@ async () => {{
 
   let target = null;
   let selectionNeedles = [];
+  let requestedTestIds = [];
   if (autoMode) {{
     target =
       findExactTierLabelItem(items, "pro") ||
@@ -545,7 +687,7 @@ async () => {{
     }}
     selectionNeedles.push(target.testId.toLowerCase(), target.text.toLowerCase());
   }} else {{
-    const requestedTestIds = Array.from(new Set(
+    requestedTestIds = Array.from(new Set(
       (MODEL_TESTID_CANDIDATES[requestedLower] || [MODEL_TESTID_ALIASES[requestedLower] || requestedLower])
         .map((value) => normalize(value).toLowerCase())
         .filter(Boolean)
@@ -581,7 +723,7 @@ async () => {{
   }}
 
   const targetTestId = target.testId || null;
-  if (target.ariaChecked === "true" || target.dataState === "checked") {{
+  if (itemIsSelected(target)) {{
     return {{
       ...responseBase,
       status: "already-selected",
@@ -641,19 +783,21 @@ async () => {{
           ? findPreferredTestIdItem(updatedItems, [targetTestId.toLowerCase()]) || null
           : findGenericNeedleItem(updatedItems, selectionNeedles) || null;
       const targetNode = targetTestId
-        ? document.querySelector(`[data-testid="${{targetTestId}}"]`)
-          : null;
+        ? Array.from(document.querySelectorAll(`[data-testid="${{targetTestId}}"]`)).find((el) => isVisible(el)) || null
+        : null;
       targetChecked = isCheckedState(
         normalize(targetNode?.getAttribute?.("aria-checked") || "").toLowerCase(),
         normalize(targetNode?.getAttribute?.("data-state") || "").toLowerCase(),
-      ) || isCheckedState(updatedTarget?.ariaChecked || "", updatedTarget?.dataState || "");
+      ) ||
+        hasSelectedCurrentMarker(
+          normalize(targetNode?.getAttribute?.("aria-selected") || "").toLowerCase(),
+          normalize(targetNode?.getAttribute?.("aria-current") || "").toLowerCase(),
+          normalize(targetNode?.getAttribute?.("data-selected") || "").toLowerCase(),
+          normalize(targetNode?.getAttribute?.("data-current") || "").toLowerCase(),
+        ) ||
+        itemIsSelected(updatedTarget);
       selectedLabel = readSelectorLabel();
-      const effectiveTierSlug = targetTierSlug || classifyTier(updatedTarget || target);
-      const trustedTierSelected = effectiveTierSlug && (
-        hasTrustedUserFacingTierLabel(updatedTarget || target, effectiveTierSlug) ||
-        updatedItems.some((item) => hasTrustedUserFacingTierLabel(item, effectiveTierSlug))
-      );
-      if (targetChecked || selectionNeedles.filter(Boolean).some((needle) => needle && selectedLabel.includes(needle)) || trustedTierSelected) {{
+      if (targetChecked) {{
         verifyConfirmed = true;
       }}
     }}
@@ -662,9 +806,7 @@ async () => {{
       return {{
         ...responseBase,
         status: "selected",
-        modelUsed: targetChecked
-          ? (updatedTarget?.text || target.text || requestedTrimmed || currentLabel || null)
-          : (selectedLabel || updatedTarget?.text || target.text || requestedTrimmed || currentLabel || null),
+        modelUsed: updatedTarget?.text || target.text || requestedTrimmed || currentLabel || null,
         selectedLabel: selectedLabel || null,
         targetTestId,
         targetChecked,
@@ -691,18 +833,9 @@ async () => {{
     const reopenedChecked = isCheckedState(
       reopenedTarget?.ariaChecked || "",
       reopenedTarget?.dataState || "",
-    );
+    ) || itemIsSelected(reopenedTarget);
     const reopenedLabel = readSelectorLabel();
-    const reopenedEffectiveTierSlug = targetTierSlug || classifyTier(reopenedTarget || target);
-    const reopenedTrustedTierSelected = reopenedEffectiveTierSlug && (
-      hasTrustedUserFacingTierLabel(reopenedTarget || target, reopenedEffectiveTierSlug) ||
-      reopenedItems.some((item) => hasTrustedUserFacingTierLabel(item, reopenedEffectiveTierSlug))
-    );
-    if (
-      reopenedChecked ||
-      selectionNeedles.filter(Boolean).some((needle) => needle && reopenedLabel.includes(needle)) ||
-      reopenedTrustedTierSelected
-    ) {{
+    if (reopenedChecked) {{
       selectionConfirmed = true;
       updatedItems = reopenedItems;
       updatedTarget = reopenedTarget;
@@ -711,9 +844,7 @@ async () => {{
       return {{
         ...responseBase,
         status: "selected",
-        modelUsed: reopenedChecked
-          ? (reopenedTarget?.text || target.text || requestedTrimmed || currentLabel || null)
-          : (reopenedLabel || reopenedTarget?.text || target.text || requestedTrimmed || currentLabel || null),
+        modelUsed: reopenedTarget?.text || target.text || requestedTrimmed || currentLabel || null,
         selectedLabel: reopenedLabel || null,
         targetTestId,
         targetChecked: reopenedChecked,
@@ -742,6 +873,7 @@ async () => {{
         model_item_selector = model_item_selector,
         model_testid_aliases = model_testid_aliases,
         model_testid_candidates = model_testid_candidates,
+        visibility_helpers = JS_VISIBILITY_HELPERS,
     )
 }
 
@@ -759,87 +891,180 @@ pub fn build_attachment_probe_function(file_name: &str) -> Result<String> {
   const fileName = {file_name_json};
   const fileStem = {file_stem_json};
   const ATTACHMENT_TILE_SELECTOR = {attachment_tile_selector_json};
-  const clip = (value, max = 120) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
-  const composer = document.querySelector({composer_selector_json});
-  const composerForm = composer?.closest("form");
-  const root = composerForm || document;
-  const isBusy = (tile) => {{
-    const busyNode = tile.matches?.("[aria-busy='true'], [data-state='uploading'], [role='progressbar']")
-      ? tile
-      : tile.querySelector("[class*='animate-spin'], [role='progressbar'], [aria-busy='true'], [data-state='uploading']");
-    if (!busyNode) {{
-      const busyText = clip(tile.innerText || tile.textContent || "").toLowerCase();
-      return /\buploading\b|\bprocessing\b|\bscanning\b/.test(busyText);
-    }}
-    const visibilityTarget = busyNode.closest?.("[aria-busy='true'], [data-state='uploading'], [role='progressbar']") || busyNode.parentElement || busyNode;
-    return getComputedStyle(visibilityTarget).display !== "none";
+  const COMPOSER_SELECTOR = {composer_selector_json};
+  const clip = (value, max = 160) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+{visibility_helpers}
+{composer_scope_helpers}
+  const escapeRegExp = (value) => String(value || "").replace(/[.*+?^${{}}()|[\]\\]/g, "\\$&");
+  const stripExpectedName = (value) => {{
+    let text = String(value || "");
+    [fileName, fileStem].filter(Boolean).forEach((name) => {{
+      text = text.replace(new RegExp(escapeRegExp(name), "gi"), " ");
+    }});
+    return clip(text, 220);
   }};
-  const describeTile = (tile) => {{
-    const text = clip(tile.innerText || tile.textContent || "");
-    const ariaLabel = clip(tile.getAttribute?.("aria-label") || "");
-    const title = clip(tile.getAttribute?.("title") || "");
-    const busy = isBusy(tile);
+  const includesName = (value) => {{
+    const text = String(value || "");
+    return !!fileName && text.includes(fileName);
+  }};
+  const includesStem = (value) => {{
+    const text = String(value || "");
+    return !!fileStem && text.includes(fileStem);
+  }};
+  const failurePattern = /\b(upload failed|failed|failure|error uploading|upload error|attachment error|file error|something went wrong|could not|couldn't|cannot|can't|unsupported|too large|blocked|try again)\b/i;
+  const busyPattern = /\b(uploading|processing|scanning|attaching|preparing|loading)\b/i;
+  const busySelector = "[aria-busy='true'], [role='progressbar'], [data-state='uploading'], [data-state='loading'], [class*='progress'], [class*='spinner'], [class*='animate-spin']";
+  const {{ composerForm, composerRoot }} = getComposerScope();
+  const readFields = (tile) => [
+    clip(tile.innerText || tile.textContent || ""),
+    clip(tile.getAttribute?.("aria-label") || ""),
+    clip(tile.getAttribute?.("title") || ""),
+    clip(tile.getAttribute?.("data-testid") || "", 80),
+  ].filter(Boolean);
+  const childHasExactName = (tile) => Array.from(tile.querySelectorAll("*")).some((node) => {{
+    const text = clip(node.innerText || node.textContent || "", 220);
+    return text === fileName ||
+      clip(node.getAttribute?.("aria-label") || "", 220) === fileName ||
+      clip(node.getAttribute?.("title") || "", 220) === fileName;
+  }});
+  const busyInfo = (tile) => {{
+    const busyNodes = [
+      ...(tile.matches?.(busySelector) ? [tile] : []),
+      ...Array.from(tile.querySelectorAll(busySelector)),
+    ].filter((node) => isVisible(node));
+    const text = stripExpectedName(tile.innerText || tile.textContent || "");
     return {{
-      text,
-      ariaLabel,
-      title,
-      ready: !busy,
+      busy: busyNodes.length > 0 || busyPattern.test(text),
+      busyMarkerCount: busyNodes.length,
+      busyText: busyPattern.test(text) ? text : "",
     }};
   }};
-  const visibleEvidence = Array.from(root.querySelectorAll(ATTACHMENT_TILE_SELECTOR))
-    .map((tile) => describeTile(tile))
-    .filter((entry) => {{
-      const combined = `${{entry.text}} ${{entry.ariaLabel}} ${{entry.title}}`;
-      return combined.includes(fileName) || (fileStem && combined.includes(fileStem));
-    }})
-    .slice(0, 6);
+  const describeTile = (tile, scope, index) => {{
+    const fields = readFields(tile);
+    const combined = fields.join(" ");
+    const failureText = fields.map(stripExpectedName).join(" ");
+    const combinedNameMatched = includesName(combined) || includesStem(combined);
+    const exactNameMatched = fields.some((field) => field === fileName) ||
+      (!combinedNameMatched && childHasExactName(tile));
+    const nameMatched = exactNameMatched || combinedNameMatched;
+    const busy = busyInfo(tile);
+    const failed = failurePattern.test(failureText);
+    return {{
+      scope,
+      index,
+      text: fields[0] || "",
+      ariaLabel: fields[1] || "",
+      title: fields[2] || "",
+      testId: fields[3] || "",
+      nameMatched,
+      exactNameMatched,
+      stemMatched: !exactNameMatched && includesStem(combined),
+      busy: busy.busy,
+      busyMarkerCount: busy.busyMarkerCount,
+      busyText: busy.busyText,
+      failure: failed,
+      failureText: failed ? clip(failureText, 180) : "",
+      ready: nameMatched && !busy.busy && !failed,
+    }};
+  }};
+  const collectTiles = (root, scope) => root
+    ? Array.from(root.querySelectorAll(ATTACHMENT_TILE_SELECTOR))
+      .filter((tile) => isVisible(tile))
+      .map((tile, index) => describeTile(tile, scope, index))
+    : [];
+  const scopedTiles = collectTiles(composerRoot, composerForm ? "form" : "composer-root");
+  const documentTiles = collectTiles(document, "document");
+  const scopedMatches = scopedTiles.filter((entry) => entry.nameMatched);
+  const documentMatches = documentTiles.filter((entry) => entry.nameMatched);
+  const matchedTiles = scopedMatches.some((entry) => entry.exactNameMatched)
+    ? scopedMatches.filter((entry) => entry.exactNameMatched)
+    : scopedMatches.length > 0
+      ? scopedMatches
+      : documentMatches.some((entry) => entry.exactNameMatched)
+        ? documentMatches.filter((entry) => entry.exactNameMatched)
+        : documentMatches;
+  const alertEvidence = Array.from(document.querySelectorAll("[role='alert'], [aria-live], [class*='error'], [data-testid*='error']"))
+    .filter((el) => isVisible(el))
+    .map((el) => clip(el.innerText || el.textContent || el.getAttribute?.("aria-label") || "", 180))
+    .filter((text) => failurePattern.test(text) && (includesName(text) || includesStem(text) || /\bupload|attachment|file\b/i.test(text)))
+    .slice(0, 4);
+  const failureEvidence = [
+    ...matchedTiles.filter((entry) => entry.failure),
+    ...alertEvidence.map((text) => ({{ scope: "alert", text, failure: true }})),
+  ].slice(0, 6);
+  const busyEvidence = matchedTiles.filter((entry) => entry.busy).slice(0, 6);
+  const readinessEvidence = matchedTiles.filter((entry) => entry.ready).slice(0, 6);
   const inputs = Array.from(document.querySelectorAll("input[type='file']")).map((input) => ({{
     fileNames: Array.from(input.files || []).map((file) => file.name),
     multiple: !!input.multiple,
+    inComposer: !!(composerRoot && composerRoot.contains(input)),
   }}));
   const inputMatched = inputs.some((input) => input.fileNames.some((name) => name === fileName));
-  if (visibleEvidence.some((entry) => entry.ready)) {{
+  const attachmentFailure = failureEvidence.length > 0;
+  const exactNameMatched = matchedTiles.some((entry) => entry.exactNameMatched);
+  const readyNow = readinessEvidence.length > 0 && busyEvidence.length === 0 && !attachmentFailure;
+  const readyCounts = window.__yoetzAttachmentReadyCounts || (window.__yoetzAttachmentReadyCounts = Object.create(null));
+  const readyKey = `file:${{fileName}}`;
+  readyCounts[readyKey] = readyNow ? (Number(readyCounts[readyKey] || 0) + 1) : 0;
+  const status = attachmentFailure
+    ? "failed"
+    : readyNow
+      ? "done"
+      : matchedTiles.length > 0 || inputMatched
+        ? "uploading"
+        : (scopedTiles.length > 0 || documentTiles.length > 0 ? "no_match" : "no_tile");
+  if (readyNow) {{
     return {{
       ok: true,
-      status: "done",
-      visibleEvidence,
+      status,
+      visibleEvidence: matchedTiles.slice(0, 6),
+      readinessEvidence,
+      busyEvidence,
+      failureEvidence,
       inputMatched,
-      composerScoped: !!composerForm,
+      exactNameMatched,
+      stableReadyCount: readyCounts[readyKey],
+      composerScoped: !!composerRoot,
+      scopeUsed: matchedTiles[0]?.scope || null,
+      tileCount: scopedTiles.length || documentTiles.length,
     }};
   }}
   return {{
     ok: false,
-    status: visibleEvidence.length > 0 || inputMatched ? "uploading" : "no_match",
-    visibleEvidence,
+    status,
+    visibleEvidence: matchedTiles.slice(0, 6),
+    readinessEvidence,
+    busyEvidence,
+    failureEvidence,
+    attachmentFailure,
+    exactNameMatched,
+    stableReadyCount: readyCounts[readyKey],
     inputMatched,
     inputs,
-    composerScoped: !!composerForm,
+    composerScoped: !!composerRoot,
+    scopeUsed: matchedTiles[0]?.scope || null,
+    tileCount: scopedTiles.length || documentTiles.length,
+    matchedTileCount: matchedTiles.length,
+    fallbackMatches: scopedMatches.length > 0 ? [] : documentMatches.slice(0, 4),
   }};
 }}
 "##,
         attachment_tile_selector_json = attachment_tile_selector_json,
         composer_selector_json = composer_selector_json(),
+        visibility_helpers = JS_VISIBILITY_HELPERS,
+        composer_scope_helpers = JS_COMPOSER_SCOPE_HELPERS,
     ))
 }
 
-pub fn build_open_attachment_ui_function() -> String {
+pub(crate) fn build_open_attachment_ui_function() -> String {
     let attachment_trigger_selector_json = attachment_trigger_selector_json();
     format!(
         r##"
 () => {{
-  const ATTACHMENT_TRIGGER_SELECTOR = {attachment_trigger_selector_json};
-  const clip = (value, max = 120) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
-  const isVisible = (el) => {{
-    if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 &&
-      rect.height > 0 &&
-      style.visibility !== "hidden" &&
-      style.display !== "none" &&
-      style.pointerEvents !== "none";
-  }};
-  const button = Array.from(document.querySelectorAll(ATTACHMENT_TRIGGER_SELECTOR)).find((el) => isVisible(el))
+    const ATTACHMENT_TRIGGER_SELECTOR = {attachment_trigger_selector_json};
+    const clip = (value, max = 120) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+{visibility_helpers}
+    const button = Array.from(document.querySelectorAll(ATTACHMENT_TRIGGER_SELECTOR)).find((el) => isVisible(el))
     || document.querySelector(ATTACHMENT_TRIGGER_SELECTOR);
   if (!button) {{
     return {{
@@ -857,26 +1082,18 @@ pub fn build_open_attachment_ui_function() -> String {
 }}
 "##,
         attachment_trigger_selector_json = attachment_trigger_selector_json,
+        visibility_helpers = JS_VISIBILITY_HELPERS,
     )
 }
 
-pub fn build_upload_menu_item_click_function() -> String {
+pub(crate) fn build_upload_menu_item_click_function() -> String {
     let upload_menu_text_pattern_json = upload_menu_text_pattern_json();
     format!(
         r##"
 () => {{
-  const TEXT_PATTERN = new RegExp({upload_menu_text_pattern_json}, "i");
-  const clip = (value, max = 120) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
-  const isVisible = (el) => {{
-    if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 &&
-      rect.height > 0 &&
-      style.visibility !== "hidden" &&
-      style.display !== "none" &&
-      style.pointerEvents !== "none";
-  }};
+    const TEXT_PATTERN = new RegExp({upload_menu_text_pattern_json}, "i");
+    const clip = (value, max = 120) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+{visibility_helpers}
   const selectors = ["[role='menuitem']", "button", "[role='button']", "label", "li"];
   const nodes = Array.from(document.querySelectorAll(selectors.join(",")));
   const target = nodes.find((el) => {{
@@ -896,6 +1113,7 @@ pub fn build_upload_menu_item_click_function() -> String {
 }}
 "##,
         upload_menu_text_pattern_json = upload_menu_text_pattern_json,
+        visibility_helpers = JS_VISIBILITY_HELPERS,
     )
 }
 
@@ -903,9 +1121,9 @@ pub fn build_upload_menu_item_click_function() -> String {
 /// snapshot walker (and `upload_file`'s fallback) can identify the correct
 /// target. Using the composer form's own file input — never a page-wide
 /// first-match — keeps the bundle from landing on unrelated hidden inputs.
-pub const COMPOSER_FILE_INPUT_MARKER: &str = "yoetz-upload-target";
+pub(crate) const COMPOSER_FILE_INPUT_MARKER: &str = "yoetz-upload-target";
 
-pub fn build_scope_composer_file_input_function() -> String {
+pub(crate) fn build_scope_composer_file_input_function() -> String {
     let composer_selector_json = composer_selector_json();
     let marker_json = serde_json::to_string(COMPOSER_FILE_INPUT_MARKER)
         .expect("serialize composer-file-input marker");
@@ -940,46 +1158,53 @@ pub fn build_send_button_click_function() -> String {
         r##"
 () => {{
   const SEND_BUTTON_SELECTOR = {send_button_selector_json};
-  const COMPOSER_SELECTOR = {composer_selector_json};
-  const ATTACHMENT_TILE_SELECTOR = {attachment_tile_selector_json};
-  const clip = (value, max = 120) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
-  const isVisible = (el) => {{
-    if (!el) return false;
-    const rect = el.getBoundingClientRect();
-    const style = window.getComputedStyle(el);
-    return rect.width > 0 &&
-      rect.height > 0 &&
-      style.visibility !== "hidden" &&
-      style.display !== "none" &&
-      style.pointerEvents !== "none";
-  }};
-  const buttons = Array.from(document.querySelectorAll(SEND_BUTTON_SELECTOR)).filter((el) => isVisible(el));
-  const enabledButton = buttons.find((button) => !button.disabled) || null;
+    const COMPOSER_SELECTOR = {composer_selector_json};
+    const ATTACHMENT_TILE_SELECTOR = {attachment_tile_selector_json};
+    const clip = (value, max = 120) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
+{visibility_helpers}
+{composer_scope_helpers}
+    const {{ composerEl, composerForm, composerRoot, roots: searchRoots }} = getComposerScope();
+  const seenButtons = new Set();
+  const buttonEntries = [];
+  searchRoots.forEach((root) => {{
+    const scope = root === composerForm ? "form" : root === composerRoot ? "composer-root" : "document";
+    Array.from(root.querySelectorAll(SEND_BUTTON_SELECTOR)).forEach((button) => {{
+      if (!seenButtons.has(button) && isVisible(button)) {{
+        seenButtons.add(button);
+        buttonEntries.push({{ button, scope }});
+      }}
+    }});
+  }});
+  const enabledEntry = buttonEntries.find((entry) => !entry.button.disabled) || null;
   const assistantMessages = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
   const lastAssistant = assistantMessages.length > 0 ? assistantMessages[assistantMessages.length - 1] : null;
-  const composerEl = document.querySelector(COMPOSER_SELECTOR);
+  const attachmentRoot = composerRoot || document;
   const diagnostics = {{
     url: window.location.href || "",
     title: document.title || "",
-    attachmentPresent: !!document.querySelector(ATTACHMENT_TILE_SELECTOR),
+    attachmentPresent: !!attachmentRoot.querySelector(ATTACHMENT_TILE_SELECTOR),
     composerTextLength: ((composerEl?.innerText || composerEl?.textContent || "").trim()).length,
-    buttonCount: buttons.length,
-    buttons: buttons.slice(0, 4).map((button) => ({{
-      text: clip(button.innerText || button.textContent || ""),
-      testId: clip(button.getAttribute?.("data-testid") || "", 80),
-      disabled: !!button.disabled,
-      ariaLabel: clip(button.getAttribute?.("aria-label") || ""),
+    composerScoped: !!composerRoot,
+    buttonCount: buttonEntries.length,
+    buttons: buttonEntries.slice(0, 6).map((entry) => ({{
+      scope: entry.scope,
+      text: clip(entry.button.innerText || entry.button.textContent || ""),
+      testId: clip(entry.button.getAttribute?.("data-testid") || "", 80),
+      disabled: !!entry.button.disabled,
+      ariaLabel: clip(entry.button.getAttribute?.("aria-label") || ""),
     }})),
   }};
-  if (!enabledButton) {{
+  if (!enabledEntry) {{
     return {{
       status: "not-ready",
       diagnostics,
     }};
   }}
+  const enabledButton = enabledEntry.button;
   enabledButton.click();
   return {{
     status: "sent",
+    sendScope: enabledEntry.scope,
     selectorLabel: clip(enabledButton.getAttribute?.("data-testid") || enabledButton.getAttribute?.("aria-label") || enabledButton.innerText || enabledButton.textContent || "", 80),
     assistantCountBeforeSend: assistantMessages.length,
     assistantLastLenBeforeSend: (lastAssistant?.innerText || "").length,
@@ -989,63 +1214,89 @@ pub fn build_send_button_click_function() -> String {
         send_button_selector_json = send_button_selector_json,
         composer_selector_json = composer_selector_json,
         attachment_tile_selector_json = attachment_tile_selector_json,
+        visibility_helpers = JS_VISIBILITY_HELPERS,
+        composer_scope_helpers = JS_COMPOSER_SCOPE_HELPERS,
     )
 }
 
 pub fn build_chatgpt_dom_probe_function() -> String {
     let send_button_selector_json = send_button_selector_json();
     let stop_button_selector_json = stop_button_selector_json();
+    let composer_selector_json = composer_selector_json();
     format!(
         r##"
 () => {{
-  const isVisible = (button) => {{
-    const rect = button.getBoundingClientRect();
-    const style = window.getComputedStyle(button);
-    return rect.width > 0 &&
-      rect.height > 0 &&
-      style.visibility !== "hidden" &&
-      style.display !== "none";
-  }};
-  const send = Array.from(document.querySelectorAll({send_button_selector_json})).find((button) => isVisible(button)) || null;
-  const stopButton = Array.from(document.querySelectorAll({stop_button_selector_json})).find((button) => isVisible(button)) || null;
-  const stopGenerating = !!stopButton && !stopButton.disabled;
-  const thinking = document.querySelector(".result-thinking, [data-testid*='thinking'], [class*='thinking']");
-  const msgs = document.querySelectorAll("[data-message-author-role='assistant']");
+  const COMPOSER_SELECTOR = {composer_selector_json};
+{visibility_helpers}
+{composer_scope_helpers}
+{turn_root_helpers}
+  const {{ roots }} = getComposerScope();
+  const send = roots.flatMap((root) => Array.from(root.querySelectorAll({send_button_selector_json}))).find((button) => isVisible(button)) || null;
+  const msgs = Array.from(document.querySelectorAll("[data-message-author-role='assistant']")).filter((msg) => isVisible(msg));
   const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
-  const turnRoot =
-    lastMsg?.closest(".agent-turn, [class*='agent-turn'], [class*='turn-messages']") ||
-    lastMsg?.parentElement?.parentElement ||
-    lastMsg?.parentElement ||
-    document;
-  const copyButtons = lastMsg ? turnRoot.querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']").length : 0;
-  const lastLen = msgs.length > 0 ? msgs[msgs.length - 1].innerText.length : 0;
+  const turnRoot = latestAssistantTurn(lastMsg);
+  const globalStopButton = findVisible(document, {stop_button_selector_json});
+  const stopButton = (turnRoot ? findVisible(turnRoot, {stop_button_selector_json}) : null) ||
+    ((send?.disabled || !lastMsg) ? globalStopButton : null);
+  const stopGenerating = !!stopButton && !stopButton.disabled;
+  const thinkingSelector = ".result-thinking, [data-testid*='thinking'], [class*='thinking']";
+  const visibleThinking = !!((turnRoot ? findVisible(turnRoot, thinkingSelector) : null) ||
+    (!turnRoot ? findVisible(document, thinkingSelector) : null));
+  const copyButtons = lastMsg
+    ? Array.from((turnRoot || lastMsg).querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']")).filter((button) => isVisible(button)).length
+    : 0;
+  const lastLen = lastMsg ? (lastMsg.innerText || "").length : 0;
   const sendState = !send ? "missing" : send.disabled ? "disabled" : "enabled";
-  const errEl = document.querySelector("[class*='error-toast'], [data-testid*='error'], [role='alert']");
+  const errEl = findVisible(document, "[class*='error-toast'], [data-testid*='error'], [role='alert']");
   const errText = errEl ? errEl.innerText.substring(0, 100).toLowerCase() : "";
   const markers = ["network error","something went wrong","error generating","attachment failed","upload failed","too many requests"];
   const err = markers.find((marker) => errText.includes(marker)) || "";
-  return `send=${{sendState}}|stop=${{stopGenerating ? 1 : 0}}|thinking=${{thinking ? 1 : 0}}|copy=${{copyButtons}}|msgs=${{msgs.length}}|lastlen=${{lastLen}}|err=${{err}}`;
+  return `send=${{sendState}}|stop=${{stopGenerating ? 1 : 0}}|thinking=${{visibleThinking ? 1 : 0}}|copy=${{copyButtons}}|msgs=${{msgs.length}}|lastlen=${{lastLen}}|err=${{err}}`;
 }}
 "##,
         send_button_selector_json = send_button_selector_json,
         stop_button_selector_json = stop_button_selector_json,
+        composer_selector_json = composer_selector_json,
+        visibility_helpers = JS_VISIBILITY_HELPERS,
+        composer_scope_helpers = JS_COMPOSER_SCOPE_HELPERS,
+        turn_root_helpers = JS_TURN_ROOT_HELPERS,
     )
 }
 
 pub fn build_latest_response_probe_function() -> String {
-    r#"
+    let mut source = String::from(
+        r#"
 () => {
-  const msgs = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
+"#,
+    );
+    source.push_str(JS_VISIBILITY_HELPERS);
+    source.push_str(JS_TURN_ROOT_HELPERS);
+    source.push_str(
+        r#"
+  const cleanMessageText = (msg) => {
+    if (!msg) return "";
+    const clone = msg.cloneNode(true);
+    clone.querySelectorAll("button, [role='button'], input, textarea").forEach((node) => node.remove());
+    return String(clone.textContent || "").replace(/\s+/g, " ").trim();
+  };
+  const msgs = Array.from(document.querySelectorAll("[data-message-author-role='assistant']")).filter((msg) => isVisible(msg));
   const lastMsg = msgs.length > 0 ? msgs[msgs.length - 1] : null;
+  const turnRoot = latestAssistantTurn(lastMsg);
+  const visibleCopyButtons = lastMsg
+    ? Array.from((turnRoot || lastMsg).querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']")).filter((button) => isVisible(button)).length
+    : 0;
   return {
-    response: String(lastMsg?.innerText || "").trim(),
+    response: cleanMessageText(lastMsg),
+    assistantCount: msgs.length,
+    visibleCopyButtons,
   };
 }
-"#
-    .to_string()
+"#,
+    );
+    source
 }
 
-pub fn wrap_function_source_for_json_eval(function_source: &str) -> Result<String> {
+pub(crate) fn wrap_function_source_for_json_eval(function_source: &str) -> Result<String> {
     let function_json = serde_json::to_string(function_source)?;
     Ok(format!(
         r#"(async () => {{
@@ -1166,11 +1417,41 @@ mod tests {
     }
 
     #[test]
-    fn keep_current_chatgpt_model_detects_auto_and_empty_requests() {
+    fn keep_current_chatgpt_model_detects_current_and_empty_requests() {
         assert!(should_keep_current_chatgpt_model(""));
-        assert!(should_keep_current_chatgpt_model("auto"));
-        assert!(should_keep_current_chatgpt_model(" AUTO "));
+        assert!(should_keep_current_chatgpt_model("current"));
+        assert!(should_keep_current_chatgpt_model(" KEEP-CURRENT "));
+        assert!(!should_keep_current_chatgpt_model("auto"));
         assert!(!should_keep_current_chatgpt_model("pro"));
+    }
+
+    #[test]
+    fn chatgpt_model_selection_status_reports_contract_values() {
+        assert_eq!(
+            chatgpt_model_selection_status(&serde_json::json!({"status": "selected"}), "pro"),
+            ChatgptModelSelectionStatus::Selected
+        );
+        assert_eq!(
+            chatgpt_model_selection_status(
+                &serde_json::json!({"status": "already-selected"}),
+                "current"
+            ),
+            ChatgptModelSelectionStatus::KeptCurrent
+        );
+        assert_eq!(
+            chatgpt_model_selection_status(
+                &serde_json::json!({"status": "missing-selector"}),
+                "current"
+            ),
+            ChatgptModelSelectionStatus::Unavailable
+        );
+        assert_eq!(
+            chatgpt_model_selection_status(
+                &serde_json::json!({"status": "selection-mismatch"}),
+                "pro"
+            ),
+            ChatgptModelSelectionStatus::Mismatch
+        );
     }
 
     #[test]
@@ -1289,6 +1570,42 @@ mod tests {
     }
 
     #[test]
+    fn model_selection_function_does_not_confirm_visible_unchecked_pro_with_generic_label() {
+        let visible_unchecked_pro_fixture = r#"
+<button data-testid="model-switcher-dropdown-button">
+  <span data-testid="model-switcher-selected-model">ChatGPT</span>
+</button>
+<div role="menuitemradio" data-testid="model-switcher-gpt-5-4-pro" aria-checked="false">
+  Pro Research-grade intelligence
+</div>
+"#;
+        assert!(visible_unchecked_pro_fixture.contains("aria-checked=\"false\""));
+        assert!(visible_unchecked_pro_fixture.contains(">ChatGPT<"));
+
+        let script = build_model_selection_function("pro");
+        assert!(
+            script.contains("if (targetChecked)"),
+            "model selection must require checked/current menu state, not only selector label text"
+        );
+        assert!(
+            !script.contains("targetChecked || selectorLabelConfirmed"),
+            "selector label text must not confirm model selection without checked/current state"
+        );
+        assert!(
+            !script.contains("reopenedChecked ||"),
+            "reopened selector label text must not confirm model selection without checked/current state"
+        );
+        assert!(
+            !script.contains("trustedTierSelected"),
+            "visible trusted tier menu text must not confirm selection by itself"
+        );
+        assert!(
+            !script.contains("reopenedTrustedTierSelected"),
+            "visible trusted tier menu text must not confirm selection after reopen"
+        );
+    }
+
+    #[test]
     fn model_selection_function_supports_auto_and_explicit_modes() {
         let auto_script = build_model_selection_function("auto");
         assert!(auto_script.contains(r#"const requested = "auto";"#));
@@ -1308,9 +1625,23 @@ mod tests {
         let script = build_attachment_probe_function("bundle.txt").unwrap();
         assert!(script.contains(r#"const fileName = "bundle.txt";"#));
         assert!(script.contains(r#"const fileStem = "bundle";"#));
-        assert!(script.contains(
-            r#"status: visibleEvidence.length > 0 || inputMatched ? "uploading" : "no_match""#
-        ));
+        assert!(script.contains("readinessEvidence"));
+        assert!(script.contains("stableReadyCount"));
+        assert!(script.contains("attachmentFailure"));
+        assert!(script.contains("exactNameMatched"));
+        assert!(script.contains("busyEvidence"));
+    }
+
+    #[test]
+    fn attachment_probe_function_ignores_failure_words_inside_filename() {
+        let script = build_attachment_probe_function("review-failed-cases.md").unwrap();
+        assert!(script.contains(r#"const fileName = "review-failed-cases.md";"#));
+        assert!(script.contains("stripExpectedName"));
+        assert!(script.contains("const failed = failurePattern.test(failureText);"));
+        assert!(
+            !script.contains("failurePattern.test(combined)"),
+            "tile failure matching must not run against text that still includes the filename"
+        );
     }
 
     #[test]
@@ -1327,16 +1658,21 @@ mod tests {
         assert!(send_click.contains("SEND_BUTTON_SELECTOR"));
         assert!(send_click.contains("status: \"sent\""));
         assert!(send_click.contains("status: \"not-ready\""));
+        assert!(send_click.contains("roots: searchRoots"));
+        assert!(send_click.contains("const scope = root === composerForm ? \"form\""));
 
         let dom_probe = build_chatgpt_dom_probe_function();
         assert!(dom_probe.contains("send="));
         assert!(dom_probe.contains("copyButtons"));
         assert!(dom_probe.contains("stopGenerating = !!stopButton && !stopButton.disabled"));
-        assert!(dom_probe.contains("turnRoot.querySelectorAll"));
+        assert!(dom_probe.contains("latestAssistantTurn"));
+        assert!(dom_probe.contains("copyButtons"));
+        assert!(dom_probe.contains("visibleThinking"));
 
         let latest_response = build_latest_response_probe_function();
         assert!(latest_response.contains("data-message-author-role"));
-        assert!(latest_response.contains("response: String"));
+        assert!(latest_response.contains("response: cleanMessageText(lastMsg)"));
+        assert!(latest_response.contains("visibleCopyButtons"));
     }
 
     #[test]
@@ -1370,6 +1706,16 @@ mod tests {
         assert!(timestamp.ends_with('Z'));
         assert_eq!(suffix.len(), 6);
         assert!(suffix.chars().all(|ch| ch.is_ascii_hexdigit()));
+        validate_run_id(&run_id).unwrap();
+    }
+
+    #[test]
+    fn validate_run_id_rejects_url_and_log_injection_characters() {
+        validate_run_id("run:abc.123_ok-9").unwrap();
+        assert!(validate_run_id("").is_err());
+        assert!(validate_run_id("run&evil=1").is_err());
+        assert!(validate_run_id("run\nnext").is_err());
+        assert!(validate_run_id(&"a".repeat(129)).is_err());
     }
 
     #[test]
@@ -1377,6 +1723,10 @@ mod tests {
         assert_eq!(
             mark_chatgpt_url("20260417T071228Z_ab12cd"),
             "https://chatgpt.com/?_yoetz=20260417T071228Z_ab12cd"
+        );
+        assert_eq!(
+            mark_chatgpt_url("run:abc.123"),
+            "https://chatgpt.com/?_yoetz=run%3Aabc.123"
         );
         let script = build_set_window_name_js("20260417T071228Z_ab12cd");
         assert!(script.contains(r#"window.name = "yoetz:20260417T071228Z_ab12cd""#));
@@ -1391,7 +1741,6 @@ mod tests {
     <style>
       body { font-family: sans-serif; }
       .file-tile { border: 1px solid #ccc; padding: 8px; margin-top: 8px; }
-      .hidden-copy { display: none; }
     </style>
   </head>
   <body>
@@ -1418,7 +1767,6 @@ mod tests {
         message.textContent = "Fixture assistant response";
         const copy = document.createElement("button");
         copy.setAttribute("aria-label", "Copy");
-        copy.className = "hidden-copy";
         copy.textContent = "Copy";
         message.appendChild(copy);
         transcript.appendChild(message);

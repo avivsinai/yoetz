@@ -23,6 +23,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{futures::OwnedNotified, Mutex as AsyncMutex, Notify};
 
 use crate::browser::ResolvedCdpTarget;
+#[cfg(test)]
+use crate::chatgpt_recipe;
 use crate::chatgpt_web;
 use crate::chrome_devtools_mcp::{
     self,
@@ -786,6 +788,7 @@ impl TestSessionClient {
             TestRecipeBehavior::Succeed => Ok(ChatgptRunResult {
                 response: "ok".to_string(),
                 model_used: None,
+                model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus::Unavailable,
             }),
             TestRecipeBehavior::Error(message) => Err(anyhow!(message)),
             TestRecipeBehavior::CdpTargetCreateDeniedClosed => {
@@ -807,6 +810,7 @@ impl TestSessionClient {
                 Ok(ChatgptRunResult {
                     response: "ok".to_string(),
                     model_used: None,
+                    model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus::Unavailable,
                 })
             }
         }

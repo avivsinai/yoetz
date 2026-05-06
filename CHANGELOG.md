@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Hardened the ChatGPT Pro browser recipe across live transports: each run now
+  opens and refocuses a run-marked ChatGPT tab, reports
+  `model_selection_status` separately from `model_used`, and avoids automatic
+  fallback after upload/send/wait phases that may already have side effects.
+
+### Fixed
+
+- Replaced the macOS clipboard upload path with composer-scoped file input
+  attachment handling, including stable attachment readiness checks and
+  recipe-controlled `upload_timeout_ms` for both dev-browser and
+  chrome-devtools-mcp transports.
+- Added run-id/manual recovery details to terminal ChatGPT transport errors so
+  interrupted runs can be continued from the yoetz-owned tab without blindly
+  submitting a duplicate request.
+- Tightened ChatGPT model selection verification to require checked/current
+  menu state instead of accepting selector-label text alone, scoped response
+  polling indicators to the active assistant turn, and scales upload timeouts
+  with bundle size for large attachments.
+
+### Security
+
+- Fixed a critical same-machine live-CDP daemon exposure by requiring a private
+  runtime directory, same-user peer credentials, and token-protected RPCs before
+  accepting browser JavaScript execution requests.
+- Prefer `XDG_RUNTIME_DIR` for the live-CDP daemon on Unix and automatically
+  tighten existing owner-matched `~/.yoetz` directories to `0700` during
+  upgrade so the hardened socket and token checks do not reject normal users.
+
 ## [0.3.0] - 2026-05-03
 
 ## [0.2.59] - 2026-05-03

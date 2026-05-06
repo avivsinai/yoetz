@@ -3202,6 +3202,7 @@ dependencies = [
  "headless_chrome",
  "hex",
  "jsonschema",
+ "libc",
  "litellm-rust",
  "predicates",
  "rand",

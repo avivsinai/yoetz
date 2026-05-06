@@ -12,14 +12,13 @@ static TS_FORMAT: &[FormatItem<'static>] =
 
 /// Create a new timestamped session directory under `~/.yoetz/sessions/`.
 pub fn create_session_dir() -> Result<SessionInfo> {
-    let base = session_base_dir();
+    let root = yoetz_root_dir();
+    fs::create_dir_all(&root).with_context(|| format!("create yoetz dir {}", root.display()))?;
+    chmod_owner_only_dir(&root)?;
+
+    let base = root.join("sessions");
     fs::create_dir_all(&base).with_context(|| format!("create sessions dir {}", base.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&base, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod 700 {}", base.display()))?;
-    }
+    chmod_owner_only_dir(&base)?;
 
     let ts = OffsetDateTime::now_utc()
         .format(TS_FORMAT)
@@ -32,24 +31,36 @@ pub fn create_session_dir() -> Result<SessionInfo> {
     let id = format!("{ts}_{rand}");
     let path = base.join(&id);
     fs::create_dir_all(&path).with_context(|| format!("create session {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("chmod 700 {}", path.display()))?;
-    }
+    chmod_owner_only_dir(&path)?;
 
     Ok(SessionInfo { id, path })
 }
 
 pub fn session_base_dir() -> PathBuf {
+    yoetz_root_dir().join("sessions")
+}
+
+fn yoetz_root_dir() -> PathBuf {
     if let Ok(dir) = env::var("YOETZ_DIR") {
-        return PathBuf::from(dir).join("sessions");
+        return PathBuf::from(dir);
     }
     if let Some(home) = home_dir() {
-        return home.join(".yoetz/sessions");
+        return home.join(".yoetz");
     }
-    PathBuf::from(".yoetz/sessions")
+    PathBuf::from(".yoetz")
+}
+
+#[cfg(unix)]
+fn chmod_owner_only_dir(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 700 {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn chmod_owner_only_dir(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 pub fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
