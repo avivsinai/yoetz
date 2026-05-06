@@ -105,6 +105,9 @@ pub struct DevtoolsMcpRecipeContext {
     /// Poll interval for stable-idle response detection, in ms.
     pub response_poll_interval_ms: u64,
 
+    /// Maximum time to wait for file input discovery and attachment readiness.
+    pub upload_timeout_ms: u64,
+
     /// Whether to disable Extended Pro before sending.
     pub disable_extended: bool,
 
@@ -125,6 +128,7 @@ impl Default for DevtoolsMcpRecipeContext {
             run_id: String::new(),
             response_timeout_ms: 1_800_000, // 30 min default for ChatGPT Pro Extended
             response_poll_interval_ms: 30_000,
+            upload_timeout_ms: 120_000,
             disable_extended: false,
             show_approval_guidance: true,
         }

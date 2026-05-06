@@ -60,7 +60,7 @@ fn browser_keeps_destructive_helpers_in_whitelisted_locations() {
     );
     assert!(
         browser_rs.contains(
-            "pub fn close_browser_for_connection(connection: &BrowserConnection) -> Result<()> {\n    if connection.is_live_attach() {\n        return close_live_attach_session();\n    }\n    close_browser_daemon()\n}"
+            "pub fn close_browser_for_connection(connection: &BrowserConnection) -> Result<()> {\n    match connection {\n        BrowserConnection::AutoConnect => return close_live_attach_session(),\n        BrowserConnection::Cdp { run_id, .. } => {\n            let session_name = run_id\n                .as_deref()\n                .map(live_cdp_session_name_for_run)\n                .unwrap_or_else(|| CDP_SESSION_NAME.to_string());\n            return close_live_attach_session_name(&session_name);\n        }\n        BrowserConnection::CookieState { .. } | BrowserConnection::Profile { .. } => {}\n    }\n    close_browser_daemon()\n}"
         ),
         "live-attach close path must stay non-destructive"
     );

@@ -42,12 +42,12 @@ use std::time::Duration;
 
 use super::client::{is_external_create_target_block_error, ChromeCdpClient};
 use super::DevtoolsMcpRecipeContext;
-use crate::chatgpt_web;
+use crate::chatgpt_recipe::AnyhowResultExt;
+use crate::{chatgpt_recipe, chatgpt_web};
 
 /// Stable-idle polling parameters.
 const STABLE_IDLE_CONSECUTIVE_POLLS: u32 = 12;
-const UPLOAD_INPUT_WAIT_MS: u64 = 5_000;
-const ATTACHMENT_VERIFY_WAIT_MS: u64 = 15_000;
+const EAGER_FILE_INPUT_VERIFY_TIMEOUT_MS: u64 = 15_000;
 const WAIT_FOR_COMPOSER_JS_TEMPLATE: &str = r##"
 async () => {
   const focusComposer = __YOETZ_FOCUS_COMPOSER__;
@@ -101,6 +101,13 @@ fn build_wait_for_composer_script(focus_composer: bool) -> String {
 pub struct ChatgptRunResult {
     pub response: String,
     pub model_used: Option<String>,
+    pub model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ModelSelectionOutcome {
+    model_used: Option<String>,
+    model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -328,11 +335,11 @@ async fn run_attached_recipe_inner(
         .context("mark yoetz-owned ChatGPT tab with window.name")?;
 
     // Step 2: wait for the composer to mount, then select the best model the
-    // user can actually access. When `model` is `auto` or empty, prefer the
-    // strongest available Pro/GPT-5 option and fall back to the current model
-    // if the selector UI is unavailable.
+    // user can actually access. `model=auto` actively selects the strongest
+    // visible Pro/GPT-5 option; an empty/current model keeps the current UI
+    // selection.
     wait_for_composer_ready(client, /* focus_composer */ true).await?;
-    let model_used = maybe_select_model(client, &ctx.model).await?;
+    let model_selection = maybe_select_model(client, &ctx.model).await?;
     if ctx.disable_extended {
         maybe_disable_extended(client).await?;
     }
@@ -350,8 +357,9 @@ async fn run_attached_recipe_inner(
         .bundle_path
         .as_ref()
         .context("ChatGPT recipe requires a bundle file path")?;
-    try_upload_bundle(client, bundle_path)
+    try_upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
         .await
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Upload)
         .context("upload bundle to ChatGPT")?;
 
     // Step 4: type the delivery text into the focused composer.
@@ -375,17 +383,20 @@ async fn run_attached_recipe_inner(
     let _ = client
         .evaluate_script(&refocus_js, vec![])
         .await
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send)
         .context("refocus composer after upload")?;
 
     client
         .type_text(&delivery_text, /* submit_key */ None)
         .await
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send)
         .context("type_text into ChatGPT composer")?;
 
     let click_send_js = chatgpt_web::build_send_button_click_function();
     let clicked = client
         .evaluate_script(&click_send_js, vec![])
         .await
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send)
         .context("evaluate_script click send button")?;
     if clicked.get("status").and_then(serde_json::Value::as_str) != Some("sent") {
         return Err(anyhow!(
@@ -394,10 +405,12 @@ async fn run_attached_recipe_inner(
                 .get("diagnostics")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null)
-        ));
+        ))
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send);
     }
-    let response_baseline =
-        parse_response_baseline(&clicked).context("parse ChatGPT response baseline before send")?;
+    let response_baseline = parse_response_baseline(&clicked)
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send)
+        .context("parse ChatGPT response baseline before send")?;
 
     // Step 6: stable-idle polling for response completion.
     //
@@ -418,11 +431,13 @@ async fn run_attached_recipe_inner(
         reconnect_policy,
     )
     .await
+    .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::WaitResponse)
     .context("stable-idle polling for ChatGPT response")?;
 
     Ok(ChatgptRunResult {
         response: response_text,
-        model_used,
+        model_used: model_selection.model_used,
+        model_selection_status: model_selection.model_selection_status,
     })
 }
 
@@ -722,7 +737,7 @@ fn should_retry_wait_for_composer_error(err: &anyhow::Error) -> bool {
 async fn maybe_select_model(
     client: &ChromeCdpClient,
     requested_model: &str,
-) -> Result<Option<String>> {
+) -> Result<ModelSelectionOutcome> {
     let keep_current_model = chatgpt_web::should_keep_current_chatgpt_model(requested_model);
     let script = build_model_selection_script(requested_model);
     let selection = client
@@ -737,9 +752,17 @@ async fn maybe_select_model(
         "phase=select-model status={status} payload={selection}"
     ));
     let model_used = chatgpt_web::select_reported_chatgpt_model(&selection, requested_model);
+    let model_selection_status =
+        chatgpt_web::chatgpt_model_selection_status(&selection, requested_model);
     match status {
-        "selected" | "already-selected" => Ok(model_used),
-        "missing-selector" | "not-found" if keep_current_model => Ok(model_used),
+        "selected" | "already-selected" => Ok(ModelSelectionOutcome {
+            model_used,
+            model_selection_status,
+        }),
+        "missing-selector" | "not-found" if keep_current_model => Ok(ModelSelectionOutcome {
+            model_used,
+            model_selection_status,
+        }),
         "missing-selector" => Err(anyhow!(
             "ChatGPT model selector button not found. {}",
             format_page_probe_summary(&selection)
@@ -1109,16 +1132,30 @@ fn format_page_probe_summary(state: &serde_json::Value) -> String {
 /// `upload_file`. `upload_file` accepts either the file input itself or the
 /// element that opens the file chooser, so prefer visible menu items/buttons
 /// over guessing a hidden input uid.
-async fn try_upload_bundle(client: &ChromeCdpClient, bundle_path: &std::path::Path) -> Result<()> {
+async fn try_upload_bundle(
+    client: &ChromeCdpClient,
+    bundle_path: &std::path::Path,
+    upload_timeout_ms: u64,
+) -> Result<()> {
+    let deadline = std::time::Instant::now() + Duration::from_millis(upload_timeout_ms);
     let file_name = bundle_path
         .file_name()
         .and_then(|value| value.to_str())
         .map(ToOwned::to_owned)
         .context("bundle path must end in a UTF-8 filename")?;
 
-    if try_upload_via_file_input(client, bundle_path, &file_name)
-        .await
-        .context("eager file input upload")?
+    // Fast path: 0ms input wait falls through to click flow if no input, but
+    // once an input is found and upload_file runs we still need real verify time.
+    let (input_wait_ms, verify_timeout_ms) = eager_file_input_upload_timeouts();
+    if try_upload_via_file_input(
+        client,
+        bundle_path,
+        &file_name,
+        input_wait_ms,
+        verify_timeout_ms,
+    )
+    .await
+    .context("eager file input upload")?
     {
         return Ok(());
     }
@@ -1159,7 +1196,12 @@ async fn try_upload_bundle(client: &ChromeCdpClient, bundle_path: &std::path::Pa
         attempts.push(format!("clicked candidate: {label}"));
         tokio::time::sleep(Duration::from_millis(300)).await;
 
-        if try_upload_via_file_input(client, bundle_path, &file_name)
+        let remaining_ms = remaining_upload_timeout_ms(deadline);
+        if remaining_ms == 0 {
+            attempts.push("upload deadline exhausted before file input wait".to_string());
+            break;
+        }
+        if try_upload_via_file_input(client, bundle_path, &file_name, remaining_ms, remaining_ms)
             .await
             .with_context(|| format!("upload after clicking {label}"))?
         {
@@ -1172,9 +1214,20 @@ async fn try_upload_bundle(client: &ChromeCdpClient, bundle_path: &std::path::Pa
         if menu_clicked {
             attempts.push(format!("clicked upload menu after: {label}"));
             tokio::time::sleep(Duration::from_millis(300)).await;
-            if try_upload_via_file_input(client, bundle_path, &file_name)
-                .await
-                .with_context(|| format!("upload after upload menu from {label}"))?
+            let remaining_ms = remaining_upload_timeout_ms(deadline);
+            if remaining_ms == 0 {
+                attempts.push("upload deadline exhausted before upload-menu wait".to_string());
+                break;
+            }
+            if try_upload_via_file_input(
+                client,
+                bundle_path,
+                &file_name,
+                remaining_ms,
+                remaining_ms,
+            )
+            .await
+            .with_context(|| format!("upload after upload menu from {label}"))?
             {
                 return Ok(());
             }
@@ -1192,12 +1245,25 @@ async fn try_upload_bundle(client: &ChromeCdpClient, bundle_path: &std::path::Pa
     ))
 }
 
+fn remaining_upload_timeout_ms(deadline: std::time::Instant) -> u64 {
+    deadline
+        .saturating_duration_since(std::time::Instant::now())
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn eager_file_input_upload_timeouts() -> (u64, u64) {
+    (0, EAGER_FILE_INPUT_VERIFY_TIMEOUT_MS)
+}
+
 async fn try_upload_via_file_input(
     client: &ChromeCdpClient,
     bundle_path: &std::path::Path,
     file_name: &str,
+    input_wait_timeout_ms: u64,
+    attachment_verify_timeout_ms: u64,
 ) -> Result<bool> {
-    let input_uid = wait_for_file_input_uid(client, UPLOAD_INPUT_WAIT_MS)
+    let input_uid = wait_for_file_input_uid(client, input_wait_timeout_ms)
         .await
         .context("wait for file input")?;
 
@@ -1210,7 +1276,7 @@ async fn try_upload_via_file_input(
         .await
         .with_context(|| format!("upload_file via input `{input_uid}`"))?;
 
-    wait_for_attachment_visible(client, file_name)
+    wait_for_attachment_visible(client, file_name, attachment_verify_timeout_ms)
         .await
         .with_context(|| format!("verify attachment chip for `{file_name}`"))?;
 
@@ -1421,8 +1487,12 @@ fn format_upload_diagnostics(diagnostics: &serde_json::Value) -> String {
     serde_json::to_string_pretty(diagnostics).unwrap_or_else(|_| diagnostics.to_string())
 }
 
-async fn wait_for_attachment_visible(client: &ChromeCdpClient, file_name: &str) -> Result<()> {
-    let script = build_wait_for_attachment_visible_script(file_name)?;
+async fn wait_for_attachment_visible(
+    client: &ChromeCdpClient,
+    file_name: &str,
+    upload_timeout_ms: u64,
+) -> Result<()> {
+    let script = build_wait_for_attachment_visible_script(file_name, upload_timeout_ms)?;
     let evidence = client
         .evaluate_script(&script, vec![])
         .await
@@ -1437,25 +1507,35 @@ async fn wait_for_attachment_visible(client: &ChromeCdpClient, file_name: &str) 
     ))
 }
 
-fn build_wait_for_attachment_visible_script(file_name: &str) -> Result<String> {
+fn build_wait_for_attachment_visible_script(
+    file_name: &str,
+    upload_timeout_ms: u64,
+) -> Result<String> {
     let probe_function_json =
         serde_json::to_string(&chatgpt_web::build_attachment_probe_function(file_name)?)?;
     Ok(format!(
         r##"
 async () => {{
   const probe = eval("(" + {probe_function_json} + ")");
-  const deadline = Date.now() + {ATTACHMENT_VERIFY_WAIT_MS};
+  const stableEnough = (state) => state?.ok && Number(state?.stableReadyCount || 0) >= {upload_stable_polls};
+  const deadline = Date.now() + {upload_timeout_ms};
   while (Date.now() < deadline) {{
     const state = probe();
-    if (state?.ok) {{
+    if (stableEnough(state) || state?.status === "failed") {{
       return state;
     }}
     await new Promise((resolve) => setTimeout(resolve, 250));
   }}
-  return probe();
+  const finalState = probe();
+  if (finalState?.ok && !stableEnough(finalState)) {{
+    return {{ ...finalState, ok: false, status: "uploading", stableReady: false }};
+  }}
+  return finalState;
 }}
 "##,
         probe_function_json = probe_function_json,
+        upload_timeout_ms = upload_timeout_ms,
+        upload_stable_polls = chatgpt_web::CHATGPT_UPLOAD_STABLE_POLLS,
     ))
 }
 
@@ -1618,19 +1698,19 @@ fn response_poll_state_script() -> String {
     let stop_button_selector_json = chatgpt_web::stop_button_selector_json();
     format!(
         r##"
-() => {{
-  const nodes = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
-  const send = Array.from(document.querySelectorAll({send_button_selector_json})).find((button) => {{
-    const rect = button.getBoundingClientRect();
-    const style = window.getComputedStyle(button);
-    return rect.width > 0 &&
-      rect.height > 0 &&
-      style.visibility !== "hidden" &&
-      style.display !== "none";
-  }}) || null;
-  const stopButton = document.querySelector({stop_button_selector_json});
+  () => {{
+{visibility_helpers}
+{turn_root_helpers}
+    const nodes = Array.from(document.querySelectorAll("[data-message-author-role='assistant']"));
+  const send = findVisible(document, {send_button_selector_json});
+  const last = nodes.length > 0 ? nodes[nodes.length - 1] : null;
+  const turnRoot = latestAssistantTurn(last);
+  const stopButton = (turnRoot ? findVisible(turnRoot, {stop_button_selector_json}) : null) ||
+    (!turnRoot ? findVisible(document, {stop_button_selector_json}) : null);
   const stopGenerating = !!stopButton && !stopButton.disabled;
-  const thinking = document.querySelector(".result-thinking, [data-testid*='thinking'], [class*='thinking']");
+  const thinkingSelector = ".result-thinking, [data-testid*='thinking'], [class*='thinking']";
+  const thinking = (turnRoot ? findVisible(turnRoot, thinkingSelector) : null) ||
+    (!turnRoot ? findVisible(document, thinkingSelector) : null);
   if (nodes.length === 0) {{
     return {{
       ready: false,
@@ -1645,13 +1725,8 @@ fn response_poll_state_script() -> String {
       error: "",
     }};
   }}
-  const last = nodes[nodes.length - 1];
-  const turnRoot =
-    last.closest(".agent-turn, [class*='agent-turn'], [class*='turn-messages']") ||
-    last.parentElement?.parentElement ||
-    last.parentElement ||
-    document;
-  const copyButtons = turnRoot.querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']").length;
+  const copyRoot = turnRoot || last.parentElement || document;
+  const copyButtons = copyRoot.querySelectorAll("button[aria-label*='Copy'], button[data-testid*='copy']").length;
   const errEl = document.querySelector('[class*="error-toast"], [data-testid*="error"], [role="alert"]');
   const errText = errEl ? (errEl.innerText || "").substring(0, 100).toLowerCase() : "";
   const markers = ["network error","something went wrong","error generating","attachment failed","upload failed","too many requests"];
@@ -1673,9 +1748,11 @@ fn response_poll_state_script() -> String {
     error,
   }};
 }}
-"##,
+  "##,
         send_button_selector_json = send_button_selector_json,
         stop_button_selector_json = stop_button_selector_json,
+        visibility_helpers = chatgpt_web::JS_VISIBILITY_HELPERS,
+        turn_root_helpers = chatgpt_web::JS_TURN_ROOT_HELPERS,
     )
 }
 
@@ -1806,6 +1883,16 @@ mod tests {
         assert!(chatgpt_web::STABLE_IDLE_INTERVAL_MULTIPLIER >= 2);
         assert!(!chatgpt_web::CHATGPT_URL.is_empty());
     };
+
+    #[test]
+    fn eager_file_input_upload_keeps_verify_slack_after_zero_wait_probe() {
+        let (input_wait_ms, verify_timeout_ms) = eager_file_input_upload_timeouts();
+        assert_eq!(input_wait_ms, 0);
+        assert!(
+            verify_timeout_ms >= 5_000,
+            "finding an eager file input must not upload and then verify with a 0ms deadline"
+        );
+    }
 
     fn lock_env() -> MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -2198,9 +2285,11 @@ mod tests {
 
     #[test]
     fn attachment_visibility_script_matches_file_name_variable() {
-        let script = build_wait_for_attachment_visible_script("bundle.txt").unwrap();
+        let script = build_wait_for_attachment_visible_script("bundle.txt", 180_000).unwrap();
         assert!(script.contains("name === fileName"));
-        assert!(!script.contains("exactName"));
+        assert!(script.contains("exactNameMatched"));
+        assert!(script.contains("stableReadyCount"));
+        assert!(script.contains("Date.now() + 180000"));
     }
 
     #[test]
@@ -2213,7 +2302,9 @@ mod tests {
     #[test]
     fn response_poll_script_looks_for_copy_buttons_on_turn_root() {
         let script = response_poll_state_script();
-        assert!(script.contains("last.closest(\".agent-turn"));
-        assert!(script.contains("turnRoot.querySelectorAll"));
+        assert!(script.contains("latestAssistantTurn"));
+        assert!(script.contains("const copyRoot = turnRoot || last.parentElement || document;"));
+        assert!(script.contains("copyRoot.querySelectorAll"));
+        assert!(script.contains("findVisible(turnRoot,"));
     }
 }

@@ -21,6 +21,14 @@ import vm from "node:vm";
 import { EventEmitter } from "node:events";
 var LIVE_CDP_BROWSER_INIT_TIMEOUT_MS = 5e3;
 var LIVE_CDP_TARGET_INIT_TIMEOUT_MS = 5e3;
+var INPUT_FILE_DIAGNOSTIC_LIMIT = 10;
+var LiveCdpSetInputFilesError = class extends Error {
+  constructor(message, details) {
+    super(`${message} ${formatSetInputFilesErrorDetails(details)}`);
+    this.details = details;
+    this.name = "LiveCdpSetInputFilesError";
+  }
+};
 var WebSocketLiveCdpTransport = class _WebSocketLiveCdpTransport {
   constructor(socket) {
     this.socket = socket;
@@ -735,29 +743,83 @@ var LiveCdpPage = class extends EventEmitter {
   }
   async setInputFiles(selector, files) {
     const fileList = Array.isArray(files) ? files : [files];
+    const scopedMarkerRequirements = findScopedMarkerRequirements(selector);
+    const scopedMarkers = scopedMarkerRequirements.map((marker) => marker.description);
     await this.sendSession("DOM.enable", {}).catch(() => {
     });
     const documentResult = await this.sendSession("DOM.getDocument", {
-      depth: -1,
-      pierce: true
+      depth: 0,
+      pierce: false
     });
     const root = documentResult.root;
     const nodeId = typeof root?.nodeId === "number" ? root.nodeId : void 0;
     if (nodeId === void 0) {
       throw new Error("DOM.getDocument did not return a root node");
     }
-    const queryResult = await this.sendSession("DOM.querySelector", {
+    const queryResult = await this.sendSession("DOM.querySelectorAll", {
       nodeId,
       selector
     });
-    const inputNodeId = typeof queryResult.nodeId === "number" ? queryResult.nodeId : void 0;
-    if (!inputNodeId) {
-      throw new Error(`No file input found for selector "${selector}"`);
+    const inputNodeIds = Array.isArray(queryResult.nodeIds) ? queryResult.nodeIds.filter((candidate) => typeof candidate === "number") : [];
+    const baseDetails = (diagnostics, diagnosticsTruncated = false) => ({
+      selector,
+      fileCount: fileList.length,
+      matchCount: inputNodeIds.length,
+      targetId: this.targetId,
+      url: this.#url,
+      scopedMarkers,
+      diagnostics,
+      diagnosticsTruncated
+    });
+    if (inputNodeIds.length === 0) {
+      throw new LiveCdpSetInputFilesError(
+        `No file input found for selector "${selector}"`,
+        baseDetails([])
+      );
+    }
+    let selectedNode;
+    let selectedViaScopedMarker = false;
+    if (inputNodeIds.length === 1) {
+      selectedNode = await describeInputFileCandidate(this, inputNodeIds[0]);
+    } else {
+      const shouldInspectAllMatches = scopedMarkerRequirements.length > 0;
+      const inspectedNodeIds = shouldInspectAllMatches ? inputNodeIds : inputNodeIds.slice(0, INPUT_FILE_DIAGNOSTIC_LIMIT);
+      const diagnostics = await Promise.all(
+        inspectedNodeIds.map((candidateNodeId) => describeInputFileCandidate(this, candidateNodeId))
+      );
+      const scopedMarkerMatches = diagnostics.filter(
+        (diagnostic) => matchesAnyScopedMarker(diagnostic, scopedMarkerRequirements)
+      );
+      if (scopedMarkerMatches.length === 1) {
+        selectedNode = scopedMarkerMatches[0];
+        selectedViaScopedMarker = true;
+      } else {
+        throw new LiveCdpSetInputFilesError(
+          `Ambiguous file input selector "${selector}" matched ${inputNodeIds.length} nodes`,
+          baseDetails(diagnostics, inspectedNodeIds.length < inputNodeIds.length)
+        );
+      }
+    }
+    if (!isFileInputDiagnostic(selectedNode)) {
+      throw new LiveCdpSetInputFilesError(
+        `Selector "${selector}" resolved to ${selectedNode.selectorHint}, not an input[type=file]`,
+        baseDetails([selectedNode])
+      );
     }
     await this.sendSession("DOM.setFileInputFiles", {
-      nodeId: inputNodeId,
+      nodeId: selectedNode.nodeId,
       files: fileList
     });
+    return {
+      selector,
+      fileCount: fileList.length,
+      matchCount: inputNodeIds.length,
+      targetId: this.targetId,
+      url: this.#url,
+      selectedNode,
+      selectedViaScopedMarker,
+      scopedMarkers
+    };
   }
   async screenshot(options = {}) {
     const params = {
@@ -1102,6 +1164,132 @@ function normalizeLocatorDescriptor(descriptor) {
     index: descriptor.index ?? null,
     hasText: descriptor.hasText ?? null
   };
+}
+async function describeInputFileCandidate(page, nodeId) {
+  const describeResult = await page.sendSession("DOM.describeNode", {
+    nodeId,
+    depth: 0,
+    pierce: false
+  });
+  const node = typeof describeResult.node === "object" && describeResult.node !== null ? describeResult.node : void 0;
+  const attributes = readDomAttributes(node?.attributes);
+  const nodeName = typeof node?.nodeName === "string" ? node.nodeName : void 0;
+  const localName = typeof node?.localName === "string" ? node.localName : void 0;
+  return {
+    nodeId: typeof node?.nodeId === "number" ? node.nodeId : nodeId,
+    backendNodeId: typeof node?.backendNodeId === "number" ? node.backendNodeId : void 0,
+    nodeName,
+    localName,
+    attributes,
+    selectorHint: buildInputFileSelectorHint(localName ?? nodeName, attributes)
+  };
+}
+function readDomAttributes(attributes) {
+  if (!Array.isArray(attributes)) {
+    return {};
+  }
+  const result = {};
+  for (let index = 0; index + 1 < attributes.length; index += 2) {
+    const name = attributes[index];
+    const value = attributes[index + 1];
+    if (typeof name === "string" && typeof value === "string") {
+      result[name.toLowerCase()] = value;
+    }
+  }
+  return result;
+}
+function buildInputFileSelectorHint(rawName, attributes) {
+  const tagName = rawName ? rawName.toLowerCase() : "node";
+  const parts = [tagName];
+  if (attributes.id) {
+    parts.push(`#${truncateDiagnosticValue(attributes.id, 60)}`);
+  }
+  const interestingAttributes = [
+    "type",
+    "name",
+    "title",
+    "accept",
+    "multiple",
+    "aria-label",
+    "data-testid",
+    ...Object.keys(attributes).filter((attributeName) => attributeName.startsWith("data-yoetz-")).sort()
+  ];
+  const seen = /* @__PURE__ */ new Set();
+  for (const attributeName of interestingAttributes) {
+    if (seen.has(attributeName) || !(attributeName in attributes)) {
+      continue;
+    }
+    seen.add(attributeName);
+    const value = attributes[attributeName];
+    if (value === "") {
+      parts.push(`[${attributeName}]`);
+    } else {
+      parts.push(`[${attributeName}=${JSON.stringify(truncateDiagnosticValue(value, 80))}]`);
+    }
+  }
+  return parts.join("");
+}
+function isFileInputDiagnostic(diagnostic) {
+  const tagName = (diagnostic.localName ?? diagnostic.nodeName ?? "").toLowerCase();
+  return tagName === "input" && diagnostic.attributes.type?.toLowerCase() === "file";
+}
+function findScopedMarkerRequirements(selector) {
+  const markers = [];
+  const attributePattern = /\[\s*([a-zA-Z_][-\w:.]*)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\]\s]+))\s*\]/g;
+  for (const match of selector.matchAll(attributePattern)) {
+    const attributeName = match[1].toLowerCase();
+    const value = match[2] ?? match[3] ?? match[4] ?? "";
+    if (!isScopedMarkerAttribute(attributeName, value)) {
+      continue;
+    }
+    markers.push({
+      attributeName,
+      value,
+      description: `${attributeName}=${JSON.stringify(value)}`
+    });
+  }
+  return markers;
+}
+function isScopedMarkerAttribute(attributeName, value) {
+  if (attributeName.startsWith("data-yoetz-")) {
+    return value.length > 0;
+  }
+  return attributeName === "title" && value.startsWith("yoetz-");
+}
+function matchesAnyScopedMarker(diagnostic, requirements) {
+  return requirements.some(
+    (requirement) => diagnostic.attributes[requirement.attributeName] === requirement.value
+  );
+}
+function formatSetInputFilesErrorDetails(details) {
+  const parts = [
+    `matches=${details.matchCount}`,
+    `files=${details.fileCount}`,
+    `target=${details.targetId}`
+  ];
+  if (details.url) {
+    parts.push(`url=${JSON.stringify(truncateDiagnosticValue(details.url, 120))}`);
+  }
+  if (details.scopedMarkers.length > 0) {
+    parts.push(`scopedMarkers=[${details.scopedMarkers.join(", ")}]`);
+  }
+  if (details.diagnostics.length > 0) {
+    const candidates = details.diagnostics.map(formatInputFileCandidateDiagnostic).join("; ");
+    parts.push(
+      `candidates=[${candidates}${details.diagnosticsTruncated ? "; ..." : ""}]`
+    );
+  }
+  return `(${parts.join(", ")})`;
+}
+function formatInputFileCandidateDiagnostic(diagnostic) {
+  const backend = diagnostic.backendNodeId === void 0 ? "" : ` backendNodeId=${diagnostic.backendNodeId}`;
+  return `nodeId=${diagnostic.nodeId}${backend} ${diagnostic.selectorHint}`;
+}
+function truncateDiagnosticValue(value, maxLength) {
+  if (value.length <= maxLength) {
+    return value;
+  }
+  return `${value.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 function compareTargetAttachPriority(left, right) {
   const leftIsYoetz = isYoetzTarget(left);
