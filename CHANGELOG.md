@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-05-07
 ### Changed
 
 - Hardened the ChatGPT Pro browser recipe across live transports: each run now
@@ -38,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Prefer `XDG_RUNTIME_DIR` for the live-CDP daemon on Unix and automatically
   tighten existing owner-matched `~/.yoetz` directories to `0700` during
   upgrade so the hardened socket and token checks do not reject normal users.
+
 
 ## [0.3.0] - 2026-05-03
 
