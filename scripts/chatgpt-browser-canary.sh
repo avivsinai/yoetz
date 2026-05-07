@@ -44,8 +44,8 @@ echo "==> running live ChatGPT browser canary via ${yoetz_bin}"
 result="$("${yoetz_bin}" browser recipe \
   --recipe chatgpt \
   --bundle "${bundle_path}" \
-  "${cdp_args[@]}" \
-  "${profile_args[@]}" \
+  ${cdp_args[@]+"${cdp_args[@]}"} \
+  ${profile_args[@]+"${profile_args[@]}"} \
   --var model=pro \
   --var wait_timeout_ms="${YOETZ_CHATGPT_WAIT_TIMEOUT_MS:-2400000}" \
   --format json)"

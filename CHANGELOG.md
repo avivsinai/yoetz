@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   menu state instead of accepting selector-label text alone, scoped response
   polling indicators to the active assistant turn, and scales upload timeouts
   with bundle size for large attachments.
+- Fixed the live ChatGPT browser canary on macOS bash 3.2 and made explicit
+  ChatGPT model selection wait briefly for the selector button on fresh tabs.
 
 ### Security
 

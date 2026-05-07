@@ -512,7 +512,21 @@ async () => {{
       )
       .map(({{ item }}) => item)[0] || null;
   const findSelectorButton = () => document.querySelector(MODEL_BUTTON_SELECTOR);
-  const selectorButton = findSelectorButton();
+  const requestedTrimmed = normalize(requested);
+  const requestedLower = requestedTrimmed.toLowerCase();
+  const keepCurrentMode = !requestedTrimmed || requestedLower === "current" || requestedLower === "keep-current";
+  const autoMode = requestedLower === "auto";
+  const requestedGenericTier = deriveRequestedTier(requestedLower);
+  const waitForSelectorButton = async () => {{
+    let button = findSelectorButton();
+    if (button || keepCurrentMode) return button;
+    for (let attempt = 0; attempt < 5 && !button; attempt += 1) {{
+      await wait(1000);
+      button = findSelectorButton();
+    }}
+    return button;
+  }};
+  const selectorButton = await waitForSelectorButton();
   const currentLabel = normalize(
     selectorButton?.querySelector?.("[data-testid='selected-model'], [data-testid='model-switcher-selected-model']")?.textContent ||
     selectorButton?.innerText ||
@@ -527,11 +541,6 @@ async () => {{
     title: document.title || "",
     bodyText: normalize(document.body?.innerText || "").slice(0, 240),
   }};
-  const requestedTrimmed = normalize(requested);
-  const requestedLower = requestedTrimmed.toLowerCase();
-  const keepCurrentMode = !requestedTrimmed || requestedLower === "current" || requestedLower === "keep-current";
-  const autoMode = requestedLower === "auto";
-  const requestedGenericTier = deriveRequestedTier(requestedLower);
 
   if (keepCurrentMode) {{
     return {{
@@ -1530,6 +1539,19 @@ mod tests {
             script.contains("let verifyConfirmed = false;"),
             "verify confirmation flag missing"
         );
+    }
+
+    #[test]
+    fn model_selection_function_waits_for_selector_button_before_failing() {
+        // Fresh ChatGPT tabs can render the shell before the model selector
+        // exists in the React tree. Explicit model selection should wait
+        // briefly for that button instead of failing on the first probe.
+        let script = build_model_selection_function("pro");
+        assert!(script.contains("const waitForSelectorButton = async () =>"));
+        assert!(script.contains("attempt < 5 && !button"));
+        assert!(script.contains("await wait(1000);"));
+        assert!(script.contains("if (button || keepCurrentMode) return button;"));
+        assert!(script.contains("const selectorButton = await waitForSelectorButton();"));
     }
 
     #[test]
