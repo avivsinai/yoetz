@@ -3056,16 +3056,16 @@ mod tests {
     #[test]
     fn infer_email_hints_extracts_emails_from_titles_and_urls() {
         let hints = infer_email_hints(
-            "Inbox (6,096) - aviv.s@taboola.com - Taboola Mail",
+            "Inbox (6,096) - work@example.com - Work Mail",
             "https://mail.google.com/mail/u/0/#inbox",
         );
-        assert_eq!(hints, vec!["aviv.s@taboola.com".to_string()]);
+        assert_eq!(hints, vec!["work@example.com".to_string()]);
 
         let from_url = infer_email_hints(
             "Account chooser",
-            "https://accounts.google.com/AccountChooser?Email=avivsinai@gmail.com",
+            "https://accounts.google.com/AccountChooser?Email=personal@example.com",
         );
-        assert_eq!(from_url, vec!["avivsinai@gmail.com".to_string()]);
+        assert_eq!(from_url, vec!["personal@example.com".to_string()]);
     }
 
     #[test]
@@ -3073,7 +3073,7 @@ mod tests {
         let contexts = summarize_browser_contexts(&[
             BrowserContextPage {
                 browser_context_id: Some("ctx-personal".to_string()),
-                title: "Inbox (43,617) - avivsinai@gmail.com - Gmail".to_string(),
+                title: "Inbox (43,617) - personal@example.com - Gmail".to_string(),
                 url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
             },
             BrowserContextPage {
@@ -3083,7 +3083,7 @@ mod tests {
             },
             BrowserContextPage {
                 browser_context_id: Some("ctx-work".to_string()),
-                title: "Inbox (6,096) - aviv.s@taboola.com - Taboola Mail".to_string(),
+                title: "Inbox (6,096) - work@example.com - Work Mail".to_string(),
                 url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
             },
         ]);
@@ -3091,12 +3091,12 @@ mod tests {
         assert_eq!(contexts.len(), 2);
         assert!(contexts.iter().any(|context| {
             context.id.as_deref() == Some("ctx-personal")
-                && context.inferred_emails == vec!["avivsinai@gmail.com".to_string()]
+                && context.inferred_emails == vec!["personal@example.com".to_string()]
                 && context.chatgpt_tab_count == 1
         }));
         assert!(contexts.iter().any(|context| {
             context.id.as_deref() == Some("ctx-work")
-                && context.inferred_emails == vec!["aviv.s@taboola.com".to_string()]
+                && context.inferred_emails == vec!["work@example.com".to_string()]
                 && context.chatgpt_tab_count == 0
         }));
     }
@@ -3106,7 +3106,7 @@ mod tests {
         let page = browser_context_page_from_target_info(TargetInfo {
             target_id: "target-1".to_string(),
             Type: "page".to_string(),
-            title: "Inbox (43,617) - avivsinai@gmail.com - Gmail".to_string(),
+            title: "Inbox (43,617) - personal@example.com - Gmail".to_string(),
             url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
             attached: false,
             opener_id: None,
@@ -3118,7 +3118,7 @@ mod tests {
         });
 
         assert_eq!(page.browser_context_id.as_deref(), Some("ctx-personal"));
-        assert_eq!(page.title, "Inbox (43,617) - avivsinai@gmail.com - Gmail");
+        assert_eq!(page.title, "Inbox (43,617) - personal@example.com - Gmail");
         assert_eq!(page.url, "https://mail.google.com/mail/u/0/#inbox");
     }
 
@@ -3134,18 +3134,18 @@ mod tests {
         }
         let rendered = render_browser_contexts_for_error(&[BrowserContextSummary {
             id: Some("ctx-work".to_string()),
-            inferred_emails: vec!["aviv.s@taboola.com".to_string()],
+            inferred_emails: vec!["work@example.com".to_string()],
             chatgpt_tab_count: 1,
             page_target_count: 3,
-            sample_tabs: vec!["Taboola Mail".to_string(), "ChatGPT".to_string()],
+            sample_tabs: vec!["Work Mail".to_string(), "ChatGPT".to_string()],
         }]);
         assert!(rendered.contains("ctx-work"));
         assert!(
-            !rendered.contains("aviv.s@taboola.com"),
+            !rendered.contains("work@example.com"),
             "default error rendering must not leak inferred emails; got: {rendered}"
         );
         assert!(
-            !rendered.contains("Taboola Mail"),
+            !rendered.contains("Work Mail"),
             "default error rendering must not leak sample tab titles; got: {rendered}"
         );
         assert!(rendered.contains("1 inferred"));
@@ -3170,14 +3170,14 @@ mod tests {
         }
         let rendered = render_browser_contexts_for_error(&[BrowserContextSummary {
             id: Some("ctx-work".to_string()),
-            inferred_emails: vec!["aviv.s@taboola.com".to_string()],
+            inferred_emails: vec!["work@example.com".to_string()],
             chatgpt_tab_count: 1,
             page_target_count: 3,
-            sample_tabs: vec!["Taboola Mail".to_string(), "ChatGPT".to_string()],
+            sample_tabs: vec!["Work Mail".to_string(), "ChatGPT".to_string()],
         }]);
         assert!(rendered.contains("ctx-work"));
-        assert!(rendered.contains("aviv.s@taboola.com"));
-        assert!(rendered.contains("Taboola Mail"));
+        assert!(rendered.contains("work@example.com"));
+        assert!(rendered.contains("Work Mail"));
         match previous {
             Some(value) => {
                 #[allow(unsafe_code)]
@@ -3489,10 +3489,10 @@ mod tests {
     #[test]
     fn build_window_open_expression_serializes_url() {
         let expression =
-            build_window_open_expression("https://chatgpt.com/?q=taboola&note=\"pro\"").unwrap();
+            build_window_open_expression("https://chatgpt.com/?q=example&note=\"pro\"").unwrap();
         assert_eq!(
             expression,
-            "window.open(\"https://chatgpt.com/?q=taboola&note=\\\"pro\\\"\", '_blank');"
+            "window.open(\"https://chatgpt.com/?q=example&note=\\\"pro\\\"\", '_blank');"
         );
     }
 

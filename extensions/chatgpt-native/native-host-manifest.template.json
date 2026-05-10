@@ -1,0 +1,9 @@
+{
+  "name": "com.yoetz.chatgpt_native",
+  "description": "Yoetz ChatGPT native messaging host",
+  "path": "{{YOETZ_BINARY}}",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://njdakhppfigmloihiikbjmheejfndbfa/"
+  ]
+}

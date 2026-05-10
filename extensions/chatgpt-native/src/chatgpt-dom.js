@@ -1,0 +1,1406 @@
+export const YOETZ_WINDOW_PREFIX = "yoetz-chatgpt-native:";
+export const OWNERSHIP_ATTR = "data-yoetz-chatgpt-native-job";
+const DEFAULT_WAIT_TIMEOUT_MS = 15000;
+const DEFAULT_WAIT_INTERVAL_MS = 250;
+const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
+
+export function ownedWindowName(job) {
+  return `${YOETZ_WINDOW_PREFIX}${job.run_id}:${job.job_id}`;
+}
+
+export function parseOwnedWindowName(value) {
+  if (typeof value !== "string" || !value.startsWith(YOETZ_WINDOW_PREFIX)) {
+    return null;
+  }
+  const rest = value.slice(YOETZ_WINDOW_PREFIX.length);
+  const separator = rest.lastIndexOf(":");
+  if (separator <= 0 || separator === rest.length - 1) {
+    return null;
+  }
+  return {
+    run_id: rest.slice(0, separator),
+    job_id: rest.slice(separator + 1)
+  };
+}
+
+export function chatgptJobUrl(runId) {
+  const url = new URL("https://chatgpt.com/");
+  url.searchParams.set("_yoetz", runId);
+  return url.toString();
+}
+
+export function classifyManualHandoff({ url = "", title = "", text = "" } = {}) {
+  const haystack = `${url}\n${title}\n${text}`.toLowerCase();
+  if (/\/auth\/login|log in|sign in/.test(haystack)) {
+    return {
+      state: "login_required",
+      message: "ChatGPT login required in this Chrome profile"
+    };
+  }
+  if (/captcha|cloudflare|verify you are human|security check/.test(haystack)) {
+    return {
+      state: "challenge_required",
+      message: "ChatGPT requires manual challenge completion"
+    };
+  }
+  if (/rate limit|too many requests|try again later/.test(haystack)) {
+    return {
+      state: "rate_limited",
+      message: "ChatGPT is rate limited"
+    };
+  }
+  return null;
+}
+
+export function findComposer(root = document) {
+  return firstVisible(root, [
+    "#prompt-textarea",
+    'div[contenteditable="true"][role="textbox"]',
+    'textarea[placeholder*="Message"]',
+    'textarea[data-testid*="composer"]',
+    'textarea',
+    'div[contenteditable="true"][data-testid*="composer"]',
+    'div[contenteditable="true"]'
+  ]);
+}
+
+export function findFileInput(root = document) {
+  return findFileInputControl(root, { allowHidden: true });
+}
+
+function findFileInputControl(root = document, options = {}) {
+  return firstInComposerScopes(root, [
+    'input[type="file"][accept*="text"]',
+    'input[type="file"]'
+  ], options);
+}
+
+export function findSendButton(root = document) {
+  return findSendButtonControl(root, { requireEnabled: true });
+}
+
+export function findModelButton(root = document) {
+  return firstVisible(root, [
+    'button[data-testid="model-switcher-dropdown-button"]',
+    'button:has([data-testid="selected-model"])',
+    'button:has([data-testid="model-switcher-selected-model"])',
+    'button[aria-label*="model" i]',
+    'button[aria-controls*="model" i]',
+    'button[id*="model" i]'
+  ]);
+}
+
+export function getPageText(root = document) {
+  return String(root.body?.innerText ?? root.documentElement?.innerText ?? "");
+}
+
+export function markOwnership(root, job) {
+  const target = root.documentElement ?? root.body;
+  if (!target) {
+    return false;
+  }
+  target.setAttribute(OWNERSHIP_ATTR, job.job_id);
+  target.setAttribute("data-yoetz-run-id", job.run_id);
+  return true;
+}
+
+export function assertOwnedPage(win, job) {
+  const parsed = parseOwnedWindowName(win.name);
+  return parsed?.job_id === job.job_id && parsed?.run_id === job.run_id;
+}
+
+export async function insertPrompt(root, prompt, options = {}) {
+  const composer = await waitForElement(root, findComposer, "ChatGPT composer", options);
+  composer.focus();
+  if ("value" in composer) {
+    setInputValue(composer, prompt);
+    dispatchTextInput(composer, "input", prompt);
+    composer.dispatchEvent(new Event("change", { bubbles: true }));
+  } else {
+    insertContenteditableText(root, composer, prompt);
+  }
+  await waitForCondition(
+    () => composerContainsPrompt(findComposer(root), prompt),
+    `ChatGPT composer did not accept prompt text (${sendReadinessDiagnostics(root)})`,
+    {
+      timeoutMs: Number(options.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS),
+      intervalMs: Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS)
+    }
+  );
+  return true;
+}
+
+export async function uploadFile(root, file, options = {}) {
+  let input = findFileInputControl(root, { allowHidden: true });
+  if (!input) {
+    await openAttachmentUi(root, options);
+    input = await waitForElement(
+      root,
+      (scope) => findFileInputControl(scope, { allowHidden: true }),
+      "ChatGPT file input",
+      options
+    );
+  }
+  const baselineAttachments = attachmentNodeKeys(findAttachmentCandidates(root));
+  const dataTransfer = new DataTransfer();
+  dataTransfer.items.add(file);
+  input.files = dataTransfer.files;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+  await waitForUploadComplete(root, file, { ...options, baselineAttachments });
+  return true;
+}
+
+export async function ensureFreshChat(root = document, job = {}, options = {}) {
+  const win = options.window ?? root.defaultView ?? globalThis;
+  if (String(win.location?.pathname ?? "").startsWith("/c/")) {
+    const newChat = await waitForElement(root, findNewChatControl, "ChatGPT new chat control", {
+      timeoutMs: Number(options.timeoutMs ?? 10000),
+      intervalMs: Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS)
+    });
+    newChat.click();
+    await waitForCondition(
+      () => !String(win.location?.pathname ?? "").startsWith("/c/"),
+      "ChatGPT did not leave an existing conversation after New Chat",
+      options
+    );
+  }
+  await waitForCondition(
+    () => !hasConversationResidue(root),
+    "ChatGPT old conversation transcript did not clear before starting a fresh chat",
+    {
+      timeoutMs: Number(options.timeoutMs ?? 10000),
+      intervalMs: Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS)
+    }
+  );
+
+  const composer = await waitForElement(root, findComposer, "ChatGPT composer", options);
+  const composerText = editableText(composer);
+  const attachments = findAttachmentTiles(root, { composerOnly: true });
+  const residue = conversationResidue(root);
+  if (composerText || attachments.length > 0 || residue.user_count > 0 || residue.assistant_count > 0 || residue.copy_button_count > 0) {
+    throw new Error(`ChatGPT tab is not a clean fresh chat (${JSON.stringify({
+      pathname: String(win.location?.pathname ?? ""),
+      run_id: job.run_id ?? null,
+      composer_text_chars: composerText.length,
+      attachment_count: attachments.length,
+      ...residue
+    })})`);
+  }
+  return {
+    status: "fresh",
+    pathname: String(win.location?.pathname ?? ""),
+    composer_text_chars: 0,
+    attachment_count: 0,
+    ...residue
+  };
+}
+
+export async function configureModelState(root, job) {
+  const warnings = [];
+  const extended = configureExtendedState(root, Boolean(job.disable_extended));
+  if (extended.warning) {
+    warnings.push(extended.warning);
+  }
+
+  const requested = normalizeRequestedModel(job.model);
+  if (requested.keepCurrent) {
+    return {
+      status: "kept_current",
+      model_used: currentModelLabel(root),
+      extended_status: extended.status,
+      warning: warnings[0] ?? null
+    };
+  }
+
+  const selection = await selectRequestedModel(root, requested);
+  if (selection.warning) {
+    warnings.push(selection.warning);
+  }
+  return {
+    status: selection.status,
+    model_used: selection.model_used,
+    requested_model: job.model,
+    available_options: selection.available_options ?? [],
+    extended_status: extended.status,
+    warning: warnings[0] ?? null,
+    warnings
+  };
+}
+
+export function configureExtendedState(root, disableExtended) {
+  if (!disableExtended) {
+    return { status: "not_requested" };
+  }
+  const button = findExtendedControl(root);
+  if (!button) {
+    return {
+      status: "unavailable",
+      warning: "extended disable requested but Extended toggle was not found"
+    };
+  }
+  button.click();
+  return { status: "disabled" };
+}
+
+function findExtendedControl(root) {
+  const direct = firstVisible(root, [
+    'button[aria-label*="click to remove"][aria-label*="Extended" i]',
+    'button[aria-label*="remove"][aria-label*="Extended" i]',
+    '[data-testid*="extended" i][role="button"]',
+    '[data-testid*="extended" i][role="switch"]'
+  ]);
+  if (direct) {
+    return direct;
+  }
+
+  for (const scope of composerScopes(root, { includeRoot: false })) {
+    const candidates = uniqueElements(Array.from(scope.querySelectorAll([
+      "button",
+      '[role="button"]',
+      '[role="switch"]',
+      '[role="checkbox"]',
+      "[tabindex]",
+      "[aria-label]",
+      "[title]",
+      "[data-testid]",
+      "span",
+      "div"
+    ].join(","))));
+    for (const node of candidates) {
+      const target = extendedClickTarget(node, scope);
+      if (!target || !isVisible(target, { allowDisabled: true })) {
+        continue;
+      }
+      const haystack = extendedCandidateText(node, target);
+      if (!/\bextended\b/.test(haystack)) {
+        continue;
+      }
+      if (/\b(send|stop|copy|share|new chat|attach|upload|search|history)\b/.test(haystack)) {
+        continue;
+      }
+      if (isActionableElement(target) || isExtendedChipLike(target)) {
+        return target;
+      }
+    }
+  }
+  return null;
+}
+
+function extendedCandidateText(node, target = node) {
+  return normalizeText([
+    node?.getAttribute?.("aria-label"),
+    node?.getAttribute?.("title"),
+    node?.getAttribute?.("data-testid"),
+    node?.getAttribute?.("class"),
+    node?.innerText,
+    node?.textContent,
+    target?.getAttribute?.("aria-label"),
+    target?.getAttribute?.("title"),
+    target?.getAttribute?.("data-testid"),
+    target?.getAttribute?.("class"),
+    target?.innerText,
+    target?.textContent
+  ].filter(Boolean).join(" ")).toLowerCase();
+}
+
+function extendedClickTarget(node, stopAt) {
+  let current = node;
+  while (current) {
+    if (isActionableElement(current) || isExtendedChipLike(current)) {
+      return current;
+    }
+    if (current === stopAt) {
+      return null;
+    }
+    current = current.parentElement;
+  }
+  return null;
+}
+
+function isActionableElement(node) {
+  const tag = String(node?.tagName ?? "").toLowerCase();
+  const role = String(node?.getAttribute?.("role") ?? "").toLowerCase();
+  return tag === "button"
+    || ["button", "switch", "checkbox"].includes(role)
+    || node?.getAttribute?.("tabindex") !== null;
+}
+
+function isExtendedChipLike(node) {
+  const marker = normalizeText([
+    node?.getAttribute?.("data-testid"),
+    node?.getAttribute?.("class")
+  ].filter(Boolean).join(" ")).toLowerCase();
+  return /\bextended\b/.test(marker) && /\b(chip|pill|token|toggle|badge|model)\b/.test(marker);
+}
+
+export async function selectRequestedModel(root, requested) {
+  let modelButton = null;
+  try {
+    modelButton = await waitForElement(root, findModelButton, "ChatGPT model selector", {
+      timeoutMs: 5000,
+      intervalMs: 250
+    });
+  } catch {
+    return {
+      status: "unavailable",
+      model_used: currentModelLabel(root),
+      warning: "ChatGPT model selector button not found"
+    };
+  }
+  modelButton.click();
+  try {
+    await waitForCondition(() => visibleModelOptionLabels(root).length > 0, "ChatGPT model options did not appear", {
+      timeoutMs: 5000,
+      intervalMs: 100
+    });
+  } catch {
+    // Keep the fixed delay as a compatibility backstop for menu implementations
+    // that do not expose ARIA option roles.
+    await sleep(250);
+  }
+
+  const option = findModelOption(root, requested);
+  const availableOptions = visibleModelOptionLabels(root);
+  if (!option) {
+    return {
+      status: "unavailable",
+      model_used: currentModelLabel(root),
+      available_options: availableOptions,
+      warning: `requested ChatGPT model ${requested.raw} was not visible`
+    };
+  }
+  option.click();
+  await sleep(500);
+
+  const selected = currentModelLabel(root);
+  if (modelTextMatchesRequest(selected, requested)) {
+    return { status: "selected", model_used: selected || textOf(option), available_options: availableOptions };
+  }
+  return {
+    status: "mismatch",
+    model_used: selected || textOf(option),
+    available_options: availableOptions,
+    warning: `requested ChatGPT model ${requested.raw} was clicked but selected label is ${selected || "unknown"}`
+  };
+}
+
+export async function clickSend(root, options = {}) {
+  const requestedTimeoutMs = Number(options.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS);
+  const minTimeoutMs = Number(options.minTimeoutMs ?? DEFAULT_SEND_MIN_TIMEOUT_MS);
+  const timeoutMs = Math.max(requestedTimeoutMs, minTimeoutMs);
+  const intervalMs = Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS);
+  const startedAt = Date.now();
+  let lastCandidate = null;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const button = findSendButtonControl(root, { requireEnabled: true });
+    if (button) {
+      button.click();
+      return true;
+    }
+    lastCandidate = findSendButtonControl(root, { requireEnabled: false }) ?? lastCandidate;
+    await sleep(intervalMs);
+  }
+
+  if (lastCandidate) {
+    throw new Error(`ChatGPT send button remained disabled (${describeElement(lastCandidate)}; ${sendReadinessDiagnostics(root)})`);
+  }
+  throw new Error(`ChatGPT send button not found (${sendReadinessDiagnostics(root)})`);
+}
+
+export function sendAcceptanceBaseline(root = document) {
+  const composer = findComposer(root);
+  return {
+    user_count: findUserTurns(root).length,
+    assistant_count: findAssistantTurns(root).length,
+    is_generating: isResponseGenerating(root),
+    composer_text_chars: editableText(composer).length
+  };
+}
+
+export async function waitForSendAccepted(root, baseline = {}, options = {}) {
+  const timeoutMs = Number(options.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS);
+  const intervalMs = Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS);
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const current = sendAcceptanceBaseline(root);
+    if (current.user_count > Number(baseline.user_count ?? 0)) {
+      return { send_acceptance_signal: "user_turn" };
+    }
+    if (current.assistant_count > Number(baseline.assistant_count ?? 0)) {
+      return { send_acceptance_signal: "assistant_turn" };
+    }
+    if (!baseline.is_generating && current.is_generating) {
+      return { send_acceptance_signal: "stop_control" };
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`ChatGPT did not accept the prompt after send click (${sendReadinessDiagnostics(root)})`);
+}
+
+export function extractResponse(root = document) {
+  const userTurns = findUserTurns(root);
+  const assistantTurns = findAssistantTurns(root);
+  const copyButtons = Array.from(root.querySelectorAll('button[aria-label*="Copy"], button[data-testid*="copy"]'));
+  const assistantCopyButtons = copyButtons.filter((button) => isCopyControl(button) && assistantTurnForNode(button));
+  const copyButtonCount = assistantCopyButtons.length;
+  const latestTextEntry = latestTextBearingAssistantTurn(assistantTurns);
+  const latestAssistant = latestTextEntry?.turn ?? assistantTurns.at(-1);
+  const turnIndex = latestTextEntry?.index ?? (latestAssistant ? assistantTurns.length - 1 : -1);
+  const latestTurnHasCopyButton = assistantCopyButtons.some((button) => sameAssistantTurn(assistantTurnForNode(button), latestAssistant));
+  const diagnostics = extractionDiagnostics(root, assistantTurns, copyButtons);
+  const scopedText = latestTextEntry?.text ?? assistantMessageText(latestAssistant);
+  if (scopedText) {
+    return {
+      method: latestTurnHasCopyButton ? "copy_scope_dom_fallback" : "assistant_dom_fallback",
+      text: scopedText,
+      is_generating: isResponseGenerating(root),
+      assistant_count: assistantTurns.length,
+      user_count: userTurns.length,
+      preceding_user_count: precedingTurnCount(root, latestAssistant, userTurns),
+      copy_button_count: copyButtonCount,
+      has_copy_button: latestTurnHasCopyButton,
+      turn_index: turnIndex,
+      diagnostics
+    };
+  }
+
+  return {
+    method: "page_text_fallback",
+    text: normalizeText(getPageText(root)),
+    is_generating: isResponseGenerating(root),
+    assistant_count: assistantTurns.length,
+    user_count: userTurns.length,
+    preceding_user_count: -1,
+    copy_button_count: copyButtonCount,
+    has_copy_button: copyButtonCount > 0,
+    turn_index: -1,
+    diagnostics
+  };
+}
+
+function latestTextBearingAssistantTurn(assistantTurns) {
+  for (let index = assistantTurns.length - 1; index >= 0; index -= 1) {
+    const turn = assistantTurns[index];
+    const text = assistantMessageText(turn);
+    if (text) {
+      return { turn, index, text };
+    }
+  }
+  return null;
+}
+
+function assistantMessageText(turn) {
+  if (!turn) {
+    return "";
+  }
+  const contentNodes = [];
+  const addContentNode = (node) => {
+    if (node && !contentNodes.includes(node)) {
+      contentNodes.push(node);
+    }
+  };
+  if (isAssistantContentNode(turn)) {
+    addContentNode(turn);
+  }
+  for (const selector of [
+    '[data-testid*="assistant-message"]',
+    '[data-testid*="assistant-response"]',
+    '[data-message-author-role="assistant"] [class*="markdown"]',
+    '[class*="markdown"]'
+  ]) {
+    for (const node of Array.from(turn.querySelectorAll?.(selector) ?? [])) {
+      if (!looksLikeUserTurn(node)) {
+        addContentNode(node);
+      }
+    }
+  }
+  for (const node of contentNodes) {
+    const text = cleanAssistantText(node);
+    if (text) {
+      return text;
+    }
+  }
+  const fallback = cleanAssistantText(turn);
+  return isModelStatusText(fallback) ? "" : fallback;
+}
+
+function isAssistantContentNode(node) {
+  const marker = [
+    node?.getAttribute?.("data-testid"),
+    node?.getAttribute?.("class"),
+    node?.getAttribute?.("data-message-author-role")
+  ].filter(Boolean).join(" ");
+  return /\bassistant-(message|response)\b/i.test(marker)
+    || /\bmarkdown\b/i.test(marker)
+    || /\bassistant\b/i.test(marker);
+}
+
+function cleanAssistantText(node) {
+  const lines = textOf(node)
+    .split(/\n+/)
+    .map((line) => normalizeText(line))
+    .filter((line) => line && !isAssistantControlLine(line) && !isAssistantNoiseLine(line));
+  return normalizeText(lines.join("\n"));
+}
+
+function isAssistantControlLine(line) {
+  return /^(copy|copied|read aloud|share|regenerate|retry|edit|like|dislike)$/i.test(line)
+    || isThoughtStatusLine(line)
+    || isModelStatusText(line);
+}
+
+function isModelStatusText(text) {
+  const value = normalizeText(text);
+  return /^(pro thinking|extended thinking|thinking|pro|extended pro)$/i.test(value)
+    || /^gpt[\s.-]*\d+(?:[\s.-]*\d+)*(?:\s+(?:pro|thinking))?$/i.test(value);
+}
+
+function isAssistantNoiseLine(line) {
+  return /^[A-Z]$/.test(line);
+}
+
+function isThoughtStatusLine(line) {
+  const value = normalizeText(line);
+  return /^(thought|reasoned)\s+for\s+\S.*$/i.test(value)
+    || /^(analyzing|thinking|working|searching)[.…]*$/i.test(value)
+    || /^show\s+(more|reasoning)$/i.test(value);
+}
+
+export function isResponseGenerating(root = document) {
+  return Boolean(firstVisible(root, [
+    'button[data-testid*="stop"]',
+    'button[aria-label*="Stop generating" i]',
+    'button[aria-label*="Stop streaming" i]'
+  ]));
+}
+
+// Best-effort: click ChatGPT's visible stop-streaming/stop-generating control if
+// one is rendered. Mirrors isResponseGenerating's selector list so we click the
+// same affordance we use to detect ongoing generation. Returns true if a stop
+// control was found and clicked, false if generation was already idle.
+// Never throws — cancel is best-effort and a missing stop button is normal when
+// the response has already settled or the page navigated away.
+export function clickStopGenerating(root = document) {
+  const button = firstVisible(root, [
+    'button[data-testid*="stop"]',
+    'button[aria-label*="Stop generating" i]',
+    'button[aria-label*="Stop streaming" i]'
+  ]);
+  if (!button) {
+    return false;
+  }
+  try {
+    button.click();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function normalizeText(value) {
+  return String(value ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function firstVisible(root, selectors) {
+  return firstMatching(root, selectors, { allowHidden: false });
+}
+
+function firstMatching(root, selectors, options = {}) {
+  for (const selector of selectors) {
+    const nodes = Array.from(root.querySelectorAll(selector));
+    const visible = nodes.find((node) => options.allowHidden
+      ? isEnabled(node)
+      : isVisible(node, options));
+    if (visible) {
+      return visible;
+    }
+  }
+  return null;
+}
+
+function firstVisibleInComposerScopes(root, selectors) {
+  return firstInComposerScopes(root, selectors, { allowHidden: false });
+}
+
+function firstInComposerScopes(root, selectors, options = {}) {
+  for (const scope of composerScopes(root, { includeRoot: Boolean(options.includeRoot) })) {
+    const visible = firstMatching(scope, selectors, options);
+    if (visible) {
+      return visible;
+    }
+  }
+  return null;
+}
+
+function composerScopes(root, options = {}) {
+  const composer = findComposer(root);
+  const scopes = [];
+  const add = (scope) => {
+    if (scope && !scopes.includes(scope)) {
+      scopes.push(scope);
+    }
+  };
+  add(composer?.closest("form"));
+  add(composer?.closest('[data-testid*="composer"], [class*="composer"], main, [role="main"]'));
+  add(composer?.parentElement);
+  if (options.includeRoot) {
+    add(root);
+  }
+  return scopes;
+}
+
+function findSendButtonControl(root, { requireEnabled } = {}) {
+  const selectors = [
+    'button[data-testid="send-button"]',
+    'button[data-testid="fruitjuice-send-button"]',
+    'button[aria-label*="Send" i]',
+    'button[title*="Send" i]',
+    'form button[type="submit"]:last-of-type',
+    'button[type="submit"]'
+  ];
+  for (const scope of composerScopes(root, { includeRoot: false })) {
+    for (const selector of selectors) {
+      const candidate = Array.from(scope.querySelectorAll(selector))
+        .find((node) => isSendButtonCandidate(node, { requireEnabled }));
+      if (candidate) {
+        return candidate;
+      }
+    }
+
+    const fallback = Array.from(scope.querySelectorAll("button"))
+      .find((node) => isSendButtonCandidate(node, { requireEnabled }));
+    if (fallback) {
+      return fallback;
+    }
+  }
+  return null;
+}
+
+function isSendButtonCandidate(node, { requireEnabled } = {}) {
+  if (!isVisible(node, { allowDisabled: true })) {
+    return false;
+  }
+  if (requireEnabled && !isEnabled(node)) {
+    return false;
+  }
+  const text = [
+    node.getAttribute?.("data-testid"),
+    node.getAttribute?.("aria-label"),
+    node.getAttribute?.("title"),
+    node.getAttribute?.("type"),
+    textOf(node)
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (!text) {
+    return false;
+  }
+  if (/\b(stop|cancel|voice|microphone|dictate|attach|upload|file|model|menu)\b/.test(text)) {
+    return false;
+  }
+  return /\bsend\b|submit/.test(text);
+}
+
+async function waitForElement(root, finder, description, options = {}) {
+  const timeoutMs = Number(options.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS);
+  const intervalMs = Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS);
+  const startedAt = Date.now();
+  let element = finder(root);
+  while (!element && Date.now() - startedAt < timeoutMs) {
+    await sleep(intervalMs);
+    element = finder(root);
+  }
+  if (!element) {
+    throw new Error(`${description} not found`);
+  }
+  return element;
+}
+
+async function waitForCondition(predicate, description, options = {}) {
+  const timeoutMs = Number(options.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS);
+  const intervalMs = Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS);
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) {
+      return true;
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(description);
+}
+
+function findModelOption(root, labels) {
+  const options = visibleModelOptions(root);
+  for (const slug of labels.slugs) {
+    const exact = options.find((node) => optionSlugs(node).includes(slug));
+    if (exact) {
+      return exact;
+    }
+  }
+  for (const label of labels.labels) {
+    const textMatch = options.find((node) => modelOptionMatchesLabel(node, label));
+    if (textMatch) {
+      return textMatch;
+    }
+  }
+  return null;
+}
+
+function visibleModelOptions(root) {
+  return Array.from(root.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], [data-testid^="model-switcher-"]:not([data-testid="model-switcher-selected-model"])'))
+    .filter((node) => isVisible(node) && !/model-switcher-(dropdown-button|selected-model)$/i.test(String(node.getAttribute?.("data-testid") ?? "")));
+}
+
+function visibleModelOptionLabels(root) {
+  return visibleModelOptions(root)
+    .map((node) => optionText(node))
+    .filter(Boolean);
+}
+
+function optionSlugs(node) {
+  return [
+    node.getAttribute?.("data-testid")?.replace(/^model-switcher-/, ""),
+    node.getAttribute?.("aria-label"),
+    node.getAttribute?.("title"),
+    textOf(node)
+  ]
+    .filter(Boolean)
+    .map(canonicalModelSlug)
+    .filter(Boolean);
+}
+
+function optionText(node) {
+  return [
+    textOf(node),
+    node.getAttribute?.("aria-label"),
+    node.getAttribute?.("title"),
+    node.getAttribute?.("data-testid")
+  ].filter(Boolean).join(" ");
+}
+
+function modelTextMatchesRequest(text, requested) {
+  if (!text) {
+    return false;
+  }
+  const slug = canonicalModelSlug(text);
+  return requested.slugs.includes(slug) || requested.labels.some((label) => modelLabelMatchesText(label, text));
+}
+
+function modelOptionMatchesLabel(node, label) {
+  const labelSlug = canonicalModelSlug(label);
+  return optionSlugs(node).includes(labelSlug) || modelLabelMatchesText(label, optionText(node));
+}
+
+function modelLabelMatchesText(label, text) {
+  const labelSlug = canonicalModelSlug(label);
+  const folded = normalizeText(text).toLowerCase();
+  if (!labelSlug || !folded) {
+    return false;
+  }
+  if (labelSlug === "pro" || labelSlug === "thinking") {
+    return new RegExp(`\\b${labelSlug}\\b`).test(folded);
+  }
+  if (labelSlug === "gpt-5") {
+    return /\bgpt[\s.-]*5\b(?![\s.-]*\d)/i.test(folded);
+  }
+  return canonicalModelSlug(text) === labelSlug;
+}
+
+async function waitForUploadComplete(root, file, options = {}) {
+  const timeoutMs = Number(options.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS);
+  const intervalMs = Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS);
+  const baselineAttachments = options.baselineAttachments ?? new Set();
+  const startedAt = Date.now();
+  let lastState = "";
+  while (Date.now() - startedAt < timeoutMs) {
+    const error = uploadErrorText(root);
+    if (error) {
+      throw new Error(`ChatGPT file upload failed: ${error}`);
+    }
+    const attached = hasAttachmentNamed(root, file.name, baselineAttachments);
+    const pending = hasUploadPending(root);
+    lastState = `attached=${attached}, pending=${pending}, diagnostics=${sendReadinessDiagnostics(root)}`;
+    if (attached && !pending) {
+      return true;
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error(`ChatGPT file upload did not complete for ${file.name} (${lastState})`);
+}
+
+async function openAttachmentUi(root, options = {}) {
+  const button = findAttachmentButton(root);
+  if (button) {
+    button.click();
+    await sleep(Number(options.attachmentMenuDelayMs ?? 250));
+    const uploadItem = findUploadMenuItem(root);
+    if (uploadItem) {
+      uploadItem.click();
+      await sleep(Number(options.attachmentMenuDelayMs ?? 250));
+    }
+  }
+}
+
+function findAttachmentButton(root) {
+  for (const scope of composerScopes(root, { includeRoot: false })) {
+    const candidate = firstVisible(scope, [
+      'button[data-testid*="attach"]',
+      'button[aria-label*="Attach" i]',
+      'button[aria-label*="Upload" i]',
+      'button[title*="Attach" i]',
+      'button[title*="Upload" i]'
+    ]);
+    if (candidate) {
+      return candidate;
+    }
+    const fallback = Array.from(scope.querySelectorAll("button"))
+      .find((node) => isVisible(node) && /\b(attach|upload|file)\b/i.test(textOf(node)));
+    if (fallback) {
+      return fallback;
+    }
+  }
+  return null;
+}
+
+function findUploadMenuItem(root) {
+  const candidates = Array.from(root.querySelectorAll('[role="menuitem"], [role="option"], button'));
+  return candidates.find((node) => isVisible(node)
+    && /\b(upload|attach|file|computer)\b/i.test([
+      textOf(node),
+      node.getAttribute?.("aria-label"),
+      node.getAttribute?.("title")
+    ].filter(Boolean).join(" ")));
+}
+
+function findNewChatControl(root) {
+  return firstVisible(root, [
+    'a[href="/"]',
+    'button[data-testid="create-new-chat-button"]',
+    'button[aria-label*="New chat" i]',
+    'a[aria-label*="New chat" i]'
+  ]);
+}
+
+function findAttachmentTiles(root, options = {}) {
+  const scopes = options.composerOnly ? composerScopes(root, { includeRoot: false }) : [root];
+  return uniqueElements(scopes.flatMap((scope) => Array.from(scope.querySelectorAll('[class*="file-tile"], [data-testid*="attachment"]'))))
+    .filter((node) => isVisible(node, { allowDisabled: true }));
+}
+
+function hasAttachmentNamed(root, filename, baselineAttachments = new Set()) {
+  const needle = normalizeText(filename).toLowerCase();
+  if (!needle) {
+    return false;
+  }
+  const candidates = findAttachmentCandidates(root);
+  return candidates.some((node) => {
+    if (baselineAttachments.has(attachmentNodeKey(node))) {
+      return false;
+    }
+    const text = [
+      textOf(node),
+      node.getAttribute?.("aria-label"),
+      node.getAttribute?.("title")
+    ].filter(Boolean).join(" ");
+    return normalizeText(text).toLowerCase().includes(needle);
+  });
+}
+
+// Broad candidate selector shared by upload baseline capture and the
+// post-upload `hasAttachmentNamed` check. Keeping these in sync ensures any
+// pre-existing composer-scoped node whose text contains the filename is
+// recorded in the baseline and excluded from the per-tick match — otherwise a
+// stale span/div bearing the bundle filename would falsely satisfy
+// hasAttachmentNamed before the real upload tile appears.
+function findAttachmentCandidates(root) {
+  return uniqueElements(composerScopes(root, { includeRoot: false }).flatMap((scope) => Array.from(scope.querySelectorAll([
+    '[class*="file-tile"]',
+    '[data-testid*="attachment"]',
+    '[aria-label]',
+    '[title]',
+    'span',
+    'div'
+  ].join(",")))));
+}
+
+function attachmentNodeKeys(nodes) {
+  return new Set(nodes.map(attachmentNodeKey));
+}
+
+function attachmentNodeKey(node) {
+  return [
+    node.getAttribute?.("data-testid"),
+    node.getAttribute?.("aria-label"),
+    node.getAttribute?.("title"),
+    textOf(node)
+  ].filter(Boolean).join("|");
+}
+
+function hasUploadPending(root) {
+  const pending = firstVisible(root, [
+    '[role="progressbar"]',
+    '[aria-busy="true"]',
+    '[data-testid*="upload"][data-state*="loading"]',
+    '[data-testid*="attachment"][data-state*="loading"]'
+  ]);
+  if (pending) {
+    return true;
+  }
+  const candidates = Array.from(root.querySelectorAll("[aria-label], [role], [data-testid], button, span, div"));
+  return candidates.some((node) => isVisible(node) && /\b(uploading|attaching|processing|scanning)\b/i.test(textOf(node)));
+}
+
+function uploadErrorText(root) {
+  const candidates = Array.from(root.querySelectorAll('[role="alert"], [data-testid*="error"], [aria-live="assertive"]'));
+  const error = candidates.find((node) => isVisible(node) && /\b(upload|attach|file|failed|error)\b/i.test(textOf(node)));
+  return error ? textOf(error) : "";
+}
+
+function insertContenteditableText(root, composer, prompt) {
+  const selection = root.defaultView?.getSelection?.();
+  const range = root.createRange?.();
+  if (selection && range) {
+    range.selectNodeContents(composer);
+    range.deleteContents();
+    selection.removeAllRanges();
+    selection.addRange(range);
+  } else {
+    composer.textContent = "";
+  }
+  if (!root.execCommand?.("insertText", false, prompt)) {
+    composer.textContent = prompt;
+  }
+  dispatchTextInput(composer, "input", prompt);
+}
+
+function setInputValue(element, value) {
+  const win = element.ownerDocument?.defaultView ?? globalThis;
+  const prototypeName = element.tagName === "TEXTAREA"
+    ? "HTMLTextAreaElement"
+    : element.tagName === "INPUT"
+      ? "HTMLInputElement"
+      : null;
+  const prototype = prototypeName ? win?.[prototypeName]?.prototype : null;
+  const descriptor = prototype ? Object.getOwnPropertyDescriptor(prototype, "value") : null;
+  if (descriptor?.set) {
+    descriptor.set.call(element, value);
+  } else {
+    element.value = value;
+  }
+}
+
+function dispatchTextInput(element, type, text) {
+  let event;
+  try {
+    event = new InputEvent(type, {
+      bubbles: true,
+      inputType: "insertText",
+      data: text
+    });
+  } catch {
+    event = new Event(type, { bubbles: true });
+  }
+  element.dispatchEvent(event);
+}
+
+function composerContainsPrompt(composer, prompt) {
+  const expected = normalizeText(prompt);
+  if (!expected) {
+    return true;
+  }
+  const actual = editableText(composer);
+  return actual === expected;
+}
+
+function findUserTurns(root) {
+  const explicitUserTurns = Array.from(root.querySelectorAll('[data-message-author-role="user"]'))
+    .map((node) => node.closest?.('article, [data-testid*="conversation-turn"], [class*="user-turn"], [class*="turn-messages"]') ?? node);
+  return uniqueElements(explicitUserTurns)
+    .filter((node) => isVisible(node, { allowDisabled: true }));
+}
+
+function findAssistantTurns(root) {
+  const explicitAssistantTurns = Array.from(root.querySelectorAll('[data-message-author-role="assistant"]'))
+    .map((node) => assistantTurnForNode(node) ?? node);
+  const markdownAssistantTurns = Array.from(root.querySelectorAll([
+    '[data-testid*="assistant-message"]',
+    '[data-testid*="assistant-response"]',
+    '[data-message-author-role="assistant"] [class*="markdown"]',
+    '[data-testid*="conversation-turn"] [class*="markdown"]',
+    '[class*="agent-turn"] [class*="markdown"]'
+  ].join(",")))
+    .map((node) => assistantTurnForNode(node) ?? (isAssistantMarkerNode(node) ? node : null));
+  const copyScopedTurns = Array.from(root.querySelectorAll('button[aria-label*="Copy"], button[data-testid*="copy"]'))
+    .map((node) => assistantTurnForNode(node));
+  return uniqueElements([...explicitAssistantTurns, ...markdownAssistantTurns, ...copyScopedTurns])
+    .filter((node) => isVisible(node, { allowDisabled: true }));
+}
+
+function assistantTurnForNode(node) {
+  if (!node) {
+    return null;
+  }
+  const explicit = node.closest?.('[data-message-author-role="assistant"]');
+  const turn = node.closest?.('article, [data-testid*="conversation-turn"], [class*="agent-turn"], [class*="turn-messages"]');
+  if (explicit && turn && !looksLikeUserTurn(turn)) {
+    if (!hasUserRoleDescendant(turn)) {
+      return turn;
+    }
+  }
+  if (explicit) {
+    return explicit;
+  }
+  if (!turn) {
+    return isAssistantMarkerNode(node) ? node : null;
+  }
+  const turnRole = turn.getAttribute?.("data-message-author-role");
+  if (turnRole === "user") {
+    return null;
+  }
+  if (turnRole === "assistant") {
+    return turn;
+  }
+  if (hasUserRoleDescendant(turn)) {
+    return null;
+  }
+  const assistantDescendants = Array.from(turn.querySelectorAll?.('[data-message-author-role="assistant"]') ?? []);
+  if (assistantDescendants.length > 0) {
+    return turn;
+  }
+  if (looksLikeUserTurn(turn)) {
+    return null;
+  }
+  return isCopyControl(node) || isAssistantMarkerNode(node) || isAssistantMarkdownInTurn(node, turn) ? turn : null;
+}
+
+function hasUserRoleDescendant(node) {
+  if (!node) {
+    return false;
+  }
+  const queried = Array.from(node.querySelectorAll?.('[data-message-author-role="user"]') ?? []);
+  if (queried.length > 0) {
+    return true;
+  }
+  for (const child of Array.from(node.children ?? [])) {
+    if (child.getAttribute?.("data-message-author-role") === "user" || hasUserRoleDescendant(child)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasConversationResidue(root) {
+  const residue = conversationResidue(root);
+  return residue.user_count > 0 || residue.assistant_count > 0 || residue.copy_button_count > 0;
+}
+
+function conversationResidue(root) {
+  const copyButtons = Array.from(root.querySelectorAll('button[aria-label*="Copy"], button[data-testid*="copy"]'))
+    .filter((node) => isCopyControl(node));
+  return {
+    user_count: findUserTurns(root).length,
+    assistant_count: findAssistantTurns(root).length,
+    copy_button_count: copyButtons.length
+  };
+}
+
+function precedingTurnCount(root, turn, candidates) {
+  if (!turn) {
+    return -1;
+  }
+  return candidates.filter((candidate) => nodePrecedes(root, candidate, turn)).length;
+}
+
+function nodePrecedes(root, left, right) {
+  if (!left || !right || left === right) {
+    return false;
+  }
+  if (typeof left.compareDocumentPosition === "function") {
+    const following = root.defaultView?.Node?.DOCUMENT_POSITION_FOLLOWING ?? 4;
+    return Boolean(left.compareDocumentPosition(right) & following);
+  }
+  const ordered = flattenTree(root.documentElement ?? root.body ?? root);
+  const leftIndex = ordered.indexOf(left);
+  const rightIndex = ordered.indexOf(right);
+  return leftIndex >= 0 && rightIndex >= 0 && leftIndex < rightIndex;
+}
+
+function flattenTree(node) {
+  if (!node) {
+    return [];
+  }
+  return [node, ...Array.from(node.children ?? []).flatMap(flattenTree)];
+}
+
+function sameAssistantTurn(left, right) {
+  return Boolean(left && right && (
+    left === right
+    || containsNode(left, right)
+    || containsNode(right, left)
+  ));
+}
+
+function containsNode(parent, child) {
+  if (!parent || !child) {
+    return false;
+  }
+  if (typeof parent.contains === "function") {
+    return parent.contains(child);
+  }
+  for (const node of Array.from(parent.children ?? [])) {
+    if (node === child || containsNode(node, child)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isCopyControl(node) {
+  if (isCodeCopyControl(node)) {
+    return false;
+  }
+  return /\bcopy\b/i.test([
+    node?.getAttribute?.("aria-label"),
+    node?.getAttribute?.("data-testid"),
+    node?.getAttribute?.("title"),
+    textOf(node)
+  ].filter(Boolean).join(" "));
+}
+
+function isCodeCopyControl(node) {
+  return Boolean(node?.closest?.('pre, code, [class*="code"], [data-testid*="code"]'));
+}
+
+function isAssistantMarkerNode(node) {
+  const marker = [
+    node?.getAttribute?.("data-testid"),
+    node?.getAttribute?.("class"),
+    node?.getAttribute?.("data-message-author-role")
+  ].filter(Boolean).join(" ");
+  return /\bassistant\b/i.test(marker);
+}
+
+function isAssistantMarkdownInTurn(node, turn) {
+  const marker = [
+    node?.getAttribute?.("class"),
+    turn?.getAttribute?.("class"),
+    turn?.getAttribute?.("data-testid")
+  ].filter(Boolean).join(" ");
+  return /\bmarkdown\b/i.test(marker)
+    && (/\bagent-turn\b/i.test(marker) || /\bassistant\b/i.test(marker) || /\bconversation-turn\b/i.test(marker));
+}
+
+function looksLikeUserTurn(turn) {
+  const marker = [
+    turn?.getAttribute?.("data-message-author-role"),
+    turn?.getAttribute?.("class"),
+    turn?.getAttribute?.("data-testid")
+  ].filter(Boolean).join(" ");
+  return /\buser\b/i.test(marker);
+}
+
+function extractionDiagnostics(root, assistantTurns, copyButtons) {
+  const pageText = normalizeText(getPageText(root));
+  return {
+    page_text_chars: pageText.length,
+    body_text_tail: pageText.slice(-500),
+    counts: {
+      articles: root.querySelectorAll("article").length,
+      assistant_roles: root.querySelectorAll('[data-message-author-role="assistant"]').length,
+      user_roles: root.querySelectorAll('[data-message-author-role="user"]').length,
+      markdown: root.querySelectorAll('[class*="markdown"]').length,
+      conversation_turns: root.querySelectorAll('[data-testid*="conversation-turn"]').length,
+      agent_turns: root.querySelectorAll('[class*="agent-turn"]').length,
+      stop_controls: root.querySelectorAll('button[data-testid*="stop"], button[aria-label*="Stop generating" i], button[aria-label*="Stop streaming" i]').length,
+      copy_buttons: copyButtons.length,
+      assistant_turns: assistantTurns.length
+    },
+    assistant_turn_snippets: assistantTurns.slice(-3).map(elementSummary),
+    article_snippets: Array.from(root.querySelectorAll("article")).slice(-5).map(elementSummary),
+    markdown_snippets: Array.from(root.querySelectorAll('[class*="markdown"]')).slice(-5).map(elementSummary),
+    stop_control_snippets: Array.from(root.querySelectorAll('button[data-testid*="stop"], button[aria-label*="Stop generating" i], button[aria-label*="Stop streaming" i]')).slice(0, 5).map(elementSummary)
+  };
+}
+
+function elementSummary(node) {
+  return {
+    tag: node?.tagName?.toLowerCase?.() ?? "element",
+    role: String(node?.getAttribute?.("data-message-author-role") ?? ""),
+    testid: String(node?.getAttribute?.("data-testid") ?? "").slice(0, 120),
+    class: String(node?.getAttribute?.("class") ?? "").slice(0, 160),
+    aria: String(node?.getAttribute?.("aria-label") ?? "").slice(0, 160),
+    text_chars: textOf(node).length,
+    text: textOf(node).slice(0, 240)
+  };
+}
+
+function uniqueElements(nodes) {
+  return nodes.filter((node, index) => node && nodes.indexOf(node) === index);
+}
+
+function currentModelLabel(root) {
+  const selected = firstVisible(root, [
+    '[data-testid="model-switcher-selected-model"]',
+    '[aria-checked="true"]',
+    '[aria-selected="true"]'
+  ]);
+  return normalizeText(selected?.innerText ?? selected?.textContent ?? findModelButton(root)?.innerText ?? "");
+}
+
+function normalizeRequestedModel(model) {
+  const raw = String(model ?? "").trim();
+  const slug = canonicalModelSlug(raw);
+  if (!raw || slug === "current") {
+    return { raw, keepCurrent: true, labels: [], slugs: [] };
+  }
+  if (slug === "auto") {
+    return {
+      raw,
+      keepCurrent: false,
+      labels: ["GPT-5.4 Pro", "GPT-5 Pro", "Pro", "GPT-5.4 Thinking", "Thinking", "GPT-5.4", "GPT-5"],
+      slugs: ["gpt-5-4-pro", "gpt-5-pro", "pro", "thinking", "gpt-5-4", "gpt-5"]
+    };
+  }
+  const labelsBySlug = {
+    "pro": ["GPT-5.4 Pro", "GPT-5 Pro", "Pro"],
+    "gpt-5-pro": ["GPT-5 Pro", "Pro"],
+    "gpt-5-4-pro": ["GPT-5.4 Pro", "GPT-5 Pro", "Pro"],
+    "thinking": ["GPT-5.4 Thinking", "Thinking"],
+    "gpt-5": ["GPT-5"],
+    "gpt-5-4": ["GPT-5.4", "GPT-5"]
+  };
+  return {
+    raw,
+    keepCurrent: false,
+    labels: labelsBySlug[slug] ?? [raw.replace(/-/g, " ")],
+    slugs: [slug]
+  };
+}
+
+function canonicalModelSlug(value) {
+  const folded = normalizeText(value).toLowerCase();
+  if (!folded || folded === "current" || folded === "keep current") return "current";
+  if (folded === "auto") return "auto";
+  if (folded === "pro") return "pro";
+  if (folded.includes("thinking")) return "thinking";
+  const match = folded.match(/^gpt[\s-]*(\d+)(?:[.\s-]*(\d+))?(?:[.\s-]*(\d+))?(?:[\s.-]*(pro))?$/);
+  if (!match) return folded.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+  const version = [match[1], match[2], match[3]].filter(Boolean).join("-");
+  return `gpt-${version}${match[4] ? "-pro" : ""}`;
+}
+
+function includesFolded(value, needle) {
+  return normalizeText(value).toLowerCase().includes(normalizeText(needle).toLowerCase());
+}
+
+function textOf(node) {
+  const inner = normalizeText(node?.innerText ?? "");
+  return inner || normalizeText(node?.textContent ?? "");
+}
+
+function editableText(node) {
+  if (!node) {
+    return "";
+  }
+  if ("value" in node) {
+    return normalizeText(node.value);
+  }
+  return textOf(node);
+}
+
+function sendReadinessDiagnostics(root) {
+  const composer = findComposer(root);
+  const attachmentTiles = Array.from(root.querySelectorAll('[class*="file-tile"], [data-testid*="attachment"]'))
+    .filter((node) => isVisible(node, { allowDisabled: true }))
+    .slice(0, 3)
+    .map((node) => ({
+      text: textOf(node).slice(0, 120),
+      ariaLabel: String(node.getAttribute?.("aria-label") ?? "").slice(0, 120),
+      testId: String(node.getAttribute?.("data-testid") ?? "").slice(0, 80),
+      busy: node.getAttribute?.("aria-busy") === "true"
+        || /uploading|processing|attaching|scanning/i.test(textOf(node))
+    }));
+  const alerts = Array.from(root.querySelectorAll('[role="alert"], [aria-live], [data-testid*="error"]'))
+    .filter((node) => isVisible(node, { allowDisabled: true }))
+    .map((node) => textOf(node).slice(0, 160))
+    .filter(Boolean)
+    .slice(0, 3);
+  return JSON.stringify({
+    composer: composer ? describeElement(composer) : null,
+    composer_text_chars: textOf(composer).length || String(composer?.value ?? "").length,
+    attachment_tiles: attachmentTiles,
+    alerts
+  }).slice(0, 800);
+}
+
+function describeElement(node) {
+  const attrs = ["data-testid", "aria-label", "title", "type", "aria-disabled", "disabled"]
+    .map((name) => {
+      const value = node.getAttribute?.(name);
+      return value == null ? null : `${name}=${JSON.stringify(value)}`;
+    })
+    .filter(Boolean)
+    .join(" ");
+  return `${node.tagName?.toLowerCase?.() ?? "element"}${attrs ? ` ${attrs}` : ""}`;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isVisible(element, options = {}) {
+  if (!element) {
+    return false;
+  }
+  if (!options.allowDisabled && !isEnabled(element)) {
+    return false;
+  }
+  if (typeof element.checkVisibility === "function") {
+    try {
+      if (!element.checkVisibility({
+        checkOpacity: true,
+        checkVisibilityCSS: true,
+        contentVisibilityAuto: true
+      })) {
+        return false;
+      }
+    } catch {
+      if (!element.checkVisibility()) {
+        return false;
+      }
+    }
+  }
+  let current = element;
+  while (current) {
+    if (current.hidden
+      || current.getAttribute?.("hidden") != null
+      || current.getAttribute?.("aria-hidden") === "true"
+      || current.getAttribute?.("inert") != null) {
+      return false;
+    }
+    const style = current.ownerDocument?.defaultView?.getComputedStyle?.(current);
+    if (style && (
+      style.visibility === "hidden"
+      || style.display === "none"
+      || style.opacity === "0"
+      || style.pointerEvents === "none"
+    )) {
+      return false;
+    }
+    current = current.parentElement;
+  }
+  if (!options.allowNoLayout && typeof element.getClientRects === "function" && element.getClientRects().length === 0) {
+    return false;
+  }
+  return true;
+}
+
+function isEnabled(element) {
+  return !element.disabled
+    && element.getAttribute?.("disabled") == null
+    && element.getAttribute?.("aria-disabled") !== "true";
+}

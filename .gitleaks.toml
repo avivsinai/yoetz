@@ -86,4 +86,7 @@ paths = [
     '''\.example\.''',
     '''config\.example\.toml$''',
     '''prompt\.md$''',
+    # Chrome extension manifest `key` is a public RSA key used to pin the
+    # unpacked/release extension id, not a credential.
+    '''extensions/chatgpt-native/manifest\.json$''',
 ]

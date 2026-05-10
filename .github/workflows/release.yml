@@ -154,6 +154,10 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.prepare.outputs.release_ref }}
 
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: 24
+
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy, rustfmt
@@ -162,6 +166,12 @@ jobs:
 
       - name: Verify release metadata
         run: ./scripts/check-release-version.sh "${{ needs.prepare.outputs.version }}"
+
+      - name: Verify ChatGPT native extension package
+        run: ./scripts/build-chatgpt-native-extension.sh --check
+
+      - name: Test ChatGPT native extension
+        run: node --test extensions/chatgpt-native/tests/*.test.js
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -258,10 +268,53 @@ jobs:
           path: yoetz-${{ matrix.target }}.*
           retention-days: 1
 
+  build-chatgpt-native-extension:
+    name: Build ChatGPT Native Extension
+    needs: [prepare, verify]
+    if: needs.prepare.result == 'success' && needs.verify.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ needs.prepare.outputs.release_ref }}
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6
+        with:
+          node-version: 24
+
+      - name: Build extension zip
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          ./scripts/build-chatgpt-native-extension.sh
+
+          zip_path="extensions/chatgpt-native/dist/yoetz-chatgpt-native-extension.zip"
+          if [[ ! -f "$zip_path" ]]; then
+            printf '::error::Expected extension zip at %s.\n' "$zip_path"
+            exit 1
+          fi
+
+          cp "$zip_path" "yoetz-chatgpt-native-extension-${VERSION}.zip"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: yoetz-chatgpt-native-extension
+          path: yoetz-chatgpt-native-extension-${{ needs.prepare.outputs.version }}.zip
+          retention-days: 1
+
   release:
     name: Create Release
-    needs: [prepare, verify, build]
-    if: needs.prepare.result == 'success' && needs.verify.result == 'success' && needs.build.result == 'success'
+    needs: [prepare, verify, build, build-chatgpt-native-extension]
+    if: >-
+      needs.prepare.result == 'success' && needs.verify.result == 'success'
+      && needs.build.result == 'success'
+      && needs['build-chatgpt-native-extension'].result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

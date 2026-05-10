@@ -192,6 +192,11 @@ for PLUGIN_JSON in .codex-plugin/plugin.json .claude-plugin/plugin.json; do
   fi
 done
 
+if [[ -f extensions/chatgpt-native/manifest.json ]]; then
+  sed -i '' "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" extensions/chatgpt-native/manifest.json 2>/dev/null \
+    || sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" extensions/chatgpt-native/manifest.json
+fi
+
 while IFS= read -r SKILL_MD; do
   if grep -q '^version:' "$SKILL_MD"; then
     sed -i '' "s/^version: .*/version: ${VERSION}/" "$SKILL_MD" 2>/dev/null \
@@ -204,6 +209,8 @@ if [[ "$skip_verify" -eq 0 ]]; then
   cargo test --workspace
   cargo clippy --workspace -- -D warnings
   cargo fmt --all -- --check
+  node --test extensions/chatgpt-native/tests/*.test.js
+  ./scripts/build-chatgpt-native-extension.sh --check
 fi
 ./scripts/check-release-version.sh "$VERSION"
 
@@ -211,6 +218,7 @@ git add CHANGELOG.md Cargo.toml Cargo.lock
 for f in .codex-plugin/plugin.json .claude-plugin/plugin.json; do
   [[ -f "$f" ]] && git add "$f"
 done
+[[ -f extensions/chatgpt-native/manifest.json ]] && git add extensions/chatgpt-native/manifest.json
 find skills -mindepth 2 -maxdepth 2 -name SKILL.md -print0 | while IFS= read -r -d '' f; do
   git add "$f"
 done

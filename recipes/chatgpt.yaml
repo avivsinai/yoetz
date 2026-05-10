@@ -26,8 +26,15 @@ name: chatgpt
 #   browser_context_id — exact Chrome `browserContextId` to target when multiple
 #              signed-in Chrome contexts are live in the same browser process.
 #   profile_email — signed-in Chrome profile email to target (for example
-#              `aviv.s@taboola.com`). Yoetz resolves this to a live
-#              `browserContextId` from the tabs currently open in Chrome.
+#              `user@example.com`). Yoetz resolves this to a live
+#              `browserContextId` from the tabs currently open in Chrome for
+#              CDP transports. For chrome-extension-native, it is a fail-closed
+#              verifier for the Chrome profile where the extension is installed.
+#   extension_instance_id — chrome-extension-native-only stable Yoetz extension
+#              instance id from `yoetz browser extension status --chatgpt`.
+#              Use this when Chrome profile email is unavailable or ambiguous.
+#   extension_profile_id — chrome-extension-native-only Chrome identity profile
+#              id from extension status. Optional secondary selector.
 #   thread   — "fresh" (default). Every yoetz request opens a new ChatGPT tab
 #              marked with `?_yoetz=<run-id>` so the user's own ChatGPT tabs
 #              are never touched. Passing `thread=reuse` is rejected; parallel
@@ -36,6 +43,8 @@ name: chatgpt
 #   wait_interval_ms — poll interval in ms (default: 30000 = 30s).
 #   upload_timeout_ms  — attachment upload deadline in ms (default: 120000 = 2min).
 #   upload_interval_ms — attachment upload poll interval in ms (default: 2000 = 2s).
+#   send_timeout_ms — extension-native send-button enable deadline in ms
+#              (default: 120000 = 2min).
 
 transports:
   - chrome-devtools-mcp
@@ -50,6 +59,7 @@ defaults:
   thread: "fresh"
   upload_timeout_ms: "120000"
   upload_interval_ms: "2000"
+  send_timeout_ms: "120000"
   wait_timeout_ms: "1800000"
   wait_interval_ms: "30000"
 

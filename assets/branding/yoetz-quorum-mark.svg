@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Yoetz quorum mark</title>
+  <desc id="desc">An asymmetric quorum mark: several inputs converge on a single verdict pivot.</desc>
+  <rect width="512" height="512" rx="96" fill="#0f172a"/>
+  <path d="M256 256m-174 0a174 174 0 1 0 348 0a174 174 0 1 0-348 0" fill="#132b35"/>
+  <path d="M254 82h54v136h-54z" fill="#f7f1e6"/>
+  <path d="M131 145l38-38 102 102-38 38z" fill="#06b6d4"/>
+  <path d="M93 276h149v54H93z" fill="#10b981"/>
+  <path d="M149 402l-38-38 114-114 38 38z" fill="#f7f1e6"/>
+  <path d="M288 244 408 124l38 38-82 82 82 82-38 38z" fill="#f59e0b"/>
+  <rect x="224" y="224" width="64" height="64" rx="14" fill="#0f172a"/>
+  <rect x="239" y="239" width="34" height="34" rx="6" fill="#f7f1e6"/>
+</svg>

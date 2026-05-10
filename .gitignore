@@ -51,6 +51,7 @@ state.json
 browser-profile/
 /scripts/node_modules/
 /crates/yoetz-cli/assets/live-cdp-daemon-src/node_modules/
+/extensions/chatgpt-native/dist/
 
 # OS files
 Thumbs.db

@@ -1,5 +1,9 @@
 # yoetz
 
+<p>
+  <img src="assets/branding/yoetz-quorum-mark.svg" alt="Yoetz quorum mark" width="96" height="96">
+</p>
+
 [![CI](https://github.com/avivsinai/yoetz/actions/workflows/ci.yml/badge.svg)](https://github.com/avivsinai/yoetz/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
@@ -62,22 +66,30 @@ Download the latest release from [GitHub Releases](https://github.com/avivsinai/
 
 ```bash
 # macOS (Apple Silicon)
-curl -LO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
 tar xzf yoetz-aarch64-apple-darwin.tar.gz
 sudo mv yoetz /usr/local/bin/
 
 # macOS (Intel)
-curl -LO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-x86_64-apple-darwin.tar.gz
+curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-x86_64-apple-darwin.tar.gz
+curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
+shasum -a 256 -c SHA256SUMS.txt --ignore-missing
 tar xzf yoetz-x86_64-apple-darwin.tar.gz
 sudo mv yoetz /usr/local/bin/
 
 # Linux (x86_64)
-curl -LO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-x86_64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
+sha256sum -c SHA256SUMS.txt --ignore-missing
 tar xzf yoetz-x86_64-unknown-linux-gnu.tar.gz
 sudo mv yoetz /usr/local/bin/
 
 # Linux (ARM64)
-curl -LO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-aarch64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-aarch64-unknown-linux-gnu.tar.gz
+curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
+sha256sum -c SHA256SUMS.txt --ignore-missing
 tar xzf yoetz-aarch64-unknown-linux-gnu.tar.gz
 sudo mv yoetz /usr/local/bin/
 ```
@@ -85,7 +97,7 @@ sudo mv yoetz /usr/local/bin/
 ### From Source
 
 ```bash
-cargo install --git https://github.com/avivsinai/yoetz
+cargo install --git https://github.com/avivsinai/yoetz --tag v0.4.0
 ```
 
 ### Build Locally
@@ -119,7 +131,7 @@ Create `~/.yoetz/config.toml`:
 ```toml
 [defaults]
 provider = "openrouter"
-model = "anthropic/claude-sonnet-4-5-20250929"
+model = "anthropic/claude-sonnet-4.5"
 
 [providers.openrouter]
 api_key_env = "OPENROUTER_API_KEY"
@@ -136,7 +148,14 @@ api_key_env = "GEMINI_API_KEY"
 ```bash
 # Bundle files for LLM context
 yoetz bundle --prompt "Review this code" --files "src/**/*.rs"
+```
 
+Bundles are trust boundaries: treat bundled repository content, issues, logs,
+and pasted browser output as untrusted prompt input. Keep instructions in
+`--prompt`, avoid bundling secrets, and review generated changes before applying
+them.
+
+```bash
 # Ask a question
 yoetz ask --prompt "Explain this function" --files "src/main.rs"
 
@@ -154,19 +173,29 @@ yoetz ask --prompt "Summarize this" --video meeting.mp4 --provider gemini --mode
 
 # Override video MIME type for signed/extensionless URLs
 yoetz ask --prompt "Summarize this" --video https://example.com/signed --video-mime video/mp4
+```
 
 > Note: Gemini can return empty content if `--max-output-tokens` is too low because tokens are consumed by thoughts. If you see warnings or empty output, increase the limit.
 
+```bash
 # Debug raw provider responses
 yoetz --debug ask --provider gemini --model gemini-3-flash-preview --prompt "ping"
 
+# Resolve live model IDs before putting them in scripts
+yoetz models frontier --format json
+
 # Multi-model council
-yoetz council --prompt "Review this PR" --models "openai/gpt-5.2-codex,anthropic/claude-sonnet-4-5-20250929"
+yoetz council --prompt "Review this PR" --models "openai/<model-id>,openrouter/anthropic/claude-sonnet-4.5"
 
 # Code review
 yoetz review diff --model openai/gpt-5.2-codex
-yoetz review file --path src/lib.rs --model anthropic/claude-sonnet-4-5-20250929
+yoetz review file --path src/lib.rs --provider openrouter --model anthropic/claude-sonnet-4.5
 ```
+
+Council calls require explicit model IDs and cost roughly scales with every
+selected model. Budget flags are local preflight/accounting aids for
+ask/council/review, not provider-side hard limits; verify current model IDs and
+provider capabilities before relying on examples.
 
 ### Generation
 
@@ -193,6 +222,85 @@ yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle bundle.md
 # JSON output aggregates steps
 yoetz --format json browser recipe --recipe recipes/chatgpt.yaml --bundle bundle.md
 ```
+
+The default browser stack remains extension-free: ChatGPT recipes use
+`chrome-devtools-mcp`, then `dev-browser`, then `agent-browser` / cookie
+fallbacks as needed. The experimental `chrome-extension-native` transport is an
+explicit opt-in exception for ChatGPT Pro runs that need install-once native
+messaging instead of CDP approval prompts. This native-host path is currently
+macOS/Linux-only; Windows CLI artifacts still ship, but Windows native-host
+registration is not implemented yet.
+
+```bash
+yoetz browser extension install-host --chatgpt
+yoetz browser extension doctor --chatgpt
+yoetz browser extension status --chatgpt
+yoetz browser extension reconnect --chatgpt
+yoetz browser extension reload --chatgpt
+yoetz browser extension canary --chatgpt
+
+yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md
+yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md --var profile_email=user@example.com
+yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md --var extension_instance_id=ext_...
+```
+
+For the extension transport, every loaded Chrome profile publishes a separate
+native bridge instance. With exactly one connected instance, Yoetz uses it. With
+multiple connected instances, pass `--var profile_email=<email>` or
+`--var extension_instance_id=<id>` from `status --chatgpt` so Yoetz can route to
+the matching Chrome profile; otherwise it fails closed rather than guessing. If
+Chrome does not expose the profile email to the extension, an explicit
+`profile_email` request also fails closed, but the stable
+`extension_instance_id` selector still works. These selectors identify the
+Chrome extension/profile instance, not the ChatGPT account or Enterprise
+workspace. Exact `browser_context_id` targeting remains CDP-only.
+
+Release builds publish the ChatGPT native extension as a separate versioned zip
+artifact alongside the CLI archives. To install or update it manually, unzip the
+artifact, open `chrome://extensions`, enable Developer mode, choose **Load
+unpacked**, and select the extracted zip directory itself. From a source
+checkout, select `extensions/chatgpt-native` instead. When updating an unpacked
+install, replace the extracted files and click the extension row's reload
+button, or run `yoetz browser extension reload --chatgpt` when the currently
+loaded extension already supports the reload command; then run
+`yoetz browser extension reconnect --chatgpt` and
+`yoetz browser extension doctor --chatgpt`.
+
+For normal Google Chrome profiles, `install-host` writes the Native Messaging
+host manifest to Chrome's default user path. If Chrome is launched with a custom
+`--user-data-dir`, or if you are using Chrome for Testing or Chromium, set
+`YOETZ_CHROME_NATIVE_MESSAGING_DIR` to that browser user-data directory's
+`NativeMessagingHosts` folder before running `install-host`. On Windows this
+transport fails closed until registry-based native-host setup is added.
+
+### DX: ChatGPT Pro autonomous review via the extension transport
+
+The transport drives upload → send → wait → extract reliably, but ChatGPT
+Pro's file analyzer rate-limits or context-truncates on attachments above
+roughly 30–50k effective tokens. For autonomous code review, prefer focused
+per-directory slices over a single large bundle. Yoetz fails terminally with
+privacy-scoped diagnostics (`response_timeout`, extraction method/status,
+assistant-turn counts, and bounded scoped snippets) rather than returning
+partial or thought-only chrome as success.
+
+The recipe never auto-falls-back to another transport once a side effect has
+landed in the user's tab. If the run fails after upload/send, the error
+includes a manual recovery hint (`window.name` marker, `_yoetz` URL marker,
+extension marker prefix) so an agent can decide whether to reuse the tab or
+abort. Pass `--allow-cdp-fallback` only if you understand that explicitly
+permits a second submission via CDP.
+
+The `--var extended=false` toggle is best-effort. Yoetz scopes the chip
+match to the ChatGPT composer with negative-control guards, but ChatGPT
+re-skins the Extended thinking control occasionally; on a miss the run
+continues with whatever Extended state the tab was in and emits a warning.
+
+If the next ChatGPT run after an unexplained failure should inspect the
+Yoetz-owned tab without resubmitting, use
+`yoetz browser extension inspect --chatgpt --run-id <id>` to read the live
+extraction, conversation id, and privacy-scoped diagnostics through the
+extension bridge. Inspection is read-only, omits broad page text by default,
+and never restarts the run.
 
 ## Architecture
 
@@ -244,17 +352,22 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
 
 ## Verifying Downloads
 
-After downloading a release binary, verify its checksum:
+Verify archive checksums before extracting or moving binaries into `PATH`:
 
 ```bash
-# Download the checksums file
-curl -LO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
+# Download the archive and checksums file
+curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-aarch64-apple-darwin.tar.gz
+curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
 
-# Verify (macOS)
+# Verify the downloaded archive (macOS)
 shasum -a 256 -c SHA256SUMS.txt --ignore-missing
 
-# Verify (Linux)
+# Verify the downloaded archive (Linux)
 sha256sum -c SHA256SUMS.txt --ignore-missing
+
+# Then extract and install
+tar xzf yoetz-aarch64-apple-darwin.tar.gz
+sudo mv yoetz /usr/local/bin/
 ```
 
 ## License
