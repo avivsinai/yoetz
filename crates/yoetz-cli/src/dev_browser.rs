@@ -51,6 +51,7 @@ const DEV_BROWSER_WAIT_POLL_MS: u64 = 100;
 const CHATGPT_POLL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
 const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 30_000;
 const CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT: u64 = 120_000;
+const CHATGPT_SEND_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 const CHATGPT_BROWSER_NAME: &str = "yoetz-chatgpt";
 const CHATGPT_AUTH_PROBE_PAGE_NAME: &str = "yoetz-chatgpt-main";
 const CHATGPT_RECIPE_PAGE_NAME_PREFIX: &str = "yoetz-chatgpt-run";
@@ -750,6 +751,11 @@ pub fn resolve_chatgpt_upload_timeout_ms(
     ))
 }
 
+pub fn resolve_chatgpt_send_timeout_ms(vars: &BTreeMap<String, String>) -> Result<u64> {
+    parse_positive_u64_var(vars, "send_timeout_ms")
+        .map(|value| value.unwrap_or(CHATGPT_SEND_TIMEOUT_MS_DEFAULT))
+}
+
 fn scale_chatgpt_upload_timeout_ms(base_timeout_ms: u64, file_size_bytes: u64) -> u64 {
     const BYTES_PER_MIB: u64 = 1024 * 1024;
     const EXTRA_MS_PER_MIB: u64 = 5_000;
@@ -1355,7 +1361,7 @@ const start = Date.now();
 let stableSince = null;
 let stableKey = null;
 while (Date.now() - start < POLL_TIMEOUT_MS) {{
-  const state = await page.evaluate((baselineCount, baselineLastLen) => {{
+  const state = await page.evaluate((baselineCount, baselineLastLen, allowEmptyResponse) => {{
 {visibility_helpers}
 {turn_root_helpers}
       const errorEl = document.querySelector("[role='alert'], [data-testid*='error']");
@@ -1379,7 +1385,7 @@ while (Date.now() - start < POLL_TIMEOUT_MS) {{
       const responseReady =
         !stopButton &&
         !hasThinkingIndicator &&
-        ((newMessage && (ALLOW_EMPTY_RESPONSE || response.length > 0)) || sameMessageGrew);
+        ((newMessage && (allowEmptyResponse || response.length > 0)) || sameMessageGrew);
       return {{
       error: errorEl ? errorEl.innerText.slice(0, 200).trim() : null,
       hasThinkingIndicator,
@@ -1393,7 +1399,7 @@ while (Date.now() - start < POLL_TIMEOUT_MS) {{
         responseTail: response.slice(-256),
         response: responseReady ? response : "",
       }};
-  }}, BASELINE_COUNT, BASELINE_LAST_LEN);
+  }}, BASELINE_COUNT, BASELINE_LAST_LEN, ALLOW_EMPTY_RESPONSE);
   if (state.error) {{
     console.log(JSON.stringify({{ status: "error", error: state.error }}));
     return;
@@ -2150,6 +2156,8 @@ mod tests {
         assert!(script.contains("const POLL_INTERVAL_MS = 45000;"));
         assert!(script.contains("const STABLE_IDLE_THRESHOLD_MS = 135000;"));
         assert!(script.contains("const ALLOW_EMPTY_RESPONSE = false;"));
+        assert!(script.contains("allowEmptyResponse || response.length > 0"));
+        assert!(script.contains("BASELINE_COUNT, BASELINE_LAST_LEN, ALLOW_EMPTY_RESPONSE"));
         assert!(script.contains("let stableSince = null;"));
         assert!(script.contains(".result-thinking, [data-testid*='thinking']"));
         assert!(script.contains("[data-testid='stop-button']"));

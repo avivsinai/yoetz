@@ -74,6 +74,7 @@ pub enum RecipeTransport {
     DevBrowser,
     AgentBrowser,
     ChromeDevtoolsMcp,
+    ChromeExtensionNative,
     Manual,
 }
 
@@ -5603,13 +5604,13 @@ browser_cdp = "http://evil.example.com:9222"
                 AgentBrowserTab {
                     index: 0,
                     active: false,
-                    title: "Inbox (43,617) - avivsinai@gmail.com - Gmail".to_string(),
+                    title: "Inbox (43,617) - personal@example.com - Gmail".to_string(),
                     url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
                 },
                 AgentBrowserTab {
                     index: 1,
                     active: false,
-                    title: "Inbox (6,096) - aviv.s@taboola.com - Taboola Mail".to_string(),
+                    title: "Inbox (6,096) - work@example.com - Work Mail".to_string(),
                     url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
                 },
             ]),
@@ -5624,8 +5625,8 @@ browser_cdp = "http://evil.example.com:9222"
             },
         );
         assert!(report.contains("inferred profile emails"));
-        assert!(report.contains("avivsinai@gmail.com"));
-        assert!(report.contains("aviv.s@taboola.com"));
+        assert!(report.contains("personal@example.com"));
+        assert!(report.contains("work@example.com"));
         assert!(report.contains("use `--var profile_email=<email>`"));
     }
 
@@ -5850,7 +5851,7 @@ browser_cdp = "http://evil.example.com:9222"
             AgentBrowserTab {
                 index: 1,
                 active: true,
-                title: "Inbox (43,617) - avivsinai@gmail.com - Gmail".to_string(),
+                title: "Inbox (43,617) - personal@example.com - Gmail".to_string(),
                 url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
             },
             AgentBrowserTab {
@@ -5861,7 +5862,7 @@ browser_cdp = "http://evil.example.com:9222"
             },
         ];
 
-        let selected = select_live_attach_profile_tab(&tabs, "avivsinai@gmail.com").unwrap();
+        let selected = select_live_attach_profile_tab(&tabs, "personal@example.com").unwrap();
         assert_eq!(selected.index, 1);
     }
 
@@ -5870,14 +5871,14 @@ browser_cdp = "http://evil.example.com:9222"
         let tabs = vec![AgentBrowserTab {
             index: 2,
             active: true,
-            title: "Inbox (6,096) - aviv.s@taboola.com - Taboola Mail".to_string(),
+            title: "Inbox (6,096) - work@example.com - Work Mail".to_string(),
             url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
         }];
 
-        let err = select_live_attach_profile_tab(&tabs, "avivsinai@gmail.com").unwrap_err();
+        let err = select_live_attach_profile_tab(&tabs, "personal@example.com").unwrap_err();
         assert!(err
             .to_string()
-            .contains("profile_email `avivsinai@gmail.com` was not visible"));
+            .contains("profile_email `personal@example.com` was not visible"));
     }
 
     #[test]
@@ -5886,18 +5887,18 @@ browser_cdp = "http://evil.example.com:9222"
             AgentBrowserTab {
                 index: 1,
                 active: true,
-                title: "Inbox (43,617) - avivsinai@gmail.com - Gmail".to_string(),
+                title: "Inbox (43,617) - personal@example.com - Gmail".to_string(),
                 url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
             },
             AgentBrowserTab {
                 index: 2,
                 active: false,
-                title: "Drafts - avivsinai@gmail.com - Gmail".to_string(),
+                title: "Drafts - personal@example.com - Gmail".to_string(),
                 url: "https://mail.google.com/mail/u/1/#drafts".to_string(),
             },
         ];
 
-        let err = select_live_attach_profile_tab(&tabs, "avivsinai@gmail.com").unwrap_err();
+        let err = select_live_attach_profile_tab(&tabs, "personal@example.com").unwrap_err();
         assert!(err
             .to_string()
             .contains("matched multiple live auto-connect tabs"));
@@ -6737,7 +6738,7 @@ steps:
     #[test]
     fn is_chatgpt_profile_selector_visibility_error_detects_context_mismatch() {
         let err = anyhow!(
-            "profile_email `aviv.s@taboola.com` was not visible in the live auto-connect tab list. Visible emails: avivsinai@gmail.com"
+            "profile_email `work@example.com` was not visible in the live auto-connect tab list. Visible emails: personal@example.com"
         );
         let other = anyhow!("requested ChatGPT model `pro` was not actually selected");
 
@@ -7240,7 +7241,7 @@ steps:
         let recipe = serde_yaml_ng::from_str::<Recipe>(
             r#"
 name: chatgpt
-transports: [dev-browser, agent-browser, chrome-devtools-mcp, manual]
+transports: [dev-browser, agent-browser, chrome-devtools-mcp, chrome-extension-native, manual]
 steps:
   - action: open
     args: ["https://chatgpt.com/"]
@@ -7254,6 +7255,7 @@ steps:
                 RecipeTransport::DevBrowser,
                 RecipeTransport::AgentBrowser,
                 RecipeTransport::ChromeDevtoolsMcp,
+                RecipeTransport::ChromeExtensionNative,
                 RecipeTransport::Manual,
             ])
         );

@@ -286,6 +286,98 @@ fn browser_recipe_help_shows_cdp_flag() {
 }
 
 #[test]
+fn browser_recipe_help_shows_explicit_transport_flag() {
+    yoetz()
+        .args(["browser", "recipe", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--transport"))
+        .stdout(predicate::str::contains("--allow-cdp-fallback"));
+}
+
+#[test]
+fn browser_extension_help_shows_chatgpt_lifecycle() {
+    yoetz()
+        .args(["browser", "extension", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("install-host"))
+        .stdout(predicate::str::contains("doctor"))
+        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("reconnect"))
+        .stdout(predicate::str::contains("canary"));
+}
+
+#[test]
+fn browser_extension_maintenance_help_shows_instance_selectors() {
+    yoetz()
+        .args(["browser", "extension", "reconnect", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--profile-email"))
+        .stdout(predicate::str::contains("--extension-instance-id"))
+        .stdout(predicate::str::contains("--extension-profile-id"));
+
+    yoetz()
+        .args(["browser", "extension", "canary", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--profile-email"))
+        .stdout(predicate::str::contains("--extension-instance-id"))
+        .stdout(predicate::str::contains("--extension-profile-id"));
+}
+
+#[test]
+fn browser_extension_status_requires_chatgpt_scope() {
+    yoetz()
+        .args(["browser", "extension", "status", "--format", "json"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("pass --chatgpt"));
+}
+
+#[test]
+fn browser_extension_status_is_read_only_under_isolated_home() {
+    let dir = tempfile::tempdir().unwrap();
+    let native_hosts = dir.path().join("native-hosts");
+    let state = dir.path().join("state");
+    yoetz()
+        .env("YOETZ_CHROME_NATIVE_MESSAGING_DIR", &native_hosts)
+        .env("YOETZ_DIR", &state)
+        .args([
+            "--format",
+            "json",
+            "browser",
+            "extension",
+            "status",
+            "--chatgpt",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"status\": \"not_installed\""));
+    assert!(!native_hosts.exists());
+    assert!(!state.exists());
+}
+
+#[test]
+fn browser_extension_status_text_is_copy_paste_friendly() {
+    let dir = tempfile::tempdir().unwrap();
+    let native_hosts = dir.path().join("native-hosts");
+    let state = dir.path().join("state");
+    yoetz()
+        .env("YOETZ_CHROME_NATIVE_MESSAGING_DIR", &native_hosts)
+        .env("YOETZ_DIR", &state)
+        .args(["browser", "extension", "status", "--chatgpt"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Yoetz ChatGPT native extension: not_installed",
+        ))
+        .stdout(predicate::str::contains("extension_instance_id:"))
+        .stdout(predicate::str::contains("connected_instances: none"));
+}
+
+#[test]
 fn browser_attach_explicit_cdp_failure_does_not_fallback() {
     yoetz()
         .args(["browser", "attach", "--cdp", "http://127.0.0.1:1"])
@@ -392,6 +484,31 @@ fn bundle_prompt_file_without_files_succeeds() {
         .assert()
         .success()
         .stdout(predicate::str::contains("\"file_count\": 0"));
+}
+
+#[test]
+fn bundle_markdown_separates_user_prompt_as_untrusted_input() {
+    let output = yoetz()
+        .args([
+            "bundle",
+            "--prompt",
+            "Reply exactly AUTO_MODEL_OK.",
+            "--format",
+            "json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+    let bundle_md = json["artifacts"]["bundle_md"].as_str().unwrap();
+    let markdown = fs::read_to_string(bundle_md).unwrap();
+    assert!(markdown.contains("## User Prompt"));
+    assert!(markdown.contains("untrusted user-supplied input"));
+    assert!(markdown.contains("```text\nReply exactly AUTO_MODEL_OK.\n```"));
+    assert!(!markdown.contains("## Prompt\n\nReply exactly AUTO_MODEL_OK."));
 }
 
 #[test]

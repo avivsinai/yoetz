@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Yoetz ChatGPT Native Transport</title>
+    <style>
+      body {
+        min-width: 240px;
+        margin: 0;
+        padding: 12px;
+        font: 13px system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: #111827;
+      }
+      .status {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        font-weight: 600;
+      }
+      .dot {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: #6b7280;
+      }
+      .dot.connected {
+        background: #059669;
+      }
+      .dot.version_mismatch,
+      .dot.missing_native_host,
+      .dot.restore_failed,
+      .dot.state_lost,
+      .dot.failed {
+        background: #dc2626;
+      }
+      .detail {
+        margin-top: 8px;
+        color: #4b5563;
+        overflow-wrap: anywhere;
+      }
+      button {
+        margin-top: 12px;
+        width: 100%;
+        border: 1px solid #d1d5db;
+        border-radius: 6px;
+        padding: 7px 10px;
+        background: #f9fafb;
+        color: #111827;
+        font: inherit;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="status">
+      <span id="dot" class="dot"></span>
+      <span id="label">Disconnected</span>
+    </div>
+    <div id="detail" class="detail"></div>
+    <button id="reconnect" type="button">Reconnect</button>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

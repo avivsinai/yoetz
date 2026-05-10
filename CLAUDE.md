@@ -46,6 +46,11 @@ After the release PR merges:
 - `.github/workflows/release.yml` detects the merged `chore(release): vX.Y.Z`
   commit on `main`, creates/pushes the matching tag, publishes artifacts,
   uses `CHANGELOG.md` for the GitHub release notes, and updates Homebrew/Scoop
+- Release verification also runs
+  `./scripts/build-chatgpt-native-extension.sh --check`; the release publishes
+  the experimental ChatGPT native extension as a separate
+  `yoetz-chatgpt-native-extension-X.Y.Z.zip` artifact when the extension source
+  is present.
 - `.github/workflows/release.yml` also supports `workflow_dispatch` as a retry
   path for an existing tag if a release job needs to be rerun manually
 
@@ -93,13 +98,25 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 
 ## Browser Architecture
 
-Yoetz browser integrations are extension-free by design.
+Yoetz browser integrations are extension-free by default.
 
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
 - Preferred transport order for live Chrome work is `chrome-devtools-mcp`
   first, `dev-browser` second, `agent-browser` third. Keep the stack
   extension-free.
+- The experimental `chrome-extension-native` path is the explicit exception for
+  ChatGPT Pro recipe robustness. It is opt-in only via
+  `yoetz browser recipe --recipe chatgpt --transport chrome-extension-native`
+  and is managed with `yoetz browser extension install-host --chatgpt`,
+  `doctor --chatgpt`, `status --chatgpt`, `reconnect --chatgpt`, and
+  `canary --chatgpt`.
+- For multiple loaded Chrome extension profiles, route extension-native jobs by
+  `profile_email` when Chrome exposes it, or by the stable
+  `extension_instance_id` shown in `status --chatgpt` when it does not.
+- Manual extension updates are explicit: unzip the release artifact, load or
+  reload the extracted extension in `chrome://extensions` Developer mode, then
+  run `yoetz browser extension reconnect --chatgpt` and `doctor --chatgpt`.
 - Default mode is connect-first: attach to the user's already running Chrome
   session (`--connect`, auto-connect, or explicit `--cdp`) before considering
   cookie sync or managed-profile fallbacks.

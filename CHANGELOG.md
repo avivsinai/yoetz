@@ -6,6 +6,94 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+
+- ChatGPT `chrome-extension-native` transport reaches V1: opt-in extension +
+  Native Messaging bridge for ChatGPT Pro that bypasses CDP approval prompts
+  and avoids touching the default extension-free browser stack. Lifecycle:
+  `yoetz browser extension install-host|status|doctor|reconnect|reload|canary
+  |inspect|grant-identity --chatgpt`, then
+  `yoetz browser recipe --recipe chatgpt --transport chrome-extension-native
+  --bundle <file>` with optional `--var profile_email=...` or
+  `--var extension_instance_id=...` selectors.
+- Sharded per-job storage (`jobs.<id>` keys in `chrome.storage.session`) with
+  legacy `jobs` map migration, plus 8KB on-disk tail cap for streaming
+  response text. Long Pro responses no longer threaten the 10MB session
+  quota; the in-memory job retains the full text for `response_delta` calc.
+- Cancel side effects: `cancelJob` now clicks ChatGPT's stop control via the
+  content script, removes the owned tab, and evicts the job from the
+  in-memory map plus a TTL tombstone so a stale `job_start` cannot
+  resurrect it.
+- `inspect_run` envelope: read-only diagnostic that enumerates Yoetz-owned
+  ChatGPT tabs, returns extraction + privacy-scoped diagnostics. Used by the CLI as
+  `yoetz browser extension inspect --chatgpt --run-id <id>` to debug failed
+  runs without restarting them.
+- `request_identity_permission` envelope and matching
+  `yoetz browser extension grant-identity --chatgpt` so `identity.email` can
+  be granted on-demand instead of being mandatory at install. Doctor now
+  surfaces whether the optional permission is granted.
+
+### Changed
+
+- `identity.email` moved from required `permissions` to
+  `optional_permissions` in the extension manifest. Extension installs no
+  longer prompt for "Read your email address" by default; routing relies on
+  the per-Chrome-profile `extension_instance_id` published in
+  `chrome.storage.local`. Pass `profile_email` only when you want a
+  fail-closed verifier and have run `grant-identity` first.
+- Job correlation hardened end-to-end: capability-token gate on every
+  follow-on envelope, duplicate `job_start` rejection (with
+  `terminalJobIds` tombstones), `connection_generation` fence so
+  pre-disconnect async work cannot post `job_complete` after a `state_lost`
+  has been emitted, and `conversation_id` + `submitted_user_count` pinning
+  so a tab navigation mid-run cannot satisfy completion with an unrelated
+  assistant turn.
+- Completion safety: copy-button completion now requires the production 90s
+  `MIN_STABLE_IDLE_MS` floor in addition to the affordance and stable text.
+  `extractResponse` strips ChatGPT thought/status chrome ("Thought for...",
+  "Reasoned for...", "Analyzing...", "Show reasoning", etc.) so a thinking
+  marker by itself can never satisfy a successful response, even with a
+  copy-button visible.
+- `send_acceptance_unknown` is a terminal Send-phase error with
+  `side_effect_started: true`: when ChatGPT accepts the click but Yoetz
+  cannot confirm the prompt was acknowledged, the recipe runner refuses
+  fallback to another transport so the user is never silently re-submitted.
+- `chrome-extension-native` socket falls back to a short
+  `/tmp/yoetz-cen-<hash>/<hash>.sock` path when the state-directory socket
+  would exceed the Unix `sun_path` length limit. The native host refuses to
+  steal an active socket, removes only stale ones, and tears its own socket
+  file down on normal exit.
+
+### Fixed
+
+- Upload completion no longer false-positives on composer-scoped span/div
+  nodes that merely contain the bundle filename. The pre-upload baseline
+  now captures the same broad selector set as the per-tick check, so
+  pre-existing filename-bearing nodes are excluded from completion
+  candidates.
+- Extension `service-worker.js` lifecycle events (`onInstalled`,
+  `onStartup`) no longer overwrite a successful top-level
+  `connectNative()` status with a stale "disconnected" state.
+- `inspect_run` no longer leaks unrelated tab url/title for tabs that
+  rejected the inspection with `run_mismatch`. URL and title are now
+  suppressed for those entries; the `code` field is surfaced for tooling.
+  Broad page text tails and diagnostic body text tails are omitted by
+  default, so read-only inspection does not expose unrelated ChatGPT sidebar
+  or transcript content.
+
+### Known caveats
+
+- ChatGPT Pro's file analyzer rate-limits / context-truncates on
+  attachments above roughly 30-50k effective tokens. The extension
+  transport reliably drives upload, send, and wait, but ChatGPT itself may
+  return a truncated or chrome-only response on large bundles. Use focused
+  per-directory slices for autonomous review jobs; Yoetz fails terminally
+  rather than returning partial answers.
+- The Extended thinking toggle selector is a moving target on ChatGPT Pro.
+  `--var extended=false` currently emits an "Extended toggle was not
+  found" warning when the chip cannot be located but does not block the
+  run; the user can flip the toggle manually if it matters for the
+  request.
 
 ## [0.4.0] - 2026-05-07
 ### Changed

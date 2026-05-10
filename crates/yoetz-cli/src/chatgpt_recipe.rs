@@ -155,10 +155,13 @@ pub struct ChatgptRecipeSpec {
     pub prompt: String,
     pub browser_context_id: Option<String>,
     pub profile_email: Option<String>,
+    pub extension_instance_id: Option<String>,
+    pub extension_profile_id: Option<String>,
     pub run_id: String,
     pub wait_timeout_ms: u64,
     pub wait_interval_ms: u64,
     pub upload_timeout_ms: u64,
+    pub send_timeout_ms: u64,
     pub disable_extended: bool,
 }
 

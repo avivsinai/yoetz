@@ -60,6 +60,12 @@ for path in [".claude-plugin/plugin.json", ".codex-plugin/plugin.json"]:
     if actual != version:
         mismatches.append((path, actual))
 
+extension_manifest = pathlib.Path("extensions/chatgpt-native/manifest.json")
+if extension_manifest.exists():
+    actual = json.loads(extension_manifest.read_text()).get("version")
+    if actual != version:
+        mismatches.append((str(extension_manifest), actual))
+
 changelog = pathlib.Path("CHANGELOG.md")
 if not changelog.exists():
     mismatches.append(("CHANGELOG.md", "<missing>"))

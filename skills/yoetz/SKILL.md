@@ -33,9 +33,9 @@ If `command -v yoetz` fails, install via one of the following:
 
 | Platform | Command |
 |----------|---------|
-| macOS (Homebrew) | `brew install avivsinai/homebrew-tap/yoetz` |
-| Linux (Homebrew if available) | `brew install avivsinai/homebrew-tap/yoetz` |
-| From source (Rust 1.88+) | `cargo install --git https://github.com/avivsinai/yoetz` |
+| macOS (Homebrew) | `brew install avivsinai/tap/yoetz` |
+| Linux (Homebrew if available) | `brew install avivsinai/tap/yoetz` |
+| From source (Rust 1.88+) | `cargo install --git https://github.com/avivsinai/yoetz --tag v0.4.0` |
 | Windows (Scoop) | `scoop bucket add yoetz https://github.com/avivsinai/scoop-bucket && scoop install yoetz` |
 | Pre-built binary | Download from [GitHub Releases](https://github.com/avivsinai/yoetz/releases) and place in PATH |
 
@@ -172,6 +172,18 @@ yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 
 For web-only models like ChatGPT Pro that lack API access. Connects to your running Chrome via CDP (Chrome DevTools Protocol) to submit bundles through the web UI.
 
+### ChatGPT Pro DX recommendation
+
+If the user is doing repeated ChatGPT Pro/Enterprise recipe work, or mentions
+Chrome remote-debugging approval friction, recommend the opt-in
+`chrome-extension-native` transport as the robust path. Keep it explicit:
+install the native host, load/update the extension in Chrome, run `doctor`, then
+target the stable `extension_instance_id` when multiple profiles are open.
+
+Do not silently switch transports after upload/send/wait side effects. If the
+extension reports a terminal ChatGPT phase, preserve the manual-recovery tab and
+warn before any rerun that could duplicate a submission.
+
 ### Prerequisites
 
 ```bash
@@ -222,6 +234,7 @@ Current policy:
 - Prefer live attach over cookie sync: `chrome-devtools-mcp` first, `dev-browser` second, `agent-browser` third.
 - Trust an existing live-attach daemon by default; yoetz does not silently recycle it during normal attach/check/recipe flows.
 - If recovery is actually needed, use `yoetz browser reset` explicitly.
+- Default browser work is extension-free. The experimental `chrome-extension-native` transport is an explicit opt-in ChatGPT-only exception, not part of the default transport order.
 
 If you see "Allow remote debugging?" in Chrome, click Allow and retry.
 
@@ -234,6 +247,37 @@ yoetz browser attach --cdp http://127.0.0.1:9222
 ```
 
 Chrome for Testing is also a good fallback for this manual path.
+
+### Experimental Chrome extension native transport
+
+Use this only when ChatGPT Pro recipe robustness needs install-once native
+messaging instead of CDP approval prompts:
+
+```bash
+yoetz browser extension install-host --chatgpt
+yoetz browser extension doctor --chatgpt
+yoetz browser extension status --chatgpt
+yoetz browser extension reconnect --chatgpt
+yoetz browser extension reload --chatgpt
+yoetz browser extension canary --chatgpt
+
+yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle "$BUNDLE"
+yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle "$BUNDLE" --var extension_instance_id=ext_...
+```
+
+The extension transport is ChatGPT-only, experimental, explicit, and currently
+macOS/Linux-only. Do not use it as a general browser interpreter, and do not
+silently fall back to CDP after browser-side side effects have started.
+
+Manual Chrome-side install/update is part of this path: unzip the release
+artifact, load the extracted extension from `chrome://extensions` with Developer
+mode enabled, and click the extension reload button after replacing files. Then
+run `yoetz browser extension reconnect --chatgpt` and `doctor --chatgpt`.
+From a source checkout, load `extensions/chatgpt-native`; from a release zip,
+load the extracted zip directory itself.
+When multiple Chrome profiles have the extension loaded, pass
+`--var profile_email=<email>` if Chrome exposes one, or the stable
+`--var extension_instance_id=<id>` shown by `status --chatgpt`.
 
 ### Cookie sync (legacy fallback)
 
@@ -306,6 +350,9 @@ Built-in recipes: `chatgpt`, `claude`, `gemini`.
 | `daemon already running` | Run `yoetz browser attach` to check connection. If the daemon is stale, use `yoetz browser reset`, not `agent-browser close` directly. |
 | `agent-browser failed` | Ensure `npx agent-browser --version` works, or `npm install -g agent-browser` |
 | `dev-browser failed` | Ensure `dev-browser --help` works, verify Chrome remote debugging is enabled, and retry with `--cdp` if you need a specific Chrome profile. |
+| `chrome-extension-native` not connected | Run `yoetz browser extension install-host --chatgpt`, load/reload the extension in `chrome://extensions`, then run `yoetz browser extension reconnect --chatgpt` and `doctor --chatgpt`. |
+| Multiple extension profiles | Run `yoetz browser extension status --chatgpt`; pass `--var extension_instance_id=ext_...` for deterministic routing. `profile_email` is only a Chrome-profile guard when Chrome exposes it. |
+| Extension terminal phase after upload/send/wait | Do not rerun automatically. Continue in the Yoetz-owned ChatGPT tab or intentionally rerun knowing it may duplicate a submission. |
 | Recipe not found | Use `--recipe chatgpt` (name) or full path. Check `brew --prefix`/share/yoetz/recipes/ |
 | `cookie extraction failed` | Legacy path: ensure Node >= 24.4, log into ChatGPT in Chrome, close Chrome, `yoetz browser sync-cookies` |
 
@@ -337,7 +384,9 @@ The browser module connects to your running Chrome via CDP (Chrome DevTools Prot
 - **dev-browser** (fallback): Playwright-based transport for the same live-attach flow
 - **agent-browser** (fallback 2): browser automation fallback with cookie/profile fallback support
 - **Cookie sync** (final fallback): extracts cookies from Chrome's encrypted store, injects into agent-browser only after live attach paths are exhausted
-- Extension-free by design: no browser extension is required or desired
+- Extension-free by default: no browser extension is required for normal browser
+  recipes; `chrome-extension-native` is the explicit experimental exception for
+  ChatGPT Pro
 - Daemon model: one persistent connection per session, reused across invocations until you explicitly run `yoetz browser reset`
 
 ## Provider Configuration
