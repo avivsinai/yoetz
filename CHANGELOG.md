@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.0] - 2026-05-10
 ### Added
 
 - ChatGPT `chrome-extension-native` transport reaches V1: opt-in extension +
@@ -94,6 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   found" warning when the chip cannot be located but does not block the
   run; the user can flip the toggle manually if it matters for the
   request.
+
 
 ## [0.4.0] - 2026-05-07
 ### Changed
