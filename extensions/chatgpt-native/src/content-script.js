@@ -26,6 +26,7 @@ async function handleMessage(message) {
       return cancelSend(message.job);
     case "yoetz_inspect_page":
       return inspectPage(message.run_id, {
+        conversation_id: message.conversation_id,
         include_page_text: Boolean(message.include_page_text)
       });
     case "yoetz_probe":
@@ -156,14 +157,19 @@ async function inspectPage(runId, options = {}) {
   const { extractResponse, getPageText, parseOwnedWindowName } = await domHelpers();
   const parsed = parseOwnedWindowName(window.name);
   const urlRunId = runIdFromUrl(location.href);
-  if (runId && parsed?.run_id !== runId && urlRunId !== runId) {
-    throw commandError("run_mismatch", `tab is not owned by Yoetz run ${runId}`);
+  const conversationId = conversationIdFromUrl(location.href);
+  const conversationTarget = String(options.conversation_id ?? "").trim();
+  const runMatches = !runId || parsed?.run_id === runId || urlRunId === runId;
+  const conversationMatches = Boolean(conversationTarget && conversationId === conversationTarget);
+  if (!runMatches && !conversationMatches) {
+    throw commandError("run_mismatch", `tab is not owned by Yoetz run or conversation ${runId}`);
   }
   const extraction = extractResponse(document);
   const pageText = getPageText(document);
   const result = {
     url: location.href,
     title: document.title,
+    conversation_id: conversationId,
     window_name: window.name,
     ownership: parsed,
     active_job_ids: Array.from(activeJobs.keys()),

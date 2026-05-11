@@ -335,6 +335,11 @@ pub fn status() -> Result<ExtensionStatus> {
     })
 }
 
+pub fn prune_stale_instance_records() -> Result<usize> {
+    let paths = extension_paths()?;
+    Ok(prune_stale_instance_records_at(&paths))
+}
+
 pub fn doctor() -> Result<DoctorReport> {
     let paths = extension_paths()?;
     let status_value = read_status_file(&paths.status_path);
@@ -834,10 +839,57 @@ fn connected_extension_instances(paths: &ExtensionPaths) -> Vec<ExtensionInstanc
             serde_json::from_str::<ExtensionInstanceStatus>(&text).ok()
         })
         .filter(|instance| instance.protocol_version == PROTOCOL_VERSION)
+        .filter(|instance| process_alive(instance.pid))
         .filter(|instance| socket_reachable(&instance.socket_path))
         .collect::<Vec<_>>();
     instances.sort_by(|a, b| a.native_instance_id.cmp(&b.native_instance_id));
     instances
+}
+
+fn prune_stale_instance_records_at(paths: &ExtensionPaths) -> usize {
+    let Ok(entries) = fs::read_dir(&paths.instances_dir) else {
+        return 0;
+    };
+    let mut pruned = 0;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let stale = fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<ExtensionInstanceStatus>(&text).ok())
+            .is_none_or(|instance| {
+                instance.protocol_version != PROTOCOL_VERSION
+                    || !process_alive(instance.pid)
+                    || !socket_reachable(&instance.socket_path)
+            });
+        if stale && fs::remove_file(&path).is_ok() {
+            pruned += 1;
+        }
+    }
+    pruned
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if result == 0 {
+        return true;
+    }
+    matches!(
+        io::Error::last_os_error().raw_os_error(),
+        Some(code) if code == libc::EPERM
+    )
+}
+
+#[cfg(not(unix))]
+fn process_alive(_pid: u32) -> bool {
+    true
 }
 
 fn select_extension_instance(
@@ -2872,7 +2924,7 @@ mod tests {
             ExtensionInstanceStatus {
                 native_instance_id: "native_work".to_string(),
                 socket_path: socket,
-                pid: 111,
+                pid: process::id(),
                 extension_instance_id: Some("ext_123".to_string()),
                 extension_version: Some("0.2.0".to_string()),
                 profile_email: Some("work@example.com".to_string()),
@@ -2909,6 +2961,51 @@ mod tests {
     #[test]
     #[cfg(unix)]
     #[serial]
+    fn dead_pid_instances_are_filtered_and_pruned_by_reset_path() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+        let paths = extension_paths().unwrap();
+        fs::create_dir_all(&paths.instances_dir).unwrap();
+        let socket = dir.path().join("stale.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let dead_pid = i32::MAX as u32;
+        assert!(!process_alive(dead_pid));
+        write_instance_fixture(
+            &paths,
+            ExtensionInstanceStatus {
+                native_instance_id: "native_stale".to_string(),
+                socket_path: socket,
+                pid: dead_pid,
+                extension_instance_id: Some("ext_stale".to_string()),
+                extension_version: Some("0.4.0".to_string()),
+                profile_email: Some("stale@example.com".to_string()),
+                profile_id: Some("stale_profile".to_string()),
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 1234,
+            },
+        );
+
+        let payload = status().unwrap();
+
+        assert!(payload.connected_instances.is_empty());
+        assert!(!payload.hello_seen);
+        assert!(paths.instances_dir.join("native_stale.json").exists());
+
+        let pruned = prune_stale_instance_records().unwrap();
+
+        assert_eq!(pruned, 1);
+        assert!(!paths.instances_dir.join("native_stale.json").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
     fn select_extension_instance_routes_by_profile_and_fails_closed_when_ambiguous() {
         use std::os::unix::net::UnixListener;
 
@@ -2928,7 +3025,7 @@ mod tests {
             ExtensionInstanceStatus {
                 native_instance_id: "native_work".to_string(),
                 socket_path: work_socket.clone(),
-                pid: 111,
+                pid: process::id(),
                 extension_instance_id: Some("ext_work".to_string()),
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: Some("work@example.com".to_string()),
@@ -2942,7 +3039,7 @@ mod tests {
             ExtensionInstanceStatus {
                 native_instance_id: "native_personal".to_string(),
                 socket_path: personal_socket.clone(),
-                pid: 222,
+                pid: process::id(),
                 extension_instance_id: Some("ext_personal".to_string()),
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: Some("personal@example.com".to_string()),
@@ -2992,7 +3089,7 @@ mod tests {
             ExtensionInstanceStatus {
                 native_instance_id: "native_work".to_string(),
                 socket_path: work_socket.clone(),
-                pid: 111,
+                pid: process::id(),
                 extension_instance_id: Some("ext_work".to_string()),
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: None,
@@ -3006,7 +3103,7 @@ mod tests {
             ExtensionInstanceStatus {
                 native_instance_id: "native_personal".to_string(),
                 socket_path: personal_socket,
-                pid: 222,
+                pid: process::id(),
                 extension_instance_id: Some("ext_personal".to_string()),
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: None,

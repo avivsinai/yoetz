@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- ChatGPT `chrome-extension-native` completion no longer rejects valid
+  post-send answers when ChatGPT cannot report `preceding_user_count`, and
+  final copy-button affordance completion now uses a shorter stable window.
+- `yoetz browser extension inspect --chatgpt --run-id <id>` can inspect a
+  completed ChatGPT conversation by conversation id when the Yoetz run marker is
+  no longer available.
+- `terminal_delivery_lost` jobs remain terminal across service-worker restores
+  instead of being overwritten as `state_lost`.
+- Dead-PID ChatGPT native-extension instance records are ignored for routing
+  and can be pruned via `yoetz browser reset`.
+- Successful `chrome-extension-native` recipe runs now write `response.json`
+  beside Yoetz `bundle.md` / `bundle.json` session artifacts.
 
 ## [0.5.0] - 2026-05-10
 ### Added

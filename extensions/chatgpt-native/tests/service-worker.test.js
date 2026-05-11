@@ -751,6 +751,56 @@ test("service worker inspect_run omits broad page text by default", async () => 
   }
 });
 
+test("service worker inspect_run can target a ChatGPT conversation id", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const conversationId = "6a0228a7-4994-832d-8bb0-ea6b35d1b7af";
+  let inspectMessage = null;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      query: async () => [{ id: 9, url: `https://chatgpt.com/c/${conversationId}`, title: "Finished run" }],
+      sendMessage: async (_id, message) => {
+        inspectMessage = message;
+        return {
+          ok: true,
+          payload: {
+            url: `https://chatgpt.com/c/${conversationId}`,
+            title: "Finished run",
+            conversation_id: conversationId,
+            window_name: "",
+            ownership: null,
+            active_job_ids: [],
+            page_text_chars: 128,
+            extraction: {
+              method: "assistant_dom_fallback",
+              text: "final answer",
+              diagnostics: { counts: { assistant_turns: 1 } }
+            }
+          }
+        };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?inspect_conversation=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("inspect_run", "job_inspect_conversation", { run_id: conversationId }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    assert.equal(inspectMessage.type, "yoetz_inspect_page");
+    assert.equal(inspectMessage.run_id, conversationId);
+    assert.equal(inspectMessage.conversation_id, conversationId);
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.equal(complete.payload.tabs[0].inspection.conversation_id, conversationId);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker times out stale pre-send assistant text as job_error", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -802,6 +852,78 @@ test("service worker times out stale pre-send assistant text as job_error", asyn
     const error = port.messages.find((message) => message.type === "job_error" && message.payload.code === "response_timeout");
     assert.equal(error.payload.phase, "wait_response");
     assert.equal(error.payload.side_effect_started, true);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker completes post-send response when preceding user count is unknown", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "kept_current", model_used: "ChatGPT" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "assistant_dom_fallback",
+                    text: "final answer",
+                    is_generating: false,
+                    assistant_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    preceding_user_count: -1,
+                    turn_index: 0
+                  }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?unknown_preceding_user=${Date.now()}`);
+    port.emit(envelope("job_start", "job_unknown_preceding_user", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 2000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_unknown_preceding_user", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_unknown_preceding_user.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.equal(complete.payload.response, "final answer");
+    assert.equal(complete.payload.completion_reason, "copy_button");
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -1793,6 +1915,39 @@ test("service worker migrates legacy { jobs: {...} } map to per-job shards on re
     assert.equal(all.jobs, undefined, "legacy 'jobs' key must be removed after migration");
     assert.equal(all["jobs.job_legacy_alpha"].job_id, "job_legacy_alpha");
     assert.equal(all["jobs.job_legacy_beta"].job_id, "job_legacy_beta");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker preserves terminal_delivery_lost jobs on restore", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  await storage.set({
+    "jobs.job_delivery_lost": {
+      job_id: "job_delivery_lost",
+      run_id: "run_delivery_lost",
+      workspace_id: "workspace_test",
+      capability_token: "tok-delivery-lost",
+      status: "terminal_delivery_lost",
+      delivery_lost_phase: "wait_response",
+      started_at: Date.now(),
+      updated_at: Date.now()
+    }
+  });
+
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {}
+  });
+
+  try {
+    await import(`../src/service-worker.js?terminal_delivery_lost_restore=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    await eventually(async () => (await storage.get("jobs.job_delivery_lost"))["jobs.job_delivery_lost"]?.status === "terminal_delivery_lost");
+    assert.equal(port.messages.some((message) => message.type === "job_error" && message.job_id === "job_delivery_lost"), false);
   } finally {
     globalThis.chrome = originalChrome;
   }
