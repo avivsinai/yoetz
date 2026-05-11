@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.1] - 2026-05-11
 ### Fixed
 
 - ChatGPT `chrome-extension-native` completion no longer rejects valid
@@ -20,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and can be pruned via `yoetz browser reset`.
 - Successful `chrome-extension-native` recipe runs now write `response.json`
   beside Yoetz `bundle.md` / `bundle.json` session artifacts.
+
 
 ## [0.5.0] - 2026-05-10
 ### Added
