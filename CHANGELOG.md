@@ -85,12 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Known caveats
 
-- ChatGPT Pro's file analyzer rate-limits / context-truncates on
-  attachments above roughly 30-50k effective tokens. The extension
-  transport reliably drives upload, send, and wait, but ChatGPT itself may
-  return a truncated or chrome-only response on large bundles. Use focused
-  per-directory slices for autonomous review jobs; Yoetz fails terminally
-  rather than returning partial answers.
+- ChatGPT Pro's file analyzer can stall or return truncated answers on
+  large real-review attachments. Live testing observed failures around 60k
+  and 220k effective tokens, while tiny sentinel canaries completed, so this
+  is not documented as a stable token ceiling. Use focused per-directory
+  slices for autonomous review jobs and raise `wait_timeout_ms` for expected
+  long file-analysis runs; Yoetz fails terminally rather than returning
+  partial answers.
 - The Extended thinking toggle selector is a moving target on ChatGPT Pro.
   `--var extended=false` currently emits an "Extended toggle was not
   found" warning when the chip cannot be located but does not block the

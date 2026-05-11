@@ -276,12 +276,15 @@ transport fails closed until registry-based native-host setup is added.
 ### DX: ChatGPT Pro autonomous review via the extension transport
 
 The transport drives upload → send → wait → extract reliably, but ChatGPT
-Pro's file analyzer rate-limits or context-truncates on attachments above
-roughly 30–50k effective tokens. For autonomous code review, prefer focused
-per-directory slices over a single large bundle. Yoetz fails terminally with
-privacy-scoped diagnostics (`response_timeout`, extraction method/status,
-assistant-turn counts, and bounded scoped snippets) rather than returning
-partial or thought-only chrome as success.
+Pro's file analyzer can still stall or return truncated answers on large
+real-review attachments. This is not a stable token ceiling: in live testing,
+large review bundles around 60k and 220k effective tokens failed, while tiny
+sentinel canaries succeeded. For autonomous code review, prefer focused
+per-directory slices over a single large bundle, and raise `wait_timeout_ms`
+for jobs that are expected to spend a long time in ChatGPT file analysis.
+Yoetz fails terminally with privacy-scoped diagnostics (`response_timeout`,
+extraction method/status, assistant-turn counts, and bounded scoped snippets)
+rather than returning partial or thought-only chrome as success.
 
 The recipe never auto-falls-back to another transport once a side effect has
 landed in the user's tab. If the run fails after upload/send, the error
