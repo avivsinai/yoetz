@@ -3,7 +3,7 @@
   "name": "Yoetz ChatGPT Native Transport",
   "short_name": "Yoetz ChatGPT",
   "description": "Experimental Yoetz native transport for ChatGPT recipe jobs.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAujviQNA7EjHnfqpn3TM5IfgmHzOnvtu5pXg3Y1rS5koNJBT2PSG7FTGi9wD4oqNLVFehKm5h46vq1u1ACsMjAUrqMMUVvf7RUeqieUmfbtKRmx24N2blfz4b8KYpMlNUhf8IZ5TAFbvzy9NEO2KHAHCV6pP84E4lLBW2OQIDhqJd0FfS3Ecn91pbsH3tcsU6Gu+WiPEHLXZjPj85KcgQ+8qL0Xz83V5hEXIocMlCQ0RnMOfQIp5qUEIKgZ7qKqEjW2czNz48s5Fdgzbv95Lf09vat1NWiDHXZtDPWIa6TRjlKAAXIwsz5A/DJibzWiCgKiuOWmCgQPJgDidoyj/7RQIDAQAB",
   "icons": {
     "16": "icons/icon-16.png",
