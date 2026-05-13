@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.2] - 2026-05-13
 ### Fixed
 
 - ChatGPT `chrome-extension-native` now fails fast with
@@ -24,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Documented that realistic unattended ChatGPT Pro review jobs can run for
   15-20 minutes, should keep the original native-extension run attached, and
   should inspect terminal failed runs before any duplicate rerun.
+
 
 ## [0.5.1] - 2026-05-11
 ### Fixed
