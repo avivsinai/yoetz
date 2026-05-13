@@ -14,9 +14,10 @@ import { chatgptJobUrl } from "./chatgpt-dom.js";
 const JOB_TTL_MS = 2 * 60 * 60 * 1000;
 const HEARTBEAT_ALARM = "yoetz-heartbeat";
 const RECONNECT_ALARM = "yoetz-reconnect";
-const TERMINAL_STATUSES = new Set(["complete", "cancelled", "failed", "manual_handoff", "state_lost"]);
+const TERMINAL_STATUSES = new Set(["complete", "cancelled", "failed", "manual_handoff", "state_lost", "terminal_delivery_lost"]);
 const EXTENSION_ID_STORAGE_KEY = "yoetz_extension_instance_id";
 const MIN_STABLE_IDLE_MS = Number(globalThis.__YOETZ_MIN_STABLE_IDLE_MS ?? 90000);
+const FINAL_AFFORDANCE_STABLE_IDLE_MS = Number(globalThis.__YOETZ_FINAL_AFFORDANCE_STABLE_IDLE_MS ?? 5000);
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
 // Cap for the tail of last_response_progress_text persisted to chrome.storage.session.
@@ -503,7 +504,11 @@ async function handleInspectRun(message) {
       continue;
     }
     try {
-      const inspection = sanitizeInspection(await sendToTab(tab.id, { type: "yoetz_inspect_page", run_id: runId }));
+      const inspection = sanitizeInspection(await sendToTab(tab.id, {
+        type: "yoetz_inspect_page",
+        run_id: runId,
+        conversation_id: runId
+      }));
       matches.push({
         tab_id: tab.id,
         url: tab.url ?? inspection?.url ?? null,
@@ -974,6 +979,7 @@ async function waitForResponse(job) {
   const startedAt = Date.now();
   const interval = Math.max(500, Math.min(Number(job.wait_interval_ms) || 30000, 30000));
   const stableIdleMs = Math.max(MIN_STABLE_IDLE_MS, interval * 3);
+  const finalAffordanceIdleMs = Math.min(MIN_STABLE_IDLE_MS, Math.max(FINAL_AFFORDANCE_STABLE_IDLE_MS, 0));
   const stablePolls = 2;
   let best = { method: "none", text: "", is_generating: true };
   let last = { method: "none", text: "", is_generating: true };
@@ -1010,14 +1016,15 @@ async function waitForResponse(job) {
     }
     const stableForMs = stableSinceMs ? Date.now() - stableSinceMs : 0;
     if (stableCount >= stablePolls && extraction.method !== "page_text_fallback") {
-      if (finalAffordance && stableForMs >= MIN_STABLE_IDLE_MS) {
+      if (finalAffordance && stableForMs >= finalAffordanceIdleMs) {
         return completedExtraction(extraction, "copy_button", stableForMs);
       }
       if (stableForMs >= stableIdleMs) {
         return completedExtraction(extraction, "stable_idle", stableForMs);
       }
     }
-    await sleep(interval);
+    const nextDelay = finalAffordance ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500)) : interval;
+    await sleep(nextDelay);
   }
   const timeoutSummary = `ChatGPT response did not reach stable completion before timeout (baseline_assistant_count=${job.response_baseline?.assistant_count ?? 0}, best_method=${best.method}, best_text_chars=${best.text?.length ?? 0}, best_assistant_count=${best.assistant_count ?? 0}, best_turn_index=${best.turn_index ?? -1}, best_copy_button_count=${best.copy_button_count ?? 0}, best_is_generating=${Boolean(best.is_generating)}, last_method=${last.method}, last_text_chars=${last.text?.length ?? 0}, last_assistant_count=${last.assistant_count ?? 0}, last_turn_index=${last.turn_index ?? -1}, last_copy_button_count=${last.copy_button_count ?? 0}, last_is_generating=${Boolean(last.is_generating)}, last_diagnostics=${diagnosticSummary(last.diagnostics)})`;
   await failJob(job, "response_timeout", timeoutSummary, {
@@ -1124,8 +1131,10 @@ function isPostSendExtraction(job, extraction) {
   if (!extraction || extraction.method === "page_text_fallback") {
     return false;
   }
-  if (Number.isFinite(Number(job.submitted_user_count)) && Number.isFinite(Number(extraction.preceding_user_count))) {
-    if (Number(extraction.preceding_user_count) < Number(job.submitted_user_count)) {
+  const submittedUserCount = nonNegativeFiniteNumber(job.submitted_user_count);
+  const precedingUserCount = nonNegativeFiniteNumber(extraction.preceding_user_count);
+  if (submittedUserCount !== null && precedingUserCount !== null) {
+    if (precedingUserCount < submittedUserCount) {
       return false;
     }
   }
@@ -1136,6 +1145,11 @@ function isPostSendExtraction(job, extraction) {
     return true;
   }
   return baselineCount === 0 && currentCount > 0;
+}
+
+function nonNegativeFiniteNumber(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
 function requiresExplicitModel(model) {

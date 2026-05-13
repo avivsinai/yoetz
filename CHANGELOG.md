@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.1] - 2026-05-11
+### Fixed
+
+- ChatGPT `chrome-extension-native` completion no longer rejects valid
+  post-send answers when ChatGPT cannot report `preceding_user_count`, and
+  final copy-button affordance completion now uses a shorter stable window.
+- `yoetz browser extension inspect --chatgpt --run-id <id>` can inspect a
+  completed ChatGPT conversation by conversation id when the Yoetz run marker is
+  no longer available.
+- `terminal_delivery_lost` jobs remain terminal across service-worker restores
+  instead of being overwritten as `state_lost`.
+- Dead-PID ChatGPT native-extension instance records are ignored for routing
+  and can be pruned via `yoetz browser reset`.
+- Successful `chrome-extension-native` recipe runs now write `response.json`
+  beside Yoetz `bundle.md` / `bundle.json` session artifacts.
+
+
+## [0.5.0] - 2026-05-10
 ### Added
 
 - ChatGPT `chrome-extension-native` transport reaches V1: opt-in extension +
@@ -83,17 +102,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Known caveats
 
-- ChatGPT Pro's file analyzer rate-limits / context-truncates on
-  attachments above roughly 30-50k effective tokens. The extension
-  transport reliably drives upload, send, and wait, but ChatGPT itself may
-  return a truncated or chrome-only response on large bundles. Use focused
-  per-directory slices for autonomous review jobs; Yoetz fails terminally
-  rather than returning partial answers.
+- ChatGPT Pro's file analyzer can stall or return truncated answers on
+  large real-review attachments. Live testing observed failures around 60k
+  and 220k effective tokens, while tiny sentinel canaries completed, so this
+  is not documented as a stable token ceiling. Use focused per-directory
+  slices for autonomous review jobs and raise `wait_timeout_ms` for expected
+  long file-analysis runs; Yoetz fails terminally rather than returning
+  partial answers.
 - The Extended thinking toggle selector is a moving target on ChatGPT Pro.
   `--var extended=false` currently emits an "Extended toggle was not
   found" warning when the chip cannot be located but does not block the
   run; the user can flip the toggle manually if it matters for the
   request.
+
 
 ## [0.4.0] - 2026-05-07
 ### Changed

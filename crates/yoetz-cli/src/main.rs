@@ -1858,7 +1858,8 @@ fn run_recipe_via_chrome_extension_native(
         delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
         auto_paste_fallback: false,
     };
-    let payload = output.to_value();
+    let mut payload = output.to_value();
+    attach_browser_recipe_artifacts(&mut payload, recipe_args.bundle.as_deref())?;
     maybe_write_output(ctx, &payload)?;
     match format {
         OutputFormat::Json => {
@@ -1872,6 +1873,45 @@ fn run_recipe_via_chrome_extension_native(
         }
     }
     Ok(payload)
+}
+
+fn attach_browser_recipe_artifacts(payload: &mut Value, bundle_path: Option<&Path>) -> Result<()> {
+    let Some(artifacts) = browser_recipe_artifact_paths(bundle_path) else {
+        return Ok(());
+    };
+    payload["artifacts"] = serde_json::to_value(&artifacts)?;
+    if let Some(response_json) = artifacts.response_json.as_deref() {
+        let response_path = Path::new(response_json);
+        if let Some(parent) = response_path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        }
+        write_json_file(response_path, payload)?;
+    }
+    Ok(())
+}
+
+fn browser_recipe_artifact_paths(bundle_path: Option<&Path>) -> Option<ArtifactPaths> {
+    let bundle_path = bundle_path?;
+    let session_dir = bundle_path.parent()?;
+    let bundle_name = bundle_path.file_name()?.to_string_lossy();
+    let sibling_bundle_json = session_dir.join("bundle.json");
+    if bundle_name != "bundle.md" || !sibling_bundle_json.exists() {
+        return None;
+    }
+    Some(ArtifactPaths {
+        session_dir: session_dir.to_string_lossy().to_string(),
+        bundle_json: sibling_bundle_json
+            .exists()
+            .then(|| sibling_bundle_json.to_string_lossy().to_string()),
+        bundle_md: Some(bundle_path.to_string_lossy().to_string()),
+        response_json: Some(
+            session_dir
+                .join("response.json")
+                .to_string_lossy()
+                .to_string(),
+        ),
+        media_dir: None,
+    })
 }
 
 fn resolve_dev_browser_delivery_mode(
@@ -2762,6 +2802,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             browser::close_live_attach_session()?;
             browser::close_browser()?;
             let default_daemon_reset = browser::force_kill_stale_daemon();
+            let chrome_extension_native_instances_pruned =
+                browser_extension_native::prune_stale_instance_records()?;
 
             let payload = json!({
                 "status": "ok",
@@ -2769,6 +2811,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 "live_attach_state_cleared": true,
                 "agent_browser_default": format!("{default_daemon_reset:?}"),
                 "agent_browser_cdp_session_closed": true,
+                "chrome_extension_native_instances_pruned": chrome_extension_native_instances_pruned,
             });
             match format {
                 OutputFormat::Json => write_json(&payload),
@@ -2781,6 +2824,9 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     }
                     println!("Closed agent-browser live-attach session.");
                     println!("Reset agent-browser default daemon state: {default_daemon_reset:?}.");
+                    println!(
+                        "Pruned {chrome_extension_native_instances_pruned} stale chrome-extension-native instance records."
+                    );
                     Ok(())
                 }
             }
@@ -3571,6 +3617,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::TempDir;
 
     fn normalize_model_name(model: &str) -> String {
         normalize_model_name_with_aliases(model, &std::collections::HashMap::new())
@@ -3668,6 +3715,39 @@ mod tests {
         assert_eq!(written, payload);
 
         let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn browser_recipe_artifact_paths_follow_bundle_session() {
+        let dir = TempDir::new().unwrap();
+        let bundle_md = dir.path().join("bundle.md");
+        let bundle_json = dir.path().join("bundle.json");
+        fs::write(&bundle_md, "# bundle").unwrap();
+        fs::write(&bundle_json, "{}").unwrap();
+
+        let artifacts = browser_recipe_artifact_paths(Some(&bundle_md)).unwrap();
+        let expected_session_dir = dir.path().to_string_lossy().to_string();
+        let expected_bundle_md = bundle_md.to_string_lossy().to_string();
+        let expected_bundle_json = bundle_json.to_string_lossy().to_string();
+        let expected_response_json = dir
+            .path()
+            .join("response.json")
+            .to_string_lossy()
+            .to_string();
+
+        assert_eq!(artifacts.session_dir, expected_session_dir);
+        assert_eq!(
+            artifacts.bundle_md.as_deref(),
+            Some(expected_bundle_md.as_str())
+        );
+        assert_eq!(
+            artifacts.bundle_json.as_deref(),
+            Some(expected_bundle_json.as_str())
+        );
+        assert_eq!(
+            artifacts.response_json.as_deref(),
+            Some(expected_response_json.as_str())
+        );
     }
 
     #[test]
