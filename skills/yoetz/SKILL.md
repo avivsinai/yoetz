@@ -184,6 +184,18 @@ Do not silently switch transports after upload/send/wait side effects. If the
 extension reports a terminal ChatGPT phase, preserve the manual-recovery tab and
 warn before any rerun that could duplicate a submission.
 
+ChatGPT Pro code reviews can legitimately spend 15-20 minutes in file analysis.
+This is normal. The native-extension transport prints low-noise lifecycle and
+`waiting_response` progress to stderr, including in `--format json` mode so
+stdout remains parseable. For unattended review loops, keep waiting on the
+original process until it returns, write the result with `--output-final`, and do
+not launch a second run just because progress is sparse. The recipe response
+poll default is 30 minutes; use
+`--var wait_timeout_ms=2400000` only when the submitted review slice is expected
+to exceed that. If the extension returns a terminal upload/send/wait error, use
+`yoetz browser extension inspect --chatgpt --run-id <run-id>` before deciding
+whether an intentional rerun is safe.
+
 ### Prerequisites
 
 ```bash
@@ -268,6 +280,30 @@ yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bund
 The extension transport is ChatGPT-only, experimental, explicit, and currently
 macOS/Linux-only. Do not use it as a general browser interpreter, and do not
 silently fall back to CDP after browser-side side effects have started.
+
+For autonomous ChatGPT Pro reviews, prefer focused bundles and expect long waits:
+15-20 minutes is normal for real file analysis, and the default
+`wait_timeout_ms` is 30 minutes. Use JSON output and a durable result file;
+progress is emitted to stderr so stdout remains valid JSON. Example:
+
+```bash
+YOETZ_AGENT=1 yoetz browser recipe \
+  --recipe chatgpt \
+  --transport chrome-extension-native \
+  --bundle "$BUNDLE" \
+  --format json \
+  --output-final /tmp/yoetz-chatgpt-review.json \
+  --var extension_instance_id=ext_...
+```
+
+Keep the process attached until it returns. If it fails after upload/send/wait,
+inspect the marked tab with the run id from the error instead of rerunning
+blindly; reruns after browser side effects can duplicate the submission.
+For `response_extraction_failed`, compare the tab and diagnostics: if the owned
+tab itself only shows a tiny/truncated assistant fragment, treat it as a bad
+ChatGPT answer and intentionally rerun with a smaller bundle or more explicit
+prompt; if the tab visibly contains the full answer, preserve the tab and report
+the extraction miss.
 
 Manual Chrome-side install/update is part of this path: unzip the release
 artifact, load the extracted extension from `chrome://extensions` with Developer

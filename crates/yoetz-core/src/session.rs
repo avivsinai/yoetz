@@ -1,7 +1,7 @@
 use crate::paths::home_dir;
 use crate::types::SessionInfo;
 use anyhow::{Context, Result};
-use rand::{distr::Alphanumeric, Rng};
+use rand::{distr::Alphanumeric, RngExt};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};

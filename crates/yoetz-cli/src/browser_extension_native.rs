@@ -1558,7 +1558,12 @@ fn emit_progress(format: OutputFormat, envelope: &ProtocolEnvelope) -> Result<()
             }
             Ok(())
         }
-        OutputFormat::Json => Ok(()),
+        OutputFormat::Json => {
+            if let Some(message) = envelope.payload.get("message").and_then(Value::as_str) {
+                eprintln!("chrome-extension-native: {message}");
+            }
+            Ok(())
+        }
     }
 }
 

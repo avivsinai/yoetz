@@ -286,6 +286,18 @@ Yoetz fails terminally with privacy-scoped diagnostics (`response_timeout`,
 extraction method/status, assistant-turn counts, and bounded scoped snippets)
 rather than returning partial or thought-only chrome as success.
 
+Real ChatGPT Pro review jobs can run for 15-20 minutes while file analysis
+runs. That is expected. The native-extension transport emits low-noise lifecycle
+and `waiting_response` progress to stderr, including in `--format json` mode so
+stdout stays parseable. The recipe response poll default is 30 minutes; agents
+should keep the original process attached, write the response with
+`--output-final`, and avoid launching a duplicate run just because progress is
+sparse. Use `--var wait_timeout_ms=2400000` only for slices that are expected to
+exceed the default. If a terminal upload/send/wait error is reported, inspect
+the marked tab with
+`yoetz browser extension inspect --chatgpt --run-id <run-id>` before deciding
+whether an intentional rerun is safe.
+
 The recipe never auto-falls-back to another transport once a side effect has
 landed in the user's tab. If the run fails after upload/send, the error
 includes a manual recovery hint (`window.name` marker, `_yoetz` URL marker,
@@ -304,6 +316,12 @@ Yoetz-owned tab without resubmitting, use
 extraction, conversation id, and privacy-scoped diagnostics through the
 extension bridge. Inspection is read-only, omits broad page text by default,
 and never restarts the run.
+
+If inspection shows `response_extraction_failed` and the owned tab also contains
+only a tiny/truncated assistant fragment, treat it as a bad ChatGPT answer and
+rerun intentionally with a smaller bundle or a more explicit prompt. If the tab
+visibly contains the full answer, preserve the tab and report the extraction
+miss instead of rerunning blindly.
 
 ## Architecture
 

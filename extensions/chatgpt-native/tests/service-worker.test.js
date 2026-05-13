@@ -857,6 +857,89 @@ test("service worker times out stale pre-send assistant text as job_error", asyn
   }
 });
 
+test("service worker classifies final affordance without scoped assistant text", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "kept_current", model_used: "ChatGPT" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "page_text_fallback",
+                    text: "Skip to content\nbundle.md\nFile\nReview the attached file and provide your analysis.\n\nI\n\nExtended Pro",
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: -1,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: -1,
+                    diagnostics: {
+                      counts: { assistant_roles: 1, markdown: 1, copy_buttons: 1 },
+                      assistant_turn_snippets: [{ text: "I", text_chars: 1 }]
+                    }
+                  }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?final_affordance_no_scoped_text=${Date.now()}`);
+    port.emit(envelope("job_start", "job_final_affordance_no_scoped_text", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 2000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_final_affordance_no_scoped_text", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_final_affordance_no_scoped_text.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_extraction_failed"));
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    const error = port.messages.find((message) => message.type === "job_error" && message.payload.code === "response_extraction_failed");
+    assert.equal(error.payload.phase, "wait_response");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.completion_reason, "final_affordance_without_scoped_text");
+    assert.match(error.payload.message, /could not extract scoped assistant text/);
+    assert.equal(error.payload.extraction_method, "page_text_fallback");
+    assert.equal(error.payload.copy_button_count, 1);
+    assert.deepEqual(error.payload.diagnostics.assistant_turn_snippets, [{ text: "I", text_chars: 1 }]);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker completes post-send response when preceding user count is unknown", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -997,6 +1080,84 @@ test("service worker does not complete on brief stable assistant text without a 
     assert.equal(observed?.payload.is_generating, false);
   } finally {
     globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker emits low-noise waiting progress while ChatGPT is quiet", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousWaitingProgressInterval = globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
+  globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = 100;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "kept_current", model_used: "ChatGPT" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? { method: "none", text: "", is_generating: true, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?waiting_progress=${Date.now()}`);
+    port.emit(envelope("job_start", "job_waiting_progress", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1200
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_waiting_progress", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_waiting_progress.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_progress" && message.payload.phase === "waiting_response"));
+    const uploaded = port.messages.find((message) => message.type === "job_progress" && message.payload.phase === "file_uploaded");
+    const sentProgress = port.messages.find((message) => message.type === "job_progress" && message.payload.phase === "prompt_sent");
+    const waiting = port.messages.find((message) => message.type === "job_progress" && message.payload.phase === "waiting_response");
+    assert.match(uploaded?.payload.message, /bundle uploaded/);
+    assert.match(sentProgress?.payload.message, /waiting for ChatGPT response/);
+    assert.match(waiting?.payload.message, /waiting for ChatGPT response/);
+    assert.equal(waiting.payload.extraction_method, "none");
+    assert.equal(waiting.payload.is_generating, true);
+    assert.equal(waiting.payload.response_length, 0);
+    assert.equal(Object.hasOwn(waiting.payload, "response_tail"), false);
+    assert.equal(Object.hasOwn(waiting.payload, "response_delta"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousWaitingProgressInterval === undefined) {
+      delete globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
+    } else {
+      globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = previousWaitingProgressInterval;
+    }
   }
 });
 
@@ -1207,6 +1368,80 @@ test("service worker does not complete on copy button while response is still ge
     }));
     await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
     assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker completes when a generating response becomes idle without text growth", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let extractCount = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "kept_current", model_used: "ChatGPT" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            extractCount += 1;
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "copy_scope_dom_fallback",
+                    text: "OK",
+                    is_generating: extractCount <= 2,
+                    assistant_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: 0
+                  }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?generating_then_idle=${Date.now()}`);
+    port.emit(envelope("job_start", "job_generating_then_idle", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 2000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_generating_then_idle", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_generating_then_idle.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.equal(complete.payload.response, "OK");
+    assert.equal(complete.payload.completion_reason, "copy_button");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
   } finally {
     globalThis.chrome = originalChrome;
   }

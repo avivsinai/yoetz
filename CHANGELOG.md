@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- ChatGPT `chrome-extension-native` now fails fast with
+  `response_extraction_failed` when ChatGPT shows final assistant affordances
+  but Yoetz cannot extract scoped assistant text, instead of burning the full
+  wait timeout and tempting duplicate reruns.
+- ChatGPT `chrome-extension-native` completion now handles responses whose text
+  first appears while ChatGPT is still generating and then becomes idle without
+  further text growth.
+
+### Changed
+
+- ChatGPT `chrome-extension-native` now emits low-noise lifecycle and
+  `waiting_response` progress to stderr, including in `--format json` mode,
+  while keeping stdout parseable for agents.
+- Documented that realistic unattended ChatGPT Pro review jobs can run for
+  15-20 minutes, should keep the original native-extension run attached, and
+  should inspect terminal failed runs before any duplicate rerun.
 
 ## [0.5.1] - 2026-05-11
 ### Fixed

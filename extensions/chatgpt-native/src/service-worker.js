@@ -18,6 +18,7 @@ const TERMINAL_STATUSES = new Set(["complete", "cancelled", "failed", "manual_ha
 const EXTENSION_ID_STORAGE_KEY = "yoetz_extension_instance_id";
 const MIN_STABLE_IDLE_MS = Number(globalThis.__YOETZ_MIN_STABLE_IDLE_MS ?? 90000);
 const FINAL_AFFORDANCE_STABLE_IDLE_MS = Number(globalThis.__YOETZ_FINAL_AFFORDANCE_STABLE_IDLE_MS ?? 5000);
+const WAITING_RESPONSE_PROGRESS_INTERVAL_MS = Math.max(50, Number(globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS ?? 60000) || 60000);
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
 // Cap for the tail of last_response_progress_text persisted to chrome.storage.session.
@@ -321,7 +322,11 @@ async function runJobWithFile(job, file) {
   });
   assertJobConnectionCurrent(job);
   if (job.cancelled) return;
-  if (!postNative(progress(job, "file_uploaded", { filename: file.filename, bytes: file.bytes.byteLength }))) {
+  if (!postNative(progress(job, "file_uploaded", {
+    filename: file.filename,
+    bytes: file.bytes.byteLength,
+    message: `bundle uploaded (${file.bytes.byteLength} bytes); sending prompt`
+  }))) {
     await recordTerminalDeliveryLost(job, "upload");
     return;
   }
@@ -344,7 +349,10 @@ async function runJobWithFile(job, file) {
       : null;
     assertJobConnectionCurrent(job);
     if (job.cancelled) return;
-    if (!postNative(progress(job, "prompt_sent"))) {
+    if (!postNative(progress(job, "prompt_sent", {
+      timeout_ms: Number(job.wait_timeout_ms || 1800000),
+      message: `prompt sent; waiting for ChatGPT response (timeout ${formatDurationForMessage(Number(job.wait_timeout_ms || 1800000))})`
+    }))) {
       await recordTerminalDeliveryLost(job, "send");
       return;
     }
@@ -359,9 +367,9 @@ async function runJobWithFile(job, file) {
     return;
   }
 
-    job.status = "waiting_response";
-    job.updated_at = Date.now();
-    await persistJob(job);
+  job.status = "waiting_response";
+  job.updated_at = Date.now();
+  await persistJob(job);
   const extraction = await waitForResponse(job);
   assertJobConnectionCurrent(job);
   if (job.cancelled || !extraction) return;
@@ -986,7 +994,11 @@ async function waitForResponse(job) {
   let lastStableText = "";
   let stableCount = 0;
   let stableSinceMs = 0;
-  while (Date.now() - startedAt <= Number(job.wait_timeout_ms || 1800000)) {
+  let extractionFailureAnchor = "";
+  let extractionFailureSinceMs = 0;
+  let lastWaitingProgressAt = startedAt;
+  const timeoutMs = Number(job.wait_timeout_ms || 1800000);
+  while (Date.now() - startedAt <= timeoutMs) {
     assertJobConnectionCurrent(job);
     if (job.cancelled) {
       return null;
@@ -996,6 +1008,7 @@ async function waitForResponse(job) {
     assertJobConversationCurrent(job, extraction);
     last = extraction ?? last;
     const postSend = isPostSendExtraction(job, extraction);
+    const postSendAssistantActivity = isPostSendAssistantActivity(job, extraction, true);
     if (postSend && extraction?.text && extraction.text.length >= best.text.length) {
       best = extraction;
     }
@@ -1006,9 +1019,18 @@ async function waitForResponse(job) {
     const rawText = extraction?.text ?? "";
     const text = meaningfulResponseText(rawText) ? rawText : "";
     const finalAffordance = Boolean(postSend && text && hasFinalAssistantAffordance(job, extraction));
+    const finalAffordanceWithoutScopedText = Boolean(
+      postSendAssistantActivity
+      && extraction?.method === "page_text_fallback"
+      && !extraction?.is_generating
+      && hasFinalAssistantAffordance(job, extraction)
+    );
     const extractionIdle = !extraction?.is_generating;
     if (postSend && text && extractionIdle && text === lastStableText) {
       stableCount += 1;
+      if (!stableSinceMs) {
+        stableSinceMs = Date.now();
+      }
     } else {
       lastStableText = text;
       stableCount = postSend && text && extractionIdle ? 1 : 0;
@@ -1023,7 +1045,46 @@ async function waitForResponse(job) {
         return completedExtraction(extraction, "stable_idle", stableForMs);
       }
     }
-    const nextDelay = finalAffordance ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500)) : interval;
+    if (finalAffordanceWithoutScopedText) {
+      const anchor = finalAffordanceExtractionFailureAnchor(extraction);
+      if (anchor !== extractionFailureAnchor) {
+        extractionFailureAnchor = anchor;
+        extractionFailureSinceMs = Date.now();
+      }
+      const extractionFailureStableForMs = Date.now() - extractionFailureSinceMs;
+      if (extractionFailureStableForMs >= finalAffordanceIdleMs) {
+        await failJob(job, "response_extraction_failed", finalAffordanceExtractionFailureMessage(job, extraction, extractionFailureStableForMs), {
+          phase: "wait_response",
+          side_effect_started: true,
+          completion_reason: "final_affordance_without_scoped_text",
+          stable_for_ms: extractionFailureStableForMs,
+          extraction_method: extraction.method,
+          response_length: extraction.text?.length ?? 0,
+          assistant_count: extraction.assistant_count ?? 0,
+          turn_index: extraction.turn_index ?? -1,
+          copy_button_count: extraction.copy_button_count ?? 0,
+          diagnostics: diagnosticPayload(extraction.diagnostics)
+        });
+        return null;
+      }
+    } else {
+      extractionFailureAnchor = "";
+      extractionFailureSinceMs = 0;
+    }
+    const nextDelay = (finalAffordance || finalAffordanceWithoutScopedText) ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500)) : interval;
+    const nowMs = Date.now();
+    const elapsedMs = nowMs - startedAt;
+    if (nowMs - lastWaitingProgressAt >= WAITING_RESPONSE_PROGRESS_INTERVAL_MS) {
+      postWaitingResponseProgress(job, extraction, {
+        elapsed_ms: elapsedMs,
+        timeout_ms: timeoutMs,
+        next_poll_ms: nextDelay,
+        stable_for_ms: stableForMs,
+        final_affordance: finalAffordance,
+        extraction_failure_candidate: finalAffordanceWithoutScopedText
+      });
+      lastWaitingProgressAt = nowMs;
+    }
     await sleep(nextDelay);
   }
   const timeoutSummary = `ChatGPT response did not reach stable completion before timeout (baseline_assistant_count=${job.response_baseline?.assistant_count ?? 0}, best_method=${best.method}, best_text_chars=${best.text?.length ?? 0}, best_assistant_count=${best.assistant_count ?? 0}, best_turn_index=${best.turn_index ?? -1}, best_copy_button_count=${best.copy_button_count ?? 0}, best_is_generating=${Boolean(best.is_generating)}, last_method=${last.method}, last_text_chars=${last.text?.length ?? 0}, last_assistant_count=${last.assistant_count ?? 0}, last_turn_index=${last.turn_index ?? -1}, last_copy_button_count=${last.copy_button_count ?? 0}, last_is_generating=${Boolean(last.is_generating)}, last_diagnostics=${diagnosticSummary(last.diagnostics)})`;
@@ -1075,6 +1136,35 @@ function postResponseProgress(job, extraction) {
     copy_button_count: extraction.copy_button_count ?? 0,
     has_copy_button: Boolean(extraction.has_copy_button)
   }));
+}
+
+function postWaitingResponseProgress(job, extraction, detail = {}) {
+  const elapsedMs = Number(detail.elapsed_ms ?? 0);
+  const timeoutMs = Number(detail.timeout_ms ?? job.wait_timeout_ms ?? 1800000);
+  postNative(progress(job, "waiting_response", {
+    ...detail,
+    message: `waiting for ChatGPT response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${extraction?.is_generating ? ", generating" : ""})`,
+    extraction_method: extraction?.method ?? "none",
+    is_generating: Boolean(extraction?.is_generating),
+    assistant_count: extraction?.assistant_count ?? 0,
+    turn_index: extraction?.turn_index ?? -1,
+    copy_button_count: extraction?.copy_button_count ?? 0,
+    has_copy_button: Boolean(extraction?.has_copy_button),
+    response_length: extraction?.text?.length ?? 0
+  }));
+}
+
+function formatDurationForMessage(ms) {
+  const seconds = Math.max(0, Math.round(Number(ms || 0) / 1000));
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  const remainder = seconds % 60;
+  if (remainder === 0) {
+    return `${minutes}m`;
+  }
+  return `${minutes}m ${remainder}s`;
 }
 
 function diagnosticSummary(diagnostics) {
@@ -1131,6 +1221,13 @@ function isPostSendExtraction(job, extraction) {
   if (!extraction || extraction.method === "page_text_fallback") {
     return false;
   }
+  return isPostSendAssistantActivity(job, extraction);
+}
+
+function isPostSendAssistantActivity(job, extraction, allowUnknownTurnIndex = false) {
+  if (!extraction) {
+    return false;
+  }
   const submittedUserCount = nonNegativeFiniteNumber(job.submitted_user_count);
   const precedingUserCount = nonNegativeFiniteNumber(extraction.preceding_user_count);
   if (submittedUserCount !== null && precedingUserCount !== null) {
@@ -1142,6 +1239,9 @@ function isPostSendExtraction(job, extraction) {
   const currentCount = Number(extraction.assistant_count ?? 0);
   const currentTurnIndex = Number(extraction.turn_index ?? -1);
   if (currentCount > baselineCount && currentTurnIndex >= baselineCount) {
+    return true;
+  }
+  if (allowUnknownTurnIndex && currentCount > baselineCount && currentTurnIndex < 0) {
     return true;
   }
   return baselineCount === 0 && currentCount > 0;
@@ -1163,6 +1263,20 @@ function isAcceptableModelSelection(selection) {
 
 function hasFinalAssistantAffordance(job, extraction) {
   return Boolean(extraction?.has_copy_button);
+}
+
+function finalAffordanceExtractionFailureAnchor(extraction) {
+  return [
+    extraction?.method ?? "none",
+    extraction?.assistant_count ?? 0,
+    extraction?.turn_index ?? -1,
+    extraction?.copy_button_count ?? 0,
+    extraction?.text?.length ?? 0
+  ].join(":");
+}
+
+function finalAffordanceExtractionFailureMessage(job, extraction, stableForMs) {
+  return `ChatGPT rendered a final assistant affordance but Yoetz could not extract scoped assistant text (method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, turn_index=${extraction?.turn_index ?? -1}, copy_button_count=${extraction?.copy_button_count ?? 0}, stable_for_ms=${stableForMs}). Inspect the owned tab with \`yoetz browser extension inspect --chatgpt --run-id ${job.run_id}\` before rerunning.`;
 }
 
 function meaningfulResponseText(text) {
