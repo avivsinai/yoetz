@@ -1226,16 +1226,34 @@ fn choose_chatgpt_recovery_strategy(
     browser_context_id: Option<&str>,
     url: &str,
 ) -> Result<ChatgptRecoveryStrategy> {
-    if has_chatgpt_anchor && mutate_existing_chatgpt_tab_allowed() {
+    choose_chatgpt_recovery_strategy_with_flags(
+        has_chatgpt_anchor,
+        safe_anchor_url,
+        browser_context_id,
+        url,
+        user_tab_anchor_allowed(),
+        mutate_existing_chatgpt_tab_allowed(),
+    )
+}
+
+fn choose_chatgpt_recovery_strategy_with_flags(
+    has_chatgpt_anchor: bool,
+    safe_anchor_url: Option<&str>,
+    browser_context_id: Option<&str>,
+    url: &str,
+    allow_user_tab_anchor: bool,
+    allow_mutate_existing_chatgpt_tab: bool,
+) -> Result<ChatgptRecoveryStrategy> {
+    if has_chatgpt_anchor && allow_mutate_existing_chatgpt_tab {
         return Ok(ChatgptRecoveryStrategy::ReuseExistingChatgptTab);
     }
     if safe_anchor_url.is_some_and(|value| context_tab_reuse_rank(value).is_some()) {
         return Ok(ChatgptRecoveryStrategy::ExistingSafeAnchor);
     }
-    if has_chatgpt_anchor && user_tab_anchor_allowed() {
+    if has_chatgpt_anchor && allow_user_tab_anchor {
         return Ok(ChatgptRecoveryStrategy::ExistingChatgptAnchor);
     }
-    if user_tab_anchor_allowed() {
+    if allow_user_tab_anchor {
         // Caller opted in via YOETZ_ALLOW_USER_TAB_ANCHOR=1. Use any existing
         // page as the `window.open` anchor — the anchor is still not
         // navigated; we just spawn a sibling tab from it. Marked user-opt-in
@@ -3393,11 +3411,13 @@ mod tests {
     #[test]
     fn recovery_prefers_safe_anchor_before_existing_chatgpt_tab() {
         assert_eq!(
-            choose_chatgpt_recovery_strategy(
+            choose_chatgpt_recovery_strategy_with_flags(
                 true,
                 Some("about:blank"),
                 None,
-                "https://chatgpt.com/?_yoetz=test"
+                "https://chatgpt.com/?_yoetz=test",
+                false,
+                false,
             )
             .unwrap(),
             ChatgptRecoveryStrategy::ExistingSafeAnchor
@@ -3405,72 +3425,42 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial]
     fn recovery_can_reuse_existing_chatgpt_tab_when_operator_opted_in() {
-        let previous = std::env::var(YOETZ_ALLOW_MUTATE_EXISTING_CHATGPT_TAB_ENV).ok();
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var(YOETZ_ALLOW_MUTATE_EXISTING_CHATGPT_TAB_ENV, "1");
-        }
-        let strategy = choose_chatgpt_recovery_strategy(
+        let strategy = choose_chatgpt_recovery_strategy_with_flags(
             true,
             Some("about:blank"),
             None,
             "https://chatgpt.com/?_yoetz=test",
+            false,
+            true,
         )
         .unwrap();
-        match previous {
-            Some(value) => {
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::env::set_var(YOETZ_ALLOW_MUTATE_EXISTING_CHATGPT_TAB_ENV, value);
-                }
-            }
-            None => {
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::env::remove_var(YOETZ_ALLOW_MUTATE_EXISTING_CHATGPT_TAB_ENV);
-                }
-            }
-        }
         assert_eq!(strategy, ChatgptRecoveryStrategy::ReuseExistingChatgptTab);
     }
 
     #[test]
-    #[serial_test::serial]
     fn recovery_uses_existing_chatgpt_anchor_only_with_user_tab_opt_in() {
-        let previous = std::env::var(YOETZ_ALLOW_USER_TAB_ANCHOR_ENV).ok();
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var(YOETZ_ALLOW_USER_TAB_ANCHOR_ENV, "1");
-        }
-        let strategy =
-            choose_chatgpt_recovery_strategy(true, None, None, "https://chatgpt.com/?_yoetz=test")
-                .unwrap();
-        match previous {
-            Some(value) => {
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::env::set_var(YOETZ_ALLOW_USER_TAB_ANCHOR_ENV, value);
-                }
-            }
-            None => {
-                #[allow(unsafe_code)]
-                unsafe {
-                    std::env::remove_var(YOETZ_ALLOW_USER_TAB_ANCHOR_ENV);
-                }
-            }
-        }
+        let strategy = choose_chatgpt_recovery_strategy_with_flags(
+            true,
+            None,
+            None,
+            "https://chatgpt.com/?_yoetz=test",
+            true,
+            false,
+        )
+        .unwrap();
         assert_eq!(strategy, ChatgptRecoveryStrategy::ExistingChatgptAnchor);
     }
 
     #[test]
     fn recovery_never_touches_non_yoetz_safe_anchors() {
-        let err = choose_chatgpt_recovery_strategy(
+        let err = choose_chatgpt_recovery_strategy_with_flags(
             false,
             Some("https://meet.google.com/abc-defg-hij"),
             None,
             "https://chatgpt.com/?_yoetz=test",
+            false,
+            false,
         )
         .unwrap_err();
         let msg = format!("{err:#}");
