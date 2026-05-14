@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.4] - 2026-05-14
 ### Added
 
 - Added `yoetz browser check --transport chrome-extension-native` to verify the
@@ -22,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Removed stale source-install, Scoop bucket, docs.rs, and root `prompt.md`
   documentation/artifact drift from the repository.
+
 
 ## [0.5.3] - 2026-05-14
 ### Fixed
