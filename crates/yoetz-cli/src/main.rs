@@ -297,6 +297,10 @@ struct BrowserLoginArgs {
 struct BrowserCheckArgs {
     #[arg(long)]
     profile: Option<PathBuf>,
+    /// Select the browser check transport. Use chrome-extension-native to check
+    /// the extension bridge without CDP approval.
+    #[arg(long, value_parser = parse_recipe_transport_flag)]
+    transport: Option<browser::RecipeTransport>,
     /// CDP endpoint (e.g. http://127.0.0.1:9222). Falls back to YOETZ_BROWSER_CDP env
     /// or config, then chrome://inspect auto-connect (Chrome 144+).
     #[arg(long)]
@@ -304,6 +308,16 @@ struct BrowserCheckArgs {
     /// Select a local Chrome browser by its published `/devtools/browser/<id>` suffix.
     #[arg(long)]
     browser_id: Option<String>,
+    /// Route an extension-native check to a Chrome profile email reported by
+    /// `yoetz browser extension status --chatgpt`.
+    #[arg(long, alias = "profile_email")]
+    profile_email: Option<String>,
+    /// Route an extension-native check to the stable extension instance id.
+    #[arg(long, alias = "extension_instance_id")]
+    extension_instance_id: Option<String>,
+    /// Route an extension-native check to a Chrome extension profile id.
+    #[arg(long, alias = "extension_profile_id")]
+    extension_profile_id: Option<String>,
 }
 
 #[derive(Args)]
@@ -1436,6 +1450,22 @@ fn browser_check_transport_name(transport: BrowserCheckTransport) -> &'static st
     }
 }
 
+fn browser_check_transport_override(
+    transport: browser::RecipeTransport,
+) -> Result<Option<BrowserCheckTransport>> {
+    match transport {
+        browser::RecipeTransport::ChromeDevtoolsMcp => {
+            Ok(Some(BrowserCheckTransport::ChromeDevtoolsMcp))
+        }
+        browser::RecipeTransport::DevBrowser => Ok(Some(BrowserCheckTransport::DevBrowser)),
+        browser::RecipeTransport::AgentBrowser => Ok(Some(BrowserCheckTransport::AgentBrowser)),
+        browser::RecipeTransport::ChromeExtensionNative => Ok(None),
+        browser::RecipeTransport::Manual => {
+            bail!("manual transport is not valid for `yoetz browser check`")
+        }
+    }
+}
+
 fn browser_check_live_method(target: Option<&browser::ResolvedCdpTarget>) -> String {
     match target {
         Some(target) if !target.is_auto_discovered() => format!("cdp: {}", target.endpoint),
@@ -1497,6 +1527,57 @@ fn browser_check_exhausted_error(
         "browser check failed; no browser check transport succeeded.\n\n\
          Attempted transports:\n- {attempted}"
     )
+}
+
+fn check_args_have_extension_selector(args: &BrowserCheckArgs) -> bool {
+    args.profile_email
+        .as_deref()
+        .is_some_and(|value| !value.trim().is_empty())
+        || args
+            .extension_instance_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+        || args
+            .extension_profile_id
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn handle_browser_extension_native_check(
+    args: &BrowserCheckArgs,
+    format: OutputFormat,
+) -> Result<()> {
+    if args.profile.is_some() || args.cdp.is_some() || args.browser_id.is_some() {
+        bail!(
+            "chrome-extension-native check uses the installed extension bridge; do not pass --profile, --cdp, or --browser-id"
+        );
+    }
+    let selector = extension_selector_from_parts(
+        args.profile_email.as_ref(),
+        args.extension_instance_id.as_ref(),
+        args.extension_profile_id.as_ref(),
+    );
+    let bridge = browser_extension_native::canary(false, selector)?;
+    let payload = json!({
+        "status": "ok",
+        "method": "extension_native_dry_run",
+        "transport": browser_extension_native::TRANSPORT_NAME,
+        "live": false,
+        "extension": bridge,
+    });
+    match format {
+        OutputFormat::Json => write_json(&payload),
+        OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
+        OutputFormat::Text | OutputFormat::Markdown => {
+            println!(
+                "Browser extension bridge ready via chrome-extension-native (dry-run canary; no CDP approval)."
+            );
+            println!(
+                "For a live ChatGPT auth probe, run: yoetz browser extension canary --chatgpt --live"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn maybe_print_auto_selected_cdp_target(
@@ -2542,6 +2623,19 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             }
         }
         BrowserCommand::Check(check_args) => {
+            let requested_transport = check_args.transport;
+            if requested_transport == Some(browser::RecipeTransport::ChromeExtensionNative) {
+                return handle_browser_extension_native_check(&check_args, format);
+            }
+            if check_args_have_extension_selector(&check_args) {
+                bail!(
+                    "extension selectors require `yoetz browser check --transport chrome-extension-native`"
+                );
+            }
+            let requested_check_transport = requested_transport
+                .map(browser_check_transport_override)
+                .transpose()?
+                .flatten();
             let managed_profile_only = profile_forces_managed_browser(
                 check_args.profile.as_deref(),
                 check_args.cdp.as_deref(),
@@ -2614,10 +2708,15 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     live_attach_owner_is_present,
                 );
             maybe_print_running_profile_auto_connect_preference(prefer_auto_connect, format);
-            let transports = browser_check_transports(
-                browser::use_dev_browser(),
-                managed_profile_only,
-                prefer_auto_connect,
+            let transports = requested_check_transport.map_or_else(
+                || {
+                    browser_check_transports(
+                        browser::use_dev_browser(),
+                        managed_profile_only,
+                        prefer_auto_connect,
+                    )
+                },
+                |transport| vec![transport],
             );
             let mut prior_live_attach_failure: Option<String> = None;
             let mut check_errors: Vec<(BrowserCheckTransport, String)> = Vec::new();
@@ -4545,6 +4644,28 @@ mod tests {
             browser_check_transports(false, false, true),
             vec![BrowserCheckTransport::ChromeDevtoolsMcp]
         );
+    }
+
+    #[test]
+    fn browser_check_transport_override_maps_recipe_transports() {
+        assert_eq!(
+            browser_check_transport_override(browser::RecipeTransport::ChromeDevtoolsMcp).unwrap(),
+            Some(BrowserCheckTransport::ChromeDevtoolsMcp)
+        );
+        assert_eq!(
+            browser_check_transport_override(browser::RecipeTransport::DevBrowser).unwrap(),
+            Some(BrowserCheckTransport::DevBrowser)
+        );
+        assert_eq!(
+            browser_check_transport_override(browser::RecipeTransport::AgentBrowser).unwrap(),
+            Some(BrowserCheckTransport::AgentBrowser)
+        );
+        assert_eq!(
+            browser_check_transport_override(browser::RecipeTransport::ChromeExtensionNative)
+                .unwrap(),
+            None
+        );
+        assert!(browser_check_transport_override(browser::RecipeTransport::Manual).is_err());
     }
 
     #[test]

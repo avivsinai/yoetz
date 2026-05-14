@@ -35,8 +35,8 @@ If `command -v yoetz` fails, install via one of the following:
 |----------|---------|
 | macOS (Homebrew) | `brew install avivsinai/tap/yoetz` |
 | Linux (Homebrew if available) | `brew install avivsinai/tap/yoetz` |
-| From source (Rust 1.88+) | `cargo install --git https://github.com/avivsinai/yoetz --tag v0.4.0` |
-| Windows (Scoop) | `scoop bucket add yoetz https://github.com/avivsinai/scoop-bucket && scoop install yoetz` |
+| From source (Rust 1.88+) | `cargo install --git https://github.com/avivsinai/yoetz --locked` |
+| Windows (Scoop) | `scoop bucket add avivsinai https://github.com/avivsinai/scoop-bucket && scoop install yoetz` |
 | Pre-built binary | Download from [GitHub Releases](https://github.com/avivsinai/yoetz/releases) and place in PATH |
 
 Prefer Homebrew when available — pre-built binaries, fastest install.
@@ -90,7 +90,8 @@ yoetz models list -s claude --format json
 | Bundle files | `yoetz bundle -p "context" -f src/**/*.rs --format json` |
 | Generate image | `yoetz generate image -p "description" --provider openai --model MODEL_ID --format json` |
 | Estimate cost | `yoetz pricing estimate --model MODEL_ID --input-tokens 1000 --output-tokens 500` |
-| Browser check | `yoetz browser check` |
+| Browser check (CDP/default) | `yoetz browser check` |
+| Extension check | `yoetz browser check --transport chrome-extension-native` |
 | Browser attach | `yoetz browser attach` |
 | Browser login | `yoetz browser login` |
 
@@ -272,6 +273,7 @@ yoetz browser extension status --chatgpt
 yoetz browser extension reconnect --chatgpt
 yoetz browser extension reload --chatgpt
 yoetz browser extension canary --chatgpt
+yoetz browser check --transport chrome-extension-native
 
 yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle "$BUNDLE"
 yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle "$BUNDLE" --var extension_instance_id=ext_...
@@ -280,6 +282,10 @@ yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bund
 The extension transport is ChatGPT-only, experimental, explicit, and currently
 macOS/Linux-only. Do not use it as a general browser interpreter, and do not
 silently fall back to CDP after browser-side side effects have started.
+For extension-native workflows, do not run plain `yoetz browser check`; that
+checks the default CDP/browser stack and may trigger Chrome's remote-debugging
+approval. Use `yoetz browser check --transport chrome-extension-native` or
+`yoetz browser extension doctor --chatgpt` instead.
 
 For autonomous ChatGPT Pro work, prefer focused bundles and expect long waits:
 15-20 minutes is normal for large file analysis, and the default

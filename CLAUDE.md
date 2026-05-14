@@ -109,8 +109,11 @@ Yoetz browser integrations are extension-free by default.
   ChatGPT Pro recipe robustness. It is opt-in only via
   `yoetz browser recipe --recipe chatgpt --transport chrome-extension-native`
   and is managed with `yoetz browser extension install-host --chatgpt`,
-  `doctor --chatgpt`, `status --chatgpt`, `reconnect --chatgpt`, and
-  `canary --chatgpt`.
+  `doctor --chatgpt`, `status --chatgpt`, `reconnect --chatgpt`,
+  `canary --chatgpt`, `inspect --chatgpt --run-id <id>`, and
+  `grant-identity --chatgpt`. Use
+  `yoetz browser check --transport chrome-extension-native` for extension
+  readiness; plain `yoetz browser check` verifies the default CDP/browser stack.
 - For multiple loaded Chrome extension profiles, route extension-native jobs by
   `profile_email` when Chrome exposes it, or by the stable
   `extension_instance_id` shown in `status --chatgpt` when it does not.

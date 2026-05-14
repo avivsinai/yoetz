@@ -32,14 +32,25 @@ yoetz/
 │       │   ├── openai.rs     # OpenAI/OpenRouter API client
 │       │   └── gemini.rs     # Google Gemini API client
 │       ├── browser.rs        # Browser automation (CDP via agent-browser)
+│       ├── browser_extension_native.rs  # ChatGPT native extension bridge
+│       ├── chatgpt_recipe.rs # ChatGPT recipe spec assembly
+│       ├── chatgpt_web.rs    # ChatGPT DOM/web helpers
+│       ├── chrome_devtools_mcp/
+│       │   ├── client.rs     # CDP transport client
+│       │   ├── chatgpt.rs    # ChatGPT CDP recipe flow
+│       │   └── mod.rs
+│       ├── dev_browser.rs    # QuickJS/WASM browser recipe runner
+│       ├── fuzzy.rs          # Lightweight matching helpers
+│       ├── live_attach.rs    # Live Chrome attach daemon
+│       ├── live_cdp_daemon.rs # Local CDP daemon integration
 │       ├── budget.rs         # Daily spend tracking (file-based)
 │       ├── registry.rs       # Runtime model resolution
 │       └── http.rs           # Shared HTTP utilities
 │
 ├── recipes/                  # Browser automation YAML recipes
 ├── skills/                   # Agent skill definitions
-├── scripts/                  # Helper scripts (cookie extraction)
-└── docs/                     # Configuration examples
+├── scripts/                  # Helper scripts
+└── docs/                     # Configuration examples and ADRs
 ```
 
 ## Design Decisions
@@ -85,9 +96,13 @@ Browser integrations are extension-free by default. Yoetz prefers to act as a wr
 - `chrome-devtools-mcp` is the primary live-Chrome transport for ChatGPT recipes.
 - `dev-browser` is the secondary live-Chrome transport.
 - `agent-browser` remains the tertiary / legacy fallback when the first two transports are unavailable or a non-ChatGPT path still depends on it.
+- `manual` is the explicit final fallback; it tells the user to complete the web flow manually and does not need CDP.
 - Explicit CDP endpoints are forwarded to the transport unchanged; the transport owns `/json/version`, `DevToolsActivePort`, and related connection logic.
 
 Connection priority remains connect-first: explicit CDP endpoint > auto-connect > cookie state > profile fallback.
+
+See [ADR-001: Live Attach Owner](docs/decisions/ADR-001-live-attach-owner.md)
+for the ownership model behind the live Chrome attach path.
 
 Chrome 146+ may show a one-time "Allow remote debugging?" approval dialog for a new CDP session. The acceptance criterion is one approval per browser session, not per yoetz invocation, so yoetz avoids silently tearing down live-attach daemons in normal attach/check/recipe flows. Recovery is explicit via `yoetz browser reset`.
 
@@ -97,10 +112,13 @@ extension exception. It is ChatGPT-only, opt-in via
 is not part of the default transport order. Its lifecycle is explicit:
 `yoetz browser extension install-host --chatgpt`,
 `doctor --chatgpt`, `status --chatgpt`, `reconnect --chatgpt`, and
-`canary --chatgpt`. Release builds package it as a separate versioned extension
-zip so the CLI archives do not make the extension path implicit. Manual
-Chrome-side install/update is intentionally explicit: unzip the release artifact,
-load the extracted extension via `chrome://extensions` Developer mode, reload the
+`canary --chatgpt`; `inspect --chatgpt --run-id <id>` is the read-only
+diagnostic path for failed runs, and `grant-identity --chatgpt` opts into
+Chrome's `identity.email` permission when `profile_email` routing is required.
+Release builds package it as a separate versioned extension zip so the CLI
+archives do not make the extension path implicit. Manual Chrome-side
+install/update is intentionally explicit: unzip the release artifact, load the
+extracted extension via `chrome://extensions` Developer mode, reload the
 extension after replacing files, then use `reconnect` and `doctor` to confirm the
 native bridge and extension protocol version agree. The native-host install and
 runtime are currently macOS/Linux-only; Windows requires registry-based native

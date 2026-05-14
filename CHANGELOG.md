@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+
+- Added `yoetz browser check --transport chrome-extension-native` to verify the
+  ChatGPT native extension bridge without exercising CDP or triggering Chrome's
+  remote-debugging approval dialog.
+
+### Changed
+
+- Updated user and contributor documentation for ChatGPT native-extension
+  setup, extension readiness checks, configuration paths, environment variables,
+  release flow, browser transport architecture, and packaging metadata.
+
+### Fixed
+
+- Removed stale source-install, Scoop bucket, docs.rs, and root `prompt.md`
+  documentation/artifact drift from the repository.
 
 ## [0.5.3] - 2026-05-14
 ### Fixed

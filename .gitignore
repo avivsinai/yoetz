@@ -26,6 +26,9 @@ logs/
 coverage/
 tarpaulin-report.html
 
+# Generated prompt/bundle scratch files
+/prompt.md
+
 # Local config (keep examples)
 yoetz.toml
 !docs/config.example.toml

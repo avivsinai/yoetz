@@ -58,7 +58,9 @@ body:
       description: Which LLM provider were you using?
       options:
         - OpenAI
+        - Anthropic
         - Gemini
+        - xAI
         - OpenRouter
         - LiteLLM
         - Browser (ChatGPT)

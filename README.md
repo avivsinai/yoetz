@@ -97,7 +97,7 @@ sudo mv yoetz /usr/local/bin/
 ### From Source
 
 ```bash
-cargo install --git https://github.com/avivsinai/yoetz --tag v0.4.0
+cargo install --git https://github.com/avivsinai/yoetz --locked
 ```
 
 ### Build Locally
@@ -126,22 +126,16 @@ npx skild install @avivsinai/yoetz
 
 ### Configuration
 
-Create `~/.yoetz/config.toml`:
+Create `~/.config/yoetz/config.toml`:
 
-```toml
-[defaults]
-provider = "openrouter"
-model = "anthropic/claude-sonnet-4.5"
-
-[providers.openrouter]
-api_key_env = "OPENROUTER_API_KEY"
-
-[providers.openai]
-api_key_env = "OPENAI_API_KEY"
-
-[providers.gemini]
-api_key_env = "GEMINI_API_KEY"
+```bash
+mkdir -p ~/.config/yoetz
+cp docs/config.example.toml ~/.config/yoetz/config.toml
 ```
+
+Yoetz also loads the legacy `~/.yoetz/config.toml`, profiles under those config
+directories, repo-local `./yoetz.toml` with untrusted-provider safeguards, and
+`YOETZ_CONFIG_PATH` when set.
 
 ### Basic Usage
 
@@ -238,6 +232,9 @@ yoetz browser extension status --chatgpt
 yoetz browser extension reconnect --chatgpt
 yoetz browser extension reload --chatgpt
 yoetz browser extension canary --chatgpt
+yoetz browser extension inspect --chatgpt --run-id <run-id>
+yoetz browser extension grant-identity --chatgpt
+yoetz browser check --transport chrome-extension-native
 
 yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md
 yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md --var profile_email=user@example.com
@@ -253,7 +250,9 @@ Chrome does not expose the profile email to the extension, an explicit
 `profile_email` request also fails closed, but the stable
 `extension_instance_id` selector still works. These selectors identify the
 Chrome extension/profile instance, not the ChatGPT account or Enterprise
-workspace. Exact `browser_context_id` targeting remains CDP-only.
+workspace. To use `profile_email`, first opt in with
+`yoetz browser extension grant-identity --chatgpt`; exact
+`browser_context_id` targeting remains CDP-only.
 
 Release builds publish the ChatGPT native extension as a separate versioned zip
 artifact alongside the CLI archives. To install or update it manually, unzip the
@@ -272,6 +271,10 @@ host manifest to Chrome's default user path. If Chrome is launched with a custom
 `YOETZ_CHROME_NATIVE_MESSAGING_DIR` to that browser user-data directory's
 `NativeMessagingHosts` folder before running `install-host`. On Windows this
 transport fails closed until registry-based native-host setup is added.
+Use `yoetz browser check --transport chrome-extension-native` to verify the
+installed extension bridge without exercising CDP or triggering Chrome's remote
+debugging approval dialog. Use `yoetz browser extension canary --chatgpt --live`
+only when you intentionally want to submit a tiny live ChatGPT probe.
 
 ### DX: ChatGPT Pro autonomous review via the extension transport
 
@@ -334,14 +337,27 @@ yoetz/
 │   │   ├── bundle.rs     # File bundling with gitignore
 │   │   ├── config.rs     # TOML config loading + profiles
 │   │   ├── media.rs      # Media types for multimodal
+│   │   ├── output.rs     # JSON/JSONL formatting
+│   │   ├── paths.rs      # Home/XDG path helpers
+│   │   ├── registry.rs   # Model registry types
+│   │   ├── session.rs    # Session storage
 │   │   └── types.rs      # Shared types
 │   └── yoetz-cli/        # CLI binary
 │       ├── main.rs       # Command handlers
-│       ├── providers/    # OpenAI, Gemini implementations
-│       ├── registry.rs   # Model registry (OpenRouter, LiteLLM)
+│       ├── commands/     # ask, bundle, council, generate, models, pricing, review
+│       ├── providers/    # Provider-specific helpers not covered by litellm-rust
+│       ├── browser.rs    # Browser recipe orchestration
+│       ├── browser_extension_native.rs
+│       ├── chatgpt_recipe.rs
+│       ├── chatgpt_web.rs
+│       ├── chrome_devtools_mcp/
+│       ├── dev_browser.rs
+│       ├── live_attach.rs
+│       ├── live_cdp_daemon.rs
+│       ├── registry.rs   # Runtime model registry
 │       └── budget.rs     # Daily spend tracking
 ├── recipes/              # Browser automation YAML
-└── docs/                 # Configuration examples
+└── docs/                 # Config examples and design decisions
 ```
 
 ## Supported Providers
@@ -360,8 +376,19 @@ yoetz/
 | `OPENROUTER_API_KEY` | OpenRouter API key |
 | `OPENAI_API_KEY` | OpenAI API key |
 | `GEMINI_API_KEY` | Google Gemini API key |
+| `ANTHROPIC_API_KEY` | Anthropic API key for direct Anthropic provider configs |
+| `XAI_API_KEY` | xAI API key for direct xAI/OpenAI-compatible provider configs |
 | `LITELLM_API_KEY` | LiteLLM proxy key |
 | `YOETZ_CONFIG_PATH` | Custom config path |
+| `YOETZ_AGENT=1` | Default command output to JSON for agent parsing |
+| `YOETZ_BROWSER_CDP` | CDP endpoint for browser attach/check/recipe commands |
+| `YOETZ_BROWSER_PROFILE` | Browser profile name used by browser flows |
+| `YOETZ_BROWSER_TARGET_PATH` | Browser target metadata path for live attach |
+| `YOETZ_AGENT_BROWSER_BIN` | Override `agent-browser` executable |
+| `YOETZ_DEV_BROWSER_BIN` | Override `dev-browser` executable |
+| `YOETZ_CHROME_NATIVE_MESSAGING_DIR` | Native Messaging host directory for custom Chrome/Chromium profiles |
+| `YOETZ_REGISTRY_PATH` | Override local model registry cache path |
+| `YOETZ_BUDGET_PATH` | Override local budget ledger path |
 
 ## MSRV Policy
 

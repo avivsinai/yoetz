@@ -1,6 +1,8 @@
 # VHS demo tape for yoetz
 # Install: https://github.com/charmbracelet/vhs
 # Run: vhs demo.tape
+# Model IDs in recorded commands are illustrative; refresh them with
+# `yoetz models frontier --format json` before re-recording.
 
 Output demo.gif
 Set FontSize 16

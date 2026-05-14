@@ -273,7 +273,8 @@ fn browser_check_help_shows_cdp_flag() {
         .args(["browser", "check", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--cdp"));
+        .stdout(predicate::str::contains("--cdp"))
+        .stdout(predicate::str::contains("--transport"));
 }
 
 #[test]

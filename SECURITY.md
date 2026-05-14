@@ -32,4 +32,5 @@ This project uses:
 - **gitleaks** - Automated secret scanning in CI
 - **cargo-deny** - Dependency vulnerability and license auditing
 - **clippy** - Static analysis for common Rust pitfalls
-- No `unsafe` code in library
+- Core library code avoids `unsafe`; the workspace lint warns on any `unsafe`
+  use so reviewers can inspect it explicitly.
