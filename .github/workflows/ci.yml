@@ -178,6 +178,7 @@ jobs:
         if: needs.changes.outputs.light_only != 'true'
         with:
           shared-key: rust-stable-${{ runner.os }}
+          cache-bin: false
       - run: cargo clippy --workspace --all-targets -- -D warnings
         if: needs.changes.outputs.light_only != 'true'
 
@@ -199,6 +200,7 @@ jobs:
         if: needs.changes.outputs.light_only != 'true'
         with:
           shared-key: rust-stable-${{ runner.os }}
+          cache-bin: false
       - run: cargo test --workspace
         if: needs.changes.outputs.light_only != 'true'
 
@@ -216,6 +218,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: rust-msrv-1.88-${{ runner.os }}
+          cache-bin: false
       - run: cargo check --workspace
 
   doc:
@@ -230,6 +233,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: rust-stable-${{ runner.os }}
+          cache-bin: false
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
@@ -278,6 +282,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: rust-stable-${{ runner.os }}
+          cache-bin: false
       - run: cargo build --release --workspace
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.os != 'windows-latest'
@@ -304,6 +309,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: rust-stable-${{ runner.os }}
+          cache-bin: false
       - name: Install Chrome for Testing
         id: install-chrome
         uses: browser-actions/setup-chrome@4f8e94349a351df0f048634f25fec36c3c91eded # v2
