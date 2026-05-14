@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- ChatGPT browser recipes now default the composer prompt to the prompt stored
+  in a Yoetz `bundle.md` session, while preserving explicit `--var prompt=...`
+  overrides, so native-extension runs are governed by the user's task instead
+  of the recipe's generic fallback text.
+- ChatGPT `chrome-extension-native` response extraction now keeps copy-button
+  completion evidence scoped to the current assistant response, avoids detached
+  transcript copy-count shortcuts, and can return valid short model responses
+  after normal stable-idle completion.
+- ChatGPT `chrome-extension-native` now treats manual-handoff states detected
+  from page metadata or no-transcript fallback pages during response wait as
+  terminal instead of polling until timeout, without classifying user prompt or
+  model response text.
+
+### Changed
+
+- Documented the unattended ChatGPT Pro native-extension review loop in the
+  Yoetz skill, including durable JSON outputs, intentional re-review after
+  patches, and the `stable_idle` completion reason.
 
 ## [0.5.2] - 2026-05-13
 ### Fixed

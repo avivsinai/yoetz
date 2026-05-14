@@ -45,6 +45,7 @@ use http::send_json;
 /// (which consume thinking tokens from the budget) but prevents runaway costs on
 /// simple queries when no explicit --max-output-tokens is provided.
 const REGISTRY_OUTPUT_TOKENS_CAP: usize = 16384;
+const DEFAULT_CHATGPT_RECIPE_PROMPT: &str = "Review the attached file and provide your analysis.";
 
 #[derive(Parser)]
 #[command(
@@ -1773,7 +1774,7 @@ fn build_chatgpt_recipe_spec(
         prompt: recipe_vars
             .get("prompt")
             .cloned()
-            .unwrap_or_else(|| "Review the attached file and provide your analysis.".to_string()),
+            .unwrap_or_else(|| DEFAULT_CHATGPT_RECIPE_PROMPT.to_string()),
         browser_context_id: recipe_vars
             .get("browser_context_id")
             .map(|value| value.trim().to_string())
@@ -1803,6 +1804,63 @@ fn build_chatgpt_recipe_spec(
             .get("extended")
             .is_some_and(|value| value == "false"),
     })
+}
+
+fn apply_chatgpt_prompt_default(
+    recipe_args: &BrowserRecipeArgs,
+    recipe_vars: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let prompt = resolve_chatgpt_recipe_prompt(recipe_args, recipe_vars)?;
+    recipe_vars.insert("prompt".to_string(), prompt);
+    Ok(())
+}
+
+fn resolve_chatgpt_recipe_prompt(
+    recipe_args: &BrowserRecipeArgs,
+    recipe_vars: &BTreeMap<String, String>,
+) -> Result<String> {
+    if recipe_args_has_var(recipe_args, "prompt") {
+        return Ok(recipe_vars.get("prompt").cloned().unwrap_or_default());
+    }
+    if let Some(prompt) = bundle_prompt_for_recipe(recipe_args.bundle.as_deref())? {
+        return Ok(prompt);
+    }
+    Ok(recipe_vars
+        .get("prompt")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_CHATGPT_RECIPE_PROMPT.to_string()))
+}
+
+fn recipe_args_has_var(recipe_args: &BrowserRecipeArgs, key: &str) -> bool {
+    recipe_args.vars.iter().any(|entry| {
+        entry
+            .split_once('=')
+            .is_some_and(|(name, _)| name.trim() == key)
+    })
+}
+
+fn bundle_prompt_for_recipe(bundle_path: Option<&Path>) -> Result<Option<String>> {
+    let Some(bundle_path) = bundle_path else {
+        return Ok(None);
+    };
+    if bundle_path.file_name().and_then(|name| name.to_str()) != Some("bundle.md") {
+        return Ok(None);
+    }
+    let Some(session_dir) = bundle_path.parent() else {
+        return Ok(None);
+    };
+    let bundle_json = session_dir.join("bundle.json");
+    if !bundle_json.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(&bundle_json)
+        .with_context(|| format!("read bundle prompt from {}", bundle_json.display()))?;
+    let bundle: yoetz_core::types::Bundle = serde_json::from_str(&raw)
+        .with_context(|| format!("parse bundle prompt from {}", bundle_json.display()))?;
+    if bundle.prompt.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(bundle.prompt))
 }
 
 fn run_recipe_via_chrome_extension_native(
@@ -2876,6 +2934,9 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.browser_defaults, recipe_args.profile.as_ref())?;
             let is_chatgpt = is_chatgpt_recipe(&recipe, &recipe_path);
+            if is_chatgpt {
+                apply_chatgpt_prompt_default(&recipe_args, &mut recipe_vars)?;
+            }
             let managed_profile_only = profile_forces_managed_browser(
                 recipe_args.profile.as_deref(),
                 recipe_args.cdp.as_deref(),
@@ -4900,6 +4961,88 @@ mod tests {
         assert_eq!(spec.upload_timeout_ms, 180_000);
         assert_eq!(spec.send_timeout_ms, 150_000);
         assert!(spec.disable_extended);
+    }
+
+    #[test]
+    fn build_chatgpt_recipe_spec_uses_bundle_prompt_when_prompt_var_absent() {
+        let dir = TempDir::new().unwrap();
+        let bundle_md = dir.path().join("bundle.md");
+        let bundle_json = dir.path().join("bundle.json");
+        fs::write(&bundle_md, "# bundle").unwrap();
+        fs::write(
+            &bundle_json,
+            json!({
+                "prompt": "User supplied task",
+                "files": [],
+                "stats": {
+                    "file_count": 0,
+                    "total_bytes": 0,
+                    "total_chars": 0,
+                    "estimated_tokens": 0
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            transport: None,
+            allow_cdp_fallback: false,
+            bundle: Some(bundle_md),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec![],
+        };
+        let mut recipe_vars = BTreeMap::from([(
+            "prompt".to_string(),
+            DEFAULT_CHATGPT_RECIPE_PROMPT.to_string(),
+        )]);
+
+        apply_chatgpt_prompt_default(&recipe_args, &mut recipe_vars).unwrap();
+        let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
+
+        assert_eq!(spec.prompt, "User supplied task");
+    }
+
+    #[test]
+    fn build_chatgpt_recipe_spec_honors_explicit_prompt_var_over_bundle_prompt() {
+        let dir = TempDir::new().unwrap();
+        let bundle_md = dir.path().join("bundle.md");
+        let bundle_json = dir.path().join("bundle.json");
+        fs::write(&bundle_md, "# bundle").unwrap();
+        fs::write(
+            &bundle_json,
+            json!({
+                "prompt": "Bundle prompt",
+                "files": [],
+                "stats": {
+                    "file_count": 0,
+                    "total_bytes": 0,
+                    "total_chars": 0,
+                    "estimated_tokens": 0
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            transport: None,
+            allow_cdp_fallback: false,
+            bundle: Some(bundle_md),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec!["prompt=Explicit prompt".to_string()],
+        };
+        let mut recipe_vars =
+            BTreeMap::from([("prompt".to_string(), "Explicit prompt".to_string())]);
+
+        apply_chatgpt_prompt_default(&recipe_args, &mut recipe_vars).unwrap();
+        let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
+
+        assert_eq!(spec.prompt, "Explicit prompt");
     }
 
     #[test]

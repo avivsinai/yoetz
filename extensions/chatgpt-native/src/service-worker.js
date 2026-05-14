@@ -1006,6 +1006,17 @@ async function waitForResponse(job) {
     const extraction = await extractResponseForJob(job);
     assertJobConnectionCurrent(job);
     assertJobConversationCurrent(job, extraction);
+    if (extraction?.manual_handoff) {
+      postNative(progress(job, "manual_handoff", extraction.manual_handoff));
+      await failJob(job, "manual_handoff", extraction.manual_handoff.message, {
+        state: extraction.manual_handoff.state,
+        phase: "wait_response",
+        side_effect_started: true,
+        terminal_status: "manual_handoff",
+        diagnostics: diagnosticPayload(extraction.diagnostics)
+      });
+      return null;
+    }
     last = extraction ?? last;
     const postSend = isPostSendExtraction(job, extraction);
     const postSendAssistantActivity = isPostSendAssistantActivity(job, extraction, true);
@@ -1017,15 +1028,17 @@ async function waitForResponse(job) {
       assertJobConnectionCurrent(job);
     }
     const rawText = extraction?.text ?? "";
-    const text = meaningfulResponseText(rawText) ? rawText : "";
-    const finalAffordance = Boolean(postSend && text && hasFinalAssistantAffordance(job, extraction));
+    const extractionIdle = !extraction?.is_generating;
+    const scopedFinalAffordance = Boolean(postSend && hasFinalAssistantAffordance(job, extraction));
+    const allowStableSingleLetter = Boolean(postSend && extractionIdle);
+    const text = meaningfulResponseText(rawText, { allowSingleLetter: scopedFinalAffordance || allowStableSingleLetter }) ? rawText : "";
+    const finalAffordance = Boolean(scopedFinalAffordance && text);
     const finalAffordanceWithoutScopedText = Boolean(
       postSendAssistantActivity
       && extraction?.method === "page_text_fallback"
       && !extraction?.is_generating
       && hasFinalAssistantAffordance(job, extraction)
     );
-    const extractionIdle = !extraction?.is_generating;
     if (postSend && text && extractionIdle && text === lastStableText) {
       stableCount += 1;
       if (!stableSinceMs) {
@@ -1037,7 +1050,7 @@ async function waitForResponse(job) {
       stableSinceMs = stableCount > 0 ? Date.now() : 0;
     }
     const stableForMs = stableSinceMs ? Date.now() - stableSinceMs : 0;
-    if (stableCount >= stablePolls && extraction.method !== "page_text_fallback") {
+    if (postSend && extractionIdle && text && stableCount >= stablePolls && extraction?.method !== "page_text_fallback") {
       if (finalAffordance && stableForMs >= finalAffordanceIdleMs) {
         return completedExtraction(extraction, "copy_button", stableForMs);
       }
@@ -1262,7 +1275,7 @@ function isAcceptableModelSelection(selection) {
 }
 
 function hasFinalAssistantAffordance(job, extraction) {
-  return Boolean(extraction?.has_copy_button);
+  return Boolean(!extraction?.is_generating && extraction?.has_copy_button);
 }
 
 function finalAffordanceExtractionFailureAnchor(extraction) {
@@ -1279,7 +1292,7 @@ function finalAffordanceExtractionFailureMessage(job, extraction, stableForMs) {
   return `ChatGPT rendered a final assistant affordance but Yoetz could not extract scoped assistant text (method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, turn_index=${extraction?.turn_index ?? -1}, copy_button_count=${extraction?.copy_button_count ?? 0}, stable_for_ms=${stableForMs}). Inspect the owned tab with \`yoetz browser extension inspect --chatgpt --run-id ${job.run_id}\` before rerunning.`;
 }
 
-function meaningfulResponseText(text) {
+function meaningfulResponseText(text, options = {}) {
   const lines = String(text ?? "")
     .split(/\n+/)
     .map((line) => line.replace(/\s+/g, " ").trim())
@@ -1287,17 +1300,17 @@ function meaningfulResponseText(text) {
   if (lines.length === 0) {
     return false;
   }
-  return lines.some((line) => !isResponseChromeLine(line));
+  return lines.some((line) => !isResponseChromeLine(line, options));
 }
 
-function isResponseChromeLine(line) {
+function isResponseChromeLine(line, options = {}) {
   return /^(copy|copied|read aloud|share|regenerate|retry|edit|like|dislike)$/i.test(line)
     || /^(thought|reasoned)\s+for\s+\S.*$/i.test(line)
     || /^(analyzing|thinking|working|searching)[.…]*$/i.test(line)
     || /^show\s+(more|reasoning)$/i.test(line)
     || /^(pro thinking|extended thinking|thinking|pro|extended pro)$/i.test(line)
     || /^gpt[\s.-]*\d+(?:[\s.-]*\d+)*(?:\s+(?:pro|thinking))?$/i.test(line)
-    || /^[A-Z]$/.test(line);
+    || (!options.allowSingleLetter && /^[A-Z]$/.test(line));
 }
 
 function completedExtraction(extraction, completionReason, stableForMs) {

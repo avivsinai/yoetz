@@ -52,6 +52,10 @@ export function classifyManualHandoff({ url = "", title = "", text = "" } = {}) 
   return null;
 }
 
+export function classifyWaitManualHandoff({ url = "", title = "" } = {}) {
+  return classifyManualHandoff({ url, title });
+}
+
 export function findComposer(root = document) {
   return firstVisible(root, [
     "#prompt-textarea",
@@ -448,7 +452,19 @@ export function extractResponse(root = document) {
   const latestTextEntry = latestTextBearingAssistantTurn(assistantTurns);
   const latestAssistant = latestTextEntry?.turn ?? assistantTurns.at(-1);
   const turnIndex = latestTextEntry?.index ?? (latestAssistant ? assistantTurns.length - 1 : -1);
-  const latestTurnHasCopyButton = assistantCopyButtons.some((button) => sameAssistantTurn(assistantTurnForNode(button), latestAssistant));
+  const latestUser = userTurns.at(-1);
+  const latestTextConversation = latestTextEntry?.node ? responseConversationScope(latestTextEntry.node, latestUser) : null;
+  const latestTextHasCopyButton = latestTextEntry?.node
+    ? Boolean(
+        latestTextConversation
+          && copyButtons.some((button) => isScopedResponseCopyButton(root, button, latestUser, latestTextConversation, {
+            responseNode: latestTextEntry.node,
+            responseTurn: latestAssistant
+          }))
+      )
+    : false;
+  const latestTurnHasCopyButton = latestTextHasCopyButton
+    || assistantCopyButtons.some((button) => sameAssistantTurn(assistantTurnForNode(button), latestAssistant));
   const diagnostics = extractionDiagnostics(root, assistantTurns, copyButtons);
   const scopedText = latestTextEntry?.text ?? assistantMessageText(latestAssistant);
   if (scopedText) {
@@ -462,6 +478,23 @@ export function extractResponse(root = document) {
       copy_button_count: copyButtonCount,
       has_copy_button: latestTurnHasCopyButton,
       turn_index: turnIndex,
+      diagnostics
+    };
+  }
+
+  const standalone = latestStandaloneAssistantMarkdown(root, userTurns, copyButtons);
+  if (standalone) {
+    const assistantCount = Math.max(assistantTurns.length, 1);
+    return {
+      method: standalone.hasCopyButton ? "copy_scope_dom_fallback" : "assistant_dom_fallback",
+      text: standalone.text,
+      is_generating: isResponseGenerating(root),
+      assistant_count: assistantCount,
+      user_count: userTurns.length,
+      preceding_user_count: precedingTurnCount(root, standalone.node, userTurns),
+      copy_button_count: Math.max(copyButtonCount, standalone.hasCopyButton ? 1 : 0),
+      has_copy_button: standalone.hasCopyButton,
+      turn_index: assistantCount - 1,
       diagnostics
     };
   }
@@ -483,17 +516,209 @@ export function extractResponse(root = document) {
 function latestTextBearingAssistantTurn(assistantTurns) {
   for (let index = assistantTurns.length - 1; index >= 0; index -= 1) {
     const turn = assistantTurns[index];
-    const text = assistantMessageText(turn);
-    if (text) {
-      return { turn, index, text };
+    const entry = assistantMessageTextEntry(turn);
+    if (entry.text) {
+      return { turn, index, ...entry };
     }
   }
   return null;
 }
 
+function latestStandaloneAssistantMarkdown(root, userTurns, copyButtons) {
+  const latestUser = userTurns.at(-1);
+  if (!latestUser) {
+    return null;
+  }
+  const conversation = conversationScope(latestUser);
+  if (!conversation) {
+    return null;
+  }
+  const ordered = flattenTree(root.documentElement ?? root.body ?? root);
+  const latestUserIndex = ordered.indexOf(latestUser);
+  if (latestUserIndex < 0) {
+    return null;
+  }
+  for (let index = ordered.length - 1; index > latestUserIndex; index -= 1) {
+    const marker = ordered[index];
+    if (marker?.getAttribute?.("data-message-author-role") !== "assistant"
+      || !containsNode(conversation, marker)
+      || isInsideUserTurn(marker)
+      || isNonConversationChrome(marker)) {
+      continue;
+    }
+    const segment = standaloneAssistantSegment(root, conversation, ordered, marker, latestUser, copyButtons);
+    if (segment) {
+      return segment;
+    }
+  }
+  return null;
+}
+
+function standaloneAssistantSegment(root, conversation, ordered, marker, latestUser, copyButtons) {
+  const markerIndex = ordered.indexOf(marker);
+  if (markerIndex < 0) {
+    return null;
+  }
+  const nextBoundaryIndex = nextRoleBoundaryIndex(ordered, markerIndex);
+  const markdownNodes = leafNodes(Array.from(conversation.querySelectorAll('[class*="markdown"]')))
+    .filter((node) => {
+      const nodeIndex = ordered.indexOf(node);
+      return nodeIndex > markerIndex
+        && (nextBoundaryIndex < 0 || nodeIndex < nextBoundaryIndex)
+        && nodePrecedes(root, latestUser, node)
+        && isVisible(node, { allowDisabled: true })
+        && !isInsideUserTurn(node)
+        && !isNonConversationChrome(node);
+    });
+  const textEntries = markdownNodes
+    .map((node) => ({ node, text: cleanAssistantText(node, { allowSingleLetter: true }) }))
+    .filter((entry) => entry.text);
+  if (textEntries.length === 0) {
+    return null;
+  }
+  const hasCopyButton = copyButtons.some((button) => isScopedResponseCopyButton(root, button, latestUser, conversation, {
+    ordered,
+    startIndex: markerIndex,
+    nextBoundaryIndex
+  }));
+  return {
+    node: textEntries.at(-1).node,
+    text: normalizeText(textEntries.map((entry) => entry.text).join("\n\n")),
+    hasCopyButton
+  };
+}
+
+function nextRoleBoundaryIndex(ordered, startIndex) {
+  for (let index = startIndex + 1; index < ordered.length; index += 1) {
+    const role = ordered[index]?.getAttribute?.("data-message-author-role");
+    if (role === "user" || role === "assistant") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function isScopedResponseCopyButton(root, button, latestUser, conversation, scope = {}) {
+  if (!isCopyControl(button) || !isVisible(button, { allowDisabled: true, allowTransparent: true, allowPointerEventsNone: true, allowNoLayout: true })) {
+    return false;
+  }
+  if (!containsNode(conversation, button) || isNonConversationChrome(button) || isInsideUserTurn(button)) {
+    return false;
+  }
+  if (latestUser && !nodePrecedes(root, latestUser, button)) {
+    return false;
+  }
+  if (scope.responseNode && sameResponseFrame(button, scope.responseNode)) {
+    return true;
+  }
+  if (scope.responseTurn && sameAssistantTurn(assistantTurnForNode(button), scope.responseTurn)) {
+    return true;
+  }
+  const ordered = scope.ordered ?? flattenTree(root.documentElement ?? root.body ?? root);
+  const buttonIndex = ordered.indexOf(button);
+  if (buttonIndex < 0) {
+    return false;
+  }
+  if (Number.isInteger(scope.startIndex)) {
+    return buttonIndex > scope.startIndex
+      && (scope.nextBoundaryIndex < 0 || buttonIndex < scope.nextBoundaryIndex);
+  }
+  if (!scope.responseNode) {
+    return false;
+  }
+  const responseIndex = ordered.indexOf(scope.responseNode);
+  if (responseIndex < 0) {
+    return false;
+  }
+  if (buttonIndex > responseIndex) {
+    return !hasResponseBoundaryBetween(ordered, responseIndex, buttonIndex);
+  }
+  return !hasResponseBoundaryBetween(ordered, buttonIndex, responseIndex);
+}
+
+function hasResponseBoundaryBetween(ordered, startIndex, endIndex) {
+  for (let index = startIndex + 1; index < endIndex; index += 1) {
+    const node = ordered[index];
+    const role = node?.getAttribute?.("data-message-author-role");
+    if (role === "user" || role === "assistant") {
+      return true;
+    }
+    if (isMarkdownNode(node) && cleanAssistantText(node, { allowSingleLetter: true })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function sameResponseFrame(left, right) {
+  const leftFrame = responseFrame(left);
+  return Boolean(leftFrame && leftFrame === responseFrame(right));
+}
+
+function responseFrame(node) {
+  return node?.closest?.('[data-testid*="conversation-turn"], article') ?? null;
+}
+
+function isInsideUserTurn(node) {
+  return Boolean(node.closest?.('[data-message-author-role="user"], [class*="user-turn"]'));
+}
+
+function responseConversationScope(node, latestUser) {
+  const userScope = latestUser ? conversationScope(latestUser) : null;
+  if (userScope && containsNode(userScope, node)) {
+    return userScope;
+  }
+  return conversationScope(node);
+}
+
+function conversationScope(node) {
+  for (let current = node; current; current = current.parentElement) {
+    // A turn can be labelled like a conversation; walk past it to the transcript root.
+    if (isTurnLikeScope(current)) {
+      continue;
+    }
+    if (isConversationContainer(current)) {
+      return current;
+    }
+  }
+  return null;
+}
+
+function isConversationContainer(node) {
+  const marker = nodeMarker(node, ["tag", "role", "data-testid", "class"]);
+  return /\bmain\b/i.test(marker)
+    || /\bconversation\b/i.test(marker);
+}
+
+function isTurnLikeScope(node) {
+  const marker = nodeMarker(node, ["data-message-author-role", "data-testid", "class"]);
+  return /\b(user|assistant|conversation-turn|turn-messages|user-turn|agent-turn)\b/i.test(marker);
+}
+
+function isNonConversationChrome(node) {
+  for (let current = node; current; current = current.parentElement) {
+    const marker = nodeMarker(current, ["tag", "role", "data-testid", "class", "aria-label"]);
+    if (/\b(aside|nav|header|footer|complementary|navigation|dialog|sidebar|side-panel|popover|modal)\b/i.test(marker)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function nodeMarker(node, fields) {
+  return fields
+    .map((field) => field === "tag" ? node?.tagName?.toLowerCase?.() : node?.getAttribute?.(field))
+    .filter(Boolean)
+    .join(" ");
+}
+
 function assistantMessageText(turn) {
+  return assistantMessageTextEntry(turn).text;
+}
+
+function assistantMessageTextEntry(turn) {
   if (!turn) {
-    return "";
+    return { node: null, text: "" };
   }
   const contentNodes = [];
   const addContentNode = (node) => {
@@ -516,14 +741,22 @@ function assistantMessageText(turn) {
       }
     }
   }
-  for (const node of contentNodes) {
-    const text = cleanAssistantText(node);
+  const leafContentNodes = leafNodes(contentNodes);
+  const textEntries = [];
+  for (const node of leafContentNodes) {
+    const text = cleanAssistantText(node, { allowSingleLetter: isMarkdownNode(node) });
     if (text) {
-      return text;
+      textEntries.push({ node, text });
     }
   }
+  if (textEntries.length > 0) {
+    return {
+      node: textEntries.at(-1).node,
+      text: normalizeText(textEntries.map((entry) => entry.text).join("\n\n"))
+    };
+  }
   const fallback = cleanAssistantText(turn);
-  return isModelStatusText(fallback) ? "" : fallback;
+  return { node: turn, text: isModelStatusText(fallback) ? "" : fallback };
 }
 
 function isAssistantContentNode(node) {
@@ -537,11 +770,15 @@ function isAssistantContentNode(node) {
     || /\bassistant\b/i.test(marker);
 }
 
-function cleanAssistantText(node) {
+function leafNodes(nodes) {
+  return nodes.filter((node) => !nodes.some((other) => other !== node && containsNode(node, other)));
+}
+
+function cleanAssistantText(node, options = {}) {
   const lines = textOf(node)
     .split(/\n+/)
     .map((line) => normalizeText(line))
-    .filter((line) => line && !isAssistantControlLine(line) && !isAssistantNoiseLine(line));
+    .filter((line) => line && !isAssistantControlLine(line) && !isAssistantNoiseLine(line, options));
   return normalizeText(lines.join("\n"));
 }
 
@@ -557,8 +794,12 @@ function isModelStatusText(text) {
     || /^gpt[\s.-]*\d+(?:[\s.-]*\d+)*(?:\s+(?:pro|thinking))?$/i.test(value);
 }
 
-function isAssistantNoiseLine(line) {
-  return /^[A-Z]$/.test(line);
+function isAssistantNoiseLine(line, options = {}) {
+  return !options.allowSingleLetter && /^[A-Z]$/.test(line);
+}
+
+function isMarkdownNode(node) {
+  return /\bmarkdown\b/i.test(String(node?.getAttribute?.("class") ?? ""));
 }
 
 function isThoughtStatusLine(line) {
@@ -1020,7 +1261,7 @@ function findUserTurns(root) {
   const explicitUserTurns = Array.from(root.querySelectorAll('[data-message-author-role="user"]'))
     .map((node) => node.closest?.('article, [data-testid*="conversation-turn"], [class*="user-turn"], [class*="turn-messages"]') ?? node);
   return uniqueElements(explicitUserTurns)
-    .filter((node) => isVisible(node, { allowDisabled: true }));
+    .filter((node) => isVisible(node, { allowDisabled: true, allowNoLayout: true }));
 }
 
 function findAssistantTurns(root) {
@@ -1037,7 +1278,7 @@ function findAssistantTurns(root) {
   const copyScopedTurns = Array.from(root.querySelectorAll('button[aria-label*="Copy"], button[data-testid*="copy"]'))
     .map((node) => assistantTurnForNode(node));
   return uniqueElements([...explicitAssistantTurns, ...markdownAssistantTurns, ...copyScopedTurns])
-    .filter((node) => isVisible(node, { allowDisabled: true }));
+    .filter((node) => isVisible(node, { allowDisabled: true, allowNoLayout: true }));
 }
 
 function assistantTurnForNode(node) {
@@ -1359,7 +1600,8 @@ function isVisible(element, options = {}) {
   if (!options.allowDisabled && !isEnabled(element)) {
     return false;
   }
-  if (typeof element.checkVisibility === "function") {
+  const usesHiddenAffordanceException = options.allowTransparent || options.allowPointerEventsNone || options.allowNoLayout;
+  if (!usesHiddenAffordanceException && typeof element.checkVisibility === "function") {
     try {
       if (!element.checkVisibility({
         checkOpacity: true,
@@ -1386,8 +1628,8 @@ function isVisible(element, options = {}) {
     if (style && (
       style.visibility === "hidden"
       || style.display === "none"
-      || style.opacity === "0"
-      || style.pointerEvents === "none"
+      || (!options.allowTransparent && style.opacity === "0")
+      || (!options.allowPointerEventsNone && style.pointerEvents === "none")
     )) {
       return false;
     }

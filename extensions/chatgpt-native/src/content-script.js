@@ -133,7 +133,11 @@ async function sendPrompt(job, prompt) {
 }
 
 async function extractJobResponse(job) {
-  const { extractResponse, parseOwnedWindowName } = await domHelpers();
+  const {
+    classifyWaitManualHandoff,
+    extractResponse,
+    parseOwnedWindowName
+  } = await domHelpers();
   assertJobOwnership(job, parseOwnedWindowName);
   const conversationId = conversationIdFromUrl(location.href);
   if (job.submitted_conversation_id && conversationId && job.submitted_conversation_id !== conversationId) {
@@ -146,8 +150,17 @@ async function extractJobResponse(job) {
       }
     );
   }
+  const extraction = extractResponse(document);
+  // During response wait, page text includes the user prompt and model output.
+  // Handoff classification here must stay on transport/page metadata only.
+  const handoff = classifyWaitManualHandoff({
+    url: location.href,
+    title: document.title,
+    extraction
+  });
   return {
-    ...extractResponse(document),
+    ...extraction,
+    manual_handoff: handoff,
     url: location.href,
     conversation_id: conversationId
   };

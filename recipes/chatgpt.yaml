@@ -22,7 +22,9 @@ name: chatgpt
 #              best available model, preferring GPT-5/Pro when the account has it.
 #              Set to "" or "current" to keep the current ChatGPT selector state.
 #   extended — set to "false" to disable Extended Pro. Default: leave as-is.
-#   prompt   — prompt text to send with the attachment.
+#   prompt   — prompt text to send with the attachment. For Yoetz bundle
+#              sessions, typed ChatGPT transports default this to bundle.json's
+#              stored user prompt unless --var prompt=... explicitly overrides.
 #   browser_context_id — exact Chrome `browserContextId` to target when multiple
 #              signed-in Chrome contexts are live in the same browser process.
 #   profile_email — signed-in Chrome profile email to target (for example

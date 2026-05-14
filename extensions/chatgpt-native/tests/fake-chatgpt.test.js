@@ -70,7 +70,24 @@ class FakeElement {
   }
 
   getClientRects() {
+    if (this.attrs.noLayout) {
+      return [];
+    }
     return [{}];
+  }
+
+  checkVisibility(options = {}) {
+    const style = String(this.attrs.style ?? "");
+    if (/display\s*:\s*none/i.test(style) || /visibility\s*:\s*hidden/i.test(style)) {
+      return false;
+    }
+    if (options.checkOpacity && /opacity\s*:\s*0(?:\.0+)?\b/i.test(style)) {
+      return false;
+    }
+    if (this.attrs.noLayout) {
+      return false;
+    }
+    return true;
   }
 
   querySelectorAll(selector) {
@@ -98,7 +115,9 @@ class FakeDocument {
         const style = String(element.attrs.style ?? "");
         return {
           display: /display\s*:\s*none/i.test(style) ? "none" : "block",
-          visibility: /visibility\s*:\s*hidden/i.test(style) ? "hidden" : "visible"
+          visibility: /visibility\s*:\s*hidden/i.test(style) ? "hidden" : "visible",
+          opacity: /opacity\s*:\s*0(?:\.0+)?\b/i.test(style) ? "0" : "1",
+          pointerEvents: /pointer-events\s*:\s*none/i.test(style) ? "none" : "auto"
         };
       },
       location: {
@@ -303,6 +322,25 @@ test("extractResponse associates sibling copy controls with nested assistant con
   assert.equal(extraction.has_copy_button, true);
 });
 
+test("extractResponse does not associate user-turn copy controls with assistant content", () => {
+  const prompt = new FakeElement("div", { class: "markdown prose" }, "Review bundle");
+  const userCopy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle")
+    .append(prompt, userCopy);
+  const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Final answer")
+    .append(new FakeElement("div", { class: "markdown prose" }, "Final answer"));
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Final answer")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "Review bundle Final answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.text, "Final answer");
+  assert.equal(extraction.has_copy_button, false);
+});
+
 test("extractResponse does not promote mixed user and assistant role turns", () => {
   const userMarker = new FakeElement("div", { "data-message-author-role": "user" }, "User prompt");
   const roleMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "Assistant marker");
@@ -360,6 +398,331 @@ test("extractResponse ignores single-letter assistant fragments", () => {
 
   assert.equal(extraction.method, "page_text_fallback");
   assert.equal(extraction.assistant_count, 1);
+});
+
+test("extractResponse returns single-letter assistant markdown with a copy affordance", () => {
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Thought for 7m 44s\n\nI")
+    .append(new FakeElement("div", { class: "markdown prose" }, "I"), copy);
+  const body = new FakeElement("body", {}, "Thought for 7m 44s I").append(assistant);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse does not reuse an earlier assistant copy button for a newer assistant text", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const oldMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const oldMarkdown = new FakeElement("div", { class: "markdown prose" }, "Old answer");
+  const oldTurn = new FakeElement("div", { class: "turn-messages" }, "Old answer").append(oldMarker, oldMarkdown);
+  const oldCopy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const oldActionRow = new FakeElement("div", { class: "agent-turn" }, "Copy").append(oldCopy);
+  const newMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const newMarkdown = new FakeElement("div", { class: "markdown prose" }, "Partial answer");
+  const newTurn = new FakeElement("div", { class: "turn-messages" }, "Partial answer").append(newMarker, newMarkdown);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Old answer Copy Partial answer")
+    .append(user, oldTurn, oldActionRow, newTurn);
+  const body = new FakeElement("body", {}, "Review bundle Old answer Copy Partial answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.text, "Partial answer");
+  assert.equal(extraction.has_copy_button, false);
+  assert.equal(extraction.copy_button_count, 1);
+});
+
+test("extractResponse associates a split copy button before assistant markdown within the same response", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const copy = new FakeElement("button", { "aria-label": "Copy", noLayout: true }, "Copy");
+  const actionRow = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "I");
+  const responseShell = new FakeElement("div", { "data-testid": "conversation-turn-2", class: "thread" }, "Copy I")
+    .append(marker, actionRow, markdown);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Copy I")
+    .append(user, responseShell);
+  const body = new FakeElement("body", {}, "Review bundle Copy I").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse does not reuse a copy button from an earlier response frame", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const oldMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const oldMarkdown = new FakeElement("div", { class: "markdown prose" }, "Old answer");
+  const oldCopy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const oldFrame = new FakeElement("div", { "data-testid": "conversation-turn-old" }, "Old answer Copy")
+    .append(oldMarker, oldMarkdown, new FakeElement("div", { class: "agent-turn" }, "Copy").append(oldCopy));
+  const newMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const newMarkdown = new FakeElement("div", { class: "markdown prose" }, "Partial answer");
+  const newFrame = new FakeElement("div", { "data-testid": "conversation-turn-new" }, "Partial answer")
+    .append(newMarker, newMarkdown);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Old answer Copy Partial answer")
+    .append(user, oldFrame, newFrame);
+  const body = new FakeElement("body", {}, "Review bundle Old answer Copy Partial answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.text, "Partial answer");
+  assert.equal(extraction.has_copy_button, false);
+});
+
+test("extractResponse accepts one transcript copy button for one assistant response after the latest user", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "I");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "I").append(marker, markdown);
+  const copy = new FakeElement("button", { "aria-label": "Copy", noLayout: true }, "Copy");
+  const detachedActionRow = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle I Copy")
+    .append(user, assistantTurn, detachedActionRow);
+  const body = new FakeElement("body", {}, "Review bundle I Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse does not use an unscoped transcript copy button when multiple assistant responses follow the latest user", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const oldMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const oldMarkdown = new FakeElement("div", { class: "markdown prose" }, "Old answer");
+  const oldTurn = new FakeElement("div", { class: "turn-messages" }, "Old answer").append(oldMarker, oldMarkdown);
+  const copy = new FakeElement("button", { "aria-label": "Copy", noLayout: true }, "Copy");
+  const detachedActionRow = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const newMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const newMarkdown = new FakeElement("div", { class: "markdown prose" }, "Partial answer");
+  const newTurn = new FakeElement("div", { class: "turn-messages" }, "Partial answer").append(newMarker, newMarkdown);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Old answer Copy Partial answer")
+    .append(user, oldTurn, detachedActionRow, newTurn);
+  const body = new FakeElement("body", {}, "Review bundle Old answer Copy Partial answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.text, "Partial answer");
+  assert.equal(extraction.has_copy_button, false);
+});
+
+test("extractResponse associates a copy button after the assistant markdown text node", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "I");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "Thought for 7m 44s\n\nI")
+    .append(marker, markdown);
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const copyTurn = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Thought for 7m 44s I Copy")
+    .append(user, assistantTurn, copyTurn);
+  const body = new FakeElement("body", {}, "Review bundle Thought for 7m 44s I Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, true);
+  assert.equal(extraction.copy_button_count, 1);
+});
+
+test("extractResponse associates a copy button before the assistant markdown text node", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "I");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "Thought for 7m 44s\n\nI")
+    .append(marker, copy, markdown);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Copy Thought for 7m 44s I")
+    .append(user, assistantTurn);
+  const body = new FakeElement("body", {}, "Review bundle Copy Thought for 7m 44s I").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, true);
+  assert.equal(extraction.copy_button_count, 1);
+});
+
+test("extractResponse associates a visually hidden copy button with assistant markdown", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "I");
+  const copy = new FakeElement("button", { "aria-label": "Copy", style: "opacity:0; pointer-events:none" }, "Copy");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "Thought for 7m 24s\n\nI")
+    .append(marker, markdown);
+  const copyTurn = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Thought for 7m 24s I Copy")
+    .append(user, assistantTurn, copyTurn);
+  const body = new FakeElement("body", {}, "Review bundle Thought for 7m 24s I Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse associates a zero-layout hidden copy button with assistant markdown", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "I");
+  const copy = new FakeElement("button", { "aria-label": "Copy", noLayout: true }, "Copy");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "I")
+    .append(marker, markdown);
+  const copyTurn = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle I Copy")
+    .append(user, assistantTurn, copyTurn);
+  const body = new FakeElement("body", {}, "Review bundle I Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse returns all rendered markdown blocks from one assistant turn", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const intro = new FakeElement("div", { class: "markdown prose" }, "I will review this.");
+  const findings = new FakeElement("div", { class: "markdown prose" }, "I have actionable comments.");
+  const copy = new FakeElement("button", { "aria-label": "Copy", style: "opacity:0; pointer-events:none" }, "Copy");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "I will review this. I have actionable comments.")
+    .append(marker, intro, findings);
+  const actionRow = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle I will review this. I have actionable comments. Copy")
+    .append(user, assistantTurn, actionRow);
+  const body = new FakeElement("body", {}, "Review bundle I will review this. I have actionable comments. Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "I will review this.\n\nI have actionable comments.");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse uses the latest user transcript scope for split action rows", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "Final answer");
+  const innerThread = new FakeElement("div", { class: "thread" }, "Final answer")
+    .append(marker, markdown);
+  const copy = new FakeElement("button", { "aria-label": "Copy", style: "opacity:0; pointer-events:none" }, "Copy");
+  const actionRow = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Final answer Copy")
+    .append(user, innerThread, actionRow);
+  const body = new FakeElement("body", {}, "Review bundle Final answer Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Final answer");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse walks past plain thread wrappers to the transcript scope", () => {
+  const userMarkdown = new FakeElement("div", { class: "markdown prose" }, "Review bundle");
+  const user = new FakeElement("div", { class: "thread" }, "Review bundle")
+    .append(new FakeElement("div", { class: "turn-messages", "data-message-author-role": "user" }, "Review bundle").append(userMarkdown));
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "I");
+  const assistant = new FakeElement("div", { class: "thread" }, "I")
+    .append(new FakeElement("div", { class: "turn-messages" }, "I").append(marker, markdown));
+  const copy = new FakeElement("button", { "aria-label": "Copy", noLayout: true }, "Copy");
+  const actionRow = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const transcript = new FakeElement("main", { role: "main" }, "Review bundle I Copy")
+    .append(user, assistant, actionRow);
+  const body = new FakeElement("body", {}, "Review bundle I Copy").append(transcript);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse ignores display-none copy buttons after assistant markdown", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "I");
+  const copy = new FakeElement("button", { "aria-label": "Copy", style: "display:none" }, "Copy");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "Thought for 7m 24s\n\nI")
+    .append(marker, markdown);
+  const copyTurn = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Thought for 7m 24s I Copy")
+    .append(user, assistantTurn, copyTurn);
+  const body = new FakeElement("body", {}, "Review bundle Thought for 7m 24s I Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, false);
+});
+
+test("extractResponse does not associate a stale copy button before the latest user turn", () => {
+  const oldAnswer = new FakeElement("div", { class: "markdown prose" }, "Old answer");
+  const oldCopy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "I");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "Thought for 7m 44s\n\nI")
+    .append(marker, markdown);
+  const conversation = new FakeElement("main", { role: "main" }, "Old answer Copy Review bundle Thought for 7m 44s I")
+    .append(oldAnswer, oldCopy, user, assistantTurn);
+  const body = new FakeElement("body", {}, "Old answer Copy Review bundle Thought for 7m 44s I").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, false);
+});
+
+test("extractResponse ignores popover copy controls after assistant markdown", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "Final answer");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "Final answer")
+    .append(marker, markdown);
+  const popover = new FakeElement("div", { role: "dialog" }, "Copy link")
+    .append(new FakeElement("button", { "aria-label": "Copy link" }, "Copy"));
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Final answer Copy link")
+    .append(user, assistantTurn, popover);
+  const body = new FakeElement("body", {}, "Review bundle Final answer Copy link").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.text, "Final answer");
+  assert.equal(extraction.has_copy_button, false);
 });
 
 test("extractResponse ignores thought-only assistant chrome", () => {
@@ -420,6 +783,254 @@ test("extractResponse does not treat user markdown as assistant content", () => 
 
   assert.equal(extraction.method, "page_text_fallback");
   assert.equal(extraction.assistant_count, 0);
+});
+
+test("extractResponse uses standalone assistant markdown after an assistant role marker", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "Final answer");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Final answer").append(user, marker, answer, copy);
+  const body = new FakeElement("body", {}, "Review bundle Final answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Final answer");
+  assert.equal(extraction.preceding_user_count, 1);
+  assert.equal(extraction.has_copy_button, true);
+  assert.equal(extraction.assistant_count, 1);
+});
+
+test("extractResponse uses standalone markdown with zero-layout role markers", () => {
+  const user = new FakeElement("div", { "data-message-author-role": "user", noLayout: true }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant", noLayout: true }, "");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "Final answer");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Final answer").append(user, marker, answer, copy);
+  const body = new FakeElement("body", {}, "Review bundle Final answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Final answer");
+  assert.equal(extraction.user_count, 1);
+  assert.equal(extraction.assistant_count, 1);
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse returns all standalone markdown blocks after one assistant role marker", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const intro = new FakeElement("div", { class: "markdown prose" }, "First part.");
+  const conclusion = new FakeElement("div", { class: "markdown prose" }, "Second part.");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle First part. Second part. Copy")
+    .append(user, marker, intro, conclusion, copy);
+  const body = new FakeElement("body", {}, "Review bundle First part. Second part. Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "First part.\n\nSecond part.");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse ignores standalone markdown with copy but without assistant ownership", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "Final answer");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Final answer").append(user, answer, copy);
+  const body = new FakeElement("body", {}, "Review bundle Final answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
+});
+
+test("extractResponse does not use user-turn copy controls for standalone markdown", () => {
+  const prompt = new FakeElement("div", { class: "markdown prose" }, "Review bundle");
+  const userCopy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle")
+    .append(prompt, userCopy);
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "Final answer");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Final answer")
+    .append(user, marker, answer);
+  const body = new FakeElement("body", {}, "Review bundle Final answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.text, "Final answer");
+  assert.equal(extraction.has_copy_button, false);
+});
+
+test("extractResponse does not let a turn-like user wrapper hide later standalone markdown", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", "data-testid": "conversation-turn-1" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "Final answer");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Final answer").append(user, marker, answer, copy);
+  const body = new FakeElement("body", {}, "Review bundle Final answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Final answer");
+});
+
+test("extractResponse uses standalone assistant markdown with a sibling role marker", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "Final answer");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Final answer").append(user, marker, answer);
+  const body = new FakeElement("body", {}, "Review bundle Final answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.text, "Final answer");
+  assert.equal(extraction.preceding_user_count, 1);
+  assert.equal(extraction.has_copy_button, false);
+  assert.equal(extraction.assistant_count, 1);
+});
+
+test("extractResponse uses the latest standalone assistant markdown candidate", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const partialMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const partial = new FakeElement("div", { class: "markdown prose" }, "Partial answer");
+  const partialCopy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const answerMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "Final answer");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Partial answer Final answer")
+    .append(user, partialMarker, partial, partialCopy, answerMarker, answer, copy);
+  const body = new FakeElement("body", {}, "Review bundle Partial answer Final answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Final answer");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse ignores standalone markdown when the assistant marker follows it", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "Final answer");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Final answer").append(user, answer, marker);
+  const body = new FakeElement("body", {}, "Review bundle Final answer").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
+});
+
+test("extractResponse preserves generating state for standalone assistant markdown", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "Partial answer");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const stop = new FakeElement("button", { "aria-label": "Stop generating" }, "Stop");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Partial answer Stop").append(user, marker, answer, copy, stop);
+  const body = new FakeElement("body", {}, "Review bundle Partial answer Stop").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Partial answer");
+  assert.equal(extraction.is_generating, true);
+});
+
+test("extractResponse ignores split user-role markdown with copy controls", () => {
+  const marker = new FakeElement("div", { "data-message-author-role": "user" }, "");
+  const prompt = new FakeElement("div", { class: "markdown prose" }, "User prompt");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const userTurn = new FakeElement("div", { class: "turn-messages" }, "User prompt").append(marker, prompt, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "User prompt").append(userTurn);
+  const body = new FakeElement("body", {}, "User prompt").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
+  assert.equal(extraction.assistant_count, 0);
+});
+
+test("extractResponse ignores standalone markdown without assistant evidence", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const sidebar = new FakeElement("div", { class: "markdown prose" }, "Sidebar note");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle").append(user);
+  const body = new FakeElement("body", {}, "Review bundle Sidebar note").append(conversation, sidebar);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
+});
+
+test("extractResponse ignores sidebar thread markdown with a copy button", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle").append(user);
+  const sidebar = new FakeElement("aside", {}, "Sidebar note")
+    .append(new FakeElement("div", { class: "thread" }, "Sidebar note")
+      .append(new FakeElement("div", { class: "markdown prose" }, "Sidebar note"), new FakeElement("button", { "aria-label": "Copy" }, "Copy")));
+  const body = new FakeElement("body", {}, "Review bundle Sidebar note").append(conversation, sidebar);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
+});
+
+test("extractResponse ignores sidebar markdown with a copy button", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle").append(user);
+  const sidebar = new FakeElement("aside", {}, "Sidebar note")
+    .append(new FakeElement("div", { class: "markdown prose" }, "Sidebar note"), new FakeElement("button", { "aria-label": "Copy" }, "Copy"));
+  const body = new FakeElement("body", {}, "Review bundle Sidebar note").append(conversation, sidebar);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
+});
+
+test("extractResponse ignores sidebar markdown inside the conversation landmark", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const sidebar = new FakeElement("aside", {}, "Sidebar note")
+    .append(new FakeElement("div", { class: "markdown prose" }, "Sidebar note"), new FakeElement("button", { "aria-label": "Copy" }, "Copy"));
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Sidebar note").append(user, sidebar);
+  const body = new FakeElement("body", {}, "Review bundle Sidebar note").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
+});
+
+test("extractResponse does not reuse standalone markdown before the latest user turn", () => {
+  const oldAnswer = new FakeElement("div", { class: "markdown prose" }, "Old answer");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "New prompt");
+  const conversation = new FakeElement("main", { role: "main" }, "Old answer New prompt").append(oldAnswer, copy, user);
+  const body = new FakeElement("body", {}, "Old answer New prompt").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
 });
 
 test("ensureFreshChat rejects dirty composers and existing attachments", async () => {

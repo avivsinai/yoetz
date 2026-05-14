@@ -281,8 +281,8 @@ The extension transport is ChatGPT-only, experimental, explicit, and currently
 macOS/Linux-only. Do not use it as a general browser interpreter, and do not
 silently fall back to CDP after browser-side side effects have started.
 
-For autonomous ChatGPT Pro reviews, prefer focused bundles and expect long waits:
-15-20 minutes is normal for real file analysis, and the default
+For autonomous ChatGPT Pro work, prefer focused bundles and expect long waits:
+15-20 minutes is normal for large file analysis, and the default
 `wait_timeout_ms` is 30 minutes. Use JSON output and a durable result file;
 progress is emitted to stderr so stdout remains valid JSON. Example:
 
@@ -296,14 +296,27 @@ YOETZ_AGENT=1 yoetz browser recipe \
   --var extension_instance_id=ext_...
 ```
 
-Keep the process attached until it returns. If it fails after upload/send/wait,
-inspect the marked tab with the run id from the error instead of rerunning
-blindly; reruns after browser side effects can duplicate the submission.
+When `--bundle` points at a Yoetz session `bundle.md`, the ChatGPT composer
+prompt defaults to the user prompt stored in the adjacent `bundle.json`; use
+`--var prompt=...` only when intentionally overriding that prompt for a test or
+manual run.
+
+Keep the process attached until it returns. Parse the JSON `response` as the
+model's answer to the prompt; Yoetz does not attach pass/fail/review semantics
+to the text. Hand the response back according to the user's current task. If
+that task explicitly calls for iteration, apply the requested follow-up work,
+build a fresh focused bundle, and run a new native-extension recipe with a new
+`run_id` and `--output-final`. If the answer is obviously truncated or
+nonsensical, report that the model response was unusable; rerun only when the
+current user task calls for another attempt.
+
+If a run fails after upload/send/wait, inspect the marked tab with the run id
+from the error instead of rerunning blindly; reruns after browser side effects
+can duplicate the submission.
 For `response_extraction_failed`, compare the tab and diagnostics: if the owned
-tab itself only shows a tiny/truncated assistant fragment, treat it as a bad
-ChatGPT answer and intentionally rerun with a smaller bundle or more explicit
-prompt; if the tab visibly contains the full answer, preserve the tab and report
-the extraction miss.
+tab itself only shows a tiny/truncated assistant fragment, report that ChatGPT
+returned an unusable answer; if the tab visibly contains the full answer,
+preserve the tab and report the extraction miss.
 
 Manual Chrome-side install/update is part of this path: unzip the release
 artifact, load the extracted extension from `chrome://extensions` with Developer
@@ -346,7 +359,7 @@ yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var model=gpt-5-4-pro
 The wait loop reports `completion_reason` in its JSON output:
 - `copy_button` — the strong signal: a copy control rendered on the new
   assistant message (response is fully streamed).
-- `stable_idle_fallback` — the page looked idle with unchanged length for
+- `stable_idle` — the page looked idle with unchanged length for
   ≥ `max(90s, 3 × wait_interval_ms)`. Used when ChatGPT changes its copy-button
   selectors; otherwise `copy_button` is the normal completion path.
 

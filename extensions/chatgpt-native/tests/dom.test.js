@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   chatgptJobUrl,
   classifyManualHandoff,
+  classifyWaitManualHandoff,
   normalizeText,
   ownedWindowName,
   parseOwnedWindowName
@@ -23,6 +24,44 @@ test("classifyManualHandoff detects login, challenge, and rate limits", () => {
   assert.equal(classifyManualHandoff({ text: "Verify you are human" }).state, "challenge_required");
   assert.equal(classifyManualHandoff({ text: "Too many requests, try again later" }).state, "rate_limited");
   assert.equal(classifyManualHandoff({ text: "Message ChatGPT" }), null);
+});
+
+test("classifyWaitManualHandoff avoids prompt and response text false positives", () => {
+  assert.equal(classifyWaitManualHandoff({ url: "https://chatgpt.com/auth/login" }).state, "login_required");
+  assert.equal(classifyWaitManualHandoff({ title: "Too many requests | ChatGPT" }).state, "rate_limited");
+  assert.equal(
+    classifyWaitManualHandoff({
+      extraction: {
+        method: "page_text_fallback",
+        text: "Too many requests. Please wait a few minutes.",
+        user_count: 0,
+        assistant_count: 0
+      }
+    }),
+    null
+  );
+  assert.equal(
+    classifyWaitManualHandoff({
+      extraction: {
+        method: "assistant_dom_fallback",
+        text: "A rate limit is HTTP 429.",
+        user_count: 1,
+        assistant_count: 1
+      }
+    }),
+    null
+  );
+  assert.equal(
+    classifyWaitManualHandoff({
+      extraction: {
+        method: "page_text_fallback",
+        text: "Explain rate limit handling",
+        user_count: 1,
+        assistant_count: 0
+      }
+    }),
+    null
+  );
 });
 
 test("normalizeText trims repeated whitespace conservatively", () => {
