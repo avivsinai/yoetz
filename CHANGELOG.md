@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.3] - 2026-05-14
 ### Fixed
 
 - ChatGPT browser recipes now default the composer prompt to the prompt stored
@@ -26,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Documented the unattended ChatGPT Pro native-extension review loop in the
   Yoetz skill, including durable JSON outputs, intentional re-review after
   patches, and the `stable_idle` completion reason.
+
 
 ## [0.5.2] - 2026-05-13
 ### Fixed
