@@ -7472,6 +7472,43 @@ steps:
     }
 
     #[test]
+    fn builtin_chatgpt_recipe_does_not_pin_transports_so_auto_promotion_can_fire() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/chatgpt.yaml");
+        let content = fs::read_to_string(&path).expect("read recipes/chatgpt.yaml");
+        let recipe: Recipe = serde_yaml_ng::from_str(&content).expect("parse chatgpt.yaml");
+
+        assert!(
+            recipe.transports.is_none(),
+            "built-in chatgpt.yaml must not pin `transports:` so that \
+             chrome-extension-native auto-promotion gates correctly"
+        );
+
+        let base = recipe_transports(&recipe, true);
+        let promoted = maybe_prefer_extension_native_for_chatgpt(
+            base,
+            true,
+            recipe.transports.is_some(),
+            true,
+        );
+        assert_eq!(
+            promoted.first(),
+            Some(&RecipeTransport::ChromeExtensionNative),
+            "with extension connected, the built-in chatgpt recipe must \
+             auto-promote chrome-extension-native to the front of the funnel"
+        );
+        assert_eq!(
+            &promoted[1..],
+            &[
+                RecipeTransport::ChromeDevtoolsMcp,
+                RecipeTransport::DevBrowser,
+                RecipeTransport::AgentBrowser,
+                RecipeTransport::Manual,
+            ],
+            "auto-promotion must preserve the existing extension-free funnel order behind it"
+        );
+    }
+
+    #[test]
     fn resolve_recipe_ignores_same_name_cwd_directory_for_bare_builtin_name() {
         let _guard = lock_env();
         let cwd = unique_test_dir("recipe_shadow_cwd");

@@ -3217,10 +3217,17 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 recipe_args.transport,
                 Some(browser::RecipeTransport::ChromeExtensionNative)
             );
-            if recipe_uses_extension_instance_selector(&recipe_vars) && !requested_extension_native
+            let recipe_transports_pinned = recipe.transports.is_some();
+            let extension_auto_promotion_eligible = recipe_args.transport.is_none()
+                && is_chatgpt
+                && !recipe_transports_pinned
+                && extension_status_connected_for_auto_promotion();
+            let extension_native_will_route =
+                requested_extension_native || extension_auto_promotion_eligible;
+            if recipe_uses_extension_instance_selector(&recipe_vars) && !extension_native_will_route
             {
                 bail!(
-                    "extension_instance_id and extension_profile_id selectors require --transport chrome-extension-native"
+                    "extension_instance_id and extension_profile_id selectors require chrome-extension-native; install the Yoetz Chrome extension (`yoetz browser extension setup --chatgpt`) or pass --transport chrome-extension-native"
                 );
             }
             if is_chatgpt {
@@ -3238,18 +3245,13 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     && (!requested_extension_native || recipe_args.allow_cdp_fallback),
             )?;
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
-            let recipe_transports_pinned = recipe.transports.is_some();
-            let extension_connected = recipe_args.transport.is_none()
-                && is_chatgpt
-                && !recipe_transports_pinned
-                && extension_status_connected_for_auto_promotion();
             let base_transports = browser::maybe_prefer_extension_native_for_chatgpt(
                 browser::recipe_transports(&recipe, is_chatgpt),
                 is_chatgpt,
                 recipe_transports_pinned,
-                extension_connected,
+                extension_auto_promotion_eligible,
             );
-            let extension_native_auto_promoted = extension_connected
+            let extension_native_auto_promoted = extension_auto_promotion_eligible
                 && base_transports.first()
                     == Some(&browser::RecipeTransport::ChromeExtensionNative);
             let transports = constrain_chatgpt_transports_for_browser_context_selector(
