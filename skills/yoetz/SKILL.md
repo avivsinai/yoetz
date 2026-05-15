@@ -197,6 +197,11 @@ to exceed that. If the extension returns a terminal upload/send/wait error, use
 `yoetz browser extension inspect --chatgpt --run-id <run-id>` before deciding
 whether an intentional rerun is safe.
 
+If progress says `waiting for final assistant controls`, ChatGPT has exposed
+post-send assistant text but not a final scoped action affordance yet. Do not
+treat the visible text as complete and do not start a duplicate run; use the
+reported inspect command to check the preserved tab if you need live state.
+
 ### Prerequisites
 
 ```bash
