@@ -387,7 +387,7 @@ test("extractResponse prefers assistant markdown over wrapper model status text"
   assert.equal(extraction.has_copy_button, true);
 });
 
-test("extractResponse ignores single-letter assistant fragments", () => {
+test("extractResponse returns single-letter assistant text with a copy affordance", () => {
   const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
   const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "I")
     .append(copy);
@@ -396,7 +396,9 @@ test("extractResponse ignores single-letter assistant fragments", () => {
 
   const extraction = extractResponse(doc);
 
-  assert.equal(extraction.method, "page_text_fallback");
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "I");
+  assert.equal(extraction.has_copy_button, true);
   assert.equal(extraction.assistant_count, 1);
 });
 

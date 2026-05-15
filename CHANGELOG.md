@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - ChatGPT native-extension wait progress now distinguishes total page copy
   buttons from the scoped final assistant copy button required for completion.
+- ChatGPT native-extension response completion is now driven only by scoped
+  assistant DOM structure and final controls, not response-content heuristics.
 - ChatGPT browser recipes now default to a 90-minute response wait for
   Pro/Extended Pro runs and include the owned-tab inspect command on timeout.
 
