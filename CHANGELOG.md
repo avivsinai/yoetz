@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.9] - 2026-05-15
 ### Changed
 
 - The `chatgpt` browser recipe now auto-promotes the `chrome-extension-native`
@@ -13,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `connected`. Pass `--transport <other>` or pin `transports:` in the recipe
   to opt out; non-ChatGPT recipes and unhealthy extensions stay
   extension-free.
+
 
 ## [0.5.8] - 2026-05-15
 ### Fixed
