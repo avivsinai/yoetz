@@ -930,6 +930,8 @@ test("service worker times out stale pre-send assistant text as job_error", asyn
     const error = port.messages.find((message) => message.type === "job_error" && message.payload.code === "response_timeout");
     assert.equal(error.payload.phase, "wait_response");
     assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_timeout");
+    assert.match(error.payload.message, /if it finishes later, recover with: yoetz browser extension inspect --chatgpt --run-id run_job_timeout/);
   } finally {
     globalThis.chrome = originalChrome;
   }

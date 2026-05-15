@@ -126,7 +126,7 @@ impl Default for DevtoolsMcpRecipeContext {
             browser_context_id: None,
             profile_email: None,
             run_id: String::new(),
-            response_timeout_ms: 1_800_000, // 30 min default for ChatGPT Pro Extended
+            response_timeout_ms: 5_400_000, // 90 min default for ChatGPT Pro Extended
             response_poll_interval_ms: 30_000,
             upload_timeout_ms: 120_000,
             disable_extended: false,
