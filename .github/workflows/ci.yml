@@ -44,9 +44,14 @@ jobs:
     timeout-minutes: 5
     outputs:
       light_only: ${{ steps.detect.outputs.light_only }}
+      browser_changed: ${{ steps.detect.outputs.browser_changed }}
+      build_os_matrix: ${{ steps.detect.outputs.build_os_matrix }}
     env:
+      PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       PR_TITLE: ${{ github.event.pull_request.title }}
+      PUSH_BEFORE_SHA: ${{ github.event.before }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -56,25 +61,48 @@ jobs:
         run: |
           set -euo pipefail
 
+          full_build_matrix='["ubuntu-latest","macos-latest","windows-latest"]'
+          linux_build_matrix='["ubuntu-latest"]'
+          build_os_matrix="$linux_build_matrix"
+
+          emit_outputs() {
+            {
+              echo "light_only=$1"
+              echo "browser_changed=$2"
+              echo "build_os_matrix=$3"
+            } >> "$GITHUB_OUTPUT"
+          }
+
           case "${GITHUB_EVENT_NAME}" in
             pull_request)
-              base="${{ github.event.pull_request.base.sha }}"
-              head="${{ github.event.pull_request.head.sha }}"
+              base="$PR_BASE_SHA"
+              head="$PR_HEAD_SHA"
+              if [[ "${PR_HEAD_REF:-}" == release/* ]]; then
+                build_os_matrix="$full_build_matrix"
+              fi
               ;;
-            push|*)
-              echo "light_only=false" >> "$GITHUB_OUTPUT"
+            push)
+              base="$PUSH_BEFORE_SHA"
+              head="$GITHUB_SHA"
+              ;;
+            workflow_dispatch)
+              emit_outputs false true "$full_build_matrix"
+              exit 0
+              ;;
+            *)
+              emit_outputs false true "$linux_build_matrix"
               exit 0
               ;;
           esac
 
           if [[ -z "${base:-}" || "$base" == "0000000000000000000000000000000000000000" ]]; then
-            echo "light_only=false" >> "$GITHUB_OUTPUT"
+            emit_outputs false true "$build_os_matrix"
             exit 0
           fi
 
           mapfile -t files < <(git diff --name-only "$base" "$head")
           if ((${#files[@]} == 0)); then
-            echo "light_only=false" >> "$GITHUB_OUTPUT"
+            emit_outputs false true "$build_os_matrix"
             exit 0
           fi
 
@@ -91,9 +119,14 @@ jobs:
           # GitHub "required status checks" list satisfied without needing
           # admin-bypass, but they short-circuit after checkout to keep the
           # whole PR under a minute. See clippy / test jobs below.
+          #
+          # Ordinary PRs and main pushes intentionally use the Ubuntu build
+          # only. Cross-platform release builds remain covered before release
+          # by release/* PRs, and on demand by workflow_dispatch.
           # Bash case-pattern `*` matches any characters including `/`, so
           # `docs/*` covers any depth under `docs/`.
           light_only=true
+          browser_changed=false
           for file in "${files[@]}"; do
             matched=false
             case "$file" in
@@ -108,13 +141,27 @@ jobs:
               .gitignore|.gitleaks.toml) matched=true ;;
               LICENSE*) matched=true ;;
             esac
+
+            case "$file" in
+              extensions/*) browser_changed=true ;;
+              recipes/*) browser_changed=true ;;
+              scripts/build-chatgpt-native-extension.sh) browser_changed=true ;;
+              scripts/build-live-cdp-daemon.sh) browser_changed=true ;;
+              scripts/ci-real-browser-smoke.sh) browser_changed=true ;;
+              crates/yoetz-cli/src/*browser*) browser_changed=true ;;
+              crates/yoetz-cli/src/*chatgpt*) browser_changed=true ;;
+              crates/yoetz-cli/src/live_*) browser_changed=true ;;
+              crates/yoetz-cli/src/chrome_*) browser_changed=true ;;
+              crates/yoetz-cli/tests/*browser*) browser_changed=true ;;
+              crates/yoetz-cli/tests/*chatgpt*) browser_changed=true ;;
+            esac
+
             if [[ "$matched" != "true" ]]; then
               light_only=false
-              break
             fi
           done
 
-          echo "light_only=$light_only" >> "$GITHUB_OUTPUT"
+          emit_outputs "$light_only" "$browser_changed" "$build_os_matrix"
 
   browser-scripts:
     name: Browser Scripts
@@ -275,7 +322,7 @@ jobs:
     timeout-minutes: 20
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ fromJSON(needs.changes.outputs.build_os_matrix) }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -300,7 +347,7 @@ jobs:
   browser-integration:
     name: Real-Browser Smoke (Chrome for Testing)
     needs: changes
-    if: needs.changes.outputs.light_only != 'true'
+    if: needs.changes.outputs.light_only != 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.browser_changed == 'true' || startsWith(github.head_ref, 'release/'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
