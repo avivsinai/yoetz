@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 use std::thread;
@@ -3153,15 +3153,30 @@ fn validate_cookie_sync_result(cookie_count: usize, warnings: &[String]) -> Resu
     Err(anyhow!(message))
 }
 
-/// Resolve a recipe path. If the path exists as-is, use it. Otherwise treat it
-/// as a recipe name and search in standard locations (e.g. "chatgpt" -> "chatgpt.yaml").
+/// Resolve a recipe path or bare recipe name.
+///
+/// Bare names such as `chatgpt` are resolved from installed recipe locations so
+/// a caller's working tree cannot accidentally shadow built-ins with a same-name
+/// directory.
 pub fn resolve_recipe(path: &Path) -> Result<PathBuf> {
-    // Absolute or relative path that exists — use directly
-    if path.exists() {
-        return Ok(path.to_path_buf());
+    if is_bare_recipe_name(path) {
+        return resolve_recipe_name(path);
     }
 
-    // Treat as a recipe name: try with .yaml extension
+    if path.exists() {
+        if path.is_file() {
+            return Ok(path.to_path_buf());
+        }
+        bail!(
+            "recipe path {} is not a file; pass a recipe file path or a built-in recipe name like `chatgpt`",
+            path.display()
+        );
+    }
+
+    resolve_recipe_name(path)
+}
+
+fn resolve_recipe_name(path: &Path) -> Result<PathBuf> {
     let name = path.to_string_lossy();
     let filename = if name.ends_with(".yaml") || name.ends_with(".yml") {
         name.to_string()
@@ -3170,6 +3185,14 @@ pub fn resolve_recipe(path: &Path) -> Result<PathBuf> {
     };
 
     find_data_file("recipes", &filename)
+}
+
+fn is_bare_recipe_name(path: &Path) -> bool {
+    path.extension().is_none()
+        && matches!(
+            path.components().collect::<Vec<_>>().as_slice(),
+            [Component::Normal(_)]
+        )
 }
 
 /// Resolve CDP endpoint from flag → env → config (first non-empty wins).
@@ -4827,6 +4850,24 @@ mod tests {
                 Some(value) => unsafe { env::set_var(self.key, value) },
                 None => unsafe { env::remove_var(self.key) },
             }
+        }
+    }
+
+    struct CurrentDirGuard {
+        original: PathBuf,
+    }
+
+    impl CurrentDirGuard {
+        fn enter(path: &Path) -> Self {
+            let original = env::current_dir().unwrap();
+            env::set_current_dir(path).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for CurrentDirGuard {
+        fn drop(&mut self) {
+            env::set_current_dir(&self.original).unwrap();
         }
     }
 
@@ -7349,6 +7390,34 @@ steps:
         assert!(content.contains("- action: chatgpt_send"));
         assert!(!content.contains("const fallbackLabels = ['instant', 'thinking', 'pro'"));
         assert!(!content.contains("send button disabled — page is likely recoverable"));
+    }
+
+    #[test]
+    fn resolve_recipe_ignores_same_name_cwd_directory_for_bare_builtin_name() {
+        let _guard = lock_env();
+        let cwd = unique_test_dir("recipe_shadow_cwd");
+        fs::create_dir(cwd.join("chatgpt")).unwrap();
+        let _cwd = CurrentDirGuard::enter(&cwd);
+
+        let resolved = resolve_recipe(Path::new("chatgpt")).unwrap();
+
+        assert_eq!(resolved.file_name().unwrap(), "chatgpt.yaml");
+        assert!(resolved.is_file());
+        assert_ne!(resolved, cwd.join("chatgpt"));
+    }
+
+    #[test]
+    fn resolve_recipe_ignores_same_name_cwd_file_for_bare_builtin_name() {
+        let _guard = lock_env();
+        let cwd = unique_test_dir("recipe_shadow_file_cwd");
+        fs::write(cwd.join("chatgpt"), "not: a built-in recipe").unwrap();
+        let _cwd = CurrentDirGuard::enter(&cwd);
+
+        let resolved = resolve_recipe(Path::new("chatgpt")).unwrap();
+
+        assert_eq!(resolved.file_name().unwrap(), "chatgpt.yaml");
+        assert!(resolved.is_file());
+        assert_ne!(resolved, cwd.join("chatgpt"));
     }
 
     #[test]

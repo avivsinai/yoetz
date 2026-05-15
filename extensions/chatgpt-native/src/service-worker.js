@@ -1028,36 +1028,34 @@ async function waitForResponse(job) {
     }
     const rawText = extraction?.text ?? "";
     const extractionIdle = !extraction?.is_generating;
-    const scopedFinalAffordance = Boolean(postSend && hasFinalAssistantAffordance(job, extraction));
     const text = meaningfulResponseText(rawText) ? rawText : "";
-    const finalAffordance = Boolean(scopedFinalAffordance && text);
+    const stableTextCandidate = Boolean(postSend && extractionIdle && text);
+    const scopedStableTextCandidate = Boolean(
+      stableTextCandidate
+      && extraction?.method !== "page_text_fallback"
+    );
+    const finalAffordance = Boolean(scopedStableTextCandidate && hasFinalAssistantAffordance(extraction));
     // Broad page text is diagnostic only; final controls without scoped text
     // means extraction failed, not that page chrome is safe to return.
     const finalAffordanceWithoutScopedText = Boolean(
       postSendAssistantActivity
       && extraction?.method === "page_text_fallback"
       && !extraction?.is_generating
-      && hasFinalAssistantAffordance(job, extraction)
+      && hasFinalAssistantAffordance(extraction)
     );
-    if (postSend && text && extractionIdle && text === lastStableText) {
+    if (stableTextCandidate && text === lastStableText) {
       stableCount += 1;
       if (!stableSinceMs) {
         stableSinceMs = Date.now();
       }
     } else {
       lastStableText = text;
-      stableCount = postSend && text && extractionIdle ? 1 : 0;
+      stableCount = stableTextCandidate ? 1 : 0;
       stableSinceMs = stableCount > 0 ? Date.now() : 0;
     }
     const stableForMs = stableSinceMs ? Date.now() - stableSinceMs : 0;
-    const awaitingFinalAffordance = Boolean(
-      postSend
-      && extractionIdle
-      && text
-      && extraction?.method !== "page_text_fallback"
-      && !finalAffordance
-    );
-    if (postSend && extractionIdle && text && stableCount >= stablePolls && extraction?.method !== "page_text_fallback") {
+    const awaitingFinalAffordance = Boolean(scopedStableTextCandidate && !finalAffordance);
+    if (scopedStableTextCandidate && stableCount >= stablePolls) {
       if (finalAffordance && stableForMs >= finalAffordanceIdleMs) {
         return completedExtraction(extraction, "copy_button", stableForMs);
       }
@@ -1164,9 +1162,10 @@ function postWaitingResponseProgress(job, extraction, detail = {}) {
   const elapsedMs = Number(detail.elapsed_ms ?? 0);
   const timeoutMs = Number(detail.timeout_ms ?? job.wait_timeout_ms ?? 1800000);
   const finalityStatus = detail.awaiting_final_affordance ? ", waiting for final assistant controls" : "";
+  const scopedCopyStatus = extraction?.has_copy_button ? ", scoped_copy_button=true" : ", scoped_copy_button=false";
   postNative(progress(job, "waiting_response", {
     ...detail,
-    message: `waiting for ChatGPT response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${extraction?.is_generating ? ", generating" : ""}${finalityStatus})`,
+    message: `waiting for ChatGPT response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${scopedCopyStatus}${extraction?.is_generating ? ", generating" : ""}${finalityStatus})`,
     extraction_method: extraction?.method ?? "none",
     is_generating: Boolean(extraction?.is_generating),
     assistant_count: extraction?.assistant_count ?? 0,
@@ -1289,7 +1288,7 @@ function isAcceptableModelSelection(selection) {
   return selection?.status === "selected";
 }
 
-function hasFinalAssistantAffordance(job, extraction) {
+function hasFinalAssistantAffordance(extraction) {
   return Boolean(!extraction?.is_generating && extraction?.has_copy_button);
 }
 

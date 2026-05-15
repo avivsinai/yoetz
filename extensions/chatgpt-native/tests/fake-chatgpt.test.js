@@ -1420,6 +1420,33 @@ test("fake ChatGPT personal composer model control can switch from Instant to Ex
   assert.equal(result.model_used, "Extended Pro");
 });
 
+test("fake ChatGPT auto accepts selected Pro label that appears only after menu opens", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  let selected = null;
+  const modelButton = new FakeElement("button", {
+    "aria-haspopup": "menu",
+    onClick: () => {
+      selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Extended Pro");
+      body.append(new FakeElement("div", { role: "menuitemradio" }, "Instant"), selected);
+    }
+  }, "Model");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
+  const body = new FakeElement("body", {}, "Ask anything Model").append(form);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {
+    model: "auto",
+    disable_extended: false
+  });
+
+  assert.equal(modelButton.clicked, true);
+  assert.ok(selected, "menu open should expose the selected model label");
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Extended Pro");
+  assert.deepEqual(result.available_options, ["Instant"]);
+  assert.equal(result.warning, null);
+});
+
 test("fake ChatGPT Extended disable falls back to visible chip text", async () => {
   const composer = new FakeElement("form", { "data-testid": "composer" }, "");
   const extended = new FakeElement("button", {}, "Extended Pro");
