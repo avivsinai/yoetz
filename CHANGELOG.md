@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.6] - 2026-05-15
+### Fixed
+
+- ChatGPT native-extension recipes now wait for final assistant response
+  affordances before completing, reducing premature completion on transient page
+  text while preserving valid short responses.
+
 ## [0.5.5] - 2026-05-15
 ### Added
 
