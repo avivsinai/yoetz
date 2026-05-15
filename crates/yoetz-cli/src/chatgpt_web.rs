@@ -170,6 +170,7 @@ pub fn build_set_window_name_js(run_id: &str) -> String {
 
 pub fn model_testid_alias_map() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
+        ("extended-pro", "extended-pro"),
         ("pro", "gpt-5-4-pro"),
         ("gpt-5-pro", "gpt-5-4-pro"),
         ("thinking", "gpt-5-4-thinking"),
@@ -180,6 +181,7 @@ pub fn model_testid_alias_map() -> BTreeMap<&'static str, &'static str> {
 
 pub fn model_testid_candidate_map() -> BTreeMap<&'static str, Vec<&'static str>> {
     BTreeMap::from([
+        ("extended-pro", vec!["extended-pro"]),
         ("pro", vec!["gpt-5-4-pro"]),
         ("gpt-5-pro", vec!["gpt-5-4-pro"]),
         ("gpt-5-4-pro", vec!["gpt-5-4-pro"]),
@@ -335,6 +337,7 @@ pub fn build_model_selection_function(requested_model: &str) -> String {
     let requested_model =
         serde_json::to_string(requested_model).expect("serialize requested model");
     let model_button_selector = model_selector_button_selector_json();
+    let composer_selector = composer_selector_json();
     let model_item_selector = model_item_selector_json();
     let model_testid_aliases = model_testid_aliases_json();
     let model_testid_candidates = model_testid_candidates_json();
@@ -343,6 +346,7 @@ pub fn build_model_selection_function(requested_model: &str) -> String {
 async () => {{
   const requested = {requested_model};
   const MODEL_BUTTON_SELECTOR = {model_button_selector};
+  const COMPOSER_SELECTOR = {composer_selector};
   const MODEL_ITEM_SELECTOR = {model_item_selector};
   const MODEL_TESTID_ALIASES = {model_testid_aliases};
   const MODEL_TESTID_CANDIDATES = {model_testid_candidates};
@@ -359,6 +363,73 @@ async () => {{
       hasSelectedCurrentMarker(item.ariaSelected || "", item.ariaCurrent || "", item.dataSelected || "", item.dataCurrent || "")
     );
 {visibility_helpers}
+  const composerScopes = () => {{
+    const composer = document.querySelector(COMPOSER_SELECTOR);
+    const scopes = [];
+    const add = (scope) => {{
+      if (scope && !scopes.includes(scope)) scopes.push(scope);
+    }};
+    add(composer?.closest("form"));
+    add(composer?.closest("[data-testid*='composer'], [class*='composer'], main, [role='main']"));
+    add(composer?.parentElement);
+    return scopes;
+  }};
+  const modelCandidateText = (node, target = node) => normalize([
+    node?.getAttribute?.("aria-label"),
+    node?.getAttribute?.("title"),
+    node?.getAttribute?.("data-testid"),
+    node?.getAttribute?.("class"),
+    node?.innerText,
+    node?.textContent,
+    target?.getAttribute?.("aria-label"),
+    target?.getAttribute?.("title"),
+    target?.getAttribute?.("data-testid"),
+    target?.getAttribute?.("class"),
+    target?.innerText,
+    target?.textContent,
+  ].filter(Boolean).join(" ")).toLowerCase();
+  const isModelActionableElement = (node) => {{
+    const tag = String(node?.tagName || "").toLowerCase();
+    const role = normalize(node?.getAttribute?.("role") || "").toLowerCase();
+    return tag === "button" ||
+      role === "button" ||
+      node?.getAttribute?.("aria-haspopup") !== null ||
+      node?.getAttribute?.("tabindex") !== null;
+  }};
+  const isModelChipLike = (node) => {{
+    const marker = normalize([
+      node?.getAttribute?.("data-testid"),
+      node?.getAttribute?.("class"),
+      node?.getAttribute?.("aria-label"),
+      node?.getAttribute?.("title"),
+    ].filter(Boolean).join(" ")).toLowerCase();
+    return /\b(model|model-switcher)\b/.test(marker) && /\b(chip|pill|token|button|menu|dropdown|switcher)\b/.test(marker);
+  }};
+  const modelClickTarget = (node, stopAt) => {{
+    for (let current = node; current; current = current.parentElement) {{
+      if (isModelActionableElement(current) || isModelChipLike(current)) return current;
+      if (current === stopAt) return null;
+    }}
+    return null;
+  }};
+  const looksLikeModelControl = (text) =>
+    /\bextended\s+pro\b/.test(text) ||
+    /\bgpt[\s.-]*\d/.test(text) ||
+    /\b(pro|instant|thinking|model)\b/.test(text);
+  const findComposerModelControl = () => {{
+    for (const scope of composerScopes()) {{
+      const candidates = Array.from(scope.querySelectorAll("button, [role='button'], [aria-haspopup], [tabindex], [aria-label], [title], [data-testid], span, div"));
+      for (const node of candidates) {{
+        const target = modelClickTarget(node, scope);
+        if (!target || !isVisible(target)) continue;
+        const haystack = modelCandidateText(node, target);
+        if (!looksLikeModelControl(haystack)) continue;
+        if (/\b(send|stop|copy|share|new chat|attach|upload|search|history|dictation|voice|microphone|account|profile|settings|upgrade)\b/.test(haystack)) continue;
+        return target;
+      }}
+    }}
+    return null;
+  }};
     const slugify = (value) => normalize(value).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
   const isLowSignalSelectorLabel = (value) => {{
     const key = slugify(value);
@@ -482,6 +553,35 @@ async () => {{
     if (!(slug === "pro" || slug === "thinking" || slug === "instant")) return null;
     return entries.find((item) => hasExactTierLabel(item, slug) && !hasConflictingTierHint(item, slug)) || null;
   }};
+  const modelSlug = (value) => {{
+    let key = slugify(value);
+    if (key.startsWith("model-switcher-")) key = key.slice("model-switcher-".length);
+    if (!key || isLowSignalSelectorLabel(key)) return "";
+    if (key === "extended-pro") return "extended-pro";
+    return (MODEL_TESTID_CANDIDATES[key] || [MODEL_TESTID_ALIASES[key] || key])[0] || "";
+  }};
+  const currentLabelSatisfiesRequest = (label) => {{
+    const labelText = normalize(label).toLowerCase();
+    const labelSlug = modelSlug(labelText);
+    if (!labelSlug) return false;
+    const isProLabel = /\bextended\s+pro\b/.test(labelText) ||
+      /\bgpt[\s.-]*\d+(?:[\s.-]*\d+)*[\s.-]*pro\b/.test(labelText) ||
+      /\bpro\b/.test(labelText);
+    if (autoMode) return isProLabel;
+    if (requestedGenericTier === "pro") return isProLabel;
+    if (requestedGenericTier === "thinking") return /\bthinking\b/.test(labelText);
+    if (requestedGenericTier === "instant") return /\binstant\b/.test(labelText);
+    const requestedKeys = Array.from(new Set(
+      (MODEL_TESTID_CANDIDATES[requestedLower] || [MODEL_TESTID_ALIASES[requestedLower] || requestedLower])
+        .map((value) => modelSlug(value))
+        .filter(Boolean)
+    ));
+    return requestedKeys.includes(labelSlug);
+  }};
+  const selectorLabelConfirmsTextTarget = (label, item, tierSlug, needles) => {{
+    if (!item || item.testId) return false;
+    return selectorLabelMatchesTarget(label, item, tierSlug, null, needles || []);
+  }};
   const buildTierRankings = (entries) => {{
     const tierMaxVersions = {{
       pro: maxVersionPartsForTier(entries, "pro"),
@@ -511,7 +611,7 @@ async () => {{
         right.item.text.length - left.item.text.length
       )
       .map(({{ item }}) => item)[0] || null;
-  const findSelectorButton = () => document.querySelector(MODEL_BUTTON_SELECTOR);
+  const findSelectorButton = () => document.querySelector(MODEL_BUTTON_SELECTOR) || findComposerModelControl();
   const requestedTrimmed = normalize(requested);
   const requestedLower = requestedTrimmed.toLowerCase();
   const keepCurrentMode = !requestedTrimmed || requestedLower === "current" || requestedLower === "keep-current";
@@ -532,6 +632,7 @@ async () => {{
     selectorButton?.innerText ||
     selectorButton?.textContent ||
     selectorButton?.getAttribute?.("aria-label") ||
+    selectorButton?.getAttribute?.("title") ||
     ""
   );
   const responseBase = {{
@@ -548,6 +649,14 @@ async () => {{
       status: "already-selected",
       modelUsed: currentLabel || null,
       keepCurrent: true,
+    }};
+  }}
+
+  if (currentLabelSatisfiesRequest(currentLabel)) {{
+    return {{
+      ...responseBase,
+      status: "already-selected",
+      modelUsed: currentLabel,
     }};
   }}
 
@@ -640,6 +749,8 @@ async () => {{
       liveSelectorButton?.querySelector?.("[data-testid='selected-model'], [data-testid='model-switcher-selected-model']")?.textContent ||
       liveSelectorButton?.innerText ||
       liveSelectorButton?.textContent ||
+      liveSelectorButton?.getAttribute?.("aria-label") ||
+      liveSelectorButton?.getAttribute?.("title") ||
       ""
     ).toLowerCase();
   }};
@@ -806,7 +917,15 @@ async () => {{
         ) ||
         itemIsSelected(updatedTarget);
       selectedLabel = readSelectorLabel();
+      const textTargetLabelConfirmed = selectorLabelConfirmsTextTarget(
+        selectedLabel,
+        updatedTarget || currentTarget || target,
+        targetTierSlug,
+        selectionNeedles
+      );
       if (targetChecked) {{
+        verifyConfirmed = true;
+      }} else if (textTargetLabelConfirmed) {{
         verifyConfirmed = true;
       }}
     }}
@@ -879,6 +998,7 @@ async () => {{
 }}
 "##,
         model_button_selector = model_button_selector,
+        composer_selector = composer_selector,
         model_item_selector = model_item_selector,
         model_testid_aliases = model_testid_aliases,
         model_testid_candidates = model_testid_candidates,
@@ -1374,10 +1494,12 @@ mod tests {
     #[test]
     fn model_aliases_cover_shortcuts() {
         let aliases = model_testid_alias_map();
+        assert_eq!(aliases.get("extended-pro"), Some(&"extended-pro"));
         assert_eq!(aliases.get("pro"), Some(&"gpt-5-4-pro"));
         assert_eq!(aliases.get("gpt-5-thinking"), Some(&"gpt-5-4-thinking"));
         assert_eq!(aliases.get("instant"), Some(&"gpt-5-3"));
         let candidates = model_testid_candidate_map();
+        assert_eq!(candidates.get("extended-pro"), Some(&vec!["extended-pro"]));
         assert_eq!(candidates.get("pro"), Some(&vec!["gpt-5-4-pro"]));
         assert_eq!(candidates.get("gpt-5-3-pro"), None);
     }
@@ -1389,6 +1511,10 @@ mod tests {
         assert_eq!(
             canonical_chatgpt_model_slug("Pro"),
             Some("gpt-5-4-pro".to_string())
+        );
+        assert_eq!(
+            canonical_chatgpt_model_slug("Extended Pro"),
+            Some("extended-pro".to_string())
         );
         assert_eq!(
             canonical_chatgpt_model_slug("model-switcher-gpt-5-4-thinking"),
@@ -1555,6 +1681,22 @@ mod tests {
     }
 
     #[test]
+    fn model_selection_function_supports_personal_composer_model_control() {
+        // Personal ChatGPT can expose the selected model as a composer pop-up
+        // labeled `Extended Pro` instead of the enterprise
+        // model-switcher-dropdown-button. The shared script must support that
+        // surface without removing the battle-tested enterprise selector.
+        let script = build_model_selection_function("auto");
+        assert!(script.contains("const findComposerModelControl = () =>"));
+        assert!(script.contains(
+            "document.querySelector(MODEL_BUTTON_SELECTOR) || findComposerModelControl()"
+        ));
+        assert!(script.contains("const currentLabelSatisfiesRequest = (label) =>"));
+        assert!(script.contains(r#"if (key === "extended-pro") return "extended-pro";"#));
+        assert!(script.contains("return isProLabel;"));
+    }
+
+    #[test]
     fn model_selection_function_prefers_exact_tier_labels_before_fuzzy_matching() {
         // Live ChatGPT currently exposes generic tier labels like
         // `Pro Research-grade intelligence` while the selector button itself
@@ -1638,6 +1780,7 @@ mod tests {
 
         let explicit_script = build_model_selection_function("gpt-5-4-pro");
         assert!(explicit_script.contains(r#"const requested = "gpt-5-4-pro";"#));
+        assert!(explicit_script.contains("\"extended-pro\":\"extended-pro\""));
         assert!(explicit_script.contains("\"gpt-5-pro\":\"gpt-5-4-pro\""));
         assert!(!explicit_script.contains("\"gpt-5-3-pro\""));
     }

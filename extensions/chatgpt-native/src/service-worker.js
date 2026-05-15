@@ -1030,8 +1030,7 @@ async function waitForResponse(job) {
     const rawText = extraction?.text ?? "";
     const extractionIdle = !extraction?.is_generating;
     const scopedFinalAffordance = Boolean(postSend && hasFinalAssistantAffordance(job, extraction));
-    const allowStableSingleLetter = Boolean(postSend && extractionIdle);
-    const text = meaningfulResponseText(rawText, { allowSingleLetter: scopedFinalAffordance || allowStableSingleLetter }) ? rawText : "";
+    const text = meaningfulResponseText(rawText) ? rawText : "";
     const finalAffordance = Boolean(scopedFinalAffordance && text);
     const finalAffordanceWithoutScopedText = Boolean(
       postSendAssistantActivity

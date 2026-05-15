@@ -1307,7 +1307,7 @@ test("service worker does not complete on thought/status-only assistant text", a
   }
 });
 
-test("service worker completes a scoped single-letter assistant markdown response", async () => {
+test("service worker rejects a scoped single-letter assistant markdown response", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -1359,7 +1359,7 @@ test("service worker completes a scoped single-letter assistant markdown respons
     port.emit(envelope("job_start", "job_single_letter_scoped_response", {
       prompt: "prompt",
       wait_interval_ms: 50,
-      wait_timeout_ms: 2000
+      wait_timeout_ms: 1200
     }));
     await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
     port.emit(envelope("job_file_chunk", "job_single_letter_scoped_response", {
@@ -1371,12 +1371,8 @@ test("service worker completes a scoped single-letter assistant markdown respons
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
 
-    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
-    const complete = port.messages.find((message) => message.type === "job_complete");
-    assert.equal(complete.payload.response, "I");
-    assert.equal(complete.payload.extraction_method, "copy_scope_dom_fallback");
-    assert.equal(complete.payload.completion_reason, "copy_button");
-    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -1453,7 +1449,7 @@ test("service worker does not fast-complete a single-letter response without a f
   }
 });
 
-test("service worker completes a stable idle single-letter response without a final affordance", async () => {
+test("service worker rejects a stable idle single-letter response without a final affordance", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -1517,12 +1513,8 @@ test("service worker completes a stable idle single-letter response without a fi
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
 
-    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
-    const complete = port.messages.find((message) => message.type === "job_complete");
-    assert.equal(complete.payload.response, "I");
-    assert.equal(complete.payload.extraction_method, "assistant_dom_fallback");
-    assert.equal(complete.payload.completion_reason, "stable_idle");
-    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
   } finally {
     globalThis.chrome = originalChrome;
   }
