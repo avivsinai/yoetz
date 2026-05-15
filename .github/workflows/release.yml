@@ -24,6 +24,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
   prepare:
@@ -221,10 +222,17 @@ jobs:
       - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
         with:
           node-version: 24
+          cache: npm
+          cache-dependency-path: scripts/package-lock.json
 
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: release-${{ runner.os }}-${{ matrix.target }}
+          cache-bin: false
 
       - name: Install cross
         if: matrix.cross
@@ -269,6 +277,7 @@ jobs:
           name: yoetz-${{ matrix.target }}
           path: yoetz-${{ matrix.target }}.*
           retention-days: 1
+          compression-level: 0
 
   build-chatgpt-native-extension:
     name: Build ChatGPT Native Extension
@@ -309,6 +318,7 @@ jobs:
           name: yoetz-chatgpt-native-extension
           path: yoetz-chatgpt-native-extension-${{ needs.prepare.outputs.version }}.zip
           retention-days: 1
+          compression-level: 0
 
   release:
     name: Create Release

@@ -23,6 +23,7 @@ env:
 jobs:
   check-skills:
     name: Check Skills Sync
+    if: "${{ github.event_name != 'push' || !startsWith(github.event.head_commit.message, 'chore(release): v') }}"
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -46,12 +47,14 @@ jobs:
       light_only: ${{ steps.detect.outputs.light_only }}
       browser_changed: ${{ steps.detect.outputs.browser_changed }}
       build_os_matrix: ${{ steps.detect.outputs.build_os_matrix }}
+      release_push: ${{ steps.detect.outputs.release_push }}
     env:
       PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
       PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
       PR_TITLE: ${{ github.event.pull_request.title }}
       PUSH_BEFORE_SHA: ${{ github.event.before }}
+      PUSH_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -70,6 +73,7 @@ jobs:
               echo "light_only=$1"
               echo "browser_changed=$2"
               echo "build_os_matrix=$3"
+              echo "release_push=$4"
             } >> "$GITHUB_OUTPUT"
           }
 
@@ -82,27 +86,32 @@ jobs:
               fi
               ;;
             push)
+              commit_subject="${PUSH_COMMIT_MESSAGE%%$'\n'*}"
+              if [[ "$commit_subject" == chore\(release\):\ v* ]]; then
+                emit_outputs true false "$linux_build_matrix" true
+                exit 0
+              fi
               base="$PUSH_BEFORE_SHA"
               head="$GITHUB_SHA"
               ;;
             workflow_dispatch)
-              emit_outputs false true "$full_build_matrix"
+              emit_outputs false true "$full_build_matrix" false
               exit 0
               ;;
             *)
-              emit_outputs false true "$linux_build_matrix"
+              emit_outputs false true "$linux_build_matrix" false
               exit 0
               ;;
           esac
 
           if [[ -z "${base:-}" || "$base" == "0000000000000000000000000000000000000000" ]]; then
-            emit_outputs false true "$build_os_matrix"
+            emit_outputs false true "$build_os_matrix" false
             exit 0
           fi
 
           mapfile -t files < <(git diff --name-only "$base" "$head")
           if ((${#files[@]} == 0)); then
-            emit_outputs false true "$build_os_matrix"
+            emit_outputs false true "$build_os_matrix" false
             exit 0
           fi
 
@@ -161,12 +170,23 @@ jobs:
             fi
           done
 
-          emit_outputs "$light_only" "$browser_changed" "$build_os_matrix"
+          emit_outputs "$light_only" "$browser_changed" "$build_os_matrix" false
+
+  release-commit-fast-path:
+    name: Release Commit Fast Path
+    needs: changes
+    if: needs.changes.outputs.release_push == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - run: |
+          echo "Release commit detected on main."
+          echo "The Release workflow owns release verification, artifact builds, and package publication for this commit."
 
   browser-scripts:
     name: Browser Scripts
     needs: changes
-    if: needs.changes.outputs.light_only != 'true'
+    if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -196,6 +216,8 @@ jobs:
 
   fmt:
     name: Format
+    needs: changes
+    if: needs.changes.outputs.release_push != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -208,6 +230,7 @@ jobs:
   clippy:
     name: Clippy
     needs: changes
+    if: needs.changes.outputs.release_push != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -232,6 +255,7 @@ jobs:
   test:
     name: Test
     needs: changes
+    if: needs.changes.outputs.release_push != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -254,7 +278,7 @@ jobs:
   msrv:
     name: MSRV (1.88)
     needs: changes
-    if: needs.changes.outputs.light_only != 'true'
+    if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -271,7 +295,7 @@ jobs:
   doc:
     name: Documentation
     needs: changes
-    if: needs.changes.outputs.light_only != 'true'
+    if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -288,7 +312,7 @@ jobs:
   deny:
     name: Cargo Deny
     needs: changes
-    if: needs.changes.outputs.light_only != 'true'
+    if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -302,7 +326,7 @@ jobs:
   gitleaks:
     name: Gitleaks
     needs: changes
-    if: needs.changes.outputs.light_only != 'true'
+    if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -317,7 +341,7 @@ jobs:
   build:
     name: Build (${{ matrix.os }})
     needs: changes
-    if: needs.changes.outputs.light_only != 'true'
+    if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
@@ -337,17 +361,19 @@ jobs:
           name: yoetz-${{ matrix.os }}
           path: target/release/yoetz
           retention-days: 3
+          compression-level: 0
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.os == 'windows-latest'
         with:
           name: yoetz-${{ matrix.os }}
           path: target/release/yoetz.exe
           retention-days: 3
+          compression-level: 0
 
   browser-integration:
     name: Real-Browser Smoke (Chrome for Testing)
     needs: changes
-    if: needs.changes.outputs.light_only != 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.browser_changed == 'true' || startsWith(github.head_ref, 'release/'))
+    if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.browser_changed == 'true' || startsWith(github.head_ref, 'release/'))
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
