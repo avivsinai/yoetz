@@ -1381,7 +1381,7 @@ test("service worker accepts a scoped single-letter assistant markdown response"
   }
 });
 
-test("service worker waits for streaming one-letter prefix to become stable idle text", async () => {
+test("service worker waits for streaming one-letter prefix to reach final assistant affordance", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -1422,7 +1422,7 @@ test("service worker waits for streaming one-letter prefix to become stable idle
                 user_count: 1,
                 preceding_user_count: 1,
                 copy_button_count: 1,
-                has_copy_button: streaming,
+                has_copy_button: !streaming,
                 turn_index: 0
               }
             };
@@ -1457,17 +1457,107 @@ test("service worker waits for streaming one-letter prefix to become stable idle
         message.type === "job_progress" &&
         message.payload.phase === "response_observed" &&
         message.payload.response_length === 1 &&
-        message.payload.is_generating === true &&
-        message.payload.has_copy_button === true
+        message.payload.is_generating === true
     );
     const complete = port.messages.find((message) => message.type === "job_complete");
     assert.ok(observedPrefix, "streaming one-letter prefix should be observed before completion");
-    assert.ok(extractCount >= 5, "completion should wait for idle stable polls after streaming stops");
+    assert.ok(extractCount >= 4, "completion should wait for final affordance after streaming stops");
     assert.equal(complete.payload.response, "I reviewed the bundle.");
-    assert.equal(complete.payload.completion_reason, "stable_idle");
+    assert.equal(complete.payload.completion_reason, "copy_button");
     assert.equal(port.messages.some((message) => message.type === "job_error"), false);
   } finally {
     globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker does not complete when ChatGPT idles before final assistant affordance", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousWaitingProgressInterval = globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
+  globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = 100;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let extractCount = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "kept_current", model_used: "ChatGPT" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response": {
+            if (!sent) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 } };
+            }
+            extractCount += 1;
+            const final = extractCount >= 6;
+            return {
+              ok: true,
+              payload: {
+                method: final ? "copy_scope_dom_fallback" : "assistant_dom_fallback",
+                text: final ? "I reviewed the bundle." : "I",
+                is_generating: extractCount === 1,
+                assistant_count: 1,
+                user_count: 1,
+                preceding_user_count: 1,
+                copy_button_count: 1,
+                has_copy_button: final,
+                turn_index: 0
+              }
+            };
+          }
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?idle_before_final_affordance=${Date.now()}`);
+    port.emit(envelope("job_start", "job_idle_before_final_affordance", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_idle_before_final_affordance", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_idle_before_final_affordance.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.payload?.awaiting_final_affordance), 7000);
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"), 7000);
+    const waiting = port.messages.find((message) => message.payload?.awaiting_final_affordance);
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.match(waiting.payload.message, /waiting for final assistant controls/);
+    assert.equal(waiting.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_idle_before_final_affordance");
+    assert.ok(extractCount >= 6, "completion should not happen during the idle one-letter prefix");
+    assert.equal(complete.payload.response, "I reviewed the bundle.");
+    assert.equal(complete.payload.completion_reason, "copy_button");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousWaitingProgressInterval === undefined) {
+      delete globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
+    } else {
+      globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = previousWaitingProgressInterval;
+    }
   }
 });
 

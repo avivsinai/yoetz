@@ -986,7 +986,6 @@ async function maybeGroupTab(tabId, job) {
 async function waitForResponse(job) {
   const startedAt = Date.now();
   const interval = Math.max(500, Math.min(Number(job.wait_interval_ms) || 30000, 30000));
-  const stableIdleMs = Math.max(MIN_STABLE_IDLE_MS, interval * 3);
   const finalAffordanceIdleMs = Math.min(MIN_STABLE_IDLE_MS, Math.max(FINAL_AFFORDANCE_STABLE_IDLE_MS, 0));
   const stablePolls = 2;
   let best = { method: "none", text: "", is_generating: true };
@@ -1032,6 +1031,8 @@ async function waitForResponse(job) {
     const scopedFinalAffordance = Boolean(postSend && hasFinalAssistantAffordance(job, extraction));
     const text = meaningfulResponseText(rawText) ? rawText : "";
     const finalAffordance = Boolean(scopedFinalAffordance && text);
+    // Broad page text is diagnostic only; final controls without scoped text
+    // means extraction failed, not that page chrome is safe to return.
     const finalAffordanceWithoutScopedText = Boolean(
       postSendAssistantActivity
       && extraction?.method === "page_text_fallback"
@@ -1049,12 +1050,16 @@ async function waitForResponse(job) {
       stableSinceMs = stableCount > 0 ? Date.now() : 0;
     }
     const stableForMs = stableSinceMs ? Date.now() - stableSinceMs : 0;
+    const awaitingFinalAffordance = Boolean(
+      postSend
+      && extractionIdle
+      && text
+      && extraction?.method !== "page_text_fallback"
+      && !finalAffordance
+    );
     if (postSend && extractionIdle && text && stableCount >= stablePolls && extraction?.method !== "page_text_fallback") {
       if (finalAffordance && stableForMs >= finalAffordanceIdleMs) {
         return completedExtraction(extraction, "copy_button", stableForMs);
-      }
-      if (stableForMs >= stableIdleMs) {
-        return completedExtraction(extraction, "stable_idle", stableForMs);
       }
     }
     if (finalAffordanceWithoutScopedText) {
@@ -1087,14 +1092,19 @@ async function waitForResponse(job) {
     const nowMs = Date.now();
     const elapsedMs = nowMs - startedAt;
     if (nowMs - lastWaitingProgressAt >= WAITING_RESPONSE_PROGRESS_INTERVAL_MS) {
-      postWaitingResponseProgress(job, extraction, {
+      const waitingDetail = {
         elapsed_ms: elapsedMs,
         timeout_ms: timeoutMs,
         next_poll_ms: nextDelay,
         stable_for_ms: stableForMs,
         final_affordance: finalAffordance,
         extraction_failure_candidate: finalAffordanceWithoutScopedText
-      });
+      };
+      if (awaitingFinalAffordance) {
+        waitingDetail.awaiting_final_affordance = true;
+        waitingDetail.inspect_command = inspectCommandForJob(job);
+      }
+      postWaitingResponseProgress(job, extraction, waitingDetail);
       lastWaitingProgressAt = nowMs;
     }
     await sleep(nextDelay);
@@ -1153,9 +1163,10 @@ function postResponseProgress(job, extraction) {
 function postWaitingResponseProgress(job, extraction, detail = {}) {
   const elapsedMs = Number(detail.elapsed_ms ?? 0);
   const timeoutMs = Number(detail.timeout_ms ?? job.wait_timeout_ms ?? 1800000);
+  const finalityStatus = detail.awaiting_final_affordance ? ", waiting for final assistant controls" : "";
   postNative(progress(job, "waiting_response", {
     ...detail,
-    message: `waiting for ChatGPT response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${extraction?.is_generating ? ", generating" : ""})`,
+    message: `waiting for ChatGPT response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${extraction?.is_generating ? ", generating" : ""}${finalityStatus})`,
     extraction_method: extraction?.method ?? "none",
     is_generating: Boolean(extraction?.is_generating),
     assistant_count: extraction?.assistant_count ?? 0,
@@ -1164,6 +1175,11 @@ function postWaitingResponseProgress(job, extraction, detail = {}) {
     has_copy_button: Boolean(extraction?.has_copy_button),
     response_length: extraction?.text?.length ?? 0
   }));
+}
+
+function inspectCommandForJob(job) {
+  const selector = job.extension_instance_id ? ` --extension-instance-id ${job.extension_instance_id}` : "";
+  return `yoetz browser extension inspect --chatgpt --run-id ${job.run_id}${selector}`;
 }
 
 function formatDurationForMessage(ms) {
