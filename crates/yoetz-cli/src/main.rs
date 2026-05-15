@@ -253,7 +253,10 @@ struct BrowserRecipeArgs {
     #[arg(long)]
     recipe: PathBuf,
 
-    /// Explicitly select one browser recipe transport. Defaults stay extension-free.
+    /// Explicitly select one browser recipe transport. When omitted, the
+    /// chatgpt recipe auto-promotes `chrome-extension-native` if the Yoetz
+    /// Chrome extension is installed and reports `connected`; otherwise the
+    /// default funnel stays extension-free.
     #[arg(long, value_parser = parse_recipe_transport_flag)]
     transport: Option<browser::RecipeTransport>,
 
@@ -1370,6 +1373,35 @@ fn maybe_print_running_profile_auto_connect_preference(
     }
 }
 
+/// Returns true when the locally installed Yoetz Chrome extension reports
+/// `connected`. Any other status (`disconnected`, `missing_extension`,
+/// `manual_handoff`, `version_mismatch`, `not_installed`) or I/O error is
+/// treated as not available for auto-promotion. The probe is filesystem-local
+/// (status file + Unix socket reachability) and is cheap enough to run on
+/// every `yoetz browser recipe` invocation.
+fn extension_status_connected_for_auto_promotion() -> bool {
+    browser_extension_native::status()
+        .map(|status| status.status == "connected")
+        .unwrap_or(false)
+}
+
+fn maybe_print_auto_promoted_extension_native_transport(
+    auto_promoted: bool,
+    transports: &[browser::RecipeTransport],
+    format: OutputFormat,
+) {
+    if !auto_promoted
+        || transports.first() != Some(&browser::RecipeTransport::ChromeExtensionNative)
+    {
+        return;
+    }
+    if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+        eprintln!(
+            "info: auto-selected chrome-extension-native transport because the Yoetz Chrome extension is installed and connected (pass --transport <other> or pin `transports:` in the recipe to opt out)"
+        );
+    }
+}
+
 fn running_profile_recipe_transport_priority(transport: browser::RecipeTransport) -> u8 {
     match transport {
         browser::RecipeTransport::ChromeDevtoolsMcp => 0,
@@ -1390,8 +1422,23 @@ fn prioritize_chatgpt_transports_for_running_profile_auto_connect(
 
     let has_dev_browser = transports.contains(&browser::RecipeTransport::DevBrowser);
     let has_chrome_devtools_mcp = transports.contains(&browser::RecipeTransport::ChromeDevtoolsMcp);
+    let has_chrome_extension_native =
+        transports.contains(&browser::RecipeTransport::ChromeExtensionNative);
     let has_agent_browser = transports.contains(&browser::RecipeTransport::AgentBrowser);
     let has_manual = transports.contains(&browser::RecipeTransport::Manual);
+    if has_chrome_extension_native {
+        let mut constrained = vec![browser::RecipeTransport::ChromeExtensionNative];
+        if has_chrome_devtools_mcp {
+            constrained.push(browser::RecipeTransport::ChromeDevtoolsMcp);
+        }
+        if has_dev_browser {
+            constrained.push(browser::RecipeTransport::DevBrowser);
+        }
+        if has_manual {
+            constrained.push(browser::RecipeTransport::Manual);
+        }
+        return constrained;
+    }
     if has_chrome_devtools_mcp {
         let mut constrained = vec![browser::RecipeTransport::ChromeDevtoolsMcp];
         if has_dev_browser {
@@ -3170,10 +3217,17 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 recipe_args.transport,
                 Some(browser::RecipeTransport::ChromeExtensionNative)
             );
-            if recipe_uses_extension_instance_selector(&recipe_vars) && !requested_extension_native
+            let recipe_transports_pinned = recipe.transports.is_some();
+            let extension_auto_promotion_eligible = recipe_args.transport.is_none()
+                && is_chatgpt
+                && !recipe_transports_pinned
+                && extension_status_connected_for_auto_promotion();
+            let extension_native_will_route =
+                requested_extension_native || extension_auto_promotion_eligible;
+            if recipe_uses_extension_instance_selector(&recipe_vars) && !extension_native_will_route
             {
                 bail!(
-                    "extension_instance_id and extension_profile_id selectors require --transport chrome-extension-native"
+                    "extension_instance_id and extension_profile_id selectors require chrome-extension-native; install the Yoetz Chrome extension (`yoetz browser extension setup --chatgpt`) or pass --transport chrome-extension-native"
                 );
             }
             if is_chatgpt {
@@ -3191,8 +3245,17 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     && (!requested_extension_native || recipe_args.allow_cdp_fallback),
             )?;
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
-            let transports = constrain_chatgpt_transports_for_browser_context_selector(
+            let base_transports = browser::maybe_prefer_extension_native_for_chatgpt(
                 browser::recipe_transports(&recipe, is_chatgpt),
+                is_chatgpt,
+                recipe_transports_pinned,
+                extension_auto_promotion_eligible,
+            );
+            let extension_native_auto_promoted = extension_auto_promotion_eligible
+                && base_transports.first()
+                    == Some(&browser::RecipeTransport::ChromeExtensionNative);
+            let transports = constrain_chatgpt_transports_for_browser_context_selector(
+                base_transports,
                 &recipe_vars,
                 is_chatgpt,
             );
@@ -3216,6 +3279,11 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 recipe_args.allow_cdp_fallback,
                 is_chatgpt,
             )?;
+            maybe_print_auto_promoted_extension_native_transport(
+                extension_native_auto_promoted,
+                &transports,
+                format,
+            );
             let manual_fallback =
                 manual_browser_recipe_fallback(&recipe_path, recipe_args.bundle.as_deref());
             let mut transport_errors = Vec::new();
@@ -4733,6 +4801,29 @@ mod tests {
             vec![
                 browser::RecipeTransport::ChromeDevtoolsMcp,
                 browser::RecipeTransport::Manual
+            ]
+        );
+    }
+
+    #[test]
+    fn prioritize_chatgpt_transports_for_running_profile_keeps_extension_native_in_front() {
+        let transports = prioritize_chatgpt_transports_for_running_profile_auto_connect(
+            vec![
+                browser::RecipeTransport::ChromeExtensionNative,
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::AgentBrowser,
+                browser::RecipeTransport::Manual,
+            ],
+            true,
+        );
+        assert_eq!(
+            transports,
+            vec![
+                browser::RecipeTransport::ChromeExtensionNative,
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::Manual,
             ]
         );
     }

@@ -49,12 +49,6 @@ name: chatgpt
 #   send_timeout_ms — extension-native send-button enable deadline in ms
 #              (default: 120000 = 2min).
 
-transports:
-  - chrome-devtools-mcp
-  - dev-browser
-  - agent-browser
-  - manual
-
 defaults:
   prompt: Review the attached file and provide your analysis.
   model: "auto"
