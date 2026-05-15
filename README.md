@@ -226,6 +226,7 @@ macOS/Linux-only; Windows CLI artifacts still ship, but Windows native-host
 registration is not implemented yet.
 
 ```bash
+yoetz browser extension setup --chatgpt --open-chrome
 yoetz browser extension install-host --chatgpt
 yoetz browser extension doctor --chatgpt
 yoetz browser extension status --chatgpt
@@ -264,6 +265,15 @@ button, or run `yoetz browser extension reload --chatgpt` when the currently
 loaded extension already supports the reload command; then run
 `yoetz browser extension reconnect --chatgpt` and
 `yoetz browser extension doctor --chatgpt`.
+
+For agent-driven setup, `yoetz browser extension setup --chatgpt --open-chrome`
+does everything Chrome allows from the CLI: it installs or updates the native
+host, finds the unpacked extension directory when available, opens
+`chrome://extensions`, and prints the exact folder to select. Chrome still
+requires the explicit **Load unpacked** UI step for local unpacked extensions.
+If the extension directory is not discoverable from the current checkout or
+installation, set `YOETZ_CHATGPT_NATIVE_EXTENSION_DIR` to the extracted
+extension directory and rerun `setup`.
 
 For normal Google Chrome profiles, `install-host` writes the Native Messaging
 host manifest to Chrome's default user path. If Chrome is launched with a custom

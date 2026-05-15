@@ -348,6 +348,8 @@ struct BrowserExtensionArgs {
 
 #[derive(Subcommand)]
 enum BrowserExtensionCommand {
+    /// Prepare the native-extension install and open Chrome's extension page.
+    Setup(BrowserExtensionSetupArgs),
     /// Install the ChatGPT native messaging host. Currently macOS/Linux only.
     InstallHost(BrowserExtensionScopeArgs),
     Status(BrowserExtensionScopeArgs),
@@ -365,6 +367,16 @@ enum BrowserExtensionCommand {
 struct BrowserExtensionScopeArgs {
     #[arg(long)]
     chatgpt: bool,
+}
+
+#[derive(Args)]
+struct BrowserExtensionSetupArgs {
+    #[arg(long)]
+    chatgpt: bool,
+
+    /// Open chrome://extensions after preparing the native host.
+    #[arg(long)]
+    open_chrome: bool,
 }
 
 #[derive(Args)]
@@ -2274,6 +2286,37 @@ fn handle_browser_extension(
 ) -> Result<()> {
     let mut text_output = None;
     let (kind, payload) = match args.command {
+        BrowserExtensionCommand::Setup(args) => {
+            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            let install = browser_extension_native::install_host()?;
+            let extension_dir = browser_extension_native::chatgpt_extension_source_dir();
+            let opened_chrome = if args.open_chrome {
+                open_chrome_extensions_page()?;
+                true
+            } else {
+                false
+            };
+            let status = browser_extension_native::status()?;
+            let payload = json!({
+                "status": "prepared",
+                "native_host": install,
+                "extension_id": browser_extension_native::EXTENSION_ID,
+                "extension_dir": extension_dir,
+                "extension_dir_env": browser_extension_native::CHATGPT_EXTENSION_DIR_ENV,
+                "chrome_extensions_url": browser_extension_native::CHROME_EXTENSIONS_URL,
+                "opened_chrome": opened_chrome,
+                "extension_status": status,
+                "next_steps": [
+                    "open chrome://extensions",
+                    "enable Developer mode",
+                    "click Load unpacked",
+                    "select extension_dir",
+                    "run yoetz browser extension doctor --chatgpt"
+                ],
+            });
+            text_output = Some(format_extension_setup(&payload));
+            ("browser.extension.setup", payload)
+        }
         BrowserExtensionCommand::InstallHost(args) => {
             ensure_chatgpt_extension_scope(args.chatgpt)?;
             (
@@ -2367,6 +2410,88 @@ fn handle_browser_extension(
             Ok(())
         }
     }
+}
+
+fn open_chrome_extensions_page() -> Result<()> {
+    let url = browser_extension_native::CHROME_EXTENSIONS_URL;
+    #[cfg(target_os = "macos")]
+    let mut cmd = {
+        let mut cmd = Command::new("open");
+        cmd.args(["-a", "Google Chrome", url]);
+        cmd
+    };
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let mut cmd = {
+        let mut cmd = Command::new("xdg-open");
+        cmd.arg(url);
+        cmd
+    };
+    #[cfg(windows)]
+    let mut cmd = {
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/C", "start", "", url]);
+        cmd
+    };
+    let output = cmd
+        .output()
+        .with_context(|| format!("open {}", browser_extension_native::CHROME_EXTENSIONS_URL))?;
+    if !output.status.success() {
+        bail!(
+            "failed to open {}: {}",
+            browser_extension_native::CHROME_EXTENSIONS_URL,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn format_extension_setup(payload: &Value) -> String {
+    let extension_dir = payload
+        .get("extension_dir")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "<not found; set {} to the unpacked extension directory>",
+                browser_extension_native::CHATGPT_EXTENSION_DIR_ENV
+            )
+        });
+    let opened = payload
+        .get("opened_chrome")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let native_manifest = payload
+        .get("native_host")
+        .and_then(|value| value.get("manifest_path"))
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let status = payload
+        .get("extension_status")
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+
+    let mut lines = vec![
+        "Yoetz ChatGPT native extension setup prepared.".to_string(),
+        format!("native_host_manifest: {native_manifest}"),
+        format!("extension_id: {}", browser_extension_native::EXTENSION_ID),
+        format!("extension_dir: {extension_dir}"),
+        format!("chrome_extensions_url: {}", browser_extension_native::CHROME_EXTENSIONS_URL),
+        format!("opened_chrome: {opened}"),
+        format!("current_bridge_status: {status}"),
+        "next: in Chrome, enable Developer mode, click Load unpacked, select extension_dir, then run `yoetz browser extension doctor --chatgpt`.".to_string(),
+    ];
+    if payload
+        .get("extension_dir")
+        .and_then(Value::as_str)
+        .is_none()
+    {
+        lines.push(
+            "release installs may need the extension zip extracted first; pass the extracted path via YOETZ_CHATGPT_NATIVE_EXTENSION_DIR."
+                .to_string(),
+        );
+    }
+    lines.join("\n")
 }
 
 fn format_extension_status(status: &browser_extension_native::ExtensionStatus) -> String {

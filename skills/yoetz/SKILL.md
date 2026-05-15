@@ -267,6 +267,7 @@ Use this only when ChatGPT Pro recipe robustness needs install-once native
 messaging instead of CDP approval prompts:
 
 ```bash
+yoetz browser extension setup --chatgpt --open-chrome
 yoetz browser extension install-host --chatgpt
 yoetz browser extension doctor --chatgpt
 yoetz browser extension status --chatgpt
@@ -330,6 +331,10 @@ mode enabled, and click the extension reload button after replacing files. Then
 run `yoetz browser extension reconnect --chatgpt` and `doctor --chatgpt`.
 From a source checkout, load `extensions/chatgpt-native`; from a release zip,
 load the extracted zip directory itself.
+For agent-driven setup, prefer `yoetz browser extension setup --chatgpt
+--open-chrome`; it installs the host, opens Chrome's extension page, and prints
+the exact folder to select. Chrome still requires the **Load unpacked** UI
+confirmation for local extensions.
 When multiple Chrome profiles have the extension loaded, pass
 `--var profile_email=<email>` if Chrome exposes one, or the stable
 `--var extension_instance_id=<id>` shown by `status --chatgpt`.
