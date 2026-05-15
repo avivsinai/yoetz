@@ -375,9 +375,11 @@ yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var model=gpt-5-4-pro
 The wait loop reports `completion_reason` in its JSON output:
 - `copy_button` — the strong signal: a copy control rendered on the new
   assistant message (response is fully streamed).
-- `stable_idle` — the page looked idle with unchanged length for
-  ≥ `max(90s, 3 × wait_interval_ms)`. Used when ChatGPT changes its copy-button
-  selectors; otherwise `copy_button` is the normal completion path.
+
+There is no generic "stable text" completion fallback for the extension
+transport. If ChatGPT text is visible but final controls have not appeared yet,
+Yoetz keeps waiting and prints the inspect command so the owning agent can
+debug the live tab instead of accepting a partial prefix.
 
 ### Combined workflow: API + Browser
 
