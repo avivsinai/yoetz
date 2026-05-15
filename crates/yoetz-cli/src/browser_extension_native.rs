@@ -2157,6 +2157,9 @@ mod native_host_unix {
             let mut clients = clients.lock().unwrap();
             if let Some(client) = clients.get_mut(&job_id) {
                 update_client_effect_state(client, &envelope);
+                if should_replay_upload_from_start(&envelope) {
+                    client.next_chunk = 0;
+                }
                 let stream = match client.stream.try_clone() {
                     Ok(stream) => stream,
                     Err(err) => {
@@ -2333,6 +2336,20 @@ mod native_host_unix {
             return Ok(true);
         }
         Ok(false)
+    }
+
+    pub(super) fn should_replay_upload_from_start(envelope: &ProtocolEnvelope) -> bool {
+        envelope.kind == "job_progress"
+            && envelope
+                .payload
+                .get("phase")
+                .and_then(Value::as_str)
+                .is_some_and(|phase| phase == "ready_for_file")
+            && envelope
+                .payload
+                .get("restored")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
     }
 
     fn local_client_disconnected_cancel(client: &ClientJob) -> ProtocolEnvelope {
@@ -3210,6 +3227,31 @@ mod tests {
         assert_eq!(chunks[0]["total_bytes"], 3);
         assert_eq!(chunks[0]["filename"], "bundle.md");
         assert_eq!(chunks[0]["bytes_base64"], "YWJj");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn restored_ready_for_file_replays_upload_from_start() {
+        let restored = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_restore".to_string()),
+            Some("run_restore".to_string()),
+            json!({
+                "phase": "ready_for_file",
+                "restored": true,
+            }),
+        );
+        let fresh = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_fresh".to_string()),
+            Some("run_fresh".to_string()),
+            json!({
+                "phase": "ready_for_file",
+            }),
+        );
+
+        assert!(native_host_unix::should_replay_upload_from_start(&restored));
+        assert!(!native_host_unix::should_replay_upload_from_start(&fresh));
     }
 
     #[test]

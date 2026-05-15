@@ -676,6 +676,18 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
     if (TERMINAL_STATUSES.has(job.status)) {
       continue;
     }
+    if (canResumeJobAfterWorkerRestart(job)) {
+      job.connection_generation = connectionGeneration;
+      job.updated_at = Date.now();
+      jobs.set(job.job_id, job);
+      await persistJob(job);
+      postNative(progress(job, "ready_for_file", {
+        tab_id: job.tab_id,
+        restored: true,
+        message: "ChatGPT tab is ready for bundle upload"
+      }));
+      continue;
+    }
     if (emitLostState) {
       const lostStatus = job.status;
       await failJob(job, "state_lost", `job ${job.job_id} lost in-memory extension state after service-worker restart`, {
@@ -687,6 +699,13 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
       jobs.set(job.job_id, job);
     }
   }
+}
+
+function canResumeJobAfterWorkerRestart(job) {
+  // The tab is prepared and no file chunks have been accepted yet. There is no
+  // in-memory ChunkAssembler state to reconstruct, so the native process can
+  // continue by sending the first chunk after reconnect.
+  return job.status === "waiting_for_file" && Boolean(job.tab_id);
 }
 
 function normalizeJob(message) {

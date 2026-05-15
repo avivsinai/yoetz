@@ -2709,6 +2709,129 @@ test("service worker cancelJob still removes the tab when the content script is 
   }
 });
 
+test("service worker resumes waiting_for_file jobs after service-worker restart", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+  const sentToTabs = [];
+  let sent = false;
+  await storage.set({
+    "jobs.job_restore_waiting": {
+      job_id: "job_restore_waiting",
+      run_id: "run_job_restore_waiting",
+      workspace_id: "workspace_test",
+      status: "waiting_for_file",
+      prompt: "prompt",
+      model: "current",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1500,
+      tab_id: 42,
+      started_at: now,
+      updated_at: now
+    }
+  });
+
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      create: async () => {
+        throw new Error("restore must reuse the prepared tab");
+      },
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        switch (message.type) {
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? { method: "assistant_dom_fallback", text: "restored answer", is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0 }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?restore_waiting_for_file=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    await eventually(async () => {
+      const restored = (await storage.get("jobs.job_restore_waiting"))["jobs.job_restore_waiting"];
+      return restored?.status === "waiting_for_file" && Number.isFinite(restored.connection_generation);
+    });
+    assert.equal(port.messages.some((message) => message.type === "job_error" && message.job_id === "job_restore_waiting"), false);
+    const restoredReady = port.messages.find((message) => message.type === "job_progress" && message.job_id === "job_restore_waiting" && message.payload?.phase === "ready_for_file");
+    assert.equal(restoredReady?.payload.restored, true);
+    assert.equal(restoredReady?.payload.tab_id, 42);
+
+    port.emit(envelope("job_file_chunk", "job_restore_waiting", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_restore_waiting.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete" && message.job_id === "job_restore_waiting"));
+    const complete = port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_restore_waiting");
+    assert.equal(complete.payload.response, "restored answer");
+    assert.equal(sentToTabs.find((item) => item.message.type === "yoetz_upload_file")?.id, 42);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker still fails receiving_file jobs after service-worker restart", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+  await storage.set({
+    "jobs.job_restore_receiving": {
+      job_id: "job_restore_receiving",
+      run_id: "run_job_restore_receiving",
+      workspace_id: "workspace_test",
+      status: "receiving_file",
+      prompt: "prompt",
+      model: "current",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1500,
+      tab_id: 43,
+      started_at: now,
+      updated_at: now
+    }
+  });
+
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {}
+  });
+
+  try {
+    await import(`../src/service-worker.js?restore_receiving_file=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.job_id === "job_restore_receiving"));
+    const error = port.messages.find((message) => message.type === "job_error" && message.job_id === "job_restore_receiving");
+    assert.equal(error.payload.code, "state_lost");
+    assert.equal(error.payload.phase, "upload");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal((await storage.get("jobs.job_restore_receiving"))["jobs.job_restore_receiving"].status, "state_lost");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 function envelope(type, jobId, payload = {}, fields = {}) {
   return {
     protocol_version: 1,
