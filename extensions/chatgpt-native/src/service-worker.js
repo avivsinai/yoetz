@@ -1291,7 +1291,7 @@ function finalAffordanceExtractionFailureMessage(job, extraction, stableForMs) {
   return `ChatGPT rendered a final assistant affordance but Yoetz could not extract scoped assistant text (method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, turn_index=${extraction?.turn_index ?? -1}, copy_button_count=${extraction?.copy_button_count ?? 0}, stable_for_ms=${stableForMs}). Inspect the owned tab with \`yoetz browser extension inspect --chatgpt --run-id ${job.run_id}\` before rerunning.`;
 }
 
-function meaningfulResponseText(text, options = {}) {
+function meaningfulResponseText(text) {
   const lines = String(text ?? "")
     .split(/\n+/)
     .map((line) => line.replace(/\s+/g, " ").trim())
@@ -1299,17 +1299,16 @@ function meaningfulResponseText(text, options = {}) {
   if (lines.length === 0) {
     return false;
   }
-  return lines.some((line) => !isResponseChromeLine(line, options));
+  return lines.some((line) => !isResponseChromeLine(line));
 }
 
-function isResponseChromeLine(line, options = {}) {
+function isResponseChromeLine(line) {
   return /^(copy|copied|read aloud|share|regenerate|retry|edit|like|dislike)$/i.test(line)
     || /^(thought|reasoned)\s+for\s+\S.*$/i.test(line)
     || /^(analyzing|thinking|working|searching)[.…]*$/i.test(line)
     || /^show\s+(more|reasoning)$/i.test(line)
     || /^(pro thinking|extended thinking|thinking|pro|extended pro)$/i.test(line)
-    || /^gpt[\s.-]*\d+(?:[\s.-]*\d+)*(?:\s+(?:pro|thinking))?$/i.test(line)
-    || (!options.allowSingleLetter && /^[A-Z]$/.test(line));
+    || /^gpt[\s.-]*\d+(?:[\s.-]*\d+)*(?:\s+(?:pro|thinking))?$/i.test(line);
 }
 
 function completedExtraction(extraction, completionReason, stableForMs) {

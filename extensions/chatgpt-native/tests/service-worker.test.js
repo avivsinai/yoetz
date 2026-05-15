@@ -1307,7 +1307,7 @@ test("service worker does not complete on thought/status-only assistant text", a
   }
 });
 
-test("service worker rejects a scoped single-letter assistant markdown response", async () => {
+test("service worker accepts a scoped single-letter assistant markdown response", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -1336,7 +1336,7 @@ test("service worker rejects a scoped single-letter assistant markdown response"
               payload: sent
                 ? {
                     method: "copy_scope_dom_fallback",
-                    text: "I",
+                    text: "A",
                     is_generating: false,
                     assistant_count: 1,
                     user_count: 1,
@@ -1355,34 +1355,38 @@ test("service worker rejects a scoped single-letter assistant markdown response"
   });
 
   try {
-    await import(`../src/service-worker.js?single_letter_scoped_response=${Date.now()}`);
-    port.emit(envelope("job_start", "job_single_letter_scoped_response", {
+    await import(`../src/service-worker.js?single_letter_scoped_valid=${Date.now()}`);
+    port.emit(envelope("job_start", "job_single_letter_scoped_valid", {
       prompt: "prompt",
       wait_interval_ms: 50,
       wait_timeout_ms: 1200
     }));
     await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
-    port.emit(envelope("job_file_chunk", "job_single_letter_scoped_response", {
+    port.emit(envelope("job_file_chunk", "job_single_letter_scoped_valid", {
       sequence: 0,
       total_chunks: 1,
       total_bytes: 4,
-      filename: "job_single_letter_scoped_response.md",
+      filename: "job_single_letter_scoped_valid.md",
       mime_type: "text/markdown",
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
 
-    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
-    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.equal(complete.payload.response, "A");
+    assert.equal(complete.payload.completion_reason, "copy_button");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
   } finally {
     globalThis.chrome = originalChrome;
   }
 });
 
-test("service worker does not fast-complete a single-letter response without a final affordance", async () => {
+test("service worker waits for streaming one-letter prefix to become stable idle text", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
   let sent = false;
+  let extractCount = 0;
   globalThis.chrome = chromeStub({
     port,
     tabs: {
@@ -1401,23 +1405,28 @@ test("service worker does not fast-complete a single-letter response without a f
           case "yoetz_send_prompt":
             sent = true;
             return { ok: true, payload: { sent: true } };
-          case "yoetz_extract_response":
+          case "yoetz_extract_response": {
+            if (!sent) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 } };
+            }
+            extractCount += 1;
+            const streaming = extractCount <= 2;
+            const text = extractCount === 1 ? "I" : "I reviewed the bundle.";
             return {
               ok: true,
-              payload: sent
-                ? {
-                    method: "assistant_dom_fallback",
-                    text: "I",
-                    is_generating: false,
-                    assistant_count: 1,
-                    user_count: 1,
-                    preceding_user_count: 1,
-                    copy_button_count: 0,
-                    has_copy_button: false,
-                    turn_index: 0
-                  }
-                : { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+              payload: {
+                method: "assistant_dom_fallback",
+                text,
+                is_generating: streaming,
+                assistant_count: 1,
+                user_count: 1,
+                preceding_user_count: 1,
+                copy_button_count: 1,
+                has_copy_button: streaming,
+                turn_index: 0
+              }
             };
+          }
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -1426,166 +1435,37 @@ test("service worker does not fast-complete a single-letter response without a f
   });
 
   try {
-    await import(`../src/service-worker.js?single_letter_without_final_affordance_fast=${Date.now()}`);
-    port.emit(envelope("job_start", "job_single_letter_without_final_affordance", {
+    await import(`../src/service-worker.js?streaming_single_letter_prefix=${Date.now()}`);
+    port.emit(envelope("job_start", "job_streaming_single_letter_prefix", {
       prompt: "prompt",
       wait_interval_ms: 50,
-      wait_timeout_ms: 900
+      wait_timeout_ms: 5000
     }));
     await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
-    port.emit(envelope("job_file_chunk", "job_single_letter_without_final_affordance", {
+    port.emit(envelope("job_file_chunk", "job_streaming_single_letter_prefix", {
       sequence: 0,
       total_chunks: 1,
       total_bytes: 4,
-      filename: "job_single_letter_without_final_affordance.md",
+      filename: "job_streaming_single_letter_prefix.md",
       mime_type: "text/markdown",
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
 
-    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
-    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
-  } finally {
-    globalThis.chrome = originalChrome;
-  }
-});
-
-test("service worker rejects a stable idle single-letter response without a final affordance", async () => {
-  const originalChrome = globalThis.chrome;
-  const port = makePort();
-  let tabId = 0;
-  let sent = false;
-  globalThis.chrome = chromeStub({
-    port,
-    tabs: {
-      create: async (opts) => ({ id: ++tabId, ...opts }),
-      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
-      sendMessage: async (_id, message) => {
-        switch (message.type) {
-          case "yoetz_probe":
-            return { ok: true, payload: {} };
-          case "yoetz_prepare_job":
-            return { ok: true, payload: { manual_handoff: null } };
-          case "yoetz_configure_model":
-            return { ok: true, payload: { status: "kept_current", model_used: "ChatGPT" } };
-          case "yoetz_upload_file":
-            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
-          case "yoetz_send_prompt":
-            sent = true;
-            return { ok: true, payload: { sent: true } };
-          case "yoetz_extract_response":
-            return {
-              ok: true,
-              payload: sent
-                ? {
-                    method: "assistant_dom_fallback",
-                    text: "I",
-                    is_generating: false,
-                    assistant_count: 1,
-                    user_count: 1,
-                    preceding_user_count: 1,
-                    copy_button_count: 0,
-                    has_copy_button: false,
-                    turn_index: 0
-                  }
-                : { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
-            };
-          default:
-            throw new Error(`unexpected tab message ${message.type}`);
-        }
-      }
-    }
-  });
-
-  try {
-    await import(`../src/service-worker.js?single_letter_without_final_affordance_stable=${Date.now()}`);
-    port.emit(envelope("job_start", "job_single_letter_stable_idle", {
-      prompt: "prompt",
-      wait_interval_ms: 50,
-      wait_timeout_ms: 2600
-    }));
-    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
-    port.emit(envelope("job_file_chunk", "job_single_letter_stable_idle", {
-      sequence: 0,
-      total_chunks: 1,
-      total_bytes: 4,
-      filename: "job_single_letter_stable_idle.md",
-      mime_type: "text/markdown",
-      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
-    }));
-
-    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
-    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
-  } finally {
-    globalThis.chrome = originalChrome;
-  }
-});
-
-test("service worker does not complete a single-letter response from copy count alone", async () => {
-  const originalChrome = globalThis.chrome;
-  const port = makePort();
-  let tabId = 0;
-  let sent = false;
-  globalThis.chrome = chromeStub({
-    port,
-    tabs: {
-      create: async (opts) => ({ id: ++tabId, ...opts }),
-      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
-      sendMessage: async (_id, message) => {
-        switch (message.type) {
-          case "yoetz_probe":
-            return { ok: true, payload: {} };
-          case "yoetz_prepare_job":
-            return { ok: true, payload: { manual_handoff: null } };
-          case "yoetz_configure_model":
-            return { ok: true, payload: { status: "kept_current", model_used: "ChatGPT" } };
-          case "yoetz_upload_file":
-            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
-          case "yoetz_send_prompt":
-            sent = true;
-            return { ok: true, payload: { sent: true } };
-          case "yoetz_extract_response":
-            return {
-              ok: true,
-              payload: sent
-                ? {
-                    method: "assistant_dom_fallback",
-                    text: "I",
-                    is_generating: false,
-                    assistant_count: 1,
-                    user_count: 1,
-                    preceding_user_count: 1,
-                    copy_button_count: 1,
-                    has_copy_button: false,
-                    turn_index: 0
-                  }
-                : { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
-            };
-          default:
-            throw new Error(`unexpected tab message ${message.type}`);
-        }
-      }
-    }
-  });
-
-  try {
-    await import(`../src/service-worker.js?single_letter_copy_count_only=${Date.now()}`);
-    port.emit(envelope("job_start", "job_single_letter_copy_count_only", {
-      prompt: "prompt",
-      wait_interval_ms: 50,
-      wait_timeout_ms: 900
-    }));
-    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
-    port.emit(envelope("job_file_chunk", "job_single_letter_copy_count_only", {
-      sequence: 0,
-      total_chunks: 1,
-      total_bytes: 4,
-      filename: "job_single_letter_copy_count_only.md",
-      mime_type: "text/markdown",
-      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
-    }));
-
-    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
-    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"), 7000);
+    const observedPrefix = port.messages.find(
+      (message) =>
+        message.type === "job_progress" &&
+        message.payload.phase === "response_observed" &&
+        message.payload.response_length === 1 &&
+        message.payload.is_generating === true &&
+        message.payload.has_copy_button === true
+    );
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.ok(observedPrefix, "streaming one-letter prefix should be observed before completion");
+    assert.ok(extractCount >= 5, "completion should wait for idle stable polls after streaming stops");
+    assert.equal(complete.payload.response, "I reviewed the bundle.");
+    assert.equal(complete.payload.completion_reason, "stable_idle");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
   } finally {
     globalThis.chrome = originalChrome;
   }
