@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.10] - 2026-05-15
+### Fixed
+
+- ChatGPT native-extension jobs now resume pre-upload `waiting_for_file` state
+  after a Manifest V3 service-worker restart, replaying bundle chunks from the
+  start instead of failing with lost in-memory state.
+
 ## [0.5.9] - 2026-05-15
 ### Changed
 
