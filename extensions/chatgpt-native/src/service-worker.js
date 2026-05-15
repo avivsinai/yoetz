@@ -988,12 +988,10 @@ async function waitForResponse(job) {
   const startedAt = Date.now();
   const interval = Math.max(500, Math.min(Number(job.wait_interval_ms) || 30000, 30000));
   const finalAffordanceIdleMs = Math.min(MIN_STABLE_IDLE_MS, Math.max(FINAL_AFFORDANCE_STABLE_IDLE_MS, 0));
-  const stablePolls = 2;
   let best = { method: "none", text: "", is_generating: true };
   let last = { method: "none", text: "", is_generating: true };
-  let lastStableText = "";
-  let stableCount = 0;
-  let stableSinceMs = 0;
+  let finalAffordanceAnchor = "";
+  let finalAffordanceSinceMs = 0;
   let extractionFailureAnchor = "";
   let extractionFailureSinceMs = 0;
   let lastWaitingProgressAt = startedAt;
@@ -1027,15 +1025,13 @@ async function waitForResponse(job) {
       postResponseProgress(job, extraction);
       assertJobConnectionCurrent(job);
     }
-    const rawText = extraction?.text ?? "";
     const extractionIdle = !extraction?.is_generating;
-    const text = meaningfulResponseText(rawText) ? rawText : "";
-    const stableTextCandidate = Boolean(postSend && extractionIdle && text);
-    const scopedStableTextCandidate = Boolean(
-      stableTextCandidate
+    const scopedExtractionCandidate = Boolean(
+      postSend
+      && extractionIdle
       && extraction?.method !== "page_text_fallback"
     );
-    const finalAffordance = Boolean(scopedStableTextCandidate && hasFinalAssistantAffordance(extraction));
+    const finalAffordance = Boolean(scopedExtractionCandidate && hasFinalAssistantAffordance(extraction));
     // Broad page text is diagnostic only; final controls without scoped text
     // means extraction failed, not that page chrome is safe to return.
     const finalAffordanceWithoutScopedText = Boolean(
@@ -1044,23 +1040,22 @@ async function waitForResponse(job) {
       && !extraction?.is_generating
       && hasFinalAssistantAffordance(extraction)
     );
-    if (stableTextCandidate && text === lastStableText) {
-      stableCount += 1;
-      if (!stableSinceMs) {
-        stableSinceMs = Date.now();
+    let stableForMs = 0;
+    if (finalAffordance) {
+      const anchor = responseFinalityAnchor(extraction);
+      if (anchor !== finalAffordanceAnchor) {
+        finalAffordanceAnchor = anchor;
+        finalAffordanceSinceMs = Date.now();
       }
-    } else {
-      lastStableText = text;
-      stableCount = stableTextCandidate ? 1 : 0;
-      stableSinceMs = stableCount > 0 ? Date.now() : 0;
-    }
-    const stableForMs = stableSinceMs ? Date.now() - stableSinceMs : 0;
-    const awaitingFinalAffordance = Boolean(scopedStableTextCandidate && !finalAffordance);
-    if (scopedStableTextCandidate && stableCount >= stablePolls) {
-      if (finalAffordance && stableForMs >= finalAffordanceIdleMs) {
+      stableForMs = Date.now() - finalAffordanceSinceMs;
+      if (stableForMs >= finalAffordanceIdleMs) {
         return completedExtraction(extraction, "copy_button", stableForMs);
       }
+    } else {
+      finalAffordanceAnchor = "";
+      finalAffordanceSinceMs = 0;
     }
+    const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalAffordance);
     if (finalAffordanceWithoutScopedText) {
       const anchor = finalAffordanceExtractionFailureAnchor(extraction);
       if (anchor !== extractionFailureAnchor) {
@@ -1299,38 +1294,22 @@ function hasFinalAssistantAffordance(extraction) {
   return Boolean(!extraction?.is_generating && extraction?.has_copy_button);
 }
 
-function finalAffordanceExtractionFailureAnchor(extraction) {
+function responseFinalityAnchor(extraction) {
   return [
     extraction?.method ?? "none",
     extraction?.assistant_count ?? 0,
     extraction?.turn_index ?? -1,
     extraction?.copy_button_count ?? 0,
-    extraction?.text?.length ?? 0
+    extraction?.has_copy_button ? 1 : 0
   ].join(":");
+}
+
+function finalAffordanceExtractionFailureAnchor(extraction) {
+  return responseFinalityAnchor(extraction);
 }
 
 function finalAffordanceExtractionFailureMessage(job, extraction, stableForMs) {
   return `ChatGPT rendered a final assistant affordance but Yoetz could not extract scoped assistant text (method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, turn_index=${extraction?.turn_index ?? -1}, copy_button_count=${extraction?.copy_button_count ?? 0}, stable_for_ms=${stableForMs}). Inspect the owned tab with \`yoetz browser extension inspect --chatgpt --run-id ${job.run_id}\` before rerunning.`;
-}
-
-function meaningfulResponseText(text) {
-  const lines = String(text ?? "")
-    .split(/\n+/)
-    .map((line) => line.replace(/\s+/g, " ").trim())
-    .filter(Boolean);
-  if (lines.length === 0) {
-    return false;
-  }
-  return lines.some((line) => !isResponseChromeLine(line));
-}
-
-function isResponseChromeLine(line) {
-  return /^(copy|copied|read aloud|share|regenerate|retry|edit|like|dislike)$/i.test(line)
-    || /^(thought|reasoned)\s+for\s+\S.*$/i.test(line)
-    || /^(analyzing|thinking|working|searching)[.…]*$/i.test(line)
-    || /^show\s+(more|reasoning)$/i.test(line)
-    || /^(pro thinking|extended thinking|thinking|pro|extended pro)$/i.test(line)
-    || /^gpt[\s.-]*\d+(?:[\s.-]*\d+)*(?:\s+(?:pro|thinking))?$/i.test(line);
 }
 
 function completedExtraction(extraction, completionReason, stableForMs) {

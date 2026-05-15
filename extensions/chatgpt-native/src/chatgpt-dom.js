@@ -686,7 +686,7 @@ function standaloneAssistantSegment(root, conversation, ordered, marker, latestU
         && !isNonConversationChrome(node);
     });
   const textEntries = markdownNodes
-    .map((node) => ({ node, text: cleanAssistantText(node, { allowSingleLetter: true }) }))
+    .map((node) => ({ node, text: cleanAssistantText(node) }))
     .filter((entry) => entry.text);
   if (textEntries.length === 0) {
     return null;
@@ -758,7 +758,7 @@ function hasResponseBoundaryBetween(ordered, startIndex, endIndex) {
     if (role === "user" || role === "assistant") {
       return true;
     }
-    if (isMarkdownNode(node) && cleanAssistantText(node, { allowSingleLetter: true })) {
+    if (isMarkdownNode(node) && cleanAssistantText(node)) {
       return true;
     }
   }
@@ -859,7 +859,7 @@ function assistantMessageTextEntry(turn) {
   const leafContentNodes = leafNodes(contentNodes);
   const textEntries = [];
   for (const node of leafContentNodes) {
-    const text = cleanAssistantText(node, { allowSingleLetter: isMarkdownNode(node) });
+    const text = cleanAssistantText(node);
     if (text) {
       textEntries.push({ node, text });
     }
@@ -889,11 +889,11 @@ function leafNodes(nodes) {
   return nodes.filter((node) => !nodes.some((other) => other !== node && containsNode(node, other)));
 }
 
-function cleanAssistantText(node, options = {}) {
+function cleanAssistantText(node) {
   const lines = textOf(node)
     .split(/\n+/)
     .map((line) => normalizeText(line))
-    .filter((line) => line && !isAssistantControlLine(line) && !isAssistantNoiseLine(line, options));
+    .filter((line) => line && !isAssistantControlLine(line));
   return normalizeText(lines.join("\n"));
 }
 
@@ -907,10 +907,6 @@ function isModelStatusText(text) {
   const value = normalizeText(text);
   return /^(pro thinking|extended thinking|thinking|pro|extended pro)$/i.test(value)
     || /^gpt[\s.-]*\d+(?:[\s.-]*\d+)*(?:\s+(?:pro|thinking))?$/i.test(value);
-}
-
-function isAssistantNoiseLine(line, options = {}) {
-  return !options.allowSingleLetter && /^[A-Z]$/.test(line);
 }
 
 function isMarkdownNode(node) {

@@ -1241,7 +1241,7 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
   }
 });
 
-test("service worker does not complete on thought/status-only assistant text", async () => {
+test("service worker completion is structural and does not classify response text", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -1287,7 +1287,7 @@ test("service worker does not complete on thought/status-only assistant text", a
   });
 
   try {
-    await import(`../src/service-worker.js?thought_only=${Date.now()}`);
+    await import(`../src/service-worker.js?structural_finality=${Date.now()}`);
     port.emit(envelope("job_start", "job_thought_only", {
       prompt: "prompt",
       wait_interval_ms: 50,
@@ -1302,8 +1302,10 @@ test("service worker does not complete on thought/status-only assistant text", a
       mime_type: "text/markdown",
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
-    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
-    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.equal(complete.payload.response, "Thought for 9m 55s\nThought for 9m 55s");
+    assert.equal(complete.payload.completion_reason, "copy_button");
   } finally {
     globalThis.chrome = originalChrome;
   }
