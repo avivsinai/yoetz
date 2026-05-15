@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.7] - 2026-05-15
+### Changed
+
+- Clarified Yoetz skill guidance for ChatGPT native-extension completion: the
+  extension waits for final assistant controls instead of accepting stable
+  partial page text.
+
 ## [0.5.6] - 2026-05-15
 ### Fixed
 
