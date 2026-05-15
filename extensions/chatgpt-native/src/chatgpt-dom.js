@@ -473,9 +473,18 @@ export async function selectRequestedModel(root, requested) {
   const option = findModelOption(root, requested);
   const availableOptions = visibleModelOptionLabels(root);
   if (!option) {
+    const currentAfterOpen = currentModelLabel(root);
+    if (modelTextMatchesRequest(currentAfterOpen, requested)) {
+      return {
+        status: "selected",
+        model_used: currentAfterOpen,
+        available_options: availableOptions,
+        already_selected: true
+      };
+    }
     return {
       status: "unavailable",
-      model_used: currentModelLabel(root),
+      model_used: currentAfterOpen,
       available_options: availableOptions,
       warning: `requested ChatGPT model ${requested.raw} was not visible`
     };

@@ -47,8 +47,8 @@ const DEV_BROWSER_ATTACH_TO_OTHER_ENV: &str = "PW_CHROMIUM_ATTACH_TO_OTHER";
 const DEV_BROWSER_PARENT_TIMEOUT_GRACE_SECS: u64 = 20;
 const DEV_BROWSER_WAIT_POLL_MS: u64 = 100;
 
-/// Extended timeout for ChatGPT response polling (30 minutes by default).
-const CHATGPT_POLL_TIMEOUT_MS_DEFAULT: u64 = 1_800_000;
+/// Extended timeout for ChatGPT response polling (90 minutes by default).
+const CHATGPT_POLL_TIMEOUT_MS_DEFAULT: u64 = 5_400_000;
 const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 30_000;
 const CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 const CHATGPT_SEND_TIMEOUT_MS_DEFAULT: u64 = 120_000;
@@ -1806,7 +1806,7 @@ mod tests {
 
     #[test]
     fn chatgpt_script_timeout_secs_adds_grace_window() {
-        assert_eq!(chatgpt_script_timeout_secs(1_800_000), 1_860);
+        assert_eq!(chatgpt_script_timeout_secs(900_000), 960);
     }
 
     #[test]
@@ -2202,12 +2202,12 @@ mod tests {
         let message = chatgpt_wait_progress_message(
             Duration::from_secs(95),
             ChatgptPollSettings {
-                timeout_ms: 1_800_000,
+                timeout_ms: 5_400_000,
                 interval_ms: 30_000,
             },
         );
         assert!(message.contains("elapsed 1m 35s"));
-        assert!(message.contains("timeout 30m 0s"));
+        assert!(message.contains("timeout 1h 30m"));
         assert!(message.contains("poll every 30s"));
     }
 

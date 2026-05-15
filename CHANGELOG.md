@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- Built-in browser recipes such as `chatgpt` now resolve by name even when the
+  caller's working directory contains a same-name file or directory.
+- ChatGPT native-extension auto model selection now reports the current
+  Pro/Extended Pro model as selected when that label appears only after opening
+  the personal ChatGPT model menu.
+
+### Changed
+
+- ChatGPT native-extension wait progress now distinguishes total page copy
+  buttons from the scoped final assistant copy button required for completion.
+- ChatGPT browser recipes now default to a 90-minute response wait for
+  Pro/Extended Pro runs and include the owned-tab inspect command on timeout.
 
 ## [0.5.7] - 2026-05-15
 ### Changed
