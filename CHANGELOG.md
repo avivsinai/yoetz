@@ -8,6 +8,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ## [0.5.5] - 2026-05-15
+### Added
+
+- Added `yoetz browser extension setup --chatgpt` to streamline ChatGPT native
+  extension host installation and open Chrome with the expected setup page.
+- Added personal ChatGPT UI model-selection support for Pro and Extended Pro,
+  alongside the existing enterprise ChatGPT selectors.
+
+### Changed
+
+- Reduced routine GitHub Actions runner spend by limiting ordinary PR/main
+  builds to Ubuntu while keeping the full cross-platform matrix for release
+  branches and manual CI runs.
+
+### Fixed
+
+- ChatGPT native-extension recipes now prefer Pro/Extended Pro by default and
+  avoid falling back to Instant unless the user explicitly asks for it.
+- ChatGPT native-extension response extraction no longer completes a job early
+  on transient one-character streaming snapshots.
 
 ## [0.5.4] - 2026-05-14
 ### Added
