@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.8] - 2026-05-15
 ### Fixed
 
 - Built-in browser recipes such as `chatgpt` now resolve by name even when the
@@ -22,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   assistant DOM structure and final controls, not response-content heuristics.
 - ChatGPT browser recipes now default to a 90-minute response wait for
   Pro/Extended Pro runs and include the owned-tab inspect command on timeout.
+
 
 ## [0.5.7] - 2026-05-15
 ### Changed
