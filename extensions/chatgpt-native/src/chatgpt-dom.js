@@ -84,7 +84,7 @@ export function findSendButton(root = document) {
 }
 
 export function findModelButton(root = document) {
-  return firstVisible(root, [
+  const enterpriseButton = firstVisible(root, [
     'button[data-testid="model-switcher-dropdown-button"]',
     'button:has([data-testid="selected-model"])',
     'button:has([data-testid="model-switcher-selected-model"])',
@@ -92,6 +92,7 @@ export function findModelButton(root = document) {
     'button[aria-controls*="model" i]',
     'button[id*="model" i]'
   ]);
+  return enterpriseButton ?? findComposerModelControl(root);
 }
 
 export function getPageText(root = document) {
@@ -338,7 +339,112 @@ function isExtendedChipLike(node) {
   return /\bextended\b/.test(marker) && /\b(chip|pill|token|toggle|badge|model)\b/.test(marker);
 }
 
+function findComposerModelControl(root) {
+  for (const scope of composerScopes(root, { includeRoot: false })) {
+    const candidates = uniqueElements(Array.from(scope.querySelectorAll([
+      "button",
+      '[role="button"]',
+      "[aria-haspopup]",
+      "[tabindex]",
+      "[aria-label]",
+      "[title]",
+      "[data-testid]",
+      "span",
+      "div"
+    ].join(","))));
+    for (const node of candidates) {
+      const target = modelClickTarget(node, scope);
+      if (!target || !isVisible(target, { allowDisabled: true })) {
+        continue;
+      }
+      const haystack = modelCandidateText(node, target);
+      if (!looksLikeModelControl(haystack)) {
+        continue;
+      }
+      if (/\b(send|stop|copy|share|new chat|attach|upload|search|history|dictation|voice|microphone|account|profile|settings|upgrade)\b/.test(haystack)) {
+        continue;
+      }
+      return target;
+    }
+  }
+  return null;
+}
+
+function modelClickTarget(node, stopAt) {
+  let current = node;
+  while (current) {
+    if (isModelActionableElement(current) || isModelChipLike(current)) {
+      return current;
+    }
+    if (current === stopAt) {
+      return null;
+    }
+    current = current.parentElement;
+  }
+  return null;
+}
+
+function modelCandidateText(node, target = node) {
+  return normalizeText([
+    node?.getAttribute?.("aria-label"),
+    node?.getAttribute?.("title"),
+    node?.getAttribute?.("data-testid"),
+    node?.getAttribute?.("class"),
+    node?.innerText,
+    node?.textContent,
+    target?.getAttribute?.("aria-label"),
+    target?.getAttribute?.("title"),
+    target?.getAttribute?.("data-testid"),
+    target?.getAttribute?.("class"),
+    target?.innerText,
+    target?.textContent
+  ].filter(Boolean).join(" ")).toLowerCase();
+}
+
+function modelControlLabel(node) {
+  return normalizeText([
+    textOf(node),
+    node?.getAttribute?.("aria-label"),
+    node?.getAttribute?.("title")
+  ].filter(Boolean).join(" "));
+}
+
+function looksLikeModelControl(text) {
+  return /\bextended\s+pro\b/.test(text)
+    || /\bgpt[\s.-]*\d/.test(text)
+    || /\b(pro|instant|thinking|model)\b/.test(text);
+}
+
+function isModelActionableElement(node) {
+  const tag = String(node?.tagName ?? "").toLowerCase();
+  const role = String(node?.getAttribute?.("role") ?? "").toLowerCase();
+  return tag === "button"
+    || role === "button"
+    || node?.getAttribute?.("aria-haspopup") !== null
+    || node?.getAttribute?.("tabindex") !== null;
+}
+
+function isModelChipLike(node) {
+  const marker = normalizeText([
+    node?.getAttribute?.("data-testid"),
+    node?.getAttribute?.("class"),
+    node?.getAttribute?.("aria-label"),
+    node?.getAttribute?.("title")
+  ].filter(Boolean).join(" ")).toLowerCase();
+  return /\b(model|model-switcher)\b/.test(marker) && /\b(chip|pill|token|button|menu|dropdown|switcher)\b/.test(marker);
+}
+
 export async function selectRequestedModel(root, requested) {
+  const currentBefore = currentModelLabel(root);
+  if (modelTextMatchesRequest(currentBefore, requested)) {
+    return {
+      status: "selected",
+      model_used: currentBefore,
+      available_options: [],
+      already_selected: true
+    };
+  }
+
   let modelButton = null;
   try {
     modelButton = await waitForElement(root, findModelButton, "ChatGPT model selector", {
@@ -1489,7 +1595,11 @@ function currentModelLabel(root) {
     '[aria-checked="true"]',
     '[aria-selected="true"]'
   ]);
-  return normalizeText(selected?.innerText ?? selected?.textContent ?? findModelButton(root)?.innerText ?? "");
+  const selectedText = normalizeText(selected?.innerText ?? selected?.textContent ?? "");
+  if (selectedText) {
+    return selectedText;
+  }
+  return modelControlLabel(findModelButton(root));
 }
 
 function normalizeRequestedModel(model) {
@@ -1502,14 +1612,15 @@ function normalizeRequestedModel(model) {
     return {
       raw,
       keepCurrent: false,
-      labels: ["GPT-5.4 Pro", "GPT-5 Pro", "Pro", "GPT-5.4 Thinking", "Thinking", "GPT-5.4", "GPT-5"],
-      slugs: ["gpt-5-4-pro", "gpt-5-pro", "pro", "thinking", "gpt-5-4", "gpt-5"]
+      labels: ["Extended Pro", "GPT-5.4 Pro", "GPT-5 Pro", "Pro", "GPT-5.4 Thinking", "Thinking", "GPT-5.4", "GPT-5"],
+      slugs: ["extended-pro", "gpt-5-4-pro", "gpt-5-pro", "pro", "thinking", "gpt-5-4", "gpt-5"]
     };
   }
   const labelsBySlug = {
-    "pro": ["GPT-5.4 Pro", "GPT-5 Pro", "Pro"],
-    "gpt-5-pro": ["GPT-5 Pro", "Pro"],
-    "gpt-5-4-pro": ["GPT-5.4 Pro", "GPT-5 Pro", "Pro"],
+    "extended-pro": ["Extended Pro"],
+    "pro": ["Extended Pro", "GPT-5.4 Pro", "GPT-5 Pro", "Pro"],
+    "gpt-5-pro": ["Extended Pro", "GPT-5 Pro", "Pro"],
+    "gpt-5-4-pro": ["Extended Pro", "GPT-5.4 Pro", "GPT-5 Pro", "Pro"],
     "thinking": ["GPT-5.4 Thinking", "Thinking"],
     "gpt-5": ["GPT-5"],
     "gpt-5-4": ["GPT-5.4", "GPT-5"]
@@ -1527,6 +1638,7 @@ function canonicalModelSlug(value) {
   if (!folded || folded === "current" || folded === "keep current") return "current";
   if (folded === "auto") return "auto";
   if (folded === "pro") return "pro";
+  if (/\bextended\b/.test(folded) && /\bpro\b/.test(folded)) return "extended-pro";
   if (folded.includes("thinking")) return "thinking";
   const match = folded.match(/^gpt[\s-]*(\d+)(?:[.\s-]*(\d+))?(?:[.\s-]*(\d+))?(?:[\s.-]*(pro))?$/);
   if (!match) return folded.replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");

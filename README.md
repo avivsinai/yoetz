@@ -226,6 +226,7 @@ macOS/Linux-only; Windows CLI artifacts still ship, but Windows native-host
 registration is not implemented yet.
 
 ```bash
+yoetz browser extension setup --chatgpt --open-chrome
 yoetz browser extension install-host --chatgpt
 yoetz browser extension doctor --chatgpt
 yoetz browser extension status --chatgpt
@@ -264,6 +265,15 @@ button, or run `yoetz browser extension reload --chatgpt` when the currently
 loaded extension already supports the reload command; then run
 `yoetz browser extension reconnect --chatgpt` and
 `yoetz browser extension doctor --chatgpt`.
+
+For agent-driven setup, `yoetz browser extension setup --chatgpt --open-chrome`
+does everything Chrome allows from the CLI: it installs or updates the native
+host, finds the unpacked extension directory when available, opens
+`chrome://extensions`, and prints the exact folder to select. Chrome still
+requires the explicit **Load unpacked** UI step for local unpacked extensions.
+If the extension directory is not discoverable from the current checkout or
+installation, set `YOETZ_CHATGPT_NATIVE_EXTENSION_DIR` to the extracted
+extension directory and rerun `setup`.
 
 For normal Google Chrome profiles, `install-host` writes the Native Messaging
 host manifest to Chrome's default user path. If Chrome is launched with a custom
@@ -308,10 +318,13 @@ extension marker prefix) so an agent can decide whether to reuse the tab or
 abort. Pass `--allow-cdp-fallback` only if you understand that explicitly
 permits a second submission via CDP.
 
-The `--var extended=false` toggle is best-effort. Yoetz scopes the chip
-match to the ChatGPT composer with negative-control guards, but ChatGPT
-re-skins the Extended thinking control occasionally; on a miss the run
-continues with whatever Extended state the tab was in and emits a warning.
+The default ChatGPT target is Pro with Extended enabled. `model=auto` prefers
+the Pro/Extended personal UI control when it exists, and the enterprise model
+switcher remains supported. The `--var extended=false` toggle is best-effort
+and only runs when explicitly requested. Yoetz scopes the chip match to the
+ChatGPT composer with negative-control guards, but ChatGPT re-skins the
+Extended thinking control occasionally; on a miss the run continues with
+whatever Extended state the tab was in and emits a warning.
 
 If the next ChatGPT run after an unexplained failure should inspect the
 Yoetz-owned tab without resubmitting, use

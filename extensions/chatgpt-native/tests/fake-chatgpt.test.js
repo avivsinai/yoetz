@@ -1356,8 +1356,14 @@ test("fake ChatGPT model controls select model and disable Extended", async () =
     "data-testid": "model-switcher-dropdown-button",
     "aria-haspopup": "menu"
   }, "ChatGPT");
-  const proOption = new FakeElement("div", { role: "menuitemradio" }, "GPT-5.4 Pro");
-  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "GPT-5.4 Pro");
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Default");
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    onClick: () => {
+      selected.innerText = "GPT-5.4 Pro";
+      selected.textContent = "GPT-5.4 Pro";
+    }
+  }, "GPT-5.4 Pro");
   const body = new FakeElement("body", {}, "ChatGPT GPT-5.4 Pro").append(extended, modelButton, proOption, selected);
   const doc = new FakeDocument(body);
 
@@ -1370,6 +1376,48 @@ test("fake ChatGPT model controls select model and disable Extended", async () =
   assert.equal(proOption.clicked, true);
   assert.equal(result.status, "selected");
   assert.equal(result.extended_status, "disabled");
+});
+
+test("fake ChatGPT personal composer model control accepts current Extended Pro for auto", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const modelButton = new FakeElement("button", { "aria-haspopup": "menu" }, "Extended Pro");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
+  const body = new FakeElement("body", {}, "Ask anything Extended Pro").append(form);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {
+    model: "auto",
+    disable_extended: false
+  });
+
+  assert.equal(modelButton.clicked, false);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Extended Pro");
+  assert.deepEqual(result.available_options, []);
+});
+
+test("fake ChatGPT personal composer model control can switch from Instant to Extended Pro", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const modelButton = new FakeElement("button", {
+    "aria-haspopup": "menu",
+    onClick: () => delete modelButton.attrs["aria-checked"]
+  }, "Instant");
+  const extendedProOption = new FakeElement("div", { role: "menuitemradio" }, "Extended Pro");
+  const instantOption = new FakeElement("div", { role: "menuitemradio" }, "Instant");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
+  const body = new FakeElement("body", {}, "Ask anything Instant Extended Pro").append(form, instantOption, extendedProOption);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {
+    model: "auto",
+    disable_extended: false
+  });
+
+  assert.equal(modelButton.clicked, true);
+  assert.equal(instantOption.clicked, false);
+  assert.equal(extendedProOption.clicked, true);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Extended Pro");
 });
 
 test("fake ChatGPT Extended disable falls back to visible chip text", async () => {
@@ -1427,8 +1475,14 @@ test("fake ChatGPT model controls can select data-testid only model items", asyn
     "data-testid": "model-switcher-dropdown-button",
     "aria-haspopup": "menu"
   }, "ChatGPT");
-  const proOption = new FakeElement("div", { "data-testid": "model-switcher-gpt-5-4-pro" }, "");
-  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "GPT-5.4 Pro");
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Default");
+  const proOption = new FakeElement("div", {
+    "data-testid": "model-switcher-gpt-5-4-pro",
+    onClick: () => {
+      selected.innerText = "GPT-5.4 Pro";
+      selected.textContent = "GPT-5.4 Pro";
+    }
+  }, "");
   const body = new FakeElement("body", {}, "ChatGPT").append(modelButton, proOption, selected);
   const doc = new FakeDocument(body);
 
@@ -1450,8 +1504,14 @@ test("fake ChatGPT model controls do not match gpt-5 by gpt-5.4 substring", asyn
     "aria-haspopup": "menu"
   }, "ChatGPT");
   const proOption = new FakeElement("div", { role: "menuitemradio" }, "GPT-5.4 Pro");
-  const gpt5Option = new FakeElement("div", { role: "menuitemradio" }, "GPT-5");
-  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "GPT-5");
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Default");
+  const gpt5Option = new FakeElement("div", {
+    role: "menuitemradio",
+    onClick: () => {
+      selected.innerText = "GPT-5";
+      selected.textContent = "GPT-5";
+    }
+  }, "GPT-5");
   const body = new FakeElement("body", {}, "ChatGPT GPT-5.4 Pro GPT-5").append(modelButton, proOption, gpt5Option, selected);
   const doc = new FakeDocument(body);
 
@@ -1473,8 +1533,14 @@ test("fake ChatGPT model controls keep hyphenated Pro slugs as Pro", async () =>
     "aria-haspopup": "menu"
   }, "ChatGPT");
   const baseOption = new FakeElement("div", { role: "menuitemradio" }, "GPT-5.4");
-  const proOption = new FakeElement("div", { role: "menuitemradio" }, "GPT-5.4 Pro");
-  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "GPT-5.4 Pro");
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Default");
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    onClick: () => {
+      selected.innerText = "GPT-5.4 Pro";
+      selected.textContent = "GPT-5.4 Pro";
+    }
+  }, "GPT-5.4 Pro");
   const body = new FakeElement("body", {}, "ChatGPT GPT-5.4 GPT-5.4 Pro").append(modelButton, baseOption, proOption, selected);
   const doc = new FakeDocument(body);
 

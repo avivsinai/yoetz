@@ -19,9 +19,10 @@ name: chatgpt
 #
 # Variables:
 #   model    — model slug (e.g., "gpt-5-4-pro"). Default: "auto" selects the
-#              best available model, preferring GPT-5/Pro when the account has it.
+#              best available model, preferring Pro with Extended enabled when
+#              the account has it.
 #              Set to "" or "current" to keep the current ChatGPT selector state.
-#   extended — set to "false" to disable Extended Pro. Default: leave as-is.
+#   extended — set to "false" to disable Extended Pro. Default: keep Extended on.
 #   prompt   — prompt text to send with the attachment. For Yoetz bundle
 #              sessions, typed ChatGPT transports default this to bundle.json's
 #              stored user prompt unless --var prompt=... explicitly overrides.

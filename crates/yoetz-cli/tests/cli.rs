@@ -302,11 +302,22 @@ fn browser_extension_help_shows_chatgpt_lifecycle() {
         .args(["browser", "extension", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("setup"))
         .stdout(predicate::str::contains("install-host"))
         .stdout(predicate::str::contains("doctor"))
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("reconnect"))
         .stdout(predicate::str::contains("canary"));
+}
+
+#[test]
+fn browser_extension_setup_help_shows_open_chrome() {
+    yoetz()
+        .args(["browser", "extension", "setup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--open-chrome"))
+        .stdout(predicate::str::contains("--chatgpt"));
 }
 
 #[test]

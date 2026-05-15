@@ -30,6 +30,8 @@ pub const TOKEN_FILENAME: &str = "chatgpt-native.token";
 pub const STATUS_FILENAME: &str = "chatgpt-native-status.json";
 pub const WRAPPER_FILENAME: &str = "yoetz-chrome-native-host";
 pub const INSTANCES_DIRNAME: &str = "instances";
+pub const CHROME_EXTENSIONS_URL: &str = "chrome://extensions/";
+pub const CHATGPT_EXTENSION_DIR_ENV: &str = "YOETZ_CHATGPT_NATIVE_EXTENSION_DIR";
 pub const MAX_CHROME_NATIVE_EXTENSION_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_CHROME_NATIVE_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = MAX_CHROME_NATIVE_EXTENSION_MESSAGE_BYTES;
@@ -211,6 +213,60 @@ pub fn install_host() -> Result<InstallHostResult> {
     {
         bail!("chrome-extension-native install-host is currently supported on macOS/Linux only")
     }
+}
+
+pub fn chatgpt_extension_source_dir() -> Option<PathBuf> {
+    chatgpt_extension_source_dir_candidates()
+        .into_iter()
+        .find_map(|candidate| {
+            if !is_chatgpt_extension_source_dir(&candidate) {
+                return None;
+            }
+            Some(candidate.canonicalize().unwrap_or(candidate))
+        })
+}
+
+pub fn chatgpt_extension_source_dir_candidates() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = env::var(CHATGPT_EXTENSION_DIR_ENV) {
+        let path = path.trim();
+        if !path.is_empty() {
+            candidates.push(PathBuf::from(path));
+        }
+    }
+    if let Ok(cwd) = env::current_dir() {
+        candidates.push(cwd.join("extensions").join("chatgpt-native"));
+    }
+
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    candidates.push(
+        crate_dir
+            .join("..")
+            .join("..")
+            .join("extensions")
+            .join("chatgpt-native"),
+    );
+
+    if let Ok(exe) = env::current_exe() {
+        if let Some(prefix) = exe.parent().and_then(Path::parent) {
+            candidates.push(
+                prefix
+                    .join("share")
+                    .join("yoetz")
+                    .join("extensions")
+                    .join("chatgpt-native"),
+            );
+            candidates.push(prefix.join("share").join("yoetz").join("chatgpt-native"));
+        }
+    }
+
+    candidates
+}
+
+fn is_chatgpt_extension_source_dir(path: &Path) -> bool {
+    path.join("manifest.json").is_file()
+        && path.join("src").join("service-worker.js").is_file()
+        && path.join("src").join("content-script.js").is_file()
 }
 
 pub fn status() -> Result<ExtensionStatus> {
