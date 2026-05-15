@@ -98,16 +98,23 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 
 ## Browser Architecture
 
-Yoetz browser integrations are extension-free by default.
+Yoetz browser integrations are extension-free by default unless the Yoetz
+Chrome extension is installed and connected, in which case the `chatgpt`
+recipe auto-promotes it.
 
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
 - Preferred transport order for live Chrome work is `chrome-devtools-mcp`
-  first, `dev-browser` second, `agent-browser` third. Keep the stack
-  extension-free.
-- The experimental `chrome-extension-native` path is the explicit exception for
-  ChatGPT Pro recipe robustness. It is opt-in only via
-  `yoetz browser recipe --recipe chatgpt --transport chrome-extension-native`
+  first, `dev-browser` second, `agent-browser` third. Keep the non-extension
+  stack extension-free.
+- For the `chatgpt` recipe specifically, when `yoetz browser extension
+  status --chatgpt` reports `connected`, `chrome-extension-native` is
+  auto-promoted to the front of the default transport funnel; pass
+  `--transport <other>` or pin `transports:` in the recipe yaml to opt out.
+  Non-ChatGPT recipes and unhealthy/missing extensions are not affected.
+- The `chrome-extension-native` path stays the explicit choice when callers
+  want it regardless of detection, via
+  `yoetz browser recipe --recipe chatgpt --transport chrome-extension-native`,
   and is managed with `yoetz browser extension install-host --chatgpt`,
   `setup --chatgpt --open-chrome`, `doctor --chatgpt`, `status --chatgpt`, `reconnect --chatgpt`,
   `canary --chatgpt`, `inspect --chatgpt --run-id <id>`, and

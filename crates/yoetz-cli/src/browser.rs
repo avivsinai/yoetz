@@ -245,6 +245,29 @@ pub fn recipe_transports(recipe: &Recipe, is_chatgpt: bool) -> Vec<RecipeTranspo
     })
 }
 
+/// Prepend `chrome-extension-native` to the ChatGPT recipe transport list when
+/// the Yoetz Chrome extension is installed and connected and the recipe author
+/// did not pin their own transport order. The list is returned unchanged for
+/// any other recipe, when the recipe pinned `transports:`, when the extension
+/// is unhealthy, or when the list already contains `chrome-extension-native`.
+pub fn maybe_prefer_extension_native_for_chatgpt(
+    transports: Vec<RecipeTransport>,
+    is_chatgpt: bool,
+    recipe_transports_pinned: bool,
+    extension_connected: bool,
+) -> Vec<RecipeTransport> {
+    if !is_chatgpt || recipe_transports_pinned || !extension_connected {
+        return transports;
+    }
+    if transports.contains(&RecipeTransport::ChromeExtensionNative) {
+        return transports;
+    }
+    let mut promoted = Vec::with_capacity(transports.len() + 1);
+    promoted.push(RecipeTransport::ChromeExtensionNative);
+    promoted.extend(transports);
+    promoted
+}
+
 /// Returns (program, extra_prefix_args) for launching agent-browser.
 /// Checks YOETZ_AGENT_BROWSER_BIN on every call, then falls back to a cached
 /// PATH probe for the lifetime of the process.
@@ -7330,6 +7353,62 @@ steps:
             recipe_transports(&recipe, false),
             vec![RecipeTransport::AgentBrowser]
         );
+    }
+
+    #[test]
+    fn maybe_prefer_extension_native_prepends_for_chatgpt_when_connected() {
+        let base = vec![
+            RecipeTransport::ChromeDevtoolsMcp,
+            RecipeTransport::DevBrowser,
+            RecipeTransport::AgentBrowser,
+            RecipeTransport::Manual,
+        ];
+        let promoted = maybe_prefer_extension_native_for_chatgpt(base, true, false, true);
+        assert_eq!(
+            promoted,
+            vec![
+                RecipeTransport::ChromeExtensionNative,
+                RecipeTransport::ChromeDevtoolsMcp,
+                RecipeTransport::DevBrowser,
+                RecipeTransport::AgentBrowser,
+                RecipeTransport::Manual,
+            ]
+        );
+    }
+
+    #[test]
+    fn maybe_prefer_extension_native_noop_when_extension_disconnected() {
+        let base = vec![
+            RecipeTransport::ChromeDevtoolsMcp,
+            RecipeTransport::DevBrowser,
+        ];
+        let result = maybe_prefer_extension_native_for_chatgpt(base.clone(), true, false, false);
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn maybe_prefer_extension_native_noop_when_recipe_pinned_transports() {
+        let base = vec![RecipeTransport::ChromeDevtoolsMcp, RecipeTransport::Manual];
+        let result = maybe_prefer_extension_native_for_chatgpt(base.clone(), true, true, true);
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn maybe_prefer_extension_native_noop_for_non_chatgpt() {
+        let base = vec![RecipeTransport::AgentBrowser];
+        let result = maybe_prefer_extension_native_for_chatgpt(base.clone(), false, false, true);
+        assert_eq!(result, base);
+    }
+
+    #[test]
+    fn maybe_prefer_extension_native_noop_when_already_present() {
+        let base = vec![
+            RecipeTransport::ChromeDevtoolsMcp,
+            RecipeTransport::ChromeExtensionNative,
+            RecipeTransport::Manual,
+        ];
+        let result = maybe_prefer_extension_native_for_chatgpt(base.clone(), true, false, true);
+        assert_eq!(result, base);
     }
 
     #[test]
