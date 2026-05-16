@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ## [0.5.11] - 2026-05-16
+### Fixed
+
+- ChatGPT native-extension jobs now resume post-send `waiting_response` state
+  after a Manifest V3 service-worker restart, rebinding the owned tab and
+  continuing structural response polling without re-uploading or re-sending the
+  prompt.
 
 ## [0.5.10] - 2026-05-15
 ### Fixed
