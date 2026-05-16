@@ -2792,6 +2792,120 @@ test("service worker resumes waiting_for_file jobs after service-worker restart"
   }
 });
 
+test("service worker resumes waiting_response jobs after service-worker restart", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+  const sentToTabs = [];
+  let extractCount = 0;
+  await storage.set({
+    "jobs.job_restore_waiting_response": {
+      job_id: "job_restore_waiting_response",
+      run_id: "run_job_restore_waiting_response",
+      workspace_id: "workspace_test",
+      status: "waiting_response",
+      prompt: "prompt",
+      model: "current",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 2500,
+      tab_id: 44,
+      response_baseline: {
+        method: "none",
+        text: "",
+        is_generating: false,
+        assistant_count: 0,
+        turn_index: -1
+      },
+      submitted_user_count: 1,
+      submitted_assistant_count: 0,
+      started_at: now,
+      response_wait_started_at: now,
+      updated_at: now
+    }
+  });
+
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      create: async () => {
+        throw new Error("restore must reuse the submitted tab");
+      },
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_restore_waiting_response" }),
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT" } };
+          case "yoetz_bind_job":
+            return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT" } };
+          case "yoetz_extract_response": {
+            extractCount += 1;
+            const streaming = {
+              method: "assistant_dom_fallback",
+              text: "I",
+              is_generating: true,
+              assistant_count: 1,
+              copy_button_count: 0,
+              has_copy_button: false,
+              turn_index: 0,
+              preceding_user_count: 1
+            };
+            const complete = {
+              method: "assistant_dom_fallback",
+              text: "restored final answer",
+              is_generating: false,
+              assistant_count: 1,
+              copy_button_count: 1,
+              has_copy_button: true,
+              turn_index: 0,
+              preceding_user_count: 1
+            };
+            return { ok: true, payload: extractCount < 3 ? streaming : complete };
+          }
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?restore_waiting_response=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress"
+      && message.job_id === "job_restore_waiting_response"
+      && message.payload?.phase === "waiting_response"
+      && message.payload.restored === true
+    ));
+    port.emit(envelope("reconnect", "job_restore_waiting_response_control"));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_complete" && message.job_id === "job_restore_waiting_response"
+    ));
+    assert.equal(port.messages.some((message) => message.type === "job_error" && message.job_id === "job_restore_waiting_response"), false);
+    const waiting = port.messages.find((message) =>
+      message.type === "job_progress"
+      && message.job_id === "job_restore_waiting_response"
+      && message.payload?.phase === "waiting_response"
+    );
+    assert.equal(waiting?.payload.restored, true);
+    assert.equal(waiting?.payload.tab_id, 44);
+    const complete = port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_restore_waiting_response");
+    assert.equal(complete.payload.response, "restored final answer");
+    assert.equal(sentToTabs.some((item) => item.message.type === "yoetz_upload_file"), false);
+    assert.equal(sentToTabs.some((item) => item.message.type === "yoetz_send_prompt"), false);
+    assert.equal(sentToTabs.find((item) => item.message.type === "yoetz_extract_response")?.id, 44);
+    assert.equal(sentToTabs.filter((item) => item.message.type === "yoetz_bind_job").length, 1);
+    assert.equal(port.messages.filter((message) =>
+      message.type === "job_complete" && message.job_id === "job_restore_waiting_response"
+    ).length, 1);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker still fails receiving_file jobs after service-worker restart", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

@@ -369,11 +369,16 @@ async function runJobWithFile(job, file) {
   }
 
   job.status = "waiting_response";
+  job.response_wait_started_at = Date.now();
   job.updated_at = Date.now();
   await persistJob(job);
   const extraction = await waitForResponse(job);
   assertJobConnectionCurrent(job);
   if (job.cancelled || !extraction) return;
+  await completeJobWithExtraction(job, extraction);
+}
+
+async function completeJobWithExtraction(job, extraction) {
   job.status = "complete";
   job.updated_at = Date.now();
   await persistJob(job);
@@ -406,6 +411,33 @@ async function runJobWithFile(job, file) {
   rememberTerminalJob(job.job_id);
   jobs.delete(job.job_id);
   chunks.discard(job.job_id);
+}
+
+async function resumeWaitingResponseJob(job) {
+  try {
+    await waitForChatgptTab(job.tab_id);
+    await waitForContentScript(job.tab_id);
+    const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
+    postNative(progress(job, "content_script_recovered", {
+      restored: true,
+      url: rebound?.url ?? null,
+      title: rebound?.title ?? null
+    }));
+    const extraction = await waitForResponse(job);
+    assertJobConnectionCurrent(job);
+    if (job.cancelled || !extraction) return;
+    await completeJobWithExtraction(job, extraction);
+  } catch (error) {
+    if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
+      return;
+    }
+    await failJob(
+      job,
+      error?.code ?? "extension_error",
+      String(error?.message ?? error),
+      errorContextForJob(job, error)
+    );
+  }
 }
 
 async function cancelJob(message) {
@@ -676,6 +708,9 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
     if (TERMINAL_STATUSES.has(job.status)) {
       continue;
     }
+    if (jobs.has(job.job_id)) {
+      continue;
+    }
     if (canResumeJobAfterWorkerRestart(job)) {
       job.connection_generation = connectionGeneration;
       job.updated_at = Date.now();
@@ -686,6 +721,30 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
         restored: true,
         message: "ChatGPT tab is ready for bundle upload"
       }));
+      continue;
+    }
+    if (canResumeWaitingResponseAfterWorkerRestart(job)) {
+      job.connection_generation = connectionGeneration;
+      job.response_wait_started_at = job.response_wait_started_at ?? Date.now();
+      if (
+        !job.last_response_progress_text
+        && job.last_response_progress_length === job.last_response_progress_tail?.length
+      ) {
+        job.last_response_progress_text = job.last_response_progress_tail;
+      }
+      job.updated_at = Date.now();
+      jobs.set(job.job_id, job);
+      await persistJob(job);
+      if (!postNative(progress(job, "waiting_response", {
+        tab_id: job.tab_id,
+        restored: true,
+        inspect_command: inspectCommandForJob(job),
+        message: "restored ChatGPT response wait after service-worker restart"
+      }))) {
+        await recordTerminalDeliveryLost(job, "wait_response");
+        continue;
+      }
+      void resumeWaitingResponseJob(job);
       continue;
     }
     if (emitLostState) {
@@ -706,6 +765,13 @@ function canResumeJobAfterWorkerRestart(job) {
   // in-memory ChunkAssembler state to reconstruct, so the native process can
   // continue by sending the first chunk after reconnect.
   return job.status === "waiting_for_file" && Boolean(job.tab_id);
+}
+
+function canResumeWaitingResponseAfterWorkerRestart(job) {
+  // The prompt has already been accepted by ChatGPT and the only remaining
+  // mutable state is the DOM polling loop. Rebind the content script to the
+  // persisted owned tab and continue structural-finality polling.
+  return job.status === "waiting_response" && Boolean(job.tab_id);
 }
 
 function normalizeJob(message) {
@@ -1004,7 +1070,8 @@ async function maybeGroupTab(tabId, job) {
 }
 
 async function waitForResponse(job) {
-  const startedAt = Date.now();
+  const startedAt = Number(job.response_wait_started_at) || Date.now();
+  job.response_wait_started_at = startedAt;
   const interval = Math.max(500, Math.min(Number(job.wait_interval_ms) || 30000, 30000));
   const finalAffordanceIdleMs = Math.min(MIN_STABLE_IDLE_MS, Math.max(FINAL_AFFORDANCE_STABLE_IDLE_MS, 0));
   let best = { method: "none", text: "", is_generating: true };
