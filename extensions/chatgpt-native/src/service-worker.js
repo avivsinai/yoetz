@@ -18,7 +18,8 @@ const RECONNECT_ALARM = "yoetz-reconnect";
 const TERMINAL_STATUSES = new Set(["complete", "cancelled", "failed", "manual_handoff", "state_lost", "terminal_delivery_lost"]);
 const EXTENSION_ID_STORAGE_KEY = "yoetz_extension_instance_id";
 const MIN_STABLE_IDLE_MS = Number(globalThis.__YOETZ_MIN_STABLE_IDLE_MS ?? 90000);
-const FINAL_AFFORDANCE_STABLE_IDLE_MS = Number(globalThis.__YOETZ_FINAL_AFFORDANCE_STABLE_IDLE_MS ?? 5000);
+// Require multiple stable polls so final controls cannot win before late text hydration.
+const STABLE_IDLE_INTERVAL_MULTIPLIER = Number(globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER ?? 3);
 const WAITING_RESPONSE_PROGRESS_INTERVAL_MS = Math.max(50, Number(globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS ?? 60000) || 60000);
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
@@ -1073,7 +1074,7 @@ async function waitForResponse(job) {
   const startedAt = Number(job.response_wait_started_at) || Date.now();
   job.response_wait_started_at = startedAt;
   const interval = Math.max(500, Math.min(Number(job.wait_interval_ms) || 30000, 30000));
-  const finalAffordanceIdleMs = Math.min(MIN_STABLE_IDLE_MS, Math.max(FINAL_AFFORDANCE_STABLE_IDLE_MS, 0));
+  const finalAffordanceIdleMs = responseStableIdleThresholdMs(interval);
   let best = { method: "none", text: "", is_generating: true };
   let last = { method: "none", text: "", is_generating: true };
   let finalAffordanceAnchor = "";
@@ -1380,18 +1381,46 @@ function hasFinalAssistantAffordance(extraction) {
   return Boolean(!extraction?.is_generating && extraction?.has_copy_button);
 }
 
+function responseStableIdleThresholdMs(intervalMs) {
+  const interval = Math.max(0, Number(intervalMs) || 0);
+  return Math.max(MIN_STABLE_IDLE_MS, interval * STABLE_IDLE_INTERVAL_MULTIPLIER);
+}
+
 function responseFinalityAnchor(extraction) {
+  const text = normalizedResponseText(extraction?.text);
+  // Tail hashing catches late citation/code-block changes without making logs huge.
+  const textTail = text.slice(-4096);
   return [
     extraction?.method ?? "none",
     extraction?.assistant_count ?? 0,
     extraction?.turn_index ?? -1,
     extraction?.copy_button_count ?? 0,
-    extraction?.has_copy_button ? 1 : 0
+    extraction?.has_copy_button ? 1 : 0,
+    text.length,
+    stableTextHash(text),
+    stableTextHash(textTail)
   ].join(":");
 }
 
 function finalAffordanceExtractionFailureAnchor(extraction) {
   return responseFinalityAnchor(extraction);
+}
+
+function normalizedResponseText(value) {
+  return String(value ?? "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function stableTextHash(value) {
+  let hash = 0x811c9dc5;
+  const text = String(value ?? "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
+  }
+  return hash.toString(16).padStart(8, "0");
 }
 
 function finalAffordanceExtractionFailureMessage(job, extraction, stableForMs) {

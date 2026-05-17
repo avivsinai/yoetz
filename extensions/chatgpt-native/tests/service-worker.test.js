@@ -3,6 +3,7 @@ import test from "node:test";
 import { uint8ArrayToBase64 } from "../src/chunks.js";
 
 globalThis.__YOETZ_MIN_STABLE_IDLE_MS = 100;
+globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER = 0;
 
 test("service worker routes reconnect and multiplexes two native jobs", async () => {
   const originalChrome = globalThis.chrome;
@@ -1378,6 +1379,85 @@ test("service worker accepts a scoped single-letter assistant markdown response"
     await eventually(() => port.messages.some((message) => message.type === "job_complete"));
     const complete = port.messages.find((message) => message.type === "job_complete");
     assert.equal(complete.payload.response, "A");
+    assert.equal(complete.payload.completion_reason, "copy_button");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker waits for scoped response text bytes to stabilize after final controls appear", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let extractCount = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "kept_current", model_used: "ChatGPT" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response": {
+            if (!sent) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 } };
+            }
+            extractCount += 1;
+            return {
+              ok: true,
+              payload: {
+                method: "copy_scope_dom_fallback",
+                text: `final answer revision ${Math.min(extractCount, 4)}`,
+                is_generating: false,
+                assistant_count: 1,
+                user_count: 1,
+                preceding_user_count: 1,
+                copy_button_count: 1,
+                has_copy_button: true,
+                turn_index: 0
+              }
+            };
+          }
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?text_hash_stability=${Date.now()}`);
+    port.emit(envelope("job_start", "job_text_hash_stability", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_text_hash_stability", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_text_hash_stability.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"), 7000);
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.ok(extractCount >= 5, "completion should wait past repeated text mutations under the same structural anchor");
+    assert.equal(complete.payload.response, "final answer revision 4");
     assert.equal(complete.payload.completion_reason, "copy_button");
     assert.equal(port.messages.some((message) => message.type === "job_error"), false);
   } finally {

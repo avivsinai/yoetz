@@ -686,7 +686,7 @@ function standaloneAssistantSegment(root, conversation, ordered, marker, latestU
         && !isNonConversationChrome(node);
     });
   const textEntries = markdownNodes
-    .map((node) => ({ node, text: cleanAssistantText(node) }))
+    .map((node) => ({ node, text: cleanAssistantText(node, { preserveContentStatusText: true }) }))
     .filter((entry) => entry.text);
   if (textEntries.length === 0) {
     return null;
@@ -758,7 +758,7 @@ function hasResponseBoundaryBetween(ordered, startIndex, endIndex) {
     if (role === "user" || role === "assistant") {
       return true;
     }
-    if (isMarkdownNode(node) && cleanAssistantText(node)) {
+    if (isMarkdownNode(node) && cleanAssistantText(node, { preserveContentStatusText: true })) {
       return true;
     }
   }
@@ -841,7 +841,7 @@ function assistantMessageTextEntry(turn) {
       contentNodes.push(node);
     }
   };
-  if (isAssistantContentNode(turn)) {
+  if (isAssistantContentNode(turn, turn)) {
     addContentNode(turn);
   }
   for (const selector of [
@@ -851,7 +851,7 @@ function assistantMessageTextEntry(turn) {
     '[class*="markdown"]'
   ]) {
     for (const node of Array.from(turn.querySelectorAll?.(selector) ?? [])) {
-      if (!looksLikeUserTurn(node)) {
+      if (!looksLikeUserTurn(node) && isAssistantContentNode(node, turn)) {
         addContentNode(node);
       }
     }
@@ -859,7 +859,7 @@ function assistantMessageTextEntry(turn) {
   const leafContentNodes = leafNodes(contentNodes);
   const textEntries = [];
   for (const node of leafContentNodes) {
-    const text = cleanAssistantText(node);
+    const text = cleanAssistantText(node, { preserveContentStatusText: node !== turn });
     if (text) {
       textEntries.push({ node, text });
     }
@@ -874,33 +874,45 @@ function assistantMessageTextEntry(turn) {
   return { node: turn, text: isModelStatusText(fallback) ? "" : fallback };
 }
 
-function isAssistantContentNode(node) {
-  const marker = [
-    node?.getAttribute?.("data-testid"),
-    node?.getAttribute?.("class"),
-    node?.getAttribute?.("data-message-author-role")
-  ].filter(Boolean).join(" ");
-  return /\bassistant-(message|response)\b/i.test(marker)
-    || /\bmarkdown\b/i.test(marker)
-    || /\bassistant\b/i.test(marker);
+function isAssistantContentNode(node, turn = null) {
+  if (!node || looksLikeUserTurn(node) || isInsideUserTurn(node) || isNonConversationChrome(node)) {
+    return false;
+  }
+  const role = node.getAttribute?.("data-message-author-role");
+  if (role === "assistant") {
+    return true;
+  }
+  if (role === "user") {
+    return false;
+  }
+  const testId = String(node.getAttribute?.("data-testid") ?? "");
+  if (/assistant-(message|response)/i.test(testId)) {
+    return true;
+  }
+  if (isMarkdownNode(node)) {
+    return isAssistantMarkdownInTurn(node, turn ?? assistantTurnForNode(node));
+  }
+  return false;
 }
 
 function leafNodes(nodes) {
   return nodes.filter((node) => !nodes.some((other) => other !== node && containsNode(node, other)));
 }
 
-function cleanAssistantText(node) {
+function cleanAssistantText(node, options = {}) {
   const lines = textOf(node)
     .split(/\n+/)
     .map((line) => normalizeText(line))
-    .filter((line) => line && !isAssistantControlLine(line));
+    .filter((line) => line && !isAssistantControlLine(line, options));
   return normalizeText(lines.join("\n"));
 }
 
-function isAssistantControlLine(line) {
-  return /^(copy|copied|read aloud|share|regenerate|retry|edit|like|dislike)$/i.test(line)
-    || isThoughtStatusLine(line)
-    || isModelStatusText(line);
+function isAssistantControlLine(line, options = {}) {
+  const value = normalizeText(line);
+  return /^(copy|copied|read aloud|share|regenerate|retry|edit|like|dislike)$/i.test(value)
+    || /^(thought|reasoned)\s+for\s+\S.*$/i.test(value)
+    || /^show\s+(more|reasoning)$/i.test(value)
+    || (!options.preserveContentStatusText && (isThoughtStatusLine(line) || isModelStatusText(line)));
 }
 
 function isModelStatusText(text) {
@@ -1445,6 +1457,22 @@ function hasUserRoleDescendant(node) {
   return false;
 }
 
+function hasAssistantRoleDescendant(node) {
+  if (!node) {
+    return false;
+  }
+  const queried = Array.from(node.querySelectorAll?.('[data-message-author-role="assistant"]') ?? []);
+  if (queried.length > 0) {
+    return true;
+  }
+  for (const child of Array.from(node.children ?? [])) {
+    if (child.getAttribute?.("data-message-author-role") === "assistant" || hasAssistantRoleDescendant(child)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function hasConversationResidue(root) {
   const residue = conversationResidue(root);
   return residue.user_count > 0 || residue.assistant_count > 0 || residue.copy_button_count > 0;
@@ -1528,12 +1556,12 @@ function isCodeCopyControl(node) {
 }
 
 function isAssistantMarkerNode(node) {
-  const marker = [
-    node?.getAttribute?.("data-testid"),
-    node?.getAttribute?.("class"),
-    node?.getAttribute?.("data-message-author-role")
-  ].filter(Boolean).join(" ");
-  return /\bassistant\b/i.test(marker);
+  const role = node?.getAttribute?.("data-message-author-role");
+  if (role === "assistant") {
+    return true;
+  }
+  const testId = String(node?.getAttribute?.("data-testid") ?? "");
+  return /assistant-(message|response)/i.test(testId);
 }
 
 function isAssistantMarkdownInTurn(node, turn) {
@@ -1543,7 +1571,13 @@ function isAssistantMarkdownInTurn(node, turn) {
     turn?.getAttribute?.("data-testid")
   ].filter(Boolean).join(" ");
   return /\bmarkdown\b/i.test(marker)
-    && (/\bagent-turn\b/i.test(marker) || /\bassistant\b/i.test(marker) || /\bconversation-turn\b/i.test(marker));
+    && (
+      /\bagent-turn\b/i.test(marker)
+      || /\bassistant\b/i.test(marker)
+      || /\bconversation-turn\b/i.test(marker)
+      || turn?.getAttribute?.("data-message-author-role") === "assistant"
+      || hasAssistantRoleDescendant(turn)
+    );
 }
 
 function looksLikeUserTurn(turn) {
