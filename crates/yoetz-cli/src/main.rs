@@ -1347,6 +1347,36 @@ fn constrain_chatgpt_transports_for_browser_context_selector(
     transports
 }
 
+fn ensure_chatgpt_transport_constraints_allow_any(
+    transports: &[browser::RecipeTransport],
+    requested: Option<browser::RecipeTransport>,
+    recipe_vars: &std::collections::BTreeMap<String, String>,
+    is_chatgpt: bool,
+) -> Result<()> {
+    if !transports.is_empty() || !is_chatgpt {
+        return Ok(());
+    }
+
+    let requested = requested
+        .map(recipe_transport_name)
+        .map(|name| format!("requested transport `{name}`"))
+        .unwrap_or_else(|| "configured transports".to_string());
+
+    if recipe_uses_exact_browser_context_selector(recipe_vars) {
+        bail!(
+            "browser_context_id requires chrome-devtools-mcp or manual; {requested} is not compatible"
+        );
+    }
+
+    if recipe_uses_profile_email_selector(recipe_vars) {
+        bail!(
+            "profile_email requires chrome-devtools-mcp, chrome-extension-native, agent-browser, or manual; {requested} is not compatible"
+        );
+    }
+
+    Ok(())
+}
+
 fn live_attach_owner_present(summary: &live_attach::DaemonSummary) -> bool {
     matches!(summary.health, live_attach::DaemonHealth::Busy)
         || matches!(summary.health, live_attach::DaemonHealth::Healthy) && summary.session_count > 0
@@ -3254,11 +3284,12 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             let extension_native_auto_promoted = extension_auto_promotion_eligible
                 && base_transports.first()
                     == Some(&browser::RecipeTransport::ChromeExtensionNative);
-            let transports = constrain_chatgpt_transports_for_browser_context_selector(
+            let transports = recipe_transports_with_explicit_override(
                 base_transports,
-                &recipe_vars,
+                recipe_args.transport,
+                recipe_args.allow_cdp_fallback,
                 is_chatgpt,
-            );
+            )?;
             let live_attach_owner_is_present =
                 live_attach_owner_present(&live_attach::inspect_daemon_sync());
             let prefer_auto_connect = is_chatgpt
@@ -3273,10 +3304,15 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 transports,
                 prefer_auto_connect,
             );
-            let transports = recipe_transports_with_explicit_override(
+            let transports = constrain_chatgpt_transports_for_browser_context_selector(
                 transports,
+                &recipe_vars,
+                is_chatgpt,
+            );
+            ensure_chatgpt_transport_constraints_allow_any(
+                &transports,
                 recipe_args.transport,
-                recipe_args.allow_cdp_fallback,
+                &recipe_vars,
                 is_chatgpt,
             )?;
             maybe_print_auto_promoted_extension_native_transport(
@@ -4659,6 +4695,39 @@ mod tests {
                 browser::RecipeTransport::Manual
             ]
         );
+    }
+
+    #[test]
+    fn exact_browser_context_selector_rejects_explicit_dev_browser_transport() {
+        let vars = std::collections::BTreeMap::from([(
+            "browser_context_id".to_string(),
+            "ctx-123".to_string(),
+        )]);
+        let transports = recipe_transports_with_explicit_override(
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::Manual,
+            ],
+            Some(browser::RecipeTransport::DevBrowser),
+            false,
+            true,
+        )
+        .unwrap();
+        let transports =
+            constrain_chatgpt_transports_for_browser_context_selector(transports, &vars, true);
+        let err = ensure_chatgpt_transport_constraints_allow_any(
+            &transports,
+            Some(browser::RecipeTransport::DevBrowser),
+            &vars,
+            true,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("browser_context_id requires"));
+        assert!(err
+            .to_string()
+            .contains("requested transport `dev-browser`"));
     }
 
     #[test]

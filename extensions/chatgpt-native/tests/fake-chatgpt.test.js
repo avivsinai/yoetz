@@ -416,6 +416,42 @@ test("extractResponse returns single-letter assistant markdown with a copy affor
   assert.equal(extraction.has_copy_button, true);
 });
 
+test("extractResponse preserves one-word assistant markdown answers that look like model status labels", () => {
+  for (const answer of ["GPT-5", "Pro", "Thinking"]) {
+    const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "One word");
+    const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+    const markdown = new FakeElement("div", { class: "markdown prose" }, answer);
+    const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+    const conversation = new FakeElement("main", { role: "main" }, `One word ${answer} Copy`)
+      .append(user, marker, markdown, copy);
+    const body = new FakeElement("body", {}, `One word ${answer} Copy`).append(conversation);
+    const doc = new FakeDocument(body);
+
+    const extraction = extractResponse(doc);
+
+    assert.equal(extraction.method, "copy_scope_dom_fallback");
+    assert.equal(extraction.text, answer);
+    assert.equal(extraction.has_copy_button, true);
+  }
+});
+
+test("extractResponse ignores assistant-like preview chrome without structural ownership", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const previewCopy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const preview = new FakeElement("div", { class: "assistant-preview thinking-node" }, "I")
+    .append(previewCopy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle I Copy")
+    .append(user, preview);
+  const body = new FakeElement("body", {}, "Review bundle I Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
+  assert.equal(extraction.assistant_count, 0);
+  assert.equal(extraction.has_copy_button, false);
+});
+
 test("extractResponse does not reuse an earlier assistant copy button for a newer assistant text", () => {
   const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
   const oldMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
