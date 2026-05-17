@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.12] - 2026-05-17
 ### Fixed
 
 - ChatGPT native-extension response completion now waits for scoped response
@@ -16,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - ChatGPT browser recipes now reject incompatible explicit transport overrides
   when `browser_context_id` or `profile_email` selectors require a narrower
   transport set.
+
 
 ## [0.5.11] - 2026-05-16
 ### Fixed
