@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- ChatGPT native-extension response completion now waits for scoped response
+  text bytes to stabilize after final controls render, preventing Pro/Extended
+  runs from finishing on transient thinking or preview text.
+- ChatGPT response extraction now requires structural assistant ownership for
+  markdown/fallback nodes while preserving legitimate short assistant answers.
+- ChatGPT browser recipes now reject incompatible explicit transport overrides
+  when `browser_context_id` or `profile_email` selectors require a narrower
+  transport set.
 
 ## [0.5.11] - 2026-05-16
 ### Fixed
