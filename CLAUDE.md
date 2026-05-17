@@ -89,10 +89,14 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   Node features such as `require`, arbitrary `fs`, or `fetch`.
 - For contenteditable ChatGPT inputs, use typing APIs such as
   `pressSequentially` instead of `fill()`.
-- For file upload, the ChatGPT recipe uses macOS clipboard paste via `osascript`
-  (set clipboard to POSIX file, then `Meta+v` in the composer). This avoids
-  QuickJS buffer limitations and native file dialog issues with `setInputFiles`.
-  Non-macOS platforms currently fall back to paste mode (inline text).
+- For file upload, primary transports use first-class APIs: the
+  `chrome-extension-native` transport streams the bundle over native messaging
+  chunks, and `chrome-devtools-mcp` uses CDP `upload_file` (the transport
+  explicitly rejects `--var paste=true`, per `crates/yoetz-cli/src/main.rs`).
+  Only the `dev-browser` (QuickJS) transport still falls back to macOS
+  clipboard paste via `osascript` because QuickJS cannot drive
+  `setInputFiles`; this is a dev-browser-specific workaround and is not the
+  default upload path. Non-macOS dev-browser runs degrade to inline paste.
 - The QuickJS GC crash recovery in `dev_browser.rs` can salvage stdout from a
   completed script, but recipe correctness must not depend on that recovery.
 
