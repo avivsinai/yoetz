@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Changed
+
+- The built-in ChatGPT browser recipe now defaults to `model=gpt-5-4-pro`
+  with Extended left enabled; `model=auto` remains available as an explicit
+  override.
 
 ## [0.5.12] - 2026-05-17
 ### Fixed

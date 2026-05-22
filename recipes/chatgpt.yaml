@@ -18,9 +18,10 @@ name: chatgpt
 # transports connect directly to Chrome via CDP.
 #
 # Variables:
-#   model    — model slug (e.g., "gpt-5-4-pro"). Default: "auto" selects the
-#              best available model, preferring Pro with Extended enabled when
-#              the account has it.
+#   model    — model slug (e.g., "gpt-5-4-pro"). Default: "gpt-5-4-pro" with
+#              Extended enabled when the account exposes it.
+#              Set to "auto" to select the best available model, preferring
+#              Pro with Extended enabled when the account has it.
 #              Set to "" or "current" to keep the current ChatGPT selector state.
 #   extended — set to "false" to disable Extended Pro. Default: keep Extended on.
 #   prompt   — prompt text to send with the attachment. For Yoetz bundle
@@ -51,7 +52,7 @@ name: chatgpt
 
 defaults:
   prompt: Review the attached file and provide your analysis.
-  model: "auto"
+  model: "gpt-5-4-pro"
   extended: ""
   thread: "fresh"
   upload_timeout_ms: "120000"
