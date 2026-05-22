@@ -5370,6 +5370,38 @@ mod tests {
     }
 
     #[test]
+    fn builtin_chatgpt_recipe_defaults_flow_into_shared_spec_with_extended_enabled() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/chatgpt.yaml");
+        let content = fs::read_to_string(&path).expect("read recipes/chatgpt.yaml");
+        let recipe: browser::Recipe =
+            serde_yaml_ng::from_str(&content).expect("parse chatgpt.yaml");
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            transport: None,
+            allow_cdp_fallback: false,
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec![],
+        };
+
+        let recipe_vars = browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)
+            .expect("build recipe vars");
+        let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
+
+        assert_eq!(spec.model, "gpt-5-4-pro");
+        assert!(!spec.disable_extended);
+
+        let auto_vars =
+            browser::build_recipe_vars(recipe.defaults.as_ref(), &["model=auto".to_string()])
+                .expect("build recipe vars with auto override");
+        let auto_spec = build_chatgpt_recipe_spec(&recipe_args, &auto_vars).unwrap();
+        assert_eq!(auto_spec.model, "auto");
+        assert!(!auto_spec.disable_extended);
+    }
+
+    #[test]
     fn build_chatgpt_recipe_spec_uses_bundle_prompt_when_prompt_var_absent() {
         let dir = TempDir::new().unwrap();
         let bundle_md = dir.path().join("bundle.md");

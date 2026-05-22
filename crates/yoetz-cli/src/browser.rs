@@ -7472,20 +7472,6 @@ steps:
     }
 
     #[test]
-    fn builtin_chatgpt_recipe_defaults_to_explicit_pro_with_extended_enabled() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/chatgpt.yaml");
-        let content = fs::read_to_string(&path).expect("read recipes/chatgpt.yaml");
-        let recipe: Recipe = serde_yaml_ng::from_str(&content).expect("parse chatgpt.yaml");
-        let defaults = recipe.defaults.expect("chatgpt recipe defaults");
-
-        assert_eq!(
-            defaults.get("model").map(String::as_str),
-            Some("gpt-5-4-pro")
-        );
-        assert_eq!(defaults.get("extended").map(String::as_str), Some(""));
-    }
-
-    #[test]
     fn builtin_chatgpt_recipe_does_not_pin_transports_so_auto_promotion_can_fire() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/chatgpt.yaml");
         let content = fs::read_to_string(&path).expect("read recipes/chatgpt.yaml");
