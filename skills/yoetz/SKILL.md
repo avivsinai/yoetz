@@ -363,8 +363,8 @@ BUNDLE=$(yoetz bundle -p "Review this code" -f src/*.rs --format json | jq -r .a
 # Send to ChatGPT
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 
-# By default yoetz auto-selects Pro with Extended enabled when the logged-in
-# account exposes it. Override it only if needed.
+# By default yoetz selects GPT-5.4 Pro with Extended enabled, preferring a clear
+# unavailable-model error over silent tier fallback. Override it only if needed.
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var model=gpt-5-4-pro
 
 # Every request opens a fresh, yoetz-owned ChatGPT tab marked with ?_yoetz=<run-id>

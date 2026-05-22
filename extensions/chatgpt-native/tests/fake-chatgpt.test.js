@@ -1416,6 +1416,36 @@ test("fake ChatGPT model controls select model and disable Extended", async () =
   assert.equal(result.extended_status, "disabled");
 });
 
+test("fake ChatGPT explicit GPT-5.4 Pro leaves Extended enabled by default", async () => {
+  const extended = new FakeElement("button", { "aria-label": "click to remove Extended" }, "Extended");
+  const modelButton = new FakeElement("button", {
+    "data-testid": "model-switcher-dropdown-button",
+    "aria-haspopup": "menu"
+  }, "ChatGPT");
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Default");
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    onClick: () => {
+      selected.innerText = "GPT-5.4 Pro";
+      selected.textContent = "GPT-5.4 Pro";
+    }
+  }, "GPT-5.4 Pro");
+  const body = new FakeElement("body", {}, "ChatGPT GPT-5.4 Pro").append(extended, modelButton, proOption, selected);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {
+    model: "gpt-5-4-pro",
+    disable_extended: false
+  });
+
+  assert.equal(extended.clicked, false);
+  assert.equal(modelButton.clicked, true);
+  assert.equal(proOption.clicked, true);
+  assert.equal(result.status, "selected");
+  assert.equal(result.extended_status, "not_requested");
+  assert.equal(result.warning, null);
+});
+
 test("fake ChatGPT personal composer model control accepts current Extended Pro for auto", async () => {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const modelButton = new FakeElement("button", { "aria-haspopup": "menu" }, "Extended Pro");
