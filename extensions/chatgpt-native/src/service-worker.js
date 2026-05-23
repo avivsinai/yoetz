@@ -20,6 +20,14 @@ const EXTENSION_ID_STORAGE_KEY = "yoetz_extension_instance_id";
 const MIN_STABLE_IDLE_MS = Number(globalThis.__YOETZ_MIN_STABLE_IDLE_MS ?? 90000);
 // Require multiple stable polls so final controls cannot win before late text hydration.
 const STABLE_IDLE_INTERVAL_MULTIPLIER = Number(globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER ?? 3);
+const MAX_FINAL_AFFORDANCE_IDLE_MS = Math.max(
+  MIN_STABLE_IDLE_MS,
+  Number(globalThis.__YOETZ_MAX_FINAL_AFFORDANCE_IDLE_MS ?? 5 * 60 * 1000) || 5 * 60 * 1000
+);
+const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
+  1024,
+  Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
+);
 const WAITING_RESPONSE_PROGRESS_INTERVAL_MS = Math.max(50, Number(globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS ?? 60000) || 60000);
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
@@ -198,7 +206,13 @@ async function startJob(message) {
   job.tab_id = tab.id;
   job.updated_at = Date.now();
   await persistJob(job);
-  if (!postNative(progress(job, "tab_opened", { tab_id: tab.id, url }))) {
+  const inspectCommand = inspectCommandForJob(job);
+  if (!postNative(progress(job, "tab_opened", {
+    tab_id: tab.id,
+    url,
+    inspect_command: inspectCommand,
+    message: `opened yoetz-owned ChatGPT tab ${url}; inspect with: ${inspectCommand}`
+  }))) {
     await recordTerminalDeliveryLost(job, "upload");
     return;
   }
@@ -351,9 +365,13 @@ async function runJobWithFile(job, file) {
       : null;
     assertJobConnectionCurrent(job);
     if (job.cancelled) return;
+    const inspectCommand = inspectCommandForJob(job);
     if (!postNative(progress(job, "prompt_sent", {
       timeout_ms: responseWaitTimeoutMs(job),
-      message: `prompt sent; waiting for ChatGPT response (timeout ${formatDurationForMessage(responseWaitTimeoutMs(job))})`
+      inspect_command: inspectCommand,
+      yoetz_url: chatgptJobUrl(job.run_id),
+      submitted_url: job.submitted_url,
+      message: `prompt sent; waiting for ChatGPT response (timeout ${formatDurationForMessage(responseWaitTimeoutMs(job))}); inspect with: ${inspectCommand}`
     }))) {
       await recordTerminalDeliveryLost(job, "send");
       return;
@@ -380,10 +398,7 @@ async function runJobWithFile(job, file) {
 }
 
 async function completeJobWithExtraction(job, extraction) {
-  job.status = "complete";
-  job.updated_at = Date.now();
-  await persistJob(job);
-  const delivered = postNative(makeEnvelope("job_complete", {
+  const completeEnvelope = makeEnvelope("job_complete", {
     job_id: job.job_id,
     run_id: job.run_id,
     workspace_id: job.workspace_id,
@@ -404,7 +419,31 @@ async function completeJobWithExtraction(job, extraction) {
         ...(extraction.warning ? [extraction.warning] : [])
       ]
     }
-  }));
+  });
+  const completeBytes = nativeEnvelopeByteLength(completeEnvelope);
+  if (completeBytes > MAX_NATIVE_OUTBOUND_BYTES) {
+    const inspectCommand = inspectCommandForJob(job);
+    await failJob(
+      job,
+      "response_too_large",
+      `ChatGPT response is too large to deliver through chrome-extension-native (${completeBytes} bytes > ${MAX_NATIVE_OUTBOUND_BYTES}); inspect the owned tab with: ${inspectCommand}`,
+      {
+        phase: "wait_response",
+        side_effect_started: true,
+        completion_reason: extraction.completion_reason,
+        extraction_method: extraction.method,
+        response_length: extraction.text?.length ?? 0,
+        native_message_bytes: completeBytes,
+        max_native_message_bytes: MAX_NATIVE_OUTBOUND_BYTES,
+        inspect_command: inspectCommand
+      }
+    );
+    return;
+  }
+  job.status = "complete";
+  job.updated_at = Date.now();
+  await persistJob(job);
+  const delivered = postNative(completeEnvelope);
   if (!delivered) {
     await recordTerminalDeliveryLost(job, "wait_response");
     return;
@@ -1077,9 +1116,9 @@ async function waitForResponse(job) {
   const finalAffordanceIdleMs = responseStableIdleThresholdMs(interval);
   let best = { method: "none", text: "", is_generating: true };
   let last = { method: "none", text: "", is_generating: true };
-  let finalAffordanceAnchor = "";
-  let finalAffordanceSinceMs = 0;
-  let extractionFailureAnchor = "";
+  let finalAffordanceCandidate = null;
+  let bestFinalAffordanceCandidate = null;
+  let finalAffordanceCandidateSinceMs = 0;
   let extractionFailureSinceMs = 0;
   let lastWaitingProgressAt = startedAt;
   const timeoutMs = responseWaitTimeoutMs(job);
@@ -1129,24 +1168,39 @@ async function waitForResponse(job) {
     );
     let stableForMs = 0;
     if (finalAffordance) {
-      const anchor = responseFinalityAnchor(extraction);
-      if (anchor !== finalAffordanceAnchor) {
-        finalAffordanceAnchor = anchor;
-        finalAffordanceSinceMs = Date.now();
+      // Once ChatGPT exposes final assistant controls, scope and turn checks
+      // have already ruled out pre-send content. From here we track the best
+      // scoped candidate by text growth so late page chrome cannot replace a
+      // completed response, and transient generating blips cannot forget it.
+      const bestSelection = selectFinalAffordanceCandidate(bestFinalAffordanceCandidate, extraction);
+      bestFinalAffordanceCandidate = bestSelection.candidate;
+      const candidateSelection = selectFinalAffordanceCandidate(
+        finalAffordanceCandidate ?? bestFinalAffordanceCandidate,
+        extraction
+      );
+      if (!finalAffordanceCandidate || candidateSelection.candidate !== finalAffordanceCandidate) {
+        if (!finalAffordanceCandidate || candidateSelection.resetTimer) {
+          finalAffordanceCandidateSinceMs = Date.now();
+        }
+        finalAffordanceCandidate = candidateSelection.candidate;
+      } else if (!finalAffordanceCandidateSinceMs) {
+        finalAffordanceCandidateSinceMs = Date.now();
       }
-      stableForMs = Date.now() - finalAffordanceSinceMs;
+      stableForMs = Date.now() - finalAffordanceCandidateSinceMs;
       if (stableForMs >= finalAffordanceIdleMs) {
-        return completedExtraction(extraction, "copy_button", stableForMs);
+        return completedExtraction(finalAffordanceCandidate, "copy_button", stableForMs);
       }
-    } else {
-      finalAffordanceAnchor = "";
-      finalAffordanceSinceMs = 0;
+    } else if (extraction?.is_generating) {
+      finalAffordanceCandidate = null;
+      finalAffordanceCandidateSinceMs = 0;
+    } else if (!postSendAssistantActivity) {
+      finalAffordanceCandidate = null;
+      bestFinalAffordanceCandidate = null;
+      finalAffordanceCandidateSinceMs = 0;
     }
     const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalAffordance);
     if (finalAffordanceWithoutScopedText) {
-      const anchor = finalAffordanceExtractionFailureAnchor(extraction);
-      if (anchor !== extractionFailureAnchor) {
-        extractionFailureAnchor = anchor;
+      if (!extractionFailureSinceMs) {
         extractionFailureSinceMs = Date.now();
       }
       const extractionFailureStableForMs = Date.now() - extractionFailureSinceMs;
@@ -1166,7 +1220,6 @@ async function waitForResponse(job) {
         return null;
       }
     } else {
-      extractionFailureAnchor = "";
       extractionFailureSinceMs = 0;
     }
     const nextDelay = (finalAffordance || finalAffordanceWithoutScopedText) ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500)) : interval;
@@ -1250,6 +1303,7 @@ function postWaitingResponseProgress(job, extraction, detail = {}) {
   const scopedCopyStatus = extraction?.has_copy_button ? ", scoped_copy_button=true" : ", scoped_copy_button=false";
   postNative(progress(job, "waiting_response", {
     ...detail,
+    inspect_command: detail.inspect_command ?? inspectCommandForJob(job),
     message: `waiting for ChatGPT response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${scopedCopyStatus}${extraction?.is_generating ? ", generating" : ""}${finalityStatus})`,
     extraction_method: extraction?.method ?? "none",
     is_generating: Boolean(extraction?.is_generating),
@@ -1378,32 +1432,38 @@ function isAcceptableModelSelection(selection) {
 }
 
 function hasFinalAssistantAffordance(extraction) {
+  // ChatGPT shows assistant copy controls when a turn is externally complete.
+  // Pair this with the scoped extraction and !is_generating checks above.
   return Boolean(!extraction?.is_generating && extraction?.has_copy_button);
 }
 
 function responseStableIdleThresholdMs(intervalMs) {
   const interval = Math.max(0, Number(intervalMs) || 0);
-  return Math.max(MIN_STABLE_IDLE_MS, interval * STABLE_IDLE_INTERVAL_MULTIPLIER);
+  return Math.min(
+    MAX_FINAL_AFFORDANCE_IDLE_MS,
+    Math.max(MIN_STABLE_IDLE_MS, interval * STABLE_IDLE_INTERVAL_MULTIPLIER)
+  );
 }
 
-function responseFinalityAnchor(extraction) {
-  const text = normalizedResponseText(extraction?.text);
-  // Tail hashing catches late citation/code-block changes without making logs huge.
-  const textTail = text.slice(-4096);
-  return [
-    extraction?.method ?? "none",
-    extraction?.assistant_count ?? 0,
-    extraction?.turn_index ?? -1,
-    extraction?.copy_button_count ?? 0,
-    extraction?.has_copy_button ? 1 : 0,
-    text.length,
-    stableTextHash(text),
-    stableTextHash(textTail)
-  ].join(":");
-}
-
-function finalAffordanceExtractionFailureAnchor(extraction) {
-  return responseFinalityAnchor(extraction);
+function selectFinalAffordanceCandidate(candidate, extraction) {
+  const candidateText = normalizedResponseText(candidate?.text);
+  const nextText = normalizedResponseText(extraction?.text);
+  if (!candidate && extraction) {
+    return { candidate: extraction, resetTimer: true };
+  }
+  if (!nextText) {
+    return { candidate, resetTimer: false };
+  }
+  if (!candidateText) {
+    return { candidate: extraction, resetTimer: true };
+  }
+  if (nextText.length < candidateText.length) {
+    return { candidate, resetTimer: false };
+  }
+  if (nextText === candidateText) {
+    return { candidate, resetTimer: false };
+  }
+  return { candidate: extraction, resetTimer: nextText.length > candidateText.length };
 }
 
 function normalizedResponseText(value) {
@@ -1414,13 +1474,12 @@ function normalizedResponseText(value) {
     .trim();
 }
 
-function stableTextHash(value) {
-  let hash = 0x811c9dc5;
-  const text = String(value ?? "");
-  for (let index = 0; index < text.length; index += 1) {
-    hash = Math.imul(hash ^ text.charCodeAt(index), 0x01000193) >>> 0;
+function nativeEnvelopeByteLength(message) {
+  const json = JSON.stringify(message);
+  if (typeof TextEncoder !== "undefined") {
+    return new TextEncoder().encode(json).byteLength;
   }
-  return hash.toString(16).padStart(8, "0");
+  return json.length;
 }
 
 function finalAffordanceExtractionFailureMessage(job, extraction, stableForMs) {
