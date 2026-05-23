@@ -8,8 +8,8 @@
 #
 # Requires:
 #   - YOETZ_CHROME_BIN pointing at a Chrome (or Chrome for Testing) binary
-#   - `yoetz` binary built in release mode at the expected target path
-#     (override with YOETZ_BIN=...)
+#   - `yoetz` binary built at the expected target path (override with
+#     YOETZ_BIN=...)
 #   - curl, jq
 #
 # The fixture is a throwaway user-data-dir under $TMPDIR so we never touch the
@@ -33,10 +33,10 @@ fi
 yoetz_bin="${YOETZ_BIN:-}"
 if [[ -z "${yoetz_bin}" ]]; then
   repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-  yoetz_bin="${repo_root}/target/release/yoetz"
+  yoetz_bin="${repo_root}/target/debug/yoetz"
 fi
 if [[ ! -x "${yoetz_bin}" ]]; then
-  die "yoetz binary not found or not executable: ${yoetz_bin} (build with \`cargo build --release --bin yoetz\` or set YOETZ_BIN)"
+  die "yoetz binary not found or not executable: ${yoetz_bin} (build with \`cargo build --bin yoetz\` or set YOETZ_BIN)"
 fi
 
 for cmd in curl jq; do

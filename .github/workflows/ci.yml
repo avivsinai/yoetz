@@ -409,9 +409,10 @@ jobs:
         env:
           YOETZ_CHROME_BIN: ${{ steps.install-chrome.outputs.chrome-path }}
         run: cargo test -p yoetz fake_chatgpt_fixture_ -- --ignored
-      - name: Build yoetz
-        run: cargo build --release --bin yoetz
+      - name: Build yoetz smoke binary
+        run: cargo build --bin yoetz
       - name: Real-browser smoke
         env:
           YOETZ_CHROME_BIN: ${{ steps.install-chrome.outputs.chrome-path }}
+          YOETZ_BIN: target/debug/yoetz
         run: ./scripts/ci-real-browser-smoke.sh
