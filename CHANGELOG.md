@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.14] - 2026-05-23
+### Fixed
+
+- ChatGPT native-extension response completion now survives transient
+  generating-state blips and same-length final-control churn, reports
+  inspection commands during waits, and fails oversized native responses before
+  marking a job complete.
+
 ## [0.5.13] - 2026-05-22
 ### Changed
 
