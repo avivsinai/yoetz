@@ -22,6 +22,7 @@ use yoetz_core::paths::home_dir;
 
 pub const TRANSPORT_NAME: &str = "chrome-extension-native";
 pub const PROTOCOL_VERSION: u32 = 1;
+pub const YOETZ_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const EXTENSION_ID: &str = "njdakhppfigmloihiikbjmheejfndbfa";
 pub const EXTENSION_KEY: &str = "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAujviQNA7EjHnfqpn3TM5IfgmHzOnvtu5pXg3Y1rS5koNJBT2PSG7FTGi9wD4oqNLVFehKm5h46vq1u1ACsMjAUrqMMUVvf7RUeqieUmfbtKRmx24N2blfz4b8KYpMlNUhf8IZ5TAFbvzy9NEO2KHAHCV6pP84E4lLBW2OQIDhqJd0FfS3Ecn91pbsH3tcsU6Gu+WiPEHLXZjPj85KcgQ+8qL0Xz83V5hEXIocMlCQ0RnMOfQIp5qUEIKgZ7qKqEjW2czNz48s5Fdgzbv95Lf09vat1NWiDHXZtDPWIa6TRjlKAAXIwsz5A/DJibzWiCgKiuOWmCgQPJgDidoyj/7RQIDAQAB";
 pub const NATIVE_HOST_NAME: &str = "com.yoetz.chatgpt_native";
@@ -269,6 +270,16 @@ fn is_chatgpt_extension_source_dir(path: &Path) -> bool {
         && path.join("src").join("content-script.js").is_file()
 }
 
+fn extension_version_skew_message(extension_version: Option<&str>) -> Option<String> {
+    let extension_version = extension_version?.trim();
+    if extension_version.is_empty() || extension_version == YOETZ_CLI_VERSION {
+        return None;
+    }
+    Some(format!(
+        "loaded chrome-extension-native extension version {extension_version} does not match yoetz CLI {YOETZ_CLI_VERSION}; reload the matching unpacked Yoetz extension in chrome://extensions, then run `yoetz browser extension reconnect --chatgpt`"
+    ))
+}
+
 pub fn status() -> Result<ExtensionStatus> {
     let paths = extension_paths()?;
     let token_present = paths.token_path.exists();
@@ -314,17 +325,21 @@ pub fn status() -> Result<ExtensionStatus> {
         .or_else(|| {
             legacy_extension_status_string(legacy_hello_seen, extension_value, "profile_id")
         });
-    let version_mismatch = status_value
+    let protocol_version_mismatch = status_value
         .as_ref()
         .and_then(|value| value.get("version_mismatch"))
         .and_then(Value::as_str)
-        .is_some();
+        .map(str::to_string);
+    let extension_version_mismatch = extension_version_skew_message(extension_version.as_deref());
+    let version_mismatch = protocol_version_mismatch
+        .clone()
+        .or_else(|| extension_version_mismatch.clone());
     let manual_handoff = status_value
         .as_ref()
         .and_then(|value| value.get("last_manual_handoff"))
         .and_then(Value::as_object)
         .is_some();
-    let status = if version_mismatch {
+    let status = if version_mismatch.is_some() {
         "version_mismatch"
     } else if manual_handoff {
         "manual_handoff"
@@ -354,8 +369,9 @@ pub fn status() -> Result<ExtensionStatus> {
             .as_ref()
             .and_then(|value| value.get("version_mismatch"))
             .and_then(Value::as_str)
-            .unwrap_or("extension/native protocol version mismatch")
-            .to_string(),
+            .map(str::to_string)
+            .or_else(|| version_mismatch.clone())
+            .unwrap_or_else(|| "extension/native protocol version mismatch".to_string()),
         "manual_handoff" => status_value
             .as_ref()
             .and_then(|value| value.get("last_manual_handoff"))
@@ -459,6 +475,13 @@ pub fn doctor() -> Result<DoctorReport> {
                 .and_then(|value| value.get("protocol_version"))
                 .and_then(Value::as_u64)
         });
+    let observed_extension_version = latest_instance_with_hello
+        .and_then(|instance| instance.extension_version.clone())
+        .or_else(|| {
+            legacy_extension_status_string(legacy_hello_seen, extension_value, "extension_version")
+        });
+    let extension_version_mismatch =
+        extension_version_skew_message(observed_extension_version.as_deref());
     let extension_instance_id = latest_instance_with_hello
         .and_then(|instance| instance.extension_instance_id.clone())
         .or_else(|| {
@@ -473,7 +496,16 @@ pub fn doctor() -> Result<DoctorReport> {
         .and_then(|value| value.get("version_mismatch"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| format!("protocol_version={PROTOCOL_VERSION}"));
+        .or_else(|| extension_version_mismatch.clone())
+        .unwrap_or_else(|| {
+            observed_extension_version
+                .map(|version| {
+                    format!(
+                        "protocol_version={PROTOCOL_VERSION}, cli_version={YOETZ_CLI_VERSION}, extension_version={version}"
+                    )
+                })
+                .unwrap_or_else(|| format!("protocol_version={PROTOCOL_VERSION}"))
+        });
     let checks = vec![
         DoctorCheck {
             name: "manifest",
@@ -503,7 +535,8 @@ pub fn doctor() -> Result<DoctorReport> {
         },
         DoctorCheck {
             name: "version_compatible",
-            ok: extension_protocol == Some(PROTOCOL_VERSION as u64),
+            ok: extension_protocol == Some(PROTOCOL_VERSION as u64)
+                && extension_version_mismatch.is_none(),
             detail: version_detail,
         },
         DoctorCheck {
@@ -637,6 +670,9 @@ pub fn run_chatgpt_recipe(
             extension_profile_id: spec.extension_profile_id.as_deref(),
         },
     )?;
+    if let Some(message) = extension_version_skew_message(instance.extension_version.as_deref()) {
+        eprintln!("warning: {message}");
+    }
     let token = read_capability_token(&paths.token_path)?;
     let mut stream = connect_socket(&instance.socket_path).with_context(|| {
         format!(
@@ -3034,6 +3070,58 @@ mod tests {
             extension_hello.detail,
             "extension_version=0.2.0, extension_instance_id=ext_123, chrome_profile_email=work@example.com"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn doctor_reports_loaded_extension_version_skew() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+        let paths = extension_paths().unwrap();
+        fs::create_dir_all(&paths.instances_dir).unwrap();
+        let socket = dir.path().join("work.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        write_instance_fixture(
+            &paths,
+            ExtensionInstanceStatus {
+                native_instance_id: "native_work".to_string(),
+                socket_path: socket,
+                pid: process::id(),
+                extension_instance_id: Some("ext_123".to_string()),
+                extension_version: Some("0.5.13".to_string()),
+                profile_email: Some("work@example.com".to_string()),
+                profile_id: Some("gaia_123".to_string()),
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 1234,
+            },
+        );
+
+        let payload = status().unwrap();
+
+        assert_eq!(payload.status, "version_mismatch");
+        assert!(payload.detail.contains("extension version 0.5.13"));
+        assert!(payload.detail.contains(env!("CARGO_PKG_VERSION")));
+
+        let version_compatible = doctor()
+            .unwrap()
+            .checks
+            .into_iter()
+            .find(|check| check.name == "version_compatible")
+            .unwrap();
+        assert!(!version_compatible.ok);
+        assert!(version_compatible
+            .detail
+            .contains("extension version 0.5.13"));
+        assert!(version_compatible
+            .detail
+            .contains(env!("CARGO_PKG_VERSION")));
     }
 
     #[test]
