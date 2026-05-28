@@ -82,7 +82,13 @@ jobs:
               base="$PR_BASE_SHA"
               head="$PR_HEAD_SHA"
               if [[ "${PR_HEAD_REF:-}" == release/* ]]; then
-                build_os_matrix="$full_build_matrix"
+                # Release PRs only bump version metadata (CHANGELOG, Cargo.*,
+                # plugin/skill/extension manifests). release.yml is the real
+                # cross-platform build+publish gate and release.sh already ran
+                # local gates, so the heavy PR build/test/browser jobs here are
+                # pure redundancy. Treat the PR as light to skip them.
+                emit_outputs true false "$linux_build_matrix" false
+                exit 0
               fi
               ;;
             push)
@@ -130,8 +136,9 @@ jobs:
           # whole PR under a minute. See clippy / test jobs below.
           #
           # Ordinary PRs and main pushes intentionally use the Ubuntu build
-          # only. Cross-platform release builds remain covered before release
-          # by release/* PRs, and on demand by workflow_dispatch.
+          # only. Cross-platform release builds run in release.yml at tag time
+          # (and on demand via workflow_dispatch); release/* PRs are treated as
+          # light here because they only bump version metadata.
           # Bash case-pattern `*` matches any characters including `/`, so
           # `docs/*` covers any depth under `docs/`.
           light_only=true
@@ -373,7 +380,7 @@ jobs:
   browser-integration:
     name: Real-Browser Smoke (Chrome for Testing)
     needs: changes
-    if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.browser_changed == 'true' || startsWith(github.head_ref, 'release/'))
+    if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true' && (github.event_name != 'pull_request' || needs.changes.outputs.browser_changed == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
