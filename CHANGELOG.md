@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- The ChatGPT native-extension transport now detects when the loaded Chrome
+  extension version does not match the yoetz CLI: `browser extension status`
+  reports `version_mismatch`, `browser extension doctor` fails the
+  `version_compatible` check, and recipe runs print a reload/reconnect warning
+  before dispatch. A stale, manually-loaded extension no longer surfaces only as
+  a cryptic ChatGPT "model unavailable" error.
 
 ## [0.5.14] - 2026-05-23
 ### Fixed
