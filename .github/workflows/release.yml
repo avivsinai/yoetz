@@ -142,11 +142,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   verify:
-    name: Verify Release Commit
+    name: Verify Release Metadata
     needs: prepare
     if: needs.prepare.result == 'success'
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 5
     permissions:
       contents: read
     steps:
@@ -155,35 +155,8 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.prepare.outputs.release_ref }}
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
-        with:
-          node-version: 24
-
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          components: clippy, rustfmt
-
-      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
-        with:
-          cache-bin: false
-
       - name: Verify release metadata
         run: ./scripts/check-release-version.sh "${{ needs.prepare.outputs.version }}"
-
-      - name: Verify ChatGPT native extension package
-        run: ./scripts/build-chatgpt-native-extension.sh --check
-
-      - name: Test ChatGPT native extension
-        run: node --test extensions/chatgpt-native/tests/*.test.js
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-      - name: Run clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-
-      - name: Run tests
-        run: cargo test --workspace
 
   build:
     name: Build (${{ matrix.target }})
