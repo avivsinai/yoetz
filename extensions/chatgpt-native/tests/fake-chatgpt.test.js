@@ -1446,6 +1446,49 @@ test("fake ChatGPT explicit GPT-5.4 Pro leaves Extended enabled by default", asy
   assert.equal(result.warning, null);
 });
 
+test("fake ChatGPT resolves a pinned gpt-5-4-pro request onto the live gpt-5-5 Pro option", async () => {
+  // ChatGPT silently bumps the Pro version (5.2 -> 5.4 -> 5.5 ...), so the picker
+  // no longer exposes the gpt-5-4-pro the recipe pins. Selection must fall back
+  // to the Pro tier by label and pick the live Pro option instead of failing
+  // "model unavailable". Guards cross-version drift: a naive exact-slug matcher
+  // would not find any of these options for "gpt-5-4-pro".
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const modelButton = new FakeElement("button", {
+    "aria-haspopup": "menu",
+    onClick: () => delete modelButton.attrs["aria-checked"]
+  }, "Instant");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
+  const instantOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5"
+  }, "Instant");
+  const thinkingOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-thinking"
+  }, "Thinking");
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-pro"
+  }, "Pro • Extended");
+  const body = new FakeElement("body", {}, "Ask anything Instant Thinking Pro Extended")
+    .append(form, instantOption, thinkingOption, proOption);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {
+    model: "gpt-5-4-pro",
+    disable_extended: false
+  });
+
+  assert.equal(modelButton.clicked, true);
+  assert.equal(proOption.clicked, true);
+  assert.equal(instantOption.clicked, false);
+  assert.equal(thinkingOption.clicked, false);
+  assert.equal(result.status, "selected");
+  assert.match(result.model_used, /pro/i);
+  assert.equal(result.extended_status, "not_requested");
+  assert.equal(result.warning, null);
+});
+
 test("fake ChatGPT personal composer model control accepts current Extended Pro for auto", async () => {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const modelButton = new FakeElement("button", { "aria-haspopup": "menu" }, "Extended Pro");
