@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use reqwest::Client;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -17,6 +18,11 @@ use yoetz_core::registry::{ModelCapability, ModelEntry, ModelPricing, ModelRegis
 pub struct RegistryFetchResult {
     pub registry: ModelRegistry,
     pub warnings: Vec<String>,
+}
+
+struct OpenRouterCatalog {
+    registry: ModelRegistry,
+    live_ids: HashSet<String>,
 }
 
 pub fn registry_cache_path() -> PathBuf {
@@ -145,6 +151,7 @@ pub fn save_registry_cache(registry: &ModelRegistry) -> Result<PathBuf> {
 pub async fn fetch_registry(client: &Client, config: &Config) -> Result<RegistryFetchResult> {
     let mut registry = ModelRegistry::default();
     let mut warnings = Vec::new();
+    let mut openrouter_live_ids: Option<HashSet<String>> = None;
 
     // Embedded Gemini registry merged first as a low-priority fallback.
     // Dynamic sources (OpenRouter, LiteLLM) merged after and override these entries.
@@ -164,7 +171,14 @@ pub async fn fetch_registry(client: &Client, config: &Config) -> Result<Registry
     }
 
     match fetch_openrouter(client, config).await {
-        Ok(Some(openrouter)) => registry.merge(openrouter),
+        Ok(Some(openrouter)) => {
+            openrouter_live_ids = merge_openrouter_catalog(&mut registry, openrouter);
+            if openrouter_live_ids.is_none() {
+                warnings.push(
+                    "openrouter returned empty catalog; authoritative prune skipped".to_string(),
+                );
+            }
+        }
         Ok(None) => warnings.push("openrouter skipped: missing API key".to_string()),
         Err(err) => warnings.push(format!("openrouter failed: {err}")),
     }
@@ -174,6 +188,8 @@ pub async fn fetch_registry(client: &Client, config: &Config) -> Result<Registry
         Ok(None) => warnings.push("litellm skipped: missing API key".to_string()),
         Err(err) => warnings.push(format!("litellm failed: {err}")),
     }
+
+    prune_openrouter_to_live_catalog(&mut registry, openrouter_live_ids.as_ref());
 
     registry.updated_at = Some(
         OffsetDateTime::now_utc()
@@ -207,7 +223,7 @@ fn embedded_gemini_registry() -> Result<ModelRegistry> {
         let max_output_tokens = pricing.max_output_tokens.map(|v| v as usize);
 
         registry.models.push(ModelEntry {
-            id: name,
+            id: canonical_embedded_model_id(&name).to_string(),
             context_length,
             max_output_tokens,
             pricing: ModelPricing {
@@ -224,7 +240,11 @@ fn embedded_gemini_registry() -> Result<ModelRegistry> {
     Ok(registry)
 }
 
-async fn fetch_openrouter(client: &Client, config: &Config) -> Result<Option<ModelRegistry>> {
+fn canonical_embedded_model_id(id: &str) -> &str {
+    id.strip_prefix("openrouter/").unwrap_or(id)
+}
+
+async fn fetch_openrouter(client: &Client, config: &Config) -> Result<Option<OpenRouterCatalog>> {
     let url = config
         .registry
         .openrouter_models_url
@@ -283,8 +303,9 @@ async fn fetch_litellm(client: &Client, config: &Config) -> Result<Option<ModelR
     Ok(None)
 }
 
-fn parse_openrouter_models(value: &Value) -> ModelRegistry {
+fn parse_openrouter_models(value: &Value) -> OpenRouterCatalog {
     let mut registry = ModelRegistry::default();
+    let mut live_ids = HashSet::new();
     let data = value
         .get("data")
         .and_then(|v| v.as_array())
@@ -296,6 +317,7 @@ fn parse_openrouter_models(value: &Value) -> ModelRegistry {
         if id.is_empty() {
             continue;
         }
+        live_ids.insert(id.to_string());
         let context_length = item
             .get("context_length")
             .and_then(|v| v.as_u64())
@@ -331,7 +353,33 @@ fn parse_openrouter_models(value: &Value) -> ModelRegistry {
     }
 
     registry.rebuild_index();
-    registry
+    OpenRouterCatalog { registry, live_ids }
+}
+
+fn merge_openrouter_catalog(
+    registry: &mut ModelRegistry,
+    catalog: OpenRouterCatalog,
+) -> Option<HashSet<String>> {
+    let live_ids = if catalog.live_ids.is_empty() {
+        None
+    } else {
+        Some(catalog.live_ids)
+    };
+    registry.merge(catalog.registry);
+    live_ids
+}
+
+fn prune_openrouter_to_live_catalog(
+    registry: &mut ModelRegistry,
+    live_ids: Option<&HashSet<String>>,
+) {
+    let Some(live_ids) = live_ids else {
+        return;
+    };
+    if live_ids.is_empty() {
+        return;
+    }
+    registry.prune_provider("openrouter", live_ids);
 }
 
 fn parse_litellm_models(value: &Value) -> ModelRegistry {
@@ -483,7 +531,66 @@ fn parse_openrouter_capability(item: &Value) -> Option<ModelCapability> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use yoetz_core::config::RegistryConfig;
+    use serde_json::json;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::io::Read as _;
+    use yoetz_core::config::{ProviderConfig, RegistryConfig};
+
+    struct EnvGuard {
+        key: &'static str,
+        old: Option<OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let old = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, old }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(old) = self.old.take() {
+                env::set_var(self.key, old);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn registry_with_models(models: Vec<ModelEntry>) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.models = models;
+        registry.rebuild_index();
+        registry
+    }
+
+    fn model_entry(id: &str, provider: Option<&str>) -> ModelEntry {
+        ModelEntry {
+            id: id.to_string(),
+            provider: provider.map(ToString::to_string),
+            ..Default::default()
+        }
+    }
+
+    fn serve_json_once(body: &'static str) -> String {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 1024];
+            let _ = stream.read(&mut request);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
+        });
+        format!("http://{addr}/models")
+    }
 
     fn config_with_sync(secs: u64) -> Config {
         Config {
@@ -525,5 +632,127 @@ mod tests {
         tmp.as_file().set_modified(two_days_ago).unwrap();
         let config = config_with_sync(86400);
         assert!(is_cache_stale(tmp.path(), &config));
+    }
+
+    #[test]
+    fn embedded_gemini_registry_strips_openrouter_prefix() {
+        let registry = embedded_gemini_registry().unwrap();
+
+        assert!(registry
+            .models
+            .iter()
+            .all(|model| !model.id.starts_with("openrouter/")));
+
+        if let Some(entry) = registry.find("google/gemini-3-pro-preview") {
+            assert_eq!(entry.provider.as_deref(), Some("openrouter"));
+        }
+    }
+
+    #[test]
+    fn parse_openrouter_models_returns_live_ids_in_natural_namespace() {
+        let catalog = parse_openrouter_models(&json!({
+            "data": [{
+                "id": "google/gemini-3.1-pro-preview",
+                "context_length": 1048576,
+                "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
+                "pricing": {"prompt": "0.00000125", "completion": "0.00001"},
+                "top_provider": {"max_completion_tokens": 65536}
+            }]
+        }));
+
+        assert!(catalog.live_ids.contains("google/gemini-3.1-pro-preview"));
+        assert!(catalog
+            .registry
+            .find("google/gemini-3.1-pro-preview")
+            .is_some());
+        assert!(catalog
+            .registry
+            .find("openrouter/google/gemini-3.1-pro-preview")
+            .is_none());
+    }
+
+    #[test]
+    fn openrouter_reconcile_prunes_dead_provider_rows_after_later_merges() {
+        let mut registry = registry_with_models(vec![
+            model_entry("google/gemini-3-pro-preview", Some("openrouter")),
+            model_entry("gemini/gemini-3-pro-preview", Some("gemini")),
+        ]);
+        let catalog = parse_openrouter_models(&json!({
+            "data": [{
+                "id": "google/gemini-3.1-pro-preview",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "pricing": {"prompt": "0.000001", "completion": "0.000002"}
+            }]
+        }));
+
+        let live_ids = merge_openrouter_catalog(&mut registry, catalog);
+        registry.merge(registry_with_models(vec![model_entry(
+            "google/stale-from-later-source",
+            Some("openrouter"),
+        )]));
+        prune_openrouter_to_live_catalog(&mut registry, live_ids.as_ref());
+
+        assert!(registry.find("google/gemini-3-pro-preview").is_none());
+        assert!(registry.find("google/stale-from-later-source").is_none());
+        assert!(registry.find("google/gemini-3.1-pro-preview").is_some());
+        assert!(registry.find("gemini/gemini-3-pro-preview").is_some());
+    }
+
+    #[test]
+    fn openrouter_reconcile_does_not_prune_without_non_empty_live_catalog() {
+        let mut registry = registry_with_models(vec![
+            model_entry("google/gemini-3-pro-preview", Some("openrouter")),
+            model_entry("google/old-model", Some("openrouter")),
+        ]);
+
+        prune_openrouter_to_live_catalog(&mut registry, None);
+        assert!(registry.find("google/gemini-3-pro-preview").is_some());
+        assert!(registry.find("google/old-model").is_some());
+
+        let live_ids = merge_openrouter_catalog(
+            &mut registry,
+            OpenRouterCatalog {
+                registry: ModelRegistry::default(),
+                live_ids: Default::default(),
+            },
+        );
+        prune_openrouter_to_live_catalog(&mut registry, live_ids.as_ref());
+
+        assert!(registry.find("google/gemini-3-pro-preview").is_some());
+        assert!(registry.find("google/old-model").is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn fetch_registry_uses_openrouter_fixture_as_authoritative_catalog() {
+        let _env = EnvGuard::set("YOETZ_TEST_OPENROUTER_KEY", "test-key");
+        let mut config = Config {
+            registry: RegistryConfig {
+                openrouter_models_url: Some(serve_json_once(
+                    r#"{"data":[{"id":"google/gemini-3.1-pro-preview","architecture":{"input_modalities":["text","image"],"output_modalities":["text"]},"pricing":{"prompt":"0.000001","completion":"0.000002"}}]}"#,
+                )),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        config.providers.insert(
+            "openrouter".to_string(),
+            ProviderConfig {
+                api_key_env: Some("YOETZ_TEST_OPENROUTER_KEY".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let fetch = fetch_registry(&Client::new(), &config).await.unwrap();
+
+        assert!(fetch
+            .registry
+            .find("google/gemini-3.1-pro-preview")
+            .is_some());
+        assert!(fetch
+            .registry
+            .find("openrouter/google/gemini-3.1-pro-preview")
+            .is_none());
+        assert!(fetch.registry.find("google/gemini-3-pro-preview").is_none());
     }
 }

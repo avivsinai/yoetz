@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -155,6 +155,13 @@ impl ModelRegistry {
                 self.index.insert(self.models[idx].id.clone(), idx);
             }
         }
+    }
+
+    pub fn prune_provider(&mut self, provider: &str, keep_ids: &HashSet<String>) {
+        self.models.retain(|model| {
+            model.provider.as_deref() != Some(provider) || keep_ids.contains(&model.id)
+        });
+        self.rebuild_index();
     }
 
     pub fn rebuild_index(&mut self) {
@@ -442,6 +449,52 @@ mod tests {
         assert_eq!(capability.vision, Some(true));
         assert_eq!(capability.reasoning, Some(true));
         assert_eq!(capability.web_search, Some(false));
+    }
+
+    #[test]
+    fn prune_provider_removes_only_that_provider_outside_keep_set() {
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "google/gemini-3-pro-preview".to_string(),
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "google/old-model".to_string(),
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "google/gemini-3.1-pro-preview".to_string(),
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "gemini/gemini-3-pro-preview".to_string(),
+                    provider: Some("gemini".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "local/custom".to_string(),
+                    provider: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let keep_ids = ["google/gemini-3.1-pro-preview".to_string()]
+            .into_iter()
+            .collect();
+        reg.prune_provider("openrouter", &keep_ids);
+
+        assert!(reg.find("google/gemini-3-pro-preview").is_none());
+        assert!(reg.find("google/old-model").is_none());
+        assert!(reg.find("google/gemini-3.1-pro-preview").is_some());
+        assert!(reg.find("gemini/gemini-3-pro-preview").is_some());
+        assert!(reg.find("local/custom").is_some());
     }
 
     fn multi_provider_registry() -> ModelRegistry {
