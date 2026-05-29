@@ -21,6 +21,56 @@ impl std::fmt::Display for ModelTier {
     }
 }
 
+/// Output modality / task kind of a model. Used to keep non-chat models
+/// (image generation, video, audio, embeddings, …) out of frontier chat picks.
+/// Fail-open: an unknown or unset kind is treated as chat-eligible so a new
+/// chat-like model is never silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelKind {
+    Chat,
+    ImageGeneration,
+    VideoGeneration,
+    Audio,
+    Embedding,
+    Moderation,
+    Rerank,
+    /// A recognized non-chat mode that does not fit the categories above
+    /// (litellm `search`, `ocr`, `vector_store`, …). Excluded from chat frontier.
+    Other,
+    /// Deserialize fallback for a serialized kind string this build does not
+    /// recognize. Treated as chat-eligible (fail-open) so a future kind is
+    /// never silently dropped from frontier.
+    #[serde(other)]
+    Unknown,
+}
+
+impl ModelKind {
+    /// Whether a model of this kind can serve chat/multimodal completions and is
+    /// therefore eligible to be a family frontier pick. Unknown kinds are
+    /// eligible (fail-open) so a new chat-like mode is never silently dropped.
+    pub fn is_chat_eligible(self) -> bool {
+        matches!(self, ModelKind::Chat | ModelKind::Unknown)
+    }
+
+    /// Map a litellm `mode` string to a kind, covering the full authoritative
+    /// litellm mode set. Returns `None` for unrecognized modes so ingest stays
+    /// fail-open (the model remains chat-eligible).
+    pub fn from_litellm_mode(mode: &str) -> Option<Self> {
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "chat" | "completion" | "responses" => Some(ModelKind::Chat),
+            "image_generation" | "image_edit" => Some(ModelKind::ImageGeneration),
+            "video_generation" => Some(ModelKind::VideoGeneration),
+            "audio_speech" | "audio_transcription" => Some(ModelKind::Audio),
+            "embedding" => Some(ModelKind::Embedding),
+            "moderation" => Some(ModelKind::Moderation),
+            "rerank" => Some(ModelKind::Rerank),
+            "search" | "ocr" | "vector_store" => Some(ModelKind::Other),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FrontierEntry {
     pub family: String,
@@ -77,6 +127,8 @@ pub struct ModelCapability {
     pub vision: Option<bool>,
     pub reasoning: Option<bool>,
     pub web_search: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub kind: Option<ModelKind>,
 }
 
 impl ModelCapability {
@@ -89,6 +141,9 @@ impl ModelCapability {
         }
         if other.web_search.is_some() {
             self.web_search = other.web_search;
+        }
+        if other.kind.is_some() {
+            self.kind = other.kind;
         }
     }
 }
@@ -249,6 +304,18 @@ impl ModelRegistry {
             if tier == ModelTier::Mini {
                 continue;
             }
+            // Skip non-chat models (image generation, video, audio, embeddings, …):
+            // a family frontier query must return the chat/multimodal flagship,
+            // not a media generator. Fail-open — an unknown/unset kind stays
+            // eligible so a new chat-like model is never silently dropped.
+            let chat_eligible = model
+                .capability
+                .as_ref()
+                .and_then(|cap| cap.kind)
+                .is_none_or(ModelKind::is_chat_eligible);
+            if !chat_eligible {
+                continue;
+            }
             let family = model.family().to_string();
             let dominated = best.get(&family).is_some_and(|existing| {
                 let existing_ver = extract_version(&existing.model.id);
@@ -399,6 +466,7 @@ mod tests {
                     vision: Some(true),
                     reasoning: None,
                     web_search: Some(false),
+                    kind: None,
                 }),
                 tier: None,
             }],
@@ -421,6 +489,7 @@ mod tests {
                     vision: None,
                     reasoning: Some(true),
                     web_search: None,
+                    kind: None,
                 }),
                 tier: None,
             }],
@@ -627,6 +696,170 @@ mod tests {
         let google_frontier = frontier.iter().find(|e| e.family == "google").unwrap();
         assert_eq!(google_frontier.model.id, "google/gemini-3.1-pro-preview");
         assert_eq!(google_frontier.tier, ModelTier::Preview);
+    }
+
+    #[test]
+    fn frontier_excludes_image_generation_models() {
+        // Reproduces the reported bug: an image-generation model
+        // (imagen-4.0-ultra, version 4 beats gemini-3 on the primary version
+        // signal) must NOT be returned as the gemini family frontier.
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "google/gemini-3-pro-preview".to_string(),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.01),
+                        ..Default::default()
+                    },
+                    capability: Some(ModelCapability {
+                        kind: Some(ModelKind::Chat),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "google/imagen-4.0-ultra-generate-001".to_string(),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.04),
+                        ..Default::default()
+                    },
+                    capability: Some(ModelCapability {
+                        kind: Some(ModelKind::ImageGeneration),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        let google = frontier
+            .iter()
+            .find(|e| e.family == "google")
+            .expect("google family has a chat frontier");
+        assert_eq!(google.model.id, "google/gemini-3-pro-preview");
+        assert!(
+            !frontier.iter().any(|e| e.model.id.contains("imagen")),
+            "image-generation model must never be a frontier pick"
+        );
+    }
+
+    #[test]
+    fn frontier_keeps_vision_chat_and_unknown_kind_models() {
+        // A vision (image-INPUT) chat model stays eligible, and a model with no
+        // kind at all is fail-open (still eligible).
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "google/gemini-3.1-pro-preview".to_string(),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.02),
+                        ..Default::default()
+                    },
+                    capability: Some(ModelCapability {
+                        vision: Some(true),
+                        kind: Some(ModelKind::Chat),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "anthropic/claude-opus-4-6".to_string(),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.075),
+                        ..Default::default()
+                    },
+                    capability: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|e| e.family == "google")
+                .unwrap()
+                .model
+                .id,
+            "google/gemini-3.1-pro-preview"
+        );
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|e| e.family == "anthropic")
+                .unwrap()
+                .model
+                .id,
+            "anthropic/claude-opus-4-6"
+        );
+    }
+
+    #[test]
+    fn model_kind_from_litellm_mode_maps_known_and_unknown() {
+        // Chat-eligible modes.
+        for m in ["chat", "completion", "responses"] {
+            assert_eq!(
+                ModelKind::from_litellm_mode(m),
+                Some(ModelKind::Chat),
+                "{m}"
+            );
+        }
+        // Non-chat modes from the authoritative litellm set.
+        assert_eq!(
+            ModelKind::from_litellm_mode("image_generation"),
+            Some(ModelKind::ImageGeneration)
+        );
+        assert_eq!(
+            ModelKind::from_litellm_mode("image_edit"),
+            Some(ModelKind::ImageGeneration)
+        );
+        assert_eq!(
+            ModelKind::from_litellm_mode("video_generation"),
+            Some(ModelKind::VideoGeneration)
+        );
+        assert_eq!(
+            ModelKind::from_litellm_mode("audio_transcription"),
+            Some(ModelKind::Audio)
+        );
+        assert_eq!(
+            ModelKind::from_litellm_mode("embedding"),
+            Some(ModelKind::Embedding)
+        );
+        assert_eq!(
+            ModelKind::from_litellm_mode("rerank"),
+            Some(ModelKind::Rerank)
+        );
+        for m in ["search", "ocr", "vector_store"] {
+            assert_eq!(
+                ModelKind::from_litellm_mode(m),
+                Some(ModelKind::Other),
+                "{m}"
+            );
+        }
+        // Unknown / new modes stay fail-open (None -> chat-eligible).
+        assert_eq!(ModelKind::from_litellm_mode("brand_new_mode"), None);
+
+        // Eligibility: only Chat (and the Unknown deserialize fallback) is a
+        // valid frontier pick; every recognized non-chat kind is excluded.
+        assert!(ModelKind::Chat.is_chat_eligible());
+        assert!(ModelKind::Unknown.is_chat_eligible());
+        for k in [
+            ModelKind::ImageGeneration,
+            ModelKind::VideoGeneration,
+            ModelKind::Audio,
+            ModelKind::Embedding,
+            ModelKind::Moderation,
+            ModelKind::Rerank,
+            ModelKind::Other,
+        ] {
+            assert!(!k.is_chat_eligible(), "{k:?} must not be chat-eligible");
+        }
     }
 
     #[test]
