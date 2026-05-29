@@ -173,8 +173,7 @@ pub(crate) async fn handle_ask(
     // Media inputs have no pre-call cost estimate. When the caller opted in with
     // --allow-uncosted we skip the pre-call reservation entirely (ensure_budget
     // requires an estimate) and rely on recording the real provider cost later.
-    let uncosted_media =
-        (!image_inputs.is_empty() || video_input.is_some()) && args.allow_uncosted;
+    let uncosted_media = (!image_inputs.is_empty() || video_input.is_some()) && args.allow_uncosted;
     let budget_reservation = if budget_enabled && !uncosted_media {
         budget::ensure_budget(
             pricing.estimate_usd,
