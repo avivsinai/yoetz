@@ -486,10 +486,12 @@ async () => {{
     ) || null;
   const hasExactTierLabel = (item, slug) => {{
     const text = normalize(item?.text || "").toLowerCase();
+    if (slug === "extended-pro") return /\bextended\b/.test(text) && /\bpro\b/.test(text);
     return text === slug || text.startsWith(`${{slug}} `);
   }};
   const deriveRequestedTier = (value) => {{
     if (!value) return null;
+    if (/\bextended\b/.test(value) && /\bpro\b/.test(value)) return "extended-pro";
     if (/\bthinking\b/.test(value)) return "thinking";
     if (/\binstant\b/.test(value)) return "instant";
     if (/\bpro\b/.test(value) && !/\b5[- .]?3\b/.test(value)) return "pro";
@@ -497,6 +499,7 @@ async () => {{
   }};
   const hasTrustedUserFacingTierLabel = (item, slug) => {{
     const haystack = item?.haystack || "";
+    if (slug === "extended-pro") return /\bextended\b/.test(haystack) && /\bpro\b/.test(haystack);
     if (slug === "pro") return /research-grade intelligence/.test(haystack);
     if (slug === "thinking") return /for complex questions/.test(haystack);
     if (slug === "instant") return /for everyday chats/.test(haystack);
@@ -504,6 +507,7 @@ async () => {{
   }};
   const classifyTier = (item) => {{
     const haystack = item?.haystack || "";
+    if (hasTrustedUserFacingTierLabel(item, "extended-pro") || hasExactTierLabel(item, "extended-pro")) return "extended-pro";
     if (hasTrustedUserFacingTierLabel(item, "pro") || /\bpro\b/.test(haystack)) return "pro";
     if (hasTrustedUserFacingTierLabel(item, "thinking") || /thinking/.test(haystack)) return "thinking";
     if (hasTrustedUserFacingTierLabel(item, "instant") || /instant/.test(haystack)) return "instant";
@@ -531,6 +535,9 @@ async () => {{
   const hasConflictingTierHint = (item, slug) => {{
     const haystack = item?.haystack || "";
     if (hasTrustedUserFacingTierLabel(item, slug) || hasExactTierLabel(item, slug)) return false;
+    if (slug === "extended-pro") {{
+      return !(/\bextended\b/.test(haystack) && /\bpro\b/.test(haystack));
+    }}
     if (slug === "pro") {{
       return /\b5[- .]?3\b|gpt-5[- .]?3-pro/.test(haystack);
     }}
@@ -543,14 +550,14 @@ async () => {{
     return false;
   }};
   const findSingleGenericTierItem = (entries, slug) => {{
-    if (!(slug === "pro" || slug === "thinking" || slug === "instant")) return null;
+    if (!(slug === "extended-pro" || slug === "pro" || slug === "thinking" || slug === "instant")) return null;
     const matches = entries.filter((item) =>
       item.haystack.includes(slug) && !hasConflictingTierHint(item, slug)
     );
     return matches.length === 1 ? matches[0] : null;
   }};
   const findExactTierLabelItem = (entries, slug) => {{
-    if (!(slug === "pro" || slug === "thinking" || slug === "instant")) return null;
+    if (!(slug === "extended-pro" || slug === "pro" || slug === "thinking" || slug === "instant")) return null;
     return entries.find((item) => hasExactTierLabel(item, slug) && !hasConflictingTierHint(item, slug)) || null;
   }};
   const modelSlug = (value) => {{
@@ -568,6 +575,7 @@ async () => {{
       /\bgpt[\s.-]*\d+(?:[\s.-]*\d+)*[\s.-]*pro\b/.test(labelText) ||
       /\bpro\b/.test(labelText);
     if (autoMode) return isProLabel;
+    if (requestedGenericTier === "extended-pro") return /\bextended\b/.test(labelText) && /\bpro\b/.test(labelText);
     if (requestedGenericTier === "pro") return isProLabel;
     if (requestedGenericTier === "thinking") return /\bthinking\b/.test(labelText);
     if (requestedGenericTier === "instant") return /\binstant\b/.test(labelText);
@@ -584,11 +592,12 @@ async () => {{
   }};
   const buildTierRankings = (entries) => {{
     const tierMaxVersions = {{
+      "extended-pro": maxVersionPartsForTier(entries, "extended-pro"),
       pro: maxVersionPartsForTier(entries, "pro"),
       thinking: maxVersionPartsForTier(entries, "thinking"),
       instant: maxVersionPartsForTier(entries, "instant"),
     }};
-    const tierScore = (tier) => tier === "pro" ? 300 : tier === "thinking" ? 200 : tier === "instant" ? 100 : 0;
+    const tierScore = (tier) => tier === "extended-pro" ? 400 : tier === "pro" ? 300 : tier === "thinking" ? 200 : tier === "instant" ? 100 : 0;
     const candidateScore = (item) => {{
       const tier = classifyTier(item);
       const version = effectiveVersionParts(item, tier, tierMaxVersions);
@@ -652,7 +661,7 @@ async () => {{
     }};
   }}
 
-  if (currentLabelSatisfiesRequest(currentLabel)) {{
+  if (currentLabelSatisfiesRequest(currentLabel) && requestedGenericTier !== "extended-pro" && !autoMode) {{
     return {{
       ...responseBase,
       status: "already-selected",
@@ -754,6 +763,54 @@ async () => {{
       ""
     ).toLowerCase();
   }};
+  const targetCandidateForTier = (entries, slug) => {{
+    const rankings = buildTierRankings(entries);
+    return findExactTierLabelItem(entries, slug) ||
+      selectBestTierItem(entries, slug, rankings) ||
+      findSingleGenericTierItem(entries, slug) ||
+      null;
+  }};
+  const autoPreferredTargetCandidate = (entries) =>
+    targetCandidateForTier(entries, "extended-pro") ||
+    targetCandidateForTier(entries, "pro") ||
+    null;
+  const autoTargetCandidate = (entries) =>
+    autoPreferredTargetCandidate(entries) ||
+    targetCandidateForTier(entries, "thinking") ||
+    targetCandidateForTier(entries, "instant") ||
+    null;
+  const itemSetSignature = (entries) => entries
+    .map((item) => `${{item.testId}}|${{item.text}}|${{item.ariaChecked}}|${{item.dataState}}`)
+    .join("\n");
+  const waitForTargetOrStableItems = async (initialItems) => {{
+    let currentItems = initialItems;
+    let signature = itemSetSignature(currentItems);
+    let stableSince = signature ? Date.now() : null;
+    const deadline = Date.now() + 7000;
+    while (Date.now() < deadline) {{
+      if (requestedGenericTier && targetCandidateForTier(currentItems, requestedGenericTier)) {{
+        return currentItems;
+      }}
+      if (autoMode && autoPreferredTargetCandidate(currentItems)) {{
+        return currentItems;
+      }}
+      const nextSignature = itemSetSignature(currentItems);
+      if (nextSignature && nextSignature === signature) {{
+        if (stableSince !== null && Date.now() - stableSince >= 600) {{
+          return currentItems;
+        }}
+      }} else {{
+        signature = nextSignature;
+        stableSince = nextSignature ? Date.now() : null;
+      }}
+      await wait(100);
+      currentItems = readItems();
+      if (currentItems.length === 0) {{
+        currentItems = await openSelectorMenu();
+      }}
+    }}
+    return currentItems;
+  }};
 
   let items = readItems();
   if (items.length === 0) {{
@@ -763,6 +820,7 @@ async () => {{
       items = readItems();
     }}
   }}
+  items = await waitForTargetOrStableItems(items);
 
   if (items.length === 0) {{
     return {{
@@ -782,6 +840,9 @@ async () => {{
   let requestedTestIds = [];
   if (autoMode) {{
     target =
+      findExactTierLabelItem(items, "extended-pro") ||
+      selectBestTierItem(items, "extended-pro", rankings) ||
+      findSingleGenericTierItem(items, "extended-pro") ||
       findExactTierLabelItem(items, "pro") ||
       selectBestTierItem(items, "pro", rankings) ||
       findSingleGenericTierItem(items, "pro") ||
@@ -843,7 +904,7 @@ async () => {{
   }}
 
   const targetTestId = target.testId || null;
-  if (itemIsSelected(target)) {{
+  if (itemIsSelected(target) && classifyTier(target) !== "extended-pro") {{
     return {{
       ...responseBase,
       status: "already-selected",
@@ -1777,9 +1838,12 @@ mod tests {
         assert!(auto_script.contains("const deriveRequestedTier = (value) =>"));
         assert!(auto_script.contains("const classifyTier = (item) =>"));
         assert!(auto_script.contains("const buildTierRankings = (entries) =>"));
+        assert!(auto_script.contains("const waitForTargetOrStableItems = async (initialItems) =>"));
+        assert!(auto_script.contains("targetCandidateForTier(entries, \"extended-pro\")"));
 
-        let explicit_script = build_model_selection_function("gpt-5-4-pro");
-        assert!(explicit_script.contains(r#"const requested = "gpt-5-4-pro";"#));
+        let explicit_script =
+            build_model_selection_function(crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL);
+        assert!(explicit_script.contains(r#"const requested = "extended-pro";"#));
         assert!(explicit_script.contains("\"extended-pro\":\"extended-pro\""));
         assert!(explicit_script.contains("\"gpt-5-pro\":\"gpt-5-4-pro\""));
         assert!(!explicit_script.contains("\"gpt-5-3-pro\""));

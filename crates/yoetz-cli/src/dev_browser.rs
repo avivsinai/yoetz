@@ -679,10 +679,8 @@ pub struct DevBrowserRecipeContext {
     pub bundle_path: Option<PathBuf>,
     /// Bundle text content (for paste mode).
     pub bundle_text: Option<String>,
-    /// Model slug (e.g., "gpt-5-4-pro"). Empty string = keep current.
+    /// ChatGPT model slug to select.
     pub model: String,
-    /// Whether to disable Extended Pro.
-    pub disable_extended: bool,
     /// Whether to paste text instead of uploading as file.
     pub paste_mode: bool,
     /// Custom prompt text.
@@ -709,7 +707,6 @@ impl Default for DevBrowserRecipeContext {
             model: String::new(),
             prompt: "Review the attached file and provide your analysis.".to_string(),
             run_id: String::new(),
-            disable_extended: false,
             paste_mode: false,
             poll_settings: ChatgptPollSettings::default(),
             upload_timeout_ms: CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT,
@@ -1086,7 +1083,6 @@ fn build_chatgpt_send_script(
     delivery_text: &str,
     file_upload_path: Option<&str>,
     upload_timeout_ms: u64,
-    disable_extended: bool,
     bundle_file_name: Option<&str>,
 ) -> String {
     let page_name_json = serde_json::to_string(page_name).unwrap();
@@ -1118,7 +1114,6 @@ const FILE_UPLOAD_PATH = {file_upload_path_json};
 const UPLOAD_TIMEOUT_MS = {upload_timeout_ms};
 const DELIVERY_TEXT = {delivery_text_json};
 const PROMPT = {prompt_json};
-const DISABLE_EXTENDED = {disable_extended};
 const BUNDLE_FILE_NAME = {bundle_file_name_json};
 const COMPOSER_SELECTOR = {composer_selector_json};
 const SEND_BUTTON_SELECTOR = {send_button_selector_json};
@@ -1179,15 +1174,6 @@ const waitForAttachmentReady = async () => {{
   }}
   return false;
 }};
-if (DISABLE_EXTENDED) {{
-  const extButton = page.locator("button[aria-label*='click to remove'][aria-label*='Extended'], button[aria-label*='remove'][aria-label*='Extended']").first();
-  if (await extButton.count() > 0) {{
-    await extButton.click();
-    await page.waitForTimeout(500);
-  }} else {{
-    warning = "extended disable requested but toggle not found";
-  }}
-}}
 const composer = page.locator(COMPOSER_SELECTOR).first();
 if (FILE_UPLOAD_PATH !== null) {{
   await composer.waitFor({{ state: "visible", timeout: 15000 }});
@@ -1330,7 +1316,6 @@ console.log(JSON.stringify({{
         composer_file_input_marker_json = composer_file_input_marker_json,
         attachment_probe_function_json =
             attachment_probe_function_json.unwrap_or_else(|| "null".to_string()),
-        disable_extended = disable_extended,
         upload_stable_polls = chatgpt_web::CHATGPT_UPLOAD_STABLE_POLLS,
         visibility_helpers = chatgpt_web::JS_VISIBILITY_HELPERS,
         composer_scope_helpers = chatgpt_web::JS_COMPOSER_SCOPE_HELPERS,
@@ -1641,7 +1626,6 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
             &delivery_text,
             file_upload_path.as_deref(),
             ctx.upload_timeout_ms,
-            ctx.disable_extended,
             file_upload_path
                 .as_deref()
                 .map(Path::new)
@@ -1996,10 +1980,14 @@ mod tests {
 
     #[test]
     fn build_chatgpt_prepare_script_uses_named_page_and_login_check() {
-        let script = build_chatgpt_prepare_script("yoetz-chatgpt-test", "gpt-5-4-pro", "run-123");
+        let script = build_chatgpt_prepare_script(
+            "yoetz-chatgpt-test",
+            crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL,
+            "run-123",
+        );
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
-        assert!(script.contains("const MODEL = \"gpt-5-4-pro\";"));
+        assert!(script.contains("const MODEL = \"extended-pro\";"));
         assert!(script.contains(
             "const KEEP_CURRENT_MODEL = !MODEL_TRIMMED || MODEL_LOWER === \"current\" || MODEL_LOWER === \"keep-current\";"
         ));
@@ -2018,6 +2006,7 @@ mod tests {
         assert!(script.contains("state.assistantCount === 0"));
         assert!(script.contains("pathname.startsWith(\"/c/\")"));
         assert!(script.contains("const selection = await page.evaluate((functionSource) => {"));
+        assert!(script.contains("targetCandidateForTier(entries, \\\"extended-pro\\\")"));
         assert!(script.contains("\\\"gpt-5-pro\\\":\\\"gpt-5-4-pro\\\""));
         assert!(!script.contains("\\\"gpt-5-3-pro\\\""));
         assert!(script.contains(
@@ -2084,7 +2073,6 @@ mod tests {
             "Review this file.",
             Some("/tmp/bundle.txt"),
             180_000,
-            true,
             Some("bundle.txt"),
         );
 
@@ -2092,6 +2080,7 @@ mod tests {
         assert!(script.contains("const FILE_UPLOAD_PATH = \"/tmp/bundle.txt\";"));
         assert!(script.contains("if (FILE_UPLOAD_PATH !== null)"));
         assert!(script.contains("const UPLOAD_TIMEOUT_MS = 180000;"));
+        assert!(!script.contains("DISABLE_EXTENDED"));
         assert!(script.contains("await composer.waitFor({ state: \"visible\", timeout: 15000 });"));
         assert!(script.contains("const COMPOSER_FILE_INPUT_MARKER = \"yoetz-upload-target\";"));
         assert!(script.contains("for (const selector of [markedFileInputSelector()])"));

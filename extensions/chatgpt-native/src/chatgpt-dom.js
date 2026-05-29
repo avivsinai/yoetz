@@ -201,126 +201,19 @@ export async function ensureFreshChat(root = document, job = {}, options = {}) {
   };
 }
 
-export async function configureModelState(root, job) {
-  const warnings = [];
-  const extended = configureExtendedState(root, Boolean(job.disable_extended));
-  if (extended.warning) {
-    warnings.push(extended.warning);
-  }
-
-  const requested = normalizeRequestedModel(job.model);
-  if (requested.keepCurrent) {
-    return {
-      status: "kept_current",
-      model_used: currentModelLabel(root),
-      extended_status: extended.status,
-      warning: warnings[0] ?? null
-    };
-  }
-
+export async function configureModelState(root) {
+  const requested = proExtendedModelRequest();
   const selection = await selectRequestedModel(root, requested);
-  if (selection.warning) {
-    warnings.push(selection.warning);
-  }
+  const warnings = selection.warning ? [selection.warning] : [];
   return {
     status: selection.status,
     model_used: selection.model_used,
-    requested_model: job.model,
+    requested_model: requested.raw,
     available_options: selection.available_options ?? [],
-    extended_status: extended.status,
+    extended_status: "required",
     warning: warnings[0] ?? null,
     warnings
   };
-}
-
-export function configureExtendedState(root, disableExtended) {
-  if (!disableExtended) {
-    return { status: "not_requested" };
-  }
-  const button = findExtendedControl(root);
-  if (!button) {
-    return {
-      status: "unavailable",
-      warning: "extended disable requested but Extended toggle was not found"
-    };
-  }
-  button.click();
-  return { status: "disabled" };
-}
-
-function findExtendedControl(root) {
-  const direct = firstVisible(root, [
-    'button[aria-label*="click to remove"][aria-label*="Extended" i]',
-    'button[aria-label*="remove"][aria-label*="Extended" i]',
-    '[data-testid*="extended" i][role="button"]',
-    '[data-testid*="extended" i][role="switch"]'
-  ]);
-  if (direct) {
-    return direct;
-  }
-
-  for (const scope of composerScopes(root, { includeRoot: false })) {
-    const candidates = uniqueElements(Array.from(scope.querySelectorAll([
-      "button",
-      '[role="button"]',
-      '[role="switch"]',
-      '[role="checkbox"]',
-      "[tabindex]",
-      "[aria-label]",
-      "[title]",
-      "[data-testid]",
-      "span",
-      "div"
-    ].join(","))));
-    for (const node of candidates) {
-      const target = extendedClickTarget(node, scope);
-      if (!target || !isVisible(target, { allowDisabled: true })) {
-        continue;
-      }
-      const haystack = extendedCandidateText(node, target);
-      if (!/\bextended\b/.test(haystack)) {
-        continue;
-      }
-      if (/\b(send|stop|copy|share|new chat|attach|upload|search|history)\b/.test(haystack)) {
-        continue;
-      }
-      if (isActionableElement(target) || isExtendedChipLike(target)) {
-        return target;
-      }
-    }
-  }
-  return null;
-}
-
-function extendedCandidateText(node, target = node) {
-  return normalizeText([
-    node?.getAttribute?.("aria-label"),
-    node?.getAttribute?.("title"),
-    node?.getAttribute?.("data-testid"),
-    node?.getAttribute?.("class"),
-    node?.innerText,
-    node?.textContent,
-    target?.getAttribute?.("aria-label"),
-    target?.getAttribute?.("title"),
-    target?.getAttribute?.("data-testid"),
-    target?.getAttribute?.("class"),
-    target?.innerText,
-    target?.textContent
-  ].filter(Boolean).join(" ")).toLowerCase();
-}
-
-function extendedClickTarget(node, stopAt) {
-  let current = node;
-  while (current) {
-    if (isActionableElement(current) || isExtendedChipLike(current)) {
-      return current;
-    }
-    if (current === stopAt) {
-      return null;
-    }
-    current = current.parentElement;
-  }
-  return null;
 }
 
 function isActionableElement(node) {
@@ -329,14 +222,6 @@ function isActionableElement(node) {
   return tag === "button"
     || ["button", "switch", "checkbox"].includes(role)
     || node?.getAttribute?.("tabindex") !== null;
-}
-
-function isExtendedChipLike(node) {
-  const marker = normalizeText([
-    node?.getAttribute?.("data-testid"),
-    node?.getAttribute?.("class")
-  ].filter(Boolean).join(" ")).toLowerCase();
-  return /\bextended\b/.test(marker) && /\b(chip|pill|token|toggle|badge|model)\b/.test(marker);
 }
 
 function findComposerModelControl(root) {
@@ -435,16 +320,6 @@ function isModelChipLike(node) {
 }
 
 export async function selectRequestedModel(root, requested) {
-  const currentBefore = currentModelLabel(root);
-  if (modelTextMatchesRequest(currentBefore, requested)) {
-    return {
-      status: "selected",
-      model_used: currentBefore,
-      available_options: [],
-      already_selected: true
-    };
-  }
-
   let modelButton = null;
   try {
     modelButton = await waitForElement(root, findModelButton, "ChatGPT model selector", {
@@ -459,48 +334,31 @@ export async function selectRequestedModel(root, requested) {
     };
   }
   modelButton.click();
-  try {
-    await waitForCondition(() => visibleModelOptionLabels(root).length > 0, "ChatGPT model options did not appear", {
-      timeoutMs: 5000,
-      intervalMs: 100
-    });
-  } catch {
-    // Keep the fixed delay as a compatibility backstop for menu implementations
-    // that do not expose ARIA option roles.
-    await sleep(250);
-  }
 
-  const option = findModelOption(root, requested);
-  const availableOptions = visibleModelOptionLabels(root);
+  const { option, availableOptions } = await waitForRequestedModelOption(root, requested);
   if (!option) {
-    const currentAfterOpen = currentModelLabel(root);
-    if (modelTextMatchesRequest(currentAfterOpen, requested)) {
-      return {
-        status: "selected",
-        model_used: currentAfterOpen,
-        available_options: availableOptions,
-        already_selected: true
-      };
-    }
     return {
       status: "unavailable",
-      model_used: currentAfterOpen,
+      model_used: currentModelLabel(root),
       available_options: availableOptions,
-      warning: `requested ChatGPT model ${requested.raw} was not visible`
+      warning: "ChatGPT Pro Extended was not visible in the model picker"
     };
   }
   option.click();
-  await sleep(500);
 
-  const selected = currentModelLabel(root);
-  if (modelTextMatchesRequest(selected, requested)) {
-    return { status: "selected", model_used: selected || textOf(option), available_options: availableOptions };
+  const verification = await waitForRequestedModelSelected(root, requested, option);
+  if (verification.selected) {
+    return {
+      status: "selected",
+      model_used: verification.model_used || textOf(option),
+      available_options: availableOptions
+    };
   }
   return {
     status: "mismatch",
-    model_used: selected || textOf(option),
+    model_used: verification.model_used || textOf(option),
     available_options: availableOptions,
-    warning: `requested ChatGPT model ${requested.raw} was clicked but selected label is ${selected || "unknown"}`
+    warning: `ChatGPT Pro Extended was clicked but selected label is ${verification.model_used || "unknown"}`
   };
 }
 
@@ -1125,6 +983,72 @@ function visibleModelOptionLabels(root) {
     .filter(Boolean);
 }
 
+async function waitForRequestedModelOption(root, requested, options = {}) {
+  const timeoutMs = Number(options.timeoutMs ?? 7000);
+  const intervalMs = Number(options.intervalMs ?? 100);
+  const stableForMs = Number(options.stableForMs ?? 600);
+  const startedAt = Date.now();
+  let lastSignature = "";
+  let stableSince = 0;
+  let availableOptions = [];
+
+  while (Date.now() - startedAt < timeoutMs) {
+    const option = findModelOption(root, requested);
+    availableOptions = visibleModelOptionLabels(root);
+    if (option) {
+      return { option, availableOptions };
+    }
+
+    const signature = availableOptions.join("\n");
+    const now = Date.now();
+    if (signature !== lastSignature) {
+      lastSignature = signature;
+      stableSince = signature ? now : 0;
+    }
+
+    if (signature && stableSince > 0 && now - stableSince >= stableForMs) {
+      return { option: null, availableOptions };
+    }
+    await sleep(intervalMs);
+  }
+
+  return { option: null, availableOptions };
+}
+
+async function waitForRequestedModelSelected(root, requested, option, options = {}) {
+  const timeoutMs = Number(options.timeoutMs ?? 4000);
+  const intervalMs = Number(options.intervalMs ?? 100);
+  const startedAt = Date.now();
+  let modelUsed = currentModelLabel(root);
+
+  while (Date.now() - startedAt < timeoutMs) {
+    modelUsed = currentModelLabel(root);
+    if (modelTextMatchesRequest(modelUsed, requested)) {
+      return { selected: true, model_used: modelUsed };
+    }
+    if (modelOptionIsSelected(option)) {
+      return { selected: true, model_used: textOf(option) };
+    }
+    await sleep(intervalMs);
+  }
+
+  return { selected: false, model_used: modelUsed };
+}
+
+function modelOptionIsSelected(node) {
+  const truthy = ["true", "checked", "selected", "active"];
+  return [
+    node?.getAttribute?.("aria-checked"),
+    node?.getAttribute?.("aria-selected"),
+    node?.getAttribute?.("aria-current"),
+    node?.getAttribute?.("data-state"),
+    node?.getAttribute?.("data-selected"),
+    node?.getAttribute?.("data-current")
+  ]
+    .map((value) => String(value ?? "").trim().toLowerCase())
+    .some((value) => truthy.includes(value));
+}
+
 function optionSlugs(node) {
   return [
     node.getAttribute?.("data-testid")?.replace(/^model-switcher-/, ""),
@@ -1641,41 +1565,16 @@ function currentModelLabel(root) {
   return modelControlLabel(findModelButton(root));
 }
 
-function normalizeRequestedModel(model) {
-  const raw = String(model ?? "").trim();
-  const slug = canonicalModelSlug(raw);
-  if (!raw || slug === "current") {
-    return { raw, keepCurrent: true, labels: [], slugs: [] };
-  }
-  if (slug === "auto") {
-    return {
-      raw,
-      keepCurrent: false,
-      labels: ["Extended Pro", "GPT-5.4 Pro", "GPT-5 Pro", "Pro", "GPT-5.4 Thinking", "Thinking", "GPT-5.4", "GPT-5"],
-      slugs: ["extended-pro", "gpt-5-4-pro", "gpt-5-pro", "pro", "thinking", "gpt-5-4", "gpt-5"]
-    };
-  }
-  const labelsBySlug = {
-    "extended-pro": ["Extended Pro"],
-    "pro": ["Extended Pro", "GPT-5.4 Pro", "GPT-5 Pro", "Pro"],
-    "gpt-5-pro": ["Extended Pro", "GPT-5 Pro", "Pro"],
-    "gpt-5-4-pro": ["Extended Pro", "GPT-5.4 Pro", "GPT-5 Pro", "Pro"],
-    "thinking": ["GPT-5.4 Thinking", "Thinking"],
-    "gpt-5": ["GPT-5"],
-    "gpt-5-4": ["GPT-5.4", "GPT-5"]
-  };
+function proExtendedModelRequest() {
   return {
-    raw,
-    keepCurrent: false,
-    labels: labelsBySlug[slug] ?? [raw.replace(/-/g, " ")],
-    slugs: [slug]
+    raw: "extended-pro",
+    labels: ["Extended Pro"],
+    slugs: ["extended-pro"]
   };
 }
 
 function canonicalModelSlug(value) {
   const folded = normalizeText(value).toLowerCase();
-  if (!folded || folded === "current" || folded === "keep current") return "current";
-  if (folded === "auto") return "auto";
   if (folded === "pro") return "pro";
   if (/\bextended\b/.test(folded) && /\bpro\b/.test(folded)) return "extended-pro";
   if (folded.includes("thinking")) return "thinking";

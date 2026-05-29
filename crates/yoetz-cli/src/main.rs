@@ -1877,7 +1877,6 @@ async fn run_recipe_via_chrome_devtools_mcp(
         response_timeout_ms: recipe_spec.wait_timeout_ms,
         response_poll_interval_ms: recipe_spec.wait_interval_ms,
         upload_timeout_ms: recipe_spec.upload_timeout_ms,
-        disable_extended: recipe_spec.disable_extended,
         show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
     };
 
@@ -1942,6 +1941,7 @@ fn build_chatgpt_recipe_spec(
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
 ) -> Result<chatgpt_recipe::ChatgptRecipeSpec> {
+    ensure_chatgpt_pro_extended_only_vars(recipe_vars)?;
     let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
     let upload_timeout_ms =
         dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, recipe_args.bundle.as_deref())?;
@@ -1949,7 +1949,7 @@ fn build_chatgpt_recipe_spec(
     chrome_devtools_mcp::RecipeThreadMode::parse(recipe_vars.get("thread").map(String::as_str))?;
     Ok(chatgpt_recipe::ChatgptRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
-        model: recipe_vars.get("model").cloned().unwrap_or_default(),
+        model: chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL.to_string(),
         prompt: recipe_vars
             .get("prompt")
             .cloned()
@@ -1979,10 +1979,21 @@ fn build_chatgpt_recipe_spec(
         wait_interval_ms: poll_settings.interval_ms,
         upload_timeout_ms,
         send_timeout_ms,
-        disable_extended: recipe_vars
-            .get("extended")
-            .is_some_and(|value| value == "false"),
     })
+}
+
+fn ensure_chatgpt_pro_extended_only_vars(recipe_vars: &BTreeMap<String, String>) -> Result<()> {
+    let unsupported = ["model", "extended"]
+        .into_iter()
+        .filter(|key| recipe_vars.contains_key(*key))
+        .collect::<Vec<_>>();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "ChatGPT recipe supports only ChatGPT Pro Extended; remove unsupported var(s): {}",
+        unsupported.join(", ")
+    )
 }
 
 fn apply_chatgpt_prompt_default(
@@ -2211,7 +2222,6 @@ fn run_recipe_via_dev_browser(
         bundle_path: recipe_spec.bundle_path.clone(),
         bundle_text,
         model: recipe_spec.model.clone(),
-        disable_extended: recipe_spec.disable_extended,
         paste_mode,
         prompt: recipe_spec.prompt.clone(),
         run_id: recipe_spec.run_id.clone(),
@@ -5375,7 +5385,6 @@ mod tests {
             vars: vec![],
         };
         let recipe_vars = BTreeMap::from([
-            ("model".to_string(), "pro".to_string()),
             ("prompt".to_string(), "Review this repo".to_string()),
             ("browser_context_id".to_string(), "ctx-123".to_string()),
             ("profile_email".to_string(), "user@example.com".to_string()),
@@ -5386,12 +5395,11 @@ mod tests {
             ("wait_interval_ms".to_string(), "45000".to_string()),
             ("upload_timeout_ms".to_string(), "180000".to_string()),
             ("send_timeout_ms".to_string(), "150000".to_string()),
-            ("extended".to_string(), "false".to_string()),
         ]);
 
         let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
         assert_eq!(spec.bundle_path, Some(PathBuf::from("/tmp/bundle.md")));
-        assert_eq!(spec.model, "pro");
+        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL);
         assert_eq!(spec.prompt, "Review this repo");
         assert_eq!(spec.browser_context_id.as_deref(), Some("ctx-123"));
         assert_eq!(spec.profile_email.as_deref(), Some("user@example.com"));
@@ -5402,7 +5410,30 @@ mod tests {
         assert_eq!(spec.wait_interval_ms, 45_000);
         assert_eq!(spec.upload_timeout_ms, 180_000);
         assert_eq!(spec.send_timeout_ms, 150_000);
-        assert!(spec.disable_extended);
+    }
+
+    #[test]
+    fn build_chatgpt_recipe_spec_rejects_model_and_extended_overrides() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            transport: None,
+            allow_cdp_fallback: false,
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec![],
+        };
+        let recipe_vars = BTreeMap::from([
+            ("model".to_string(), "auto".to_string()),
+            ("extended".to_string(), "false".to_string()),
+        ]);
+
+        let err = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("only ChatGPT Pro Extended"));
+        assert!(message.contains("model"));
+        assert!(message.contains("extended"));
     }
 
     #[test]
@@ -5426,15 +5457,9 @@ mod tests {
             .expect("build recipe vars");
         let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
 
-        assert_eq!(spec.model, "gpt-5-4-pro");
-        assert!(!spec.disable_extended);
-
-        let auto_vars =
-            browser::build_recipe_vars(recipe.defaults.as_ref(), &["model=auto".to_string()])
-                .expect("build recipe vars with auto override");
-        let auto_spec = build_chatgpt_recipe_spec(&recipe_args, &auto_vars).unwrap();
-        assert_eq!(auto_spec.model, "auto");
-        assert!(!auto_spec.disable_extended);
+        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL);
+        assert!(!recipe_vars.contains_key("model"));
+        assert!(!recipe_vars.contains_key("extended"));
     }
 
     #[test]
@@ -5612,7 +5637,7 @@ mod tests {
             transport: "dev-browser".to_string(),
             backend: "dev-browser".to_string(),
             response: "ok".to_string(),
-            model_used: Some("gpt-5-4-pro".to_string()),
+            model_used: Some(chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL.to_string()),
             model_selection_status: crate::chatgpt_recipe::ChatgptModelSelectionStatus::Selected,
             warnings: vec!["clipboard fallback".to_string()],
             fallback_used: true,

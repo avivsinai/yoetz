@@ -874,7 +874,7 @@ pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Val
     fs::write(&bundle_path, "Reply with exactly OK.\n")?;
     let spec = ChatgptRecipeSpec {
         bundle_path: Some(bundle_path),
-        model: "current".to_string(),
+        model: crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL.to_string(),
         prompt: "Reply with exactly OK.".to_string(),
         browser_context_id: None,
         profile_email: selector.profile_email.map(str::to_string),
@@ -885,7 +885,6 @@ pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Val
         wait_interval_ms: 1_000,
         upload_timeout_ms: 30_000,
         send_timeout_ms: 120_000,
-        disable_extended: false,
     };
     let response = run_chatgpt_recipe(&spec, OutputFormat::Json)?;
     validate_canary_response(&response.response)?;
@@ -987,7 +986,6 @@ pub fn run_chatgpt_recipe(
             "profile_email": spec.profile_email,
             "extension_instance_id": spec.extension_instance_id,
             "extension_profile_id": spec.extension_profile_id,
-            "disable_extended": spec.disable_extended,
             "wait_timeout_ms": spec.wait_timeout_ms,
             "wait_interval_ms": spec.wait_interval_ms,
             "upload_timeout_ms": spec.upload_timeout_ms,

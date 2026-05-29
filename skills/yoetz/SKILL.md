@@ -357,16 +357,15 @@ Requires Node >= 24.4. If macOS shows a Keychain prompt for `Chrome Safe Storage
 
 ### Use ChatGPT Pro via recipe
 
+The built-in ChatGPT recipe always targets Pro with Extended enabled. Do not pass
+`model` or `extended` overrides; the CLI rejects them.
+
 ```bash
 # Create bundle and get bundle.md path
 BUNDLE=$(yoetz bundle -p "Review this code" -f src/*.rs --format json | jq -r .artifacts.bundle_md)
 
 # Send to ChatGPT
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
-
-# By default yoetz selects GPT-5.4 Pro with Extended enabled, preferring a clear
-# unavailable-model error over silent tier fallback. Override it only if needed.
-yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --var model=gpt-5-4-pro
 
 # Every request opens a fresh, yoetz-owned ChatGPT tab marked with ?_yoetz=<run-id>
 # so your own ChatGPT conversations are never touched. `--var thread=reuse` is

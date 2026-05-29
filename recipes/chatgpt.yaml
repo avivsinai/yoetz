@@ -18,12 +18,8 @@ name: chatgpt
 # transports connect directly to Chrome via CDP.
 #
 # Variables:
-#   model    — model slug (e.g., "gpt-5-4-pro"). Default: "gpt-5-4-pro" with
-#              Extended enabled when the account exposes it.
-#              Set to "auto" to select the best available model, preferring
-#              Pro with Extended enabled when the account has it.
-#              Set to "" or "current" to keep the current ChatGPT selector state.
-#   extended — set to "false" to disable Extended Pro. Default: keep Extended on.
+#   This recipe supports exactly one ChatGPT target: Pro with Extended enabled.
+#   `model` and `extended` overrides are intentionally unsupported.
 #   prompt   — prompt text to send with the attachment. For Yoetz bundle
 #              sessions, typed ChatGPT transports default this to bundle.json's
 #              stored user prompt unless --var prompt=... explicitly overrides.
@@ -52,8 +48,6 @@ name: chatgpt
 
 defaults:
   prompt: Review the attached file and provide your analysis.
-  model: "gpt-5-4-pro"
-  extended: ""
   thread: "fresh"
   upload_timeout_ms: "120000"
   upload_interval_ms: "2000"
@@ -96,19 +90,6 @@ steps:
   # Model selection is handled by the built-in Rust action so MCP,
   # dev-browser, and the generic browser transport share one selector.
   - action: chatgpt_select_model
-  - sleep_ms: 500
-
-  # Disable Extended Pro only when explicitly requested (--var extended=false).
-  - action: eval
-    args:
-      - |
-        (() => {
-          const extended = "{{extended}}";
-          if (extended !== "false") return "skipped: extended not disabled";
-          const btn = document.querySelector('button[aria-label*="click to remove"][aria-label*="Extended"]');
-          if (btn) { btn.click(); return "disabled Extended Pro"; }
-          return "Extended Pro already off";
-        })()
   - sleep_ms: 500
 
   # File attachment is the only delivery path.
