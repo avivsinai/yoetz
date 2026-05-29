@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- The built-in ChatGPT recipe now reliably uses **ChatGPT Pro Extended** across
+  all browser transports. Previously a render race could let model selection
+  settle on Thinking (and `--var model=gpt-5-4-pro` could report "unavailable"):
+  selection now waits for the Pro Extended option (or a stable option set),
+  actively selects it, verifies the selected model is Pro before any
+  upload/send, and fails before side effects if Pro cannot be proven — never
+  silently falling back to Thinking/Instant.
+
+### Changed
+
+- The ChatGPT recipe is now Pro-Extended-only: the `model` and `extended`
+  recipe vars are no longer supported (passing them is rejected). This removes
+  the previous `model=auto`/tier-override paths in favor of always consulting
+  ChatGPT Pro Extended.
 
 ## [0.5.16] - 2026-05-29
 ### Added
