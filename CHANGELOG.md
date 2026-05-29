@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Changed
+
+- Bump `litellm-rust` from v0.1.2 to v0.2.0 and adapt to its breaking API
+  changes (new required `extra_body` field on `ImageRequest`; `LiteLLMError`
+  `Refusal`/`Truncated` are now struct variants). Image generation now passes
+  `extra_body: None`. Note the v0.2.0 runtime behavior change for Anthropic:
+  structured-output requests for unsupported models are rejected instead of
+  falling back to legacy tool-call workarounds, and Anthropic
+  `stop_reason=refusal`/`max_tokens` now surface as structured errors.
 
 ## [0.5.15] - 2026-05-28
 ### Fixed
