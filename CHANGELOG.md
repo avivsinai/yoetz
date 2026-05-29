@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- The ChatGPT native extension now reliably opens the model picker and selects
+  Pro Extended. The previous build opened the picker with a plain DOM click,
+  which did not actually open the menu on the current ChatGPT UI, so selection
+  from a non-Pro state failed with "model unavailable". Selection now opens the
+  picker with real pointer events (with keyboard fallbacks), clicks Pro Extended
+  via synthetic pointer events, verifies the selected model, and accepts an
+  already-selected Pro Extended state as a fast path — supporting both the
+  personal composer and Enterprise model menus.
+- `yoetz browser extension update` (and pre-dispatch auto-heal) now refresh the
+  legacy loaded `$YOETZ_DIR/chrome-extension-native/unpacked` directory in
+  addition to the canonical `$YOETZ_DIR/chatgpt-native-extension` directory, so
+  an extension loaded from the legacy path actually receives the update instead
+  of silently running stale code.
 
 ## [0.5.17] - 2026-05-29
 ### Fixed
