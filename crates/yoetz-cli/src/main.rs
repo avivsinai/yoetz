@@ -359,6 +359,8 @@ enum BrowserExtensionCommand {
     Doctor(BrowserExtensionScopeArgs),
     Reconnect(BrowserExtensionMaintenanceArgs),
     Reload(BrowserExtensionMaintenanceArgs),
+    /// Copy the packaged extension into Yoetz state, reload Chrome, and verify the version.
+    Update(BrowserExtensionMaintenanceArgs),
     Canary(BrowserExtensionCanaryArgs),
     Inspect(BrowserExtensionInspectArgs),
     /// Request the optional `identity.email` permission so profile_email
@@ -2366,7 +2368,9 @@ fn handle_browser_extension(
         BrowserExtensionCommand::Setup(args) => {
             ensure_chatgpt_extension_scope(args.chatgpt)?;
             let install = browser_extension_native::install_host()?;
-            let extension_dir = browser_extension_native::chatgpt_extension_source_dir();
+            let extension_update = browser_extension_native::prepare_managed_chatgpt_extension()?;
+            let extension_dir = extension_update.extension_dir.clone();
+            let source_dir = extension_update.source_dir.clone();
             let opened_chrome = if args.open_chrome {
                 open_chrome_extensions_page()?;
                 true
@@ -2379,6 +2383,8 @@ fn handle_browser_extension(
                 "native_host": install,
                 "extension_id": browser_extension_native::EXTENSION_ID,
                 "extension_dir": extension_dir,
+                "source_dir": source_dir,
+                "extension_copy": extension_update,
                 "extension_dir_env": browser_extension_native::CHATGPT_EXTENSION_DIR_ENV,
                 "chrome_extensions_url": browser_extension_native::CHROME_EXTENSIONS_URL,
                 "opened_chrome": opened_chrome,
@@ -2435,6 +2441,18 @@ fn handle_browser_extension(
             (
                 "browser.extension.reload",
                 browser_extension_native::reload_extension(selector)?,
+            )
+        }
+        BrowserExtensionCommand::Update(args) => {
+            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            let selector = extension_selector_from_parts(
+                args.profile_email.as_ref(),
+                args.extension_instance_id.as_ref(),
+                args.extension_profile_id.as_ref(),
+            );
+            (
+                "browser.extension.update",
+                browser_extension_native::update_extension(selector)?,
             )
         }
         BrowserExtensionCommand::Canary(args) => {
@@ -2542,6 +2560,15 @@ fn format_extension_setup(payload: &Value) -> String {
         .and_then(|value| value.get("manifest_path"))
         .and_then(Value::as_str)
         .unwrap_or("<unknown>");
+    let source_dir = payload
+        .get("source_dir")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let copy_status = payload
+        .get("extension_copy")
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
     let status = payload
         .get("extension_status")
         .and_then(|value| value.get("status"))
@@ -2553,6 +2580,8 @@ fn format_extension_setup(payload: &Value) -> String {
         format!("native_host_manifest: {native_manifest}"),
         format!("extension_id: {}", browser_extension_native::EXTENSION_ID),
         format!("extension_dir: {extension_dir}"),
+        format!("source_dir: {source_dir}"),
+        format!("extension_copy: {copy_status}"),
         format!("chrome_extensions_url: {}", browser_extension_native::CHROME_EXTENSIONS_URL),
         format!("opened_chrome: {opened}"),
         format!("current_bridge_status: {status}"),
@@ -2564,7 +2593,7 @@ fn format_extension_setup(payload: &Value) -> String {
         .is_none()
     {
         lines.push(
-            "release installs may need the extension zip extracted first; pass the extracted path via YOETZ_CHATGPT_NATIVE_EXTENSION_DIR."
+            "set YOETZ_CHATGPT_NATIVE_EXTENSION_DIR to a valid packaged extension source and rerun setup."
                 .to_string(),
         );
     }

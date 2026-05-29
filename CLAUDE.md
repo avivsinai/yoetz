@@ -120,17 +120,19 @@ recipe auto-promotes it.
   want it regardless of detection, via
   `yoetz browser recipe --recipe chatgpt --transport chrome-extension-native`,
   and is managed with `yoetz browser extension install-host --chatgpt`,
-  `setup --chatgpt --open-chrome`, `doctor --chatgpt`, `status --chatgpt`, `reconnect --chatgpt`,
-  `canary --chatgpt`, `inspect --chatgpt --run-id <id>`, and
-  `grant-identity --chatgpt`. Use
+  `setup --chatgpt --open-chrome`, `doctor --chatgpt`, `status --chatgpt`,
+  `reconnect --chatgpt`, `update --chatgpt`, `canary --chatgpt`,
+  `inspect --chatgpt --run-id <id>`, and `grant-identity --chatgpt`. Use
   `yoetz browser check --transport chrome-extension-native` for extension
   readiness; plain `yoetz browser check` verifies the default CDP/browser stack.
 - For multiple loaded Chrome extension profiles, route extension-native jobs by
   `profile_email` when Chrome exposes it, or by the stable
   `extension_instance_id` shown in `status --chatgpt` when it does not.
-- Manual extension updates are explicit: unzip the release artifact, load or
-  reload the extracted extension in `chrome://extensions` Developer mode, then
-  run `yoetz browser extension reconnect --chatgpt` and `doctor --chatgpt`.
+- Extension setup materializes packaged source into the stable
+  `$YOETZ_DIR/chatgpt-native-extension` directory. Users load that unpacked
+  directory once; future updates use
+  `yoetz browser extension update --chatgpt`, which re-syncs the managed copy,
+  reloads the extension, and verifies the loaded version.
 - Default mode is connect-first: attach to the user's already running Chrome
   session (`--connect`, auto-connect, or explicit `--cdp`) before considering
   cookie sync or managed-profile fallbacks.

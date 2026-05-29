@@ -307,6 +307,7 @@ fn browser_extension_help_shows_chatgpt_lifecycle() {
         .stdout(predicate::str::contains("doctor"))
         .stdout(predicate::str::contains("status"))
         .stdout(predicate::str::contains("reconnect"))
+        .stdout(predicate::str::contains("update"))
         .stdout(predicate::str::contains("canary"));
 }
 
