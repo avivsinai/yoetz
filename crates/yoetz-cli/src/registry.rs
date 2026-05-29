@@ -13,7 +13,7 @@ use crate::http::send_json;
 use litellm_rust::registry::Registry as EmbeddedRegistry;
 use yoetz_core::config::Config;
 use yoetz_core::paths::home_dir;
-use yoetz_core::registry::{ModelCapability, ModelEntry, ModelPricing, ModelRegistry};
+use yoetz_core::registry::{ModelCapability, ModelEntry, ModelKind, ModelPricing, ModelRegistry};
 
 pub struct RegistryFetchResult {
     pub registry: ModelRegistry,
@@ -232,7 +232,14 @@ fn embedded_gemini_registry() -> Result<ModelRegistry> {
                 request: None,
             },
             provider: pricing.provider.clone(),
-            capability: None,
+            capability: pricing
+                .mode
+                .as_deref()
+                .and_then(ModelKind::from_litellm_mode)
+                .map(|kind| ModelCapability {
+                    kind: Some(kind),
+                    ..Default::default()
+                }),
             tier: None,
         });
     }
@@ -498,6 +505,19 @@ fn parse_openrouter_capability(item: &Value) -> Option<ModelCapability> {
         cap.vision = Some(has_image);
     }
 
+    if let Some(out) = item
+        .get("architecture")
+        .and_then(|v| v.get("output_modalities"))
+        .and_then(|v| v.as_array())
+    {
+        let mods: Vec<String> = out
+            .iter()
+            .filter_map(|m| m.as_str())
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        cap.kind = classify_output_modalities(&mods);
+    }
+
     if let Some(params) = item.get("supported_parameters").and_then(|v| v.as_array()) {
         let has_reasoning = params.iter().any(|p| {
             p.as_str().is_some_and(|s| {
@@ -521,11 +541,43 @@ fn parse_openrouter_capability(item: &Value) -> Option<ModelCapability> {
         cap.web_search = Some(true);
     }
 
-    if cap.vision.is_none() && cap.reasoning.is_none() && cap.web_search.is_none() {
+    if cap.vision.is_none()
+        && cap.reasoning.is_none()
+        && cap.web_search.is_none()
+        && cap.kind.is_none()
+    {
         None
     } else {
         Some(cap)
     }
+}
+
+/// Classify a model's OpenRouter `architecture.output_modalities` into a kind.
+/// Chat is exactly `["text"]`. Any non-empty list that is not exactly `["text"]`
+/// carries a non-text output modality and is therefore non-chat — classified
+/// specifically when recognized (image/video/audio) and `Other` otherwise.
+/// Returns `None` (fail-open, chat-eligible) only when the list is empty, i.e.
+/// the catalog gave no output-modality signal at all.
+fn classify_output_modalities(mods: &[String]) -> Option<ModelKind> {
+    let has = |needle: &str| mods.iter().any(|m| m == needle);
+    if mods.is_empty() {
+        return None;
+    }
+    if mods.len() == 1 && has("text") {
+        return Some(ModelKind::Chat);
+    }
+    if has("image") {
+        return Some(ModelKind::ImageGeneration);
+    }
+    if has("video") {
+        return Some(ModelKind::VideoGeneration);
+    }
+    if has("audio") {
+        return Some(ModelKind::Audio);
+    }
+    // Non-empty and not exactly ["text"], with no recognized media token: still a
+    // non-text output, so it is non-chat (excluded from frontier), not fail-open.
+    Some(ModelKind::Other)
 }
 
 #[cfg(test)]
@@ -590,6 +642,45 @@ mod tests {
             std::io::Write::write_all(&mut stream, response.as_bytes()).unwrap();
         });
         format!("http://{addr}/models")
+    }
+
+    fn mods(values: &[&str]) -> Vec<String> {
+        values.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn classify_output_modalities_matches_openrouter_catalog_shapes() {
+        // Verified live against OpenRouter /models (2026-05-29): output tokens
+        // are only text/image/audio, and every media model also carries "text"
+        // (so exactly ["text"] is the chat predicate).
+        assert_eq!(
+            classify_output_modalities(&mods(&["text"])),
+            Some(ModelKind::Chat)
+        );
+        assert_eq!(
+            classify_output_modalities(&mods(&["image", "text"])),
+            Some(ModelKind::ImageGeneration)
+        );
+        assert_eq!(
+            classify_output_modalities(&mods(&["audio", "text"])),
+            Some(ModelKind::Audio)
+        );
+        assert_eq!(
+            classify_output_modalities(&mods(&["text", "video"])),
+            Some(ModelKind::VideoGeneration)
+        );
+        // Non-empty and not exactly ["text"], no recognized media token: still a
+        // non-text output -> non-chat (Other), NOT fail-open chat-eligible.
+        assert_eq!(
+            classify_output_modalities(&mods(&["text", "speech"])),
+            Some(ModelKind::Other)
+        );
+        assert_eq!(
+            classify_output_modalities(&mods(&["embeddings"])),
+            Some(ModelKind::Other)
+        );
+        // Only a truly empty list (no output-modality signal) is fail-open.
+        assert_eq!(classify_output_modalities(&[]), None);
     }
 
     fn config_with_sync(secs: u64) -> Config {
