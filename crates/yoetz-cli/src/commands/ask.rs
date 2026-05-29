@@ -21,6 +21,7 @@ fn enforce_multimodal_budget_support(
     has_video: bool,
     max_cost_usd: Option<f64>,
     daily_budget_usd: Option<f64>,
+    allow_uncosted: bool,
     pricing: &mut PricingEstimate,
 ) -> Result<()> {
     if !has_images && !has_video {
@@ -32,13 +33,21 @@ fn enforce_multimodal_budget_support(
             .to_string(),
     );
 
-    if max_cost_usd.is_some() || daily_budget_usd.is_some() {
-        return Err(anyhow!(
-            "--max-cost-usd and --daily-budget-usd are not supported with image/video inputs yet because yoetz cannot estimate multimodal input cost accurately before the provider call"
-        ));
+    if max_cost_usd.is_none() && daily_budget_usd.is_none() {
+        return Ok(());
     }
 
-    Ok(())
+    if allow_uncosted {
+        pricing.warnings.push(
+            "--allow-uncosted set: skipping pre-call budget enforcement for multimodal input; only the provider-reported cost (if any) is recorded post-call"
+                .to_string(),
+        );
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "--max-cost-usd and --daily-budget-usd are not supported with image/video inputs yet because yoetz cannot estimate multimodal input cost accurately before the provider call; pass --allow-uncosted to run anyway (budget becomes best-effort/post-call)"
+    ))
 }
 
 pub(crate) async fn handle_ask(
@@ -156,11 +165,17 @@ pub(crate) async fn handle_ask(
         video_input.is_some(),
         args.max_cost_usd,
         args.daily_budget_usd,
+        args.allow_uncosted,
         &mut pricing,
     )?;
 
     let budget_enabled = args.max_cost_usd.is_some() || args.daily_budget_usd.is_some();
-    let budget_reservation = if budget_enabled {
+    // Media inputs have no pre-call cost estimate. When the caller opted in with
+    // --allow-uncosted we skip the pre-call reservation entirely (ensure_budget
+    // requires an estimate) and rely on recording the real provider cost later.
+    let uncosted_media =
+        (!image_inputs.is_empty() || video_input.is_some()) && args.allow_uncosted;
+    let budget_reservation = if budget_enabled && !uncosted_media {
         budget::ensure_budget(
             pricing.estimate_usd,
             args.max_cost_usd,
@@ -311,7 +326,15 @@ pub(crate) async fn handle_ask(
     }
 
     if budget_enabled && !args.dry_run {
-        if let Some(spend) = usage.cost_usd.or(pricing.estimate_usd) {
+        // For opted-in uncosted media, only record a real provider-reported cost;
+        // never fall back to the text-only estimate, which undercounts media and
+        // would write a misleading number into the persistent daily ledger.
+        let spend = if uncosted_media {
+            usage.cost_usd
+        } else {
+            usage.cost_usd.or(pricing.estimate_usd)
+        };
+        if let Some(spend) = spend {
             if let Some(reservation) = budget_reservation {
                 if let Err(e) = reservation.commit(spend) {
                     eprintln!("warning: budget commit failed: {e}");
@@ -363,7 +386,7 @@ mod tests {
     #[test]
     fn multimodal_budget_support_warns_without_budget_flags() {
         let mut pricing = PricingEstimate::default();
-        enforce_multimodal_budget_support(true, false, None, None, &mut pricing).unwrap();
+        enforce_multimodal_budget_support(true, false, None, None, false, &mut pricing).unwrap();
         assert_eq!(pricing.warnings.len(), 1);
         assert!(pricing.warnings[0].contains("preflight budget enforcement"));
     }
@@ -371,11 +394,34 @@ mod tests {
     #[test]
     fn multimodal_budget_support_rejects_budget_flags() {
         let mut pricing = PricingEstimate::default();
-        let err = enforce_multimodal_budget_support(true, false, Some(1.0), None, &mut pricing)
-            .unwrap_err();
+        let err =
+            enforce_multimodal_budget_support(true, false, Some(1.0), None, false, &mut pricing)
+                .unwrap_err();
         assert!(err
             .to_string()
             .contains("--max-cost-usd and --daily-budget-usd are not supported"));
+        assert!(err.to_string().contains("--allow-uncosted"));
         assert_eq!(pricing.warnings.len(), 1);
+    }
+
+    #[test]
+    fn multimodal_budget_support_allows_uncosted_opt_in() {
+        let mut pricing = PricingEstimate::default();
+        // media + budget flag + --allow-uncosted: downgrade hard fail to warning.
+        enforce_multimodal_budget_support(false, true, Some(1.0), Some(5.0), true, &mut pricing)
+            .unwrap();
+        assert!(pricing
+            .warnings
+            .iter()
+            .any(|w| w.contains("--allow-uncosted set")));
+    }
+
+    #[test]
+    fn multimodal_budget_support_allow_uncosted_is_noop_without_media() {
+        // No media -> flag has no effect, no warnings, Ok (byte-identical default).
+        let mut pricing = PricingEstimate::default();
+        enforce_multimodal_budget_support(false, false, Some(1.0), None, true, &mut pricing)
+            .unwrap();
+        assert!(pricing.warnings.is_empty());
     }
 }

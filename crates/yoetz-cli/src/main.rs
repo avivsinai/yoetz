@@ -147,6 +147,13 @@ struct AskArgs {
     #[arg(long)]
     daily_budget_usd: Option<f64>,
 
+    /// Allow image/video requests to run even when --max-cost-usd/--daily-budget-usd
+    /// are set. Multimodal input cost cannot be estimated before the call, so
+    /// pre-call budget enforcement is skipped for the media request; the actual
+    /// provider-reported cost (when available) is still recorded post-call.
+    #[arg(long)]
+    allow_uncosted: bool,
+
     #[arg(long, value_name = "PATH_OR_URL")]
     image: Vec<String>,
 
