@@ -137,6 +137,7 @@ pub struct ManagedExtensionUpdateResult {
     pub status: &'static str,
     pub source_dir: PathBuf,
     pub extension_dir: PathBuf,
+    pub loaded_extension_dirs: Vec<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_version: Option<String>,
     pub copied_files: usize,
@@ -287,12 +288,29 @@ pub fn managed_chatgpt_extension_dir() -> Result<PathBuf> {
     Ok(yoetz_state_dir()?.join("chatgpt-native-extension"))
 }
 
+fn legacy_loaded_chatgpt_extension_dir() -> Result<PathBuf> {
+    Ok(yoetz_state_dir()?
+        .join("chrome-extension-native")
+        .join("unpacked"))
+}
+
 pub fn prepare_managed_chatgpt_extension() -> Result<ManagedExtensionUpdateResult> {
     let source_dir = chatgpt_extension_source_dir().with_context(|| {
         format!("could not find ChatGPT native extension source; set {CHATGPT_EXTENSION_DIR_ENV}")
     })?;
     let extension_dir = managed_chatgpt_extension_dir()?;
-    sync_managed_chatgpt_extension_from(&source_dir, &extension_dir)
+    let mut result = sync_managed_chatgpt_extension_from(&source_dir, &extension_dir)?;
+    let legacy_dir = legacy_loaded_chatgpt_extension_dir()?;
+    if legacy_dir.exists() && !paths_refer_to_same_location(&legacy_dir, &extension_dir) {
+        sync_managed_chatgpt_extension_from(&source_dir, &legacy_dir).with_context(|| {
+            format!(
+                "sync legacy loaded ChatGPT native extension directory {}",
+                legacy_dir.display()
+            )
+        })?;
+        result.loaded_extension_dirs.push(legacy_dir);
+    }
+    Ok(result)
 }
 
 fn sync_managed_chatgpt_extension_from(
@@ -310,6 +328,7 @@ fn sync_managed_chatgpt_extension_from(
             status: "current",
             source_dir: source_dir.to_path_buf(),
             extension_dir: extension_dir.to_path_buf(),
+            loaded_extension_dirs: vec![extension_dir.to_path_buf()],
             manifest_version: extension_manifest_version(extension_dir),
             copied_files: count_regular_files(extension_dir)?,
         });
@@ -325,6 +344,7 @@ fn sync_managed_chatgpt_extension_from(
             status: "current",
             source_dir: source_dir.to_path_buf(),
             extension_dir: extension_dir.to_path_buf(),
+            loaded_extension_dirs: vec![extension_dir.to_path_buf()],
             manifest_version: extension_manifest_version(extension_dir),
             copied_files: 0,
         });
@@ -384,6 +404,7 @@ fn sync_managed_chatgpt_extension_from(
         status: "updated",
         source_dir: source_dir.to_path_buf(),
         extension_dir: extension_dir.to_path_buf(),
+        loaded_extension_dirs: vec![extension_dir.to_path_buf()],
         manifest_version: extension_manifest_version(extension_dir),
         copied_files,
     })
@@ -849,6 +870,7 @@ pub fn update_extension(selector: ExtensionInstanceSelector<'_>) -> Result<Value
         "transport": TRANSPORT_NAME,
         "extension_dir": update.extension_dir,
         "source_dir": update.source_dir,
+        "loaded_extension_dirs": update.loaded_extension_dirs,
         "manifest_version": update.manifest_version,
         "copy_status": update.status,
         "copied_files": update.copied_files,
@@ -1331,14 +1353,10 @@ fn auto_heal_extension_version_skew(
     paths: &ExtensionPaths,
     selector: ExtensionInstanceSelector<'_>,
 ) -> Result<Option<ExtensionInstanceStatus>> {
-    let source_dir = match chatgpt_extension_source_dir() {
-        Some(path) => path,
-        None => return Ok(None),
-    };
-    let extension_dir = managed_chatgpt_extension_dir()?;
-    if managed_chatgpt_extension_needs_sync(&source_dir, &extension_dir)? {
-        sync_managed_chatgpt_extension_from(&source_dir, &extension_dir)?;
+    if chatgpt_extension_source_dir().is_none() {
+        return Ok(None);
     }
+    prepare_managed_chatgpt_extension()?;
     reload_extension(selector)?;
     wait_for_extension_version(paths, selector, YOETZ_CLI_VERSION).map(Some)
 }
@@ -3512,6 +3530,33 @@ mod tests {
         assert_eq!(result.source_dir, source.canonicalize().unwrap());
         assert_eq!(result.extension_dir, state.join("chatgpt-native-extension"));
         assert!(is_chatgpt_extension_source_dir(&result.extension_dir));
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_managed_extension_refreshes_legacy_loaded_unpacked_dir_when_present() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        write_extension_source_fixture(&source, "fresh");
+        let state = dir.path().join("state");
+        let legacy_loaded = state.join("chrome-extension-native").join("unpacked");
+        write_extension_source_fixture(&legacy_loaded, "stale");
+        let _source_guard = EnvGuard::set(CHATGPT_EXTENSION_DIR_ENV, &source);
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &state);
+
+        let result = prepare_managed_chatgpt_extension().unwrap();
+
+        assert_eq!(result.extension_dir, state.join("chatgpt-native-extension"));
+        assert!(result.loaded_extension_dirs.contains(&result.extension_dir));
+        assert!(result.loaded_extension_dirs.contains(&legacy_loaded));
+        assert_eq!(
+            fs::read_to_string(legacy_loaded.join("manifest.json")).unwrap(),
+            r#"{"version":"fresh"}"#
+        );
+        assert_eq!(
+            fs::read_to_string(legacy_loaded.join("src").join("service-worker.js")).unwrap(),
+            "service-worker:fresh"
+        );
     }
 
     #[test]

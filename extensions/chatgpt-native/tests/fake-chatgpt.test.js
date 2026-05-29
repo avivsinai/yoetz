@@ -6,6 +6,7 @@ import {
   configureModelState,
   ensureFreshChat,
   extractResponse,
+  findModelButton,
   insertPrompt,
   sendAcceptanceBaseline,
   uploadFile,
@@ -28,9 +29,11 @@ class FakeElement {
     this.textContent = text;
     this.innerText = text;
     this.onClick = attrs.onClick;
+    this.onPointerDown = attrs.onPointerDown;
     this.hidden = Boolean(attrs.hidden);
     this.onChange = attrs.onChange;
     delete this.attrs.onClick;
+    delete this.attrs.onPointerDown;
     delete this.attrs.onChange;
   }
 
@@ -56,13 +59,23 @@ class FakeElement {
   }
 
   click() {
-    this.clicked = true;
-    this.attrs["aria-checked"] = "true";
+    this.recordClick();
     this.onClick?.();
+  }
+
+  recordClick() {
+    this.clicked = true;
   }
 
   dispatchEvent(event) {
     this.events.push(event.type);
+    if (event.type === "pointerdown") {
+      this.onPointerDown?.(event);
+    }
+    if (event.type === "click") {
+      this.recordClick();
+      this.onClick?.(event);
+    }
     if (event.type === "change") {
       this.onChange?.();
     }
@@ -1393,7 +1406,13 @@ test("fake ChatGPT model controls always select Pro Extended", async () => {
   const modelButton = new FakeElement("button", {
     "data-testid": "model-switcher-dropdown-button",
     "aria-haspopup": "menu",
-    onClick: () => delete modelButton.attrs["aria-checked"]
+    onClick: () => {
+      for (const option of [instantOption, thinkingOption, extendedProOption]) {
+        if (!body.children.includes(option)) {
+          body.append(option);
+        }
+      }
+    }
   }, "Instant");
   const extended = new FakeElement("button", { "aria-label": "click to remove Extended" }, "Extended");
   const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Instant");
@@ -1408,8 +1427,8 @@ test("fake ChatGPT model controls always select Pro Extended", async () => {
     }
   }, "Pro • Extended");
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
-  const body = new FakeElement("body", {}, "Ask anything Instant Thinking Pro Extended")
-    .append(extended, form, selected, instantOption, thinkingOption, extendedProOption);
+  const body = new FakeElement("body", {}, "Ask anything Instant")
+    .append(extended, form, selected);
   const doc = new FakeDocument(body);
 
   const result = await configureModelState(doc, {});
@@ -1466,21 +1485,393 @@ test("fake ChatGPT waits for late Pro Extended option before selecting", async (
   assert.equal(result.model_used, "Pro • Extended");
 });
 
+test("fake ChatGPT keeps waiting when non-Pro options render before Pro Extended", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Instant");
+  const instantOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5"
+  }, "Instant");
+  const thinkingOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-thinking"
+  }, "Thinking");
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-pro",
+    onClick: () => {
+      selected.innerText = "Pro • Extended";
+      selected.textContent = "Pro • Extended";
+    }
+  }, "Pro • Extended");
+  const modelButton = new FakeElement("button", {
+    "data-testid": "model-switcher-dropdown-button",
+    "aria-haspopup": "menu",
+    onClick: () => {
+      if (!body.children.includes(instantOption)) {
+        body.append(instantOption, thinkingOption);
+        setTimeout(() => body.append(proOption), 900);
+      }
+    }
+  }, "Instant");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
+  const body = new FakeElement("body", {}, "Ask anything Instant Thinking").append(form, selected);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.equal(proOption.clicked, true);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Pro • Extended");
+});
+
+test("fake ChatGPT opens model menu with pointer events when DOM click does not open it", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Thinking");
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-pro",
+    onClick: () => {
+      selected.innerText = "Pro • Extended";
+      selected.textContent = "Pro • Extended";
+    }
+  }, "Pro • Extended");
+  const modelButton = new FakeElement("button", {
+    "data-testid": "model-switcher-dropdown-button",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      if (!body.children.includes(proOption)) {
+        body.append(proOption);
+      }
+    }
+  }, "Thinking");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
+  const body = new FakeElement("body", {}, "Ask anything Thinking").append(form, selected);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.ok(modelButton.events.includes("pointerdown"));
+  assert.equal(modelButton.clicked, false);
+  assert.equal(proOption.clicked, true);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Pro • Extended");
+});
+
+test("fake ChatGPT stops opening sequence when pointerdown opens the menu", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Thinking");
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-pro",
+    onClick: () => {
+      selected.innerText = "Pro • Extended";
+      selected.textContent = "Pro • Extended";
+    }
+  }, "Pro • Extended");
+  const modelButton = new FakeElement("button", {
+    "data-testid": "model-switcher-dropdown-button",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      if (!body.children.includes(proOption)) {
+        body.append(proOption);
+      }
+    },
+    onClick: () => {
+      body.children = body.children.filter((child) => child !== proOption);
+    }
+  }, "Thinking");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
+  const body = new FakeElement("body", {}, "Ask anything Thinking").append(form, selected);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.ok(modelButton.events.includes("pointerdown"));
+  assert.equal(modelButton.events.includes("click"), false);
+  assert.equal(proOption.clicked, true);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Pro • Extended");
+});
+
+test("fake personal ChatGPT composer model chip selects Pro Extended", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Thinking");
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-pro",
+    onClick: () => {
+      selected.innerText = "Pro • Extended";
+      selected.textContent = "Pro • Extended";
+    }
+  }, "Pro • Extended");
+  const modelChip = new FakeElement("button", {
+    class: "model-chip",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      if (!body.children.includes(proOption)) {
+        body.append(proOption);
+      }
+    }
+  }, "Thinking");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelChip);
+  const body = new FakeElement("body", {}, "Ask anything Thinking").append(form, selected);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.ok(modelChip.events.includes("pointerdown"));
+  assert.equal(modelChip.clicked, false);
+  assert.equal(proOption.clicked, true);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Pro • Extended");
+  assert.equal(result.extended_status, "required");
+});
+
+test("fake personal ChatGPT composer model chip verifies the chip label after the menu closes", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-pro",
+    onClick: () => {
+      modelChip.innerText = "Pro Extended";
+      modelChip.textContent = "Pro Extended";
+      body.children = body.children.filter((child) => child !== proOption);
+    }
+  }, "Pro Extended");
+  const modelChip = new FakeElement("button", {
+    class: "model-chip",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      if (!body.children.includes(proOption)) {
+        body.append(proOption);
+      }
+    }
+  }, "Thinking");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelChip);
+  const body = new FakeElement("body", {}, "Ask anything Thinking").append(form);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.ok(modelChip.events.includes("pointerdown"));
+  assert.equal(proOption.clicked, true);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Pro Extended");
+  assert.equal(result.extended_status, "required");
+});
+
+test("fake personal ChatGPT composer model chip accepts already selected Extended Pro", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const modelChip = new FakeElement("button", {
+    class: "model-chip",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      throw new Error("already selected Pro Extended should not open the picker");
+    }
+  }, "Extended Pro");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelChip);
+  const body = new FakeElement("body", {}, "Ask anything Extended Pro").append(form);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.equal(modelChip.events.includes("pointerdown"), false);
+  assert.equal(modelChip.clicked, false);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Extended Pro");
+  assert.equal(result.extended_status, "required");
+});
+
+test("fake ChatGPT finds visible Extended Pro control before composer scope exists", () => {
+  const modelChip = new FakeElement("button", {
+    class: "__composer-pill __composer-pill--neutral group/pill",
+    "aria-haspopup": "menu"
+  }, "Extended Pro");
+  const body = new FakeElement("body", {}, "Extended Pro").append(modelChip);
+  const doc = new FakeDocument(body);
+
+  assert.equal(findModelButton(doc), modelChip);
+});
+
+test("fake ChatGPT accepts hydrated already selected Extended Pro before selector exists", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const body = new FakeElement("body", {}, "Ask anything").append(composer);
+  const doc = new FakeDocument(body);
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Extended Pro");
+  setTimeout(() => body.append(selected), 250);
+
+  const result = await configureModelState(doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Extended Pro");
+  assert.equal(result.extended_status, "required");
+});
+
+test("fake personal ChatGPT composer pill can live outside the inner composer scope", async () => {
+  const composer = new FakeElement("div", { id: "prompt-textarea", role: "textbox" }, "");
+  const innerComposer = new FakeElement("div", { class: "deep-research-composer-shell" }, "").append(composer);
+  const modelPill = new FakeElement("button", {
+    class: "__composer-pill __composer-pill--neutral group/pill",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      throw new Error("already selected Pro Extended should not open the picker");
+    }
+  }, "Extended Pro");
+  const trailingControls = new FakeElement("div", { class: "composer-trailing-controls" }, "").append(modelPill);
+  const main = new FakeElement("main", {}, "Ask anything Extended Pro").append(innerComposer, trailingControls);
+  const body = new FakeElement("body", {}, "Ask anything Extended Pro").append(main);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.equal(modelPill.events.includes("pointerdown"), false);
+  assert.equal(modelPill.clicked, false);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Extended Pro");
+  assert.equal(result.extended_status, "required");
+});
+
+test("fake ChatGPT accepts Pro Extended label that appears after the picker stays empty", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Thinking");
+  const modelButton = new FakeElement("button", {
+    "data-testid": "model-switcher-dropdown-button",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      setTimeout(() => {
+        selected.innerText = "Extended Pro";
+        selected.textContent = "Extended Pro";
+      }, 500);
+    }
+  }, "Thinking");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
+  const body = new FakeElement("body", {}, "Ask anything Thinking").append(form, selected);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.ok(modelButton.events.includes("pointerdown"));
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Extended Pro");
+  assert.equal(result.extended_status, "required");
+});
+
+test("fake ChatGPT reports mismatch when option checks but selected label stays Thinking", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Thinking");
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-pro",
+    onClick: () => {
+      proOption.attrs["aria-checked"] = "true";
+    }
+  }, "Pro • Extended");
+  const modelButton = new FakeElement("button", {
+    "data-testid": "model-switcher-dropdown-button",
+    "aria-haspopup": "menu",
+    onClick: () => {
+      if (!body.children.includes(proOption)) {
+        body.append(proOption);
+      }
+    }
+  }, "Thinking");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
+  const body = new FakeElement("body", {}, "Ask anything Thinking").append(form, selected);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.equal(proOption.clicked, true);
+  assert.equal(result.status, "mismatch");
+  assert.equal(result.model_used, "Thinking");
+  assert.match(result.warning, /selected label is Thinking/);
+});
+
+test("fake ChatGPT does not certify transient Pro text on an open dropdown", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-pro",
+    onClick: () => {
+      modelButton.innerText = "Pro • Extended";
+      modelButton.textContent = "Pro • Extended";
+      modelButton.attrs["aria-selected"] = "true";
+    }
+  }, "Pro • Extended");
+  const modelButton = new FakeElement("button", {
+    "data-testid": "model-switcher-dropdown-button",
+    "aria-haspopup": "menu",
+    onClick: () => {
+      if (!body.children.includes(proOption)) {
+        body.append(proOption);
+      }
+    }
+  }, "Thinking");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelButton);
+  const body = new FakeElement("body", {}, "Ask anything Thinking").append(form);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.equal(proOption.clicked, true);
+  assert.equal(result.status, "mismatch");
+  assert.equal(result.model_used, "unknown");
+  assert.match(result.warning, /selected label is unknown/);
+});
+
 test("fake ChatGPT fails when Pro Extended is absent", async () => {
   const modelButton = new FakeElement("button", {
     "data-testid": "model-switcher-dropdown-button",
-    "aria-haspopup": "menu"
+    "aria-haspopup": "menu",
+    onClick: () => {
+      for (const option of [instantOption, thinkingOption]) {
+        if (!body.children.includes(option)) {
+          body.append(option);
+        }
+      }
+    }
   }, "ChatGPT");
   const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Instant");
   const instantOption = new FakeElement("div", { role: "menuitemradio" }, "Instant");
   const thinkingOption = new FakeElement("div", { role: "menuitemradio" }, "Thinking");
   const body = new FakeElement("body", {}, "ChatGPT Instant Thinking")
-    .append(modelButton, selected, instantOption, thinkingOption);
+    .append(modelButton, selected);
   const doc = new FakeDocument(body);
 
   const result = await configureModelState(doc, {});
 
   assert.equal(modelButton.clicked, true);
+  assert.equal(instantOption.clicked, false);
+  assert.equal(thinkingOption.clicked, false);
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.extended_status, "required");
+  assert.match(result.warning, /Pro Extended was not visible/);
+});
+
+test("fake personal ChatGPT composer model chip fails when Pro Extended is absent", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Thinking");
+  const instantOption = new FakeElement("div", { role: "menuitemradio" }, "Instant");
+  const thinkingOption = new FakeElement("div", { role: "menuitemradio" }, "Thinking");
+  const modelChip = new FakeElement("button", {
+    class: "model-chip",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      for (const option of [instantOption, thinkingOption]) {
+        if (!body.children.includes(option)) {
+          body.append(option);
+        }
+      }
+    }
+  }, "Thinking");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelChip);
+  const body = new FakeElement("body", {}, "Ask anything Thinking").append(form, selected);
+  const doc = new FakeDocument(body);
+
+  const result = await configureModelState(doc, {});
+
+  assert.ok(modelChip.events.includes("pointerdown"));
   assert.equal(instantOption.clicked, false);
   assert.equal(thinkingOption.clicked, false);
   assert.equal(result.status, "unavailable");
@@ -1511,6 +1902,10 @@ function matchesSimpleSelector(element, selector) {
   const attr = (name) => element.attrs[name];
   const text = String(element.innerText ?? element.textContent ?? "");
 
+  if (selector.startsWith("button:has(")) {
+    const inner = selector.slice("button:has(".length, -1);
+    return tag === "button" && element.querySelectorAll(inner).length > 0;
+  }
   if (selector === '[data-message-author-role="assistant"] [class*="markdown"]') {
     return String(attr("class") ?? "").includes("markdown")
       && Boolean(element.closest('[data-message-author-role="assistant"]'));

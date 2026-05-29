@@ -20,6 +20,9 @@ name: chatgpt
 # Variables:
 #   This recipe supports exactly one ChatGPT target: Pro with Extended enabled.
 #   `model` and `extended` overrides are intentionally unsupported.
+#   The Pro Extended selector must work against both ChatGPT Enterprise and
+#              personal ChatGPT accounts. Their picker DOM differs, but both
+#              are fail-closed if Pro Extended cannot be proven selected.
 #   prompt   — prompt text to send with the attachment. For Yoetz bundle
 #              sessions, typed ChatGPT transports default this to bundle.json's
 #              stored user prompt unless --var prompt=... explicitly overrides.

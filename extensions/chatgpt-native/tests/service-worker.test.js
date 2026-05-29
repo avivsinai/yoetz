@@ -51,7 +51,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -183,7 +183,7 @@ test("service worker fails fast on metadata manual handoff detected while waitin
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -385,6 +385,56 @@ test("service worker fails closed when Pro Extended selection fails", async () =
   }
 });
 
+test("service worker fails closed when selected model proof is incomplete", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  let tabId = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        sentToTabs.push(message.type);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "selected",
+                model_used: "Pro Extended"
+              }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?model_selected_incomplete=${Date.now()}`);
+    port.emit(envelope("job_start", "job_model_selected_incomplete", {
+      prompt: "prompt",
+    }));
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.payload.code, "model_selection_failed");
+    assert.equal(error.payload.phase, "model_selection");
+    assert.equal(error.payload.side_effect_started, false);
+    assert.equal(error.payload.model_selection_status, "selected");
+    assert.equal(sentToTabs.includes("yoetz_upload_file"), false);
+    assert.equal(sentToTabs.includes("yoetz_send_prompt"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker rejects duplicate active job starts before opening another tab", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -401,7 +451,7 @@ test("service worker rejects duplicate active job starts before opening another 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -439,7 +489,7 @@ test("service worker rejects follow-on messages with the wrong capability token"
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -606,7 +656,7 @@ test("service worker allows matching extension instance id when profile identity
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -682,7 +732,7 @@ test("service worker allows matching profile email before opening a tab", async 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -894,7 +944,7 @@ test("service worker times out stale pre-send assistant text as job_error", asyn
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -953,7 +1003,7 @@ test("service worker classifies final affordance without scoped assistant text",
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1037,7 +1087,7 @@ test("service worker fails extraction when final affordance page text alternates
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1122,7 +1172,7 @@ test("service worker completes post-send response when preceding user count is u
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1194,7 +1244,7 @@ test("service worker does not complete on brief stable assistant text without a 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1267,7 +1317,7 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1351,7 +1401,7 @@ test("service worker completion is structural and does not classify response tex
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1421,7 +1471,7 @@ test("service worker accepts a scoped single-letter assistant markdown response"
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1497,7 +1547,7 @@ test("service worker reports oversized completed responses before native deliver
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1582,7 +1632,7 @@ test("service worker latches a completed scoped response when later ChatGPT DOM 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1662,7 +1712,7 @@ test("service worker preserves the best final response across a transient genera
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1773,7 +1823,7 @@ test("service worker settles same-length post-final text churn instead of timing
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1851,7 +1901,7 @@ test("service worker waits for scoped response text bytes to stabilize after fin
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1936,7 +1986,7 @@ test("service worker waits for streaming one-letter prefix to reach final assist
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2027,7 +2077,7 @@ test("service worker does not complete when ChatGPT idles before final assistant
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2115,7 +2165,7 @@ test("service worker rejects stale copy-button extraction from a pre-send assist
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2191,7 +2241,7 @@ test("service worker does not complete on copy button while response is still ge
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2260,7 +2310,7 @@ test("service worker completes when a generating response becomes idle without t
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2333,7 +2383,7 @@ test("service worker does not complete only because post-send copy controls incr
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2406,7 +2456,7 @@ test("service worker rebinds owned tab after content script reload during respon
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2476,7 +2526,7 @@ test("service worker preserves content-script committed-send error metadata", as
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_extract_response":
@@ -2635,7 +2685,7 @@ test("service worker stops before upload when final chunk ack cannot reach nativ
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -2686,7 +2736,7 @@ test("service worker shards storage by job id so concurrent jobs do not clobber 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2770,7 +2820,7 @@ test("service worker caps last_response_progress_text on disk while keeping the 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2892,7 +2942,7 @@ test("service worker does not persist on every in-flight chunk", async () => {
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 16 } };
           case "yoetz_send_prompt":
@@ -3073,7 +3123,7 @@ test("service worker cancelJob clicks stop, removes tab, and evicts the in-memor
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3177,7 +3227,7 @@ test("service worker cancelJob still removes the tab when the content script is 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended" } };
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":

@@ -264,8 +264,9 @@ packaged source into the stable Yoetz-owned directory
 `~/.yoetz/chatgpt-native-extension`). Load that directory once from
 `chrome://extensions` with Developer mode enabled. Future updates use
 `yoetz browser extension update --chatgpt`: Yoetz refreshes the managed copy,
-asks the loaded extension to reload, and verifies that Chrome reports the
-current CLI version.
+also refreshes the legacy `$YOETZ_DIR/chrome-extension-native/unpacked` loaded
+directory when it exists, asks the loaded extension to reload, and verifies that
+Chrome reports the current CLI version.
 
 For agent-driven setup, `yoetz browser extension setup --chatgpt --open-chrome`
 does everything Chrome allows from the CLI: it installs or updates the native
@@ -322,7 +323,9 @@ permits a second submission via CDP.
 The built-in ChatGPT recipe supports exactly one target: ChatGPT Pro with
 Extended enabled. `model` and `extended` recipe overrides are rejected. This is
 deliberate for review jobs where a silent tier downgrade is worse than a clear
-"Pro Extended unavailable" error.
+"Pro Extended unavailable" error. The selector covers both ChatGPT Enterprise
+and personal ChatGPT picker layouts; it must prove Pro Extended is selected in
+the active account UI before upload/send, otherwise the run fails closed.
 
 If the next ChatGPT run after an unexplained failure should inspect the
 Yoetz-owned tab without resubmitting, use
