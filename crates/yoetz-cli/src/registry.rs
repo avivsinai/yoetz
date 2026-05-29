@@ -505,9 +505,11 @@ fn parse_openrouter_capability(item: &Value) -> Option<ModelCapability> {
 }
 
 /// Classify a model's OpenRouter `architecture.output_modalities` into a kind.
-/// Chat is exactly `["text"]`; anything carrying a non-text output modality is a
-/// media/non-chat model. Returns `None` (fail-open, chat-eligible) when the list
-/// is empty or carries only unrecognized modalities.
+/// Chat is exactly `["text"]`. Any non-empty list that is not exactly `["text"]`
+/// carries a non-text output modality and is therefore non-chat — classified
+/// specifically when recognized (image/video/audio) and `Other` otherwise.
+/// Returns `None` (fail-open, chat-eligible) only when the list is empty, i.e.
+/// the catalog gave no output-modality signal at all.
 fn classify_output_modalities(mods: &[String]) -> Option<ModelKind> {
     let has = |needle: &str| mods.iter().any(|m| m == needle);
     if mods.is_empty() {
@@ -525,7 +527,9 @@ fn classify_output_modalities(mods: &[String]) -> Option<ModelKind> {
     if has("audio") {
         return Some(ModelKind::Audio);
     }
-    None
+    // Non-empty and not exactly ["text"], with no recognized media token: still a
+    // non-text output, so it is non-chat (excluded from frontier), not fail-open.
+    Some(ModelKind::Other)
 }
 
 #[cfg(test)]
@@ -558,7 +562,17 @@ mod tests {
             classify_output_modalities(&mods(&["text", "video"])),
             Some(ModelKind::VideoGeneration)
         );
-        // Empty / unrecognized -> fail-open (chat-eligible).
+        // Non-empty and not exactly ["text"], no recognized media token: still a
+        // non-text output -> non-chat (Other), NOT fail-open chat-eligible.
+        assert_eq!(
+            classify_output_modalities(&mods(&["text", "speech"])),
+            Some(ModelKind::Other)
+        );
+        assert_eq!(
+            classify_output_modalities(&mods(&["embeddings"])),
+            Some(ModelKind::Other)
+        );
+        // Only a truly empty list (no output-modality signal) is fail-open.
         assert_eq!(classify_output_modalities(&[]), None);
     }
 
