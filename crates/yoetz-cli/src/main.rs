@@ -5738,6 +5738,69 @@ mod tests {
         );
     }
 
+    fn registry_with_provider_model(id: &str, provider: &str) -> ModelRegistry {
+        let mut registry = ModelRegistry::default();
+        registry.models.push(yoetz_core::registry::ModelEntry {
+            id: id.to_string(),
+            context_length: None,
+            max_output_tokens: None,
+            pricing: Default::default(),
+            provider: Some(provider.to_string()),
+            capability: None,
+            tier: None,
+        });
+        registry.rebuild_index();
+        registry
+    }
+
+    #[test]
+    fn resolve_provider_from_registry_strips_openrouter_prefix() {
+        let registry = registry_with_provider_model("google/gemini-3.1-pro-preview", "openrouter");
+
+        assert_eq!(
+            resolve_provider_from_registry("openrouter/google/gemini-3.1-pro-preview", &registry),
+            Some("openrouter".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_provider_from_registry_strips_models_prefix() {
+        let registry = registry_with_provider_model("google/gemini-3.1-pro-preview", "openrouter");
+
+        assert_eq!(
+            resolve_provider_from_registry("models/google/gemini-3.1-pro-preview", &registry),
+            Some("openrouter".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_provider_from_registry_prefers_literal_match() {
+        let mut registry =
+            registry_with_provider_model("google/gemini-3.1-pro-preview", "openrouter");
+        registry.models.push(yoetz_core::registry::ModelEntry {
+            id: "openrouter/google/gemini-3.1-pro-preview".to_string(),
+            context_length: None,
+            max_output_tokens: None,
+            pricing: Default::default(),
+            provider: Some("gateway".to_string()),
+            capability: None,
+            tier: None,
+        });
+        registry.rebuild_index();
+
+        assert_eq!(
+            resolve_provider_from_registry("openrouter/google/gemini-3.1-pro-preview", &registry),
+            Some("gateway".to_string())
+        );
+    }
+
+    #[test]
+    fn resolve_provider_from_registry_keeps_no_slash_guard() {
+        let registry = registry_with_provider_model("gpt-5.4", "openrouter");
+
+        assert_eq!(resolve_provider_from_registry("gpt-5.4", &registry), None);
+    }
+
     #[test]
     fn resolve_max_output_tokens_explicit() {
         let config = Config::default();
@@ -5997,8 +6060,12 @@ pub(crate) fn resolve_provider_from_registry(
     if !model.contains('/') {
         return None;
     }
-    let entry = registry.find(model)?;
-    entry.provider.clone()
+    for candidate in registry_lookup_candidates(model) {
+        if let Some(entry) = registry.find(&candidate) {
+            return entry.provider.clone();
+        }
+    }
+    None
 }
 
 fn build_model_spec(
@@ -6138,15 +6205,7 @@ fn resolve_registry_model_id(
     registry: Option<&ModelRegistry>,
 ) -> Option<String> {
     let model_id = model_id?;
-    let mut candidates = Vec::new();
-    candidates.push(model_id.to_string());
-
-    if let Some(stripped) = model_id.strip_prefix("openrouter/") {
-        candidates.push(stripped.to_string());
-    }
-    if let Some(stripped) = model_id.strip_prefix("models/") {
-        candidates.push(stripped.to_string());
-    }
+    let mut candidates = registry_lookup_candidates(model_id);
 
     if let Some(provider) = provider {
         let provider_lc = provider.to_lowercase();
@@ -6167,6 +6226,19 @@ fn resolve_registry_model_id(
     }
 
     candidates.into_iter().next()
+}
+
+fn registry_lookup_candidates(model_id: &str) -> Vec<String> {
+    let mut candidates = vec![model_id.to_string()];
+
+    if let Some(stripped) = model_id.strip_prefix("openrouter/") {
+        candidates.push(stripped.to_string());
+    }
+    if let Some(stripped) = model_id.strip_prefix("models/") {
+        candidates.push(stripped.to_string());
+    }
+
+    candidates
 }
 
 /// Convert litellm_rust::Usage to yoetz_core::types::Usage.
