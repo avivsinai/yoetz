@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.17] - 2026-05-29
 ### Fixed
 
 - The built-in ChatGPT recipe now reliably uses **ChatGPT Pro Extended** across
@@ -22,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   recipe vars are no longer supported (passing them is rejected). This removes
   the previous `model=auto`/tier-override paths in favor of always consulting
   ChatGPT Pro Extended.
+
 
 ## [0.5.16] - 2026-05-29
 ### Added
