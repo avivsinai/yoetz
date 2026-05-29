@@ -6,6 +6,45 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+
+- `yoetz browser extension update --chatgpt`: re-sync the managed ChatGPT
+  extension copy, reload the loaded extension, and verify the running version.
+  `setup --chatgpt` now materializes the packaged extension into the stable
+  `$YOETZ_DIR/chatgpt-native-extension` directory (load that unpacked dir once;
+  future upgrades are handled by `update`). The extension is now shipped with
+  the Homebrew formula, and recipe runs auto-heal a version-skewed extension
+  before dispatch instead of failing with a cryptic ChatGPT error.
+- `yoetz ask --allow-uncosted`: opt in to running image/video requests when
+  `--max-cost-usd`/`--daily-budget-usd` are set. Pre-call budget enforcement is
+  skipped for the media request (multimodal input cost cannot be estimated
+  beforehand); only the provider-reported cost, when available, is recorded
+  post-call. The default stays fail-closed.
+
+### Changed
+
+- Bump `litellm-rust` from v0.1.2 to v0.2.0 and adapt to its breaking API
+  changes (new required `extra_body` field on image requests; `LiteLLMError`
+  `Refusal`/`Truncated` are now struct variants). Note the v0.2.0 runtime
+  behavior change for Anthropic: structured-output requests for unsupported
+  models are now rejected instead of falling back to legacy tool-call
+  workarounds, and `stop_reason=refusal`/`max_tokens` surface as structured
+  errors.
+- `yoetz models sync` now treats the live OpenRouter catalog as authoritative:
+  OpenRouter-sourced entries are reconciled into the natural `provider/model`
+  namespace and dead slugs no longer served by OpenRouter are pruned (only when
+  a non-empty live catalog was fetched), so the registry stops keeping models
+  that 404 and stops missing newly served ones.
+
+### Fixed
+
+- `yoetz models frontier` no longer returns non-chat models (image generation,
+  video, audio, embeddings, …) as a family flagship; it now classifies model
+  kind from litellm `mode` and OpenRouter output modalities and considers only
+  chat/multimodal models, while keeping vision (image-input) chat models.
+- Model resolution now infers the provider from a full nested id, so
+  `--model openrouter/google/<model>` resolves without requiring `--provider`,
+  consistent with the `--provider openrouter --model google/<model>` form.
 
 ## [0.5.15] - 2026-05-28
 ### Fixed
