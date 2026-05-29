@@ -241,7 +241,7 @@ async function startJob(message) {
     await recordTerminalDeliveryLost(job, "model_selection");
     return;
   }
-  if (requiresExplicitModel(job.model) && !isAcceptableModelSelection(modelSelection)) {
+  if (!isAcceptableModelSelection(modelSelection)) {
     await failJob(job, "model_selection_failed", `Requested ChatGPT model was not selected: ${modelSelection.status ?? "unknown"}`, {
       phase: "model_selection",
       side_effect_started: false,
@@ -823,12 +823,11 @@ function normalizeJob(message) {
     capability_token: message.capability_token,
     request_id: message.request_id,
     prompt: payload.prompt ?? "",
-    model: payload.model ?? "",
+    model: "extended-pro",
     wait_timeout_ms: payload.wait_timeout_ms ?? DEFAULT_WAIT_TIMEOUT_MS,
     wait_interval_ms: payload.wait_interval_ms ?? 30000,
     upload_timeout_ms: payload.upload_timeout_ms ?? 120000,
     send_timeout_ms: payload.send_timeout_ms ?? 120000,
-    disable_extended: Boolean(payload.disable_extended),
     browser_context_id: payload.browser_context_id ?? null,
     profile_email: payload.profile_email ?? null,
     extension_instance_id: payload.extension_instance_id ?? null,
@@ -1420,11 +1419,6 @@ function isPostSendAssistantActivity(job, extraction, allowUnknownTurnIndex = fa
 function nonNegativeFiniteNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number : null;
-}
-
-function requiresExplicitModel(model) {
-  const value = String(model ?? "").trim().toLowerCase();
-  return Boolean(value) && value !== "auto" && value !== "current" && value !== "keep-current" && value !== "keep current";
 }
 
 function isAcceptableModelSelection(selection) {

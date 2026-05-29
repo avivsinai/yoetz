@@ -1585,17 +1585,12 @@ fn parse_upload_poll_options(args: Option<&[String]>) -> Result<ChatgptPollOptio
 }
 
 fn run_chatgpt_select_model(
-    ctx: &RecipeContext,
+    _ctx: &RecipeContext,
     connection: Option<&BrowserConnection>,
     use_stealth: bool,
     headed: bool,
 ) -> Result<String> {
-    let requested_model = ctx
-        .vars
-        .get("model")
-        .map(String::as_str)
-        .unwrap_or_default();
-    let keep_current_model = chatgpt_web::should_keep_current_chatgpt_model(requested_model);
+    let requested_model = crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL;
     let function = chatgpt_web::build_model_selection_function(requested_model);
     let expression = chatgpt_web::wrap_function_source_for_json_eval(&function)?;
     let stdout = run_agent_browser_with_connection_timeout(
@@ -1617,14 +1612,6 @@ fn run_chatgpt_select_model(
         chatgpt_web::chatgpt_model_selection_status(&selection, requested_model);
     match status {
         "selected" | "already-selected" => {
-            Ok(json!({
-                "status": "ok",
-                "model_used": model_used,
-                "model_selection_status": model_selection_status,
-            })
-            .to_string())
-        }
-        "missing-selector" | "not-found" if keep_current_model => {
             Ok(json!({
                 "status": "ok",
                 "model_used": model_used,
@@ -5131,7 +5118,7 @@ case "$*" in
     count=$((count + 1))
     printf '%s' "$count" > "$EVAL_COUNT_PATH"
     if [ "$count" = "1" ]; then
-      printf '{"status":"already-selected","currentLabel":"GPT-5 Pro"}'
+      printf '{"status":"already-selected","currentLabel":"Pro Extended"}'
     elif [ "$count" = "2" ]; then
       printf '{"status":"marked"}'
     else
@@ -5162,7 +5149,7 @@ if %errorlevel%==0 (
   set /a count=count+1
   > "%EVAL_COUNT_PATH%" echo !count!
   if "!count!"=="1" (
-    echo {"status":"already-selected","currentLabel":"GPT-5 Pro"}
+    echo {"status":"already-selected","currentLabel":"Pro Extended"}
   ) else if "!count!"=="2" (
     echo {"status":"marked"}
   ) else (
@@ -6956,7 +6943,7 @@ steps:
                 "action": CHATGPT_SELECT_MODEL_ACTION,
                 "stdout": {
                     "status": "ok",
-                    "model_used": "gpt-5-4-pro",
+                    "model_used": crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL,
                     "model_selection_status": "selected"
                 }
             }),
@@ -6975,7 +6962,10 @@ steps:
         assert_eq!(payload["transport"], "agent-browser");
         assert_eq!(payload["backend"], "agent-browser");
         assert_eq!(payload["response"], "final answer");
-        assert_eq!(payload["model_used"], "gpt-5-4-pro");
+        assert_eq!(
+            payload["model_used"],
+            crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL
+        );
         assert_eq!(payload["model_selection_status"], "selected");
         assert_eq!(payload["fallback_used"], true);
         assert_eq!(payload["warnings"], json!(["used paste fallback"]));

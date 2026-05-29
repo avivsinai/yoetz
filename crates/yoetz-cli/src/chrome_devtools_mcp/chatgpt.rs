@@ -334,15 +334,10 @@ async fn run_attached_recipe_inner(
         .await
         .context("mark yoetz-owned ChatGPT tab with window.name")?;
 
-    // Step 2: wait for the composer to mount, then select the best model the
-    // user can actually access. `model=auto` actively selects the strongest
-    // visible Pro/GPT-5 option; an empty/current model keeps the current UI
-    // selection.
+    // Step 2: wait for the composer to mount, then select ChatGPT Pro Extended
+    // before any upload/send side effects.
     wait_for_composer_ready(client, /* focus_composer */ true).await?;
     let model_selection = maybe_select_model(client, &ctx.model).await?;
-    if ctx.disable_extended {
-        maybe_disable_extended(client).await?;
-    }
 
     // Step 3: upload the bundle if we have a path.
     //
@@ -866,22 +861,6 @@ fn format_model_selection_diagnostics(selection: &serde_json::Value) -> String {
         item_count,
         available_items
     )
-}
-
-async fn maybe_disable_extended(client: &ChromeCdpClient) -> Result<()> {
-    let script = r##"
-() => {
-  const button = document.querySelector("button[aria-label*='click to remove'][aria-label*='Extended'], button[aria-label*='remove'][aria-label*='Extended']");
-  if (!button) return "already-off";
-  button.click();
-  return "disabled";
-}
-"##;
-    let _ = client
-        .evaluate_script(script, vec![])
-        .await
-        .context("evaluate_script disable Extended Pro")?;
-    Ok(())
 }
 
 fn parse_response_baseline(state: &serde_json::Value) -> Result<ResponseBaseline> {
@@ -2190,8 +2169,10 @@ mod tests {
         assert!(auto_script.contains("const classifyTier = (item) =>"));
         assert!(auto_script.contains("const buildTierRankings = (entries) =>"));
 
-        let explicit_script = build_model_selection_script("gpt-5-4-pro");
-        assert!(explicit_script.contains(r#"const requested = "gpt-5-4-pro";"#));
+        let explicit_script =
+            build_model_selection_script(crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL);
+        assert!(explicit_script.contains(r#"const requested = "extended-pro";"#));
+        assert!(explicit_script.contains("targetCandidateForTier(entries, \"extended-pro\")"));
         assert!(explicit_script.contains("\"gpt-5-pro\":\"gpt-5-4-pro\""));
         assert!(!explicit_script.contains("\"gpt-5-3-pro\""));
         assert!(explicit_script.contains("const selectBestTierItem = (entries, slug, rankings) =>"));

@@ -80,8 +80,7 @@ pub struct DevtoolsMcpRecipeContext {
     /// live-attach Chrome transport does not use inline bundle text.
     pub bundle_text: Option<String>,
 
-    /// Model slug to select in the LLM provider's UI (e.g. `gpt-5-4-pro`,
-    /// `claude-sonnet-4-6`, `gemini-3-1-pro`). Empty string = keep current.
+    /// ChatGPT model slug to select.
     pub model: String,
 
     /// User prompt to send alongside the bundle.
@@ -108,9 +107,6 @@ pub struct DevtoolsMcpRecipeContext {
     /// Maximum time to wait for file input discovery and attachment readiness.
     pub upload_timeout_ms: u64,
 
-    /// Whether to disable Extended Pro before sending.
-    pub disable_extended: bool,
-
     /// Whether to surface approval-dialog guidance to stderr in text mode.
     pub show_approval_guidance: bool,
 }
@@ -129,7 +125,6 @@ impl Default for DevtoolsMcpRecipeContext {
             response_timeout_ms: 5_400_000, // 90 min default for ChatGPT Pro Extended
             response_poll_interval_ms: 30_000,
             upload_timeout_ms: 120_000,
-            disable_extended: false,
             show_approval_guidance: true,
         }
     }
