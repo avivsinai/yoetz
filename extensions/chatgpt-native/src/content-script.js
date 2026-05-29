@@ -167,7 +167,7 @@ async function extractJobResponse(job) {
 }
 
 async function inspectPage(runId, options = {}) {
-  const { extractResponse, getPageText, parseOwnedWindowName } = await domHelpers();
+  const { extractResponse, getPageText, modelSelectionDiagnostics, parseOwnedWindowName } = await domHelpers();
   const parsed = parseOwnedWindowName(window.name);
   const urlRunId = runIdFromUrl(location.href);
   const conversationId = conversationIdFromUrl(location.href);
@@ -187,6 +187,7 @@ async function inspectPage(runId, options = {}) {
     ownership: parsed,
     active_job_ids: Array.from(activeJobs.keys()),
     extraction,
+    model_selection: modelSelectionDiagnostics(document),
     page_text_chars: pageText.length
   };
   if (options.include_page_text) {

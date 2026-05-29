@@ -180,6 +180,9 @@ Chrome remote-debugging approval friction, recommend the opt-in
 `chrome-extension-native` transport as the robust path. Keep it explicit:
 install the native host, load/update the extension in Chrome, run `doctor`, then
 target the stable `extension_instance_id` when multiple profiles are open.
+The recipe supports both ChatGPT Enterprise and personal ChatGPT account UIs;
+their model pickers differ, but Yoetz still targets only Pro with Extended
+enabled and fails closed if that selection cannot be proven.
 
 Do not silently switch transports after upload/send/wait side effects. If the
 extension reports a terminal ChatGPT phase, preserve the manual-recovery tab and
@@ -336,7 +339,9 @@ by Yoetz. `setup --chatgpt` copies packaged extension source into the stable
 `$YOETZ_DIR/chatgpt-native-extension` directory; load that directory once from
 `chrome://extensions` with Developer mode enabled. After Yoetz upgrades, run
 `yoetz browser extension update --chatgpt` to refresh the managed copy, reload
-Chrome, and verify the loaded version.
+Chrome, and verify the loaded version. If an older install has Chrome loading
+`$YOETZ_DIR/chrome-extension-native/unpacked`, update refreshes that loaded
+directory too.
 For agent-driven setup, prefer `yoetz browser extension setup --chatgpt
 --open-chrome`; it installs the host, opens Chrome's extension page, and prints
 the exact folder to select. Chrome still requires the **Load unpacked** UI
@@ -358,7 +363,10 @@ Requires Node >= 24.4. If macOS shows a Keychain prompt for `Chrome Safe Storage
 ### Use ChatGPT Pro via recipe
 
 The built-in ChatGPT recipe always targets Pro with Extended enabled. Do not pass
-`model` or `extended` overrides; the CLI rejects them.
+`model` or `extended` overrides; the CLI rejects them. This applies to both
+ChatGPT Enterprise and personal ChatGPT accounts. Different picker layouts are
+handled by the transport, but an unproven Pro Extended selection is a hard
+failure before upload/send.
 
 ```bash
 # Create bundle and get bundle.md path

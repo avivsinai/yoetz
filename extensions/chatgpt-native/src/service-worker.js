@@ -1422,7 +1422,15 @@ function nonNegativeFiniteNumber(value) {
 }
 
 function isAcceptableModelSelection(selection) {
-  return selection?.status === "selected";
+  return selection?.status === "selected"
+    && selection?.requested_model === "extended-pro"
+    && selection?.extended_status === "required"
+    && modelUsedLooksLikeProExtended(selection?.model_used);
+}
+
+function modelUsedLooksLikeProExtended(value) {
+  const folded = String(value ?? "").toLowerCase();
+  return /\bpro\b/.test(folded) && /\bextended\b/.test(folded);
 }
 
 function hasFinalAssistantAffordance(extraction) {

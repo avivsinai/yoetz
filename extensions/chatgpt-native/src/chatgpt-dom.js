@@ -84,6 +84,9 @@ export function findSendButton(root = document) {
 }
 
 export function findModelButton(root = document) {
+  // ChatGPT serves at least two picker families: Enterprise exposes a global
+  // model-switcher button, while personal ChatGPT can render a composer-scoped
+  // model chip. Keep both paths because either account type may back Pro.
   const enterpriseButton = firstVisible(root, [
     'button[data-testid="model-switcher-dropdown-button"]',
     'button:has([data-testid="selected-model"])',
@@ -92,7 +95,7 @@ export function findModelButton(root = document) {
     'button[aria-controls*="model" i]',
     'button[id*="model" i]'
   ]);
-  return enterpriseButton ?? findComposerModelControl(root);
+  return enterpriseButton ?? findComposerModelControl(root) ?? findStandaloneProExtendedModelControl(root);
 }
 
 export function getPageText(root = document) {
@@ -225,7 +228,7 @@ function isActionableElement(node) {
 }
 
 function findComposerModelControl(root) {
-  for (const scope of composerScopes(root, { includeRoot: false })) {
+  for (const scope of modelControlScopes(root)) {
     const candidates = uniqueElements(Array.from(scope.querySelectorAll([
       "button",
       '[role="button"]',
@@ -253,6 +256,37 @@ function findComposerModelControl(root) {
     }
   }
   return null;
+}
+
+function findStandaloneProExtendedModelControl(root) {
+  const requested = proExtendedModelRequest();
+  const candidates = uniqueElements(Array.from(root.querySelectorAll([
+    "button",
+    '[role="button"]',
+    "[aria-haspopup]"
+  ].join(","))));
+  return candidates.find((node) => {
+    if (!isVisible(node, { allowDisabled: true })) {
+      return false;
+    }
+    const haystack = modelCandidateText(node);
+    if (!modelTextMatchesRequest(haystack, requested)) {
+      return false;
+    }
+    return !/\b(send|stop|copy|share|new chat|attach|upload|search|history|dictation|voice|microphone|account|profile|settings|upgrade)\b/.test(haystack);
+  }) ?? null;
+}
+
+function modelControlScopes(root) {
+  const composer = findComposer(root);
+  const scopes = [...composerScopes(root, { includeRoot: false })];
+  const add = (scope) => {
+    if (scope && !scopes.includes(scope)) {
+      scopes.push(scope);
+    }
+  };
+  add(composer?.closest("main, [role=\"main\"]"));
+  return scopes;
 }
 
 function modelClickTarget(node, stopAt) {
@@ -320,23 +354,57 @@ function isModelChipLike(node) {
 }
 
 export async function selectRequestedModel(root, requested) {
-  let modelButton = null;
-  try {
-    modelButton = await waitForElement(root, findModelButton, "ChatGPT model selector", {
-      timeoutMs: 5000,
-      intervalMs: 250
-    });
-  } catch {
+  const readiness = await waitForModelSelectionTarget(root, requested);
+  if (readiness.selection.selected) {
+    return {
+      status: "selected",
+      model_used: readiness.selection.model_used,
+      available_options: []
+    };
+  }
+
+  const modelButton = readiness.modelButton;
+  if (!modelButton) {
     return {
       status: "unavailable",
-      model_used: currentModelLabel(root),
+      model_used: readiness.selection.model_used,
       warning: "ChatGPT model selector button not found"
     };
   }
-  modelButton.click();
 
-  const { option, availableOptions } = await waitForRequestedModelOption(root, requested);
-  if (!option) {
+  const currentSelection = currentRequestedModelSelection(root, requested);
+  if (currentSelection.selected) {
+    return {
+      status: "selected",
+      model_used: currentSelection.model_used,
+      available_options: []
+    };
+  }
+
+  let selectedOption = null;
+  let availableOptions = [];
+  const openAttempts = 3;
+  for (let attempt = 0; attempt < openAttempts; attempt += 1) {
+    await openModelPicker(root, modelButton);
+    const result = await waitForRequestedModelOption(root, requested, {
+      timeoutMs: attempt === openAttempts - 1 ? 7000 : 2500,
+      stableForMs: attempt === openAttempts - 1 ? 0 : 600
+    });
+    selectedOption = result.option;
+    availableOptions = result.availableOptions;
+    if (selectedOption) {
+      break;
+    }
+  }
+  if (!selectedOption) {
+    const verification = await waitForRequestedModelSelected(root, requested, null);
+    if (verification.selected) {
+      return {
+        status: "selected",
+        model_used: verification.model_used,
+        available_options: availableOptions
+      };
+    }
     return {
       status: "unavailable",
       model_used: currentModelLabel(root),
@@ -344,22 +412,174 @@ export async function selectRequestedModel(root, requested) {
       warning: "ChatGPT Pro Extended was not visible in the model picker"
     };
   }
-  option.click();
+  realClick(selectedOption);
 
-  const verification = await waitForRequestedModelSelected(root, requested, option);
+  const verification = await waitForRequestedModelSelected(root, requested, selectedOption);
   if (verification.selected) {
     return {
       status: "selected",
-      model_used: verification.model_used || textOf(option),
+      model_used: verification.model_used || textOf(selectedOption),
       available_options: availableOptions
     };
   }
   return {
     status: "mismatch",
-    model_used: verification.model_used || textOf(option),
+    model_used: verification.model_used || "unknown",
     available_options: availableOptions,
     warning: `ChatGPT Pro Extended was clicked but selected label is ${verification.model_used || "unknown"}`
   };
+}
+
+async function waitForModelSelectionTarget(root, requested, options = {}) {
+  const timeoutMs = Number(options.timeoutMs ?? 30000);
+  const intervalMs = Number(options.intervalMs ?? 250);
+  const startedAt = Date.now();
+  let selection = currentRequestedModelSelection(root, requested);
+  let modelButton = findModelButton(root);
+
+  while (Date.now() - startedAt < timeoutMs) {
+    selection = currentRequestedModelSelection(root, requested);
+    if (selection.selected) {
+      return { selection, modelButton: findModelButton(root) };
+    }
+    modelButton = findModelButton(root);
+    if (modelButton) {
+      return { selection, modelButton };
+    }
+    await sleep(intervalMs);
+  }
+
+  return { selection, modelButton };
+}
+
+function currentRequestedModelSelection(root, requested) {
+  const modelUsed = currentModelLabel(root);
+  return {
+    selected: modelTextMatchesRequest(modelUsed, requested),
+    model_used: modelUsed
+  };
+}
+
+async function openModelPicker(root, modelButton, options = {}) {
+  const settleMs = Number(options.settleMs ?? 150);
+  if (visibleModelOptions(root).length > 0) {
+    return true;
+  }
+  const activators = [openWithPointerEvents, pressEnter, pressSpace];
+  for (const activate of activators) {
+    try {
+      if (await activate(root, modelButton, { settleMs })) {
+        return true;
+      }
+    } catch {
+      // Try the next activation path; ChatGPT changes this control frequently.
+    }
+  }
+  return false;
+}
+
+async function openWithPointerEvents(root, element, options = {}) {
+  element?.focus?.();
+  const settleMs = Number(options.settleMs ?? 150);
+  const phases = [
+    ["pointerdown", "PointerEvent", {
+      button: 0,
+      buttons: 1,
+      pointerId: 1,
+      pointerType: "mouse",
+      isPrimary: true
+    }],
+    ["mousedown", "MouseEvent", { button: 0, buttons: 1 }],
+    ["pointerup", "PointerEvent", {
+      button: 0,
+      buttons: 0,
+      pointerId: 1,
+      pointerType: "mouse",
+      isPrimary: true
+    }],
+    ["mouseup", "MouseEvent", { button: 0, buttons: 0 }],
+    ["click", "MouseEvent", { button: 0, buttons: 0, detail: 1 }]
+  ];
+  for (const [type, constructorName, init] of phases) {
+    dispatchSyntheticEvent(element, type, constructorName, init);
+    await sleep(settleMs);
+    if (visibleModelOptions(root).length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function pressEnter(root, element, options = {}) {
+  pressActivationKey(element, "Enter");
+  await sleep(Number(options.settleMs ?? 150));
+  return visibleModelOptions(root).length > 0;
+}
+
+async function pressSpace(root, element, options = {}) {
+  pressActivationKey(element, " ");
+  await sleep(Number(options.settleMs ?? 150));
+  return visibleModelOptions(root).length > 0;
+}
+
+function realClick(element) {
+  element?.focus?.();
+  dispatchSyntheticEvent(element, "pointerdown", "PointerEvent", {
+    button: 0,
+    buttons: 1,
+    pointerId: 1,
+    pointerType: "mouse",
+    isPrimary: true
+  });
+  dispatchSyntheticEvent(element, "mousedown", "MouseEvent", {
+    button: 0,
+    buttons: 1
+  });
+  dispatchSyntheticEvent(element, "pointerup", "PointerEvent", {
+    button: 0,
+    buttons: 0,
+    pointerId: 1,
+    pointerType: "mouse",
+    isPrimary: true
+  });
+  dispatchSyntheticEvent(element, "mouseup", "MouseEvent", {
+    button: 0,
+    buttons: 0
+  });
+  dispatchSyntheticEvent(element, "click", "MouseEvent", {
+    button: 0,
+    buttons: 0,
+    detail: 1
+  });
+}
+
+function pressActivationKey(element, key) {
+  const code = key === " " ? "Space" : key;
+  element?.focus?.();
+  dispatchSyntheticEvent(element, "keydown", "KeyboardEvent", { key, code });
+  dispatchSyntheticEvent(element, "keyup", "KeyboardEvent", { key, code });
+}
+
+function dispatchSyntheticEvent(element, type, constructorName, init = {}) {
+  const win = element?.ownerDocument?.defaultView ?? globalThis;
+  const EventConstructor = win?.[constructorName] ?? globalThis[constructorName] ?? win?.Event ?? globalThis.Event;
+  if (typeof EventConstructor !== "function") {
+    return false;
+  }
+  const eventInit = {
+    bubbles: true,
+    cancelable: true,
+    composed: true,
+    view: win,
+    ...init
+  };
+  let event = null;
+  try {
+    event = new EventConstructor(type, eventInit);
+  } catch {
+    event = new Event(type, eventInit);
+  }
+  return element.dispatchEvent?.(event) ?? false;
 }
 
 export async function clickSend(root, options = {}) {
@@ -1006,7 +1226,7 @@ async function waitForRequestedModelOption(root, requested, options = {}) {
       stableSince = signature ? now : 0;
     }
 
-    if (signature && stableSince > 0 && now - stableSince >= stableForMs) {
+    if (stableForMs > 0 && signature && stableSince > 0 && now - stableSince >= stableForMs) {
       return { option: null, availableOptions };
     }
     await sleep(intervalMs);
@@ -1015,7 +1235,7 @@ async function waitForRequestedModelOption(root, requested, options = {}) {
   return { option: null, availableOptions };
 }
 
-async function waitForRequestedModelSelected(root, requested, option, options = {}) {
+async function waitForRequestedModelSelected(root, requested, _option, options = {}) {
   const timeoutMs = Number(options.timeoutMs ?? 4000);
   const intervalMs = Number(options.intervalMs ?? 100);
   const startedAt = Date.now();
@@ -1026,27 +1246,10 @@ async function waitForRequestedModelSelected(root, requested, option, options = 
     if (modelTextMatchesRequest(modelUsed, requested)) {
       return { selected: true, model_used: modelUsed };
     }
-    if (modelOptionIsSelected(option)) {
-      return { selected: true, model_used: textOf(option) };
-    }
     await sleep(intervalMs);
   }
 
   return { selected: false, model_used: modelUsed };
-}
-
-function modelOptionIsSelected(node) {
-  const truthy = ["true", "checked", "selected", "active"];
-  return [
-    node?.getAttribute?.("aria-checked"),
-    node?.getAttribute?.("aria-selected"),
-    node?.getAttribute?.("aria-current"),
-    node?.getAttribute?.("data-state"),
-    node?.getAttribute?.("data-selected"),
-    node?.getAttribute?.("data-current")
-  ]
-    .map((value) => String(value ?? "").trim().toLowerCase())
-    .some((value) => truthy.includes(value));
 }
 
 function optionSlugs(node) {
@@ -1554,15 +1757,31 @@ function uniqueElements(nodes) {
 
 function currentModelLabel(root) {
   const selected = firstVisible(root, [
-    '[data-testid="model-switcher-selected-model"]',
-    '[aria-checked="true"]',
-    '[aria-selected="true"]'
+    '[data-testid="model-switcher-selected-model"]'
   ]);
   const selectedText = normalizeText(selected?.innerText ?? selected?.textContent ?? "");
   if (selectedText) {
     return selectedText;
   }
+  if (visibleModelOptions(root).length > 0) {
+    return "";
+  }
   return modelControlLabel(findModelButton(root));
+}
+
+export function modelSelectionDiagnostics(root = document) {
+  const requested = proExtendedModelRequest();
+  const modelButton = findModelButton(root);
+  const modelUsed = currentModelLabel(root);
+  return {
+    requested_model: requested.raw,
+    current_model_label: modelUsed,
+    current_matches_requested: modelTextMatchesRequest(modelUsed, requested),
+    model_button: modelButton ? elementSummary(modelButton) : null,
+    visible_options: visibleModelOptionLabels(root).slice(0, 20),
+    composer: elementSummary(findComposer(root)),
+    model_control_scopes: modelControlScopes(root).slice(0, 5).map(elementSummary)
+  };
 }
 
 function proExtendedModelRequest() {
