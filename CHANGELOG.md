@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.16] - 2026-05-29
 ### Added
 
 - `yoetz browser extension update --chatgpt`: re-sync the managed ChatGPT
@@ -45,6 +47,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Model resolution now infers the provider from a full nested id, so
   `--model openrouter/google/<model>` resolves without requiring `--provider`,
   consistent with the `--provider openrouter --model google/<model>` form.
+
 
 ## [0.5.15] - 2026-05-28
 ### Fixed
