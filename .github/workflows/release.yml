@@ -522,6 +522,7 @@ jobs:
           SHA_ARM_MAC=$(sha256sum artifacts/yoetz-aarch64-apple-darwin.tar.gz | awk '{print $1}')
           SHA_X86_LINUX=$(sha256sum artifacts/yoetz-x86_64-unknown-linux-gnu.tar.gz | awk '{print $1}')
           SHA_ARM_LINUX=$(sha256sum artifacts/yoetz-aarch64-unknown-linux-gnu.tar.gz | awk '{print $1}')
+          SHA_EXT=$(sha256sum artifacts/yoetz-chatgpt-native-extension-${VERSION}.zip | awk '{print $1}')
 
           git clone "https://x-access-token:${HOMEBREW_TAP_GITHUB_TOKEN}@github.com/avivsinai/homebrew-tap.git" tap
 
@@ -558,9 +559,17 @@ jobs:
               end
             end
 
+            resource "chatgpt_native_extension" do
+              url "https://github.com/avivsinai/yoetz/releases/download/${TAG}/yoetz-chatgpt-native-extension-${VERSION}.zip"
+              sha256 "${SHA_EXT}"
+            end
+
             def install
               bin.install "yoetz"
               (share/"yoetz").install "scripts", "recipes"
+              resource("chatgpt_native_extension").stage do
+                (share/"yoetz/extensions/chatgpt-native").install Dir["*"]
+              end
             end
 
             test do
