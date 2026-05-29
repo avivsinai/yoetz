@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.18] - 2026-05-29
 ### Fixed
 
 - The ChatGPT native extension now reliably opens the model picker and selects
@@ -21,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   addition to the canonical `$YOETZ_DIR/chatgpt-native-extension` directory, so
   an extension loaded from the legacy path actually receives the update instead
   of silently running stale code.
+
 
 ## [0.5.17] - 2026-05-29
 ### Fixed
