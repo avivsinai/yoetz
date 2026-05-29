@@ -141,6 +141,7 @@ async fn handle_generate_image(
                 size: args.size.clone(),
                 quality: args.quality.clone(),
                 background: args.background.clone(),
+                extra_body: None,
             })
             .await?;
         let outputs =
