@@ -278,6 +278,7 @@ yoetz browser extension doctor --chatgpt
 yoetz browser extension status --chatgpt
 yoetz browser extension reconnect --chatgpt
 yoetz browser extension reload --chatgpt
+yoetz browser extension update --chatgpt
 yoetz browser extension canary --chatgpt
 yoetz browser check --transport chrome-extension-native
 
@@ -330,12 +331,12 @@ tab itself only shows a tiny/truncated assistant fragment, report that ChatGPT
 returned an unusable answer; if the tab visibly contains the full answer,
 preserve the tab and report the extraction miss.
 
-Manual Chrome-side install/update is part of this path: unzip the release
-artifact, load the extracted extension from `chrome://extensions` with Developer
-mode enabled, and click the extension reload button after replacing files. Then
-run `yoetz browser extension reconnect --chatgpt` and `doctor --chatgpt`.
-From a source checkout, load `extensions/chatgpt-native`; from a release zip,
-load the extracted zip directory itself.
+Manual Chrome-side install is still part of this path, but updates are managed
+by Yoetz. `setup --chatgpt` copies packaged extension source into the stable
+`$YOETZ_DIR/chatgpt-native-extension` directory; load that directory once from
+`chrome://extensions` with Developer mode enabled. After Yoetz upgrades, run
+`yoetz browser extension update --chatgpt` to refresh the managed copy, reload
+Chrome, and verify the loaded version.
 For agent-driven setup, prefer `yoetz browser extension setup --chatgpt
 --open-chrome`; it installs the host, opens Chrome's extension page, and prints
 the exact folder to select. Chrome still requires the **Load unpacked** UI
@@ -417,7 +418,7 @@ Built-in recipes: `chatgpt`, `claude`, `gemini`.
 | `daemon already running` | Run `yoetz browser attach` to check connection. If the daemon is stale, use `yoetz browser reset`, not `agent-browser close` directly. |
 | `agent-browser failed` | Ensure `npx agent-browser --version` works, or `npm install -g agent-browser` |
 | `dev-browser failed` | Ensure `dev-browser --help` works, verify Chrome remote debugging is enabled, and retry with `--cdp` if you need a specific Chrome profile. |
-| `chrome-extension-native` not connected | Run `yoetz browser extension install-host --chatgpt`, load/reload the extension in `chrome://extensions`, then run `yoetz browser extension reconnect --chatgpt` and `doctor --chatgpt`. |
+| `chrome-extension-native` not connected | Run `yoetz browser extension setup --chatgpt --open-chrome`, load the printed managed extension directory in `chrome://extensions`, then run `yoetz browser extension doctor --chatgpt`. |
 | Multiple extension profiles | Run `yoetz browser extension status --chatgpt`; pass `--var extension_instance_id=ext_...` for deterministic routing. `profile_email` is only a Chrome-profile guard when Chrome exposes it. |
 | Extension terminal phase after upload/send/wait | Do not rerun automatically. Continue in the Yoetz-owned ChatGPT tab or intentionally rerun knowing it may duplicate a submission. |
 | Recipe not found | Use `--recipe chatgpt` (name) or full path. Check `brew --prefix`/share/yoetz/recipes/ |

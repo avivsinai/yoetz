@@ -232,6 +232,7 @@ yoetz browser extension doctor --chatgpt
 yoetz browser extension status --chatgpt
 yoetz browser extension reconnect --chatgpt
 yoetz browser extension reload --chatgpt
+yoetz browser extension update --chatgpt
 yoetz browser extension canary --chatgpt
 yoetz browser extension inspect --chatgpt --run-id <run-id>
 yoetz browser extension grant-identity --chatgpt
@@ -256,19 +257,19 @@ workspace. To use `profile_email`, first opt in with
 `browser_context_id` targeting remains CDP-only.
 
 Release builds publish the ChatGPT native extension as a separate versioned zip
-artifact alongside the CLI archives. To install or update it manually, unzip the
-artifact, open `chrome://extensions`, enable Developer mode, choose **Load
-unpacked**, and select the extracted zip directory itself. From a source
-checkout, select `extensions/chatgpt-native` instead. When updating an unpacked
-install, replace the extracted files and click the extension row's reload
-button, or run `yoetz browser extension reload --chatgpt` when the currently
-loaded extension already supports the reload command; then run
-`yoetz browser extension reconnect --chatgpt` and
-`yoetz browser extension doctor --chatgpt`.
+artifact alongside the CLI archives, and Homebrew installs ship that extension
+under `share/yoetz/extensions/chatgpt-native`. `setup --chatgpt` copies the
+packaged source into the stable Yoetz-owned directory
+`$YOETZ_DIR/chatgpt-native-extension` (normally
+`~/.yoetz/chatgpt-native-extension`). Load that directory once from
+`chrome://extensions` with Developer mode enabled. Future updates use
+`yoetz browser extension update --chatgpt`: Yoetz refreshes the managed copy,
+asks the loaded extension to reload, and verifies that Chrome reports the
+current CLI version.
 
 For agent-driven setup, `yoetz browser extension setup --chatgpt --open-chrome`
 does everything Chrome allows from the CLI: it installs or updates the native
-host, finds the unpacked extension directory when available, opens
+host, refreshes the managed unpacked extension directory, opens
 `chrome://extensions`, and prints the exact folder to select. Chrome still
 requires the explicit **Load unpacked** UI step for local unpacked extensions.
 If the extension directory is not discoverable from the current checkout or

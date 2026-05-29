@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 #[cfg(unix)]
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 use crate::chatgpt_recipe::{
@@ -40,6 +41,8 @@ pub const MAX_BUNDLE_BYTES: u64 = 5 * 1024 * 1024;
 const CHUNK_BYTES: usize = 192 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const RECIPE_READ_GRACE: Duration = Duration::from_secs(60);
+const EXTENSION_RELOAD_VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
+const EXTENSION_RELOAD_VERIFY_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
@@ -127,6 +130,16 @@ pub struct ExtensionRecipeResult {
     pub model_used: Option<String>,
     pub model_selection_status: ChatgptModelSelectionStatus,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct ManagedExtensionUpdateResult {
+    pub status: &'static str,
+    pub source_dir: PathBuf,
+    pub extension_dir: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub manifest_version: Option<String>,
+    pub copied_files: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -270,13 +283,252 @@ fn is_chatgpt_extension_source_dir(path: &Path) -> bool {
         && path.join("src").join("content-script.js").is_file()
 }
 
+pub fn managed_chatgpt_extension_dir() -> Result<PathBuf> {
+    Ok(yoetz_state_dir()?.join("chatgpt-native-extension"))
+}
+
+pub fn prepare_managed_chatgpt_extension() -> Result<ManagedExtensionUpdateResult> {
+    let source_dir = chatgpt_extension_source_dir().with_context(|| {
+        format!("could not find ChatGPT native extension source; set {CHATGPT_EXTENSION_DIR_ENV}")
+    })?;
+    let extension_dir = managed_chatgpt_extension_dir()?;
+    sync_managed_chatgpt_extension_from(&source_dir, &extension_dir)
+}
+
+fn sync_managed_chatgpt_extension_from(
+    source_dir: &Path,
+    extension_dir: &Path,
+) -> Result<ManagedExtensionUpdateResult> {
+    if !is_chatgpt_extension_source_dir(source_dir) {
+        bail!(
+            "ChatGPT native extension source is incomplete: {}",
+            source_dir.display()
+        );
+    }
+    if paths_refer_to_same_location(source_dir, extension_dir) {
+        return Ok(ManagedExtensionUpdateResult {
+            status: "current",
+            source_dir: source_dir.to_path_buf(),
+            extension_dir: extension_dir.to_path_buf(),
+            manifest_version: extension_manifest_version(extension_dir),
+            copied_files: count_regular_files(extension_dir)?,
+        });
+    }
+
+    let parent = extension_dir
+        .parent()
+        .context("managed extension directory must have a parent")?;
+    fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    ensure_replaceable_extension_dir(extension_dir)?;
+    if !managed_chatgpt_extension_needs_sync(source_dir, extension_dir)? {
+        return Ok(ManagedExtensionUpdateResult {
+            status: "current",
+            source_dir: source_dir.to_path_buf(),
+            extension_dir: extension_dir.to_path_buf(),
+            manifest_version: extension_manifest_version(extension_dir),
+            copied_files: 0,
+        });
+    }
+
+    let name = extension_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("chatgpt-native-extension");
+    let temp_dir = parent.join(format!(".{name}.tmp-{}", new_id("sync")));
+    let backup_dir = parent.join(format!(".{name}.old-{}", new_id("sync")));
+    if temp_dir.exists() {
+        fs::remove_dir_all(&temp_dir)
+            .with_context(|| format!("remove stale temp {}", temp_dir.display()))?;
+    }
+    if backup_dir.exists() {
+        fs::remove_dir_all(&backup_dir)
+            .with_context(|| format!("remove stale backup {}", backup_dir.display()))?;
+    }
+
+    let copied_files = copy_extension_dir_contents(source_dir, &temp_dir)
+        .with_context(|| format!("copy extension source from {}", source_dir.display()))?;
+    if !is_chatgpt_extension_source_dir(&temp_dir) {
+        let _ = fs::remove_dir_all(&temp_dir);
+        bail!(
+            "copied ChatGPT native extension is incomplete: {}",
+            temp_dir.display()
+        );
+    }
+
+    let had_existing = extension_dir.exists();
+    if had_existing {
+        fs::rename(extension_dir, &backup_dir).with_context(|| {
+            format!(
+                "move existing managed extension {} aside",
+                extension_dir.display()
+            )
+        })?;
+    }
+    if let Err(err) = fs::rename(&temp_dir, extension_dir) {
+        if had_existing {
+            let _ = fs::rename(&backup_dir, extension_dir);
+        }
+        return Err(err).with_context(|| {
+            format!(
+                "activate managed extension copy at {}",
+                extension_dir.display()
+            )
+        });
+    }
+    if had_existing {
+        fs::remove_dir_all(&backup_dir)
+            .with_context(|| format!("remove old managed extension {}", backup_dir.display()))?;
+    }
+
+    Ok(ManagedExtensionUpdateResult {
+        status: "updated",
+        source_dir: source_dir.to_path_buf(),
+        extension_dir: extension_dir.to_path_buf(),
+        manifest_version: extension_manifest_version(extension_dir),
+        copied_files,
+    })
+}
+
+fn managed_chatgpt_extension_needs_sync(source_dir: &Path, extension_dir: &Path) -> Result<bool> {
+    if !is_chatgpt_extension_source_dir(extension_dir) {
+        return Ok(true);
+    }
+    Ok(extension_dir_fingerprint(source_dir)? != extension_dir_fingerprint(extension_dir)?)
+}
+
+fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
+    let Ok(left) = left.canonicalize() else {
+        return false;
+    };
+    let Ok(right) = right.canonicalize() else {
+        return false;
+    };
+    left == right
+}
+
+fn ensure_replaceable_extension_dir(path: &Path) -> Result<()> {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "managed extension directory must not be a symlink: {}",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!(
+            "managed extension path exists but is not a directory: {}",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn copy_extension_dir_contents(source_dir: &Path, target_dir: &Path) -> Result<usize> {
+    fs::create_dir_all(target_dir).with_context(|| format!("create {}", target_dir.display()))?;
+    let mut copied = 0;
+    for entry in
+        fs::read_dir(source_dir).with_context(|| format!("read {}", source_dir.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target_dir.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&source_path)
+            .with_context(|| format!("inspect {}", source_path.display()))?;
+        if metadata.file_type().is_symlink() {
+            bail!(
+                "extension source must not contain symlinks: {}",
+                source_path.display()
+            );
+        }
+        if metadata.is_dir() {
+            copied += copy_extension_dir_contents(&source_path, &target_path)?;
+        } else if metadata.is_file() {
+            fs::copy(&source_path, &target_path).with_context(|| {
+                format!(
+                    "copy extension file {} to {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+            copied += 1;
+        } else {
+            bail!(
+                "extension source contains unsupported file type: {}",
+                source_path.display()
+            );
+        }
+    }
+    Ok(copied)
+}
+
+fn count_regular_files(root: &Path) -> Result<usize> {
+    Ok(extension_file_paths(root)?.len())
+}
+
+fn extension_dir_fingerprint(root: &Path) -> Result<Vec<(PathBuf, String)>> {
+    let mut files = Vec::new();
+    for relative in extension_file_paths(root)? {
+        let bytes = fs::read(root.join(&relative))
+            .with_context(|| format!("read extension file {}", root.join(&relative).display()))?;
+        let mut hash = Sha256::new();
+        hash.update(&bytes);
+        files.push((relative, hex::encode(hash.finalize())));
+    }
+    Ok(files)
+}
+
+fn extension_file_paths(root: &Path) -> Result<Vec<PathBuf>> {
+    fn walk(base: &Path, current: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+        for entry in fs::read_dir(current).with_context(|| format!("read {}", current.display()))? {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)
+                .with_context(|| format!("inspect {}", path.display()))?;
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "extension directory must not contain symlinks: {}",
+                    path.display()
+                );
+            }
+            if metadata.is_dir() {
+                walk(base, &path, files)?;
+            } else if metadata.is_file() {
+                files.push(path.strip_prefix(base).unwrap_or(&path).to_path_buf());
+            } else {
+                bail!(
+                    "extension directory contains unsupported file type: {}",
+                    path.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    walk(root, root, &mut files)?;
+    files.sort();
+    Ok(files)
+}
+
+fn extension_manifest_version(extension_dir: &Path) -> Option<String> {
+    let text = fs::read_to_string(extension_dir.join("manifest.json")).ok()?;
+    let value = serde_json::from_str::<Value>(&text).ok()?;
+    value
+        .get("version")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
 fn extension_version_skew_message(extension_version: Option<&str>) -> Option<String> {
     let extension_version = extension_version?.trim();
     if extension_version.is_empty() || extension_version == YOETZ_CLI_VERSION {
         return None;
     }
     Some(format!(
-        "loaded chrome-extension-native extension version {extension_version} does not match yoetz CLI {YOETZ_CLI_VERSION}; reload the matching unpacked Yoetz extension in chrome://extensions, then run `yoetz browser extension reconnect --chatgpt`"
+        "loaded chrome-extension-native extension version {extension_version} does not match yoetz CLI {YOETZ_CLI_VERSION}; run `yoetz browser extension update --chatgpt`"
     ))
 }
 
@@ -543,7 +795,7 @@ pub fn doctor() -> Result<DoctorReport> {
             name: "extension_instance_id",
             ok: extension_instance_id.is_some(),
             detail: extension_instance_id.unwrap_or_else(|| {
-                "no extension instance id observed; reload the unpacked extension in chrome://extensions".to_string()
+                "no extension instance id observed; run `yoetz browser extension update --chatgpt` or reload the managed unpacked extension in chrome://extensions".to_string()
             }),
         },
         identity_permission_doctor_check(latest_instance_with_hello, legacy_hello_seen, extension_value),
@@ -576,13 +828,32 @@ pub fn reload_extension(selector: ExtensionInstanceSelector<'_>) -> Result<Value
         response.payload.get("status").and_then(Value::as_str) == Some("reloading");
     if !reload_started {
         bail!(
-            "connected extension did not acknowledge reload; reload the unpacked Yoetz extension in chrome://extensions"
+            "connected extension did not acknowledge reload; run `yoetz browser extension update --chatgpt` or reload the managed unpacked extension in chrome://extensions"
         );
     }
     Ok(json!({
         "status": "reloading",
         "transport": TRANSPORT_NAME,
         "response": response.payload,
+    }))
+}
+
+pub fn update_extension(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
+    let update = prepare_managed_chatgpt_extension()?;
+    let reload = reload_extension(selector)?;
+    let paths = extension_paths()?;
+    let instance = wait_for_extension_version(&paths, selector, YOETZ_CLI_VERSION)
+        .context("wait for reloaded extension to report the current CLI version")?;
+    Ok(json!({
+        "status": "updated",
+        "transport": TRANSPORT_NAME,
+        "extension_dir": update.extension_dir,
+        "source_dir": update.source_dir,
+        "manifest_version": update.manifest_version,
+        "copy_status": update.status,
+        "copied_files": update.copied_files,
+        "reload": reload,
+        "extension_instance": instance,
     }))
 }
 
@@ -662,7 +933,7 @@ pub fn run_chatgpt_recipe(
         .context("chrome-extension-native transport requires `--bundle`")?;
     let bundle = validate_bundle_path(bundle_path)?;
     let paths = extension_paths()?;
-    let instance = select_extension_instance(
+    let mut instance = select_extension_instance(
         &paths,
         ExtensionInstanceSelector {
             profile_email: spec.profile_email.as_deref(),
@@ -672,6 +943,21 @@ pub fn run_chatgpt_recipe(
     )?;
     if let Some(message) = extension_version_skew_message(instance.extension_version.as_deref()) {
         eprintln!("warning: {message}");
+        let selector = ExtensionInstanceSelector {
+            profile_email: spec.profile_email.as_deref(),
+            extension_instance_id: spec.extension_instance_id.as_deref(),
+            extension_profile_id: spec.extension_profile_id.as_deref(),
+        };
+        match auto_heal_extension_version_skew(&paths, selector) {
+            Ok(Some(healed_instance)) => {
+                eprintln!(
+                    "info: refreshed and reloaded chrome-extension-native extension from packaged source"
+                );
+                instance = healed_instance;
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("warning: automatic extension update failed: {err:#}"),
+        }
     }
     let token = read_capability_token(&paths.token_path)?;
     let mut stream = connect_socket(&instance.socket_path).with_context(|| {
@@ -1040,6 +1326,51 @@ fn select_extension_instance(
             "chrome-extension-native found multiple connected extension profiles; pass --var profile_email=<chrome-profile-email> or --var extension_instance_id=<id> so Yoetz can route the job safely. Connected instances: {}",
             observed_extension_profiles(&instances)
         ),
+    }
+}
+
+fn auto_heal_extension_version_skew(
+    paths: &ExtensionPaths,
+    selector: ExtensionInstanceSelector<'_>,
+) -> Result<Option<ExtensionInstanceStatus>> {
+    let source_dir = match chatgpt_extension_source_dir() {
+        Some(path) => path,
+        None => return Ok(None),
+    };
+    let extension_dir = managed_chatgpt_extension_dir()?;
+    if managed_chatgpt_extension_needs_sync(&source_dir, &extension_dir)? {
+        sync_managed_chatgpt_extension_from(&source_dir, &extension_dir)?;
+    }
+    reload_extension(selector)?;
+    wait_for_extension_version(paths, selector, YOETZ_CLI_VERSION).map(Some)
+}
+
+fn wait_for_extension_version(
+    paths: &ExtensionPaths,
+    selector: ExtensionInstanceSelector<'_>,
+    expected_version: &str,
+) -> Result<ExtensionInstanceStatus> {
+    let deadline = Instant::now() + EXTENSION_RELOAD_VERIFY_TIMEOUT;
+    loop {
+        let current_state = match select_extension_instance(paths, selector) {
+            Ok(instance)
+                if instance.extension_version.as_deref() == Some(expected_version)
+                    && instance_has_extension_hello(&instance) =>
+            {
+                return Ok(instance)
+            }
+            Ok(instance) => format!(
+                "observed extension version {}",
+                instance.extension_version.as_deref().unwrap_or("<unknown>")
+            ),
+            Err(err) => err.to_string(),
+        };
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for chrome-extension-native extension version {expected_version}; last state: {current_state}"
+            );
+        }
+        thread::sleep(EXTENSION_RELOAD_VERIFY_INTERVAL);
     }
 }
 
@@ -3122,6 +3453,108 @@ mod tests {
         assert!(version_compatible
             .detail
             .contains(env!("CARGO_PKG_VERSION")));
+        assert!(version_compatible
+            .detail
+            .contains("yoetz browser extension update --chatgpt"));
+    }
+
+    #[test]
+    #[serial]
+    fn managed_extension_dir_uses_stable_yoetz_state_dir() {
+        let dir = TempDir::new().unwrap();
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+
+        let path = managed_chatgpt_extension_dir().unwrap();
+
+        assert_eq!(
+            path,
+            dir.path().join("state").join("chatgpt-native-extension")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn sync_managed_extension_replaces_stale_copy_atomically() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        write_extension_source_fixture(&source, "fresh");
+        let target = dir.path().join("managed");
+        fs::create_dir_all(target.join("src")).unwrap();
+        fs::write(target.join("manifest.json"), r#"{"version":"stale"}"#).unwrap();
+        fs::write(target.join("src").join("stale.js"), "stale").unwrap();
+
+        let result = sync_managed_chatgpt_extension_from(&source, &target).unwrap();
+
+        assert_eq!(result.status, "updated");
+        assert_eq!(result.source_dir, source);
+        assert_eq!(result.extension_dir, target);
+        assert_eq!(
+            fs::read_to_string(result.extension_dir.join("manifest.json")).unwrap(),
+            r#"{"version":"fresh"}"#
+        );
+        assert_eq!(
+            fs::read_to_string(result.extension_dir.join("src").join("service-worker.js")).unwrap(),
+            "service-worker:fresh"
+        );
+        assert!(!result.extension_dir.join("src").join("stale.js").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn prepare_managed_extension_materializes_from_discovered_source() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        write_extension_source_fixture(&source, "prepared");
+        let state = dir.path().join("state");
+        let _source_guard = EnvGuard::set(CHATGPT_EXTENSION_DIR_ENV, &source);
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &state);
+
+        let result = prepare_managed_chatgpt_extension().unwrap();
+
+        assert_eq!(result.source_dir, source.canonicalize().unwrap());
+        assert_eq!(result.extension_dir, state.join("chatgpt-native-extension"));
+        assert!(is_chatgpt_extension_source_dir(&result.extension_dir));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn wait_for_extension_version_requires_current_hello() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+        let paths = extension_paths().unwrap();
+        fs::create_dir_all(&paths.instances_dir).unwrap();
+        let socket = dir.path().join("current.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        write_instance_fixture(
+            &paths,
+            ExtensionInstanceStatus {
+                native_instance_id: "native_current".to_string(),
+                socket_path: socket,
+                pid: process::id(),
+                extension_instance_id: Some("ext_current".to_string()),
+                extension_version: Some(YOETZ_CLI_VERSION.to_string()),
+                profile_email: None,
+                profile_id: None,
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 1,
+            },
+        );
+
+        let selected = wait_for_extension_version(
+            &paths,
+            ExtensionInstanceSelector::default(),
+            YOETZ_CLI_VERSION,
+        )
+        .unwrap();
+
+        assert_eq!(selected.native_instance_id, "native_current");
     }
 
     #[test]
@@ -3354,6 +3787,27 @@ mod tests {
             .instances_dir
             .join(format!("{}.json", instance.native_instance_id));
         fs::write(path, serde_json::to_string_pretty(&instance).unwrap()).unwrap();
+    }
+
+    fn write_extension_source_fixture(path: &Path, version: &str) {
+        fs::create_dir_all(path.join("src")).unwrap();
+        fs::create_dir_all(path.join("icons")).unwrap();
+        fs::write(
+            path.join("manifest.json"),
+            format!(r#"{{"version":"{version}"}}"#),
+        )
+        .unwrap();
+        fs::write(
+            path.join("src").join("service-worker.js"),
+            format!("service-worker:{version}"),
+        )
+        .unwrap();
+        fs::write(
+            path.join("src").join("content-script.js"),
+            format!("content-script:{version}"),
+        )
+        .unwrap();
+        fs::write(path.join("icons").join("icon-16.png"), b"icon").unwrap();
     }
 
     #[test]
