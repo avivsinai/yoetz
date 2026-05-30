@@ -261,7 +261,7 @@ struct BrowserRecipeArgs {
     recipe: PathBuf,
 
     /// Explicitly select one browser recipe transport. When omitted, the
-    /// chatgpt recipe auto-promotes `chrome-extension-native` if the Yoetz
+    /// chatgpt recipe selects only `chrome-extension-native` if the Yoetz
     /// Chrome extension is installed and reports `connected`; otherwise the
     /// default funnel stays extension-free.
     #[arg(long, value_parser = parse_recipe_transport_flag)]
@@ -1147,6 +1147,16 @@ fn recipe_transports_with_explicit_override(
     Ok(vec![requested])
 }
 
+fn recipe_should_auto_discover_cdp_target(
+    managed_profile_only: bool,
+    requested_extension_native: bool,
+    extension_native_will_route: bool,
+    allow_cdp_fallback: bool,
+) -> bool {
+    !managed_profile_only
+        && (!extension_native_will_route || (requested_extension_native && allow_cdp_fallback))
+}
+
 fn manual_browser_recipe_fallback(recipe_path: &Path, bundle: Option<&Path>) -> String {
     let bundle_hint = bundle
         .map(|path| format!(" Upload or paste `{}` manually.", path.display()))
@@ -1415,28 +1425,28 @@ fn maybe_print_running_profile_auto_connect_preference(
 /// Returns true when the locally installed Yoetz Chrome extension reports
 /// `connected`. Any other status (`disconnected`, `missing_extension`,
 /// `manual_handoff`, `version_mismatch`, `not_installed`) or I/O error is
-/// treated as not available for auto-promotion. The probe is filesystem-local
+/// treated as not available for auto-selection. The probe is filesystem-local
 /// (status file + Unix socket reachability) and is cheap enough to run on
 /// every `yoetz browser recipe` invocation.
-fn extension_status_connected_for_auto_promotion() -> bool {
+fn extension_status_connected_for_auto_selection() -> bool {
     browser_extension_native::status()
         .map(|status| status.status == "connected")
         .unwrap_or(false)
 }
 
-fn maybe_print_auto_promoted_extension_native_transport(
-    auto_promoted: bool,
+fn maybe_print_auto_selected_extension_native_transport(
+    auto_selected: bool,
     transports: &[browser::RecipeTransport],
     format: OutputFormat,
 ) {
-    if !auto_promoted
+    if !auto_selected
         || transports.first() != Some(&browser::RecipeTransport::ChromeExtensionNative)
     {
         return;
     }
     if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
         eprintln!(
-            "info: auto-selected chrome-extension-native transport because the Yoetz Chrome extension is installed and connected (pass --transport <other> or pin `transports:` in the recipe to opt out)"
+            "info: auto-selected chrome-extension-native as the only transport because the Yoetz Chrome extension is installed and connected (pass --transport <other> to opt out, or --transport chrome-extension-native --allow-cdp-fallback to opt into CDP fallback)"
         );
     }
 }
@@ -3294,12 +3304,12 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 Some(browser::RecipeTransport::ChromeExtensionNative)
             );
             let recipe_transports_pinned = recipe.transports.is_some();
-            let extension_auto_promotion_eligible = recipe_args.transport.is_none()
+            let extension_auto_selection_eligible = recipe_args.transport.is_none()
                 && is_chatgpt
                 && !recipe_transports_pinned
-                && extension_status_connected_for_auto_promotion();
+                && extension_status_connected_for_auto_selection();
             let extension_native_will_route =
-                requested_extension_native || extension_auto_promotion_eligible;
+                requested_extension_native || extension_auto_selection_eligible;
             if recipe_uses_extension_instance_selector(&recipe_vars) && !extension_native_will_route
             {
                 bail!(
@@ -3317,17 +3327,21 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 recipe_args.cdp.as_deref(),
                 recipe_args.browser_id.as_deref(),
                 &ctx.browser_defaults,
-                !managed_profile_only
-                    && (!requested_extension_native || recipe_args.allow_cdp_fallback),
+                recipe_should_auto_discover_cdp_target(
+                    managed_profile_only,
+                    requested_extension_native,
+                    extension_native_will_route,
+                    recipe_args.allow_cdp_fallback,
+                ),
             )?;
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
-            let base_transports = browser::maybe_prefer_extension_native_for_chatgpt(
+            let base_transports = browser::maybe_select_extension_native_for_chatgpt(
                 browser::recipe_transports(&recipe, is_chatgpt),
                 is_chatgpt,
                 recipe_transports_pinned,
-                extension_auto_promotion_eligible,
+                extension_auto_selection_eligible,
             );
-            let extension_native_auto_promoted = extension_auto_promotion_eligible
+            let extension_native_auto_selected = extension_auto_selection_eligible
                 && base_transports.first()
                     == Some(&browser::RecipeTransport::ChromeExtensionNative);
             let transports = recipe_transports_with_explicit_override(
@@ -3361,8 +3375,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 &recipe_vars,
                 is_chatgpt,
             )?;
-            maybe_print_auto_promoted_extension_native_transport(
-                extension_native_auto_promoted,
+            maybe_print_auto_selected_extension_native_transport(
+                extension_native_auto_selected,
                 &transports,
                 format,
             );
@@ -4659,6 +4673,28 @@ mod tests {
         assert!(err
             .to_string()
             .contains("--allow-cdp-fallback is only valid"));
+    }
+
+    #[test]
+    fn cdp_auto_discovery_is_disabled_for_native_only_routes() {
+        assert!(recipe_should_auto_discover_cdp_target(
+            false, false, false, false
+        ));
+        assert!(!recipe_should_auto_discover_cdp_target(
+            true, false, false, false
+        ));
+        assert!(!recipe_should_auto_discover_cdp_target(
+            false, false, true, false
+        ));
+        assert!(!recipe_should_auto_discover_cdp_target(
+            false, false, true, true
+        ));
+        assert!(!recipe_should_auto_discover_cdp_target(
+            false, true, true, false
+        ));
+        assert!(recipe_should_auto_discover_cdp_target(
+            false, true, true, true
+        ));
     }
 
     #[test]

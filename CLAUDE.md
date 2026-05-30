@@ -104,7 +104,7 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 
 Yoetz browser integrations are extension-free by default unless the Yoetz
 Chrome extension is installed and connected, in which case the `chatgpt`
-recipe auto-promotes it.
+recipe selects it as the only default transport.
 
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
@@ -113,8 +113,11 @@ recipe auto-promotes it.
   stack extension-free.
 - For the `chatgpt` recipe specifically, when `yoetz browser extension
   status --chatgpt` reports `connected`, `chrome-extension-native` is
-  auto-promoted to the front of the default transport funnel; pass
-  `--transport <other>` or pin `transports:` in the recipe yaml to opt out.
+  auto-selected as the only default transport and fails closed instead of
+  falling through to CDP/dev-browser transports; pass `--transport <other>` or
+  pin `transports:` in the recipe yaml to opt out. CDP fallback after a native
+  extension failure requires the explicit
+  `--transport chrome-extension-native --allow-cdp-fallback` opt-in.
   Non-ChatGPT recipes and unhealthy/missing extensions are not affected.
 - The `chrome-extension-native` path stays the explicit choice when callers
   want it regardless of detection, via

@@ -217,11 +217,15 @@ yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle bundle.md
 yoetz --format json browser recipe --recipe recipes/chatgpt.yaml --bundle bundle.md
 ```
 
-The default browser stack remains extension-free: ChatGPT recipes use
-`chrome-devtools-mcp`, then `dev-browser`, then `agent-browser` / cookie
-fallbacks as needed. The experimental `chrome-extension-native` transport is an
-explicit opt-in exception for ChatGPT Pro runs that need install-once native
-messaging instead of CDP approval prompts. This native-host path is currently
+The default browser stack remains extension-free unless the ChatGPT native
+extension is installed and connected. Without a connected extension, ChatGPT
+recipes use `chrome-devtools-mcp`, then `dev-browser`, then `agent-browser` /
+cookie fallbacks as needed. With a connected extension, the built-in ChatGPT
+recipe auto-selects `chrome-extension-native` as the only default transport and
+fails closed instead of falling through to CDP/dev-browser transports. Pass
+`--transport <other>` to opt out, or
+`--transport chrome-extension-native --allow-cdp-fallback` to explicitly permit
+CDP fallback after a native-extension failure. This native-host path is currently
 macOS/Linux-only; Windows CLI artifacts still ship, but Windows native-host
 registration is not implemented yet.
 
@@ -317,8 +321,8 @@ The recipe never auto-falls-back to another transport once a side effect has
 landed in the user's tab. If the run fails after upload/send, the error
 includes a manual recovery hint (`window.name` marker, `_yoetz` URL marker,
 extension marker prefix) so an agent can decide whether to reuse the tab or
-abort. Pass `--allow-cdp-fallback` only if you understand that explicitly
-permits a second submission via CDP.
+abort. Pass `--transport chrome-extension-native --allow-cdp-fallback` only if
+you understand that this explicitly permits a second submission via CDP.
 
 The built-in ChatGPT recipe supports exactly one target: ChatGPT Pro with
 Extended enabled. `model` and `extended` recipe overrides are rejected. This is
