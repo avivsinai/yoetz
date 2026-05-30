@@ -245,12 +245,12 @@ pub fn recipe_transports(recipe: &Recipe, is_chatgpt: bool) -> Vec<RecipeTranspo
     })
 }
 
-/// Prepend `chrome-extension-native` to the ChatGPT recipe transport list when
+/// Select `chrome-extension-native` as the only ChatGPT recipe transport when
 /// the Yoetz Chrome extension is installed and connected and the recipe author
 /// did not pin their own transport order. The list is returned unchanged for
-/// any other recipe, when the recipe pinned `transports:`, when the extension
-/// is unhealthy, or when the list already contains `chrome-extension-native`.
-pub fn maybe_prefer_extension_native_for_chatgpt(
+/// any other recipe, when the recipe pinned `transports:`, or when the extension
+/// is unhealthy.
+pub fn maybe_select_extension_native_for_chatgpt(
     transports: Vec<RecipeTransport>,
     is_chatgpt: bool,
     recipe_transports_pinned: bool,
@@ -259,13 +259,7 @@ pub fn maybe_prefer_extension_native_for_chatgpt(
     if !is_chatgpt || recipe_transports_pinned || !extension_connected {
         return transports;
     }
-    if transports.contains(&RecipeTransport::ChromeExtensionNative) {
-        return transports;
-    }
-    let mut promoted = Vec::with_capacity(transports.len() + 1);
-    promoted.push(RecipeTransport::ChromeExtensionNative);
-    promoted.extend(transports);
-    promoted
+    vec![RecipeTransport::ChromeExtensionNative]
 }
 
 /// Returns (program, extra_prefix_args) for launching agent-browser.
@@ -7346,59 +7340,50 @@ steps:
     }
 
     #[test]
-    fn maybe_prefer_extension_native_prepends_for_chatgpt_when_connected() {
+    fn maybe_select_extension_native_requires_native_only_for_chatgpt_when_connected() {
         let base = vec![
             RecipeTransport::ChromeDevtoolsMcp,
             RecipeTransport::DevBrowser,
             RecipeTransport::AgentBrowser,
             RecipeTransport::Manual,
         ];
-        let promoted = maybe_prefer_extension_native_for_chatgpt(base, true, false, true);
-        assert_eq!(
-            promoted,
-            vec![
-                RecipeTransport::ChromeExtensionNative,
-                RecipeTransport::ChromeDevtoolsMcp,
-                RecipeTransport::DevBrowser,
-                RecipeTransport::AgentBrowser,
-                RecipeTransport::Manual,
-            ]
-        );
+        let promoted = maybe_select_extension_native_for_chatgpt(base, true, false, true);
+        assert_eq!(promoted, vec![RecipeTransport::ChromeExtensionNative]);
     }
 
     #[test]
-    fn maybe_prefer_extension_native_noop_when_extension_disconnected() {
+    fn maybe_select_extension_native_noop_when_extension_disconnected() {
         let base = vec![
             RecipeTransport::ChromeDevtoolsMcp,
             RecipeTransport::DevBrowser,
         ];
-        let result = maybe_prefer_extension_native_for_chatgpt(base.clone(), true, false, false);
+        let result = maybe_select_extension_native_for_chatgpt(base.clone(), true, false, false);
         assert_eq!(result, base);
     }
 
     #[test]
-    fn maybe_prefer_extension_native_noop_when_recipe_pinned_transports() {
+    fn maybe_select_extension_native_noop_when_recipe_pinned_transports() {
         let base = vec![RecipeTransport::ChromeDevtoolsMcp, RecipeTransport::Manual];
-        let result = maybe_prefer_extension_native_for_chatgpt(base.clone(), true, true, true);
+        let result = maybe_select_extension_native_for_chatgpt(base.clone(), true, true, true);
         assert_eq!(result, base);
     }
 
     #[test]
-    fn maybe_prefer_extension_native_noop_for_non_chatgpt() {
+    fn maybe_select_extension_native_noop_for_non_chatgpt() {
         let base = vec![RecipeTransport::AgentBrowser];
-        let result = maybe_prefer_extension_native_for_chatgpt(base.clone(), false, false, true);
+        let result = maybe_select_extension_native_for_chatgpt(base.clone(), false, false, true);
         assert_eq!(result, base);
     }
 
     #[test]
-    fn maybe_prefer_extension_native_noop_when_already_present() {
+    fn maybe_select_extension_native_keeps_native_only_when_already_present() {
         let base = vec![
             RecipeTransport::ChromeDevtoolsMcp,
             RecipeTransport::ChromeExtensionNative,
             RecipeTransport::Manual,
         ];
-        let result = maybe_prefer_extension_native_for_chatgpt(base.clone(), true, false, true);
-        assert_eq!(result, base);
+        let result = maybe_select_extension_native_for_chatgpt(base, true, false, true);
+        assert_eq!(result, vec![RecipeTransport::ChromeExtensionNative]);
     }
 
     #[test]
@@ -7462,7 +7447,7 @@ steps:
     }
 
     #[test]
-    fn builtin_chatgpt_recipe_does_not_pin_transports_so_auto_promotion_can_fire() {
+    fn builtin_chatgpt_recipe_does_not_pin_transports_so_native_selection_can_fail_closed() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/chatgpt.yaml");
         let content = fs::read_to_string(&path).expect("read recipes/chatgpt.yaml");
         let recipe: Recipe = serde_yaml_ng::from_str(&content).expect("parse chatgpt.yaml");
@@ -7470,31 +7455,22 @@ steps:
         assert!(
             recipe.transports.is_none(),
             "built-in chatgpt.yaml must not pin `transports:` so that \
-             chrome-extension-native auto-promotion gates correctly"
+             chrome-extension-native auto-selection gates correctly"
         );
 
         let base = recipe_transports(&recipe, true);
-        let promoted = maybe_prefer_extension_native_for_chatgpt(
+        let promoted = maybe_select_extension_native_for_chatgpt(
             base,
             true,
             recipe.transports.is_some(),
             true,
         );
         assert_eq!(
-            promoted.first(),
-            Some(&RecipeTransport::ChromeExtensionNative),
+            promoted,
+            vec![RecipeTransport::ChromeExtensionNative],
             "with extension connected, the built-in chatgpt recipe must \
-             auto-promote chrome-extension-native to the front of the funnel"
-        );
-        assert_eq!(
-            &promoted[1..],
-            &[
-                RecipeTransport::ChromeDevtoolsMcp,
-                RecipeTransport::DevBrowser,
-                RecipeTransport::AgentBrowser,
-                RecipeTransport::Manual,
-            ],
-            "auto-promotion must preserve the existing extension-free funnel order behind it"
+             auto-select chrome-extension-native and fail closed instead of \
+             silently falling through to CDP/dev-browser transports"
         );
     }
 
