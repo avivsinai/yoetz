@@ -44,20 +44,6 @@ const AFFORDANCE_CONFIRM_POLL_MS = Math.max(
   250,
   Number(globalThis.__YOETZ_AFFORDANCE_CONFIRM_POLL_MS ?? 1500) || 1500
 );
-// Weak-signal terminal path (the "dead zone" fix): generation has provably stopped (no stop
-// controls) and scoped assistant text is present, but ChatGPT did NOT render a scoped copy
-// button for this turn (e.g. a reasoning/thinking block sits between the answer node and the copy
-// control so the copy button fails scoping). Without a terminal path here the loop polls until
-// the full wait timeout (~20 min) — the observed Pro-review hang. Because "no copy button" is a
-// WEAKER completion signal than the copy button, require a LONG quiet window (default = the old
-// conservative idle floor) so we never return mid-stream on a merely-paused turn, but DO
-// eventually return instead of hanging forever. Structural only — NO content/length guard, so
-// even a degenerate single-char answer returns after the quiet window (the wrapper decides
-// usability). Env-tunable for tests + ops.
-const MIN_NO_AFFORDANCE_IDLE_MS = Math.max(
-  0,
-  Number(globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS ?? MIN_STABLE_IDLE_MS)
-);
 const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   1024,
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
@@ -1157,9 +1143,6 @@ async function waitForResponse(job) {
   let finalAffordanceCandidate = null;
   let bestFinalAffordanceCandidate = null;
   let finalAffordanceCandidateSinceMs = 0;
-  // Weak-signal (no scoped copy button) terminal-path latch, parallel to the copy-button latch.
-  let noAffordanceCandidate = null;
-  let noAffordanceCandidateSinceMs = 0;
   let extractionFailureSinceMs = 0;
   let lastWaitingProgressAt = startedAt;
   const timeoutMs = responseWaitTimeoutMs(job);
@@ -1243,40 +1226,6 @@ async function waitForResponse(job) {
       finalAffordanceCandidate = null;
       bestFinalAffordanceCandidate = null;
       finalAffordanceCandidateSinceMs = 0;
-    }
-    // Weak-signal terminal path: scoped text present, generation provably stopped, but no scoped
-    // copy button. page_text_fallback can never reach here because scopedExtractionCandidate
-    // already excludes it. stop_controls is the independent cross-check that generation truly
-    // ended (mirrors isResponseGenerating's selectors, counted in extraction diagnostics).
-    const stopControls = Number(extraction?.diagnostics?.counts?.stop_controls ?? 0);
-    const deadZoneCandidate = Boolean(
-      scopedExtractionCandidate
-      && !finalAffordance
-      && extraction?.text
-      && !extraction?.has_copy_button
-      && stopControls === 0
-    );
-    if (deadZoneCandidate) {
-      // Reuse the same growth-aware selection so text growth re-arms the long quiet window and a
-      // settled response is required to hold byte-stable across it before we accept it.
-      const noAffSelection = selectFinalAffordanceCandidate(noAffordanceCandidate, extraction);
-      if (!noAffordanceCandidate || noAffSelection.candidate !== noAffordanceCandidate) {
-        if (!noAffordanceCandidate || noAffSelection.resetTimer) {
-          noAffordanceCandidateSinceMs = Date.now();
-        }
-        noAffordanceCandidate = noAffSelection.candidate;
-      } else if (!noAffordanceCandidateSinceMs) {
-        noAffordanceCandidateSinceMs = Date.now();
-      }
-      const noAffordanceStableForMs = Date.now() - noAffordanceCandidateSinceMs;
-      if (noAffordanceStableForMs >= MIN_NO_AFFORDANCE_IDLE_MS) {
-        return completedExtraction(noAffordanceCandidate, "stable_idle_no_copy_button", noAffordanceStableForMs);
-      }
-    } else {
-      // Predicate false (generation resumed, copy button appeared, page_text_fallback, or no
-      // text) — drop the weak-signal latch so it can only fire on a continuously-stable window.
-      noAffordanceCandidate = null;
-      noAffordanceCandidateSinceMs = 0;
     }
     const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalAffordance);
     if (finalAffordanceWithoutScopedText) {

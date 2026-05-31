@@ -1227,17 +1227,8 @@ test("service worker completes post-send response when preceding user count is u
   }
 });
 
-test("service worker completes via the bounded no-copy-button idle path when generation stopped but no scoped copy button appears", async () => {
-  // Dead-zone fix (P3): a turn whose generation has provably stopped (is_generating=false AND
-  // diagnostics stop_controls=0) and whose scoped assistant text is present but for which ChatGPT
-  // rendered NO scoped copy button must NOT hang to the wait timeout. It now completes via the
-  // bounded weak-signal path (completion_reason "stable_idle_no_copy_button") once the text has
-  // held stable for MIN_NO_AFFORDANCE_IDLE_MS. (Previously this hung to response_timeout, which
-  // was the observed Pro-review failure.) Structural only — no content/length guard, so even a
-  // short answer returns after the quiet window.
+test("service worker does not complete on brief stable assistant text without a final affordance", async () => {
   const originalChrome = globalThis.chrome;
-  const previousNoAffordanceIdle = globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS;
-  globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS = 120;
   const port = makePort();
   let tabId = 0;
   let sent = false;
@@ -1265,15 +1256,12 @@ test("service worker completes via the bounded no-copy-button idle path when gen
               payload: sent
                 ? {
                     method: "assistant_dom_fallback",
-                    text: "stable answer without a scoped copy button",
+                    text: "stable but possibly partial",
                     is_generating: false,
                     assistant_count: 1,
-                    user_count: 1,
-                    preceding_user_count: 1,
                     copy_button_count: 0,
                     has_copy_button: false,
-                    turn_index: 0,
-                    diagnostics: { counts: { stop_controls: 0 } }
+                    turn_index: 0
                   }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
             };
@@ -1289,7 +1277,7 @@ test("service worker completes via the bounded no-copy-button idle path when gen
     port.emit(envelope("job_start", "job_stable_no_copy", {
       prompt: "prompt",
       wait_interval_ms: 50,
-      wait_timeout_ms: 5000
+      wait_timeout_ms: 1200
     }));
     await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
     port.emit(envelope("job_file_chunk", "job_stable_no_copy", {
@@ -1300,18 +1288,13 @@ test("service worker completes via the bounded no-copy-button idle path when gen
       mime_type: "text/markdown",
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
-    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
-    const complete = port.messages.find((message) => message.type === "job_complete");
-    assert.equal(complete.payload.response, "stable answer without a scoped copy button");
-    assert.equal(complete.payload.completion_reason, "stable_idle_no_copy_button");
-    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    const observed = port.messages.find((message) => message.type === "job_progress" && message.payload.phase === "response_observed");
+    assert.equal(observed?.payload.response_delta, "stable but possibly partial");
+    assert.equal(observed?.payload.is_generating, false);
   } finally {
     globalThis.chrome = originalChrome;
-    if (previousNoAffordanceIdle === undefined) {
-      delete globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS;
-    } else {
-      globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS = previousNoAffordanceIdle;
-    }
   }
 });
 
@@ -2078,12 +2061,6 @@ test("service worker does not complete when ChatGPT idles before final assistant
   const originalChrome = globalThis.chrome;
   const previousWaitingProgressInterval = globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
   globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = 100;
-  // Keep the weak-signal (no-copy-button) idle window LONG so this test still proves the strong
-  // signal wins: the one-letter "I" prefix (no copy button) must NOT complete via the dead-zone
-  // path before the real copy button + full text arrive. This mirrors production, where the
-  // ~90s no-copy-button window is far longer than the seconds it takes the copy button to render.
-  const previousNoAffordanceIdle = globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS;
-  globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS = 60000;
   const port = makePort();
   let tabId = 0;
   let sent = false;
@@ -2167,11 +2144,6 @@ test("service worker does not complete when ChatGPT idles before final assistant
       delete globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
     } else {
       globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = previousWaitingProgressInterval;
-    }
-    if (previousNoAffordanceIdle === undefined) {
-      delete globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS;
-    } else {
-      globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS = previousNoAffordanceIdle;
     }
   }
 });
@@ -2394,13 +2366,7 @@ test("service worker completes when a generating response becomes idle without t
   }
 });
 
-test("service worker does not complete on a raw copy-count rise while generation is still in progress", async () => {
-  // Guards that a rising RAW copy_button_count (here 2) with NO scoped copy button
-  // (has_copy_button=false) does not by itself complete the job. To keep this focused on the
-  // copy-count signal (and isolated from the bounded no-copy-button idle path), the turn reports
-  // is_generating=true and a stop control present, so neither the copy-button affordance path nor
-  // the dead-zone weak-signal path (which both require generation to have stopped) can fire — the
-  // job must wait, then time out.
+test("service worker does not complete only because post-send copy controls increased", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -2430,12 +2396,11 @@ test("service worker does not complete on a raw copy-count rise while generation
                 ? {
                     method: "assistant_dom_fallback",
                     text: "YOETZ_EXTENSION_NATIVE_SMOKE_OK",
-                    is_generating: true,
+                    is_generating: false,
                     assistant_count: 3,
                     copy_button_count: 2,
                     has_copy_button: false,
-                    turn_index: 0,
-                    diagnostics: { counts: { stop_controls: 1 } }
+                    turn_index: 0
                   }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
             };
@@ -2467,92 +2432,6 @@ test("service worker does not complete on a raw copy-count rise while generation
     assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
   } finally {
     globalThis.chrome = originalChrome;
-  }
-});
-
-test("service worker dead-zone path resets on is_generating re-entry and stays excluded for page_text_fallback", async () => {
-  // (e)+(f) combined: the weak-signal no-copy-button completion must NOT fire while generation is
-  // re-entering, and must NEVER fire for page_text_fallback (broad page chrome is not a scoped
-  // answer). Sequence: idle scoped "draft" (no copy button) for a couple polls (arming the
-  // window), then a generating poll (must reset the window), then a page_text_fallback poll (must
-  // not be eligible). The job must therefore time out, never completing via the dead-zone path.
-  const originalChrome = globalThis.chrome;
-  const previousNoAffordanceIdle = globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS;
-  // Window longer than the test's whole runtime: completion here could ONLY happen if the
-  // dead-zone path ignored the is_generating re-entry reset or accepted page_text_fallback. The
-  // job must instead reach response_timeout, proving neither happened.
-  globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS = 60000;
-  const port = makePort();
-  let tabId = 0;
-  let sent = false;
-  let extractCount = 0;
-  globalThis.chrome = chromeStub({
-    port,
-    tabs: {
-      create: async (opts) => ({ id: ++tabId, ...opts }),
-      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
-      sendMessage: async (_id, message) => {
-        switch (message.type) {
-          case "yoetz_probe":
-            return { ok: true, payload: {} };
-          case "yoetz_prepare_job":
-            return { ok: true, payload: { manual_handoff: null } };
-          case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
-          case "yoetz_upload_file":
-            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
-          case "yoetz_send_prompt":
-            sent = true;
-            return { ok: true, payload: { sent: true } };
-          case "yoetz_extract_response": {
-            if (!sent) {
-              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 } };
-            }
-            extractCount += 1;
-            // Poll 1: idle scoped draft, no copy button (arms the window).
-            // Poll 2: generation re-enters (must reset the window).
-            // Poll 3+: page_text_fallback (never eligible for the dead-zone path).
-            if (extractCount === 1) {
-              return { ok: true, payload: { method: "assistant_dom_fallback", text: "draft", is_generating: false, assistant_count: 1, user_count: 1, preceding_user_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0, diagnostics: { counts: { stop_controls: 0 } } } };
-            }
-            if (extractCount === 2) {
-              return { ok: true, payload: { method: "assistant_dom_fallback", text: "draft", is_generating: true, assistant_count: 1, user_count: 1, preceding_user_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0, diagnostics: { counts: { stop_controls: 1 } } } };
-            }
-            return { ok: true, payload: { method: "page_text_fallback", text: "whole page text", is_generating: false, assistant_count: 1, user_count: 1, preceding_user_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: -1, diagnostics: { counts: { stop_controls: 0 } } } };
-          }
-          default:
-            throw new Error(`unexpected tab message ${message.type}`);
-        }
-      }
-    }
-  });
-
-  try {
-    await import(`../src/service-worker.js?deadzone_reset=${Date.now()}`);
-    port.emit(envelope("job_start", "job_deadzone_reset", {
-      prompt: "prompt",
-      wait_interval_ms: 50,
-      wait_timeout_ms: 1200
-    }));
-    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
-    port.emit(envelope("job_file_chunk", "job_deadzone_reset", {
-      sequence: 0,
-      total_chunks: 1,
-      total_bytes: 4,
-      filename: "job_deadzone_reset.md",
-      mime_type: "text/markdown",
-      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
-    }));
-
-    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
-    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
-  } finally {
-    globalThis.chrome = originalChrome;
-    if (previousNoAffordanceIdle === undefined) {
-      delete globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS;
-    } else {
-      globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS = previousNoAffordanceIdle;
-    }
   }
 });
 
