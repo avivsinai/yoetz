@@ -648,10 +648,21 @@ async function handleInspectRun(message) {
       // missing P2 fields are a reload problem, not a code bug. Each inspected tab also carries
       // content_script_build (see inspectPage) since content scripts in already-open tabs do not
       // refresh on extension reload even when the SW does.
-      service_worker_build: EXTENSION_VERSION,
+      service_worker_build: serviceWorkerBuild(),
       tabs: matches
     }
   }));
+}
+
+// Runtime build marker for the service worker (manifest version of the LIVE SW). Used in the
+// inspect payload so an operator can confirm the running SW is the expected build before
+// trusting/distrusting the diagnostics fields. Defensive: never throws inside handleInspectRun.
+function serviceWorkerBuild() {
+  try {
+    return chrome.runtime?.getManifest?.().version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function sanitizeInspection(inspection) {
