@@ -1,5 +1,5 @@
 const DEFAULT_MAX_CHUNKS = 100000;
-export const MAX_BUNDLE_BYTES = 5 * 1024 * 1024;
+export const MAX_BUNDLE_BYTES = 10 * 1024 * 1024;
 export const MAX_NATIVE_INBOUND_BYTES = 1024 * 1024;
 
 export class ChunkAssembler {
