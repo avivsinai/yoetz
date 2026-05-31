@@ -1382,6 +1382,13 @@ function diagnosticPayload(diagnostics) {
     return null;
   }
   return {
+    // page_text_content_chars (textContent length) is surfaced alongside the snippet
+    // text_content_chars so an operator running `yoetz browser extension inspect` can compare it
+    // to the innerText-derived page_text_chars and settle the innerText-vs-textContent truncation
+    // fork. Snippets are passed through verbatim below, so each already carries text_content_chars
+    // from elementSummary; this only had to re-add the page-level field that the projection dropped.
+    page_text_chars: diagnostics.page_text_chars ?? null,
+    page_text_content_chars: diagnostics.page_text_content_chars ?? null,
     counts: diagnostics.counts ?? {},
     assistant_turn_snippets: (diagnostics.assistant_turn_snippets ?? []).slice(-3),
     article_snippets: (diagnostics.article_snippets ?? []).slice(-3),
