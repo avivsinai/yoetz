@@ -24,6 +24,40 @@ const MAX_FINAL_AFFORDANCE_IDLE_MS = Math.max(
   MIN_STABLE_IDLE_MS,
   Number(globalThis.__YOETZ_MAX_FINAL_AFFORDANCE_IDLE_MS ?? 5 * 60 * 1000) || 5 * 60 * 1000
 );
+// Once ChatGPT has exposed a final assistant affordance (copy control) AND scoped
+// text is extractable AND generation has stopped, the response is structurally
+// complete. Confirm it over a SHORT stable window at a FAST cadence instead of
+// waiting out the full MIN_STABLE_IDLE_MS late-hydration floor. The dual-candidate
+// latch still re-arms this window on any text growth (selectFinalAffordanceCandidate
+// -> resetTimer), so a still-hydrating response cannot complete early; this only
+// removes the dead wall-clock wait after the text has genuinely settled. This is the
+// post-affordance confirm window and is always clamped to the slower idle floor so it
+// can only ever shorten the wait, never lengthen it.
+const MIN_AFFORDANCE_CONFIRM_MS = Math.max(
+  0,
+  Number(globalThis.__YOETZ_MIN_AFFORDANCE_CONFIRM_MS ?? 8000)
+);
+// Fast poll cadence used only while a final affordance is latched, so the short
+// confirm window is actually sampled across several polls instead of a single coarse
+// 30s tick overshooting it.
+const AFFORDANCE_CONFIRM_POLL_MS = Math.max(
+  250,
+  Number(globalThis.__YOETZ_AFFORDANCE_CONFIRM_POLL_MS ?? 1500) || 1500
+);
+// Weak-signal terminal path (the "dead zone" fix): generation has provably stopped (no stop
+// controls) and scoped assistant text is present, but ChatGPT did NOT render a scoped copy
+// button for this turn (e.g. a reasoning/thinking block sits between the answer node and the copy
+// control so the copy button fails scoping). Without a terminal path here the loop polls until
+// the full wait timeout (~20 min) — the observed Pro-review hang. Because "no copy button" is a
+// WEAKER completion signal than the copy button, require a LONG quiet window (default = the old
+// conservative idle floor) so we never return mid-stream on a merely-paused turn, but DO
+// eventually return instead of hanging forever. Structural only — NO content/length guard, so
+// even a degenerate single-char answer returns after the quiet window (the wrapper decides
+// usability). Env-tunable for tests + ops.
+const MIN_NO_AFFORDANCE_IDLE_MS = Math.max(
+  0,
+  Number(globalThis.__YOETZ_MIN_NO_AFFORDANCE_IDLE_MS ?? MIN_STABLE_IDLE_MS)
+);
 const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   1024,
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
@@ -1113,11 +1147,19 @@ async function waitForResponse(job) {
   job.response_wait_started_at = startedAt;
   const interval = Math.max(500, Math.min(Number(job.wait_interval_ms) || 30000, 30000));
   const finalAffordanceIdleMs = responseStableIdleThresholdMs(interval);
+  // The post-affordance confirm window is clamped to the idle floor so it can only
+  // shorten the wait for a settled response, never extend it past the late-hydration
+  // ceiling (and so test envs that drive MIN_STABLE_IDLE_MS below the confirm default
+  // still complete promptly).
+  const affordanceConfirmMs = Math.min(MIN_AFFORDANCE_CONFIRM_MS, finalAffordanceIdleMs);
   let best = { method: "none", text: "", is_generating: true };
   let last = { method: "none", text: "", is_generating: true };
   let finalAffordanceCandidate = null;
   let bestFinalAffordanceCandidate = null;
   let finalAffordanceCandidateSinceMs = 0;
+  // Weak-signal (no scoped copy button) terminal-path latch, parallel to the copy-button latch.
+  let noAffordanceCandidate = null;
+  let noAffordanceCandidateSinceMs = 0;
   let extractionFailureSinceMs = 0;
   let lastWaitingProgressAt = startedAt;
   const timeoutMs = responseWaitTimeoutMs(job);
@@ -1186,7 +1228,12 @@ async function waitForResponse(job) {
         finalAffordanceCandidateSinceMs = Date.now();
       }
       stableForMs = Date.now() - finalAffordanceCandidateSinceMs;
-      if (stableForMs >= finalAffordanceIdleMs) {
+      // The latch above only re-stamps finalAffordanceCandidateSinceMs on a
+      // timer-resetting candidate change (first candidate or text growth), so
+      // stableForMs is "time since the scoped text last grew". Once that has held
+      // for the short confirm window, the response is settled — emit instead of
+      // burning the full idle floor.
+      if (stableForMs >= affordanceConfirmMs) {
         return completedExtraction(finalAffordanceCandidate, "copy_button", stableForMs);
       }
     } else if (extraction?.is_generating) {
@@ -1196,6 +1243,40 @@ async function waitForResponse(job) {
       finalAffordanceCandidate = null;
       bestFinalAffordanceCandidate = null;
       finalAffordanceCandidateSinceMs = 0;
+    }
+    // Weak-signal terminal path: scoped text present, generation provably stopped, but no scoped
+    // copy button. page_text_fallback can never reach here because scopedExtractionCandidate
+    // already excludes it. stop_controls is the independent cross-check that generation truly
+    // ended (mirrors isResponseGenerating's selectors, counted in extraction diagnostics).
+    const stopControls = Number(extraction?.diagnostics?.counts?.stop_controls ?? 0);
+    const deadZoneCandidate = Boolean(
+      scopedExtractionCandidate
+      && !finalAffordance
+      && extraction?.text
+      && !extraction?.has_copy_button
+      && stopControls === 0
+    );
+    if (deadZoneCandidate) {
+      // Reuse the same growth-aware selection so text growth re-arms the long quiet window and a
+      // settled response is required to hold byte-stable across it before we accept it.
+      const noAffSelection = selectFinalAffordanceCandidate(noAffordanceCandidate, extraction);
+      if (!noAffordanceCandidate || noAffSelection.candidate !== noAffordanceCandidate) {
+        if (!noAffordanceCandidate || noAffSelection.resetTimer) {
+          noAffordanceCandidateSinceMs = Date.now();
+        }
+        noAffordanceCandidate = noAffSelection.candidate;
+      } else if (!noAffordanceCandidateSinceMs) {
+        noAffordanceCandidateSinceMs = Date.now();
+      }
+      const noAffordanceStableForMs = Date.now() - noAffordanceCandidateSinceMs;
+      if (noAffordanceStableForMs >= MIN_NO_AFFORDANCE_IDLE_MS) {
+        return completedExtraction(noAffordanceCandidate, "stable_idle_no_copy_button", noAffordanceStableForMs);
+      }
+    } else {
+      // Predicate false (generation resumed, copy button appeared, page_text_fallback, or no
+      // text) — drop the weak-signal latch so it can only fire on a continuously-stable window.
+      noAffordanceCandidate = null;
+      noAffordanceCandidateSinceMs = 0;
     }
     const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalAffordance);
     if (finalAffordanceWithoutScopedText) {
@@ -1221,7 +1302,13 @@ async function waitForResponse(job) {
     } else {
       extractionFailureSinceMs = 0;
     }
-    const nextDelay = (finalAffordance || finalAffordanceWithoutScopedText) ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500)) : interval;
+    const nextDelay = finalAffordance
+      // Poll fast while confirming a latched final affordance so the short confirm
+      // window is sampled across several ticks rather than overshot by a coarse poll.
+      ? Math.min(interval, AFFORDANCE_CONFIRM_POLL_MS)
+      : (finalAffordanceWithoutScopedText
+          ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500))
+          : interval);
     const nowMs = Date.now();
     const elapsedMs = nowMs - startedAt;
     if (nowMs - lastWaitingProgressAt >= WAITING_RESPONSE_PROGRESS_INTERVAL_MS) {

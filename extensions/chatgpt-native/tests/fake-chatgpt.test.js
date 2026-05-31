@@ -429,6 +429,65 @@ test("extractResponse returns single-letter assistant markdown with a copy affor
   assert.equal(extraction.has_copy_button, true);
 });
 
+test("extractResponse recovers the full answer when innerText is virtualized to a head char (textContent body reader)", () => {
+  // P1 regression guard for the live 955 KB Pro-review failure: ChatGPT virtualized/clipped the
+  // long assistant turn, so the markdown body's innerText collapsed to the rendered head "I" while
+  // textContent still held the full answer. The body reader must use textContent, recover the full
+  // review, and strip a code-block "Copy code" toolbar line without eating the code body or prose.
+  const fullReview = [
+    "## Findings",
+    "1. The cutover gate can be green with fabricated evidence.",
+    "Copy code",
+    "const gate = verify(report);",
+    "2. Rollback transcript verification is sound."
+  ].join("\n");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const markdownAnswer = new FakeElement("div", { class: "markdown prose" }, fullReview);
+  // Simulate virtualization: layout-derived innerText shows only the rendered head; textContent
+  // (set above via the constructor text) retains the full DOM text.
+  markdownAnswer.innerText = "I";
+  const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Thought for 9m 44s\n\nI")
+    .append(markdownAnswer, copy);
+  const body = new FakeElement("body", {}, "I").append(assistant);
+
+  const extraction = extractResponse(new FakeDocument(body));
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.has_copy_button, true);
+  assert.ok(extraction.text.includes("## Findings"), `expected full review, got: ${extraction.text}`);
+  assert.ok(extraction.text.includes("Rollback transcript verification is sound."));
+  assert.ok(extraction.text.includes("const gate = verify(report);"), "code body must survive");
+  assert.ok(!/copy code/i.test(extraction.text), `"Copy code" leaked: ${extraction.text}`);
+  assert.notEqual(extraction.text, "I");
+});
+
+test("extractResponse diagnostics expose textContent length next to innerText length for the truncation fork", () => {
+  // P2: a single native inspect must discriminate innerText-truncation from a genuine short
+  // answer. The selected markdown snippet must report text_chars (innerText) == 1 while
+  // text_content_chars (textContent) reflects the full answer — that per-node gap is the fork
+  // discriminator codex reads live. (The page-level page_text_content_chars field is also added in
+  // code for live inspects; it is not asserted here because this fake DOM stores textContent as a
+  // flat per-node string rather than aggregating descendants like a real DOM, so a page-level
+  // textContent length is not meaningful under the harness.)
+  const fullReview = "## Findings\nThis is a long completed review body with many characters.";
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const markdownAnswer = new FakeElement("div", { class: "markdown prose" }, fullReview);
+  markdownAnswer.innerText = "I";
+  const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "I")
+    .append(markdownAnswer, copy);
+  const body = new FakeElement("body", {}, "I").append(assistant);
+  body.innerText = "I";
+
+  const extraction = extractResponse(new FakeDocument(body));
+
+  const snippet = extraction.diagnostics.markdown_snippets.find((s) => s.text_chars === 1);
+  assert.ok(snippet, "expected a markdown snippet whose innerText is the truncated head");
+  assert.equal(snippet.text_chars, 1);
+  assert.ok(snippet.text_content_chars > 10, `text_content_chars should expose full length, got ${snippet.text_content_chars}`);
+  // Field is present on the diagnostics for live inspects to read.
+  assert.equal(typeof extraction.diagnostics.page_text_content_chars, "number");
+});
+
 test("extractResponse preserves one-word assistant markdown answers that look like model status labels", () => {
   for (const answer of ["GPT-5", "Pro", "Thinking"]) {
     const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "One word");

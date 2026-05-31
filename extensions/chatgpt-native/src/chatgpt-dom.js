@@ -978,7 +978,13 @@ function leafNodes(nodes) {
 }
 
 function cleanAssistantText(node, options = {}) {
-  const lines = textOf(node)
+  // Body text MUST come from textContent, not innerText: a virtualized/clipped long answer node
+  // returns only its rendered head via innerText (observed live as a single "I"). textContent
+  // returns the full DOM text regardless of layout. Per-line control/status stripping below then
+  // removes any code-block "Copy code", sr-only, thought/status, and control lines that
+  // textContent may surface. Fall back to innerText only if textContent is empty (defensive).
+  const source = bodyTextOf(node) || textOf(node);
+  const lines = source
     .split(/\n+/)
     .map((line) => normalizeText(line))
     .filter((line) => line && !isAssistantControlLine(line, options));
@@ -988,6 +994,11 @@ function cleanAssistantText(node, options = {}) {
 function isAssistantControlLine(line, options = {}) {
   const value = normalizeText(line);
   return /^(copy|copied|read aloud|share|regenerate|retry|edit|like|dislike)$/i.test(value)
+    // Code-block affordances: textContent (unlike innerText) surfaces the code-block toolbar
+    // button labels, which ChatGPT renders as "Copy code"/"Copy"/"Edit"/"Copy code button text".
+    // Strip them as standalone lines so a fenced code block in the answer doesn't leak its
+    // toolbar text. Anchored to a standalone line so it never eats real answer prose.
+    || /^copy code$/i.test(value)
     || /^(thought|reasoned)\s+for\s+\S.*$/i.test(value)
     || /^show\s+(more|reasoning)$/i.test(value)
     || (!options.preserveContentStatusText && (isThoughtStatusLine(line) || isModelStatusText(line)));
@@ -1718,8 +1729,17 @@ function looksLikeUserTurn(turn) {
 
 function extractionDiagnostics(root, assistantTurns, copyButtons) {
   const pageText = normalizeText(getPageText(root));
+  // page_text_chars is innerText-derived (getPageText = body.innerText) and therefore
+  // UNDER-reports when ChatGPT virtualizes/clips long turns. page_text_content_chars is the
+  // textContent length, which is layout-independent. A large gap between the two on a completed
+  // turn is the discriminator for the "extracted only a single char" failure mode: if
+  // textContent >> innerText, the answer is present but innerText-truncated (extraction bug,
+  // recovered by the textContent body reader); if both are tiny, the model genuinely produced
+  // little text.
+  const pageTextContentChars = normalizeText(root.body?.textContent ?? root.documentElement?.textContent ?? "").length;
   return {
     page_text_chars: pageText.length,
+    page_text_content_chars: pageTextContentChars,
     body_text_tail: pageText.slice(-500),
     counts: {
       articles: root.querySelectorAll("article").length,
@@ -1747,6 +1767,11 @@ function elementSummary(node) {
     class: String(node?.getAttribute?.("class") ?? "").slice(0, 160),
     aria: String(node?.getAttribute?.("aria-label") ?? "").slice(0, 160),
     text_chars: textOf(node).length,
+    // text_content_chars exposes the layout-independent textContent length next to the
+    // innerText-derived text_chars. On the truncation failure mode this node will show
+    // text_chars=1 ("I") while text_content_chars holds the full answer length — a single
+    // native inspect then settles whether "I" is an extraction artifact or genuine output.
+    text_content_chars: bodyTextOf(node).length,
     text: textOf(node).slice(0, 240)
   };
 }
@@ -1810,6 +1835,18 @@ function includesFolded(value, needle) {
 function textOf(node) {
   const inner = normalizeText(node?.innerText ?? "");
   return inner || normalizeText(node?.textContent ?? "");
+}
+
+// Body-text reader for assistant ANSWER content nodes (markdown leaves), NOT control/label
+// nodes. Uses textContent, not innerText, on purpose: ChatGPT virtualizes/clips long assistant
+// turns, so innerText (layout-dependent) returns only the rendered head — observed live as a
+// single "I" for a completed 955 KB Pro review while the full answer sat in textContent. Because
+// callers pass markdown LEAF nodes (the [class*="markdown"] answer content, never the turn
+// container) and the result is still run through cleanAssistantText's per-line control/status
+// stripping, this recovers the full answer without pulling in reasoning/thinking-block text or
+// code-block "Copy code"/sr-only control lines (those are separate nodes and/or stripped lines).
+function bodyTextOf(node) {
+  return normalizeText(node?.textContent ?? "");
 }
 
 function editableText(node) {
