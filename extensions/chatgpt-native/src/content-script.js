@@ -188,6 +188,12 @@ async function inspectPage(runId, options = {}) {
     active_job_ids: Array.from(activeJobs.keys()),
     extraction,
     model_selection: modelSelectionDiagnostics(document),
+    // Runtime build marker for the CONTENT SCRIPT specifically. Content scripts already injected
+    // into open tabs do NOT refresh when the extension is reloaded (only the service worker
+    // does), so a stale content script can emit old diagnostics (e.g. snippets without
+    // text_content_chars) even when the SW build is current. Surfacing the content-script
+    // manifest version here lets an operator detect that stale-injected-script case directly.
+    content_script_build: contentScriptBuild(),
     page_text_chars: pageText.length
   };
   if (options.include_page_text) {
@@ -289,6 +295,14 @@ function commandError(code, message, detail = {}) {
   error.phase = detail.phase;
   error.side_effect_started = detail.side_effect_started;
   return error;
+}
+
+function contentScriptBuild() {
+  try {
+    return chrome.runtime?.getManifest?.().version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function runIdFromUrl(value) {

@@ -642,6 +642,13 @@ async function handleInspectRun(message) {
     run_id: runId,
     payload: {
       run_id: runId,
+      // Runtime build marker for the SERVICE WORKER. Lets an operator confirm the live SW is the
+      // expected build before trusting (or distrusting) the diagnostics fields below — if this
+      // does not match the shipped version, Chrome is running a stale service worker and any
+      // missing P2 fields are a reload problem, not a code bug. Each inspected tab also carries
+      // content_script_build (see inspectPage) since content scripts in already-open tabs do not
+      // refresh on extension reload even when the SW does.
+      service_worker_build: EXTENSION_VERSION,
       tabs: matches
     }
   }));

@@ -878,6 +878,134 @@ test("service worker inspect_run omits broad page text by default", async () => 
   }
 });
 
+test("service worker inspect_run surfaces the textContent diagnostics and a runtime build marker", async () => {
+  // P2: the innerText-vs-textContent truncation discriminator must reach `yoetz browser extension
+  // inspect` output. This drives the full inspect_run -> sanitizeInspection -> diagnosticPayload
+  // projection and asserts (a) the page-level page_text_chars + page_text_content_chars survive,
+  // (b) per-snippet text_content_chars survives on markdown_snippets/assistant_turn_snippets, and
+  // (c) the service_worker_build runtime marker is present so an operator can confirm the live SW
+  // is the expected build before trusting/distrusting the fields (stale-runtime disambiguation).
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      query: async () => [{ id: 11, url: "https://chatgpt.com/c/run", title: "Yoetz run" }],
+      sendMessage: async (_id, message) => {
+        assert.equal(message.type, "yoetz_inspect_page");
+        return {
+          ok: true,
+          payload: {
+            url: "https://chatgpt.com/c/run",
+            title: "Yoetz run",
+            window_name: "yoetz-chatgpt-native:run_inspect:job_inspect",
+            ownership: { run_id: "run_inspect", job_id: "job_inspect" },
+            active_job_ids: ["job_inspect"],
+            content_script_build: "9.9.9-content",
+            page_text_chars: 42,
+            extraction: {
+              method: "copy_scope_dom_fallback",
+              text: "I",
+              diagnostics: {
+                page_text_chars: 42,
+                page_text_content_chars: 10823,
+                counts: { markdown: 1, assistant_turns: 1 },
+                markdown_snippets: [{ tag: "div", role: "", text: "I", text_chars: 1, text_content_chars: 10823 }],
+                assistant_turn_snippets: [{ tag: "article", role: "assistant", text: "I", text_chars: 1, text_content_chars: 10823 }],
+                article_snippets: [],
+                stop_control_snippets: []
+              }
+            }
+          }
+        };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?inspect_textcontent=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("inspect_run", "job_inspect", { run_id: "run_inspect" }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    // (A) service-worker runtime build marker present on the inspect envelope.
+    assert.equal(typeof complete.payload.service_worker_build, "string");
+    assert.ok(complete.payload.service_worker_build.length > 0);
+    const inspection = complete.payload.tabs[0].inspection;
+    // (C) content-script runtime build marker passed through sanitizeInspection's spread.
+    assert.equal(inspection.content_script_build, "9.9.9-content");
+    const diagnostics = inspection.extraction.diagnostics;
+    // (B)+(D) page-level + per-snippet textContent discriminator survives the projection.
+    assert.equal(diagnostics.page_text_chars, 42);
+    assert.equal(diagnostics.page_text_content_chars, 10823);
+    assert.equal(diagnostics.markdown_snippets[0].text_content_chars, 10823);
+    assert.equal(diagnostics.assistant_turn_snippets[0].text_content_chars, 10823);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("diagnosticPayload defensively emits page-level textContent keys even when source omits them", async () => {
+  // Defensiveness guard: the KEY must be present (even as null) when the source diagnostics lack
+  // page_text_content_chars, so the mere presence of the key in live inspect output proves the new
+  // service-worker code is executing (its total absence => stale runtime, not a code bug).
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      query: async () => [{ id: 12, url: "https://chatgpt.com/c/run", title: "Yoetz run" }],
+      sendMessage: async (_id, message) => {
+        assert.equal(message.type, "yoetz_inspect_page");
+        return {
+          ok: true,
+          payload: {
+            url: "https://chatgpt.com/c/run",
+            title: "Yoetz run",
+            window_name: "yoetz-chatgpt-native:run_inspect:job_inspect",
+            ownership: { run_id: "run_inspect", job_id: "job_inspect" },
+            active_job_ids: ["job_inspect"],
+            extraction: {
+              method: "assistant_dom_fallback",
+              text: "answer",
+              // Source diagnostics WITHOUT the page-level textContent field (stale content script).
+              diagnostics: {
+                counts: { assistant_turns: 1 },
+                assistant_turn_snippets: [{ text: "answer" }],
+                article_snippets: [],
+                markdown_snippets: [],
+                stop_control_snippets: []
+              }
+            }
+          }
+        };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?inspect_defensive=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("inspect_run", "job_inspect", { run_id: "run_inspect" }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    const diagnostics = complete.payload.tabs[0].inspection.extraction.diagnostics;
+    // Keys present (the diagnostics object literally has the property) even though the value is null.
+    assert.ok(Object.hasOwn(diagnostics, "page_text_content_chars"));
+    assert.ok(Object.hasOwn(diagnostics, "page_text_chars"));
+    assert.equal(diagnostics.page_text_content_chars, null);
+    assert.equal(diagnostics.page_text_chars, null);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker inspect_run can target a ChatGPT conversation id", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
