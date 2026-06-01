@@ -210,6 +210,39 @@ export async function ensureFreshChat(root = document, job = {}, options = {}) {
   };
 }
 
+export async function ensureConversationLoaded(root = document, conversationId, options = {}) {
+  const win = options.window ?? root.defaultView ?? globalThis;
+  const pathname = String(win.location?.pathname ?? "");
+  const loadedConversationId = conversationIdFromPathname(pathname);
+  if (loadedConversationId !== conversationId) {
+    throw chatgptCommandError(
+      "conversation_not_loaded",
+      `ChatGPT conversation ${conversationId} did not load; current path is ${pathname || "(unknown)"}`,
+      {
+        phase: "upload",
+        side_effect_started: false
+      }
+    );
+  }
+  try {
+    await waitForElement(root, findComposer, "ChatGPT composer", options);
+  } catch (error) {
+    throw chatgptCommandError(
+      "conversation_not_loaded",
+      `ChatGPT conversation ${conversationId} did not load a composer: ${String(error?.message ?? error)}`,
+      {
+        phase: "upload",
+        side_effect_started: false
+      }
+    );
+  }
+  return {
+    status: "loaded",
+    conversation_id: conversationId,
+    pathname
+  };
+}
+
 export async function configureModelState(root) {
   const requested = proExtendedModelRequest();
   const selection = await selectRequestedModel(root, requested);
@@ -1924,6 +1957,30 @@ function describeElement(node) {
     .filter(Boolean)
     .join(" ");
   return `${node.tagName?.toLowerCase?.() ?? "element"}${attrs ? ` ${attrs}` : ""}`;
+}
+
+function conversationIdFromPathname(pathname) {
+  const match = String(pathname ?? "").match(/^\/c\/([^/?#]+)$/);
+  if (!match) {
+    return null;
+  }
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function chatgptCommandError(code, message, detail = {}) {
+  const error = new Error(message);
+  error.code = code;
+  if (detail.phase) {
+    error.phase = detail.phase;
+  }
+  if (typeof detail.side_effect_started === "boolean") {
+    error.side_effect_started = detail.side_effect_started;
+  }
+  return error;
 }
 
 function sleep(ms) {

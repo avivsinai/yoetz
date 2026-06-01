@@ -4,6 +4,7 @@ import {
   clickSend,
   clickStopGenerating,
   configureModelState,
+  ensureConversationLoaded,
   ensureFreshChat,
   extractResponse,
   findModelButton,
@@ -1231,6 +1232,31 @@ test("ensureFreshChat rejects old transcript residue on a fresh-looking path", a
   await assert.rejects(
     () => ensureFreshChat(doc, { run_id: "run_dirty" }, { timeoutMs: 30, intervalMs: 10 }),
     /old conversation transcript did not clear|not a clean fresh chat/
+  );
+});
+
+test("ensureConversationLoaded accepts the requested conversation with a composer", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+  const body = new FakeElement("body", {}, "").append(composer);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  const loaded = await ensureConversationLoaded(doc, "conv-123", { timeoutMs: 30, intervalMs: 10 });
+
+  assert.equal(loaded.status, "loaded");
+  assert.equal(loaded.conversation_id, "conv-123");
+  assert.equal(loaded.pathname, "/c/conv-123");
+});
+
+test("ensureConversationLoaded rejects the wrong conversation before send", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+  const body = new FakeElement("body", {}, "").append(composer);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/other";
+
+  await assert.rejects(
+    () => ensureConversationLoaded(doc, "conv-123", { timeoutMs: 30, intervalMs: 10 }),
+    (error) => error.code === "conversation_not_loaded"
   );
 });
 
