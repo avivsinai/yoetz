@@ -6,6 +6,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- The ChatGPT native extension no longer hangs after a completed Pro review.
+  When a large bundle produced a long assistant turn, the wait loop could keep
+  waiting for final assistant controls even though generation had finished and
+  the response was complete. Assistant body text is now read from
+  `textContent` (layout-independent) instead of `innerText` (which returns only
+  the rendered head of a virtualized/clipped long answer), so the real answer
+  node is selected, the existing same-turn copy-button binding fires, and the
+  turn completes normally and promptly. The 955 KB Pro-review bundle that
+  previously hung now returns the full review with no fallback.
+- Native ChatGPT response extraction no longer falls back to whole-page text
+  (and then stalls) when the assistant turn's container class embeds a CSS
+  keyword such as `var(--header-height)`. Conversation-chrome detection now
+  matches keywords like `header`/`nav`/`aside` as whole class tokens instead of
+  substrings, so a styled answer turn is correctly recognized as the response.
+
+### Added
+
+- `yoetz browser extension inspect --chatgpt` now reports `page_text_content_chars`
+  and per-snippet `text_content_chars` (textContent lengths) alongside the
+  existing innerText-based `page_text_chars`/`text_chars`, so the
+  innerText-vs-textContent gap on a completed turn is observable from a single
+  native inspect. Inspect output also carries `service_worker_build` and
+  `content_script_build` markers so the loaded extension build can be verified
+  against the CLI.
+
+### Changed
+
+- The native ChatGPT response-wait loop confirms a copy-button-final turn over a
+  short fast-poll window (~8s) instead of the previous ~90s stable-idle floor,
+  so short responses (and the transport canary) return promptly without
+  weakening the completion latch.
 
 ## [0.5.19] - 2026-05-31
 
