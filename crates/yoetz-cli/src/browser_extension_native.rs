@@ -999,23 +999,7 @@ pub fn run_chatgpt_recipe(
         "job_start",
         Some(job_id.clone()),
         Some(spec.run_id.clone()),
-        json!({
-            "recipe": "chatgpt",
-            "bundle_path": bundle.path,
-            "file_name": bundle.file_name,
-            "bundle_size": bundle.size,
-            "mime": bundle.mime,
-            "prompt": spec.prompt,
-            "model": spec.model,
-            "browser_context_id": spec.browser_context_id,
-            "profile_email": spec.profile_email,
-            "extension_instance_id": spec.extension_instance_id,
-            "extension_profile_id": spec.extension_profile_id,
-            "wait_timeout_ms": spec.wait_timeout_ms,
-            "wait_interval_ms": spec.wait_interval_ms,
-            "upload_timeout_ms": spec.upload_timeout_ms,
-            "send_timeout_ms": spec.send_timeout_ms,
-        }),
+        chatgpt_job_start_payload(spec, &bundle),
     )
     .with_token(token);
     write_json_frame(&mut stream, &start)?;
@@ -1045,6 +1029,27 @@ pub fn serve_native_host_chatgpt() -> Result<()> {
     {
         bail!("chrome-extension-native native host is currently supported on macOS/Linux only")
     }
+}
+
+fn chatgpt_job_start_payload(spec: &ChatgptRecipeSpec, bundle: &BundleInfo) -> Value {
+    json!({
+        "recipe": "chatgpt",
+        "bundle_path": bundle.path,
+        "file_name": bundle.file_name,
+        "bundle_size": bundle.size,
+        "mime": bundle.mime,
+        "prompt": spec.prompt,
+        "model": spec.model,
+        "browser_context_id": spec.browser_context_id,
+        "profile_email": spec.profile_email,
+        "extension_instance_id": spec.extension_instance_id,
+        "extension_profile_id": spec.extension_profile_id,
+        "conversation_id": spec.conversation_id,
+        "wait_timeout_ms": spec.wait_timeout_ms,
+        "wait_interval_ms": spec.wait_interval_ms,
+        "upload_timeout_ms": spec.upload_timeout_ms,
+        "send_timeout_ms": spec.send_timeout_ms,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -3067,6 +3072,35 @@ mod tests {
         let decoded = read_json_frame(&mut &buf[..]).unwrap();
         assert_eq!(decoded.kind, "job_progress");
         assert_eq!(decoded.payload["message"], "uploading");
+    }
+
+    #[test]
+    fn chatgpt_job_start_payload_carries_conversation_id() {
+        let bundle = BundleInfo {
+            path: PathBuf::from("/tmp/yoetz-bundle.md"),
+            file_name: "yoetz-bundle.md".to_string(),
+            size: 42,
+            mime: "text/markdown".to_string(),
+        };
+        let spec = ChatgptRecipeSpec {
+            bundle_path: Some(bundle.path.clone()),
+            model: "extended-pro".to_string(),
+            prompt: "continue".to_string(),
+            browser_context_id: None,
+            profile_email: None,
+            extension_instance_id: None,
+            extension_profile_id: None,
+            conversation_id: Some("conv-123".to_string()),
+            run_id: "run-123".to_string(),
+            wait_timeout_ms: 10_000,
+            wait_interval_ms: 1_000,
+            upload_timeout_ms: 2_000,
+            send_timeout_ms: 3_000,
+        };
+
+        let payload = chatgpt_job_start_payload(&spec, &bundle);
+
+        assert_eq!(payload["conversation_id"], "conv-123");
     }
 
     #[test]

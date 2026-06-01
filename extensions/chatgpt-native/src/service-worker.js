@@ -886,6 +886,7 @@ function normalizeJob(message) {
     profile_email: payload.profile_email ?? null,
     extension_instance_id: payload.extension_instance_id ?? null,
     extension_profile_id: payload.extension_profile_id ?? null,
+    conversation_id: payload.conversation_id ?? null,
     bundle_size: payload.bundle_size ?? 0,
     file_name: payload.file_name ?? "yoetz-bundle.md",
     model_selection_status: "unavailable",

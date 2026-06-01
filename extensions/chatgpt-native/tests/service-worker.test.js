@@ -96,6 +96,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     for (const jobId of jobs) {
       port.emit(envelope("job_start", jobId, {
         prompt: `prompt ${jobId}`,
+        ...(jobId === "job_a" ? { conversation_id: "conv-resume-a" } : {}),
         wait_interval_ms: 500,
         wait_timeout_ms: 2500
       }));
@@ -132,6 +133,14 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     assert.equal(
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.conversation_url,
       "https://chatgpt.com/c/conv-job_a"
+    );
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_a")?.message.job.conversation_id,
+      "conv-resume-a"
+    );
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_b")?.message.job.conversation_id,
+      null
     );
     assert.equal(sentToTabs.filter((item) => item.message.type === "yoetz_upload_file").length, 2);
     assert.equal(

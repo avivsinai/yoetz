@@ -4822,6 +4822,21 @@ mod tests {
     }
 
     #[test]
+    fn conversation_selector_allows_native_transport_route() {
+        let vars = std::collections::BTreeMap::from([(
+            "conversation".to_string(),
+            "conv-123".to_string(),
+        )]);
+        ensure_chatgpt_transport_constraints_allow_any(
+            &[browser::RecipeTransport::ChromeExtensionNative],
+            Some(browser::RecipeTransport::ChromeExtensionNative),
+            &vars,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn conversation_selector_rejects_non_native_transport_routes() {
         let vars = std::collections::BTreeMap::from([(
             "conversation".to_string(),
