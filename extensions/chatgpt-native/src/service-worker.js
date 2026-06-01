@@ -24,6 +24,26 @@ const MAX_FINAL_AFFORDANCE_IDLE_MS = Math.max(
   MIN_STABLE_IDLE_MS,
   Number(globalThis.__YOETZ_MAX_FINAL_AFFORDANCE_IDLE_MS ?? 5 * 60 * 1000) || 5 * 60 * 1000
 );
+// Once ChatGPT has exposed a final assistant affordance (copy control) AND scoped
+// text is extractable AND generation has stopped, the response is structurally
+// complete. Confirm it over a SHORT stable window at a FAST cadence instead of
+// waiting out the full MIN_STABLE_IDLE_MS late-hydration floor. The dual-candidate
+// latch still re-arms this window on any text growth (selectFinalAffordanceCandidate
+// -> resetTimer), so a still-hydrating response cannot complete early; this only
+// removes the dead wall-clock wait after the text has genuinely settled. This is the
+// post-affordance confirm window and is always clamped to the slower idle floor so it
+// can only ever shorten the wait, never lengthen it.
+const MIN_AFFORDANCE_CONFIRM_MS = Math.max(
+  0,
+  Number(globalThis.__YOETZ_MIN_AFFORDANCE_CONFIRM_MS ?? 8000)
+);
+// Fast poll cadence used only while a final affordance is latched, so the short
+// confirm window is actually sampled across several polls instead of a single coarse
+// 30s tick overshooting it.
+const AFFORDANCE_CONFIRM_POLL_MS = Math.max(
+  250,
+  Number(globalThis.__YOETZ_AFFORDANCE_CONFIRM_POLL_MS ?? 1500) || 1500
+);
 const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   1024,
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
@@ -622,9 +642,27 @@ async function handleInspectRun(message) {
     run_id: runId,
     payload: {
       run_id: runId,
+      // Runtime build marker for the SERVICE WORKER. Lets an operator confirm the live SW is the
+      // expected build before trusting (or distrusting) the diagnostics fields below — if this
+      // does not match the shipped version, Chrome is running a stale service worker and any
+      // missing P2 fields are a reload problem, not a code bug. Each inspected tab also carries
+      // content_script_build (see inspectPage) since content scripts in already-open tabs do not
+      // refresh on extension reload even when the SW does.
+      service_worker_build: serviceWorkerBuild(),
       tabs: matches
     }
   }));
+}
+
+// Runtime build marker for the service worker (manifest version of the LIVE SW). Used in the
+// inspect payload so an operator can confirm the running SW is the expected build before
+// trusting/distrusting the diagnostics fields. Defensive: never throws inside handleInspectRun.
+function serviceWorkerBuild() {
+  try {
+    return chrome.runtime?.getManifest?.().version ?? "unknown";
+  } catch {
+    return "unknown";
+  }
 }
 
 function sanitizeInspection(inspection) {
@@ -1113,6 +1151,11 @@ async function waitForResponse(job) {
   job.response_wait_started_at = startedAt;
   const interval = Math.max(500, Math.min(Number(job.wait_interval_ms) || 30000, 30000));
   const finalAffordanceIdleMs = responseStableIdleThresholdMs(interval);
+  // The post-affordance confirm window is clamped to the idle floor so it can only
+  // shorten the wait for a settled response, never extend it past the late-hydration
+  // ceiling (and so test envs that drive MIN_STABLE_IDLE_MS below the confirm default
+  // still complete promptly).
+  const affordanceConfirmMs = Math.min(MIN_AFFORDANCE_CONFIRM_MS, finalAffordanceIdleMs);
   let best = { method: "none", text: "", is_generating: true };
   let last = { method: "none", text: "", is_generating: true };
   let finalAffordanceCandidate = null;
@@ -1186,7 +1229,12 @@ async function waitForResponse(job) {
         finalAffordanceCandidateSinceMs = Date.now();
       }
       stableForMs = Date.now() - finalAffordanceCandidateSinceMs;
-      if (stableForMs >= finalAffordanceIdleMs) {
+      // The latch above only re-stamps finalAffordanceCandidateSinceMs on a
+      // timer-resetting candidate change (first candidate or text growth), so
+      // stableForMs is "time since the scoped text last grew". Once that has held
+      // for the short confirm window, the response is settled — emit instead of
+      // burning the full idle floor.
+      if (stableForMs >= affordanceConfirmMs) {
         return completedExtraction(finalAffordanceCandidate, "copy_button", stableForMs);
       }
     } else if (extraction?.is_generating) {
@@ -1221,7 +1269,13 @@ async function waitForResponse(job) {
     } else {
       extractionFailureSinceMs = 0;
     }
-    const nextDelay = (finalAffordance || finalAffordanceWithoutScopedText) ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500)) : interval;
+    const nextDelay = finalAffordance
+      // Poll fast while confirming a latched final affordance so the short confirm
+      // window is sampled across several ticks rather than overshot by a coarse poll.
+      ? Math.min(interval, AFFORDANCE_CONFIRM_POLL_MS)
+      : (finalAffordanceWithoutScopedText
+          ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500))
+          : interval);
     const nowMs = Date.now();
     const elapsedMs = nowMs - startedAt;
     if (nowMs - lastWaitingProgressAt >= WAITING_RESPONSE_PROGRESS_INTERVAL_MS) {
@@ -1346,6 +1400,13 @@ function diagnosticPayload(diagnostics) {
     return null;
   }
   return {
+    // page_text_content_chars (textContent length) is surfaced alongside the snippet
+    // text_content_chars so an operator running `yoetz browser extension inspect` can compare it
+    // to the innerText-derived page_text_chars and settle the innerText-vs-textContent truncation
+    // fork. Snippets are passed through verbatim below, so each already carries text_content_chars
+    // from elementSummary; this only had to re-add the page-level field that the projection dropped.
+    page_text_chars: diagnostics.page_text_chars ?? null,
+    page_text_content_chars: diagnostics.page_text_content_chars ?? null,
     counts: diagnostics.counts ?? {},
     assistant_turn_snippets: (diagnostics.assistant_turn_snippets ?? []).slice(-3),
     article_snippets: (diagnostics.article_snippets ?? []).slice(-3),

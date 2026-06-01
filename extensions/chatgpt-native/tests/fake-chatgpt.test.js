@@ -429,6 +429,110 @@ test("extractResponse returns single-letter assistant markdown with a copy affor
   assert.equal(extraction.has_copy_button, true);
 });
 
+test("extractResponse recovers the full answer when innerText is virtualized to a head char (textContent body reader)", () => {
+  // P1 regression guard for the live 955 KB Pro-review failure: ChatGPT virtualized/clipped the
+  // long assistant turn, so the markdown body's innerText collapsed to the rendered head "I" while
+  // textContent still held the full answer. The body reader must use textContent, recover the full
+  // review, and strip a code-block "Copy code" toolbar line without eating the code body or prose.
+  const fullReview = [
+    "## Findings",
+    "1. The cutover gate can be green with fabricated evidence.",
+    "Copy code",
+    "const gate = verify(report);",
+    "2. Rollback transcript verification is sound."
+  ].join("\n");
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const markdownAnswer = new FakeElement("div", { class: "markdown prose" }, fullReview);
+  // Simulate virtualization: layout-derived innerText shows only the rendered head; textContent
+  // (set above via the constructor text) retains the full DOM text.
+  markdownAnswer.innerText = "I";
+  const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Thought for 9m 44s\n\nI")
+    .append(markdownAnswer, copy);
+  const body = new FakeElement("body", {}, "I").append(assistant);
+
+  const extraction = extractResponse(new FakeDocument(body));
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.has_copy_button, true);
+  assert.ok(extraction.text.includes("## Findings"), `expected full review, got: ${extraction.text}`);
+  assert.ok(extraction.text.includes("Rollback transcript verification is sound."));
+  assert.ok(extraction.text.includes("const gate = verify(report);"), "code body must survive");
+  assert.ok(!/copy code/i.test(extraction.text), `"Copy code" leaked: ${extraction.text}`);
+  assert.notEqual(extraction.text, "I");
+});
+
+test("extractResponse selects the answer turn when its class embeds a chrome keyword inside a Tailwind CSS expression", () => {
+  // Live regression (conversation 6a1d4327, GPT-5.5 Pro "OK" canary on branch tip 03685ec): the
+  // assistant turn <section data-testid="conversation-turn-2"> carries a Tailwind utility token
+  // scroll-mt-[calc(var(--header-height)+min(200px,max(70px,20svh)))]. The old chrome filter ran a
+  // /\bheader\b/i test against the whole class string, so the "header" inside var(--header-height)
+  // mis-flagged the entire answer turn as non-conversation chrome. extractResponse dropped the
+  // "OK" markdown node and fell to page_text_fallback (excluded from completion), so the wait loop
+  // hung (stable_for_ms=90553) even though the answer "OK" + a copy button were present and
+  // is_generating=false. The toggle button "Thought for 16s" is the collapsed reasoning header and
+  // must not be mistaken for the answer. The chrome filter must only treat WHOLE class tokens as
+  // chrome, never substrings of arbitrary CSS expressions.
+  const turnSectionClass = "text-token-text-primary w-full focus:outline-none "
+    + "has-data-writing-block:pointer-events-none "
+    + "scroll-mt-[calc(var(--header-height)+min(200px,max(70px,20svh)))]";
+  const reasoningToggle = new FakeElement("button", { type: "button", class: "text-token-text-tertiary" }, "Thought for 16s");
+  const reasoningHeader = new FakeElement("div", { class: "flex items-center justify-between" }, "Thought for 16s")
+    .append(reasoningToggle);
+  const answerMarkdown = new FakeElement("div", { class: "markdown prose dark:prose-invert markdown-new-styling" }, "OK");
+  const answerWrap = new FakeElement("div", { class: "flex w-full flex-col gap-1 empty:hidden" }, "OK").append(answerMarkdown);
+  const assistantMessage = new FakeElement("div", {
+    "data-message-author-role": "assistant",
+    "data-message-model-slug": "gpt-5-5-pro",
+    class: "min-h-8 text-message"
+  }, "OK").append(answerWrap);
+  const grow = new FakeElement("div", { class: "flex max-w-full flex-col gap-4 grow" }, "Thought for 16s OK")
+    .append(reasoningHeader, assistantMessage);
+  const turnMessages = new FakeElement("div", { class: "mx-auto group/turn-messages flex w-full" }, "Thought for 16s OK").append(grow);
+  const copy = new FakeElement("button", { "aria-label": "Copy response", "data-testid": "copy-turn-action-button" }, "Copy");
+  const actions = new FakeElement("div", { "aria-label": "Response actions", role: "group" }, "Copy").append(copy);
+  const turnSection = new FakeElement("section", { "data-testid": "conversation-turn-2", "data-turn": "assistant", class: turnSectionClass }, "Thought for 16s OK")
+    .append(turnMessages, actions);
+  const user = new FakeElement("section", { "data-testid": "conversation-turn-1" }, "Reply with OK")
+    .append(new FakeElement("div", { "data-message-author-role": "user", class: "user-turn" }, "Reply with OK"));
+  const conversation = new FakeElement("main", { role: "main" }, "Reply with OK Thought for 16s OK").append(user, turnSection);
+  const body = new FakeElement("body", {}, "Reply with OK Thought for 16s OK").append(conversation);
+
+  const extraction = extractResponse(new FakeDocument(body));
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback", `expected scoped extraction, got ${extraction.method} (${JSON.stringify(extraction.text)})`);
+  assert.equal(extraction.text, "OK");
+  assert.equal(extraction.has_copy_button, true);
+  assert.equal(extraction.is_generating, false);
+  assert.notEqual(extraction.turn_index, -1);
+});
+
+test("extractResponse diagnostics expose textContent length next to innerText length for the truncation fork", () => {
+  // P2: a single native inspect must discriminate innerText-truncation from a genuine short
+  // answer. The selected markdown snippet must report text_chars (innerText) == 1 while
+  // text_content_chars (textContent) reflects the full answer — that per-node gap is the fork
+  // discriminator codex reads live. (The page-level page_text_content_chars field is also added in
+  // code for live inspects; it is not asserted here because this fake DOM stores textContent as a
+  // flat per-node string rather than aggregating descendants like a real DOM, so a page-level
+  // textContent length is not meaningful under the harness.)
+  const fullReview = "## Findings\nThis is a long completed review body with many characters.";
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const markdownAnswer = new FakeElement("div", { class: "markdown prose" }, fullReview);
+  markdownAnswer.innerText = "I";
+  const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "I")
+    .append(markdownAnswer, copy);
+  const body = new FakeElement("body", {}, "I").append(assistant);
+  body.innerText = "I";
+
+  const extraction = extractResponse(new FakeDocument(body));
+
+  const snippet = extraction.diagnostics.markdown_snippets.find((s) => s.text_chars === 1);
+  assert.ok(snippet, "expected a markdown snippet whose innerText is the truncated head");
+  assert.equal(snippet.text_chars, 1);
+  assert.ok(snippet.text_content_chars > 10, `text_content_chars should expose full length, got ${snippet.text_content_chars}`);
+  // Field is present on the diagnostics for live inspects to read.
+  assert.equal(typeof extraction.diagnostics.page_text_content_chars, "number");
+});
+
 test("extractResponse preserves one-word assistant markdown answers that look like model status labels", () => {
   for (const answer of ["GPT-5", "Pro", "Thinking"]) {
     const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "One word");
