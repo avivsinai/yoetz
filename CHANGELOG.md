@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.20] - 2026-06-01
 ### Fixed
 
 - The ChatGPT native extension no longer hangs after a completed Pro review.
@@ -39,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   short fast-poll window (~8s) instead of the previous ~90s stable-idle floor,
   so short responses (and the transport canary) return promptly without
   weakening the completion latch.
+
 
 ## [0.5.19] - 2026-05-31
 
