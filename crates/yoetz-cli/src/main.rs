@@ -1961,6 +1961,10 @@ fn build_chatgpt_recipe_spec(
         dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, recipe_args.bundle.as_deref())?;
     let send_timeout_ms = dev_browser::resolve_chatgpt_send_timeout_ms(recipe_vars)?;
     chrome_devtools_mcp::RecipeThreadMode::parse(recipe_vars.get("thread").map(String::as_str))?;
+    let conversation = recipe_vars
+        .get("conversation")
+        .map(|value| chatgpt_web::normalize_conversation(value))
+        .transpose()?;
     Ok(chatgpt_recipe::ChatgptRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
         model: chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL.to_string(),
@@ -1984,6 +1988,7 @@ fn build_chatgpt_recipe_spec(
             .get("extension_profile_id")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        conversation_id: conversation.map(|value| value.id),
         run_id: recipe_vars
             .get("run_id")
             .cloned()
@@ -5434,6 +5439,10 @@ mod tests {
             ("profile_email".to_string(), "user@example.com".to_string()),
             ("extension_instance_id".to_string(), "ext-work".to_string()),
             ("extension_profile_id".to_string(), "gaia-work".to_string()),
+            (
+                "conversation".to_string(),
+                "https://chat.openai.com/c/conv-123?model=gpt-4".to_string(),
+            ),
             ("run_id".to_string(), "run-123".to_string()),
             ("wait_timeout_ms".to_string(), "2400000".to_string()),
             ("wait_interval_ms".to_string(), "45000".to_string()),
@@ -5449,6 +5458,7 @@ mod tests {
         assert_eq!(spec.profile_email.as_deref(), Some("user@example.com"));
         assert_eq!(spec.extension_instance_id.as_deref(), Some("ext-work"));
         assert_eq!(spec.extension_profile_id.as_deref(), Some("gaia-work"));
+        assert_eq!(spec.conversation_id.as_deref(), Some("conv-123"));
         assert_eq!(spec.run_id, "run-123");
         assert_eq!(spec.wait_timeout_ms, 2_400_000);
         assert_eq!(spec.wait_interval_ms, 45_000);

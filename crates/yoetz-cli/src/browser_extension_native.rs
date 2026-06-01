@@ -904,6 +904,7 @@ pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Val
         profile_email: selector.profile_email.map(str::to_string),
         extension_instance_id: selector.extension_instance_id.map(str::to_string),
         extension_profile_id: selector.extension_profile_id.map(str::to_string),
+        conversation_id: None,
         run_id: new_id("canary"),
         wait_timeout_ms: 180_000,
         wait_interval_ms: 1_000,

@@ -9,6 +9,8 @@ use time::{format_description::FormatItem, macros::format_description, OffsetDat
 use crate::chatgpt_recipe::ChatgptModelSelectionStatus;
 
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
+const CHATGPT_LEGACY_HOST: &str = "chat.openai.com";
+const CHATGPT_HOST: &str = "chatgpt.com";
 pub const COMPOSER_SELECTOR: &str =
     "#prompt-textarea, div[contenteditable='true'][role='textbox'], [role='textbox']";
 pub const MODEL_SELECTOR_BUTTON_SELECTOR: &str = "[data-testid='model-switcher-dropdown-button'], button[aria-label='Model selector'], button[aria-label='Model selector menu'], button:has([data-testid='selected-model']), button:has([data-testid='model-switcher-selected-model'])";
@@ -96,6 +98,12 @@ const LOGIN_MARKERS: &[&str] = &[
     "continue with apple",
 ];
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChatgptConversation {
+    pub id: String,
+    pub url: String,
+}
+
 pub fn stable_idle_threshold_ms(interval_ms: u64) -> u64 {
     interval_ms
         .saturating_mul(STABLE_IDLE_INTERVAL_MULTIPLIER)
@@ -137,6 +145,74 @@ pub fn validate_thread_mode(raw: Option<&str>) -> Result<()> {
     }
 }
 
+pub fn normalize_conversation(raw: &str) -> Result<ChatgptConversation> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!(
+            "invalid `conversation`: expected a ChatGPT conversation id or /c/<id> URL"
+        ));
+    }
+    let id = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        conversation_id_from_url(trimmed)?
+    } else {
+        trimmed.to_string()
+    };
+    validate_conversation_id(&id)?;
+    Ok(ChatgptConversation {
+        url: chatgpt_conversation_url(&id),
+        id,
+    })
+}
+
+pub fn chatgpt_conversation_url(conversation_id: &str) -> String {
+    format!(
+        "{CHATGPT_URL}c/{}",
+        percent_encode_path_segment(conversation_id)
+    )
+}
+
+fn conversation_id_from_url(raw: &str) -> Result<String> {
+    let without_scheme = raw.strip_prefix("https://").ok_or_else(|| {
+        anyhow!("invalid `conversation` URL: expected https://chatgpt.com/c/<id>")
+    })?;
+    let (host, path_and_more) = without_scheme.split_once('/').ok_or_else(|| {
+        anyhow!("invalid `conversation` URL: expected https://chatgpt.com/c/<id>")
+    })?;
+    let host = host.to_ascii_lowercase();
+    if host != CHATGPT_HOST && host != CHATGPT_LEGACY_HOST {
+        return Err(anyhow!(
+            "invalid `conversation` URL host `{host}`; expected chatgpt.com or chat.openai.com"
+        ));
+    }
+    let path = path_and_more.split(['?', '#']).next().unwrap_or_default();
+    let id = path
+        .strip_prefix("c/")
+        .ok_or_else(|| anyhow!("invalid `conversation` URL path: expected /c/<id>"))?;
+    if id.contains('/') {
+        return Err(anyhow!(
+            "invalid `conversation` URL path: expected a single /c/<id> path segment"
+        ));
+    }
+    Ok(id.to_string())
+}
+
+fn validate_conversation_id(id: &str) -> Result<()> {
+    let valid = !id.is_empty()
+        && id != "."
+        && id != ".."
+        && id.len() <= 256
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "invalid `conversation`: expected 1-256 ASCII letters, digits, `_`, `-`, or `.`"
+        ))
+    }
+}
+
 pub fn mark_chatgpt_url(run_id: &str) -> String {
     format!("{CHATGPT_URL}?{}", chatgpt_run_url_marker(run_id))
 }
@@ -146,6 +222,18 @@ pub(crate) fn chatgpt_run_url_marker(run_id: &str) -> String {
 }
 
 fn percent_encode_query_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn percent_encode_path_segment(value: &str) -> String {
     let mut encoded = String::new();
     for byte in value.bytes() {
         if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
@@ -1925,6 +2013,54 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("unsupported `thread` value `sideways`"));
         assert!(msg.contains("fresh"));
+    }
+
+    #[test]
+    fn normalize_conversation_accepts_ids_and_chatgpt_urls() {
+        let cases = [
+            (
+                "6a0228a7-4994-832d-8bb0-ea6b35d1b7af",
+                "6a0228a7-4994-832d-8bb0-ea6b35d1b7af",
+            ),
+            (
+                "https://chatgpt.com/c/6a0228a7-4994-832d-8bb0-ea6b35d1b7af?_yoetz=run-1",
+                "6a0228a7-4994-832d-8bb0-ea6b35d1b7af",
+            ),
+            ("https://chat.openai.com/c/legacy_123#thread", "legacy_123"),
+        ];
+
+        for (raw, expected_id) in cases {
+            let conversation = normalize_conversation(raw).unwrap();
+            assert_eq!(conversation.id, expected_id);
+            assert_eq!(
+                conversation.url,
+                format!("https://chatgpt.com/c/{expected_id}")
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_conversation_rejects_unsafe_or_wrong_targets() {
+        for raw in [
+            "",
+            "   ",
+            "https://example.com/c/conv-123",
+            "http://chatgpt.com/c/conv-123",
+            "https://chatgpt.com/",
+            "https://chatgpt.com/g/g-123",
+            "https://chatgpt.com/c/conv-123/extra",
+            "conv/123",
+            "conv?123",
+            "conv 123",
+            "conv%20123",
+            ".",
+            "..",
+        ] {
+            assert!(
+                normalize_conversation(raw).is_err(),
+                "expected {raw:?} to be rejected"
+            );
+        }
     }
 
     #[test]
