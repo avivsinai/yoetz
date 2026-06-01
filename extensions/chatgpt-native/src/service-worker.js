@@ -539,28 +539,43 @@ async function cancelJob(message) {
   chunks.discard(job.job_id);
   await persistJob(job);
 
-  // Best-effort: tell the content script to click ChatGPT's stop control so we
-  // do not keep consuming the user's ChatGPT quota for a generation they
-  // cancelled. The content script's cancelSend handler does NOT require the
-  // ownership marker — cancel is a kill, and the tab may have navigated away,
-  // lost its window.name marker, or had its content script reloaded. We never
-  // let a content-script failure block the rest of the cancel teardown.
+  // Best-effort: tell the content script to click ChatGPT's stop control AND
+  // wait for generation to actually go idle before we tear the tab down — a bare
+  // stop click only initiates ChatGPT's abort to OpenAI, and removing the tab
+  // microseconds later races/drops that request so the server keeps generating.
+  // We await cancelSend so chrome.tabs.remove below runs only AFTER the stop is
+  // confirmed (or its bounded ~5s idle-wait elapses). The content script's
+  // cancelSend handler does NOT require the ownership marker — cancel is a kill,
+  // and the tab may have navigated away, lost its window.name marker, or had its
+  // content script reloaded. We never let a content-script failure block the
+  // rest of the cancel teardown.
   let stopClicked = false;
+  // stopConfirmed === false means we could not confirm generation halted (timed
+  // out still generating, or the content script was unreachable). The CLI uses
+  // it to warn the user the run may still be live server-side. null = unknown
+  // (no tab to ask).
+  let stopConfirmed = job.tab_id ? false : null;
   if (job.tab_id) {
     try {
       const stopResult = await sendToTab(job.tab_id, { type: "yoetz_cancel_send", job });
       stopClicked = Boolean(stopResult?.stopped);
+      stopConfirmed = Boolean(stopResult?.confirmed_idle);
     } catch {
       // Tab may already be gone / content script unreachable; cancel proceeds.
+      // Leave stopConfirmed false so the CLI can warn it may still be running.
     }
   }
+  // True when we asked a tab to stop but could not confirm it went idle.
+  const cancelMayStillBeRunning = job.tab_id ? stopConfirmed === false : false;
 
   // Close the tab so generation cannot continue in the background. V1 chooses
   // hard removal over chrome.tabGroups.update({ collapsed: true }) into a
   // "yoetz-cancelled" group — removal is the simpler contract (no group cleanup
   // to manage, no risk of a collapsed-but-still-streaming tab consuming quota).
   // If a future revision wants to preserve the tab for forensics, route that
-  // here through the tabGroups API instead of chrome.tabs.remove.
+  // here through the tabGroups API instead of chrome.tabs.remove. This runs only
+  // after the awaited cancelSend above resolves, so we never destroy the page
+  // mid-abort.
   if (job.tab_id && chrome.tabs?.remove) {
     try {
       await chrome.tabs.remove(job.tab_id);
@@ -569,14 +584,26 @@ async function cancelJob(message) {
     }
   }
 
-  postNative(progress(job, "cancelled", { tab_id: job.tab_id, stop_clicked: stopClicked }));
+  postNative(progress(job, "cancelled", {
+    tab_id: job.tab_id,
+    stop_clicked: stopClicked,
+    stop_confirmed: stopConfirmed,
+    generation_idle: stopConfirmed,
+    may_still_be_running: cancelMayStillBeRunning
+  }));
   postNative(makeEnvelope("job_cancel", {
     request_id: message.request_id,
     job_id: job.job_id,
     run_id: job.run_id,
     workspace_id: job.workspace_id,
     capability_token: job.capability_token,
-    payload: { cancelled: true, stop_clicked: stopClicked }
+    payload: {
+      cancelled: true,
+      stop_clicked: stopClicked,
+      stop_confirmed: stopConfirmed,
+      generation_idle: stopConfirmed,
+      may_still_be_running: cancelMayStillBeRunning
+    }
   }));
   // Mark terminal and evict from the in-memory map AFTER the cancel envelope is
   // posted and the job's terminal status is persisted. Subsequent extract /

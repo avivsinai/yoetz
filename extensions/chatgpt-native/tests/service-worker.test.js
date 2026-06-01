@@ -3874,6 +3874,276 @@ test("service worker cancelJob still removes the tab when the content script is 
     const cancelEnvelope = port.messages.find((m) => m.type === "job_cancel" && m.job_id === "job_cancel_b");
     assert.equal(cancelEnvelope.payload.cancelled, true);
     assert.equal(cancelEnvelope.payload.stop_clicked, false);
+    // Content script unreachable → we cannot confirm generation stopped, so the
+    // CLI must be told the run may still be live server-side.
+    assert.equal(cancelEnvelope.payload.stop_confirmed, false);
+    assert.equal(cancelEnvelope.payload.generation_idle, false);
+    assert.equal(cancelEnvelope.payload.may_still_be_running, true);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker cancelJob waits for cancelSend to resolve before removing the tab and reports confirmed idle", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const removedTabs = [];
+  let createdTabId = 0;
+  let sent = false;
+  // Gate the yoetz_cancel_send response so the test can observe ordering: the
+  // tab must NOT be removed while cancelSend is still in flight.
+  let releaseCancel;
+  const cancelGate = new Promise((resolve) => {
+    releaseCancel = resolve;
+  });
+  let cancelSendStarted = false;
+  let extracted = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++createdTabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      remove: async (id) => {
+        removedTabs.push(id);
+      },
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            extracted = true;
+            return {
+              ok: true,
+              payload: sent
+                ? { method: "assistant_dom_fallback", text: "partial...", is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0 }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          case "yoetz_cancel_send":
+            cancelSendStarted = true;
+            // Block until the test releases us, mimicking confirmGenerationStopped
+            // polling for idle.
+            await cancelGate;
+            return { ok: true, payload: { stopped: true, confirmed_idle: true, waited_ms: 250 } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?cancel_waits=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+
+    port.emit(envelope("job_start", "job_cancel_wait", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 60000
+    }));
+    await eventually(() => port.messages.some((m) => m.payload?.phase === "ready_for_file"));
+
+    port.emit(envelope("job_file_chunk", "job_cancel_wait", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_cancel_wait.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => sent);
+    await eventually(() => extracted);
+
+    port.emit(envelope("job_cancel", "job_cancel_wait"));
+
+    // cancelSend is in flight (gated). The tab must NOT be removed yet.
+    await eventually(() => cancelSendStarted);
+    assert.deepEqual(removedTabs, [], "tab must not be removed while cancelSend is still awaited");
+
+    // Release cancelSend; only now may the tab be removed and the envelope post.
+    releaseCancel();
+    await eventually(() => port.messages.some((m) => m.type === "job_cancel" && m.job_id === "job_cancel_wait"));
+    assert.deepEqual(removedTabs, [createdTabId], "tab removal must happen after cancelSend resolves");
+
+    const cancelEnvelope = port.messages.find((m) => m.type === "job_cancel" && m.job_id === "job_cancel_wait");
+    assert.equal(cancelEnvelope.payload.cancelled, true);
+    assert.equal(cancelEnvelope.payload.stop_clicked, true);
+    assert.equal(cancelEnvelope.payload.stop_confirmed, true);
+    assert.equal(cancelEnvelope.payload.generation_idle, true);
+    assert.equal(cancelEnvelope.payload.may_still_be_running, false);
+
+    const cancelledProgress = port.messages.find((m) => m.type === "job_progress" && m.job_id === "job_cancel_wait" && m.payload?.phase === "cancelled");
+    assert.equal(cancelledProgress.payload.stop_confirmed, true);
+    assert.equal(cancelledProgress.payload.generation_idle, true);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker cancelJob removes the tab but warns may_still_be_running when stop is not confirmed", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const removedTabs = [];
+  let createdTabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++createdTabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      remove: async (id) => {
+        removedTabs.push(id);
+      },
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? { method: "assistant_dom_fallback", text: "partial...", is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0 }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          case "yoetz_cancel_send":
+            // Generation outlasted the bounded wait: clicked but not confirmed idle.
+            return { ok: true, payload: { stopped: true, confirmed_idle: false, waited_ms: 5000 } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?cancel_unconfirmed=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+
+    port.emit(envelope("job_start", "job_cancel_warn", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 60000
+    }));
+    await eventually(() => port.messages.some((m) => m.payload?.phase === "ready_for_file"));
+
+    port.emit(envelope("job_file_chunk", "job_cancel_warn", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_cancel_warn.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => sent);
+
+    port.emit(envelope("job_cancel", "job_cancel_warn"));
+    await eventually(() => port.messages.some((m) => m.type === "job_cancel" && m.job_id === "job_cancel_warn"));
+
+    // Can't block forever: tab is still removed even when stop is unconfirmed.
+    assert.deepEqual(removedTabs, [createdTabId]);
+    const cancelEnvelope = port.messages.find((m) => m.type === "job_cancel" && m.job_id === "job_cancel_warn");
+    assert.equal(cancelEnvelope.payload.stop_clicked, true);
+    assert.equal(cancelEnvelope.payload.stop_confirmed, false);
+    assert.equal(cancelEnvelope.payload.generation_idle, false);
+    assert.equal(cancelEnvelope.payload.may_still_be_running, true);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker cancelJob on an already-idle response removes the tab and reports confirmed_idle", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const removedTabs = [];
+  let createdTabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++createdTabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      remove: async (id) => {
+        removedTabs.push(id);
+      },
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? { method: "assistant_dom_fallback", text: "partial...", is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0 }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          case "yoetz_cancel_send":
+            // Response had already settled: no stop button, so nothing clicked
+            // but idle is confirmed.
+            return { ok: true, payload: { stopped: false, confirmed_idle: true, waited_ms: 0 } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?cancel_idle=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+
+    port.emit(envelope("job_start", "job_cancel_idle", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 60000
+    }));
+    await eventually(() => port.messages.some((m) => m.payload?.phase === "ready_for_file"));
+
+    port.emit(envelope("job_file_chunk", "job_cancel_idle", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_cancel_idle.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => sent);
+
+    port.emit(envelope("job_cancel", "job_cancel_idle"));
+    await eventually(() => port.messages.some((m) => m.type === "job_cancel" && m.job_id === "job_cancel_idle"));
+
+    assert.deepEqual(removedTabs, [createdTabId], "already-idle cancel must still remove the tab");
+    const cancelEnvelope = port.messages.find((m) => m.type === "job_cancel" && m.job_id === "job_cancel_idle");
+    assert.equal(cancelEnvelope.payload.cancelled, true);
+    assert.equal(cancelEnvelope.payload.stop_clicked, false);
+    assert.equal(cancelEnvelope.payload.stop_confirmed, true);
+    assert.equal(cancelEnvelope.payload.generation_idle, true);
+    assert.equal(cancelEnvelope.payload.may_still_be_running, false);
   } finally {
     globalThis.chrome = originalChrome;
   }
