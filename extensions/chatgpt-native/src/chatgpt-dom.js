@@ -89,7 +89,7 @@ export function findSendButton(root = document) {
   return findSendButtonControl(root, { requireEnabled: true });
 }
 
-export function findModelButton(root = document) {
+export function findModelButton(root = document, options = {}) {
   // ChatGPT serves at least two picker families: Enterprise exposes a global
   // model-switcher button, while personal ChatGPT can render a composer-scoped
   // model chip. Keep both paths because either account type may back Pro.
@@ -101,7 +101,11 @@ export function findModelButton(root = document) {
     'button[aria-controls*="model" i]',
     'button[id*="model" i]'
   ]);
-  return enterpriseButton ?? findComposerModelControl(root) ?? findStandaloneProExtendedModelControl(root);
+  const composerButton = findComposerModelControl(root);
+  if (options.allowStandaloneFallback === false) {
+    return enterpriseButton ?? composerButton;
+  }
+  return enterpriseButton ?? composerButton ?? findStandaloneProExtendedModelControl(root);
 }
 
 export function getPageText(root = document) {
@@ -243,9 +247,9 @@ export async function ensureConversationLoaded(root = document, conversationId, 
   };
 }
 
-export async function configureModelState(root) {
+export async function configureModelState(root, job = {}) {
   const requested = proExtendedModelRequest();
-  const selection = await selectRequestedModel(root, requested);
+  const selection = await selectRequestedModel(root, requested, modelSelectionOptionsForJob(job));
   const warnings = selection.warning ? [selection.warning] : [];
   return {
     status: selection.status,
@@ -256,6 +260,22 @@ export async function configureModelState(root) {
     warning: warnings[0] ?? null,
     warnings
   };
+}
+
+function modelSelectionOptionsForJob(job = {}) {
+  const options = {};
+  if (String(job?.conversation_id ?? "").trim()) {
+    options.allowStandaloneFallback = false;
+  }
+  const timeoutMs = Number(job?.model_selection_timeout_ms);
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    options.timeoutMs = timeoutMs;
+  }
+  const intervalMs = Number(job?.model_selection_interval_ms);
+  if (Number.isFinite(intervalMs) && intervalMs > 0) {
+    options.intervalMs = intervalMs;
+  }
+  return options;
 }
 
 function isActionableElement(node) {
@@ -392,8 +412,8 @@ function isModelChipLike(node) {
   return /\b(model|model-switcher)\b/.test(marker) && /\b(chip|pill|token|button|menu|dropdown|switcher)\b/.test(marker);
 }
 
-export async function selectRequestedModel(root, requested) {
-  const readiness = await waitForModelSelectionTarget(root, requested);
+export async function selectRequestedModel(root, requested, options = {}) {
+  const readiness = await waitForModelSelectionTarget(root, requested, options);
   if (readiness.selection.selected) {
     return {
       status: "selected",
@@ -411,7 +431,7 @@ export async function selectRequestedModel(root, requested) {
     };
   }
 
-  const currentSelection = currentRequestedModelSelection(root, requested);
+  const currentSelection = currentRequestedModelSelection(root, requested, options);
   if (currentSelection.selected) {
     return {
       status: "selected",
@@ -436,7 +456,7 @@ export async function selectRequestedModel(root, requested) {
     }
   }
   if (!selectedOption) {
-    const verification = await waitForRequestedModelSelected(root, requested, null);
+    const verification = await waitForRequestedModelSelected(root, requested, null, options);
     if (verification.selected) {
       return {
         status: "selected",
@@ -453,7 +473,7 @@ export async function selectRequestedModel(root, requested) {
   }
   realClick(selectedOption);
 
-  const verification = await waitForRequestedModelSelected(root, requested, selectedOption);
+  const verification = await waitForRequestedModelSelected(root, requested, selectedOption, options);
   if (verification.selected) {
     return {
       status: "selected",
@@ -473,15 +493,15 @@ async function waitForModelSelectionTarget(root, requested, options = {}) {
   const timeoutMs = Number(options.timeoutMs ?? 30000);
   const intervalMs = Number(options.intervalMs ?? 250);
   const startedAt = Date.now();
-  let selection = currentRequestedModelSelection(root, requested);
-  let modelButton = findModelButton(root);
+  let selection = currentRequestedModelSelection(root, requested, options);
+  let modelButton = findModelButton(root, options);
 
   while (Date.now() - startedAt < timeoutMs) {
-    selection = currentRequestedModelSelection(root, requested);
+    selection = currentRequestedModelSelection(root, requested, options);
     if (selection.selected) {
-      return { selection, modelButton: findModelButton(root) };
+      return { selection, modelButton: findModelButton(root, options) };
     }
-    modelButton = findModelButton(root);
+    modelButton = findModelButton(root, options);
     if (modelButton) {
       return { selection, modelButton };
     }
@@ -491,8 +511,8 @@ async function waitForModelSelectionTarget(root, requested, options = {}) {
   return { selection, modelButton };
 }
 
-function currentRequestedModelSelection(root, requested) {
-  const modelUsed = currentModelLabel(root);
+function currentRequestedModelSelection(root, requested, options = {}) {
+  const modelUsed = currentModelLabel(root, options);
   return {
     selected: modelTextMatchesRequest(modelUsed, requested),
     model_used: modelUsed
@@ -1314,10 +1334,10 @@ async function waitForRequestedModelSelected(root, requested, _option, options =
   const timeoutMs = Number(options.timeoutMs ?? 4000);
   const intervalMs = Number(options.intervalMs ?? 100);
   const startedAt = Date.now();
-  let modelUsed = currentModelLabel(root);
+  let modelUsed = currentModelLabel(root, options);
 
   while (Date.now() - startedAt < timeoutMs) {
-    modelUsed = currentModelLabel(root);
+    modelUsed = currentModelLabel(root, options);
     if (modelTextMatchesRequest(modelUsed, requested)) {
       return { selected: true, model_used: modelUsed };
     }
@@ -1844,10 +1864,11 @@ function uniqueElements(nodes) {
   return nodes.filter((node, index) => node && nodes.indexOf(node) === index);
 }
 
-function currentModelLabel(root) {
-  const selected = firstVisible(root, [
-    '[data-testid="model-switcher-selected-model"]'
-  ]);
+function currentModelLabel(root, options = {}) {
+  const modelButton = findModelButton(root, options);
+  const selected = options.allowStandaloneFallback === false
+    ? (modelButton ? firstVisible(modelButton, ['[data-testid="model-switcher-selected-model"]']) : null)
+    : firstVisible(root, ['[data-testid="model-switcher-selected-model"]']);
   const selectedText = normalizeText(selected?.innerText ?? selected?.textContent ?? "");
   if (selectedText) {
     return selectedText;
@@ -1855,7 +1876,7 @@ function currentModelLabel(root) {
   if (visibleModelOptions(root).length > 0) {
     return "";
   }
-  return modelControlLabel(findModelButton(root));
+  return modelControlLabel(modelButton);
 }
 
 export function modelSelectionDiagnostics(root = document) {
