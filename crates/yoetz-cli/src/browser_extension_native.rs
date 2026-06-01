@@ -1976,11 +1976,7 @@ fn parse_model_selection_status(value: Option<&str>) -> ChatgptModelSelectionSta
 }
 
 fn job_error(envelope: ProtocolEnvelope) -> anyhow::Error {
-    let message = envelope
-        .payload
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("chrome-extension-native job failed");
+    let message = job_error_message(&envelope.payload);
     let phase = envelope.payload.get("phase").and_then(Value::as_str);
     let side_effect_started = envelope
         .payload
@@ -2006,6 +2002,63 @@ fn job_error(envelope: ProtocolEnvelope) -> anyhow::Error {
             crate::chatgpt_recipe::mark_terminal_fallback_phase(err, ChatgptTransportPhase::Upload)
         }
     }
+}
+
+fn job_error_message(payload: &Value) -> String {
+    let mut message = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("chrome-extension-native job failed")
+        .to_string();
+    let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
+    if !code.starts_with("conversation_") {
+        return message;
+    }
+
+    let mut detail = Vec::new();
+    if let Some(requested) = payload
+        .get("requested_conversation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        if !message.contains(requested) {
+            detail.push(format!("requested conversation {requested}"));
+        }
+    }
+    if let Some(current_url) = payload
+        .get("current_url")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        if !message.contains(current_url) {
+            detail.push(format!("current URL {current_url}"));
+        }
+    }
+    if let Some(phase) = payload
+        .get("phase")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        let phase_text = format!("phase {phase}");
+        if !message.contains(&phase_text) {
+            detail.push(phase_text);
+        }
+    }
+    if let Some(inspect_command) = payload
+        .get("inspect_command")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        if !message.contains(inspect_command) {
+            detail.push(format!("inspect with: {inspect_command}"));
+        }
+    }
+
+    if !detail.is_empty() {
+        message.push_str(". ");
+        message.push_str(&detail.join("; "));
+    }
+    message
 }
 
 fn emit_progress(format: OutputFormat, envelope: &ProtocolEnvelope) -> Result<()> {
@@ -3962,5 +4015,29 @@ mod tests {
             crate::chatgpt_recipe::terminal_fallback_phase(&post_effect),
             Some(ChatgptTransportPhase::Send)
         );
+    }
+
+    #[test]
+    fn job_error_conversation_failures_surface_actionable_context() {
+        let err = job_error(ProtocolEnvelope::new(
+            "job_error",
+            Some("job_conv".to_string()),
+            Some("run_conv".to_string()),
+            json!({
+                "code": "conversation_unavailable",
+                "message": "ChatGPT conversation is unavailable",
+                "phase": "upload",
+                "side_effect_started": false,
+                "requested_conversation_id": "conv-404",
+                "current_url": "https://chatgpt.com/c/conv-404?_yoetz=run_conv",
+                "inspect_command": "yoetz browser extension inspect --chatgpt --run-id run_conv",
+            }),
+        ));
+        let text = err.to_string();
+
+        assert!(text.contains("requested conversation conv-404"));
+        assert!(text.contains("current URL https://chatgpt.com/c/conv-404?_yoetz=run_conv"));
+        assert!(text.contains("phase upload"));
+        assert!(text.contains("yoetz browser extension inspect --chatgpt --run-id run_conv"));
     }
 }

@@ -155,7 +155,9 @@ async function extractJobResponse(job) {
       `tab moved from ChatGPT conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
       {
         phase: "wait_response",
-        side_effect_started: true
+        side_effect_started: true,
+        requested_conversation_id: expectedConversationId,
+        current_conversation_id: conversationId
       }
     );
   }
@@ -252,7 +254,9 @@ async function bindJob(job) {
       `tab moved from ChatGPT conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
       {
         phase: "wait_response",
-        side_effect_started: true
+        side_effect_started: true,
+        requested_conversation_id: expectedConversationId,
+        current_conversation_id: conversationId
       }
     );
   }
@@ -286,7 +290,9 @@ function assertJobOwnership(job, parseOwnedWindowName, options = {}) {
       `job ${job.job_id} expected ChatGPT conversation ${options.requireConversation}, current conversation is ${actualConversationId ?? "(none)"}`,
       {
         phase: options.phase ?? "upload",
-        side_effect_started: false
+        side_effect_started: false,
+        requested_conversation_id: options.requireConversation,
+        current_conversation_id: actualConversationId
       }
     );
   }
@@ -334,7 +340,25 @@ function commandError(code, message, detail = {}) {
   error.code = code;
   error.phase = detail.phase;
   error.side_effect_started = detail.side_effect_started;
+  for (const [key, value] of Object.entries({
+    ...conversationLocationDetail(code),
+    ...detail
+  })) {
+    if (!(key in error) && value !== undefined) {
+      error[key] = value;
+    }
+  }
   return error;
+}
+
+function conversationLocationDetail(code) {
+  if (!String(code ?? "").startsWith("conversation_")) {
+    return {};
+  }
+  return {
+    current_url: String(location.href ?? ""),
+    current_pathname: String(location.pathname ?? "")
+  };
 }
 
 function contentScriptBuild() {
@@ -376,6 +400,16 @@ function errorResponse(error) {
   }
   if (typeof error?.side_effect_started === "boolean") {
     response.side_effect_started = error.side_effect_started;
+  }
+  for (const key of [
+    "requested_conversation_id",
+    "current_conversation_id",
+    "current_url",
+    "current_pathname"
+  ]) {
+    if (error?.[key] !== undefined) {
+      response[key] = error[key];
+    }
   }
   return response;
 }

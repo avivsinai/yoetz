@@ -1260,6 +1260,25 @@ test("ensureConversationLoaded rejects the wrong conversation before send", asyn
   );
 });
 
+test("ensureConversationLoaded reports unavailable when the requested conversation has no composer", async () => {
+  const body = new FakeElement("body", {}, "Conversation not found");
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+  doc.defaultView.location.href = "https://chatgpt.com/c/conv-123?_yoetz=run_resume";
+
+  await assert.rejects(
+    () => ensureConversationLoaded(doc, "conv-123", { timeoutMs: 30, intervalMs: 10 }),
+    (error) => {
+      assert.equal(error.code, "conversation_unavailable");
+      assert.equal(error.phase, "upload");
+      assert.equal(error.side_effect_started, false);
+      assert.equal(error.requested_conversation_id, "conv-123");
+      assert.equal(error.current_url, "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+      return true;
+    }
+  );
+});
+
 test("uploadFile accepts hidden composer-scoped file inputs", async () => {
   const previousDataTransfer = globalThis.DataTransfer;
   globalThis.DataTransfer = FakeDataTransfer;

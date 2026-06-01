@@ -182,11 +182,13 @@ async function handleNativeMessage(message) {
   } catch (error) {
     const job = message?.job_id ? jobs.get(message.job_id) : null;
     if (job) {
+      const code = error?.code ?? "extension_error";
+      const detail = errorContextForJob(job, error);
       await failJob(
         job,
-        error?.code ?? "extension_error",
-        String(error?.message ?? error),
-        errorContextForJob(job, error)
+        code,
+        jobErrorMessage(job, error, code, detail),
+        detail
       );
     } else {
       postNative(errorEnvelope(message, "extension_error", String(error?.message ?? error), {
@@ -912,12 +914,41 @@ function errorContextForJob(job, error = null) {
     return {};
   }
   const phase = phaseForStatus(job.status) ?? (job.tab_id ? "upload" : undefined);
-  return {
+  const detail = {
     phase: error?.phase ?? phase,
     side_effect_started: typeof error?.side_effect_started === "boolean"
       ? error.side_effect_started
       : Boolean(job.tab_id)
   };
+  if (job.run_id) {
+    detail.inspect_command = inspectCommandForJob(job);
+  }
+  if (isConversationFailureCode(error?.code)) {
+    detail.requested_conversation_id = error?.requested_conversation_id
+      ?? job.expected_conversation_id
+      ?? job.conversation_id
+      ?? null;
+    detail.current_conversation_id = error?.current_conversation_id ?? null;
+    detail.current_url = error?.current_url ?? job.submitted_url ?? null;
+    detail.current_pathname = error?.current_pathname ?? null;
+  }
+  return detail;
+}
+
+function jobErrorMessage(job, error, code, detail = {}) {
+  const base = String(error?.message ?? error);
+  if (!isConversationFailureCode(code)) {
+    return base;
+  }
+  const requested = detail.requested_conversation_id ?? job?.expected_conversation_id ?? job?.conversation_id ?? "(unknown)";
+  const currentUrl = detail.current_url ?? "(unknown)";
+  const phase = detail.phase ?? phaseForStatus(job?.status) ?? "upload";
+  const inspect = detail.inspect_command ?? inspectCommandForJob(job);
+  return `${base}. requested conversation ${requested}; current URL ${currentUrl}; phase ${phase}; inspect with: ${inspect}`;
+}
+
+function isConversationFailureCode(code) {
+  return String(code ?? "").startsWith("conversation_");
 }
 
 function postHello() {
@@ -1146,6 +1177,16 @@ function tabCommandError(response) {
   }
   if (typeof response?.side_effect_started === "boolean") {
     error.side_effect_started = response.side_effect_started;
+  }
+  for (const key of [
+    "requested_conversation_id",
+    "current_conversation_id",
+    "current_url",
+    "current_pathname"
+  ]) {
+    if (response?.[key] !== undefined) {
+      error[key] = response[key];
+    }
   }
   return error;
 }

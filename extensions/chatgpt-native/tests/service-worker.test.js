@@ -231,6 +231,70 @@ test("service worker opens fresh and resume jobs in new owned tabs", async () =>
   }
 });
 
+test("service worker fails unavailable conversations with inspectable terminal error", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  let tabId = 0;
+  const currentUrl = "https://chatgpt.com/c/conv-404?_yoetz=run_job_unavailable";
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: currentUrl }),
+      sendMessage: async (_id, message) => {
+        sentToTabs.push(message.type);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return {
+              ok: false,
+              code: "conversation_unavailable",
+              error: "ChatGPT conversation conv-404 is unavailable",
+              phase: "upload",
+              side_effect_started: false,
+              requested_conversation_id: "conv-404",
+              current_url: currentUrl
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?conversation_unavailable=${Date.now()}`);
+    port.emit(envelope("job_start", "job_unavailable", {
+      prompt: "resume",
+      conversation_id: "conv-404",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.payload.code === "conversation_unavailable"
+    ));
+
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.payload.phase, "upload");
+    assert.equal(error.payload.side_effect_started, false);
+    assert.equal(error.payload.requested_conversation_id, "conv-404");
+    assert.equal(error.payload.current_url, currentUrl);
+    assert.equal(error.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_unavailable");
+    assert.match(error.payload.message, /requested conversation conv-404/);
+    assert.match(error.payload.message, /current URL https:\/\/chatgpt\.com\/c\/conv-404\?_yoetz=run_job_unavailable/);
+    assert.match(error.payload.message, /phase upload/);
+    assert.match(error.payload.message, /yoetz browser extension inspect --chatgpt --run-id run_job_unavailable/);
+    assert.equal(sentToTabs.includes("yoetz_upload_file"), false);
+    assert.equal(sentToTabs.includes("yoetz_send_prompt"), false);
+    assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker marks manual handoff as terminal after tab side effects", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

@@ -219,12 +219,19 @@ export async function ensureConversationLoaded(root = document, conversationId, 
   const pathname = String(win.location?.pathname ?? "");
   const loadedConversationId = conversationIdFromPathname(pathname);
   if (loadedConversationId !== conversationId) {
+    const code = loadedConversationId ? "conversation_not_loaded" : "conversation_unavailable";
     throw chatgptCommandError(
-      "conversation_not_loaded",
-      `ChatGPT conversation ${conversationId} did not load; current path is ${pathname || "(unknown)"}`,
+      code,
+      code === "conversation_unavailable"
+        ? `ChatGPT conversation ${conversationId} is unavailable; current URL is ${currentLocationForError(win)}`
+        : `ChatGPT conversation ${conversationId} did not load; current URL is ${currentLocationForError(win)}`,
       {
         phase: "upload",
-        side_effect_started: false
+        side_effect_started: false,
+        requested_conversation_id: conversationId,
+        current_conversation_id: loadedConversationId,
+        current_url: currentLocationForError(win),
+        current_pathname: pathname
       }
     );
   }
@@ -232,11 +239,15 @@ export async function ensureConversationLoaded(root = document, conversationId, 
     await waitForElement(root, findComposer, "ChatGPT composer", options);
   } catch (error) {
     throw chatgptCommandError(
-      "conversation_not_loaded",
-      `ChatGPT conversation ${conversationId} did not load a composer: ${String(error?.message ?? error)}`,
+      "conversation_unavailable",
+      `ChatGPT conversation ${conversationId} is unavailable; composer did not load at ${currentLocationForError(win)}: ${String(error?.message ?? error)}`,
       {
         phase: "upload",
-        side_effect_started: false
+        side_effect_started: false,
+        requested_conversation_id: conversationId,
+        current_conversation_id: loadedConversationId,
+        current_url: currentLocationForError(win),
+        current_pathname: pathname
       }
     );
   }
@@ -2001,7 +2012,16 @@ function chatgptCommandError(code, message, detail = {}) {
   if (typeof detail.side_effect_started === "boolean") {
     error.side_effect_started = detail.side_effect_started;
   }
+  for (const [key, value] of Object.entries(detail)) {
+    if (!(key in error) && value !== undefined) {
+      error[key] = value;
+    }
+  }
   return error;
+}
+
+function currentLocationForError(win) {
+  return String(win.location?.href ?? win.location?.pathname ?? "(unknown)") || "(unknown)";
 }
 
 function sleep(ms) {

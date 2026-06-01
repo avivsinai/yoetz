@@ -52,9 +52,11 @@ export async function ensureConversationLoaded(_document, conversationId) {
   }
   if (hooks.failConversationLoaded) {
     const error = new Error(hooks.failConversationLoaded.message);
-    error.code = hooks.failConversationLoaded.code;
-    error.phase = hooks.failConversationLoaded.phase;
-    error.side_effect_started = hooks.failConversationLoaded.side_effect_started;
+    for (const [key, value] of Object.entries(hooks.failConversationLoaded)) {
+      if (key !== "message") {
+        error[key] = value;
+      }
+    }
     throw error;
   }
   return { status: "loaded", conversation_id: conversationId, pathname: globalThis.location.pathname };
@@ -153,6 +155,32 @@ test("content script resume prepare rejects a different conversation before send
     assert.equal(response.code, "conversation_not_loaded");
     assert.equal(response.phase, "upload");
     assert.equal(response.side_effect_started, false);
+  } finally {
+    restore();
+  }
+});
+
+test("content script resume prepare preserves conversation unavailable details", async () => {
+  const currentUrl = "https://chatgpt.com/c/conv-123?_yoetz=run_resume";
+  const { send, hooks, restore } = await loadContentScript("resume_unavailable", currentUrl);
+  try {
+    hooks.failConversationLoaded = {
+      message: "ChatGPT conversation conv-123 is unavailable",
+      code: "conversation_unavailable",
+      phase: "upload",
+      side_effect_started: false,
+      requested_conversation_id: "conv-123",
+      current_url: currentUrl
+    };
+
+    const response = await send({ type: "yoetz_prepare_job", job: resumeJob() });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "conversation_unavailable");
+    assert.equal(response.phase, "upload");
+    assert.equal(response.side_effect_started, false);
+    assert.equal(response.requested_conversation_id, "conv-123");
+    assert.equal(response.current_url, currentUrl);
   } finally {
     restore();
   }
