@@ -391,6 +391,8 @@ async function runJobWithFile(job, file) {
       inspect_command: inspectCommand,
       yoetz_url: chatgptJobUrl(job.run_id),
       submitted_url: job.submitted_url,
+      conversation_id: conversationIdForJob(job),
+      conversation_url: conversationUrlForId(conversationIdForJob(job)),
       message: `prompt sent; waiting for ChatGPT response (timeout ${formatDurationForMessage(responseWaitTimeoutMs(job))}); inspect with: ${inspectCommand}`
     }))) {
       await recordTerminalDeliveryLost(job, "send");
@@ -418,6 +420,7 @@ async function runJobWithFile(job, file) {
 }
 
 async function completeJobWithExtraction(job, extraction) {
+  const conversationId = conversationIdForJob(job, extraction);
   const completeEnvelope = makeEnvelope("job_complete", {
     job_id: job.job_id,
     run_id: job.run_id,
@@ -431,6 +434,8 @@ async function completeJobWithExtraction(job, extraction) {
       stable_for_ms: extraction.stable_for_ms,
       assistant_turn_count: extraction.assistant_turn_count ?? extraction.assistant_count ?? 0,
       copy_button_count: extraction.copy_button_count ?? 0,
+      conversation_id: conversationId,
+      conversation_url: conversationUrlForId(conversationId),
       model_used: job.model_used ?? null,
       model_selection_status: job.model_selection_status ?? "unavailable",
       warnings: [
@@ -471,6 +476,17 @@ async function completeJobWithExtraction(job, extraction) {
   rememberTerminalJob(job.job_id);
   jobs.delete(job.job_id);
   chunks.discard(job.job_id);
+}
+
+function conversationIdForJob(job, extraction = null) {
+  return job?.submitted_conversation_id ?? extraction?.conversation_id ?? job?.conversation_id ?? null;
+}
+
+function conversationUrlForId(conversationId) {
+  if (!conversationId) {
+    return null;
+  }
+  return `https://chatgpt.com/c/${encodeURIComponent(conversationId)}`;
 }
 
 async function resumeWaitingResponseJob(job) {

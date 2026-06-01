@@ -1907,6 +1907,8 @@ async fn run_recipe_via_chrome_devtools_mcp(
         fallback_used,
         delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
         auto_paste_fallback: false,
+        conversation_id: None,
+        conversation_url: None,
     }
     .to_value();
     maybe_write_output(ctx, &payload)?;
@@ -1935,6 +1937,8 @@ async fn run_recipe_via_chrome_devtools_mcp(
                 fallback_used,
                 delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
                 auto_paste_fallback: false,
+                conversation_id: payload["conversation_id"].as_str().map(str::to_owned),
+                conversation_url: payload["conversation_url"].as_str().map(str::to_owned),
             }
             .to_recipe_complete_event();
             write_jsonl("browser.recipe", &event)?;
@@ -2115,6 +2119,8 @@ fn run_recipe_via_chrome_extension_native(
         fallback_used,
         delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
         auto_paste_fallback: false,
+        conversation_id: response.conversation_id,
+        conversation_url: response.conversation_url,
     };
     let mut payload = output.to_value();
     attach_browser_recipe_artifacts(&mut payload, recipe_args.bundle.as_deref())?;
@@ -2262,6 +2268,8 @@ fn run_recipe_via_dev_browser(
             chatgpt_recipe::ChatgptDeliveryMode::FileUpload
         },
         auto_paste_fallback,
+        conversation_id: None,
+        conversation_url: None,
     };
     let payload = output.to_value();
     maybe_write_output(ctx, &payload)?;
@@ -5679,6 +5687,8 @@ mod tests {
             fallback_used: true,
             delivery_mode: crate::chatgpt_recipe::ChatgptDeliveryMode::Paste,
             auto_paste_fallback: true,
+            conversation_id: Some("conv-123".to_string()),
+            conversation_url: Some("https://chatgpt.com/c/conv-123".to_string()),
         };
 
         let event = output.to_recipe_complete_event();
@@ -5688,6 +5698,8 @@ mod tests {
         assert_eq!(event["delivery_mode"], "paste");
         assert_eq!(event["auto_paste_fallback"], true);
         assert_eq!(event["warnings"], json!(["clipboard fallback"]));
+        assert_eq!(event["conversation_id"], "conv-123");
+        assert_eq!(event["conversation_url"], "https://chatgpt.com/c/conv-123");
     }
 
     #[test]

@@ -130,6 +130,8 @@ pub struct ExtensionRecipeResult {
     pub model_used: Option<String>,
     pub model_selection_status: ChatgptModelSelectionStatus,
     pub warnings: Vec<String>,
+    pub conversation_id: Option<String>,
+    pub conversation_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1927,11 +1929,23 @@ fn parse_recipe_result(envelope: ProtocolEnvelope) -> Result<ExtensionRecipeResu
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let conversation_id = envelope
+        .payload
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let conversation_url = envelope
+        .payload
+        .get("conversation_url")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Ok(ExtensionRecipeResult {
         response,
         model_used,
         model_selection_status,
         warnings,
+        conversation_id,
+        conversation_url,
     })
 }
 
@@ -3052,6 +3066,38 @@ mod tests {
         let decoded = read_json_frame(&mut &buf[..]).unwrap();
         assert_eq!(decoded.kind, "job_progress");
         assert_eq!(decoded.payload["message"], "uploading");
+    }
+
+    #[test]
+    fn parse_recipe_result_carries_conversation_fields() {
+        let envelope = ProtocolEnvelope::new(
+            "job_complete",
+            Some("job_1".to_string()),
+            Some("run_1".to_string()),
+            json!({
+                "response": "done",
+                "model_used": "Pro Extended",
+                "model_selection_status": "selected",
+                "warnings": ["kept current"],
+                "conversation_id": "conv-123",
+                "conversation_url": "https://chatgpt.com/c/conv-123",
+            }),
+        );
+
+        let result = parse_recipe_result(envelope).unwrap();
+
+        assert_eq!(result.response, "done");
+        assert_eq!(result.model_used.as_deref(), Some("Pro Extended"));
+        assert_eq!(
+            result.model_selection_status,
+            ChatgptModelSelectionStatus::Selected
+        );
+        assert_eq!(result.warnings, vec!["kept current"]);
+        assert_eq!(result.conversation_id.as_deref(), Some("conv-123"));
+        assert_eq!(
+            result.conversation_url.as_deref(),
+            Some("https://chatgpt.com/c/conv-123")
+        );
     }
 
     #[test]

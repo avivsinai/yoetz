@@ -56,12 +56,18 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
             sentJobs.add(message.job.job_id);
-            return { ok: true, payload: { sent: true } };
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: `conv-${message.job.job_id}`
+              }
+            };
           case "yoetz_extract_response":
             return {
               ok: true,
               payload: sentJobs.has(message.job.job_id)
-                ? { method: "assistant_dom_fallback", text: `answer ${message.job.job_id}`, is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0 }
+                ? { method: "assistant_dom_fallback", text: `answer ${message.job.job_id}`, is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0, conversation_id: `conv-${message.job.job_id}` }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
             };
           default:
@@ -118,6 +124,14 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     assert.equal(
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.completion_reason,
       "copy_button"
+    );
+    assert.equal(
+      port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.conversation_id,
+      "conv-job_a"
+    );
+    assert.equal(
+      port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.conversation_url,
+      "https://chatgpt.com/c/conv-job_a"
     );
     assert.equal(sentToTabs.filter((item) => item.message.type === "yoetz_upload_file").length, 2);
     assert.equal(
@@ -1450,12 +1464,12 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
             sent = true;
-            return { ok: true, payload: { sent: true } };
+            return { ok: true, payload: { sent: true, conversation_id: "conv-waiting-progress" } };
           case "yoetz_extract_response":
             return {
               ok: true,
               payload: sent
-                ? { method: "none", text: "", is_generating: true, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+                ? { method: "none", text: "", is_generating: true, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1, conversation_id: "conv-waiting-progress" }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
             };
           default:
@@ -1494,6 +1508,8 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
     assert.match(sentProgress?.payload.message, /waiting for ChatGPT response/);
     assert.equal(sentProgress?.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_waiting_progress");
     assert.equal(sentProgress?.payload.yoetz_url, "https://chatgpt.com/?_yoetz=run_job_waiting_progress");
+    assert.equal(sentProgress?.payload.conversation_id, "conv-waiting-progress");
+    assert.equal(sentProgress?.payload.conversation_url, "https://chatgpt.com/c/conv-waiting-progress");
     assert.match(sentProgress?.payload.message, /inspect with: yoetz browser extension inspect --chatgpt --run-id run_job_waiting_progress/);
     assert.match(waiting?.payload.message, /waiting for ChatGPT response/);
     assert.equal(waiting.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_waiting_progress");
