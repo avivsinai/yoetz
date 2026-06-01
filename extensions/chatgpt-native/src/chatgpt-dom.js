@@ -888,14 +888,39 @@ function isTurnLikeScope(node) {
   return /\b(user|assistant|conversation-turn|turn-messages|user-turn|agent-turn)\b/i.test(marker);
 }
 
+const CHROME_KEYWORD = /^(aside|nav|header|footer|complementary|navigation|dialog|sidebar|side-panel|popover|modal)$/i;
+
 function isNonConversationChrome(node) {
   for (let current = node; current; current = current.parentElement) {
-    const marker = nodeMarker(current, ["tag", "role", "data-testid", "class", "aria-label"]);
-    if (/\b(aside|nav|header|footer|complementary|navigation|dialog|sidebar|side-panel|popover|modal)\b/i.test(marker)) {
+    // tag / role / data-testid / aria-label are semantic identifiers — match chrome keywords
+    // as whole words there. The class attribute is NOT semantic: ChatGPT uses Tailwind utility
+    // tokens that embed arbitrary CSS expressions (e.g. scroll-mt-[calc(var(--header-height)+...)]
+    // on the conversation-turn <section>), so a substring \bheader\b inside var(--header-height)
+    // would mis-flag a real answer turn as chrome and drop it to page_text_fallback. Match class
+    // chrome keywords only as whole space-separated tokens so genuine chrome classes still match
+    // while CSS-expression substrings do not.
+    const semanticMarker = nodeMarker(current, ["tag", "role", "data-testid", "aria-label"]);
+    if (/\b(aside|nav|header|footer|complementary|navigation|dialog|sidebar|side-panel|popover|modal)\b/i.test(semanticMarker)) {
+      return true;
+    }
+    if (classTokensSignalChrome(current)) {
       return true;
     }
   }
   return false;
+}
+
+function classTokensSignalChrome(node) {
+  const className = node?.getAttribute?.("class");
+  if (!className) {
+    return false;
+  }
+  // Match a chrome keyword only as a WHOLE space-separated class token (e.g. "popover", "modal",
+  // "sidebar", "side-panel"). A Tailwind utility such as scroll-mt-[calc(var(--header-height)+...)]
+  // is a single token that is not equal to any chrome keyword, so it no longer false-positives.
+  return String(className)
+    .split(/\s+/)
+    .some((token) => CHROME_KEYWORD.test(token));
 }
 
 function nodeMarker(node, fields) {
