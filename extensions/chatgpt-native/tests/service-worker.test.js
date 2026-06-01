@@ -96,7 +96,6 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     for (const jobId of jobs) {
       port.emit(envelope("job_start", jobId, {
         prompt: `prompt ${jobId}`,
-        ...(jobId === "job_a" ? { conversation_id: "conv-resume-a" } : {}),
         wait_interval_ms: 500,
         wait_timeout_ms: 2500
       }));
@@ -134,14 +133,6 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.conversation_url,
       "https://chatgpt.com/c/conv-job_a"
     );
-    assert.equal(
-      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_a")?.message.job.conversation_id,
-      "conv-resume-a"
-    );
-    assert.equal(
-      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_b")?.message.job.conversation_id,
-      null
-    );
     assert.equal(sentToTabs.filter((item) => item.message.type === "yoetz_upload_file").length, 2);
     assert.equal(
       sentToTabs.find((item) => item.message.type === "yoetz_configure_model" && item.message.job.job_id === "job_b")?.message.job.model,
@@ -151,6 +142,92 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     globalThis.chrome = originalChrome;
     globalThis.setInterval = originalSetInterval;
     globalThis.clearInterval = originalClearInterval;
+  }
+});
+
+test("service worker opens fresh and resume jobs in new owned tabs", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const createdTabs = [];
+  const sentToTabs = [];
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => {
+        const tab = { id: createdTabs.length + 1, ...opts };
+        createdTabs.push(tab);
+        return tab;
+      },
+      query: async () => {
+        throw new Error("resume jobs must not discover or reuse existing tabs");
+      },
+      get: async (id) => {
+        const tab = createdTabs.find((item) => item.id === id);
+        return { id, status: "complete", url: tab?.url ?? "https://chatgpt.com/" };
+      },
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?resume_url=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_fresh_url", {
+      prompt: "fresh",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+    port.emit(envelope("job_start", "job_resume_url", {
+      prompt: "resume",
+      conversation_id: "conv-123",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+
+    await eventually(() => port.messages.filter((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ).length === 2);
+
+    assert.deepEqual(
+      createdTabs.map((tab) => ({ url: tab.url, active: tab.active })),
+      [
+        { url: "https://chatgpt.com/?_yoetz=run_job_fresh_url", active: false },
+        { url: "https://chatgpt.com/c/conv-123?_yoetz=run_job_resume_url", active: false }
+      ]
+    );
+    assert.equal(createdTabs.length, 2);
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_resume_url")?.message.job.expected_conversation_id,
+      "conv-123"
+    );
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_resume_url")?.message.job.conversation_id,
+      "conv-123"
+    );
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_fresh_url")?.message.job.expected_conversation_id,
+      null
+    );
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_fresh_url")?.message.job.conversation_id,
+      null
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
   }
 });
 

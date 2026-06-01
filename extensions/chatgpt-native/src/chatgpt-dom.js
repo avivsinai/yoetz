@@ -29,6 +29,12 @@ export function chatgptJobUrl(runId) {
   return url.toString();
 }
 
+export function chatgptConversationJobUrl(conversationId, runId) {
+  const url = new URL(`https://chatgpt.com/c/${encodeURIComponent(conversationId)}`);
+  url.searchParams.set("_yoetz", runId);
+  return url.toString();
+}
+
 export function classifyManualHandoff({ url = "", title = "", text = "" } = {}) {
   const haystack = `${url}\n${title}\n${text}`.toLowerCase();
   if (/\/auth\/login|log in|sign in/.test(haystack)) {

@@ -9,7 +9,7 @@ import {
   progress,
   validateEnvelope
 } from "./protocol.js";
-import { chatgptJobUrl } from "./chatgpt-dom.js";
+import { chatgptConversationJobUrl, chatgptJobUrl } from "./chatgpt-dom.js";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 90 * 60 * 1000;
 const JOB_TTL_MS = 3 * 60 * 60 * 1000;
@@ -217,11 +217,14 @@ async function startJob(message) {
     return;
   }
 
+  job.expected_conversation_id = job.conversation_id ?? null;
   job.status = "opening_tab";
   jobs.set(job.job_id, job);
   await persistJob(job);
 
-  const url = chatgptJobUrl(job.run_id);
+  const url = job.expected_conversation_id
+    ? chatgptConversationJobUrl(job.expected_conversation_id, job.run_id)
+    : chatgptJobUrl(job.run_id);
   const tab = await chrome.tabs.create({ url, active: false });
   job.tab_id = tab.id;
   job.updated_at = Date.now();
@@ -1604,13 +1607,14 @@ function assertJobConnectionCurrent(job) {
 }
 
 function assertJobConversationCurrent(job, extraction) {
-  if (!job.submitted_conversation_id || !extraction?.conversation_id) {
+  const expectedConversationId = job.expected_conversation_id ?? job.submitted_conversation_id;
+  if (!expectedConversationId || !extraction?.conversation_id) {
     return;
   }
-  if (job.submitted_conversation_id === extraction.conversation_id) {
+  if (expectedConversationId === extraction.conversation_id) {
     return;
   }
-  throw commandError("conversation_changed", `job ${job.job_id} moved from ChatGPT conversation ${job.submitted_conversation_id} to ${extraction.conversation_id}`, {
+  throw commandError("conversation_changed", `job ${job.job_id} moved from ChatGPT conversation ${expectedConversationId} to ${extraction.conversation_id}`, {
     phase: "wait_response",
     side_effect_started: true
   });
