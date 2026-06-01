@@ -1193,6 +1193,54 @@ export function clickStopGenerating(root = document) {
   }
 }
 
+// Click stop, then WAIT for ChatGPT to actually go idle before reporting back.
+// A bare clickStopGenerating only *initiates* ChatGPT's client-side abort to
+// OpenAI; the service worker tearing the tab down microseconds later races that
+// request and frequently never stops server-side generation. Polling
+// isResponseGenerating until it clears both proves the abort registered in the
+// UI and gives the abort request time to flush before the tab is removed.
+//
+// Bounded loop (default ≤5s, 250ms interval) with ONE extra re-click if the
+// stop control is still present after the first interval (covers a click that
+// landed on a stale/transitional button). Returns { stopped, confirmed_idle,
+// waited_ms }. Never throws — cancel is best-effort and a torn-down or
+// navigated page must not turn into a hard error.
+export async function confirmGenerationStopped(root = document, options = {}) {
+  const timeoutMs = Number(options.timeoutMs ?? 5000);
+  const intervalMs = Number(options.intervalMs ?? 250);
+  const startedAt = Date.now();
+  let stopped = false;
+  let reclicked = false;
+  try {
+    // Already idle (no stop control) → confirmed_idle without waiting.
+    if (!isResponseGenerating(root)) {
+      return { stopped: false, confirmed_idle: true, waited_ms: 0 };
+    }
+    stopped = clickStopGenerating(root);
+    while (Date.now() - startedAt < timeoutMs) {
+      await sleep(intervalMs);
+      if (!isResponseGenerating(root)) {
+        return { stopped, confirmed_idle: true, waited_ms: Date.now() - startedAt };
+      }
+      // Still generating after the first interval: re-click once in case the
+      // first click hit a transitional control, then keep polling.
+      if (!reclicked) {
+        reclicked = true;
+        if (clickStopGenerating(root)) {
+          stopped = true;
+        }
+      }
+    }
+    // Timed out still generating: report not-idle so the caller can warn the
+    // user the run may still be live server-side.
+    return { stopped, confirmed_idle: false, waited_ms: Date.now() - startedAt };
+  } catch {
+    // Page torn down / navigated mid-poll. Treat as best-effort: we clicked
+    // (maybe), we cannot confirm idle.
+    return { stopped, confirmed_idle: false, waited_ms: Date.now() - startedAt };
+  }
+}
+
 export function normalizeText(value) {
   return String(value ?? "")
     .replace(/\r\n/g, "\n")
