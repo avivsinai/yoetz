@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.22] - 2026-06-02
 ### Fixed
 
 - Further hardened ChatGPT conversation resume against tab/conversation drift.
@@ -20,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   switcher instead of merely excluding transcript containers, so a stale model
   chip rendered inside the conversation transcript can no longer be mistaken for
   the current model; an unfound live control fails closed to `unavailable`.
+
 
 ## [0.5.21] - 2026-06-02
 ### Added
