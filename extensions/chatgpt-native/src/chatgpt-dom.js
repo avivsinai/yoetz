@@ -93,15 +93,15 @@ export function findModelButton(root = document, options = {}) {
   // ChatGPT serves at least two picker families: Enterprise exposes a global
   // model-switcher button, while personal ChatGPT can render a composer-scoped
   // model chip. Keep both paths because either account type may back Pro.
-  const enterpriseButton = firstVisible(root, [
+  const enterpriseButton = firstVisibleModelControl(root, [
     'button[data-testid="model-switcher-dropdown-button"]',
     'button:has([data-testid="selected-model"])',
     'button:has([data-testid="model-switcher-selected-model"])',
     'button[aria-label*="model" i]',
     'button[aria-controls*="model" i]',
     'button[id*="model" i]'
-  ]);
-  const composerButton = findComposerModelControl(root);
+  ], options);
+  const composerButton = findComposerModelControl(root, options);
   if (options.allowStandaloneFallback === false) {
     return enterpriseButton ?? composerButton;
   }
@@ -340,7 +340,7 @@ function isActionableElement(node) {
     || node?.getAttribute?.("tabindex") !== null;
 }
 
-function findComposerModelControl(root) {
+function findComposerModelControl(root, options = {}) {
   for (const scope of modelControlScopes(root)) {
     const candidates = uniqueElements(Array.from(scope.querySelectorAll([
       "button",
@@ -356,6 +356,9 @@ function findComposerModelControl(root) {
     for (const node of candidates) {
       const target = modelClickTarget(node, scope);
       if (!target || !isVisible(target, { allowDisabled: true })) {
+        continue;
+      }
+      if (isTranscriptModelControl(target, options)) {
         continue;
       }
       const haystack = modelCandidateText(node, target);
@@ -520,7 +523,7 @@ export async function selectRequestedModel(root, requested, options = {}) {
     }
     return {
       status: "unavailable",
-      model_used: currentModelLabel(root),
+      model_used: currentModelLabel(root, options),
       available_options: availableOptions,
       warning: "ChatGPT Pro Extended was not visible in the model picker"
     };
@@ -1200,6 +1203,33 @@ export function normalizeText(value) {
 
 function firstVisible(root, selectors) {
   return firstMatching(root, selectors, { allowHidden: false });
+}
+
+function firstVisibleModelControl(root, selectors, options = {}) {
+  for (const selector of selectors) {
+    const nodes = Array.from(root.querySelectorAll(selector));
+    const visible = nodes.find((node) =>
+      isVisible(node, options) && !isTranscriptModelControl(node, options)
+    );
+    if (visible) {
+      return visible;
+    }
+  }
+  return null;
+}
+
+function isTranscriptModelControl(node, options = {}) {
+  if (options.allowStandaloneFallback !== false) {
+    return false;
+  }
+  return Boolean(node?.closest?.([
+    "[data-message-author-role]",
+    "article",
+    '[data-testid*="conversation-turn"]',
+    '[class*="turn-messages"]',
+    '[class*="agent-turn"]',
+    '[class*="user-turn"]'
+  ].join(",")));
 }
 
 function firstMatching(root, selectors, options = {}) {

@@ -1951,6 +1951,37 @@ test("fake ChatGPT resume does not accept stale conversation Pro Extended labels
   assert.match(result.warning, /model selector button not found/);
 });
 
+test("fake ChatGPT resume ignores stale transcript model switcher buttons", async () => {
+  const staleSelectedLabel = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Pro Extended");
+  const staleConversationControl = new FakeElement("button", {
+    "data-testid": "model-switcher-dropdown-button",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      throw new Error("stale transcript model button should not be opened");
+    }
+  }, "Pro Extended").append(staleSelectedLabel);
+  const priorAssistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "")
+    .append(staleConversationControl);
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Pro Extended Ask anything")
+    .append(priorAssistant, form);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  const result = await configureModelState(doc, {
+    conversation_id: "conv-123",
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 10
+  });
+
+  assert.equal(staleConversationControl.clicked, false);
+  assert.equal(staleConversationControl.events.includes("pointerdown"), false);
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.extended_status, "required");
+  assert.match(result.warning, /model selector button not found/);
+});
+
 test("fake ChatGPT reports mismatch when option checks but selected label stays Thinking", async () => {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Thinking");

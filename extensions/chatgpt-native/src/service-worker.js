@@ -1702,16 +1702,23 @@ function assertSubmittedConversationCurrent(job, sendResult) {
 
 function assertJobConversationCurrent(job, extraction) {
   const expectedConversationId = job.expected_conversation_id ?? job.submitted_conversation_id ?? job.conversation_id;
-  if (!expectedConversationId || !extraction?.conversation_id) {
+  if (!expectedConversationId) {
     return;
   }
-  if (expectedConversationId === extraction.conversation_id) {
+  const currentConversationId = extraction?.conversation_id ?? null;
+  if (expectedConversationId === currentConversationId) {
     return;
   }
-  throw commandError("conversation_changed", `job ${job.job_id} moved from ChatGPT conversation ${expectedConversationId} to ${extraction.conversation_id}`, {
-    phase: "wait_response",
-    side_effect_started: true
-  });
+  throw commandError(
+    "conversation_changed",
+    `job ${job.job_id} moved from ChatGPT conversation ${expectedConversationId} to ${currentConversationId ?? "(none)"}`,
+    {
+      phase: "wait_response",
+      side_effect_started: true,
+      requested_conversation_id: expectedConversationId,
+      current_conversation_id: currentConversationId
+    }
+  );
 }
 
 function commandError(code, message, detail = {}) {

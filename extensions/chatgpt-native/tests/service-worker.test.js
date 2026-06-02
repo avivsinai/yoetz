@@ -398,6 +398,77 @@ test("service worker fails immediately when send reports the wrong resumed conve
   }
 });
 
+test("service worker fails resumed jobs when post-send extraction omits the conversation id", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/conv-123?_yoetz=run_job_missing_extract_conversation" }),
+      sendMessage: async (_id, message) => {
+        sentToTabs.push(message.type);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, conversation_id: "conv-123" } };
+          case "yoetz_extract_response":
+            return sent
+              ? { ok: true, payload: { method: "assistant_dom_fallback", text: "answer without identity", is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0 } }
+              : { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1, conversation_id: "conv-123" } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?missing_extract_conversation=${Date.now()}`);
+    port.emit(envelope("job_start", "job_missing_extract_conversation", {
+      prompt: "resume",
+      conversation_id: "conv-123",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_missing_extract_conversation", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_missing_extract_conversation.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.payload?.code === "conversation_changed"
+    ));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.payload.phase, "wait_response");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.requested_conversation_id, "conv-123");
+    assert.equal(error.payload.current_conversation_id, null);
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    assert.equal(sentToTabs.includes("yoetz_send_prompt"), true);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker fails unavailable conversations with inspectable terminal error", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -623,6 +694,70 @@ test("service worker fails closed when Pro Extended is unavailable", async () =>
     assert.equal(error.payload.model_selection_status, "unavailable");
     assert.equal(sentToTabs.includes("yoetz_upload_file"), false);
     assert.equal(sentToTabs.includes("yoetz_send_prompt"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker fails resumed jobs before upload when Pro Extended is unavailable", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const createdTabs = [];
+  const sentToTabs = [];
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => {
+        const tab = { id: createdTabs.length + 1, ...opts };
+        createdTabs.push(tab);
+        return tab;
+      },
+      get: async (id) => ({ id, status: "complete", url: createdTabs.find((tab) => tab.id === id)?.url ?? "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        sentToTabs.push(message.type);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "unavailable",
+                model_used: "Default",
+                requested_model: "extended-pro",
+                extended_status: "required",
+                available_options: ["Default"],
+                warning: "ChatGPT model selector button not found"
+              }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?resume_model_unavailable=${Date.now()}`);
+    port.emit(envelope("job_start", "job_resume_model_fail", {
+      prompt: "resume",
+      conversation_id: "conv-123",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(createdTabs[0].url, "https://chatgpt.com/c/conv-123?_yoetz=run_job_resume_model_fail");
+    assert.equal(error.payload.code, "model_selection_failed");
+    assert.equal(error.payload.phase, "model_selection");
+    assert.equal(error.payload.side_effect_started, false);
+    assert.equal(error.payload.model_selection_status, "unavailable");
+    assert.equal(sentToTabs.includes("yoetz_upload_file"), false);
+    assert.equal(sentToTabs.includes("yoetz_send_prompt"), false);
+    assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
   } finally {
     globalThis.chrome = originalChrome;
   }
