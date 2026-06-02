@@ -75,13 +75,7 @@ async function prepareJob(job) {
   });
   const conversationId = conversationIdForJob(job);
   if (!handoff && conversationId) {
-    const urlRunId = runIdFromUrl(location.href);
-    if (urlRunId !== job.run_id) {
-      throw commandError("run_mismatch", `tab is not owned by Yoetz run ${job.run_id}`, {
-        phase: "upload",
-        side_effect_started: false
-      });
-    }
+    assertUrlRunMarker(job);
   }
   const conversation = !handoff && conversationId
     ? await ensureConversationLoaded(document, conversationId, conversationLoadOptionsForJob(job))
@@ -90,6 +84,9 @@ async function prepareJob(job) {
     ? await ensureFreshChat(document, job)
     : null;
   if (!handoff) {
+    if (conversationId) {
+      assertUrlRunMarker(job);
+    }
     window.name = ownedWindowName(job);
     markOwnership(document, job);
     activeJobs.set(job.job_id, { ...job, prepare_complete: true });
@@ -133,7 +130,12 @@ async function sendPrompt(job, prompt) {
   const baseline = sendAcceptanceBaseline(document);
   await insertPrompt(document, prompt, { timeoutMs: 20000 });
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send"));
-  await clickSend(document, { timeoutMs: Number(job.send_timeout_ms) || 120000 });
+  const clickOptions = { timeoutMs: Number(job.send_timeout_ms) || 120000 };
+  const expectedConversationId = expectedConversationIdForJob(job);
+  if (expectedConversationId) {
+    clickOptions.expectedConversationId = expectedConversationId;
+  }
+  await clickSend(document, clickOptions);
   let accepted;
   try {
     accepted = await waitForSendAccepted(document, baseline, {
@@ -329,6 +331,16 @@ function ownershipOptionsForJob(job, phase) {
   return conversationId
     ? { requireConversation: conversationId, phase }
     : { requireFresh: true, phase };
+}
+
+function assertUrlRunMarker(job) {
+  const urlRunId = runIdFromUrl(location.href);
+  if (urlRunId !== job.run_id) {
+    throw commandError("run_mismatch", `tab is not owned by Yoetz run ${job.run_id}`, {
+      phase: "upload",
+      side_effect_started: false
+    });
+  }
 }
 
 function conversationIdForJob(job) {

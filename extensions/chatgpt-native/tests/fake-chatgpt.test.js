@@ -1635,6 +1635,39 @@ test("hidden ancestors make controls invisible", async () => {
   );
 });
 
+test("clickSend rejects conversation drift immediately before clicking send", async () => {
+  const composer = new FakeElement("div", { id: "prompt-textarea", role: "textbox" }, "Review this");
+  const send = new FakeElement("button", { "aria-label": "Send prompt", "aria-disabled": "true" }, "");
+  const body = new FakeElement("body", {}, "Review this").append(composer, send);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.href = "https://chatgpt.com/c/conv-123?_yoetz=run_resume";
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  setTimeout(() => {
+    doc.defaultView.location.href = "https://chatgpt.com/c/other?_yoetz=run_resume";
+    doc.defaultView.location.pathname = "/c/other";
+    delete send.attrs["aria-disabled"];
+  }, 20);
+
+  await assert.rejects(
+    () => clickSend(doc, {
+      expectedConversationId: "conv-123",
+      timeoutMs: 250,
+      intervalMs: 10,
+      minTimeoutMs: 0
+    }),
+    (error) => {
+      assert.equal(error.code, "conversation_changed");
+      assert.equal(error.phase, "send");
+      assert.equal(error.side_effect_started, false);
+      assert.equal(error.requested_conversation_id, "conv-123");
+      assert.equal(error.current_conversation_id, "other");
+      return true;
+    }
+  );
+  assert.equal(send.clicked, false);
+});
+
 test("clickSend waits for a visible ChatGPT send control to become enabled", async () => {
   const composer = new FakeElement("div", { id: "prompt-textarea", role: "textbox" }, "Review this");
   const send = new FakeElement("button", { "aria-label": "Send prompt", "aria-disabled": "true" }, "");
