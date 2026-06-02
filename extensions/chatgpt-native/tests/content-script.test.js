@@ -59,6 +59,7 @@ export async function ensureConversationLoaded(_document, conversationId, option
     }
     throw error;
   }
+  hooks.afterEnsureConversationLoaded?.();
   return { status: "loaded", conversation_id: conversationId, pathname: globalThis.location.pathname };
 }
 
@@ -218,6 +219,26 @@ test("content script resume prepare rejects an unowned resume URL marker", async
     assert.equal(response.phase, "upload");
     assert.equal(response.side_effect_started, false);
     assert.deepEqual(hooks.ensureConversationLoadedCalls, []);
+    assert.deepEqual(hooks.markOwnershipCalls, []);
+  } finally {
+    restore();
+  }
+});
+
+test("content script resume prepare rejects marker drift during conversation loading before ownership mark", async () => {
+  const { send, hooks, restore, location } = await loadContentScript("resume_marker_drift_during_load", "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+  try {
+    hooks.afterEnsureConversationLoaded = () => {
+      location.href = "https://chatgpt.com/c/conv-123?_yoetz=other_run";
+    };
+
+    const response = await send({ type: "yoetz_prepare_job", job: resumeJob() });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "run_mismatch");
+    assert.equal(response.phase, "upload");
+    assert.equal(response.side_effect_started, false);
+    assert.equal(hooks.ensureConversationLoadedCalls.length, 1);
     assert.deepEqual(hooks.markOwnershipCalls, []);
   } finally {
     restore();
