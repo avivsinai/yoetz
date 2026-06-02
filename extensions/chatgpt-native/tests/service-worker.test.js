@@ -1892,6 +1892,168 @@ test("service worker does not complete on brief stable assistant text without a 
   }
 });
 
+test("service worker completes long stable assistant text with an unscoped copy affordance", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const longAnswer = "Final Pro review paragraph with concrete evidence.\n".repeat(160).trim();
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "assistant_dom_fallback",
+                    text: longAnswer,
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: false,
+                    turn_index: 0,
+                    diagnostics: {
+                      counts: { stop_controls: 0, copy_buttons: 1 }
+                    }
+                  }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, user_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?long_unscoped_copy=${Date.now()}`);
+    port.emit(envelope("job_start", "job_long_unscoped_copy", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 2000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_long_unscoped_copy", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_long_unscoped_copy.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.equal(complete.payload.response, longAnswer);
+    assert.equal(complete.payload.extraction_method, "assistant_dom_fallback");
+    assert.equal(complete.payload.completion_reason, "stable_idle_unscoped_copy_button");
+    assert.ok(complete.payload.stable_for_ms >= 100);
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker does not complete long idle assistant text with only baseline copy controls", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const longAnswer = "Final Pro review paragraph with concrete evidence.\n".repeat(160).trim();
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "assistant_dom_fallback",
+                    text: longAnswer,
+                    is_generating: false,
+                    assistant_count: 2,
+                    user_count: 2,
+                    preceding_user_count: 2,
+                    copy_button_count: 1,
+                    has_copy_button: false,
+                    turn_index: 1
+                  }
+                : {
+                    method: "copy_scope_dom_fallback",
+                    text: "old answer",
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: 0
+                  }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?long_baseline_copy_only=${Date.now()}`);
+    port.emit(envelope("job_start", "job_long_baseline_copy_only", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1200
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_long_baseline_copy_only", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_long_baseline_copy_only.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker emits low-noise waiting progress while ChatGPT is quiet", async () => {
   const originalChrome = globalThis.chrome;
   const previousWaitingProgressInterval = globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
@@ -2881,6 +3043,81 @@ test("service worker does not complete on copy button while response is still ge
       mime_type: "text/markdown",
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
+    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker does not complete long unscoped-copy text while response is still generating", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const longPartial = "Streaming Pro review paragraph that is still changing.\n".repeat(160).trim();
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "assistant_dom_fallback",
+                    text: longPartial,
+                    is_generating: true,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: false,
+                    turn_index: 0,
+                    diagnostics: {
+                      counts: { stop_controls: 1, copy_buttons: 1 }
+                    }
+                  }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, user_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?long_unscoped_copy_generating=${Date.now()}`);
+    port.emit(envelope("job_start", "job_long_unscoped_copy_generating", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1200
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_long_unscoped_copy_generating", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_long_unscoped_copy_generating.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
     await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
     assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
   } finally {
