@@ -36,16 +36,26 @@ async function handleMessage(message) {
   }
 }
 
-// Best-effort cancel: click ChatGPT's stop control if visible, then return.
+// Best-effort cancel: click ChatGPT's stop control, then WAIT for generation to
+// actually go idle before returning so the service worker does not remove the
+// tab while the abort request to OpenAI is still in flight (closing the tab
+// early lets the server keep generating). Returns confirmed_idle so the worker
+// can report a truthful stop status to the CLI.
+//
 // Intentionally does NOT call assertJobOwnership — the cancel may arrive after
 // the tab has navigated, lost its window.name marker, or after the content
 // script reloaded (in which case activeJobs is empty). Cancel is a kill, not a
 // safe-tab-only operation; the service worker is already going to remove the
-// tab right after this regardless of outcome.
+// tab right after this regardless of outcome. confirmGenerationStopped never
+// throws, so cancel stays best-effort.
 async function cancelSend(_job) {
-  const { clickStopGenerating } = await domHelpers();
-  const stopped = clickStopGenerating(document);
-  return { stopped: Boolean(stopped) };
+  const { confirmGenerationStopped } = await domHelpers();
+  const result = await confirmGenerationStopped(document);
+  return {
+    stopped: Boolean(result?.stopped),
+    confirmed_idle: Boolean(result?.confirmed_idle),
+    waited_ms: Number(result?.waited_ms ?? 0)
+  };
 }
 
 async function prepareJob(job) {

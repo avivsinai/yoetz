@@ -4,11 +4,13 @@ import {
   clickSend,
   clickStopGenerating,
   configureModelState,
+  confirmGenerationStopped,
   ensureConversationLoaded,
   ensureFreshChat,
   extractResponse,
   findModelButton,
   insertPrompt,
+  isResponseGenerating,
   sendAcceptanceBaseline,
   uploadFile,
   waitForSendAccepted
@@ -230,6 +232,96 @@ test("clickStopGenerating ignores hidden stop controls", () => {
 
   assert.equal(clickStopGenerating(doc), false);
   assert.equal(stop.clicked, false);
+});
+
+test("confirmGenerationStopped reports confirmed_idle immediately when already idle", async () => {
+  const body = new FakeElement("body", {}, "ChatGPT settled");
+  const doc = new FakeDocument(body);
+
+  const result = await confirmGenerationStopped(doc, { timeoutMs: 1000, intervalMs: 10 });
+  assert.deepEqual(result, { stopped: false, confirmed_idle: true, waited_ms: 0 });
+});
+
+test("confirmGenerationStopped clicks stop then waits until generation goes idle", async () => {
+  // Clicking stop hides the control on the next poll, mirroring ChatGPT removing
+  // the Stop button once it accepts the abort.
+  const stop = new FakeElement("button", {
+    "aria-label": "Stop streaming",
+    onClick: () => {
+      stop.attrs.style = "display:none";
+    }
+  }, "Stop");
+  const body = new FakeElement("body", {}, "Stop").append(stop);
+  const doc = new FakeDocument(body);
+
+  assert.equal(isResponseGenerating(doc), true);
+  const result = await confirmGenerationStopped(doc, { timeoutMs: 1000, intervalMs: 10 });
+  assert.equal(stop.clicked, true);
+  assert.equal(result.stopped, true);
+  assert.equal(result.confirmed_idle, true);
+  assert.equal(isResponseGenerating(doc), false);
+});
+
+test("confirmGenerationStopped re-clicks once when generation persists after the first interval", async () => {
+  // First click is ignored (transitional control); the SECOND click halts.
+  let clicks = 0;
+  const stop = new FakeElement("button", {
+    "aria-label": "Stop streaming",
+    onClick: () => {
+      clicks += 1;
+      if (clicks >= 2) {
+        stop.attrs.style = "display:none";
+      }
+    }
+  }, "Stop");
+  const body = new FakeElement("body", {}, "Stop").append(stop);
+  const doc = new FakeDocument(body);
+
+  const result = await confirmGenerationStopped(doc, { timeoutMs: 1000, intervalMs: 10 });
+  assert.equal(clicks, 2, "expected exactly one re-click after the first interval");
+  assert.equal(result.stopped, true);
+  assert.equal(result.confirmed_idle, true);
+});
+
+test("confirmGenerationStopped re-clicks at most once and reports not idle on timeout", async () => {
+  // Generation never stops no matter how many times we click → timeout path.
+  let clicks = 0;
+  const stop = new FakeElement("button", {
+    "aria-label": "Stop streaming",
+    onClick: () => {
+      clicks += 1;
+    }
+  }, "Stop");
+  const body = new FakeElement("body", {}, "Stop").append(stop);
+  const doc = new FakeDocument(body);
+
+  const result = await confirmGenerationStopped(doc, { timeoutMs: 80, intervalMs: 10 });
+  assert.equal(result.stopped, true);
+  assert.equal(result.confirmed_idle, false, "must report not-idle when generation outlasts the timeout");
+  assert.ok(result.waited_ms >= 0);
+  // Initial click + exactly one re-click, never more (re-click is bounded to once).
+  assert.equal(clicks, 2, "re-click must fire at most once even across many poll cycles");
+});
+
+test("confirmGenerationStopped never throws when the page tears down mid-poll", async () => {
+  let polls = 0;
+  const stop = new FakeElement("button", { "aria-label": "Stop streaming" }, "Stop");
+  const body = new FakeElement("body", {}, "Stop").append(stop);
+  const doc = new FakeDocument(body);
+  // Simulate the document being torn down (navigated/removed) after the stop
+  // click, so a later querySelectorAll throws.
+  const realQuery = doc.querySelectorAll.bind(doc);
+  doc.querySelectorAll = (selector) => {
+    polls += 1;
+    if (polls > 1) {
+      throw new Error("document detached");
+    }
+    return realQuery(selector);
+  };
+
+  const result = await confirmGenerationStopped(doc, { timeoutMs: 200, intervalMs: 10 });
+  assert.equal(result.confirmed_idle, false);
+  assert.equal(typeof result.stopped, "boolean");
 });
 
 test("extractResponse ignores user prompt articles and copy controls", () => {
