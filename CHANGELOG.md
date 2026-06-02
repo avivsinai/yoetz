@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.21] - 2026-06-02
 ### Added
 
 - ChatGPT recipe **conversation resume**: pass `--var conversation=<id|url>` to
@@ -32,6 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   re-click) before removing the tab, and reports `stop_confirmed` /
   `generation_idle` / `may_still_be_running` so the outcome is truthful when a
   stop cannot be confirmed.
+
 
 ## [0.5.20] - 2026-06-01
 ### Fixed
