@@ -130,7 +130,12 @@ async function sendPrompt(job, prompt) {
   const baseline = sendAcceptanceBaseline(document);
   await insertPrompt(document, prompt, { timeoutMs: 20000 });
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send"));
-  await clickSend(document, { timeoutMs: Number(job.send_timeout_ms) || 120000 });
+  const clickOptions = { timeoutMs: Number(job.send_timeout_ms) || 120000 };
+  const expectedConversationId = expectedConversationIdForJob(job);
+  if (expectedConversationId) {
+    clickOptions.expectedConversationId = expectedConversationId;
+  }
+  await clickSend(document, clickOptions);
   let accepted;
   try {
     accepted = await waitForSendAccepted(document, baseline, {

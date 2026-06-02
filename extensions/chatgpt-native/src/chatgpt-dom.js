@@ -709,6 +709,7 @@ export async function clickSend(root, options = {}) {
   while (Date.now() - startedAt < timeoutMs) {
     const button = findSendButtonControl(root, { requireEnabled: true });
     if (button) {
+      assertExpectedConversationBeforeSendClick(root, options.expectedConversationId);
       button.click();
       return true;
     }
@@ -720,6 +721,32 @@ export async function clickSend(root, options = {}) {
     throw new Error(`ChatGPT send button remained disabled (${describeElement(lastCandidate)}; ${sendReadinessDiagnostics(root)})`);
   }
   throw new Error(`ChatGPT send button not found (${sendReadinessDiagnostics(root)})`);
+}
+
+function assertExpectedConversationBeforeSendClick(root, expectedConversationId) {
+  const expected = String(expectedConversationId ?? "").trim();
+  if (!expected) {
+    return;
+  }
+  const win = root.defaultView ?? globalThis;
+  const pathname = String(win.location?.pathname ?? "");
+  const currentConversationId = conversationIdFromPathname(pathname);
+  if (currentConversationId === expected) {
+    return;
+  }
+  const code = currentConversationId ? "conversation_changed" : "conversation_not_loaded";
+  throw chatgptCommandError(
+    code,
+    `ChatGPT conversation changed before send click; expected ${expected}, current ${currentConversationId ?? "(none)"}`,
+    {
+      phase: "send",
+      side_effect_started: false,
+      requested_conversation_id: expected,
+      current_conversation_id: currentConversationId,
+      current_url: currentLocationForError(win),
+      current_pathname: pathname
+    }
+  );
 }
 
 export function sendAcceptanceBaseline(root = document) {

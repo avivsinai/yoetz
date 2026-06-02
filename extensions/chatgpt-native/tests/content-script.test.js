@@ -139,6 +139,7 @@ test("content script resume path skips fresh enforcement and completes on reques
     const sent = await send({ type: "yoetz_send_prompt", job, prompt: "continue" });
     assert.equal(sent.ok, true);
     assert.equal(sent.payload.conversation_id, "conv-123");
+    assert.equal(hooks.clickSendCalls[0].expectedConversationId, "conv-123");
 
     const extracted = await send({ type: "yoetz_extract_response", job });
     assert.equal(extracted.ok, true);
