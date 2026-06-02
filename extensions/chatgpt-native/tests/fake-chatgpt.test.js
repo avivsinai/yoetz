@@ -2090,6 +2090,105 @@ test("fake ChatGPT accepts Pro Extended label that appears after the picker stay
   assert.equal(result.extended_status, "required");
 });
 
+test("fake ChatGPT resume selects Enterprise header model switcher", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const selected = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Thinking");
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-pro",
+    onClick: () => {
+      selected.innerText = "Pro Extended";
+      selected.textContent = "Pro Extended";
+    }
+  }, "Pro Extended");
+  const modelButton = new FakeElement("button", {
+    "data-testid": "model-switcher-dropdown-button",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      if (!body.children.includes(proOption)) {
+        body.append(proOption);
+      }
+    }
+  }, "Thinking").append(selected);
+  const header = new FakeElement("header", {}, "Thinking").append(modelButton);
+  const main = new FakeElement("main", {}, "Ask anything").append(composer);
+  const body = new FakeElement("body", {}, "Thinking Ask anything").append(header, main);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  const result = await configureModelState(doc, { conversation_id: "conv-123" });
+
+  assert.ok(modelButton.events.includes("pointerdown"));
+  assert.equal(proOption.clicked, true);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Pro Extended");
+  assert.equal(result.extended_status, "required");
+});
+
+test("fake ChatGPT resume selects personal composer model picker", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const proOption = new FakeElement("div", {
+    role: "menuitemradio",
+    "data-testid": "model-switcher-gpt-5-5-pro",
+    onClick: () => {
+      modelChip.innerText = "Pro Extended";
+      modelChip.textContent = "Pro Extended";
+      body.children = body.children.filter((child) => child !== proOption);
+    }
+  }, "Pro Extended");
+  const modelChip = new FakeElement("button", {
+    class: "model-chip",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      if (!body.children.includes(proOption)) {
+        body.append(proOption);
+      }
+    }
+  }, "Thinking");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer, modelChip);
+  const body = new FakeElement("body", {}, "Ask anything Thinking").append(form);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  const result = await configureModelState(doc, { conversation_id: "conv-123" });
+
+  assert.ok(modelChip.events.includes("pointerdown"));
+  assert.equal(proOption.clicked, true);
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "Pro Extended");
+  assert.equal(result.extended_status, "required");
+});
+
+test("fake ChatGPT resume treats stale transcript model chip as unavailable", async () => {
+  const staleModelChip = new FakeElement("button", {
+    class: "model-chip",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      throw new Error("stale transcript model chip should not be opened");
+    }
+  }, "Extended Pro");
+  const staleTranscript = new FakeElement("section", { class: "old-transcript-row" }, "Earlier model Extended Pro")
+    .append(staleModelChip);
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const main = new FakeElement("main", {}, "Earlier model Extended Pro Ask anything")
+    .append(staleTranscript, composer);
+  const body = new FakeElement("body", {}, "Earlier model Extended Pro Ask anything").append(main);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  const result = await configureModelState(doc, {
+    conversation_id: "conv-123",
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 10
+  });
+
+  assert.equal(staleModelChip.events.includes("pointerdown"), false);
+  assert.equal(staleModelChip.clicked, false);
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.extended_status, "required");
+  assert.match(result.warning, /model selector button not found/);
+});
+
 test("fake ChatGPT resume does not accept stale conversation Pro Extended labels as current model", async () => {
   const staleConversationControl = new FakeElement("button", {}, "Pro Extended");
   const staleSelectedLabel = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Pro Extended");
@@ -2317,6 +2416,7 @@ function matchesSimpleSelector(element, selector) {
   if (selector === "#prompt-textarea") return attr("id") === "prompt-textarea";
   if (selector === "button") return tag === "button";
   if (selector === "div") return tag === "div";
+  if (selector === "header") return tag === "header";
   if (selector === "article") return tag === "article";
   if (selector === "pre") return tag === "pre";
   if (selector === "code") return tag === "code";
@@ -2387,6 +2487,9 @@ function matchesSimpleSelector(element, selector) {
   }
   if (selector.includes('[role="main"]')) {
     return attr("role") === "main";
+  }
+  if (selector.includes('[role="banner"]')) {
+    return attr("role") === "banner";
   }
   if (selector.includes('[data-testid="model-switcher-dropdown-button"]')) {
     return attr("data-testid") === "model-switcher-dropdown-button";

@@ -93,7 +93,7 @@ export function findModelButton(root = document, options = {}) {
   // ChatGPT serves at least two picker families: Enterprise exposes a global
   // model-switcher button, while personal ChatGPT can render a composer-scoped
   // model chip. Keep both paths because either account type may back Pro.
-  const enterpriseButton = firstVisibleModelControl(root, [
+  const enterpriseButton = firstVisibleModelControlInScopes(modelHeaderScopes(root, options), [
     'button[data-testid="model-switcher-dropdown-button"]',
     'button:has([data-testid="selected-model"])',
     'button:has([data-testid="model-switcher-selected-model"])',
@@ -341,7 +341,7 @@ function isActionableElement(node) {
 }
 
 function findComposerModelControl(root, options = {}) {
-  for (const scope of modelControlScopes(root)) {
+  for (const scope of modelControlScopes(root, options)) {
     const candidates = uniqueElements(Array.from(scope.querySelectorAll([
       "button",
       '[role="button"]',
@@ -374,6 +374,16 @@ function findComposerModelControl(root, options = {}) {
   return null;
 }
 
+function firstVisibleModelControlInScopes(scopes, selectors, options = {}) {
+  for (const scope of scopes) {
+    const control = firstVisibleModelControl(scope, selectors, options);
+    if (control) {
+      return control;
+    }
+  }
+  return null;
+}
+
 function findStandaloneProExtendedModelControl(root) {
   const requested = proExtendedModelRequest();
   const candidates = uniqueElements(Array.from(root.querySelectorAll([
@@ -393,16 +403,69 @@ function findStandaloneProExtendedModelControl(root) {
   }) ?? null;
 }
 
-function modelControlScopes(root) {
+function modelHeaderScopes(root, options = {}) {
+  if (options.allowStandaloneFallback !== false) {
+    return [root];
+  }
+  return uniqueElements(Array.from(root.querySelectorAll([
+    "header",
+    '[role="banner"]'
+  ].join(","))));
+}
+
+function modelControlScopes(root, options = {}) {
   const composer = findComposer(root);
-  const scopes = [...composerScopes(root, { includeRoot: false })];
+  const scopes = [];
   const add = (scope) => {
     if (scope && !scopes.includes(scope)) {
       scopes.push(scope);
     }
   };
-  add(composer?.closest("main, [role=\"main\"]"));
+  add(composer?.closest("form"));
+  add(composer?.closest('[data-testid*="composer"], [class*="composer"]'));
+  const parent = composer?.parentElement;
+  if (options.allowStandaloneFallback !== false || isLocalComposerScope(parent)) {
+    add(parent);
+  }
+  for (const scope of [...scopes]) {
+    addAdjacentComposerControlScopes(scope, add);
+  }
+  if (options.allowStandaloneFallback !== false) {
+    add(composer?.closest("main, [role=\"main\"]"));
+  }
   return scopes;
+}
+
+function addAdjacentComposerControlScopes(scope, add) {
+  const parent = scope?.parentElement;
+  if (!parent) {
+    return;
+  }
+  for (const sibling of Array.from(parent.children ?? [])) {
+    if (sibling !== scope && looksLikeComposerControlScope(sibling)) {
+      add(sibling);
+    }
+  }
+}
+
+function isLocalComposerScope(node) {
+  if (!node) {
+    return false;
+  }
+  const tag = String(node.tagName ?? "").toLowerCase();
+  const role = String(node.getAttribute?.("role") ?? "").toLowerCase();
+  return !["html", "body", "main"].includes(tag) && role !== "main";
+}
+
+function looksLikeComposerControlScope(node) {
+  const marker = normalizeText([
+    node?.getAttribute?.("data-testid"),
+    node?.getAttribute?.("class"),
+    node?.getAttribute?.("aria-label"),
+    node?.getAttribute?.("role")
+  ].filter(Boolean).join(" ")).toLowerCase();
+  return /\b(composer|model|switcher|toolbar|controls|pill)\b/.test(marker)
+    && !/\b(conversation|transcript|message|turn|assistant|user)\b/.test(marker);
 }
 
 function modelClickTarget(node, stopAt) {
