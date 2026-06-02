@@ -40,8 +40,8 @@ export async function ensureFreshChat(_document, job) {
   return { status: "fresh", pathname: globalThis.location.pathname };
 }
 
-export async function ensureConversationLoaded(_document, conversationId) {
-  hooks.ensureConversationLoadedCalls.push(conversationId);
+export async function ensureConversationLoaded(_document, conversationId, options) {
+  hooks.ensureConversationLoadedCalls.push({ conversationId, options });
   const actual = conversationIdFromLocation();
   if (actual !== conversationId) {
     const error = new Error(\`ChatGPT conversation \${conversationId} did not load\`);
@@ -116,7 +116,7 @@ test("content script resume path skips fresh enforcement and completes on reques
     assert.equal(prepared.payload.manual_handoff, null);
     assert.equal(prepared.payload.fresh_chat, null);
     assert.deepEqual(hooks.ensureFreshChatCalls, []);
-    assert.deepEqual(hooks.ensureConversationLoadedCalls, ["conv-123"]);
+    assert.deepEqual(hooks.ensureConversationLoadedCalls.map((call) => call.conversationId), ["conv-123"]);
     assert.equal(globalThis.window.name, "yoetz-chatgpt-native:run_resume:job_resume");
 
     const uploaded = await send({
@@ -181,6 +181,43 @@ test("content script resume prepare preserves conversation unavailable details",
     assert.equal(response.side_effect_started, false);
     assert.equal(response.requested_conversation_id, "conv-123");
     assert.equal(response.current_url, currentUrl);
+  } finally {
+    restore();
+  }
+});
+
+test("content script resume prepare passes job load timing into conversation loading", async () => {
+  const { send, hooks, restore } = await loadContentScript("resume_timing", "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+  try {
+    const job = {
+      ...resumeJob(),
+      upload_timeout_ms: 4321,
+      upload_interval_ms: 123
+    };
+
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+
+    assert.equal(prepared.ok, true);
+    assert.equal(hooks.ensureConversationLoadedCalls.length, 1);
+    assert.equal(hooks.ensureConversationLoadedCalls[0].conversationId, "conv-123");
+    assert.equal(hooks.ensureConversationLoadedCalls[0].options.timeoutMs, 4321);
+    assert.equal(hooks.ensureConversationLoadedCalls[0].options.intervalMs, 123);
+  } finally {
+    restore();
+  }
+});
+
+test("content script resume prepare rejects an unowned resume URL marker", async () => {
+  const { send, hooks, restore } = await loadContentScript("resume_wrong_marker", "https://chatgpt.com/c/conv-123?_yoetz=other_run");
+  try {
+    const response = await send({ type: "yoetz_prepare_job", job: resumeJob() });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "run_mismatch");
+    assert.equal(response.phase, "upload");
+    assert.equal(response.side_effect_started, false);
+    assert.deepEqual(hooks.ensureConversationLoadedCalls, []);
+    assert.deepEqual(hooks.markOwnershipCalls, []);
   } finally {
     restore();
   }

@@ -231,6 +231,102 @@ test("service worker opens fresh and resume jobs in new owned tabs", async () =>
   }
 });
 
+test("service worker rejects invalid conversation ids before opening a tab", async () => {
+  const invalidCases = [
+    ".",
+    "..",
+    "a/b",
+    "conv%2F123",
+    "",
+    "x".repeat(257),
+    42
+  ];
+
+  for (const [index, invalid] of invalidCases.entries()) {
+    const originalChrome = globalThis.chrome;
+    const port = makePort();
+    const createdTabs = [];
+    globalThis.chrome = chromeStub({
+      port,
+      tabs: {
+        create: async (opts) => {
+          createdTabs.push(opts);
+          return { id: createdTabs.length, ...opts };
+        },
+        get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+        sendMessage: async () => {
+          throw new Error("invalid conversation must fail before tab messaging");
+        }
+      }
+    });
+
+    try {
+      await import(`../src/service-worker.js?invalid_conversation=${Date.now()}_${index}`);
+      port.emit(envelope("job_start", `job_invalid_${index}`, {
+        prompt: "resume",
+        conversation_id: invalid,
+        wait_interval_ms: 50,
+        wait_timeout_ms: 1000
+      }));
+
+      await eventually(() => port.messages.some((message) => message.type === "job_error"));
+      const error = port.messages.find((message) => message.type === "job_error");
+      assert.equal(error.payload.code, "invalid_conversation");
+      assert.equal(error.payload.phase, "upload");
+      assert.equal(error.payload.side_effect_started, false);
+      assert.deepEqual(createdTabs, []);
+    } finally {
+      globalThis.chrome = originalChrome;
+    }
+  }
+});
+
+test("service worker trims a valid conversation id before opening the resume tab", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const createdTabs = [];
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => {
+        const tab = { id: createdTabs.length + 1, ...opts };
+        createdTabs.push(tab);
+        return tab;
+      },
+      get: async (id) => ({ id, status: "complete", url: createdTabs.find((item) => item.id === id)?.url ?? "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?trim_conversation=${Date.now()}`);
+    port.emit(envelope("job_start", "job_trim_conversation", {
+      prompt: "resume",
+      conversation_id: " conv-123 ",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ));
+    assert.equal(createdTabs[0].url, "https://chatgpt.com/c/conv-123?_yoetz=run_job_trim_conversation");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker fails unavailable conversations with inspectable terminal error", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

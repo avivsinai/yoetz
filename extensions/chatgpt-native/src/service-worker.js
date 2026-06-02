@@ -213,6 +213,14 @@ async function startJob(message) {
   job.updated_at = Date.now();
   job.connection_generation = connectionGeneration;
 
+  if (job.conversation_error) {
+    await failJob(job, "invalid_conversation", job.conversation_error.message, {
+      phase: "upload",
+      side_effect_started: false
+    });
+    return;
+  }
+
   const targetProfile = await validateTargetProfile(job);
   if (!targetProfile.ok) {
     await failJob(job, targetProfile.code, targetProfile.message, targetProfile.detail);
@@ -875,6 +883,7 @@ function canResumeWaitingResponseAfterWorkerRestart(job) {
 
 function normalizeJob(message) {
   const payload = message.payload ?? {};
+  const conversation = normalizeConversationId(payload.conversation_id);
   return {
     job_id: message.job_id,
     run_id: message.run_id,
@@ -891,7 +900,8 @@ function normalizeJob(message) {
     profile_email: payload.profile_email ?? null,
     extension_instance_id: payload.extension_instance_id ?? null,
     extension_profile_id: payload.extension_profile_id ?? null,
-    conversation_id: payload.conversation_id ?? null,
+    conversation_id: conversation.ok ? conversation.id : null,
+    conversation_error: conversation.ok ? null : conversation,
     bundle_size: payload.bundle_size ?? 0,
     file_name: payload.file_name ?? "yoetz-bundle.md",
     model_selection_status: "unavailable",
@@ -899,6 +909,26 @@ function normalizeJob(message) {
     warnings: [],
     status: "starting"
   };
+}
+
+function normalizeConversationId(value) {
+  if (value == null) {
+    return { ok: true, id: null };
+  }
+  if (typeof value !== "string") {
+    return { ok: false, message: "invalid `conversation_id`: expected a string ChatGPT conversation id" };
+  }
+  const id = value.trim();
+  if (!id || id === "." || id === "..") {
+    return { ok: false, message: "invalid `conversation_id`: expected a non-empty ChatGPT conversation id" };
+  }
+  if (id.length > 256) {
+    return { ok: false, message: "invalid `conversation_id`: expected at most 256 characters" };
+  }
+  if (!/^[A-Za-z0-9_.-]+$/.test(id)) {
+    return { ok: false, message: "invalid `conversation_id`: expected ASCII letters, digits, `_`, `.`, or `-`" };
+  }
+  return { ok: true, id };
 }
 
 function requireJob(jobId) {
@@ -1648,7 +1678,7 @@ function assertJobConnectionCurrent(job) {
 }
 
 function assertJobConversationCurrent(job, extraction) {
-  const expectedConversationId = job.expected_conversation_id ?? job.submitted_conversation_id;
+  const expectedConversationId = job.expected_conversation_id ?? job.submitted_conversation_id ?? job.conversation_id;
   if (!expectedConversationId || !extraction?.conversation_id) {
     return;
   }

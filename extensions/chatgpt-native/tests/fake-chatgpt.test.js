@@ -1279,6 +1279,27 @@ test("ensureConversationLoaded reports unavailable when the requested conversati
   );
 });
 
+test("ensureConversationLoaded reports unavailable when an error page still renders a composer", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+  const body = new FakeElement("body", {}, "Conversation not found Message ChatGPT").append(composer);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-404";
+  doc.defaultView.location.href = "https://chatgpt.com/c/conv-404?_yoetz=run_resume";
+
+  await assert.rejects(
+    () => ensureConversationLoaded(doc, "conv-404", { timeoutMs: 30, intervalMs: 10 }),
+    (error) => {
+      assert.equal(error.code, "conversation_unavailable");
+      assert.equal(error.phase, "upload");
+      assert.equal(error.side_effect_started, false);
+      assert.equal(error.requested_conversation_id, "conv-404");
+      assert.equal(error.current_conversation_id, "conv-404");
+      assert.equal(error.current_url, "https://chatgpt.com/c/conv-404?_yoetz=run_resume");
+      return true;
+    }
+  );
+});
+
 test("uploadFile accepts hidden composer-scoped file inputs", async () => {
   const previousDataTransfer = globalThis.DataTransfer;
   globalThis.DataTransfer = FakeDataTransfer;

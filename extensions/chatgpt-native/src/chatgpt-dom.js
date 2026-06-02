@@ -235,6 +235,10 @@ export async function ensureConversationLoaded(root = document, conversationId, 
       }
     );
   }
+  const unavailable = conversationUnavailableState(root, win);
+  if (unavailable) {
+    throw conversationUnavailableError(conversationId, loadedConversationId, win, pathname, unavailable);
+  }
   try {
     await waitForElement(root, findComposer, "ChatGPT composer", options);
   } catch (error) {
@@ -251,11 +255,50 @@ export async function ensureConversationLoaded(root = document, conversationId, 
       }
     );
   }
+  const currentPathname = String(win.location?.pathname ?? "");
+  const currentConversationId = conversationIdFromPathname(currentPathname);
+  if (currentConversationId !== conversationId) {
+    const code = currentConversationId ? "conversation_not_loaded" : "conversation_unavailable";
+    throw chatgptCommandError(
+      code,
+      code === "conversation_unavailable"
+        ? `ChatGPT conversation ${conversationId} is unavailable; current URL is ${currentLocationForError(win)}`
+        : `ChatGPT conversation ${conversationId} did not load; current URL is ${currentLocationForError(win)}`,
+      {
+        phase: "upload",
+        side_effect_started: false,
+        requested_conversation_id: conversationId,
+        current_conversation_id: currentConversationId,
+        current_url: currentLocationForError(win),
+        current_pathname: currentPathname
+      }
+    );
+  }
+  const postComposerUnavailable = conversationUnavailableState(root, win);
+  if (postComposerUnavailable) {
+    throw conversationUnavailableError(conversationId, currentConversationId, win, currentPathname, postComposerUnavailable);
+  }
   return {
     status: "loaded",
     conversation_id: conversationId,
-    pathname
+    pathname: currentPathname
   };
+}
+
+function conversationUnavailableError(conversationId, currentConversationId, win, pathname, unavailable) {
+  return chatgptCommandError(
+    "conversation_unavailable",
+    `ChatGPT conversation ${conversationId} is unavailable at ${currentLocationForError(win)}${unavailable.reason ? `: ${unavailable.reason}` : ""}`,
+    {
+      phase: "upload",
+      side_effect_started: false,
+      requested_conversation_id: conversationId,
+      current_conversation_id: currentConversationId,
+      current_url: currentLocationForError(win),
+      current_pathname: pathname,
+      unavailable_reason: unavailable.reason
+    }
+  );
 }
 
 export async function configureModelState(root, job = {}) {
@@ -1709,6 +1752,29 @@ function hasAssistantRoleDescendant(node) {
 function hasConversationResidue(root) {
   const residue = conversationResidue(root);
   return residue.user_count > 0 || residue.assistant_count > 0 || residue.copy_button_count > 0;
+}
+
+function conversationUnavailableState(root, win) {
+  // Avoid treating quoted prior transcript text as a page-level unavailable
+  // marker on legitimate resumed conversations.
+  if (hasConversationResidue(root)) {
+    return null;
+  }
+  const text = normalizeText(`${String(win.document?.title ?? "")}\n${getPageText(root)}`).toLowerCase();
+  if (!text) {
+    return null;
+  }
+  const unavailablePatterns = [
+    /\bconversation not found\b/,
+    /\bchat not found\b/,
+    /\bconversation (?:is )?unavailable\b/,
+    /\byou (?:do not|don't) have access to (?:this )?(?:conversation|chat)\b/,
+    /\b(?:cannot|can't|could not) access (?:this )?(?:conversation|chat)\b/,
+    /\bthis (?:conversation|chat) (?:has been )?archived\b/,
+    /\barchived (?:conversation|chat)\b/
+  ];
+  const matched = unavailablePatterns.find((pattern) => pattern.test(text));
+  return matched ? { reason: matched.source } : null;
 }
 
 function conversationResidue(root) {

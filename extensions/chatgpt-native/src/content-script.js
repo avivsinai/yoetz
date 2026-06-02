@@ -64,8 +64,17 @@ async function prepareJob(job) {
     text: getPageText(document)
   });
   const conversationId = conversationIdForJob(job);
+  if (!handoff && conversationId) {
+    const urlRunId = runIdFromUrl(location.href);
+    if (urlRunId !== job.run_id) {
+      throw commandError("run_mismatch", `tab is not owned by Yoetz run ${job.run_id}`, {
+        phase: "upload",
+        side_effect_started: false
+      });
+    }
+  }
   const conversation = !handoff && conversationId
-    ? await ensureConversationLoaded(document, conversationId)
+    ? await ensureConversationLoaded(document, conversationId, conversationLoadOptionsForJob(job))
     : null;
   const freshChat = !handoff && !conversationId
     ? await ensureFreshChat(document, job)
@@ -316,7 +325,20 @@ function conversationIdForJob(job) {
 }
 
 function expectedConversationIdForJob(job) {
-  return String(job?.expected_conversation_id ?? job?.submitted_conversation_id ?? "").trim() || null;
+  return String(job?.expected_conversation_id ?? job?.submitted_conversation_id ?? job?.conversation_id ?? "").trim() || null;
+}
+
+function conversationLoadOptionsForJob(job) {
+  const options = {};
+  const timeoutMs = Number(job?.upload_timeout_ms);
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    options.timeoutMs = timeoutMs;
+  }
+  const intervalMs = Number(job?.upload_interval_ms);
+  if (Number.isFinite(intervalMs) && intervalMs > 0) {
+    options.intervalMs = intervalMs;
+  }
+  return options;
 }
 
 async function domHelpers() {
