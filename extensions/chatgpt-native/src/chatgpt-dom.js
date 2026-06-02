@@ -1785,12 +1785,7 @@ function hasConversationResidue(root) {
 }
 
 function conversationUnavailableState(root, win) {
-  // Avoid treating quoted prior transcript text as a page-level unavailable
-  // marker on legitimate resumed conversations.
-  if (hasConversationResidue(root)) {
-    return null;
-  }
-  const text = normalizeText(`${String(win.document?.title ?? "")}\n${getPageText(root)}`).toLowerCase();
+  const text = normalizeText(`${String(win.document?.title ?? "")}\n${conversationUnavailableSurfaceText(root)}`).toLowerCase();
   if (!text) {
     return null;
   }
@@ -1805,6 +1800,50 @@ function conversationUnavailableState(root, win) {
   ];
   const matched = unavailablePatterns.find((pattern) => pattern.test(text));
   return matched ? { reason: matched.source } : null;
+}
+
+function conversationUnavailableSurfaceText(root) {
+  // Prior transcript text can quote "conversation not found" / "no access" phrases.
+  // When transcript residue exists, keep page-level banners and other non-turn UI
+  // text, but drop message containers so quoted assistant/user content cannot
+  // mask a valid resumed conversation or create a false unavailable state.
+  if (!hasConversationResidue(root)) {
+    return getPageText(root);
+  }
+  const start = root.body ?? root.documentElement ?? root;
+  const chunks = [];
+  collectConversationUnavailableSurfaceText(start, chunks);
+  return chunks.join("\n");
+}
+
+function collectConversationUnavailableSurfaceText(node, chunks) {
+  if (!node || isConversationTurnSurface(node)) {
+    return;
+  }
+  const children = Array.from(node.children ?? []);
+  if (children.length === 0) {
+    if (isVisible(node, { allowDisabled: true })) {
+      const text = textOf(node);
+      if (text) {
+        chunks.push(text);
+      }
+    }
+    return;
+  }
+  for (const child of children) {
+    collectConversationUnavailableSurfaceText(child, chunks);
+  }
+}
+
+function isConversationTurnSurface(node) {
+  return Boolean(node?.closest?.([
+    "[data-message-author-role]",
+    "article",
+    '[data-testid*="conversation-turn"]',
+    '[class*="turn-messages"]',
+    '[class*="agent-turn"]',
+    '[class*="user-turn"]'
+  ].join(",")));
 }
 
 function conversationResidue(root) {

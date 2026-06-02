@@ -1300,6 +1300,44 @@ test("ensureConversationLoaded reports unavailable when an error page still rend
   );
 });
 
+test("ensureConversationLoaded reports unavailable from page banner even with prior transcript residue", async () => {
+  const priorAssistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Earlier assistant answer");
+  const banner = new FakeElement("div", { role: "alert" }, "This conversation has been archived");
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+  const body = new FakeElement("body", {}, "Earlier assistant answer This conversation has been archived Message ChatGPT")
+    .append(priorAssistant, banner, composer);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-archived";
+  doc.defaultView.location.href = "https://chatgpt.com/c/conv-archived?_yoetz=run_resume";
+
+  await assert.rejects(
+    () => ensureConversationLoaded(doc, "conv-archived", { timeoutMs: 30, intervalMs: 10 }),
+    (error) => {
+      assert.equal(error.code, "conversation_unavailable");
+      assert.equal(error.phase, "upload");
+      assert.equal(error.side_effect_started, false);
+      assert.equal(error.requested_conversation_id, "conv-archived");
+      assert.equal(error.current_conversation_id, "conv-archived");
+      assert.equal(error.current_url, "https://chatgpt.com/c/conv-archived?_yoetz=run_resume");
+      return true;
+    }
+  );
+});
+
+test("ensureConversationLoaded ignores unavailable text quoted inside prior transcript residue", async () => {
+  const priorAssistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Example text: you do not have access to this conversation");
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+  const body = new FakeElement("body", {}, "Example text: you do not have access to this conversation Message ChatGPT")
+    .append(priorAssistant, composer);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  const loaded = await ensureConversationLoaded(doc, "conv-123", { timeoutMs: 30, intervalMs: 10 });
+
+  assert.equal(loaded.status, "loaded");
+  assert.equal(loaded.conversation_id, "conv-123");
+});
+
 test("uploadFile accepts hidden composer-scoped file inputs", async () => {
   const previousDataTransfer = globalThis.DataTransfer;
   globalThis.DataTransfer = FakeDataTransfer;
