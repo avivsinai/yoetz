@@ -9,7 +9,7 @@ import {
   progress,
   validateEnvelope
 } from "./protocol.js";
-import { chatgptJobUrl } from "./chatgpt-dom.js";
+import { chatgptConversationJobUrl, chatgptJobUrl } from "./chatgpt-dom.js";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 90 * 60 * 1000;
 const JOB_TTL_MS = 3 * 60 * 60 * 1000;
@@ -182,11 +182,13 @@ async function handleNativeMessage(message) {
   } catch (error) {
     const job = message?.job_id ? jobs.get(message.job_id) : null;
     if (job) {
+      const code = error?.code ?? "extension_error";
+      const detail = errorContextForJob(job, error);
       await failJob(
         job,
-        error?.code ?? "extension_error",
-        String(error?.message ?? error),
-        errorContextForJob(job, error)
+        code,
+        jobErrorMessage(job, error, code, detail),
+        detail
       );
     } else {
       postNative(errorEnvelope(message, "extension_error", String(error?.message ?? error), {
@@ -211,17 +213,28 @@ async function startJob(message) {
   job.updated_at = Date.now();
   job.connection_generation = connectionGeneration;
 
+  if (job.conversation_error) {
+    await failJob(job, "invalid_conversation", job.conversation_error.message, {
+      phase: "upload",
+      side_effect_started: false
+    });
+    return;
+  }
+
   const targetProfile = await validateTargetProfile(job);
   if (!targetProfile.ok) {
     await failJob(job, targetProfile.code, targetProfile.message, targetProfile.detail);
     return;
   }
 
+  job.expected_conversation_id = job.conversation_id ?? null;
   job.status = "opening_tab";
   jobs.set(job.job_id, job);
   await persistJob(job);
 
-  const url = chatgptJobUrl(job.run_id);
+  const url = job.expected_conversation_id
+    ? chatgptConversationJobUrl(job.expected_conversation_id, job.run_id)
+    : chatgptJobUrl(job.run_id);
   const tab = await chrome.tabs.create({ url, active: false });
   job.tab_id = tab.id;
   job.updated_at = Date.now();
@@ -383,6 +396,7 @@ async function runJobWithFile(job, file) {
     job.submitted_assistant_count = Number.isFinite(Number(sendResult?.submitted_assistant_count))
       ? Number(sendResult.submitted_assistant_count)
       : null;
+    assertSubmittedConversationCurrent(job, sendResult);
     assertJobConnectionCurrent(job);
     if (job.cancelled) return;
     const inspectCommand = inspectCommandForJob(job);
@@ -391,6 +405,8 @@ async function runJobWithFile(job, file) {
       inspect_command: inspectCommand,
       yoetz_url: chatgptJobUrl(job.run_id),
       submitted_url: job.submitted_url,
+      conversation_id: conversationIdForJob(job),
+      conversation_url: conversationUrlForId(conversationIdForJob(job)),
       message: `prompt sent; waiting for ChatGPT response (timeout ${formatDurationForMessage(responseWaitTimeoutMs(job))}); inspect with: ${inspectCommand}`
     }))) {
       await recordTerminalDeliveryLost(job, "send");
@@ -418,6 +434,7 @@ async function runJobWithFile(job, file) {
 }
 
 async function completeJobWithExtraction(job, extraction) {
+  const conversationId = conversationIdForJob(job, extraction);
   const completeEnvelope = makeEnvelope("job_complete", {
     job_id: job.job_id,
     run_id: job.run_id,
@@ -431,6 +448,8 @@ async function completeJobWithExtraction(job, extraction) {
       stable_for_ms: extraction.stable_for_ms,
       assistant_turn_count: extraction.assistant_turn_count ?? extraction.assistant_count ?? 0,
       copy_button_count: extraction.copy_button_count ?? 0,
+      conversation_id: conversationId,
+      conversation_url: conversationUrlForId(conversationId),
       model_used: job.model_used ?? null,
       model_selection_status: job.model_selection_status ?? "unavailable",
       warnings: [
@@ -471,6 +490,17 @@ async function completeJobWithExtraction(job, extraction) {
   rememberTerminalJob(job.job_id);
   jobs.delete(job.job_id);
   chunks.discard(job.job_id);
+}
+
+function conversationIdForJob(job, extraction = null) {
+  return job?.submitted_conversation_id ?? extraction?.conversation_id ?? job?.conversation_id ?? null;
+}
+
+function conversationUrlForId(conversationId) {
+  if (!conversationId) {
+    return null;
+  }
+  return `https://chatgpt.com/c/${encodeURIComponent(conversationId)}`;
 }
 
 async function resumeWaitingResponseJob(job) {
@@ -854,6 +884,7 @@ function canResumeWaitingResponseAfterWorkerRestart(job) {
 
 function normalizeJob(message) {
   const payload = message.payload ?? {};
+  const conversation = normalizeConversationId(payload.conversation_id);
   return {
     job_id: message.job_id,
     run_id: message.run_id,
@@ -870,6 +901,8 @@ function normalizeJob(message) {
     profile_email: payload.profile_email ?? null,
     extension_instance_id: payload.extension_instance_id ?? null,
     extension_profile_id: payload.extension_profile_id ?? null,
+    conversation_id: conversation.ok ? conversation.id : null,
+    conversation_error: conversation.ok ? null : conversation,
     bundle_size: payload.bundle_size ?? 0,
     file_name: payload.file_name ?? "yoetz-bundle.md",
     model_selection_status: "unavailable",
@@ -877,6 +910,26 @@ function normalizeJob(message) {
     warnings: [],
     status: "starting"
   };
+}
+
+function normalizeConversationId(value) {
+  if (value == null) {
+    return { ok: true, id: null };
+  }
+  if (typeof value !== "string") {
+    return { ok: false, message: "invalid `conversation_id`: expected a string ChatGPT conversation id" };
+  }
+  const id = value.trim();
+  if (!id || id === "." || id === "..") {
+    return { ok: false, message: "invalid `conversation_id`: expected a non-empty ChatGPT conversation id" };
+  }
+  if (id.length > 256) {
+    return { ok: false, message: "invalid `conversation_id`: expected at most 256 characters" };
+  }
+  if (!/^[A-Za-z0-9_.-]+$/.test(id)) {
+    return { ok: false, message: "invalid `conversation_id`: expected ASCII letters, digits, `_`, `.`, or `-`" };
+  }
+  return { ok: true, id };
 }
 
 function requireJob(jobId) {
@@ -892,12 +945,41 @@ function errorContextForJob(job, error = null) {
     return {};
   }
   const phase = phaseForStatus(job.status) ?? (job.tab_id ? "upload" : undefined);
-  return {
+  const detail = {
     phase: error?.phase ?? phase,
     side_effect_started: typeof error?.side_effect_started === "boolean"
       ? error.side_effect_started
       : Boolean(job.tab_id)
   };
+  if (job.run_id) {
+    detail.inspect_command = inspectCommandForJob(job);
+  }
+  if (isConversationFailureCode(error?.code)) {
+    detail.requested_conversation_id = error?.requested_conversation_id
+      ?? job.expected_conversation_id
+      ?? job.conversation_id
+      ?? null;
+    detail.current_conversation_id = error?.current_conversation_id ?? null;
+    detail.current_url = error?.current_url ?? job.submitted_url ?? null;
+    detail.current_pathname = error?.current_pathname ?? null;
+  }
+  return detail;
+}
+
+function jobErrorMessage(job, error, code, detail = {}) {
+  const base = String(error?.message ?? error);
+  if (!isConversationFailureCode(code)) {
+    return base;
+  }
+  const requested = detail.requested_conversation_id ?? job?.expected_conversation_id ?? job?.conversation_id ?? "(unknown)";
+  const currentUrl = detail.current_url ?? "(unknown)";
+  const phase = detail.phase ?? phaseForStatus(job?.status) ?? "upload";
+  const inspect = detail.inspect_command ?? inspectCommandForJob(job);
+  return `${base}. requested conversation ${requested}; current URL ${currentUrl}; phase ${phase}; inspect with: ${inspect}`;
+}
+
+function isConversationFailureCode(code) {
+  return String(code ?? "").startsWith("conversation_");
 }
 
 function postHello() {
@@ -1126,6 +1208,16 @@ function tabCommandError(response) {
   }
   if (typeof response?.side_effect_started === "boolean") {
     error.side_effect_started = response.side_effect_started;
+  }
+  for (const key of [
+    "requested_conversation_id",
+    "current_conversation_id",
+    "current_url",
+    "current_pathname"
+  ]) {
+    if (response?.[key] !== undefined) {
+      error[key] = response[key];
+    }
   }
   return error;
 }
@@ -1586,17 +1678,47 @@ function assertJobConnectionCurrent(job) {
   });
 }
 
+function assertSubmittedConversationCurrent(job, sendResult) {
+  const expectedConversationId = job.expected_conversation_id ?? job.conversation_id;
+  if (!expectedConversationId) {
+    return;
+  }
+  const currentConversationId = sendResult?.conversation_id ?? null;
+  if (currentConversationId === expectedConversationId) {
+    return;
+  }
+  throw commandError(
+    "conversation_changed",
+    `job ${job.job_id} sent in ChatGPT conversation ${currentConversationId ?? "(none)"} instead of ${expectedConversationId}`,
+    {
+      phase: "send",
+      side_effect_started: true,
+      requested_conversation_id: expectedConversationId,
+      current_conversation_id: currentConversationId,
+      current_url: job.submitted_url ?? null
+    }
+  );
+}
+
 function assertJobConversationCurrent(job, extraction) {
-  if (!job.submitted_conversation_id || !extraction?.conversation_id) {
+  const expectedConversationId = job.expected_conversation_id ?? job.submitted_conversation_id ?? job.conversation_id;
+  if (!expectedConversationId) {
     return;
   }
-  if (job.submitted_conversation_id === extraction.conversation_id) {
+  const currentConversationId = extraction?.conversation_id ?? null;
+  if (expectedConversationId === currentConversationId) {
     return;
   }
-  throw commandError("conversation_changed", `job ${job.job_id} moved from ChatGPT conversation ${job.submitted_conversation_id} to ${extraction.conversation_id}`, {
-    phase: "wait_response",
-    side_effect_started: true
-  });
+  throw commandError(
+    "conversation_changed",
+    `job ${job.job_id} moved from ChatGPT conversation ${expectedConversationId} to ${currentConversationId ?? "(none)"}`,
+    {
+      phase: "wait_response",
+      side_effect_started: true,
+      requested_conversation_id: expectedConversationId,
+      current_conversation_id: currentConversationId
+    }
+  );
 }
 
 function commandError(code, message, detail = {}) {
@@ -1607,6 +1729,11 @@ function commandError(code, message, detail = {}) {
   }
   if (typeof detail.side_effect_started === "boolean") {
     error.side_effect_started = detail.side_effect_started;
+  }
+  for (const [key, value] of Object.entries(detail)) {
+    if (!(key in error) && value !== undefined) {
+      error[key] = value;
+    }
   }
   return error;
 }

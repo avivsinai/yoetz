@@ -130,6 +130,8 @@ pub struct ExtensionRecipeResult {
     pub model_used: Option<String>,
     pub model_selection_status: ChatgptModelSelectionStatus,
     pub warnings: Vec<String>,
+    pub conversation_id: Option<String>,
+    pub conversation_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -902,6 +904,7 @@ pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Val
         profile_email: selector.profile_email.map(str::to_string),
         extension_instance_id: selector.extension_instance_id.map(str::to_string),
         extension_profile_id: selector.extension_profile_id.map(str::to_string),
+        conversation_id: None,
         run_id: new_id("canary"),
         wait_timeout_ms: 180_000,
         wait_interval_ms: 1_000,
@@ -996,23 +999,7 @@ pub fn run_chatgpt_recipe(
         "job_start",
         Some(job_id.clone()),
         Some(spec.run_id.clone()),
-        json!({
-            "recipe": "chatgpt",
-            "bundle_path": bundle.path,
-            "file_name": bundle.file_name,
-            "bundle_size": bundle.size,
-            "mime": bundle.mime,
-            "prompt": spec.prompt,
-            "model": spec.model,
-            "browser_context_id": spec.browser_context_id,
-            "profile_email": spec.profile_email,
-            "extension_instance_id": spec.extension_instance_id,
-            "extension_profile_id": spec.extension_profile_id,
-            "wait_timeout_ms": spec.wait_timeout_ms,
-            "wait_interval_ms": spec.wait_interval_ms,
-            "upload_timeout_ms": spec.upload_timeout_ms,
-            "send_timeout_ms": spec.send_timeout_ms,
-        }),
+        chatgpt_job_start_payload(spec, &bundle),
     )
     .with_token(token);
     write_json_frame(&mut stream, &start)?;
@@ -1042,6 +1029,27 @@ pub fn serve_native_host_chatgpt() -> Result<()> {
     {
         bail!("chrome-extension-native native host is currently supported on macOS/Linux only")
     }
+}
+
+fn chatgpt_job_start_payload(spec: &ChatgptRecipeSpec, bundle: &BundleInfo) -> Value {
+    json!({
+        "recipe": "chatgpt",
+        "bundle_path": bundle.path,
+        "file_name": bundle.file_name,
+        "bundle_size": bundle.size,
+        "mime": bundle.mime,
+        "prompt": spec.prompt,
+        "model": spec.model,
+        "browser_context_id": spec.browser_context_id,
+        "profile_email": spec.profile_email,
+        "extension_instance_id": spec.extension_instance_id,
+        "extension_profile_id": spec.extension_profile_id,
+        "conversation_id": spec.conversation_id,
+        "wait_timeout_ms": spec.wait_timeout_ms,
+        "wait_interval_ms": spec.wait_interval_ms,
+        "upload_timeout_ms": spec.upload_timeout_ms,
+        "send_timeout_ms": spec.send_timeout_ms,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1927,11 +1935,23 @@ fn parse_recipe_result(envelope: ProtocolEnvelope) -> Result<ExtensionRecipeResu
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let conversation_id = envelope
+        .payload
+        .get("conversation_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let conversation_url = envelope
+        .payload
+        .get("conversation_url")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     Ok(ExtensionRecipeResult {
         response,
         model_used,
         model_selection_status,
         warnings,
+        conversation_id,
+        conversation_url,
     })
 }
 
@@ -1956,11 +1976,7 @@ fn parse_model_selection_status(value: Option<&str>) -> ChatgptModelSelectionSta
 }
 
 fn job_error(envelope: ProtocolEnvelope) -> anyhow::Error {
-    let message = envelope
-        .payload
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("chrome-extension-native job failed");
+    let message = job_error_message(&envelope.payload);
     let phase = envelope.payload.get("phase").and_then(Value::as_str);
     let side_effect_started = envelope
         .payload
@@ -1986,6 +2002,63 @@ fn job_error(envelope: ProtocolEnvelope) -> anyhow::Error {
             crate::chatgpt_recipe::mark_terminal_fallback_phase(err, ChatgptTransportPhase::Upload)
         }
     }
+}
+
+fn job_error_message(payload: &Value) -> String {
+    let mut message = payload
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("chrome-extension-native job failed")
+        .to_string();
+    let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
+    if !code.starts_with("conversation_") {
+        return message;
+    }
+
+    let mut detail = Vec::new();
+    if let Some(requested) = payload
+        .get("requested_conversation_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        if !message.contains(requested) {
+            detail.push(format!("requested conversation {requested}"));
+        }
+    }
+    if let Some(current_url) = payload
+        .get("current_url")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        if !message.contains(current_url) {
+            detail.push(format!("current URL {current_url}"));
+        }
+    }
+    if let Some(phase) = payload
+        .get("phase")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        let phase_text = format!("phase {phase}");
+        if !message.contains(&phase_text) {
+            detail.push(phase_text);
+        }
+    }
+    if let Some(inspect_command) = payload
+        .get("inspect_command")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        if !message.contains(inspect_command) {
+            detail.push(format!("inspect with: {inspect_command}"));
+        }
+    }
+
+    if !detail.is_empty() {
+        message.push_str(". ");
+        message.push_str(&detail.join("; "));
+    }
+    message
 }
 
 fn emit_progress(format: OutputFormat, envelope: &ProtocolEnvelope) -> Result<()> {
@@ -3055,6 +3128,67 @@ mod tests {
     }
 
     #[test]
+    fn chatgpt_job_start_payload_carries_conversation_id() {
+        let bundle = BundleInfo {
+            path: PathBuf::from("/tmp/yoetz-bundle.md"),
+            file_name: "yoetz-bundle.md".to_string(),
+            size: 42,
+            mime: "text/markdown".to_string(),
+        };
+        let spec = ChatgptRecipeSpec {
+            bundle_path: Some(bundle.path.clone()),
+            model: "extended-pro".to_string(),
+            prompt: "continue".to_string(),
+            browser_context_id: None,
+            profile_email: None,
+            extension_instance_id: None,
+            extension_profile_id: None,
+            conversation_id: Some("conv-123".to_string()),
+            run_id: "run-123".to_string(),
+            wait_timeout_ms: 10_000,
+            wait_interval_ms: 1_000,
+            upload_timeout_ms: 2_000,
+            send_timeout_ms: 3_000,
+        };
+
+        let payload = chatgpt_job_start_payload(&spec, &bundle);
+
+        assert_eq!(payload["conversation_id"], "conv-123");
+    }
+
+    #[test]
+    fn parse_recipe_result_carries_conversation_fields() {
+        let envelope = ProtocolEnvelope::new(
+            "job_complete",
+            Some("job_1".to_string()),
+            Some("run_1".to_string()),
+            json!({
+                "response": "done",
+                "model_used": "Pro Extended",
+                "model_selection_status": "selected",
+                "warnings": ["kept current"],
+                "conversation_id": "conv-123",
+                "conversation_url": "https://chatgpt.com/c/conv-123",
+            }),
+        );
+
+        let result = parse_recipe_result(envelope).unwrap();
+
+        assert_eq!(result.response, "done");
+        assert_eq!(result.model_used.as_deref(), Some("Pro Extended"));
+        assert_eq!(
+            result.model_selection_status,
+            ChatgptModelSelectionStatus::Selected
+        );
+        assert_eq!(result.warnings, vec!["kept current"]);
+        assert_eq!(result.conversation_id.as_deref(), Some("conv-123"));
+        assert_eq!(
+            result.conversation_url.as_deref(),
+            Some("https://chatgpt.com/c/conv-123")
+        );
+    }
+
+    #[test]
     fn oversized_frame_is_rejected() {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&((MAX_FRAME_BYTES as u32) + 1).to_ne_bytes());
@@ -3881,5 +4015,29 @@ mod tests {
             crate::chatgpt_recipe::terminal_fallback_phase(&post_effect),
             Some(ChatgptTransportPhase::Send)
         );
+    }
+
+    #[test]
+    fn job_error_conversation_failures_surface_actionable_context() {
+        let err = job_error(ProtocolEnvelope::new(
+            "job_error",
+            Some("job_conv".to_string()),
+            Some("run_conv".to_string()),
+            json!({
+                "code": "conversation_unavailable",
+                "message": "ChatGPT conversation is unavailable",
+                "phase": "upload",
+                "side_effect_started": false,
+                "requested_conversation_id": "conv-404",
+                "current_url": "https://chatgpt.com/c/conv-404?_yoetz=run_conv",
+                "inspect_command": "yoetz browser extension inspect --chatgpt --run-id run_conv",
+            }),
+        ));
+        let text = err.to_string();
+
+        assert!(text.contains("requested conversation conv-404"));
+        assert!(text.contains("current URL https://chatgpt.com/c/conv-404?_yoetz=run_conv"));
+        assert!(text.contains("phase upload"));
+        assert!(text.contains("yoetz browser extension inspect --chatgpt --run-id run_conv"));
     }
 }

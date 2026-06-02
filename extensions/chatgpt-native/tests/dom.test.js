@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  chatgptConversationJobUrl,
   chatgptJobUrl,
   classifyManualHandoff,
   classifyWaitManualHandoff,
@@ -17,6 +18,13 @@ test("ownedWindowName round trips run and job ids", () => {
 
 test("chatgptJobUrl scopes jobs to chatgpt.com with a Yoetz marker", () => {
   assert.equal(chatgptJobUrl("run 1"), "https://chatgpt.com/?_yoetz=run+1");
+});
+
+test("chatgptConversationJobUrl scopes resume jobs to a canonical conversation with a Yoetz marker", () => {
+  assert.equal(
+    chatgptConversationJobUrl("conv-123", "run 1"),
+    "https://chatgpt.com/c/conv-123?_yoetz=run+1"
+  );
 });
 
 test("classifyManualHandoff detects login, challenge, and rate limits", () => {

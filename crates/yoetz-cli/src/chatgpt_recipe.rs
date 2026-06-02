@@ -159,6 +159,7 @@ pub struct ChatgptRecipeSpec {
     pub profile_email: Option<String>,
     pub extension_instance_id: Option<String>,
     pub extension_profile_id: Option<String>,
+    pub conversation_id: Option<String>,
     pub run_id: String,
     pub wait_timeout_ms: u64,
     pub wait_interval_ms: u64,
@@ -177,6 +178,8 @@ pub struct ChatgptRecipeOutput {
     pub fallback_used: bool,
     pub delivery_mode: ChatgptDeliveryMode,
     pub auto_paste_fallback: bool,
+    pub conversation_id: Option<String>,
+    pub conversation_url: Option<String>,
 }
 
 impl ChatgptRecipeOutput {
@@ -192,6 +195,8 @@ impl ChatgptRecipeOutput {
             "fallback_used": self.fallback_used,
             "delivery_mode": self.delivery_mode.as_str(),
             "auto_paste_fallback": self.auto_paste_fallback,
+            "conversation_id": self.conversation_id,
+            "conversation_url": self.conversation_url,
         })
     }
 
@@ -207,6 +212,8 @@ impl ChatgptRecipeOutput {
             "fallback_used": self.fallback_used,
             "delivery_mode": self.delivery_mode.as_str(),
             "auto_paste_fallback": self.auto_paste_fallback,
+            "conversation_id": self.conversation_id,
+            "conversation_url": self.conversation_url,
         })
     }
 }
@@ -228,6 +235,8 @@ mod tests {
             fallback_used: true,
             delivery_mode: ChatgptDeliveryMode::Paste,
             auto_paste_fallback: true,
+            conversation_id: Some("conv-123".to_string()),
+            conversation_url: Some("https://chatgpt.com/c/conv-123".to_string()),
         };
 
         let payload = output.to_value();
@@ -241,6 +250,15 @@ mod tests {
         assert_eq!(payload["fallback_used"], true);
         assert_eq!(payload["delivery_mode"], "paste");
         assert_eq!(payload["auto_paste_fallback"], true);
+        assert_eq!(payload["conversation_id"], "conv-123");
+        assert_eq!(
+            payload["conversation_url"],
+            "https://chatgpt.com/c/conv-123"
+        );
+
+        let event = output.to_recipe_complete_event();
+        assert_eq!(event["conversation_id"], "conv-123");
+        assert_eq!(event["conversation_url"], "https://chatgpt.com/c/conv-123");
     }
 
     #[test]

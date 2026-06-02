@@ -18,6 +18,31 @@ name: chatgpt
 # `--transport chrome-extension-native --allow-cdp-fallback` to explicitly allow
 # CDP fallback after a native-extension failure.
 #
+# Conversation resume:
+#   Use `--var conversation=<id|url>` to continue a caller-owned ChatGPT
+#   conversation by id or by `https://chatgpt.com/c/<id>` URL. Conversation
+#   runs are supported only through `chrome-extension-native`; non-native
+#   transports and CDP fallback are rejected so Yoetz cannot silently switch to
+#   a transport that lacks conversation ownership checks. This is not context
+#   management: the caller decides whether to pass a saved conversation for a
+#   follow-up turn or omit it for a fresh run.
+#
+# Result fields:
+#   Successful ChatGPT recipe runs echo `conversation_id` and
+#   `conversation_url`. Capture these from the first run if you want a later
+#   `--var conversation=<id|url>` run to resume the same ChatGPT conversation.
+#
+# Conversation failure taxonomy:
+#   conversation_unavailable - the requested conversation could not be loaded
+#              at prepare time, including never reaching `/c/<id>`, landing on
+#              the right `/c/<id>` with no composer, or 404 / archived /
+#              wrong-profile style ChatGPT states.
+#   conversation_not_loaded  - a ChatGPT page loaded but not the requested
+#              conversation, such as wrong `/c/<other>` during prepare or
+#              moving off `/c/` after a successful prepare at ownership time.
+#   conversation_changed     - the owned tab drifted to a different
+#              `/c/<other>` after prepare or after send.
+#
 # Recommended: enable chrome://inspect/#remote-debugging (Chrome 144+) for auto-connect.
 # Note: Chrome 136+ ignores --remote-debugging-port on the default profile.
 # Note: yoetz CLI cannot proxy through a parent agent's MCP server; all
@@ -44,6 +69,10 @@ name: chatgpt
 #              Use this when Chrome profile email is unavailable or ambiguous.
 #   extension_profile_id — chrome-extension-native-only Chrome identity profile
 #              id from extension status. Optional secondary selector.
+#   conversation — ChatGPT conversation id or `https://chatgpt.com/c/<id>` URL
+#              for caller-owned resume. Native-extension only; rejected for
+#              CDP/dev-browser/agent-browser/manual transports and rejected even
+#              when `--allow-cdp-fallback` is present.
 #   thread   — "fresh" (default). Every yoetz request opens a new ChatGPT tab
 #              marked with `?_yoetz=<run-id>` so the user's own ChatGPT tabs
 #              are never touched. Passing `thread=reuse` is rejected; parallel

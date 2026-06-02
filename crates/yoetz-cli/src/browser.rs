@@ -996,6 +996,8 @@ fn chatgpt_recipe_payload_from_steps(steps: &[Value], fallback_used: bool) -> Va
         fallback_used,
         delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
         auto_paste_fallback: false,
+        conversation_id: None,
+        conversation_url: None,
     };
     let mut payload = output.to_value();
     if let Some(object) = payload.as_object_mut() {

@@ -128,6 +128,10 @@ recipe selects it as the only default transport.
   `inspect --chatgpt --run-id <id>`, and `grant-identity --chatgpt`. Use
   `yoetz browser check --transport chrome-extension-native` for extension
   readiness; plain `yoetz browser check` verifies the default CDP/browser stack.
+- ChatGPT conversation resume uses `--var conversation=<id|url>` with the
+  `conversation_id` / `conversation_url` fields returned by earlier runs. It is
+  native-extension only and does not manage context automatically; callers own
+  the decision to resume a saved conversation or start fresh.
 - For multiple loaded Chrome extension profiles, route extension-native jobs by
   `profile_email` when Chrome exposes it, or by the stable
   `extension_instance_id` shown in `status --chatgpt` when it does not.

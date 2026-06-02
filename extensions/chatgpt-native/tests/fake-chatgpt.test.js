@@ -4,6 +4,7 @@ import {
   clickSend,
   clickStopGenerating,
   configureModelState,
+  ensureConversationLoaded,
   ensureFreshChat,
   extractResponse,
   findModelButton,
@@ -1234,6 +1235,109 @@ test("ensureFreshChat rejects old transcript residue on a fresh-looking path", a
   );
 });
 
+test("ensureConversationLoaded accepts the requested conversation with a composer", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+  const body = new FakeElement("body", {}, "").append(composer);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  const loaded = await ensureConversationLoaded(doc, "conv-123", { timeoutMs: 30, intervalMs: 10 });
+
+  assert.equal(loaded.status, "loaded");
+  assert.equal(loaded.conversation_id, "conv-123");
+  assert.equal(loaded.pathname, "/c/conv-123");
+});
+
+test("ensureConversationLoaded rejects the wrong conversation before send", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+  const body = new FakeElement("body", {}, "").append(composer);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/other";
+
+  await assert.rejects(
+    () => ensureConversationLoaded(doc, "conv-123", { timeoutMs: 30, intervalMs: 10 }),
+    (error) => error.code === "conversation_not_loaded"
+  );
+});
+
+test("ensureConversationLoaded reports unavailable when the requested conversation has no composer", async () => {
+  const body = new FakeElement("body", {}, "Conversation not found");
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+  doc.defaultView.location.href = "https://chatgpt.com/c/conv-123?_yoetz=run_resume";
+
+  await assert.rejects(
+    () => ensureConversationLoaded(doc, "conv-123", { timeoutMs: 30, intervalMs: 10 }),
+    (error) => {
+      assert.equal(error.code, "conversation_unavailable");
+      assert.equal(error.phase, "upload");
+      assert.equal(error.side_effect_started, false);
+      assert.equal(error.requested_conversation_id, "conv-123");
+      assert.equal(error.current_url, "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+      return true;
+    }
+  );
+});
+
+test("ensureConversationLoaded reports unavailable when an error page still renders a composer", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+  const body = new FakeElement("body", {}, "Conversation not found Message ChatGPT").append(composer);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-404";
+  doc.defaultView.location.href = "https://chatgpt.com/c/conv-404?_yoetz=run_resume";
+
+  await assert.rejects(
+    () => ensureConversationLoaded(doc, "conv-404", { timeoutMs: 30, intervalMs: 10 }),
+    (error) => {
+      assert.equal(error.code, "conversation_unavailable");
+      assert.equal(error.phase, "upload");
+      assert.equal(error.side_effect_started, false);
+      assert.equal(error.requested_conversation_id, "conv-404");
+      assert.equal(error.current_conversation_id, "conv-404");
+      assert.equal(error.current_url, "https://chatgpt.com/c/conv-404?_yoetz=run_resume");
+      return true;
+    }
+  );
+});
+
+test("ensureConversationLoaded reports unavailable from page banner even with prior transcript residue", async () => {
+  const priorAssistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Earlier assistant answer");
+  const banner = new FakeElement("div", { role: "alert" }, "This conversation has been archived");
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+  const body = new FakeElement("body", {}, "Earlier assistant answer This conversation has been archived Message ChatGPT")
+    .append(priorAssistant, banner, composer);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-archived";
+  doc.defaultView.location.href = "https://chatgpt.com/c/conv-archived?_yoetz=run_resume";
+
+  await assert.rejects(
+    () => ensureConversationLoaded(doc, "conv-archived", { timeoutMs: 30, intervalMs: 10 }),
+    (error) => {
+      assert.equal(error.code, "conversation_unavailable");
+      assert.equal(error.phase, "upload");
+      assert.equal(error.side_effect_started, false);
+      assert.equal(error.requested_conversation_id, "conv-archived");
+      assert.equal(error.current_conversation_id, "conv-archived");
+      assert.equal(error.current_url, "https://chatgpt.com/c/conv-archived?_yoetz=run_resume");
+      return true;
+    }
+  );
+});
+
+test("ensureConversationLoaded ignores unavailable text quoted inside prior transcript residue", async () => {
+  const priorAssistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Example text: you do not have access to this conversation");
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+  const body = new FakeElement("body", {}, "Example text: you do not have access to this conversation Message ChatGPT")
+    .append(priorAssistant, composer);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  const loaded = await ensureConversationLoaded(doc, "conv-123", { timeoutMs: 30, intervalMs: 10 });
+
+  assert.equal(loaded.status, "loaded");
+  assert.equal(loaded.conversation_id, "conv-123");
+});
+
 test("uploadFile accepts hidden composer-scoped file inputs", async () => {
   const previousDataTransfer = globalThis.DataTransfer;
   globalThis.DataTransfer = FakeDataTransfer;
@@ -1859,6 +1963,61 @@ test("fake ChatGPT accepts Pro Extended label that appears after the picker stay
   assert.equal(result.status, "selected");
   assert.equal(result.model_used, "Extended Pro");
   assert.equal(result.extended_status, "required");
+});
+
+test("fake ChatGPT resume does not accept stale conversation Pro Extended labels as current model", async () => {
+  const staleConversationControl = new FakeElement("button", {}, "Pro Extended");
+  const staleSelectedLabel = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Pro Extended");
+  const priorAssistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "")
+    .append(staleConversationControl, staleSelectedLabel);
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Pro Extended Ask anything")
+    .append(priorAssistant, form);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  const result = await configureModelState(doc, {
+    conversation_id: "conv-123",
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 10
+  });
+
+  assert.equal(staleConversationControl.clicked, false);
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.extended_status, "required");
+  assert.match(result.warning, /model selector button not found/);
+});
+
+test("fake ChatGPT resume ignores stale transcript model switcher buttons", async () => {
+  const staleSelectedLabel = new FakeElement("span", { "data-testid": "model-switcher-selected-model" }, "Pro Extended");
+  const staleConversationControl = new FakeElement("button", {
+    "data-testid": "model-switcher-dropdown-button",
+    "aria-haspopup": "menu",
+    onPointerDown: () => {
+      throw new Error("stale transcript model button should not be opened");
+    }
+  }, "Pro Extended").append(staleSelectedLabel);
+  const priorAssistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "")
+    .append(staleConversationControl);
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Pro Extended Ask anything")
+    .append(priorAssistant, form);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.pathname = "/c/conv-123";
+
+  const result = await configureModelState(doc, {
+    conversation_id: "conv-123",
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 10
+  });
+
+  assert.equal(staleConversationControl.clicked, false);
+  assert.equal(staleConversationControl.events.includes("pointerdown"), false);
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.extended_status, "required");
+  assert.match(result.warning, /model selector button not found/);
 });
 
 test("fake ChatGPT reports mismatch when option checks but selected label stays Thinking", async () => {

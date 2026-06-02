@@ -51,6 +51,7 @@ async function cancelSend(_job) {
 async function prepareJob(job) {
   const {
     classifyManualHandoff,
+    ensureConversationLoaded,
     ensureFreshChat,
     getPageText,
     markOwnership,
@@ -62,7 +63,22 @@ async function prepareJob(job) {
     title: document.title,
     text: getPageText(document)
   });
-  const freshChat = handoff ? null : await ensureFreshChat(document, job);
+  const conversationId = conversationIdForJob(job);
+  if (!handoff && conversationId) {
+    const urlRunId = runIdFromUrl(location.href);
+    if (urlRunId !== job.run_id) {
+      throw commandError("run_mismatch", `tab is not owned by Yoetz run ${job.run_id}`, {
+        phase: "upload",
+        side_effect_started: false
+      });
+    }
+  }
+  const conversation = !handoff && conversationId
+    ? await ensureConversationLoaded(document, conversationId, conversationLoadOptionsForJob(job))
+    : null;
+  const freshChat = !handoff && !conversationId
+    ? await ensureFreshChat(document, job)
+    : null;
   if (!handoff) {
     window.name = ownedWindowName(job);
     markOwnership(document, job);
@@ -72,6 +88,7 @@ async function prepareJob(job) {
     url: location.href,
     title: document.title,
     window_name: window.name,
+    conversation,
     fresh_chat: freshChat,
     manual_handoff: handoff
   };
@@ -79,7 +96,7 @@ async function prepareJob(job) {
 
 async function uploadJobFile(job, filePayload) {
   const { parseOwnedWindowName, uploadFile } = await domHelpers();
-  assertJobOwnership(job, parseOwnedWindowName, { requireFresh: true });
+  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "upload"));
   const bytes = base64ToUint8Array(filePayload.bytes_base64);
   const file = new File([bytes], filePayload.filename || "yoetz-bundle.md", {
     type: filePayload.mime_type || "text/markdown"
@@ -90,7 +107,7 @@ async function uploadJobFile(job, filePayload) {
 
 async function configureModel(job) {
   const { configureModelState, parseOwnedWindowName } = await domHelpers();
-  assertJobOwnership(job, parseOwnedWindowName, { requireFresh: true });
+  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "model_selection"));
   return configureModelState(document, job);
 }
 
@@ -102,9 +119,10 @@ async function sendPrompt(job, prompt) {
     sendAcceptanceBaseline,
     waitForSendAccepted
   } = await domHelpers();
-  assertJobOwnership(job, parseOwnedWindowName, { requireFresh: true });
+  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send"));
   const baseline = sendAcceptanceBaseline(document);
   await insertPrompt(document, prompt, { timeoutMs: 20000 });
+  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send"));
   await clickSend(document, { timeoutMs: Number(job.send_timeout_ms) || 120000 });
   let accepted;
   try {
@@ -140,13 +158,16 @@ async function extractJobResponse(job) {
   } = await domHelpers();
   assertJobOwnership(job, parseOwnedWindowName);
   const conversationId = conversationIdFromUrl(location.href);
-  if (job.submitted_conversation_id && conversationId && job.submitted_conversation_id !== conversationId) {
+  const expectedConversationId = expectedConversationIdForJob(job);
+  if (expectedConversationId && conversationId !== expectedConversationId) {
     throw commandError(
       "conversation_changed",
-      `tab moved from ChatGPT conversation ${job.submitted_conversation_id} to ${conversationId}`,
+      `tab moved from ChatGPT conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
       {
         phase: "wait_response",
-        side_effect_started: true
+        side_effect_started: true,
+        requested_conversation_id: expectedConversationId,
+        current_conversation_id: conversationId
       }
     );
   }
@@ -236,13 +257,16 @@ async function bindJob(job) {
     );
   }
   const conversationId = conversationIdFromUrl(location.href);
-  if (job.submitted_conversation_id && conversationId && job.submitted_conversation_id !== conversationId) {
+  const expectedConversationId = expectedConversationIdForJob(job);
+  if (expectedConversationId && conversationId !== expectedConversationId) {
     throw commandError(
       "conversation_changed",
-      `tab moved from ChatGPT conversation ${job.submitted_conversation_id} to ${conversationId}`,
+      `tab moved from ChatGPT conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
       {
         phase: "wait_response",
-        side_effect_started: true
+        side_effect_started: true,
+        requested_conversation_id: expectedConversationId,
+        current_conversation_id: conversationId
       }
     );
   }
@@ -265,12 +289,57 @@ function assertJobOwnership(job, parseOwnedWindowName, options = {}) {
   if (parsed?.job_id !== job.job_id || parsed?.run_id !== job.run_id) {
     throw new Error(`tab ownership marker mismatch for job ${job.job_id}`);
   }
+  if (options.requireConversation) {
+    const actualConversationId = conversationIdFromUrl(location.href);
+    if (actualConversationId === options.requireConversation) {
+      return;
+    }
+    const code = actualConversationId ? "conversation_changed" : "conversation_not_loaded";
+    throw commandError(
+      code,
+      `job ${job.job_id} expected ChatGPT conversation ${options.requireConversation}, current conversation is ${actualConversationId ?? "(none)"}`,
+      {
+        phase: options.phase ?? "upload",
+        side_effect_started: false,
+        requested_conversation_id: options.requireConversation,
+        current_conversation_id: actualConversationId
+      }
+    );
+  }
   if (options.requireFresh && String(location.pathname ?? "").startsWith("/c/")) {
     throw commandError("fresh_chat_lost", `job ${job.job_id} is no longer on a fresh ChatGPT page`, {
       phase: "upload",
       side_effect_started: false
     });
   }
+}
+
+function ownershipOptionsForJob(job, phase) {
+  const conversationId = conversationIdForJob(job);
+  return conversationId
+    ? { requireConversation: conversationId, phase }
+    : { requireFresh: true, phase };
+}
+
+function conversationIdForJob(job) {
+  return String(job?.conversation_id ?? "").trim() || null;
+}
+
+function expectedConversationIdForJob(job) {
+  return String(job?.expected_conversation_id ?? job?.submitted_conversation_id ?? job?.conversation_id ?? "").trim() || null;
+}
+
+function conversationLoadOptionsForJob(job) {
+  const options = {};
+  const timeoutMs = Number(job?.upload_timeout_ms);
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    options.timeoutMs = timeoutMs;
+  }
+  const intervalMs = Number(job?.upload_interval_ms);
+  if (Number.isFinite(intervalMs) && intervalMs > 0) {
+    options.intervalMs = intervalMs;
+  }
+  return options;
 }
 
 async function domHelpers() {
@@ -294,7 +363,25 @@ function commandError(code, message, detail = {}) {
   error.code = code;
   error.phase = detail.phase;
   error.side_effect_started = detail.side_effect_started;
+  for (const [key, value] of Object.entries({
+    ...conversationLocationDetail(code),
+    ...detail
+  })) {
+    if (!(key in error) && value !== undefined) {
+      error[key] = value;
+    }
+  }
   return error;
+}
+
+function conversationLocationDetail(code) {
+  if (!String(code ?? "").startsWith("conversation_")) {
+    return {};
+  }
+  return {
+    current_url: String(location.href ?? ""),
+    current_pathname: String(location.pathname ?? "")
+  };
 }
 
 function contentScriptBuild() {
@@ -316,7 +403,7 @@ function runIdFromUrl(value) {
 function conversationIdFromUrl(value) {
   try {
     const pathname = new URL(value, location.href).pathname;
-    const match = pathname.match(/^\/c\/([^/?#]+)/);
+    const match = pathname.match(/^\/c\/([^/?#]+)$/);
     return match ? decodeURIComponent(match[1]) : null;
   } catch {
     return null;
@@ -336,6 +423,16 @@ function errorResponse(error) {
   }
   if (typeof error?.side_effect_started === "boolean") {
     response.side_effect_started = error.side_effect_started;
+  }
+  for (const key of [
+    "requested_conversation_id",
+    "current_conversation_id",
+    "current_url",
+    "current_pathname"
+  ]) {
+    if (error?.[key] !== undefined) {
+      response[key] = error[key];
+    }
   }
   return response;
 }

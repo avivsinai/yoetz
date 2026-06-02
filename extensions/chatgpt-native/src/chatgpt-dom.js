@@ -29,6 +29,12 @@ export function chatgptJobUrl(runId) {
   return url.toString();
 }
 
+export function chatgptConversationJobUrl(conversationId, runId) {
+  const url = new URL(`https://chatgpt.com/c/${encodeURIComponent(conversationId)}`);
+  url.searchParams.set("_yoetz", runId);
+  return url.toString();
+}
+
 export function classifyManualHandoff({ url = "", title = "", text = "" } = {}) {
   const haystack = `${url}\n${title}\n${text}`.toLowerCase();
   if (/\/auth\/login|log in|sign in/.test(haystack)) {
@@ -83,19 +89,23 @@ export function findSendButton(root = document) {
   return findSendButtonControl(root, { requireEnabled: true });
 }
 
-export function findModelButton(root = document) {
+export function findModelButton(root = document, options = {}) {
   // ChatGPT serves at least two picker families: Enterprise exposes a global
   // model-switcher button, while personal ChatGPT can render a composer-scoped
   // model chip. Keep both paths because either account type may back Pro.
-  const enterpriseButton = firstVisible(root, [
+  const enterpriseButton = firstVisibleModelControl(root, [
     'button[data-testid="model-switcher-dropdown-button"]',
     'button:has([data-testid="selected-model"])',
     'button:has([data-testid="model-switcher-selected-model"])',
     'button[aria-label*="model" i]',
     'button[aria-controls*="model" i]',
     'button[id*="model" i]'
-  ]);
-  return enterpriseButton ?? findComposerModelControl(root) ?? findStandaloneProExtendedModelControl(root);
+  ], options);
+  const composerButton = findComposerModelControl(root, options);
+  if (options.allowStandaloneFallback === false) {
+    return enterpriseButton ?? composerButton;
+  }
+  return enterpriseButton ?? composerButton ?? findStandaloneProExtendedModelControl(root);
 }
 
 export function getPageText(root = document) {
@@ -204,9 +214,96 @@ export async function ensureFreshChat(root = document, job = {}, options = {}) {
   };
 }
 
-export async function configureModelState(root) {
+export async function ensureConversationLoaded(root = document, conversationId, options = {}) {
+  const win = options.window ?? root.defaultView ?? globalThis;
+  const pathname = String(win.location?.pathname ?? "");
+  const loadedConversationId = conversationIdFromPathname(pathname);
+  if (loadedConversationId !== conversationId) {
+    const code = loadedConversationId ? "conversation_not_loaded" : "conversation_unavailable";
+    throw chatgptCommandError(
+      code,
+      code === "conversation_unavailable"
+        ? `ChatGPT conversation ${conversationId} is unavailable; current URL is ${currentLocationForError(win)}`
+        : `ChatGPT conversation ${conversationId} did not load; current URL is ${currentLocationForError(win)}`,
+      {
+        phase: "upload",
+        side_effect_started: false,
+        requested_conversation_id: conversationId,
+        current_conversation_id: loadedConversationId,
+        current_url: currentLocationForError(win),
+        current_pathname: pathname
+      }
+    );
+  }
+  const unavailable = conversationUnavailableState(root, win);
+  if (unavailable) {
+    throw conversationUnavailableError(conversationId, loadedConversationId, win, pathname, unavailable);
+  }
+  try {
+    await waitForElement(root, findComposer, "ChatGPT composer", options);
+  } catch (error) {
+    throw chatgptCommandError(
+      "conversation_unavailable",
+      `ChatGPT conversation ${conversationId} is unavailable; composer did not load at ${currentLocationForError(win)}: ${String(error?.message ?? error)}`,
+      {
+        phase: "upload",
+        side_effect_started: false,
+        requested_conversation_id: conversationId,
+        current_conversation_id: loadedConversationId,
+        current_url: currentLocationForError(win),
+        current_pathname: pathname
+      }
+    );
+  }
+  const currentPathname = String(win.location?.pathname ?? "");
+  const currentConversationId = conversationIdFromPathname(currentPathname);
+  if (currentConversationId !== conversationId) {
+    const code = currentConversationId ? "conversation_not_loaded" : "conversation_unavailable";
+    throw chatgptCommandError(
+      code,
+      code === "conversation_unavailable"
+        ? `ChatGPT conversation ${conversationId} is unavailable; current URL is ${currentLocationForError(win)}`
+        : `ChatGPT conversation ${conversationId} did not load; current URL is ${currentLocationForError(win)}`,
+      {
+        phase: "upload",
+        side_effect_started: false,
+        requested_conversation_id: conversationId,
+        current_conversation_id: currentConversationId,
+        current_url: currentLocationForError(win),
+        current_pathname: currentPathname
+      }
+    );
+  }
+  const postComposerUnavailable = conversationUnavailableState(root, win);
+  if (postComposerUnavailable) {
+    throw conversationUnavailableError(conversationId, currentConversationId, win, currentPathname, postComposerUnavailable);
+  }
+  return {
+    status: "loaded",
+    conversation_id: conversationId,
+    pathname: currentPathname
+  };
+}
+
+function conversationUnavailableError(conversationId, currentConversationId, win, pathname, unavailable) {
+  return chatgptCommandError(
+    "conversation_unavailable",
+    `ChatGPT conversation ${conversationId} is unavailable at ${currentLocationForError(win)}${unavailable.reason ? `: ${unavailable.reason}` : ""}`,
+    {
+      phase: "upload",
+      side_effect_started: false,
+      requested_conversation_id: conversationId,
+      current_conversation_id: currentConversationId,
+      current_url: currentLocationForError(win),
+      current_pathname: pathname,
+      unavailable_reason: unavailable.reason
+    }
+  );
+}
+
+export async function configureModelState(root, job = {}) {
   const requested = proExtendedModelRequest();
-  const selection = await selectRequestedModel(root, requested);
+  const selection = await selectRequestedModel(root, requested, modelSelectionOptionsForJob(job));
   const warnings = selection.warning ? [selection.warning] : [];
   return {
     status: selection.status,
@@ -219,6 +316,22 @@ export async function configureModelState(root) {
   };
 }
 
+function modelSelectionOptionsForJob(job = {}) {
+  const options = {};
+  if (String(job?.conversation_id ?? "").trim()) {
+    options.allowStandaloneFallback = false;
+  }
+  const timeoutMs = Number(job?.model_selection_timeout_ms);
+  if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
+    options.timeoutMs = timeoutMs;
+  }
+  const intervalMs = Number(job?.model_selection_interval_ms);
+  if (Number.isFinite(intervalMs) && intervalMs > 0) {
+    options.intervalMs = intervalMs;
+  }
+  return options;
+}
+
 function isActionableElement(node) {
   const tag = String(node?.tagName ?? "").toLowerCase();
   const role = String(node?.getAttribute?.("role") ?? "").toLowerCase();
@@ -227,7 +340,7 @@ function isActionableElement(node) {
     || node?.getAttribute?.("tabindex") !== null;
 }
 
-function findComposerModelControl(root) {
+function findComposerModelControl(root, options = {}) {
   for (const scope of modelControlScopes(root)) {
     const candidates = uniqueElements(Array.from(scope.querySelectorAll([
       "button",
@@ -243,6 +356,9 @@ function findComposerModelControl(root) {
     for (const node of candidates) {
       const target = modelClickTarget(node, scope);
       if (!target || !isVisible(target, { allowDisabled: true })) {
+        continue;
+      }
+      if (isTranscriptModelControl(target, options)) {
         continue;
       }
       const haystack = modelCandidateText(node, target);
@@ -353,8 +469,8 @@ function isModelChipLike(node) {
   return /\b(model|model-switcher)\b/.test(marker) && /\b(chip|pill|token|button|menu|dropdown|switcher)\b/.test(marker);
 }
 
-export async function selectRequestedModel(root, requested) {
-  const readiness = await waitForModelSelectionTarget(root, requested);
+export async function selectRequestedModel(root, requested, options = {}) {
+  const readiness = await waitForModelSelectionTarget(root, requested, options);
   if (readiness.selection.selected) {
     return {
       status: "selected",
@@ -372,7 +488,7 @@ export async function selectRequestedModel(root, requested) {
     };
   }
 
-  const currentSelection = currentRequestedModelSelection(root, requested);
+  const currentSelection = currentRequestedModelSelection(root, requested, options);
   if (currentSelection.selected) {
     return {
       status: "selected",
@@ -397,7 +513,7 @@ export async function selectRequestedModel(root, requested) {
     }
   }
   if (!selectedOption) {
-    const verification = await waitForRequestedModelSelected(root, requested, null);
+    const verification = await waitForRequestedModelSelected(root, requested, null, options);
     if (verification.selected) {
       return {
         status: "selected",
@@ -407,14 +523,14 @@ export async function selectRequestedModel(root, requested) {
     }
     return {
       status: "unavailable",
-      model_used: currentModelLabel(root),
+      model_used: currentModelLabel(root, options),
       available_options: availableOptions,
       warning: "ChatGPT Pro Extended was not visible in the model picker"
     };
   }
   realClick(selectedOption);
 
-  const verification = await waitForRequestedModelSelected(root, requested, selectedOption);
+  const verification = await waitForRequestedModelSelected(root, requested, selectedOption, options);
   if (verification.selected) {
     return {
       status: "selected",
@@ -434,15 +550,15 @@ async function waitForModelSelectionTarget(root, requested, options = {}) {
   const timeoutMs = Number(options.timeoutMs ?? 30000);
   const intervalMs = Number(options.intervalMs ?? 250);
   const startedAt = Date.now();
-  let selection = currentRequestedModelSelection(root, requested);
-  let modelButton = findModelButton(root);
+  let selection = currentRequestedModelSelection(root, requested, options);
+  let modelButton = findModelButton(root, options);
 
   while (Date.now() - startedAt < timeoutMs) {
-    selection = currentRequestedModelSelection(root, requested);
+    selection = currentRequestedModelSelection(root, requested, options);
     if (selection.selected) {
-      return { selection, modelButton: findModelButton(root) };
+      return { selection, modelButton: findModelButton(root, options) };
     }
-    modelButton = findModelButton(root);
+    modelButton = findModelButton(root, options);
     if (modelButton) {
       return { selection, modelButton };
     }
@@ -452,8 +568,8 @@ async function waitForModelSelectionTarget(root, requested, options = {}) {
   return { selection, modelButton };
 }
 
-function currentRequestedModelSelection(root, requested) {
-  const modelUsed = currentModelLabel(root);
+function currentRequestedModelSelection(root, requested, options = {}) {
+  const modelUsed = currentModelLabel(root, options);
   return {
     selected: modelTextMatchesRequest(modelUsed, requested),
     model_used: modelUsed
@@ -1089,6 +1205,33 @@ function firstVisible(root, selectors) {
   return firstMatching(root, selectors, { allowHidden: false });
 }
 
+function firstVisibleModelControl(root, selectors, options = {}) {
+  for (const selector of selectors) {
+    const nodes = Array.from(root.querySelectorAll(selector));
+    const visible = nodes.find((node) =>
+      isVisible(node, options) && !isTranscriptModelControl(node, options)
+    );
+    if (visible) {
+      return visible;
+    }
+  }
+  return null;
+}
+
+function isTranscriptModelControl(node, options = {}) {
+  if (options.allowStandaloneFallback !== false) {
+    return false;
+  }
+  return Boolean(node?.closest?.([
+    "[data-message-author-role]",
+    "article",
+    '[data-testid*="conversation-turn"]',
+    '[class*="turn-messages"]',
+    '[class*="agent-turn"]',
+    '[class*="user-turn"]'
+  ].join(",")));
+}
+
 function firstMatching(root, selectors, options = {}) {
   for (const selector of selectors) {
     const nodes = Array.from(root.querySelectorAll(selector));
@@ -1275,10 +1418,10 @@ async function waitForRequestedModelSelected(root, requested, _option, options =
   const timeoutMs = Number(options.timeoutMs ?? 4000);
   const intervalMs = Number(options.intervalMs ?? 100);
   const startedAt = Date.now();
-  let modelUsed = currentModelLabel(root);
+  let modelUsed = currentModelLabel(root, options);
 
   while (Date.now() - startedAt < timeoutMs) {
-    modelUsed = currentModelLabel(root);
+    modelUsed = currentModelLabel(root, options);
     if (modelTextMatchesRequest(modelUsed, requested)) {
       return { selected: true, model_used: modelUsed };
     }
@@ -1641,6 +1784,68 @@ function hasConversationResidue(root) {
   return residue.user_count > 0 || residue.assistant_count > 0 || residue.copy_button_count > 0;
 }
 
+function conversationUnavailableState(root, win) {
+  const text = normalizeText(`${String(win.document?.title ?? "")}\n${conversationUnavailableSurfaceText(root)}`).toLowerCase();
+  if (!text) {
+    return null;
+  }
+  const unavailablePatterns = [
+    /\bconversation not found\b/,
+    /\bchat not found\b/,
+    /\bconversation (?:is )?unavailable\b/,
+    /\byou (?:do not|don't) have access to (?:this )?(?:conversation|chat)\b/,
+    /\b(?:cannot|can't|could not) access (?:this )?(?:conversation|chat)\b/,
+    /\bthis (?:conversation|chat) (?:has been )?archived\b/,
+    /\barchived (?:conversation|chat)\b/
+  ];
+  const matched = unavailablePatterns.find((pattern) => pattern.test(text));
+  return matched ? { reason: matched.source } : null;
+}
+
+function conversationUnavailableSurfaceText(root) {
+  // Prior transcript text can quote "conversation not found" / "no access" phrases.
+  // When transcript residue exists, keep page-level banners and other non-turn UI
+  // text, but drop message containers so quoted assistant/user content cannot
+  // mask a valid resumed conversation or create a false unavailable state.
+  if (!hasConversationResidue(root)) {
+    return getPageText(root);
+  }
+  const start = root.body ?? root.documentElement ?? root;
+  const chunks = [];
+  collectConversationUnavailableSurfaceText(start, chunks);
+  return chunks.join("\n");
+}
+
+function collectConversationUnavailableSurfaceText(node, chunks) {
+  if (!node || isConversationTurnSurface(node)) {
+    return;
+  }
+  const children = Array.from(node.children ?? []);
+  if (children.length === 0) {
+    if (isVisible(node, { allowDisabled: true })) {
+      const text = textOf(node);
+      if (text) {
+        chunks.push(text);
+      }
+    }
+    return;
+  }
+  for (const child of children) {
+    collectConversationUnavailableSurfaceText(child, chunks);
+  }
+}
+
+function isConversationTurnSurface(node) {
+  return Boolean(node?.closest?.([
+    "[data-message-author-role]",
+    "article",
+    '[data-testid*="conversation-turn"]',
+    '[class*="turn-messages"]',
+    '[class*="agent-turn"]',
+    '[class*="user-turn"]'
+  ].join(",")));
+}
+
 function conversationResidue(root) {
   const copyButtons = Array.from(root.querySelectorAll('button[aria-label*="Copy"], button[data-testid*="copy"]'))
     .filter((node) => isCopyControl(node));
@@ -1805,10 +2010,11 @@ function uniqueElements(nodes) {
   return nodes.filter((node, index) => node && nodes.indexOf(node) === index);
 }
 
-function currentModelLabel(root) {
-  const selected = firstVisible(root, [
-    '[data-testid="model-switcher-selected-model"]'
-  ]);
+function currentModelLabel(root, options = {}) {
+  const modelButton = findModelButton(root, options);
+  const selected = options.allowStandaloneFallback === false
+    ? (modelButton ? firstVisible(modelButton, ['[data-testid="model-switcher-selected-model"]']) : null)
+    : firstVisible(root, ['[data-testid="model-switcher-selected-model"]']);
   const selectedText = normalizeText(selected?.innerText ?? selected?.textContent ?? "");
   if (selectedText) {
     return selectedText;
@@ -1816,7 +2022,7 @@ function currentModelLabel(root) {
   if (visibleModelOptions(root).length > 0) {
     return "";
   }
-  return modelControlLabel(findModelButton(root));
+  return modelControlLabel(modelButton);
 }
 
 export function modelSelectionDiagnostics(root = document) {
@@ -1918,6 +2124,39 @@ function describeElement(node) {
     .filter(Boolean)
     .join(" ");
   return `${node.tagName?.toLowerCase?.() ?? "element"}${attrs ? ` ${attrs}` : ""}`;
+}
+
+function conversationIdFromPathname(pathname) {
+  const match = String(pathname ?? "").match(/^\/c\/([^/?#]+)$/);
+  if (!match) {
+    return null;
+  }
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function chatgptCommandError(code, message, detail = {}) {
+  const error = new Error(message);
+  error.code = code;
+  if (detail.phase) {
+    error.phase = detail.phase;
+  }
+  if (typeof detail.side_effect_started === "boolean") {
+    error.side_effect_started = detail.side_effect_started;
+  }
+  for (const [key, value] of Object.entries(detail)) {
+    if (!(key in error) && value !== undefined) {
+      error[key] = value;
+    }
+  }
+  return error;
+}
+
+function currentLocationForError(win) {
+  return String(win.location?.href ?? win.location?.pathname ?? "(unknown)") || "(unknown)";
 }
 
 function sleep(ms) {

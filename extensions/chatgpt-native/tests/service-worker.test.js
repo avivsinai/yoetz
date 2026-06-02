@@ -56,12 +56,18 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
             sentJobs.add(message.job.job_id);
-            return { ok: true, payload: { sent: true } };
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: `conv-${message.job.job_id}`
+              }
+            };
           case "yoetz_extract_response":
             return {
               ok: true,
               payload: sentJobs.has(message.job.job_id)
-                ? { method: "assistant_dom_fallback", text: `answer ${message.job.job_id}`, is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0 }
+                ? { method: "assistant_dom_fallback", text: `answer ${message.job.job_id}`, is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0, conversation_id: `conv-${message.job.job_id}` }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
             };
           default:
@@ -119,6 +125,14 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.completion_reason,
       "copy_button"
     );
+    assert.equal(
+      port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.conversation_id,
+      "conv-job_a"
+    );
+    assert.equal(
+      port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.conversation_url,
+      "https://chatgpt.com/c/conv-job_a"
+    );
     assert.equal(sentToTabs.filter((item) => item.message.type === "yoetz_upload_file").length, 2);
     assert.equal(
       sentToTabs.find((item) => item.message.type === "yoetz_configure_model" && item.message.job.job_id === "job_b")?.message.job.model,
@@ -128,6 +142,394 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     globalThis.chrome = originalChrome;
     globalThis.setInterval = originalSetInterval;
     globalThis.clearInterval = originalClearInterval;
+  }
+});
+
+test("service worker opens fresh and resume jobs in new owned tabs", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const createdTabs = [];
+  const sentToTabs = [];
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => {
+        const tab = { id: createdTabs.length + 1, ...opts };
+        createdTabs.push(tab);
+        return tab;
+      },
+      query: async () => {
+        throw new Error("resume jobs must not discover or reuse existing tabs");
+      },
+      get: async (id) => {
+        const tab = createdTabs.find((item) => item.id === id);
+        return { id, status: "complete", url: tab?.url ?? "https://chatgpt.com/" };
+      },
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?resume_url=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_fresh_url", {
+      prompt: "fresh",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+    port.emit(envelope("job_start", "job_resume_url", {
+      prompt: "resume",
+      conversation_id: "conv-123",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+
+    await eventually(() => port.messages.filter((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ).length === 2);
+
+    assert.deepEqual(
+      createdTabs.map((tab) => ({ url: tab.url, active: tab.active })),
+      [
+        { url: "https://chatgpt.com/?_yoetz=run_job_fresh_url", active: false },
+        { url: "https://chatgpt.com/c/conv-123?_yoetz=run_job_resume_url", active: false }
+      ]
+    );
+    assert.equal(createdTabs.length, 2);
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_resume_url")?.message.job.expected_conversation_id,
+      "conv-123"
+    );
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_resume_url")?.message.job.conversation_id,
+      "conv-123"
+    );
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_fresh_url")?.message.job.expected_conversation_id,
+      null
+    );
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_prepare_job" && item.message.job.job_id === "job_fresh_url")?.message.job.conversation_id,
+      null
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker rejects invalid conversation ids before opening a tab", async () => {
+  const invalidCases = [
+    ".",
+    "..",
+    "a/b",
+    "conv%2F123",
+    "",
+    "x".repeat(257),
+    42
+  ];
+
+  for (const [index, invalid] of invalidCases.entries()) {
+    const originalChrome = globalThis.chrome;
+    const port = makePort();
+    const createdTabs = [];
+    globalThis.chrome = chromeStub({
+      port,
+      tabs: {
+        create: async (opts) => {
+          createdTabs.push(opts);
+          return { id: createdTabs.length, ...opts };
+        },
+        get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+        sendMessage: async () => {
+          throw new Error("invalid conversation must fail before tab messaging");
+        }
+      }
+    });
+
+    try {
+      await import(`../src/service-worker.js?invalid_conversation=${Date.now()}_${index}`);
+      port.emit(envelope("job_start", `job_invalid_${index}`, {
+        prompt: "resume",
+        conversation_id: invalid,
+        wait_interval_ms: 50,
+        wait_timeout_ms: 1000
+      }));
+
+      await eventually(() => port.messages.some((message) => message.type === "job_error"));
+      const error = port.messages.find((message) => message.type === "job_error");
+      assert.equal(error.payload.code, "invalid_conversation");
+      assert.equal(error.payload.phase, "upload");
+      assert.equal(error.payload.side_effect_started, false);
+      assert.deepEqual(createdTabs, []);
+    } finally {
+      globalThis.chrome = originalChrome;
+    }
+  }
+});
+
+test("service worker trims a valid conversation id before opening the resume tab", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const createdTabs = [];
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => {
+        const tab = { id: createdTabs.length + 1, ...opts };
+        createdTabs.push(tab);
+        return tab;
+      },
+      get: async (id) => ({ id, status: "complete", url: createdTabs.find((item) => item.id === id)?.url ?? "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?trim_conversation=${Date.now()}`);
+    port.emit(envelope("job_start", "job_trim_conversation", {
+      prompt: "resume",
+      conversation_id: " conv-123 ",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ));
+    assert.equal(createdTabs[0].url, "https://chatgpt.com/c/conv-123?_yoetz=run_job_trim_conversation");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker fails immediately when send reports the wrong resumed conversation", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/conv-123?_yoetz=run_job_send_drift" }),
+      sendMessage: async (_id, message) => {
+        sentToTabs.push(message.type);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_extract_response":
+            return sent
+              ? { ok: true, payload: { method: "assistant_dom_fallback", text: "wrong answer", is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0, conversation_id: "other" } }
+              : { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1, conversation_id: "conv-123" } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, conversation_id: "other" } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?send_wrong_conversation=${Date.now()}`);
+    port.emit(envelope("job_start", "job_send_drift", {
+      prompt: "resume",
+      conversation_id: "conv-123",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_send_drift", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_send_drift.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.payload?.code === "conversation_changed"
+    ));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.payload.phase, "send");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.requested_conversation_id, "conv-123");
+    assert.equal(error.payload.current_conversation_id, "other");
+    assert.equal(port.messages.some((message) => message.payload?.phase === "prompt_sent"), false);
+    assert.equal(sentToTabs.filter((type) => type === "yoetz_extract_response").length, 1);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker fails resumed jobs when post-send extraction omits the conversation id", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/conv-123?_yoetz=run_job_missing_extract_conversation" }),
+      sendMessage: async (_id, message) => {
+        sentToTabs.push(message.type);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, conversation_id: "conv-123" } };
+          case "yoetz_extract_response":
+            return sent
+              ? { ok: true, payload: { method: "assistant_dom_fallback", text: "answer without identity", is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0 } }
+              : { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1, conversation_id: "conv-123" } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?missing_extract_conversation=${Date.now()}`);
+    port.emit(envelope("job_start", "job_missing_extract_conversation", {
+      prompt: "resume",
+      conversation_id: "conv-123",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_missing_extract_conversation", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_missing_extract_conversation.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.payload?.code === "conversation_changed"
+    ));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.payload.phase, "wait_response");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.requested_conversation_id, "conv-123");
+    assert.equal(error.payload.current_conversation_id, null);
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    assert.equal(sentToTabs.includes("yoetz_send_prompt"), true);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker fails unavailable conversations with inspectable terminal error", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  let tabId = 0;
+  const currentUrl = "https://chatgpt.com/c/conv-404?_yoetz=run_job_unavailable";
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: currentUrl }),
+      sendMessage: async (_id, message) => {
+        sentToTabs.push(message.type);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return {
+              ok: false,
+              code: "conversation_unavailable",
+              error: "ChatGPT conversation conv-404 is unavailable",
+              phase: "upload",
+              side_effect_started: false,
+              requested_conversation_id: "conv-404",
+              current_url: currentUrl
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?conversation_unavailable=${Date.now()}`);
+    port.emit(envelope("job_start", "job_unavailable", {
+      prompt: "resume",
+      conversation_id: "conv-404",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.payload.code === "conversation_unavailable"
+    ));
+
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.payload.phase, "upload");
+    assert.equal(error.payload.side_effect_started, false);
+    assert.equal(error.payload.requested_conversation_id, "conv-404");
+    assert.equal(error.payload.current_url, currentUrl);
+    assert.equal(error.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_unavailable");
+    assert.match(error.payload.message, /requested conversation conv-404/);
+    assert.match(error.payload.message, /current URL https:\/\/chatgpt\.com\/c\/conv-404\?_yoetz=run_job_unavailable/);
+    assert.match(error.payload.message, /phase upload/);
+    assert.match(error.payload.message, /yoetz browser extension inspect --chatgpt --run-id run_job_unavailable/);
+    assert.equal(sentToTabs.includes("yoetz_upload_file"), false);
+    assert.equal(sentToTabs.includes("yoetz_send_prompt"), false);
+    assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
   }
 });
 
@@ -292,6 +694,70 @@ test("service worker fails closed when Pro Extended is unavailable", async () =>
     assert.equal(error.payload.model_selection_status, "unavailable");
     assert.equal(sentToTabs.includes("yoetz_upload_file"), false);
     assert.equal(sentToTabs.includes("yoetz_send_prompt"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker fails resumed jobs before upload when Pro Extended is unavailable", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const createdTabs = [];
+  const sentToTabs = [];
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => {
+        const tab = { id: createdTabs.length + 1, ...opts };
+        createdTabs.push(tab);
+        return tab;
+      },
+      get: async (id) => ({ id, status: "complete", url: createdTabs.find((tab) => tab.id === id)?.url ?? "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        sentToTabs.push(message.type);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "unavailable",
+                model_used: "Default",
+                requested_model: "extended-pro",
+                extended_status: "required",
+                available_options: ["Default"],
+                warning: "ChatGPT model selector button not found"
+              }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?resume_model_unavailable=${Date.now()}`);
+    port.emit(envelope("job_start", "job_resume_model_fail", {
+      prompt: "resume",
+      conversation_id: "conv-123",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(createdTabs[0].url, "https://chatgpt.com/c/conv-123?_yoetz=run_job_resume_model_fail");
+    assert.equal(error.payload.code, "model_selection_failed");
+    assert.equal(error.payload.phase, "model_selection");
+    assert.equal(error.payload.side_effect_started, false);
+    assert.equal(error.payload.model_selection_status, "unavailable");
+    assert.equal(sentToTabs.includes("yoetz_upload_file"), false);
+    assert.equal(sentToTabs.includes("yoetz_send_prompt"), false);
+    assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -1450,12 +1916,12 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
             sent = true;
-            return { ok: true, payload: { sent: true } };
+            return { ok: true, payload: { sent: true, conversation_id: "conv-waiting-progress" } };
           case "yoetz_extract_response":
             return {
               ok: true,
               payload: sent
-                ? { method: "none", text: "", is_generating: true, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+                ? { method: "none", text: "", is_generating: true, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1, conversation_id: "conv-waiting-progress" }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
             };
           default:
@@ -1494,6 +1960,8 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
     assert.match(sentProgress?.payload.message, /waiting for ChatGPT response/);
     assert.equal(sentProgress?.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_waiting_progress");
     assert.equal(sentProgress?.payload.yoetz_url, "https://chatgpt.com/?_yoetz=run_job_waiting_progress");
+    assert.equal(sentProgress?.payload.conversation_id, "conv-waiting-progress");
+    assert.equal(sentProgress?.payload.conversation_url, "https://chatgpt.com/c/conv-waiting-progress");
     assert.match(sentProgress?.payload.message, /inspect with: yoetz browser extension inspect --chatgpt --run-id run_job_waiting_progress/);
     assert.match(waiting?.payload.message, /waiting for ChatGPT response/);
     assert.equal(waiting.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_waiting_progress");

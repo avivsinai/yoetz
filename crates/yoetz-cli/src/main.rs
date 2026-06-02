@@ -1147,6 +1147,14 @@ fn recipe_transports_with_explicit_override(
     Ok(vec![requested])
 }
 
+fn recipe_effective_allow_cdp_fallback(
+    allow_cdp_fallback: bool,
+    recipe_vars: &BTreeMap<String, String>,
+    is_chatgpt: bool,
+) -> bool {
+    allow_cdp_fallback && !(is_chatgpt && recipe_uses_conversation_selector(recipe_vars))
+}
+
 fn recipe_should_auto_discover_cdp_target(
     managed_profile_only: bool,
     requested_extension_native: bool,
@@ -1319,6 +1327,12 @@ fn recipe_uses_extension_instance_selector(
         || recipe_var_present(recipe_vars)("extension_profile_id")
 }
 
+fn recipe_uses_conversation_selector(
+    recipe_vars: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    recipe_var_present(recipe_vars)("conversation")
+}
+
 #[cfg(test)]
 fn recipe_uses_chatgpt_browser_context_selector(
     recipe_vars: &std::collections::BTreeMap<String, String>,
@@ -1366,6 +1380,20 @@ fn constrain_chatgpt_transports_for_browser_context_selector(
     transports
 }
 
+fn constrain_chatgpt_transports_for_conversation(
+    transports: Vec<browser::RecipeTransport>,
+    recipe_vars: &std::collections::BTreeMap<String, String>,
+    is_chatgpt: bool,
+) -> Vec<browser::RecipeTransport> {
+    if !is_chatgpt || !recipe_uses_conversation_selector(recipe_vars) {
+        return transports;
+    }
+    transports
+        .into_iter()
+        .filter(|transport| matches!(transport, browser::RecipeTransport::ChromeExtensionNative))
+        .collect()
+}
+
 fn ensure_chatgpt_transport_constraints_allow_any(
     transports: &[browser::RecipeTransport],
     requested: Option<browser::RecipeTransport>,
@@ -1380,6 +1408,12 @@ fn ensure_chatgpt_transport_constraints_allow_any(
         .map(recipe_transport_name)
         .map(|name| format!("requested transport `{name}`"))
         .unwrap_or_else(|| "configured transports".to_string());
+
+    if recipe_uses_conversation_selector(recipe_vars) {
+        bail!(
+            "conversation requires chrome-extension-native; {requested} is not compatible. Install the Yoetz Chrome extension (`yoetz browser extension setup --chatgpt`) or pass --transport chrome-extension-native."
+        );
+    }
 
     if recipe_uses_exact_browser_context_selector(recipe_vars) {
         bail!(
@@ -1907,6 +1941,8 @@ async fn run_recipe_via_chrome_devtools_mcp(
         fallback_used,
         delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
         auto_paste_fallback: false,
+        conversation_id: None,
+        conversation_url: None,
     }
     .to_value();
     maybe_write_output(ctx, &payload)?;
@@ -1935,6 +1971,8 @@ async fn run_recipe_via_chrome_devtools_mcp(
                 fallback_used,
                 delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
                 auto_paste_fallback: false,
+                conversation_id: payload["conversation_id"].as_str().map(str::to_owned),
+                conversation_url: payload["conversation_url"].as_str().map(str::to_owned),
             }
             .to_recipe_complete_event();
             write_jsonl("browser.recipe", &event)?;
@@ -1957,6 +1995,10 @@ fn build_chatgpt_recipe_spec(
         dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, recipe_args.bundle.as_deref())?;
     let send_timeout_ms = dev_browser::resolve_chatgpt_send_timeout_ms(recipe_vars)?;
     chrome_devtools_mcp::RecipeThreadMode::parse(recipe_vars.get("thread").map(String::as_str))?;
+    let conversation = recipe_vars
+        .get("conversation")
+        .map(|value| chatgpt_web::normalize_conversation(value))
+        .transpose()?;
     Ok(chatgpt_recipe::ChatgptRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
         model: chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL.to_string(),
@@ -1980,6 +2022,7 @@ fn build_chatgpt_recipe_spec(
             .get("extension_profile_id")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        conversation_id: conversation.map(|value| value.id),
         run_id: recipe_vars
             .get("run_id")
             .cloned()
@@ -2115,6 +2158,8 @@ fn run_recipe_via_chrome_extension_native(
         fallback_used,
         delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
         auto_paste_fallback: false,
+        conversation_id: response.conversation_id,
+        conversation_url: response.conversation_url,
     };
     let mut payload = output.to_value();
     attach_browser_recipe_artifacts(&mut payload, recipe_args.bundle.as_deref())?;
@@ -2262,6 +2307,8 @@ fn run_recipe_via_dev_browser(
             chatgpt_recipe::ChatgptDeliveryMode::FileUpload
         },
         auto_paste_fallback,
+        conversation_id: None,
+        conversation_url: None,
     };
     let payload = output.to_value();
     maybe_write_output(ctx, &payload)?;
@@ -3310,6 +3357,11 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 && extension_status_connected_for_auto_selection();
             let extension_native_will_route =
                 requested_extension_native || extension_auto_selection_eligible;
+            let effective_allow_cdp_fallback = recipe_effective_allow_cdp_fallback(
+                recipe_args.allow_cdp_fallback,
+                &recipe_vars,
+                is_chatgpt,
+            );
             if recipe_uses_extension_instance_selector(&recipe_vars) && !extension_native_will_route
             {
                 bail!(
@@ -3331,7 +3383,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     managed_profile_only,
                     requested_extension_native,
                     extension_native_will_route,
-                    recipe_args.allow_cdp_fallback,
+                    effective_allow_cdp_fallback,
                 ),
             )?;
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
@@ -3347,7 +3399,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             let transports = recipe_transports_with_explicit_override(
                 base_transports,
                 recipe_args.transport,
-                recipe_args.allow_cdp_fallback,
+                effective_allow_cdp_fallback,
                 is_chatgpt,
             )?;
             let live_attach_owner_is_present =
@@ -3369,6 +3421,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 &recipe_vars,
                 is_chatgpt,
             );
+            let transports =
+                constrain_chatgpt_transports_for_conversation(transports, &recipe_vars, is_chatgpt);
             ensure_chatgpt_transport_constraints_allow_any(
                 &transports,
                 recipe_args.transport,
@@ -3496,7 +3550,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             skip_remaining_live_cdp = true;
                         }
                         if matches!(transport, browser::RecipeTransport::ChromeExtensionNative)
-                            && !recipe_args.allow_cdp_fallback
+                            && !effective_allow_cdp_fallback
                             && chatgpt_recipe::terminal_fallback_phase(&err).is_none()
                             && matches!(format, OutputFormat::Text | OutputFormat::Markdown)
                         {
@@ -4676,6 +4730,21 @@ mod tests {
     }
 
     #[test]
+    fn conversation_disables_cdp_fallback_even_when_requested() {
+        let vars = std::collections::BTreeMap::from([(
+            "conversation".to_string(),
+            "conv-123".to_string(),
+        )]);
+        assert!(!recipe_effective_allow_cdp_fallback(true, &vars, true));
+        assert!(recipe_effective_allow_cdp_fallback(
+            true,
+            &std::collections::BTreeMap::new(),
+            true
+        ));
+        assert!(recipe_effective_allow_cdp_fallback(true, &vars, false));
+    }
+
+    #[test]
     fn cdp_auto_discovery_is_disabled_for_native_only_routes() {
         assert!(recipe_should_auto_discover_cdp_target(
             false, false, false, false
@@ -4723,6 +4792,99 @@ mod tests {
         vars.insert("extension_instance_id".to_string(), "ext-work".to_string());
         assert!(recipe_uses_extension_instance_selector(&vars));
         assert!(!recipe_uses_chatgpt_browser_context_selector(&vars));
+
+        vars.clear();
+        vars.insert("conversation".to_string(), "conv-123".to_string());
+        assert!(recipe_uses_conversation_selector(&vars));
+    }
+
+    #[test]
+    fn conversation_selector_keeps_only_chrome_extension_native() {
+        let vars = std::collections::BTreeMap::from([(
+            "conversation".to_string(),
+            "conv-123".to_string(),
+        )]);
+        let transports = constrain_chatgpt_transports_for_conversation(
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::ChromeExtensionNative,
+                browser::RecipeTransport::AgentBrowser,
+                browser::RecipeTransport::Manual,
+            ],
+            &vars,
+            true,
+        );
+        assert_eq!(
+            transports,
+            vec![browser::RecipeTransport::ChromeExtensionNative]
+        );
+    }
+
+    #[test]
+    fn conversation_selector_allows_native_transport_route() {
+        let vars = std::collections::BTreeMap::from([(
+            "conversation".to_string(),
+            "conv-123".to_string(),
+        )]);
+        ensure_chatgpt_transport_constraints_allow_any(
+            &[browser::RecipeTransport::ChromeExtensionNative],
+            Some(browser::RecipeTransport::ChromeExtensionNative),
+            &vars,
+            true,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn conversation_selector_rejects_non_native_transport_routes() {
+        let vars = std::collections::BTreeMap::from([(
+            "conversation".to_string(),
+            "conv-123".to_string(),
+        )]);
+        for transport in [
+            browser::RecipeTransport::ChromeDevtoolsMcp,
+            browser::RecipeTransport::DevBrowser,
+            browser::RecipeTransport::AgentBrowser,
+            browser::RecipeTransport::Manual,
+        ] {
+            let transports =
+                constrain_chatgpt_transports_for_conversation(vec![transport], &vars, true);
+            let err = ensure_chatgpt_transport_constraints_allow_any(
+                &transports,
+                Some(transport),
+                &vars,
+                true,
+            )
+            .unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("conversation requires chrome-extension-native"));
+            assert!(message.contains("yoetz browser extension setup --chatgpt"));
+        }
+    }
+
+    #[test]
+    fn conversation_selector_rejects_default_routes_when_extension_is_not_selected() {
+        let vars = std::collections::BTreeMap::from([(
+            "conversation".to_string(),
+            "conv-123".to_string(),
+        )]);
+        let transports = constrain_chatgpt_transports_for_conversation(
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::AgentBrowser,
+                browser::RecipeTransport::Manual,
+            ],
+            &vars,
+            true,
+        );
+        let err = ensure_chatgpt_transport_constraints_allow_any(&transports, None, &vars, true)
+            .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("conversation requires chrome-extension-native"));
+        assert!(message.contains("configured transports"));
+        assert!(message.contains("yoetz browser extension setup --chatgpt"));
     }
 
     #[test]
@@ -5426,6 +5588,10 @@ mod tests {
             ("profile_email".to_string(), "user@example.com".to_string()),
             ("extension_instance_id".to_string(), "ext-work".to_string()),
             ("extension_profile_id".to_string(), "gaia-work".to_string()),
+            (
+                "conversation".to_string(),
+                "https://chat.openai.com/c/conv-123?model=gpt-4".to_string(),
+            ),
             ("run_id".to_string(), "run-123".to_string()),
             ("wait_timeout_ms".to_string(), "2400000".to_string()),
             ("wait_interval_ms".to_string(), "45000".to_string()),
@@ -5441,6 +5607,7 @@ mod tests {
         assert_eq!(spec.profile_email.as_deref(), Some("user@example.com"));
         assert_eq!(spec.extension_instance_id.as_deref(), Some("ext-work"));
         assert_eq!(spec.extension_profile_id.as_deref(), Some("gaia-work"));
+        assert_eq!(spec.conversation_id.as_deref(), Some("conv-123"));
         assert_eq!(spec.run_id, "run-123");
         assert_eq!(spec.wait_timeout_ms, 2_400_000);
         assert_eq!(spec.wait_interval_ms, 45_000);
@@ -5679,6 +5846,8 @@ mod tests {
             fallback_used: true,
             delivery_mode: crate::chatgpt_recipe::ChatgptDeliveryMode::Paste,
             auto_paste_fallback: true,
+            conversation_id: Some("conv-123".to_string()),
+            conversation_url: Some("https://chatgpt.com/c/conv-123".to_string()),
         };
 
         let event = output.to_recipe_complete_event();
@@ -5688,6 +5857,8 @@ mod tests {
         assert_eq!(event["delivery_mode"], "paste");
         assert_eq!(event["auto_paste_fallback"], true);
         assert_eq!(event["warnings"], json!(["clipboard fallback"]));
+        assert_eq!(event["conversation_id"], "conv-123");
+        assert_eq!(event["conversation_url"], "https://chatgpt.com/c/conv-123");
     }
 
     #[test]
