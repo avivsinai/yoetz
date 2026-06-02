@@ -24,6 +24,10 @@ const MAX_FINAL_AFFORDANCE_IDLE_MS = Math.max(
   MIN_STABLE_IDLE_MS,
   Number(globalThis.__YOETZ_MAX_FINAL_AFFORDANCE_IDLE_MS ?? 5 * 60 * 1000) || 5 * 60 * 1000
 );
+const MIN_UNSCOPED_COPY_STABLE_TEXT_CHARS = Math.max(
+  1,
+  Number(globalThis.__YOETZ_MIN_UNSCOPED_COPY_STABLE_TEXT_CHARS ?? 4096) || 4096
+);
 // Once ChatGPT has exposed a final assistant affordance (copy control) AND scoped
 // text is extractable AND generation has stopped, the response is structurally
 // complete. Confirm it over a SHORT stable window at a FAST cadence instead of
@@ -1280,6 +1284,9 @@ async function waitForResponse(job) {
   let finalAffordanceCandidate = null;
   let bestFinalAffordanceCandidate = null;
   let finalAffordanceCandidateSinceMs = 0;
+  let unscopedCopyCandidate = null;
+  let bestUnscopedCopyCandidate = null;
+  let unscopedCopyCandidateSinceMs = 0;
   let extractionFailureSinceMs = 0;
   let lastWaitingProgressAt = startedAt;
   const timeoutMs = responseWaitTimeoutMs(job);
@@ -1327,7 +1334,13 @@ async function waitForResponse(job) {
       && !extraction?.is_generating
       && hasFinalAssistantAffordance(extraction)
     );
+    const stableIdleUnscopedCopy = Boolean(
+      scopedExtractionCandidate
+      && !finalAffordance
+      && hasStableIdleUnscopedCopyAffordance(job, extraction)
+    );
     let stableForMs = 0;
+    let unscopedCopyStableForMs = 0;
     if (finalAffordance) {
       // Once ChatGPT exposes final assistant controls, scope and turn checks
       // have already ruled out pre-send content. From here we track the best
@@ -1356,13 +1369,47 @@ async function waitForResponse(job) {
       if (stableForMs >= affordanceConfirmMs) {
         return completedExtraction(finalAffordanceCandidate, "copy_button", stableForMs);
       }
+      unscopedCopyCandidate = null;
+      bestUnscopedCopyCandidate = null;
+      unscopedCopyCandidateSinceMs = 0;
     } else if (extraction?.is_generating) {
       finalAffordanceCandidate = null;
       finalAffordanceCandidateSinceMs = 0;
+      unscopedCopyCandidate = null;
+      unscopedCopyCandidateSinceMs = 0;
     } else if (!postSendAssistantActivity) {
       finalAffordanceCandidate = null;
       bestFinalAffordanceCandidate = null;
       finalAffordanceCandidateSinceMs = 0;
+      unscopedCopyCandidate = null;
+      bestUnscopedCopyCandidate = null;
+      unscopedCopyCandidateSinceMs = 0;
+    }
+    if (stableIdleUnscopedCopy) {
+      const bestSelection = selectFinalAffordanceCandidate(bestUnscopedCopyCandidate, extraction);
+      bestUnscopedCopyCandidate = bestSelection.candidate;
+      const candidateSelection = selectFinalAffordanceCandidate(
+        unscopedCopyCandidate ?? bestUnscopedCopyCandidate,
+        extraction
+      );
+      if (!unscopedCopyCandidate || candidateSelection.candidate !== unscopedCopyCandidate) {
+        if (!unscopedCopyCandidate || candidateSelection.resetTimer) {
+          unscopedCopyCandidateSinceMs = Date.now();
+        }
+        unscopedCopyCandidate = candidateSelection.candidate;
+      } else if (!unscopedCopyCandidateSinceMs) {
+        unscopedCopyCandidateSinceMs = Date.now();
+      }
+      unscopedCopyStableForMs = Date.now() - unscopedCopyCandidateSinceMs;
+      if (unscopedCopyStableForMs >= finalAffordanceIdleMs) {
+        return completedExtraction(unscopedCopyCandidate, "stable_idle_unscoped_copy_button", unscopedCopyStableForMs);
+      }
+    } else if (!finalAffordance) {
+      unscopedCopyCandidate = null;
+      unscopedCopyCandidateSinceMs = 0;
+      if (!postSendAssistantActivity) {
+        bestUnscopedCopyCandidate = null;
+      }
     }
     const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalAffordance);
     if (finalAffordanceWithoutScopedText) {
@@ -1402,8 +1449,9 @@ async function waitForResponse(job) {
         elapsed_ms: elapsedMs,
         timeout_ms: timeoutMs,
         next_poll_ms: nextDelay,
-        stable_for_ms: stableForMs,
+        stable_for_ms: Math.max(stableForMs, unscopedCopyStableForMs),
         final_affordance: finalAffordance,
+        stable_idle_unscoped_copy_candidate: stableIdleUnscopedCopy,
         extraction_failure_candidate: finalAffordanceWithoutScopedText
       };
       if (awaitingFinalAffordance) {
@@ -1617,6 +1665,28 @@ function hasFinalAssistantAffordance(extraction) {
   // ChatGPT shows assistant copy controls when a turn is externally complete.
   // Pair this with the scoped extraction and !is_generating checks above.
   return Boolean(!extraction?.is_generating && extraction?.has_copy_button);
+}
+
+function hasStableIdleUnscopedCopyAffordance(job, extraction) {
+  if (hasFinalAssistantAffordance(extraction)) {
+    return false;
+  }
+  if (!hasNoVisibleStopControls(extraction)) {
+    return false;
+  }
+  if (normalizedResponseText(extraction?.text).length < MIN_UNSCOPED_COPY_STABLE_TEXT_CHARS) {
+    return false;
+  }
+  const baselineCopyButtonCount = nonNegativeFiniteNumber(job.response_baseline?.copy_button_count);
+  const copyButtonCount = nonNegativeFiniteNumber(extraction?.copy_button_count);
+  return baselineCopyButtonCount !== null
+    && copyButtonCount !== null
+    && copyButtonCount > baselineCopyButtonCount;
+}
+
+function hasNoVisibleStopControls(extraction) {
+  const stopControlCount = nonNegativeFiniteNumber(extraction?.diagnostics?.counts?.stop_controls);
+  return stopControlCount === null || stopControlCount === 0;
 }
 
 function responseStableIdleThresholdMs(intervalMs) {

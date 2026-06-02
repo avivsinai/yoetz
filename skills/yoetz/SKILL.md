@@ -375,19 +375,23 @@ BUNDLE=$(yoetz bundle -p "Review this code" -f src/*.rs --format json | jq -r .a
 # Send to ChatGPT
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE"
 
-# Every request opens a fresh, yoetz-owned ChatGPT tab marked with ?_yoetz=<run-id>
-# so your own ChatGPT conversations are never touched. `--var thread=reuse` is
-# rejected — yoetz is always a fresh-tab consumer.
+# By default, every request opens a fresh, yoetz-owned ChatGPT tab marked with
+# ?_yoetz=<run-id> so your own ChatGPT tabs are not touched. `--var thread=reuse`
+# is rejected. To resume, pass `--var conversation=<id|url>`; yoetz still opens a
+# new owned tab for that conversation.
 ```
 
 The wait loop reports `completion_reason` in its JSON output:
 - `copy_button` — the strong signal: a copy control rendered on the new
   assistant message (response is fully streamed).
+- `stable_idle_unscoped_copy_button` — guarded recovery for long responses when
+  scoped assistant text is stable, generation is idle, and a new copy control is
+  visible but cannot be scoped to the latest assistant turn.
 
 There is no generic "stable text" completion fallback for the extension
 transport. If ChatGPT text is visible but final controls have not appeared yet,
-Yoetz keeps waiting and prints the inspect command so the owning agent can
-debug the live tab instead of accepting a partial prefix.
+Yoetz keeps waiting and prints the inspect command unless the long-response
+copy-control recovery above is satisfied.
 
 ### Combined workflow: API + Browser
 

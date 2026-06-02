@@ -769,6 +769,31 @@ test("extractResponse does not use an unscoped transcript copy button when multi
   assert.equal(extraction.has_copy_button, false);
 });
 
+test("extractResponse reports long idle assistant text with an unscoped copy affordance", () => {
+  const longAnswer = "Final Pro review paragraph with concrete evidence.\n".repeat(160);
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const oldMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const oldMarkdown = new FakeElement("div", { class: "markdown prose" }, "Old answer");
+  const oldTurn = new FakeElement("div", { class: "turn-messages" }, "Old answer").append(oldMarker, oldMarkdown);
+  const copy = new FakeElement("button", { "aria-label": "Copy", noLayout: true }, "Copy");
+  const detachedActionRow = new FakeElement("div", { class: "agent-turn" }, "Copy").append(copy);
+  const newMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const newMarkdown = new FakeElement("div", { class: "markdown prose" }, longAnswer);
+  const newTurn = new FakeElement("div", { class: "turn-messages" }, longAnswer).append(newMarker, newMarkdown);
+  const conversation = new FakeElement("main", { role: "main" }, `Review bundle Old answer Copy ${longAnswer}`)
+    .append(user, oldTurn, detachedActionRow, newTurn);
+  const body = new FakeElement("body", {}, `Review bundle Old answer Copy ${longAnswer}`).append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.text, longAnswer.trim());
+  assert.equal(extraction.is_generating, false);
+  assert.equal(extraction.copy_button_count, 1);
+  assert.equal(extraction.has_copy_button, false);
+});
+
 test("extractResponse associates a copy button after the assistant markdown text node", () => {
   const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
   const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
