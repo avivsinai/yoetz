@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.23] - 2026-06-02
 ### Fixed
 
 - The native ChatGPT recipe no longer times out on long ChatGPT Pro "Extended"
@@ -20,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   no-partial-prefix protections are preserved: a still-generating response, or
   one whose only copy control predates the send (e.g. a prior turn in a resumed
   conversation), never completes.
+
 
 ## [0.5.22] - 2026-06-02
 ### Fixed
