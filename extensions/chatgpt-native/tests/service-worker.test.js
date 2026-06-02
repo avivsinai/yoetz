@@ -327,6 +327,77 @@ test("service worker trims a valid conversation id before opening the resume tab
   }
 });
 
+test("service worker fails immediately when send reports the wrong resumed conversation", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/conv-123?_yoetz=run_job_send_drift" }),
+      sendMessage: async (_id, message) => {
+        sentToTabs.push(message.type);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_extract_response":
+            return sent
+              ? { ok: true, payload: { method: "assistant_dom_fallback", text: "wrong answer", is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0, conversation_id: "other" } }
+              : { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1, conversation_id: "conv-123" } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, conversation_id: "other" } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?send_wrong_conversation=${Date.now()}`);
+    port.emit(envelope("job_start", "job_send_drift", {
+      prompt: "resume",
+      conversation_id: "conv-123",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_send_drift", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_send_drift.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.payload?.code === "conversation_changed"
+    ));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.payload.phase, "send");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.requested_conversation_id, "conv-123");
+    assert.equal(error.payload.current_conversation_id, "other");
+    assert.equal(port.messages.some((message) => message.payload?.phase === "prompt_sent"), false);
+    assert.equal(sentToTabs.filter((type) => type === "yoetz_extract_response").length, 1);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker fails unavailable conversations with inspectable terminal error", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

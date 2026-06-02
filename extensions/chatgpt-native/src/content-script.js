@@ -122,6 +122,7 @@ async function sendPrompt(job, prompt) {
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send"));
   const baseline = sendAcceptanceBaseline(document);
   await insertPrompt(document, prompt, { timeoutMs: 20000 });
+  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send"));
   await clickSend(document, { timeoutMs: Number(job.send_timeout_ms) || 120000 });
   let accepted;
   try {

@@ -396,6 +396,7 @@ async function runJobWithFile(job, file) {
     job.submitted_assistant_count = Number.isFinite(Number(sendResult?.submitted_assistant_count))
       ? Number(sendResult.submitted_assistant_count)
       : null;
+    assertSubmittedConversationCurrent(job, sendResult);
     assertJobConnectionCurrent(job);
     if (job.cancelled) return;
     const inspectCommand = inspectCommandForJob(job);
@@ -1677,6 +1678,28 @@ function assertJobConnectionCurrent(job) {
   });
 }
 
+function assertSubmittedConversationCurrent(job, sendResult) {
+  const expectedConversationId = job.expected_conversation_id ?? job.conversation_id;
+  if (!expectedConversationId) {
+    return;
+  }
+  const currentConversationId = sendResult?.conversation_id ?? null;
+  if (currentConversationId === expectedConversationId) {
+    return;
+  }
+  throw commandError(
+    "conversation_changed",
+    `job ${job.job_id} sent in ChatGPT conversation ${currentConversationId ?? "(none)"} instead of ${expectedConversationId}`,
+    {
+      phase: "send",
+      side_effect_started: true,
+      requested_conversation_id: expectedConversationId,
+      current_conversation_id: currentConversationId,
+      current_url: job.submitted_url ?? null
+    }
+  );
+}
+
 function assertJobConversationCurrent(job, extraction) {
   const expectedConversationId = job.expected_conversation_id ?? job.submitted_conversation_id ?? job.conversation_id;
   if (!expectedConversationId || !extraction?.conversation_id) {
@@ -1699,6 +1722,11 @@ function commandError(code, message, detail = {}) {
   }
   if (typeof detail.side_effect_started === "boolean") {
     error.side_effect_started = detail.side_effect_started;
+  }
+  for (const [key, value] of Object.entries(detail)) {
+    if (!(key in error) && value !== undefined) {
+      error[key] = value;
+    }
   }
   return error;
 }

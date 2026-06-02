@@ -83,6 +83,7 @@ export function sendAcceptanceBaseline() {
 
 export async function insertPrompt(_document, prompt, options) {
   hooks.insertPromptCalls.push({ prompt, options });
+  hooks.afterInsertPrompt?.();
 }
 
 export async function clickSend(_document, options) {
@@ -246,6 +247,30 @@ test("content script resume follow-on commands reject conversation drift", async
     assert.equal(response.code, "conversation_changed");
     assert.equal(response.phase, "upload");
     assert.equal(response.side_effect_started, false);
+  } finally {
+    restore();
+  }
+});
+
+test("content script resume send rechecks conversation drift after prompt insertion before clicking send", async () => {
+  const { send, hooks, restore, location } = await loadContentScript("resume_send_drift", "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+  try {
+    const job = resumeJob();
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+    hooks.afterInsertPrompt = () => {
+      location.href = "https://chatgpt.com/c/other?_yoetz=run_resume";
+      location.pathname = "/c/other";
+    };
+
+    const response = await send({ type: "yoetz_send_prompt", job, prompt: "continue" });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "conversation_changed");
+    assert.equal(response.phase, "send");
+    assert.equal(response.side_effect_started, false);
+    assert.equal(hooks.insertPromptCalls.length, 1);
+    assert.equal(hooks.clickSendCalls.length, 0);
   } finally {
     restore();
   }
