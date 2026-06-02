@@ -6,6 +6,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+
+- ChatGPT recipe **conversation resume**: pass `--var conversation=<id|url>` to
+  continue an existing ChatGPT conversation instead of opening a new tab, so
+  prior context carries across follow-up turns. The caller owns the session
+  lifecycle — yoetz does not manage or trim context. Every ChatGPT recipe run
+  now echoes `conversation_id` / `conversation_url`, so a caller can capture the
+  id on one run and resume it on the next. Resume is `chrome-extension-native`
+  only: it fails closed on other transports and disables CDP fallback even with
+  `--allow-cdp-fallback`, opens a new yoetz-owned tab to the specific `/c/<id>`
+  (never reusing an arbitrary open tab), and validates the conversation id both
+  CLI- and extension-side before navigating. Unavailable/archived/no-access
+  conversations, a model selection that cannot confirm Pro Extended on an old
+  chat, and conversation drift all hard-fail with `conversation_unavailable` /
+  `conversation_not_loaded` / `conversation_changed` instead of silently falling
+  back to a fresh chat.
+
+### Fixed
+
+- Cancelling a ChatGPT native-extension job now actually stops generation before
+  closing the tab. Previously cancel clicked stop and immediately removed the
+  tab, so the abort request raced tab teardown and OpenAI kept generating
+  server-side. Cancel now waits for generation to go idle (bounded, with one
+  re-click) before removing the tab, and reports `stop_confirmed` /
+  `generation_idle` / `may_still_be_running` so the outcome is truthful when a
+  stop cannot be confirmed.
 
 ## [0.5.20] - 2026-06-01
 ### Fixed
