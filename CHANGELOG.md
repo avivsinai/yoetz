@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- The native ChatGPT recipe no longer times out on long ChatGPT Pro "Extended"
+  reasoning responses when the full answer is already rendered. The wait loop
+  previously required a copy control scoped to the latest assistant turn, which
+  sometimes never bound for long-reasoning turns, so the recipe kept waiting
+  until timeout even though generation had finished and the answer was present.
+  A guarded recovery now completes such a response when generation is idle, no
+  stop control is visible, the assistant text is long and stable, and a new copy
+  control has appeared since before send — reported as `completion_reason:
+  stable_idle_unscoped_copy_button`. The scoped-copy fast path and the
+  no-partial-prefix protections are preserved: a still-generating response, or
+  one whose only copy control predates the send (e.g. a prior turn in a resumed
+  conversation), never completes.
 
 ## [0.5.22] - 2026-06-02
 ### Fixed
