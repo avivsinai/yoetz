@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- Further hardened ChatGPT conversation resume against tab/conversation drift.
+  The `_yoetz` run marker is now re-verified immediately before claiming tab
+  ownership (not only before loading the conversation), so a marker change
+  during the conversation-load wait fails closed before ownership is marked.
+  `clickSend` now takes the expected conversation id and re-checks it in the
+  same tick as the actual send click, so a conversation change between the
+  ownership assertion and the click fails closed with `side_effect_started:
+  false` and the prompt is never sent to the wrong conversation. Resume-mode
+  model detection is now scoped positively to the live header/composer model
+  switcher instead of merely excluding transcript containers, so a stale model
+  chip rendered inside the conversation transcript can no longer be mistaken for
+  the current model; an unfound live control fails closed to `unavailable`.
 
 ## [0.5.21] - 2026-06-02
 ### Added
