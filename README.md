@@ -5,94 +5,64 @@
 </p>
 
 [![CI](https://github.com/avivsinai/yoetz/actions/workflows/ci.yml/badge.svg)](https://github.com/avivsinai/yoetz/actions/workflows/ci.yml)
+[![Latest Release](https://img.shields.io/github/v/release/avivsinai/yoetz)](https://github.com/avivsinai/yoetz/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 
-Fast, CLI-first LLM council + bundler + multimodal gateway for coding agents.
+Fast CLI for routing code and media work through the right LLM path: direct API
+calls when available, multi-model councils when you need agreement, and browser
+recipes for web-only models such as ChatGPT Pro.
 
-> **Note**: This project is under active development. APIs may change.
+Yoetz is built for coding agents and terminal workflows: gitignore-aware
+bundles, structured JSON output, reproducible session artifacts, live model
+resolution, local budget checks, and multimodal inputs across OpenAI,
+OpenRouter, Gemini, and LiteLLM-compatible backends.
 
-## Why yoetz?
+> Yoetz is under active development. Command behavior may change before 1.0.
 
-Most LLM CLI tools focus on a single provider or a single workflow. yoetz is different:
+## What It Does
 
-- **Multi-model council** — get consensus from multiple LLMs in one command, not sequential copy-paste between tabs
-- **Multimodal native** — text, images, and video as first-class inputs across providers
-- **Agent-first design** — structured JSON output, local budget tracking for ask/council/review, and agent skill integration out of the box
-- **Zero lock-in** — one config, any provider (OpenRouter, OpenAI, Gemini, LiteLLM), switch with a flag
-- **Bundle-aware** — package your codebase with gitignore-awareness for maximum LLM context
+- **Bundle** repository context into prompt-ready artifacts without fighting
+  `.gitignore`.
+- **Ask** one model with text, code, images, or video.
+- **Council** multiple models in parallel when you want independent opinions.
+- **Review** staged diffs or files with agent-readable output.
+- **Generate** images and video through providers that expose generation APIs.
+- **Use browser recipes** for web-only model surfaces while keeping terminal
+  output parseable.
 
-## Table of Contents
+## Install
 
-- [Why yoetz?](#why-yoetz)
-- [Features](#features)
-- [Installation](#installation)
-- [Quick Start](#quick-start)
-- [Architecture](#architecture)
-- [Supported Providers](#supported-providers)
-- [Environment Variables](#environment-variables)
-- [MSRV Policy](#msrv-policy)
-- [Contributing](#contributing)
-- [Verifying Downloads](#verifying-downloads)
-- [License](#license)
-
-## Features
-
-- **Bundle**: Package code files with gitignore-awareness for LLM context
-- **Ask**: Query LLMs with text, images, or video
-- **Council**: Multi-model consensus with configurable voting
-- **Review**: AI-powered code review for diffs and files
-- **Generate**: Create images (OpenAI) and videos (Sora, Veo)
-- **Browser**: Fallback to web UIs via recipes
-
-## Installation
-
-### Homebrew (macOS / Linux)
+### Homebrew
 
 ```bash
 brew install avivsinai/tap/yoetz
+yoetz --version
 ```
 
-### Scoop (Windows)
+### Scoop
 
 ```powershell
 scoop bucket add avivsinai https://github.com/avivsinai/scoop-bucket
 scoop install yoetz
+yoetz --version
 ```
 
-### Pre-built Binaries
+### Prebuilt Binaries
 
-Download the latest release from [GitHub Releases](https://github.com/avivsinai/yoetz/releases).
+Download archives and checksums from the
+[latest GitHub release](https://github.com/avivsinai/yoetz/releases/latest).
 
 ```bash
-# macOS (Apple Silicon)
 curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-aarch64-apple-darwin.tar.gz
 curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
 shasum -a 256 -c SHA256SUMS.txt --ignore-missing
 tar xzf yoetz-aarch64-apple-darwin.tar.gz
 sudo mv yoetz /usr/local/bin/
-
-# macOS (Intel)
-curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-x86_64-apple-darwin.tar.gz
-curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
-shasum -a 256 -c SHA256SUMS.txt --ignore-missing
-tar xzf yoetz-x86_64-apple-darwin.tar.gz
-sudo mv yoetz /usr/local/bin/
-
-# Linux (x86_64)
-curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-x86_64-unknown-linux-gnu.tar.gz
-curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
-sha256sum -c SHA256SUMS.txt --ignore-missing
-tar xzf yoetz-x86_64-unknown-linux-gnu.tar.gz
-sudo mv yoetz /usr/local/bin/
-
-# Linux (ARM64)
-curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-aarch64-unknown-linux-gnu.tar.gz
-curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
-sha256sum -c SHA256SUMS.txt --ignore-missing
-tar xzf yoetz-aarch64-unknown-linux-gnu.tar.gz
-sudo mv yoetz /usr/local/bin/
 ```
+
+Release archives are published for macOS, Linux, and Windows targets. Use
+`sha256sum` instead of `shasum -a 256` on Linux.
 
 ### From Source
 
@@ -100,341 +70,303 @@ sudo mv yoetz /usr/local/bin/
 cargo install --git https://github.com/avivsinai/yoetz --locked
 ```
 
-### Build Locally
+## Agent Skills
+
+Yoetz also ships an agent skill so Claude Code, Codex CLI, and compatible agent
+runtimes know how to call the CLI safely: resolve live model IDs, keep stdout
+parseable, bundle large context first, and use browser recipes intentionally.
+
+### Codex / Claude Plugin Marketplace
+
+```text
+/plugin marketplace add avivsinai/skills-marketplace
+/plugin install yoetz@avivsinai-marketplace
+```
+
+### skills.sh
+
+```bash
+npx skills add avivsinai/yoetz
+```
+
+### skild.sh
+
+```bash
+npx skild install @avivsinai/yoetz
+```
+
+The skill source lives at [skills/yoetz/SKILL.md](skills/yoetz/SKILL.md) and is
+versioned with the CLI release metadata.
+
+## First Run
+
+Start with a command that needs no API key:
+
+```bash
+yoetz bundle -p "Summarize this project" -f README.md --format json
+```
+
+Then configure at least one provider. Environment variables are enough for most
+users:
+
+```bash
+export OPENROUTER_API_KEY=...
+export OPENAI_API_KEY=...
+export GEMINI_API_KEY=...
+```
+
+For persistent configuration:
+
+```bash
+mkdir -p ~/.config/yoetz
+cat > ~/.config/yoetz/config.toml <<'EOF'
+[defaults]
+provider = "openrouter"
+# Optional after resolving a current model ID:
+# model = "<id from yoetz models resolve>"
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+kind = "openai-compatible"
+EOF
+```
+
+From a source checkout, you can start from the full example instead:
+
+```bash
+cp docs/config.example.toml ~/.config/yoetz/config.toml
+```
+
+Yoetz also supports `YOETZ_CONFIG_PATH`, repo-local `./yoetz.toml`, and config
+profiles. See [docs/config.example.toml](docs/config.example.toml) for the
+shape.
+
+Resolve live model IDs before putting them in scripts:
+
+```bash
+yoetz models sync
+yoetz models frontier --format json
+yoetz models frontier --family anthropic --format json
+```
+
+## Common Workflows
+
+### Ask With File Context
+
+```bash
+MODEL_ID=$(yoetz models frontier --family openai --format json | jq -r '.[0].model.id')
+yoetz ask \
+  -p "Explain the error handling tradeoffs in this file" \
+  -f crates/yoetz-cli/src/main.rs \
+  --provider openrouter \
+  --model "$MODEL_ID" \
+  --format json
+```
+
+### Review A Diff
+
+```bash
+yoetz review diff --staged --format json
+yoetz review file --path crates/yoetz-core/src/bundle.rs --format json
+```
+
+### Run A Council
+
+```bash
+OPENAI_MODEL=$(yoetz models frontier --family openai --format json | jq -r '.[0].model.id')
+GEMINI_MODEL=$(yoetz models frontier --family gemini --format json | jq -r '.[0].model.id')
+XAI_MODEL=$(yoetz models frontier --family xai --format json | jq -r '.[0].model.id')
+
+yoetz council \
+  -p "Which API shape is safer for agents?" \
+  -f crates/yoetz-core/src/types.rs \
+  --models "$OPENAI_MODEL,$GEMINI_MODEL,$XAI_MODEL" \
+  --format json
+```
+
+`--models` is explicit on purpose. Pick current IDs from `yoetz models frontier`
+or `yoetz models resolve`, and pass the returned IDs verbatim. Avoid using
+stale provider names or hand-written wrapper paths.
+
+### Bundle For Another Tool
+
+```bash
+yoetz bundle \
+  -p "Review the browser transport design" \
+  -f "crates/yoetz-cli/src/browser*.rs" \
+  -f recipes/chatgpt.yaml \
+  --format json
+```
+
+The JSON response points to session artifacts under `~/.yoetz/sessions/<id>/`,
+including `bundle.md`.
+
+### Multimodal Input
+
+```bash
+MODEL_ID=$(yoetz models resolve "gemini" --format json | jq -r '.[0].id')
+yoetz ask -p "Describe this diagram" --image diagram.png --provider gemini --model "$MODEL_ID" --format json
+yoetz ask -p "Summarize this clip" --video demo.mp4 --provider gemini --model "$MODEL_ID" --format json
+```
+
+Use `--image-mime` or `--video-mime` for signed URLs or extensionless files.
+
+### Generate Media
+
+```bash
+IMAGE_MODEL_ID=$(yoetz models list -s image --format json | jq -r '.models[] | .id | select(startswith("gemini/")) | sub("^gemini/"; "")' | head -1)
+yoetz generate image \
+  -p "A clean product diagram of a terminal-first LLM router" \
+  --provider gemini \
+  --model "$IMAGE_MODEL_ID" \
+  --format json
+
+VIDEO_MODEL_ID=$(yoetz models list -s veo --format json | jq -r '.models[] | .id | select(startswith("gemini/")) | sub("^gemini/"; "")' | head -1)
+yoetz generate video \
+  -p "A short UI walkthrough" \
+  --provider gemini \
+  --model "$VIDEO_MODEL_ID" \
+  --format json
+```
+
+Generation still requires a provider-specific `--provider` plus a model that
+that provider accepts. List or resolve live models before pinning a script.
+
+## Agent Usage
+
+Yoetz is designed to be called by agents and scripts.
+
+```bash
+export YOETZ_AGENT=1
+yoetz ask -p "Return JSON only" -f src/lib.rs --format json --output-final /tmp/yoetz-result.json
+```
+
+Useful agent-facing guarantees:
+
+- `--format json` keeps stdout parseable.
+- `--response-format json` and `--response-schema` request model-side
+  structured output; `--format json` only controls the Yoetz CLI envelope.
+- Progress and diagnostics use stderr where possible.
+- `--output-final` writes the final response to a stable path.
+- `ask`, `bundle`, `council`, and `review` create replayable session artifacts.
+- Budget flags such as `--max-cost-usd` and `--daily-budget-usd` are local
+  preflight/accounting aids, not provider-side hard limits.
+
+Agent skill installation options are listed in [Agent Skills](#agent-skills).
+
+## Browser Recipes And ChatGPT Pro
+
+Browser recipes let Yoetz use web-only model surfaces from the terminal. The
+built-in ChatGPT recipe targets ChatGPT Pro with Extended enabled and is
+fail-closed: if Yoetz cannot prove the requested surface is available, it stops
+instead of silently downgrading.
+
+```bash
+yoetz browser check --format json
+yoetz browser recipe --recipe chatgpt --bundle ~/.yoetz/sessions/<id>/bundle.md --format json
+```
+
+The default browser stack is extension-free unless the ChatGPT native extension
+is installed and connected. When connected, the ChatGPT recipe selects
+`chrome-extension-native` as the only default transport. Use an explicit
+`--transport <name>` when you want a different browser transport.
+
+Native extension happy path:
+
+```bash
+yoetz browser extension setup --chatgpt --open-chrome
+yoetz browser extension doctor --chatgpt
+yoetz browser extension status --chatgpt --format json
+yoetz browser check --transport chrome-extension-native --format json
+yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md --format json
+```
+
+The native-host extension transport is currently macOS/Linux-only. Windows CLI
+and Scoop installs work for the API-backed Yoetz flows, but
+`chrome-extension-native` setup fails closed until Windows native messaging host
+registration is implemented.
+
+For multiple loaded Chrome profiles, select the connected bridge with
+`--var extension_instance_id=<id>` from `yoetz browser extension status
+--chatgpt`, or opt into `profile_email` routing with `yoetz browser extension
+grant-identity --chatgpt`.
+
+The detailed browser transport model lives in [ARCHITECTURE.md](ARCHITECTURE.md).
+
+## Provider Support
+
+Capabilities vary by model and provider. Use `yoetz models frontier`,
+`yoetz models list`, and `yoetz models resolve` against the live registry before
+pinning examples.
+
+| Provider | Text | Vision | Image Gen | Video Gen | Video Understanding |
+| --- | --- | --- | --- | --- | --- |
+| OpenRouter | Yes | Model-dependent | No | No | No |
+| OpenAI | Yes | Yes | Yes | Yes (Sora) | No |
+| Gemini | Yes | Yes | No | Yes (Veo) | Yes |
+| LiteLLM-compatible | Yes | Model-dependent | No | No | No |
+
+Anthropic and xAI models are commonly reached through OpenRouter, but can also
+be configured as direct providers when you need provider-specific routing.
+
+Common API key variables:
+
+| Variable | Used for |
+| --- | --- |
+| `OPENROUTER_API_KEY` | OpenRouter |
+| `OPENAI_API_KEY` | OpenAI |
+| `GEMINI_API_KEY` | Gemini |
+| `ANTHROPIC_API_KEY` | Direct Anthropic-compatible provider configs |
+| `XAI_API_KEY` | Direct xAI/OpenAI-compatible provider configs |
+| `LITELLM_API_KEY` | LiteLLM proxy |
+
+## Safety And Trust
+
+Bundles are prompt-input artifacts, not trusted control channels. Treat bundled
+repository content, issues, logs, and pasted browser output as untrusted input.
+Keep intent in explicit CLI flags and the user prompt, avoid bundling secrets,
+and review generated changes before applying them.
+
+Project trust signals:
+
+- CI covers Rust tests, formatting, linting, dependency policy, secret scanning,
+  MSRV, extension script tests, and browser smoke checks.
+- Release archives ship with `SHA256SUMS.txt`.
+- Security policy: [SECURITY.md](SECURITY.md).
+- Code of conduct: [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
+## Development
 
 ```bash
 git clone https://github.com/avivsinai/yoetz.git
 cd yoetz
-cargo build --release
+cargo build
+cargo test
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-### Agent Skill (Claude Code / Codex CLI)
+Optional browser-extension checks:
 
 ```bash
-# Via skills marketplace
-/plugin marketplace add avivsinai/skills-marketplace
-/plugin install yoetz@avivsinai-marketplace
-
-# Via skills.sh
-npx skills add avivsinai/yoetz
-
-# Via skild.sh
-npx skild install @avivsinai/yoetz
+./scripts/build-chatgpt-native-extension.sh --check
+node --test extensions/chatgpt-native/tests/*.test.js
 ```
 
-## Quick Start
+The Rust workspace has two crates:
 
-### Configuration
+- `crates/yoetz-core`: pure core types, bundling, config, registry, sessions.
+- `crates/yoetz-cli`: async CLI, providers, browser transports, budgets.
 
-Create `~/.config/yoetz/config.toml`:
+See [ARCHITECTURE.md](ARCHITECTURE.md) and [CONTRIBUTING.md](CONTRIBUTING.md)
+for design and contribution details.
 
-```bash
-mkdir -p ~/.config/yoetz
-cp docs/config.example.toml ~/.config/yoetz/config.toml
-```
+## Release Model
 
-Yoetz also loads the legacy `~/.yoetz/config.toml`, profiles under those config
-directories, repo-local `./yoetz.toml` with untrusted-provider safeguards, and
-`YOETZ_CONFIG_PATH` when set.
-
-### Basic Usage
-
-```bash
-# Bundle files for LLM context
-yoetz bundle --prompt "Review this code" --files "src/**/*.rs"
-```
-
-Bundles are trust boundaries: treat bundled repository content, issues, logs,
-and pasted browser output as untrusted prompt input. Keep instructions in
-`--prompt`, avoid bundling secrets, and review generated changes before applying
-them.
-
-```bash
-# Ask a question
-yoetz ask --prompt "Explain this function" --files "src/main.rs"
-
-# Ask with structured JSON output (OpenAI-compatible)
-yoetz ask --prompt "Return JSON only" --provider openai --model gpt-5.2 --response-format json
-
-# Ask with an image (vision)
-yoetz ask --prompt "Describe this diagram" --image diagram.png --provider gemini --model gemini-3-flash-preview
-
-# Override MIME type for signed/extensionless URLs
-yoetz ask --prompt "Describe this" --image https://example.com/signed --image-mime image/png
-
-# Ask about a video
-yoetz ask --prompt "Summarize this" --video meeting.mp4 --provider gemini --model gemini-3-flash-preview
-
-# Override video MIME type for signed/extensionless URLs
-yoetz ask --prompt "Summarize this" --video https://example.com/signed --video-mime video/mp4
-```
-
-> Note: Gemini can return empty content if `--max-output-tokens` is too low because tokens are consumed by thoughts. If you see warnings or empty output, increase the limit.
-
-```bash
-# Debug raw provider responses
-yoetz --debug ask --provider gemini --model gemini-3-flash-preview --prompt "ping"
-
-# Resolve live model IDs before putting them in scripts
-yoetz models frontier --format json
-
-# Multi-model council
-yoetz council --prompt "Review this PR" --models "openai/<model-id>,openrouter/anthropic/claude-sonnet-4.5"
-
-# Code review
-yoetz review diff --model openai/gpt-5.2-codex
-yoetz review file --path src/lib.rs --provider openrouter --model anthropic/claude-sonnet-4.5
-```
-
-Council calls require explicit model IDs and cost roughly scales with every
-selected model. Budget flags are local preflight/accounting aids for
-ask/council/review, not provider-side hard limits; verify current model IDs and
-provider capabilities before relying on examples.
-
-### Generation
-
-```bash
-# Generate images
-yoetz generate image --prompt "A cozy cabin in snow" --provider openai --model gpt-image-1.5
-
-# Generate video (Sora)
-yoetz generate video --prompt "Drone flyover" --provider openai --model sora-2-pro
-
-# Generate video (Veo)
-yoetz generate video --prompt "Ocean waves" --provider gemini --model veo-3.1-generate-preview
-```
-
-### Browser Fallback
-
-```bash
-# Direct browser command
-yoetz browser exec -- open https://chatgpt.com/
-
-# Use a recipe
-yoetz browser recipe --recipe recipes/chatgpt.yaml --bundle bundle.md
-
-# JSON output aggregates steps
-yoetz --format json browser recipe --recipe recipes/chatgpt.yaml --bundle bundle.md
-```
-
-The default browser stack remains extension-free unless the ChatGPT native
-extension is installed and connected. Without a connected extension, ChatGPT
-recipes use `chrome-devtools-mcp`, then `dev-browser`, then `agent-browser` /
-cookie fallbacks as needed. With a connected extension, the built-in ChatGPT
-recipe auto-selects `chrome-extension-native` as the only default transport and
-fails closed instead of falling through to CDP/dev-browser transports. Pass
-`--transport <other>` to opt out, or
-`--transport chrome-extension-native --allow-cdp-fallback` to explicitly permit
-CDP fallback after a native-extension failure. This native-host path is currently
-macOS/Linux-only; Windows CLI artifacts still ship, but Windows native-host
-registration is not implemented yet.
-
-```bash
-yoetz browser extension setup --chatgpt --open-chrome
-yoetz browser extension install-host --chatgpt
-yoetz browser extension doctor --chatgpt
-yoetz browser extension status --chatgpt
-yoetz browser extension reconnect --chatgpt
-yoetz browser extension reload --chatgpt
-yoetz browser extension update --chatgpt
-yoetz browser extension canary --chatgpt
-yoetz browser extension inspect --chatgpt --run-id <run-id>
-yoetz browser extension grant-identity --chatgpt
-yoetz browser check --transport chrome-extension-native
-
-yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md
-yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md --var profile_email=user@example.com
-yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md --var extension_instance_id=ext_...
-```
-
-For the extension transport, every loaded Chrome profile publishes a separate
-native bridge instance. With exactly one connected instance, Yoetz uses it. With
-multiple connected instances, pass `--var profile_email=<email>` or
-`--var extension_instance_id=<id>` from `status --chatgpt` so Yoetz can route to
-the matching Chrome profile; otherwise it fails closed rather than guessing. If
-Chrome does not expose the profile email to the extension, an explicit
-`profile_email` request also fails closed, but the stable
-`extension_instance_id` selector still works. These selectors identify the
-Chrome extension/profile instance, not the ChatGPT account or Enterprise
-workspace. To use `profile_email`, first opt in with
-`yoetz browser extension grant-identity --chatgpt`; exact
-`browser_context_id` targeting remains CDP-only.
-
-Release builds publish the ChatGPT native extension as a separate versioned zip
-artifact alongside the CLI archives, and Homebrew installs ship that extension
-under `share/yoetz/extensions/chatgpt-native`. `setup --chatgpt` copies the
-packaged source into the stable Yoetz-owned directory
-`$YOETZ_DIR/chatgpt-native-extension` (normally
-`~/.yoetz/chatgpt-native-extension`). Load that directory once from
-`chrome://extensions` with Developer mode enabled. Future updates use
-`yoetz browser extension update --chatgpt`: Yoetz refreshes the managed copy,
-also refreshes the legacy `$YOETZ_DIR/chrome-extension-native/unpacked` loaded
-directory when it exists, asks the loaded extension to reload, and verifies that
-Chrome reports the current CLI version.
-
-For agent-driven setup, `yoetz browser extension setup --chatgpt --open-chrome`
-does everything Chrome allows from the CLI: it installs or updates the native
-host, refreshes the managed unpacked extension directory, opens
-`chrome://extensions`, and prints the exact folder to select. Chrome still
-requires the explicit **Load unpacked** UI step for local unpacked extensions.
-If the extension directory is not discoverable from the current checkout or
-installation, set `YOETZ_CHATGPT_NATIVE_EXTENSION_DIR` to the extracted
-extension directory and rerun `setup`.
-
-For normal Google Chrome profiles, `install-host` writes the Native Messaging
-host manifest to Chrome's default user path. If Chrome is launched with a custom
-`--user-data-dir`, or if you are using Chrome for Testing or Chromium, set
-`YOETZ_CHROME_NATIVE_MESSAGING_DIR` to that browser user-data directory's
-`NativeMessagingHosts` folder before running `install-host`. On Windows this
-transport fails closed until registry-based native-host setup is added.
-Use `yoetz browser check --transport chrome-extension-native` to verify the
-installed extension bridge without exercising CDP or triggering Chrome's remote
-debugging approval dialog. Use `yoetz browser extension canary --chatgpt --live`
-only when you intentionally want to submit a tiny live ChatGPT probe.
-
-### DX: ChatGPT Pro autonomous review via the extension transport
-
-The transport drives upload → send → wait → extract reliably, but ChatGPT
-Pro's file analyzer can still stall or return truncated answers on large
-real-review attachments. This is not a stable token ceiling: in live testing,
-large review bundles around 60k and 220k effective tokens failed, while tiny
-sentinel canaries succeeded. For autonomous code review, prefer focused
-per-directory slices over a single large bundle, and raise `wait_timeout_ms`
-for jobs that are expected to spend a long time in ChatGPT file analysis.
-Yoetz fails terminally with privacy-scoped diagnostics (`response_timeout`,
-extraction method/status, assistant-turn counts, and bounded scoped snippets)
-rather than returning partial or thought-only chrome as success.
-
-Real ChatGPT Pro review jobs can run for 15-20 minutes while file analysis
-runs. That is expected. The native-extension transport emits low-noise lifecycle
-and `waiting_response` progress to stderr, including in `--format json` mode so
-stdout stays parseable. The recipe response poll default is 30 minutes; agents
-should keep the original process attached, write the response with
-`--output-final`, and avoid launching a duplicate run just because progress is
-sparse. Use `--var wait_timeout_ms=2400000` only for slices that are expected to
-exceed the default. If a terminal upload/send/wait error is reported, inspect
-the marked tab with
-`yoetz browser extension inspect --chatgpt --run-id <run-id>` before deciding
-whether an intentional rerun is safe.
-
-The recipe never auto-falls-back to another transport once a side effect has
-landed in the user's tab. If the run fails after upload/send, the error
-includes a manual recovery hint (`window.name` marker, `_yoetz` URL marker,
-extension marker prefix) so an agent can decide whether to reuse the tab or
-abort. Pass `--transport chrome-extension-native --allow-cdp-fallback` only if
-you understand that this explicitly permits a second submission via CDP.
-
-The built-in ChatGPT recipe supports exactly one target: ChatGPT Pro with
-Extended enabled. `model` and `extended` recipe overrides are rejected. This is
-deliberate for review jobs where a silent tier downgrade is worse than a clear
-"Pro Extended unavailable" error. The selector covers both ChatGPT Enterprise
-and personal ChatGPT picker layouts; it must prove Pro Extended is selected in
-the active account UI before upload/send, otherwise the run fails closed.
-
-If the next ChatGPT run after an unexplained failure should inspect the
-Yoetz-owned tab without resubmitting, use
-`yoetz browser extension inspect --chatgpt --run-id <id>` to read the live
-extraction, conversation id, and privacy-scoped diagnostics through the
-extension bridge. Inspection is read-only, omits broad page text by default,
-and never restarts the run.
-
-If inspection shows `response_extraction_failed` and the owned tab also contains
-only a tiny/truncated assistant fragment, treat it as a bad ChatGPT answer and
-rerun intentionally with a smaller bundle or a more explicit prompt. If the tab
-visibly contains the full answer, preserve the tab and report the extraction
-miss instead of rerunning blindly.
-
-## Architecture
-
-See [ARCHITECTURE.md](ARCHITECTURE.md) for design details.
-
-```
-yoetz/
-├── crates/
-│   ├── yoetz-core/       # Core library
-│   │   ├── bundle.rs     # File bundling with gitignore
-│   │   ├── config.rs     # TOML config loading + profiles
-│   │   ├── media.rs      # Media types for multimodal
-│   │   ├── output.rs     # JSON/JSONL formatting
-│   │   ├── paths.rs      # Home/XDG path helpers
-│   │   ├── registry.rs   # Model registry types
-│   │   ├── session.rs    # Session storage
-│   │   └── types.rs      # Shared types
-│   └── yoetz-cli/        # CLI binary
-│       ├── main.rs       # Command handlers
-│       ├── commands/     # ask, bundle, council, generate, models, pricing, review
-│       ├── providers/    # Provider-specific helpers not covered by litellm-rust
-│       ├── browser.rs    # Browser recipe orchestration
-│       ├── browser_extension_native.rs
-│       ├── chatgpt_recipe.rs
-│       ├── chatgpt_web.rs
-│       ├── chrome_devtools_mcp/
-│       ├── dev_browser.rs
-│       ├── live_attach.rs
-│       ├── live_cdp_daemon.rs
-│       ├── registry.rs   # Runtime model registry
-│       └── budget.rs     # Daily spend tracking
-├── recipes/              # Browser automation YAML
-└── docs/                 # Config examples and design decisions
-```
-
-## Supported Providers
-
-| Provider | Text | Vision | Image Gen | Video Gen | Video Understanding |
-|----------|------|--------|-----------|-----------|---------------------|
-| OpenRouter | Yes | via model | - | - | - |
-| OpenAI | Yes | Yes | Yes | Yes (Sora) | - |
-| Gemini | Yes | Yes | - | Yes (Veo) | Yes |
-| LiteLLM | Yes | via model | - | - | - |
-
-## Environment Variables
-
-| Variable | Description |
-|----------|-------------|
-| `OPENROUTER_API_KEY` | OpenRouter API key |
-| `OPENAI_API_KEY` | OpenAI API key |
-| `GEMINI_API_KEY` | Google Gemini API key |
-| `ANTHROPIC_API_KEY` | Anthropic API key for direct Anthropic provider configs |
-| `XAI_API_KEY` | xAI API key for direct xAI/OpenAI-compatible provider configs |
-| `LITELLM_API_KEY` | LiteLLM proxy key |
-| `YOETZ_CONFIG_PATH` | Custom config path |
-| `YOETZ_AGENT=1` | Default command output to JSON for agent parsing |
-| `YOETZ_BROWSER_CDP` | CDP endpoint for browser attach/check/recipe commands |
-| `YOETZ_BROWSER_PROFILE` | Browser profile name used by browser flows |
-| `YOETZ_BROWSER_TARGET_PATH` | Browser target metadata path for live attach |
-| `YOETZ_AGENT_BROWSER_BIN` | Override `agent-browser` executable |
-| `YOETZ_DEV_BROWSER_BIN` | Override `dev-browser` executable |
-| `YOETZ_CHROME_NATIVE_MESSAGING_DIR` | Native Messaging host directory for custom Chrome/Chromium profiles |
-| `YOETZ_REGISTRY_PATH` | Override local model registry cache path |
-| `YOETZ_BUDGET_PATH` | Override local budget ledger path |
-
-## MSRV Policy
-
-The minimum supported Rust version is **1.88**. MSRV is tested in CI and bumped only with minor releases.
-
-## Contributing
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
-
-## Verifying Downloads
-
-Verify archive checksums before extracting or moving binaries into `PATH`:
-
-```bash
-# Download the archive and checksums file
-curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/yoetz-aarch64-apple-darwin.tar.gz
-curl -fLO https://github.com/avivsinai/yoetz/releases/latest/download/SHA256SUMS.txt
-
-# Verify the downloaded archive (macOS)
-shasum -a 256 -c SHA256SUMS.txt --ignore-missing
-
-# Verify the downloaded archive (Linux)
-sha256sum -c SHA256SUMS.txt --ignore-missing
-
-# Then extract and install
-tar xzf yoetz-aarch64-apple-darwin.tar.gz
-sudo mv yoetz /usr/local/bin/
-```
+Releases are cut from `main` through `./scripts/release.sh X.Y.Z` and the
+resulting release PR. The merged release commit drives the tag, GitHub release
+artifacts, Homebrew formula, Scoop manifest, and agent skill publication.
 
 ## License
 
