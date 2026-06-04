@@ -23,8 +23,11 @@ impl std::fmt::Display for ModelTier {
 
 /// Output modality / task kind of a model. Used to keep non-chat models
 /// (image generation, video, audio, embeddings, …) out of frontier chat picks.
-/// Fail-open: an unknown or unset kind is treated as chat-eligible so a new
-/// chat-like model is never silently dropped.
+/// An *unknown* kind (a serialized variant this build does not recognize) is
+/// fail-open / chat-eligible so a new chat-like mode is never silently dropped.
+/// An *unset* kind (no capability data at all — the common case) is instead
+/// resolved structurally via [`ModelEntry::looks_like_chat_completion`], since
+/// failing fully open there would let media/embedding models win frontier picks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelKind {
@@ -175,6 +178,23 @@ impl ModelEntry {
     pub fn family(&self) -> &str {
         self.id.split('/').next().unwrap_or(&self.id)
     }
+
+    /// Structural proxy for chat/completion eligibility, used when an explicit
+    /// [`ModelKind`] is absent (the common case — most catalog entries, both
+    /// live and embedded, do not carry a `kind`). A chat/completion model
+    /// advertises a max output-token budget *or* charges for generated
+    /// (completion) tokens. Media generators (imagen, veo) and search endpoints
+    /// (`*_pse/search`) have neither, and — importantly — neither do embedding
+    /// models: an embedding has input (`prompt_per_1k`) pricing but no output
+    /// budget and `completion_per_1k == 0.0`, so input pricing alone is *not* a
+    /// chat signal. Relying on `kind` alone is not enough: when it is unset,
+    /// failing fully open would let a media or embedding model win a family's
+    /// frontier pick on the version signal. This keeps a genuinely new chat
+    /// model eligible (it has an output budget or output pricing) while
+    /// excluding media/search/embedding models.
+    pub fn looks_like_chat_completion(&self) -> bool {
+        self.max_output_tokens.is_some() || self.pricing.completion_per_1k.is_some_and(|c| c > 0.0)
+    }
 }
 
 /// In-memory model registry with pricing and capability data.
@@ -232,8 +252,12 @@ impl ModelRegistry {
     }
 
     /// Infer tier for each model based on pricing and name patterns.
-    /// Name patterns define Mini/Preview/explicit Flagship labels; pricing only
-    /// promotes Standard models to Flagship within a family.
+    /// Name patterns define Mini/Preview/explicit Flagship labels; pricing then
+    /// promotes the family's most expensive non-reasoning Standard *or Preview*
+    /// model to Flagship. Promoting Preview matters because a frontier model
+    /// often ships under a `-preview` label while still being the family's
+    /// flagship (e.g. `gemini-3-pro-preview`); without this it would lose the
+    /// frontier tiebreak to a cheaper Standard model such as an open `gemma`.
     pub fn infer_tiers(&mut self) {
         // Group models by family
         let mut families: HashMap<String, Vec<usize>> = HashMap::new();
@@ -255,35 +279,50 @@ impl ModelRegistry {
                 self.models[idx].tier = Some(tier);
             }
 
-            // If we have pricing data, use it to refine:
-            // within the family, the most expensive Standard model can be promoted
-            // to Flagship. We never demote a model to Mini based on relative price.
-            let mut priced: Vec<(usize, f64)> = indices
+            // Refine tiers by price: promote the family's most expensive
+            // "serious" model to Flagship. "Serious" excludes Mini (a cheap
+            // flash/image mini must not own the family's top price and block the
+            // real flagship) and reasoning models (priced high for thinking, not
+            // general capability). Name-Flagships stay in the set so they count
+            // toward the top price but need no promotion. Preview is promotable
+            // because a flagship frequently ships under a `-preview` label
+            // (e.g. gemini-3-pro-preview); otherwise it loses the frontier
+            // tiebreak to a cheaper Standard model such as an open `gemma`. We
+            // never demote a model to Mini based on price.
+            let serious_priced: Vec<(usize, f64)> = indices
                 .iter()
-                .filter_map(|&idx| self.models[idx].pricing.completion_per_1k.map(|p| (idx, p)))
+                .filter_map(|&idx| {
+                    let model = &self.models[idx];
+                    let tier = model.tier.unwrap_or(ModelTier::Standard);
+                    let serious = tier != ModelTier::Mini && !is_reasoning_model(&model.id);
+                    serious
+                        .then(|| model.pricing.completion_per_1k.map(|p| (idx, p)))
+                        .flatten()
+                })
                 .collect();
 
-            if priced.len() >= 2 {
-                priced.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-                // Exclude reasoning models from price-based promotion (they're expensive
-                // due to thinking tokens, not because they're general-purpose flagships)
-                let non_reasoning_priced: Vec<(usize, f64)> = priced
+            if serious_priced.len() >= 2 {
+                let max_price = serious_priced
                     .iter()
-                    .filter(|&&(idx, _)| !is_reasoning_model(&self.models[idx].id))
-                    .copied()
-                    .collect();
+                    .map(|&(_, p)| p)
+                    .fold(f64::MIN, f64::max);
+                let min_price = serious_priced
+                    .iter()
+                    .map(|&(_, p)| p)
+                    .fold(f64::MAX, f64::min);
 
-                if non_reasoning_priced.len() >= 2 {
-                    let max_price = non_reasoning_priced[0].1;
-                    let min_price = non_reasoning_priced.last().unwrap().1;
-
-                    if max_price > min_price {
-                        for &(idx, price) in &non_reasoning_priced {
-                            let name_tier = self.models[idx].tier.unwrap_or(ModelTier::Standard);
-                            if name_tier == ModelTier::Standard && price == max_price {
-                                self.models[idx].tier = Some(ModelTier::Flagship);
-                            }
+                // Only promote when price actually distinguishes a top model; if
+                // every serious model costs the same we cannot single one out, so
+                // leave the name-based tiers untouched. Promote only Standard or
+                // Preview models at the top price — a flagship frequently ships
+                // as `-preview`; a name-Flagship is already where it should be.
+                if max_price > min_price {
+                    for &(idx, price) in &serious_priced {
+                        let tier = self.models[idx].tier.unwrap_or(ModelTier::Standard);
+                        if price == max_price
+                            && matches!(tier, ModelTier::Standard | ModelTier::Preview)
+                        {
+                            self.models[idx].tier = Some(ModelTier::Flagship);
                         }
                     }
                 }
@@ -313,13 +352,17 @@ impl ModelRegistry {
             }
             // Skip non-chat models (image generation, video, audio, embeddings, …):
             // a family frontier query must return the chat/multimodal flagship,
-            // not a media generator. Fail-open — an unknown/unset kind stays
-            // eligible so a new chat-like model is never silently dropped.
-            let chat_eligible = model
-                .capability
-                .as_ref()
-                .and_then(|cap| cap.kind)
-                .is_none_or(ModelKind::is_chat_eligible);
+            // not a media generator. When a model carries an explicit kind we
+            // trust it; when it does not (the common case — `kind` is almost
+            // always unset in the live/embedded registry), fall back to a
+            // structural proxy instead of failing fully open, otherwise an
+            // image/video generator (e.g. imagen-4.0 > gemini-3 on version)
+            // silently wins the family. A genuinely new chat model still passes
+            // the proxy because it carries pricing or an output-token budget.
+            let chat_eligible = match model.capability.as_ref().and_then(|cap| cap.kind) {
+                Some(kind) => kind.is_chat_eligible(),
+                None => model.looks_like_chat_completion(),
+            };
             if !chat_eligible {
                 continue;
             }
@@ -745,10 +788,12 @@ mod tests {
         assert_eq!(anthropic_frontier.tier, ModelTier::Flagship);
 
         // Google frontier: gemini-3.1-pro-preview (version 3.1) beats gemini-2.5-pro (version 2.5)
-        // because version is the primary signal — newer preview > older stable
+        // because version is the primary signal — newer preview > older stable.
+        // It is also the family's most expensive model, so it is promoted from
+        // Preview to Flagship (a `-preview` model can be the family flagship).
         let google_frontier = frontier.iter().find(|e| e.family == "google").unwrap();
         assert_eq!(google_frontier.model.id, "google/gemini-3.1-pro-preview");
-        assert_eq!(google_frontier.tier, ModelTier::Preview);
+        assert_eq!(google_frontier.tier, ModelTier::Flagship);
     }
 
     #[test]
@@ -850,6 +895,193 @@ mod tests {
                 .model
                 .id,
             "anthropic/claude-opus-4-6"
+        );
+    }
+
+    #[test]
+    fn frontier_excludes_media_models_with_unset_kind() {
+        // The real-world failure the explicit-kind test above does NOT catch:
+        // the live/embedded registry does not populate `kind`, so a media model
+        // arrives with `capability: None`. imagen-4.0 (version 4 > gemini-3 on
+        // the primary version signal) and veo-3.1 (version 3.1 > 3) must still
+        // be excluded so the gemini family frontier is the chat flagship.
+        // Their shape mirrors the live registry: no kind, no token pricing, no
+        // max output-token budget (imagen also has no context window; veo has a
+        // tiny 1024 prompt cap).
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "gemini/gemini-3-pro-preview".to_string(),
+                    context_length: Some(1_048_576),
+                    max_output_tokens: Some(65_535),
+                    pricing: ModelPricing {
+                        prompt_per_1k: Some(0.002),
+                        completion_per_1k: Some(0.012),
+                        ..Default::default()
+                    },
+                    capability: None,
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "gemini/imagen-4.0-ultra-generate-001".to_string(),
+                    capability: None,
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "gemini/veo-3.1-generate-preview".to_string(),
+                    context_length: Some(1024),
+                    capability: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        let gemini = frontier
+            .iter()
+            .find(|e| e.family == "gemini")
+            .expect("gemini family has a chat frontier");
+        assert_eq!(gemini.model.id, "gemini/gemini-3-pro-preview");
+        assert!(
+            !frontier
+                .iter()
+                .any(|e| e.model.id.contains("imagen") || e.model.id.contains("veo")),
+            "media models with unset kind must never be a frontier pick"
+        );
+    }
+
+    #[test]
+    fn frontier_excludes_embedding_model_with_unset_kind() {
+        // Embeddings carry input (prompt) pricing but no output budget and
+        // completion_per_1k == 0.0. With kind unset, input pricing alone must
+        // NOT admit them — otherwise a future higher-version embedding would win
+        // the family frontier over the real chat flagship. The embedding here is
+        // given version 5 (> gemini-3) precisely to prove version can't rescue it.
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "gemini/gemini-3-pro-preview".to_string(),
+                    context_length: Some(1_048_576),
+                    max_output_tokens: Some(65_535),
+                    pricing: ModelPricing {
+                        prompt_per_1k: Some(0.002),
+                        completion_per_1k: Some(0.012),
+                        ..Default::default()
+                    },
+                    capability: None,
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "gemini/gemini-embedding-5".to_string(),
+                    context_length: Some(2048),
+                    max_output_tokens: None,
+                    pricing: ModelPricing {
+                        prompt_per_1k: Some(0.00015),
+                        completion_per_1k: Some(0.0),
+                        ..Default::default()
+                    },
+                    capability: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        let gemini = frontier
+            .iter()
+            .find(|e| e.family == "gemini")
+            .expect("gemini family has a chat frontier");
+        assert_eq!(gemini.model.id, "gemini/gemini-3-pro-preview");
+        assert!(
+            !frontier.iter().any(|e| e.model.id.contains("embedding")),
+            "embedding model (input pricing only, no output budget) must not be a frontier pick"
+        );
+    }
+
+    #[test]
+    fn frontier_keeps_subscription_chat_model_without_token_pricing() {
+        // A flat-rate/subscription chat model (e.g. github_copilot's gemini-3)
+        // carries no per-token pricing but does advertise a max output-token
+        // budget. The structural proxy must keep it eligible so the fix does
+        // not silently drop real chat models alongside the media generators.
+        let mut reg = ModelRegistry {
+            models: vec![ModelEntry {
+                id: "github_copilot/gemini-3-pro-preview".to_string(),
+                context_length: Some(128_000),
+                max_output_tokens: Some(64_000),
+                pricing: ModelPricing::default(),
+                capability: None,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|e| e.family == "github_copilot")
+                .expect("subscription chat model stays a frontier pick")
+                .model
+                .id,
+            "github_copilot/gemini-3-pro-preview"
+        );
+    }
+
+    #[test]
+    fn frontier_prefers_priced_preview_flagship_over_cheaper_standard() {
+        // A family's flagship frequently ships under a `-preview` label
+        // (gemini-3-pro-preview) while a cheaper open Standard model (gemma)
+        // ties on the version signal. The priciest non-reasoning model must be
+        // recognized as the flagship so the real Gemini flagship wins the
+        // frontier pick, not the small open model. Without the Preview→Flagship
+        // promotion this returns gemma (Standard outranks Preview in the
+        // tiebreak), which is the bug surfaced once media models are excluded.
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "gemini/gemini-3-pro-preview".to_string(),
+                    context_length: Some(1_048_576),
+                    max_output_tokens: Some(65_535),
+                    pricing: ModelPricing {
+                        prompt_per_1k: Some(0.002),
+                        completion_per_1k: Some(0.012),
+                        ..Default::default()
+                    },
+                    capability: None,
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "gemini/gemma-3-27b-it".to_string(),
+                    context_length: Some(131_072),
+                    max_output_tokens: Some(8192),
+                    pricing: ModelPricing {
+                        prompt_per_1k: Some(0.0),
+                        completion_per_1k: Some(0.0),
+                        ..Default::default()
+                    },
+                    capability: None,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|e| e.family == "gemini")
+                .expect("gemini family has a chat frontier")
+                .model
+                .id,
+            "gemini/gemini-3-pro-preview"
         );
     }
 
