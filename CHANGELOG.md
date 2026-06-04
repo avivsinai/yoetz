@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- `yoetz models frontier` no longer returns non-chat models (image/video
+  generators, embeddings, search endpoints) as a provider family's flagship.
+  The chat-eligibility filter previously relied solely on an explicit model
+  `kind`, which is unset for nearly every catalog entry, so the filter was
+  effectively a no-op and a media model (e.g. `imagen-4.0-ultra`) could win a
+  family on the version signal — `--family gemini` returned an Imagen model
+  instead of `gemini-3-pro-preview`. When `kind` is unset, eligibility is now
+  resolved structurally: a chat/completion model advertises a max output-token
+  budget or charges for generated (completion) tokens; image/video/search/
+  embedding models have neither and are excluded.
+- Tier inference now promotes a family's most expensive non-reasoning Standard
+  *or Preview* model to Flagship (previously Standard only), and a cheap Mini
+  variant no longer counts toward the family's top price. A flagship that ships
+  under a `-preview` label (e.g. `gemini-3-pro-preview`) is now correctly the
+  family frontier instead of losing the tiebreak to a cheaper standard model
+  such as an open `gemma`.
+
+### Changed
+
+- The README and the `yoetz` agent skill now resolve model IDs live
+  (`yoetz models frontier` / `yoetz models resolve`) in every example rather
+  than hardcoding version-pinned IDs, and route the Google/Gemini reviewer via
+  `--family gemini`.
 
 ## [0.5.23] - 2026-06-02
 ### Fixed
