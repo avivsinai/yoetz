@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.24] - 2026-06-04
 ### Fixed
 
 - `yoetz models frontier` no longer returns non-chat models (image/video
@@ -31,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`yoetz models frontier` / `yoetz models resolve`) in every example rather
   than hardcoding version-pinned IDs, and route the Google/Gemini reviewer via
   `--family gemini`.
+
 
 ## [0.5.23] - 2026-06-02
 ### Fixed
