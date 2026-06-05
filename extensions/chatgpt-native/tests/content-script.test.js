@@ -149,6 +149,30 @@ test("content script resume path skips fresh enforcement and completes on reques
   }
 });
 
+test("content script auth probe reports manual handoff without job side effects", async () => {
+  const { send, hooks, restore } = await loadContentScript("auth_probe_login", "https://chatgpt.com/auth/login");
+  try {
+    hooks.manualHandoff = {
+      state: "login_required",
+      message: "ChatGPT login required in this Chrome profile"
+    };
+    hooks.pageText = "Log in to ChatGPT";
+
+    const response = await send({ type: "yoetz_auth_probe" });
+
+    assert.equal(response.ok, true);
+    assert.equal(response.payload.status, "login_required");
+    assert.equal(response.payload.authenticated, false);
+    assert.deepEqual(response.payload.manual_handoff, hooks.manualHandoff);
+    assert.equal(response.payload.text_chars, "Log in to ChatGPT".length);
+    assert.deepEqual(hooks.ensureFreshChatCalls, []);
+    assert.deepEqual(hooks.ensureConversationLoadedCalls, []);
+    assert.deepEqual(hooks.markOwnershipCalls, []);
+  } finally {
+    restore();
+  }
+});
+
 test("content script resume prepare rejects a different conversation before send", async () => {
   const { send, restore } = await loadContentScript("resume_mismatch", "https://chatgpt.com/c/other?_yoetz=run_resume");
   try {

@@ -832,6 +832,74 @@ pub fn doctor() -> Result<DoctorReport> {
     Ok(DoctorReport { ok, checks })
 }
 
+pub fn doctor_with_auth_probe(selector: ExtensionInstanceSelector<'_>) -> Result<DoctorReport> {
+    let mut report = doctor()?;
+    report.checks.push(chatgpt_auth_doctor_check(selector));
+    report.ok = report.checks.iter().all(|check| check.ok);
+    Ok(report)
+}
+
+fn chatgpt_auth_doctor_check(selector: ExtensionInstanceSelector<'_>) -> DoctorCheck {
+    match chatgpt_auth_probe(selector) {
+        Ok(payload) => chatgpt_auth_doctor_check_from_payload(&payload),
+        Err(error) => DoctorCheck {
+            name: "chatgpt_auth",
+            ok: true,
+            detail: format!("status=probe_unavailable, auth probe unavailable: {error}"),
+        },
+    }
+}
+
+fn chatgpt_auth_doctor_check_from_payload(payload: &Value) -> DoctorCheck {
+    let status = payload
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let authenticated = payload
+        .get("authenticated")
+        .and_then(Value::as_bool)
+        .unwrap_or(status == "authenticated");
+    let mut detail = vec![format!("status={status}")];
+    if let Some(message) = payload.get("message").and_then(Value::as_str) {
+        detail.push(message.to_string());
+    }
+    if let Some(tab_id) = payload.get("tab_id").and_then(Value::as_u64) {
+        detail.push(format!("tab_id={tab_id}"));
+    }
+    if let Some(selection) = payload.get("selection").and_then(Value::as_str) {
+        detail.push(format!("selection={selection}"));
+    }
+    if let Some(url) = payload
+        .get("url")
+        .or_else(|| payload.get("tab_url"))
+        .and_then(Value::as_str)
+    {
+        detail.push(format!("url={url}"));
+    }
+    DoctorCheck {
+        name: "chatgpt_auth",
+        ok: authenticated || !is_confirmed_unusable_chatgpt_auth_status(status),
+        detail: detail.join(", "),
+    }
+}
+
+fn is_confirmed_unusable_chatgpt_auth_status(status: &str) -> bool {
+    // Only hard-fail doctor on statuses that prove ChatGPT cannot be used in the profile.
+    matches!(
+        status,
+        "login_required" | "challenge_required" | "rate_limited"
+    )
+}
+
+pub fn chatgpt_auth_probe(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
+    let response = send_control_job(
+        "reconnect",
+        json!({ "intent": "doctor_auth_probe" }),
+        selector,
+    )?;
+    Ok(response.payload)
+}
+
 pub fn reconnect(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
     let response = send_control_job("reconnect", json!({ "intent": "reconnect" }), selector)?;
     Ok(json!({
@@ -1353,7 +1421,7 @@ fn select_extension_instance(
         1 => Ok(instances[0].clone()),
         0 => connect_legacy_socket_instance(paths),
         _ => bail!(
-            "chrome-extension-native found multiple connected extension profiles; pass --var profile_email=<chrome-profile-email> or --var extension_instance_id=<id> so Yoetz can route the job safely. Connected instances: {}",
+            "chrome-extension-native found multiple connected extension profiles; pass --profile-email=<chrome-profile-email> or --extension-instance-id=<id> (recipe callers can use --var profile_email=<chrome-profile-email> or --var extension_instance_id=<id>) so Yoetz can route the job safely. Connected instances: {}",
             observed_extension_profiles(&instances)
         ),
     }
@@ -3456,6 +3524,56 @@ mod tests {
         assert_eq!(payload.status, "not_installed");
         assert!(!payload.manifest_installed);
         assert!(!payload.token_present);
+    }
+
+    #[test]
+    fn chatgpt_auth_doctor_check_reports_login_required_probe() {
+        let check = chatgpt_auth_doctor_check_from_payload(&json!({
+            "status": "login_required",
+            "authenticated": false,
+            "message": "ChatGPT login required in this Chrome profile",
+            "tab_id": 7,
+            "selection": "active_non_yoetz_chatgpt_tab",
+            "url": "https://chatgpt.com/auth/login"
+        }));
+
+        assert_eq!(check.name, "chatgpt_auth");
+        assert!(!check.ok);
+        assert!(check.detail.contains("login_required"));
+        assert!(check.detail.contains("tab_id=7"));
+        assert!(check.detail.contains("active_non_yoetz_chatgpt_tab"));
+    }
+
+    #[test]
+    fn chatgpt_auth_doctor_check_accepts_authenticated_probe() {
+        let check = chatgpt_auth_doctor_check_from_payload(&json!({
+            "status": "authenticated",
+            "authenticated": true,
+            "message": "ChatGPT authenticated in this Chrome profile",
+            "tab_id": 7,
+            "selection": "active_non_yoetz_chatgpt_tab",
+            "url": "https://chatgpt.com/"
+        }));
+
+        assert_eq!(check.name, "chatgpt_auth");
+        assert!(check.ok);
+        assert!(check.detail.contains("authenticated"));
+        assert!(check.detail.contains("tab_id=7"));
+    }
+
+    #[test]
+    fn chatgpt_auth_doctor_check_keeps_no_tab_probe_informational() {
+        let check = chatgpt_auth_doctor_check_from_payload(&json!({
+            "status": "no_chatgpt_tab",
+            "authenticated": false,
+            "message": "No ChatGPT tab is open in this Chrome profile; open https://chatgpt.com/ and rerun doctor",
+            "inspected_tabs": 0
+        }));
+
+        assert_eq!(check.name, "chatgpt_auth");
+        assert!(check.ok);
+        assert!(check.detail.contains("no_chatgpt_tab"));
+        assert!(check.detail.contains("open https://chatgpt.com/"));
     }
 
     #[test]

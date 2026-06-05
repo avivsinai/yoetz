@@ -647,7 +647,91 @@ async function handleReconnect(message) {
     setTimeout(() => chrome.runtime.reload(), 50);
     return;
   }
+  if (message.payload?.intent === "doctor_auth_probe") {
+    await handleDoctorAuthProbe(message);
+    return;
+  }
   await recoverJobs(message);
+}
+
+async function handleDoctorAuthProbe(message) {
+  postNative(makeEnvelope("job_complete", {
+    request_id: message.request_id,
+    job_id: message.job_id,
+    run_id: message.run_id,
+    workspace_id: message.workspace_id,
+    payload: await probeChatgptAuthentication()
+  }));
+}
+
+async function probeChatgptAuthentication() {
+  const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+  const selected = selectChatgptAuthProbeTab(tabs);
+  if (!selected) {
+    return {
+      status: "no_chatgpt_tab",
+      authenticated: false,
+      message: "No ChatGPT tab is open in this Chrome profile; open https://chatgpt.com/ and rerun doctor",
+      inspected_tabs: 0
+    };
+  }
+  try {
+    const probe = await sendToTab(selected.tab.id, { type: "yoetz_auth_probe" });
+    return {
+      ...probe,
+      tab_id: selected.tab.id,
+      tab_url: selected.tab.url ?? null,
+      tab_title: selected.tab.title ?? null,
+      selection: selected.selection,
+      inspected_tabs: selected.total
+    };
+  } catch (error) {
+    return {
+      status: "content_script_unavailable",
+      authenticated: false,
+      message: `Yoetz content script is not ready in selected ChatGPT tab: ${String(error?.message ?? error)}`,
+      tab_id: selected.tab.id,
+      tab_url: selected.tab.url ?? null,
+      tab_title: selected.tab.title ?? null,
+      selection: selected.selection,
+      inspected_tabs: selected.total
+    };
+  }
+}
+
+function selectChatgptAuthProbeTab(tabs) {
+  const candidates = (tabs ?? [])
+    .filter((tab) => tab?.id && String(tab.url ?? "").startsWith("https://chatgpt.com/"))
+    .map((tab) => ({
+      tab,
+      yoetzOwned: new URL(tab.url).searchParams.has("_yoetz")
+    }));
+  if (candidates.length === 0) {
+    return null;
+  }
+  const candidate =
+    candidates.find((item) => item.tab.active && !item.yoetzOwned)
+    ?? candidates.find((item) => !item.yoetzOwned)
+    ?? candidates.find((item) => item.tab.active)
+    ?? candidates[0];
+  return {
+    tab: candidate.tab,
+    selection: chatgptAuthProbeSelection(candidate),
+    total: candidates.length
+  };
+}
+
+function chatgptAuthProbeSelection(candidate) {
+  if (candidate.tab.active && !candidate.yoetzOwned) {
+    return "active_non_yoetz_chatgpt_tab";
+  }
+  if (!candidate.yoetzOwned) {
+    return "non_yoetz_chatgpt_tab";
+  }
+  if (candidate.tab.active) {
+    return "active_yoetz_job_tab";
+  }
+  return "yoetz_job_tab";
 }
 
 async function handleInspectRun(message) {

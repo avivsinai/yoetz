@@ -363,7 +363,7 @@ enum BrowserExtensionCommand {
     /// Install the ChatGPT native messaging host. Currently macOS/Linux only.
     InstallHost(BrowserExtensionScopeArgs),
     Status(BrowserExtensionScopeArgs),
-    Doctor(BrowserExtensionScopeArgs),
+    Doctor(BrowserExtensionMaintenanceArgs),
     Reconnect(BrowserExtensionMaintenanceArgs),
     Reload(BrowserExtensionMaintenanceArgs),
     /// Copy the packaged extension into Yoetz state, reload Chrome, and verify the version.
@@ -2495,7 +2495,12 @@ fn handle_browser_extension(
         }
         BrowserExtensionCommand::Doctor(args) => {
             ensure_chatgpt_extension_scope(args.chatgpt)?;
-            let report = browser_extension_native::doctor()?;
+            let selector = extension_selector_from_parts(
+                args.profile_email.as_ref(),
+                args.extension_instance_id.as_ref(),
+                args.extension_profile_id.as_ref(),
+            );
+            let report = browser_extension_native::doctor_with_auth_probe(selector)?;
             text_output = Some(format_extension_doctor(&report));
             ("browser.extension.doctor", serde_json::to_value(report)?)
         }

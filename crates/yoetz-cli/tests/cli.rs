@@ -326,6 +326,14 @@ fn browser_extension_setup_help_shows_open_chrome() {
 #[test]
 fn browser_extension_maintenance_help_shows_instance_selectors() {
     yoetz()
+        .args(["browser", "extension", "doctor", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--profile-email"))
+        .stdout(predicate::str::contains("--extension-instance-id"))
+        .stdout(predicate::str::contains("--extension-profile-id"));
+
+    yoetz()
         .args(["browser", "extension", "reconnect", "--help"])
         .assert()
         .success()

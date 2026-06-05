@@ -29,6 +29,8 @@ async function handleMessage(message) {
         conversation_id: message.conversation_id,
         include_page_text: Boolean(message.include_page_text)
       });
+    case "yoetz_auth_probe":
+      return authProbe();
     case "yoetz_probe":
       return probe();
     default:
@@ -233,6 +235,28 @@ async function inspectPage(runId, options = {}) {
     result.page_text_tail = pageText.slice(-500);
   }
   return result;
+}
+
+async function authProbe() {
+  const { classifyManualHandoff, getPageText } = await domHelpers();
+  const text = getPageText(document);
+  const handoff = classifyManualHandoff({
+    url: location.href,
+    title: document.title,
+    text
+  });
+  const authenticated = !handoff;
+  return {
+    status: authenticated ? "authenticated" : handoff.state,
+    authenticated,
+    manual_handoff: handoff,
+    message: authenticated
+      ? "ChatGPT authenticated in this Chrome profile"
+      : handoff.message,
+    url: location.href,
+    title: document.title,
+    text_chars: text.length
+  };
 }
 
 async function probe() {
