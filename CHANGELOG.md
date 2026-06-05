@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Changed
+
+- ChatGPT Pro native-extension guidance now treats caller-provided bundles as
+  authoritative instead of telling agents to split or refocus them for the web
+  UI. Yoetz still surfaces long-run timing expectations, but the host agent
+  owns bundle scope.
+- `yoetz browser check --transport chrome-extension-native` now reports a
+  dry-run bridge check and no longer nudges agents to run a live canary before
+  normal ChatGPT Pro recipe runs. The extension canary remains available as an
+  explicit diagnostic command.
 
 ## [0.5.24] - 2026-06-04
 ### Fixed

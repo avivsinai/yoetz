@@ -206,7 +206,7 @@ async fn handle_review_diff(
 fn ensure_review_diff_size(input_tokens: usize) -> Result<()> {
     if input_tokens > MAX_REVIEW_DIFF_TOKENS {
         return Err(anyhow!(
-            "diff too large for `yoetz review diff` (~{input_tokens} tokens > {MAX_REVIEW_DIFF_TOKENS}); narrow `--paths` or split the review into smaller chunks"
+            "diff too large for `yoetz review diff` (~{input_tokens} tokens > {MAX_REVIEW_DIFF_TOKENS}); narrow `--paths` or run separate smaller reviews"
         ));
     }
     Ok(())

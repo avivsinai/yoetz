@@ -368,6 +368,8 @@ enum BrowserExtensionCommand {
     Reload(BrowserExtensionMaintenanceArgs),
     /// Copy the packaged extension into Yoetz state, reload Chrome, and verify the version.
     Update(BrowserExtensionMaintenanceArgs),
+    /// Explicit diagnostic probe; not required before normal recipe runs.
+    #[command(hide = true)]
     Canary(BrowserExtensionCanaryArgs),
     Inspect(BrowserExtensionInspectArgs),
     /// Request the optional `identity.email` permission so profile_email
@@ -414,7 +416,7 @@ struct BrowserExtensionCanaryArgs {
     #[arg(long)]
     chatgpt: bool,
 
-    /// Run a real ChatGPT canary job. Without this flag, canary is a dry-run bridge probe.
+    /// Run a real ChatGPT canary job. Without this flag, this is a dry-run bridge probe.
     #[arg(long)]
     live: bool,
 
@@ -1699,7 +1701,7 @@ fn handle_browser_extension_native_check(
         args.extension_instance_id.as_ref(),
         args.extension_profile_id.as_ref(),
     );
-    let bridge = browser_extension_native::canary(false, selector)?;
+    let bridge = browser_extension_native::bridge_check(selector)?;
     let payload = json!({
         "status": "ok",
         "method": "extension_native_dry_run",
@@ -1711,15 +1713,19 @@ fn handle_browser_extension_native_check(
         OutputFormat::Json => write_json(&payload),
         OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
         OutputFormat::Text | OutputFormat::Markdown => {
-            println!(
-                "Browser extension bridge ready via chrome-extension-native (dry-run canary; no CDP approval)."
-            );
-            println!(
-                "For a live ChatGPT auth probe, run: yoetz browser extension canary --chatgpt --live"
-            );
+            for line in browser_extension_native_check_text_lines() {
+                println!("{line}");
+            }
             Ok(())
         }
     }
+}
+
+fn browser_extension_native_check_text_lines() -> [&'static str; 2] {
+    [
+        "Browser extension bridge ready via chrome-extension-native (dry-run bridge check; no CDP approval).",
+        "No live canary is required before normal ChatGPT Pro recipe runs.",
+    ]
 }
 
 fn maybe_print_auto_selected_cdp_target(
@@ -5195,6 +5201,15 @@ mod tests {
             None
         );
         assert!(browser_check_transport_override(browser::RecipeTransport::Manual).is_err());
+    }
+
+    #[test]
+    fn browser_extension_native_check_text_avoids_live_canary_nudge() {
+        let text = browser_extension_native_check_text_lines().join("\n");
+        assert!(text.contains("dry-run bridge check"));
+        assert!(text.contains("No live canary is required"));
+        assert!(!text.contains("dry-run canary"));
+        assert!(!text.contains("For a live ChatGPT auth probe"));
     }
 
     #[test]

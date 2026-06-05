@@ -124,7 +124,7 @@ recipe selects it as the only default transport.
   `yoetz browser recipe --recipe chatgpt --transport chrome-extension-native`,
   and is managed with `yoetz browser extension install-host --chatgpt`,
   `setup --chatgpt --open-chrome`, `doctor --chatgpt`, `status --chatgpt`,
-  `reconnect --chatgpt`, `update --chatgpt`, `canary --chatgpt`,
+  `reconnect --chatgpt`, `update --chatgpt`,
   `inspect --chatgpt --run-id <id>`, and `grant-identity --chatgpt`. Use
   `yoetz browser check --transport chrome-extension-native` for extension
   readiness; plain `yoetz browser check` verifies the default CDP/browser stack.
