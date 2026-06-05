@@ -112,9 +112,10 @@ extension exception. It is ChatGPT-only, opt-in via
 is not part of the default transport order. Its lifecycle is explicit:
 `yoetz browser extension install-host --chatgpt`,
 `doctor --chatgpt`, `status --chatgpt`, `reconnect --chatgpt`, and
-`canary --chatgpt`; `inspect --chatgpt --run-id <id>` is the read-only
-diagnostic path for failed runs, and `grant-identity --chatgpt` opts into
-Chrome's `identity.email` permission when `profile_email` routing is required.
+`update --chatgpt`; `inspect --chatgpt --run-id <id>` is the read-only
+diagnostic path for failed runs, `canary --chatgpt --live` is reserved for
+explicit diagnostic probes, and `grant-identity --chatgpt` opts into Chrome's
+`identity.email` permission when `profile_email` routing is required.
 Release builds package it as a separate versioned extension zip so the CLI
 archives do not make the extension path implicit. Manual Chrome-side
 install/update is intentionally explicit: unzip the release artifact, load the

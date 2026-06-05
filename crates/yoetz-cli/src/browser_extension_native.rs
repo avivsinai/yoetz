@@ -881,18 +881,20 @@ pub fn update_extension(selector: ExtensionInstanceSelector<'_>) -> Result<Value
     }))
 }
 
+pub fn bridge_check(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
+    let response = send_control_job("reconnect", json!({ "intent": "bridge_check" }), selector)?;
+    Ok(json!({
+        "status": "ok",
+        "transport": TRANSPORT_NAME,
+        "live": false,
+        "response": response.payload,
+    }))
+}
+
 pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
     if !live {
-        let response =
-            send_control_job("reconnect", json!({ "intent": "dry_run_canary" }), selector)?;
-        return Ok(json!({
-            "status": "ok",
-            "transport": TRANSPORT_NAME,
-            "live": false,
-            "response": response.payload,
-        }));
+        return bridge_check(selector);
     }
-
     let dir = tempfile::tempdir()?;
     let bundle_path = dir.path().join("yoetz-chatgpt-native-canary.md");
     fs::write(&bundle_path, "Reply with exactly OK.\n")?;
