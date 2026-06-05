@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.25] - 2026-06-05
 ### Changed
 
 - ChatGPT Pro native-extension guidance now treats caller-provided bundles as
@@ -16,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   dry-run bridge check and no longer nudges agents to run a live canary before
   normal ChatGPT Pro recipe runs. The extension canary remains available as an
   explicit diagnostic command.
+
 
 ## [0.5.24] - 2026-06-04
 ### Fixed
