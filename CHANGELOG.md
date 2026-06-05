@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Changed
+
+- `yoetz browser extension doctor --chatgpt` now performs a doctor-only
+  ChatGPT auth probe through the native extension. It reports whether the
+  bridge is up and the selected Chrome profile is ChatGPT-authenticated, while
+  keeping `yoetz browser check --transport chrome-extension-native`
+  transport-only.
 
 ## [0.5.25] - 2026-06-05
 ### Changed

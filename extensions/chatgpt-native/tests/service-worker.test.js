@@ -145,6 +145,66 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
   }
 });
 
+test("service worker doctor auth probe prefers active non-owned ChatGPT tab and surfaces login", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  globalThis.chrome = chromeStub({
+    port,
+    profileEmail: "work@example.com",
+    tabs: {
+      query: async () => [
+        { id: 1, url: "https://chatgpt.com/?_yoetz=run_job", title: "Yoetz job", active: true },
+        { id: 2, url: "https://chatgpt.com/", title: "ChatGPT", active: true },
+        { id: 3, url: "https://chatgpt.com/c/older", title: "Older ChatGPT", active: false }
+      ],
+      create: async () => {
+        throw new Error("doctor auth probe must not open a tab");
+      },
+      get: async () => {
+        throw new Error("doctor auth probe must not poll tab loading");
+      },
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        assert.equal(message.type, "yoetz_auth_probe");
+        return {
+          ok: true,
+          payload: {
+            status: "login_required",
+            authenticated: false,
+            manual_handoff: {
+              state: "login_required",
+              message: "ChatGPT login required in this Chrome profile"
+            },
+            url: "https://chatgpt.com/auth/login",
+            title: "Log in | ChatGPT"
+          }
+        };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?doctor_auth=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("reconnect", "job_auth_probe", { intent: "doctor_auth_probe" }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.equal(complete.job_id, "job_auth_probe");
+    assert.equal(complete.payload.status, "login_required");
+    assert.equal(complete.payload.authenticated, false);
+    assert.equal(complete.payload.manual_handoff.state, "login_required");
+    assert.equal(complete.payload.tab_id, 2);
+    assert.equal(complete.payload.selection, "active_non_yoetz_chatgpt_tab");
+    assert.deepEqual(sentToTabs.map((item) => item.id), [2]);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker opens fresh and resume jobs in new owned tabs", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
