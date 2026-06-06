@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.27] - 2026-06-06
 ### Fixed
 
 - ChatGPT native-extension capture now reads completed answers from ChatGPT's
@@ -22,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   conversation URL with the Yoetz run marker, rebinds/revalidates the content
   script, and then resumes normal final-response polling so completed Pro
   answers can be captured instead of timing out on a frozen `"I"`.
+
 
 ## [0.5.26] - 2026-06-06
 ### Fixed
