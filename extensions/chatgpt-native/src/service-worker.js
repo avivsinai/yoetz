@@ -446,6 +446,10 @@ async function completeJobWithExtraction(job, extraction) {
     capability_token: job.capability_token,
     payload: {
       tab_id: job.tab_id,
+      // The authoritative answer. This is the ONLY surface that carries is_final=true; every
+      // job_progress event is is_final=false. A consumer must treat job_complete.response as the
+      // response and never a progress event's interim/partial text.
+      is_final: true,
       response: extraction.text,
       extraction_method: extraction.method,
       completion_reason: extraction.completion_reason,
@@ -755,10 +759,18 @@ async function handleInspectRun(message) {
         run_id: runId,
         conversation_id: runId
       }));
+      const responseInProgress = Boolean(inspection?.extraction?.is_generating);
       matches.push({
         tab_id: tab.id,
         url: tab.url ?? inspection?.url ?? null,
         title: tab.title ?? inspection?.title ?? null,
+        // Non-final marker for inspect read mid-stream. ChatGPT Pro Extended streams several interim
+        // turns before the answer; while generating, inspection.extraction.text is a partial/interim
+        // turn's body (observed live as a single "I"), NOT the verdict. Wait for generation to stop.
+        response_in_progress: responseInProgress,
+        note: responseInProgress
+          ? "response still generating; extraction.text is a partial/interim assistant turn, not the final answer"
+          : undefined,
         inspection
       });
     } catch (error) {
@@ -1578,6 +1590,24 @@ async function waitForResponse(job) {
   return null;
 }
 
+// How many assistant turns have appeared since the prompt was sent. The post-send baseline is
+// captured before send; the first turn beyond it is the response's first turn, and any turn beyond
+// THAT (while still generating) means the earlier turns were interim Pro-Extended status posts.
+function assistantTurnsSinceSend(job, extraction) {
+  const baseline = Number(job.response_baseline?.assistant_count ?? 0);
+  const current = Number(extraction?.assistant_count ?? 0);
+  return Math.max(0, current - baseline);
+}
+
+// Single source of truth for "is this progress an interim Pro-Extended turn, not the answer?".
+// A second-or-later assistant turn appearing while generation is still active proves the earlier
+// turn(s) were interim status posts ("I'll review...", "I've narrowed..."), not the final answer.
+function interimTurnState(job, extraction) {
+  const generating = Boolean(extraction?.is_generating);
+  const turnsSinceSend = assistantTurnsSinceSend(job, extraction);
+  return { generating, turnsSinceSend, interimAssistantTurn: generating && turnsSinceSend > 1 };
+}
+
 function postResponseProgress(job, extraction) {
   const text = String(extraction?.text ?? "");
   if (!text || text === job.last_response_progress_text) {
@@ -1586,13 +1616,19 @@ function postResponseProgress(job, extraction) {
   const previous = String(job.last_response_progress_text ?? "");
   const delta = text.startsWith(previous) ? text.slice(previous.length) : text;
   job.last_response_progress_text = text;
+  const { generating, turnsSinceSend, interimAssistantTurn } = interimTurnState(job, extraction);
   postNative(progress(job, "response_observed", {
-    message: `response observed (${text.length} chars${extraction?.is_generating ? ", still generating" : ""})`,
+    message: interimAssistantTurn
+      ? `interim assistant turn observed (${text.length} chars, turn ${turnsSinceSend} since send, still generating — not the final response)`
+      : `response observed (${text.length} chars${generating ? ", still generating" : ""})`,
+    response_in_progress: generating,
+    interim_assistant_turn: interimAssistantTurn,
+    assistant_turns_since_send: turnsSinceSend,
     response_delta: delta,
     response_length: text.length,
     response_tail: text.slice(-500),
     extraction_method: extraction.method,
-    is_generating: Boolean(extraction.is_generating),
+    is_generating: generating,
     assistant_count: extraction.assistant_count ?? 0,
     turn_index: extraction.turn_index ?? -1,
     copy_button_count: extraction.copy_button_count ?? 0,
@@ -1605,12 +1641,17 @@ function postWaitingResponseProgress(job, extraction, detail = {}) {
   const timeoutMs = Number(detail.timeout_ms ?? responseWaitTimeoutMs(job));
   const finalityStatus = detail.awaiting_final_affordance ? ", waiting for final assistant controls" : "";
   const scopedCopyStatus = extraction?.has_copy_button ? ", scoped_copy_button=true" : ", scoped_copy_button=false";
+  const { generating, turnsSinceSend, interimAssistantTurn } = interimTurnState(job, extraction);
+  const interimStatus = interimAssistantTurn ? `, interim assistant turn ${turnsSinceSend} (response not final)` : "";
   postNative(progress(job, "waiting_response", {
     ...detail,
     inspect_command: detail.inspect_command ?? inspectCommandForJob(job),
-    message: `waiting for ChatGPT response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${scopedCopyStatus}${extraction?.is_generating ? ", generating" : ""}${finalityStatus})`,
+    message: `waiting for ChatGPT response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${scopedCopyStatus}${generating ? ", generating" : ""}${interimStatus}${finalityStatus})`,
     extraction_method: extraction?.method ?? "none",
-    is_generating: Boolean(extraction?.is_generating),
+    response_in_progress: generating,
+    interim_assistant_turn: interimAssistantTurn,
+    assistant_turns_since_send: turnsSinceSend,
+    is_generating: generating,
     assistant_count: extraction?.assistant_count ?? 0,
     turn_index: extraction?.turn_index ?? -1,
     copy_button_count: extraction?.copy_button_count ?? 0,

@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- ChatGPT native progress no longer lets an in-progress, multi-turn Pro
+  "Extended" response be misread as the final answer. ChatGPT Pro now streams
+  the answer as several short interim turns ("I'll review…", "I've narrowed…")
+  before the real answer arrives minutes later, and the first interim turn's
+  streaming head is a single "I". The waiter already never *completes* on an
+  interim turn (generation stays active across them), but its progress and
+  `inspect` output surfaced the interim partial text, which a calling agent
+  could mistake for the verdict and abort the run early. Every `job_progress`
+  event now carries `is_final: false` (enforced — callers cannot override it),
+  the terminal `job_complete` carries `is_final: true` as the only
+  authoritative answer, and progress/`inspect` now label interim turns
+  (`response_in_progress`, `interim_assistant_turn`,
+  `assistant_turns_since_send`). Completion behavior is unchanged.
+
 ### Changed
 
 - `yoetz browser extension doctor --chatgpt` now performs a doctor-only

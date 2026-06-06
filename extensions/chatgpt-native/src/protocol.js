@@ -82,6 +82,14 @@ export function validateEnvelope(message, options = {}) {
 }
 
 export function progress(job, phase, detail = {}) {
+  // INVARIANT: every job_progress event is non-final. The authoritative answer is only ever
+  // delivered in the terminal job_complete envelope (payload.is_final=true). A machine consumer
+  // (inspect/JSONL stream) must be able to trust is_final to never mistake a streaming/interim
+  // turn's partial text for the final response — ChatGPT Pro Extended streams the answer as several
+  // interim end_turn turns before the real one, so any progress text may be an interim turn's head
+  // (observed live as a single "I"). Strip any caller-supplied is_final and force false LAST so no
+  // call site can ever emit a final-looking progress event, now or in the future.
+  const { is_final: _ignoredIsFinal, ...rest } = detail;
   return makeEnvelope("job_progress", {
     job_id: job.job_id,
     run_id: job.run_id,
@@ -89,7 +97,8 @@ export function progress(job, phase, detail = {}) {
     capability_token: job.capability_token,
     payload: {
       phase,
-      ...detail
+      ...rest,
+      is_final: false
     }
   });
 }
