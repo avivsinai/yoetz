@@ -314,23 +314,23 @@ function resolveBackendAnswer(job, conversationId, data) {
   if (!mapping) {
     return notReady("backend-api response had no conversation mapping");
   }
-  // Count COMPLETED assistant answer turns addressed to the user (recipient 'all'). This excludes
-  // thoughts/reasoning_recap (content_type != text) and tool turns (recipient like container.exec /
-  // file_search.msearch). Freshness = the count exceeds the pre-send baseline, i.e. a NEW answer
-  // landed for THIS prompt (not a leftover from a resumed conversation).
-  const assistantAnswerCount = Object.values(mapping).filter((node) => isAssistantAnswerNode(node?.message)).length;
-  // Walk current_node UP its parent chain to the latest completed assistant answer node. current_node
-  // may be a tool/reasoning_recap node, so we cannot just read it directly.
-  const answerNode = walkToAnswerNode(mapping, data.current_node);
+  // Freshness MUST be scoped to the ACTIVE current_node lineage, not the whole mapping. ChatGPT
+  // retains off-branch assistant answers (regenerations / abandoned / alternate branches) in the
+  // mapping; a global count could be inflated past the baseline by an off-branch node while the
+  // active lineage still points at a STALE earlier answer — returning that stale answer as fresh.
+  // So walk current_node -> root ONCE: the latest answer node on that path is THE answer, and the
+  // count of answer nodes on that path is what we compare against the pre-send baseline. current_node
+  // may be a tool/reasoning_recap node, so we cannot read it directly.
+  const { answerNode, count: lineageAnswerCount } = collectLineageAnswerNodes(mapping, data.current_node);
   if (!answerNode) {
-    return notReady("no completed assistant answer node yet (still generating / tool-only)");
+    return notReady("no completed assistant answer node on the active lineage yet (still generating / tool-only)");
   }
-  if (assistantAnswerCount <= baseline) {
-    return notReady(`assistant answer not fresh past baseline (${assistantAnswerCount} <= ${baseline})`);
+  if (lineageAnswerCount <= baseline) {
+    return notReady(`assistant answer not fresh past baseline (active-lineage ${lineageAnswerCount} <= ${baseline})`);
   }
   const text = answerTextOf(answerNode.message);
   if (!text) {
-    return notReady("latest assistant answer node had no text parts");
+    return notReady("latest active-lineage assistant answer node had no text parts");
   }
   return {
     method: "backend_api",
@@ -338,8 +338,8 @@ function resolveBackendAnswer(job, conversationId, data) {
     is_generating: false,
     conversation_id: conversationId,
     node_fresh: true,
-    assistant_count: assistantAnswerCount,
-    turn_index: Math.max(0, assistantAnswerCount - 1),
+    assistant_count: lineageAnswerCount,
+    turn_index: Math.max(0, lineageAnswerCount - 1),
     node_id: String(answerNode.id ?? answerNode.message?.id ?? ""),
     has_copy_button: false,
     copy_button_count: 0
@@ -378,21 +378,29 @@ function answerTextOf(message) {
   return parts.filter((part) => typeof part === "string").join("").trim();
 }
 
-function walkToAnswerNode(mapping, currentNodeId) {
+// Walk current_node -> root once, collecting the COMPLETED assistant answer nodes that lie on the
+// ACTIVE lineage. Returns { answerNode: latest-on-lineage (closest to current_node), count }.
+// Off-branch answers (not on this path) are intentionally not seen here.
+function collectLineageAnswerNodes(mapping, currentNodeId) {
   let id = currentNodeId;
   let guard = 0;
+  let answerNode = null;
+  let count = 0;
   while (id && guard < 2000) {
     guard += 1;
     const node = mapping[id];
     if (!node) {
-      return null;
+      break;
     }
     if (isAssistantAnswerNode(node.message)) {
-      return node;
+      if (!answerNode) {
+        answerNode = node;
+      }
+      count += 1;
     }
     id = node.parent;
   }
-  return null;
+  return { answerNode, count };
 }
 
 function nonNegativeInt(value) {

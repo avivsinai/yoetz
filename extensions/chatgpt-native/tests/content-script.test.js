@@ -565,6 +565,37 @@ test("backend-api read returns not-ready (keep waiting) when no answer is fresh 
   }
 });
 
+test("backend-api read scopes freshness to the active lineage (off-branch answer must not inflate)", async () => {
+  // codex's blocking finding: a global answer count could be inflated past baseline by an
+  // OFF-branch completed answer (regen/abandoned/alternate branch) while the active current_node
+  // lineage still points at a STALE earlier answer -> must NOT return the stale answer as fresh.
+  const { send, hooks, restore } = await loadContentScript("backend_offbranch", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const restoreFetch = installBackendFetch({ conv: {
+    // active lineage: root -> u1 -> a_old (the visible, stale answer). current_node = a_old.
+    // a_alt_new is a sibling regeneration off the a_old lineage (child of u1, not reachable from a_old upward).
+    current_node: "a_old",
+    mapping: {
+      root: { id: "root", parent: null, children: ["u1"], message: { author: { role: "system" }, content: { content_type: "text", parts: [""] } } },
+      u1: { id: "u1", parent: "root", children: ["a_old", "a_alt_new"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["q"] }, end_turn: null } },
+      a_old: asstTextNode("a_old", "u1", "earlier visible answer on the active branch"),
+      a_alt_new: asstTextNode("a_alt_new", "u1", "a regenerated answer on an off-branch not reachable from current_node")
+    }
+  }});
+  try {
+    // baseline already counts the single active-lineage answer (a_old) -> no NEW active answer.
+    const job = fetchJob(1);
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.payload.node_fresh, false, "off-branch answer must not make the stale lineage answer look fresh");
+    assert.equal(res.payload.is_generating, true);
+    assert.equal(res.payload.text, "");
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
+
 test("backend-api read surfaces a 401 as backend_api_unauthorized so the SW can fall back", async () => {
   const { send, hooks, restore } = await loadContentScript("backend_401", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
   const restoreFetch = installBackendFetch({ conversationStatus: 401 });
