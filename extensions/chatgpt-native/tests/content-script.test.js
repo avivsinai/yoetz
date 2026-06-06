@@ -423,3 +423,159 @@ function resumeJob() {
     send_timeout_ms: 1000
   };
 }
+
+// ---- T1 backend-api read (yoetz_fetch_conversation) ----
+
+function fetchJob(submittedAssistantCount = 0) {
+  return {
+    job_id: "job_fetch",
+    run_id: "run_fetch",
+    conversation_id: "conv-123",
+    expected_conversation_id: "conv-123",
+    submitted_assistant_count: submittedAssistantCount,
+    upload_timeout_ms: 1000,
+    send_timeout_ms: 1000
+  };
+}
+
+function asstTextNode(id, parent, text, opts = {}) {
+  return {
+    id,
+    parent,
+    children: [],
+    message: {
+      id,
+      author: { role: "assistant" },
+      content: { content_type: "text", parts: [text] },
+      end_turn: opts.end_turn ?? true,
+      recipient: opts.recipient ?? "all",
+      status: "finished_successfully"
+    }
+  };
+}
+
+// Install a mocked same-origin fetch for /api/auth/session and /backend-api/conversation/<id>.
+// conv = { current_node, mapping } or null to 404; status overrides the conversation GET status.
+function installBackendFetch({ token = "tok-123", conv = null, conversationStatus = 200, sessionStatus = 200 } = {}) {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith("/api/auth/session")) {
+      return { ok: sessionStatus >= 200 && sessionStatus < 300, status: sessionStatus, json: async () => ({ accessToken: token }) };
+    }
+    if (u.startsWith("/backend-api/conversation/")) {
+      return {
+        ok: conversationStatus >= 200 && conversationStatus < 300,
+        status: conversationStatus,
+        json: async () => conv ?? {}
+      };
+    }
+    throw new Error(`unexpected fetch ${u}`);
+  };
+  return () => { globalThis.fetch = original; };
+}
+
+async function prepareFetchJob(send, hooks, job) {
+  const prepared = await send({ type: "yoetz_prepare_job", job });
+  assert.equal(prepared.ok, true, `prepare failed: ${JSON.stringify(prepared)}`);
+}
+
+test("backend-api read returns the fresh final answer from the conversation mapping", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_happy", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const FINAL = "No P0 found. I found two P1 proof-integrity issues and several P2 residual risks across the bundle.";
+  const restoreFetch = installBackendFetch({ conv: {
+    current_node: "a_final",
+    mapping: {
+      root: { id: "root", parent: null, children: ["u1"], message: { author: { role: "system" }, content: { content_type: "text", parts: [""] } } },
+      u1: { id: "u1", parent: "root", children: ["a_interim"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["review this"] }, end_turn: null } },
+      a_interim: asstTextNode("a_interim", "u1", "I'll review the bundled diff as the source of truth"),
+      a_final: asstTextNode("a_final", "a_interim", FINAL)
+    }
+  }});
+  try {
+    const job = fetchJob(0);
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.payload.method, "backend_api");
+    assert.equal(res.payload.node_fresh, true);
+    assert.equal(res.payload.is_generating, false);
+    assert.equal(res.payload.text, FINAL);
+    assert.equal(res.payload.conversation_id, "conv-123");
+    assert.equal(res.payload.assistant_count, 2);
+    assert.equal(res.payload.node_id, "a_final");
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
+
+test("backend-api read walks past reasoning_recap and tool nodes to the real assistant answer", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_walk", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const FINAL = "I reviewed the bundle end to end; the consumer guard is correct and the producer invariants hold.";
+  const restoreFetch = installBackendFetch({ conv: {
+    // current_node is a reasoning_recap with end_turn:true (the live trap) whose parent chain leads to the text answer
+    current_node: "recap",
+    mapping: {
+      u1: { id: "u1", parent: null, children: ["a_final"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["review"] }, end_turn: null } },
+      a_final: asstTextNode("a_final", "u1", FINAL),
+      // a tool turn (recipient not 'all') must NOT count or be selected
+      tool1: { id: "tool1", parent: "a_final", children: ["recap"], message: { author: { role: "assistant" }, content: { content_type: "text", parts: ["{search}"] }, end_turn: true, recipient: "file_search.msearch" } },
+      // reasoning_recap with end_turn:true must NOT be selected
+      recap: { id: "recap", parent: "tool1", children: [], message: { author: { role: "assistant" }, content: { content_type: "reasoning_recap", parts: ["recapped"] }, end_turn: true, recipient: "all" } }
+    }
+  }});
+  try {
+    const job = fetchJob(0);
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.payload.node_fresh, true);
+    assert.equal(res.payload.text, FINAL);
+    assert.equal(res.payload.node_id, "a_final");
+    assert.equal(res.payload.assistant_count, 1, "recap + tool nodes must not count as answer turns");
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
+
+test("backend-api read returns not-ready (keep waiting) when no answer is fresh past baseline", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_stale", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const restoreFetch = installBackendFetch({ conv: {
+    current_node: "a_old",
+    mapping: {
+      u1: { id: "u1", parent: null, children: ["a_old"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["prior"] }, end_turn: null } },
+      a_old: asstTextNode("a_old", "u1", "earlier answer from a prior turn")
+    }
+  }});
+  try {
+    // baseline already counts the single existing answer turn -> no NEW answer -> not fresh
+    const job = fetchJob(1);
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.payload.method, "backend_api");
+    assert.equal(res.payload.node_fresh, false);
+    assert.equal(res.payload.is_generating, true, "stale read must keep the SW waiting, not complete");
+    assert.equal(res.payload.text, "");
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
+
+test("backend-api read surfaces a 401 as backend_api_unauthorized so the SW can fall back", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_401", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const restoreFetch = installBackendFetch({ conversationStatus: 401 });
+  try {
+    const job = fetchJob(0);
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, "backend_api_unauthorized");
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
