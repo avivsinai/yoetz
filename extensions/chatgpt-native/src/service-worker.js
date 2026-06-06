@@ -1497,11 +1497,7 @@ async function waitForResponse(job) {
       // for the short confirm window, the response is settled — emit instead of
       // burning the full idle floor.
       if (stableForMs >= affordanceConfirmMs) {
-        return completedExtraction(
-          finalAffordanceCandidate,
-          completionReasonForFinalCandidate(finalAffordanceCandidate),
-          stableForMs
-        );
+        return completedExtraction(finalAffordanceCandidate, "copy_button", stableForMs);
       }
       unscopedCopyCandidate = null;
       bestUnscopedCopyCandidate = null;
@@ -2093,10 +2089,6 @@ function completedExtraction(extraction, completionReason, stableForMs) {
     assistant_turn_count: Number(extraction.assistant_count ?? 0),
     copy_button_count: Number(extraction.copy_button_count ?? 0)
   };
-}
-
-function completionReasonForFinalCandidate(extraction) {
-  return isFreshBackendApiExtraction(extraction) ? "backend_api" : "copy_button";
 }
 
 function enforceMessageCapability(message) {
