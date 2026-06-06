@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.26] - 2026-06-06
 ### Fixed
 
 - ChatGPT native progress no longer lets an in-progress, multi-turn Pro
@@ -29,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   bridge is up and the selected Chrome profile is ChatGPT-authenticated, while
   keeping `yoetz browser check --transport chrome-extension-native`
   transport-only.
+
 
 ## [0.5.25] - 2026-06-05
 ### Changed
