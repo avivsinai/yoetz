@@ -2623,6 +2623,112 @@ test("service worker preserves the best final response across a transient genera
   }
 });
 
+test("service worker labels interim Pro-Extended turns as non-final and completes on the later real answer", async () => {
+  // RC4 regression: ChatGPT Pro Extended streams the answer as MULTIPLE interim end_turn turns
+  // ("I'll review...", "I've narrowed...") before the real answer arrives minutes later. The first
+  // interim turn's streaming head is a single "I" (observed live in conv 6a23a3a6). The waiter must
+  // NOT surface that interim "I" as if it were the final response, and must complete on the later
+  // real answer. is_generating stays TRUE across interim turns (verified live), so the gate never
+  // completes early; progress events must mark non-finality so a consumer cannot misread "I".
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let extractCount = 0;
+  const FINAL = "No P0 found. I found two P1 proof-integrity issues and several P2 residual risks.";
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response": {
+            if (!sent) {
+              // Pre-send baseline (assistant_count 0).
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 } };
+            }
+            extractCount += 1;
+            const base = { user_count: 1, preceding_user_count: 1 };
+            if (extractCount === 1) {
+              // Interim turn #1, streaming head = "I", still generating, no copy button yet.
+              return { ok: true, payload: { ...base, method: "assistant_dom_fallback", text: "I", is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0 } };
+            }
+            if (extractCount === 2) {
+              return { ok: true, payload: { ...base, method: "assistant_dom_fallback", text: "I'll review the bundled diff as the source of truth", is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0 } };
+            }
+            if (extractCount === 3) {
+              // Interim turn #2 now streaming while still generating -> proves turn #1 was interim.
+              return { ok: true, payload: { ...base, method: "assistant_dom_fallback", text: "I've narrowed review to a few possible proof-binding gaps", is_generating: true, assistant_count: 2, copy_button_count: 0, has_copy_button: false, turn_index: 1 } };
+            }
+            // Real final answer: generation stopped, scoped copy button present, stable -> completes.
+            return { ok: true, payload: { ...base, method: "copy_scope_dom_fallback", text: FINAL, is_generating: false, assistant_count: 3, copy_button_count: 1, has_copy_button: true, turn_index: 2 } };
+          }
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?interim_turn_labeling=${Date.now()}`);
+    port.emit(envelope("job_start", "job_interim_turn_labeling", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 4000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_interim_turn_labeling", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_interim_turn_labeling.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"), 6000);
+    const complete = port.messages.find((message) => message.type === "job_complete");
+
+    // Completion: the later real answer, explicitly marked final.
+    assert.equal(complete.payload.response, FINAL);
+    assert.equal(complete.payload.is_final, true);
+    assert.equal(complete.payload.completion_reason, "copy_button");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+
+    const progressEvents = port.messages.filter((message) => message.type === "job_progress");
+    // EVERY progress event is non-final by construction -> a consumer cannot mistake interim text for the answer.
+    assert.ok(progressEvents.length > 0);
+    assert.equal(progressEvents.every((message) => message.payload.is_final === false), true);
+
+    const observed = progressEvents.filter((message) => message.payload.phase === "response_observed");
+    // The interim "I" was surfaced in progress but clearly marked in-progress / non-final.
+    const iEvent = observed.find((message) => message.payload.response_length === 1);
+    assert.ok(iEvent, "expected a response_observed event for the single-char interim head 'I'");
+    assert.equal(iEvent.payload.is_final, false);
+    assert.equal(iEvent.payload.response_in_progress, true);
+    // Once a second assistant turn streams while generating, it is labeled an interim assistant turn.
+    const interim = observed.find((message) => message.payload.interim_assistant_turn === true);
+    assert.ok(interim, "expected an interim_assistant_turn=true progress event for the 2nd streaming turn");
+    assert.equal(interim.payload.assistant_turns_since_send, 2);
+    assert.equal(interim.payload.response_in_progress, true);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker settles same-length post-final text churn instead of timing out", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

@@ -6,8 +6,21 @@ import {
   PROTOCOL_VERSION,
   TRANSPORT,
   makeEnvelope,
+  progress,
   validateEnvelope
 } from "../src/protocol.js";
+
+const PROGRESS_JOB = { job_id: "job_test", run_id: "run_test", workspace_id: "ws_test", capability_token: "cap_test" };
+
+test("progress events are always non-final and the invariant cannot be overridden by the caller", () => {
+  assert.equal(progress(PROGRESS_JOB, "response_observed").payload.is_final, false);
+  // Even a caller that explicitly passes is_final:true must not be able to emit a final-looking
+  // progress event — the authoritative answer is only ever job_complete.
+  const forced = progress(PROGRESS_JOB, "response_observed", { is_final: true, response_tail: "I" });
+  assert.equal(forced.type, "job_progress");
+  assert.equal(forced.payload.is_final, false);
+  assert.equal(forced.payload.response_tail, "I");
+});
 
 test("protocol exports the pinned extension id", () => {
   assert.equal(EXTENSION_ID, "njdakhppfigmloihiikbjmheejfndbfa");
