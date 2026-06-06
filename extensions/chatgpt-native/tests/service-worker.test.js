@@ -3072,6 +3072,221 @@ test("service worker does not complete when ChatGPT idles before final assistant
   }
 });
 
+test("service worker reloads an idle frozen short response and completes from the refreshed conversation", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousWaitingProgressInterval = globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
+  globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = 100;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let reloaded = false;
+  let bindCount = 0;
+  const updates = [];
+  const conversationUrl = "https://chatgpt.com/c/conv-freeze?_yoetz=run_job_background_render_freeze";
+  let currentUrl = "https://chatgpt.com/";
+  const FINAL = "I reviewed the bundle. The consumer guard is correct, but Yoetz must refresh the frozen render.";
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => {
+        currentUrl = opts.url;
+        return { id: ++tabId, status: "complete", ...opts };
+      },
+      get: async (id) => ({ id, status: "complete", url: currentUrl }),
+      update: async (id, opts) => {
+        updates.push({ id, opts });
+        if (opts.url) {
+          currentUrl = opts.url;
+        }
+        reloaded = true;
+        return { id, status: "complete", url: currentUrl };
+      },
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            currentUrl = conversationUrl;
+            return { ok: true, payload: { sent: true, url: currentUrl, conversation_id: "conv-freeze" } };
+          case "yoetz_bind_job":
+            bindCount += 1;
+            return { ok: true, payload: { rebound: true, url: currentUrl, title: "ChatGPT" } };
+          case "yoetz_extract_response":
+            if (!sent) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, user_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 } };
+            }
+            return {
+              ok: true,
+              payload: reloaded
+                ? {
+                    method: "copy_scope_dom_fallback",
+                    text: FINAL,
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: 0,
+                    conversation_id: "conv-freeze",
+                    diagnostics: { counts: { stop_controls: 0, copy_buttons: 1 } }
+                  }
+                : {
+                    method: "assistant_dom_fallback",
+                    text: "I",
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: false,
+                    turn_index: 0,
+                    conversation_id: "conv-freeze",
+                    diagnostics: { counts: { stop_controls: 0, copy_buttons: 1 } }
+                  }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?background_render_freeze=${Date.now()}`);
+    port.emit(envelope("job_start", "job_background_render_freeze", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_background_render_freeze", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_background_render_freeze.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"), 7000);
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.equal(updates.length, 1);
+    assert.deepEqual(updates[0], { id: 1, opts: { url: conversationUrl, active: false } });
+    assert.equal(bindCount, 1);
+    assert.equal(complete.payload.response, FINAL);
+    assert.equal(complete.payload.completion_reason, "copy_button");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+    assert.ok(port.messages.some((message) => message.type === "job_progress" && message.payload.phase === "render_refreshing"));
+    assert.ok(port.messages.some((message) => message.type === "job_progress" && message.payload.phase === "render_refreshed"));
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousWaitingProgressInterval === undefined) {
+      delete globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
+    } else {
+      globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = previousWaitingProgressInterval;
+    }
+  }
+});
+
+test("service worker refreshes a frozen short render at most once", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  const updates = [];
+  const conversationUrl = "https://chatgpt.com/c/conv-still-frozen?_yoetz=run_job_render_refresh_bounded";
+  let currentUrl = "https://chatgpt.com/";
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => {
+        currentUrl = opts.url;
+        return { id: ++tabId, status: "complete", ...opts };
+      },
+      get: async (id) => ({ id, status: "complete", url: currentUrl }),
+      update: async (id, opts) => {
+        updates.push({ id, opts });
+        if (opts.url) {
+          currentUrl = opts.url;
+        }
+        return { id, status: "complete", url: currentUrl };
+      },
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            currentUrl = conversationUrl;
+            return { ok: true, payload: { sent: true, url: currentUrl, conversation_id: "conv-still-frozen" } };
+          case "yoetz_bind_job":
+            return { ok: true, payload: { rebound: true, url: currentUrl, title: "ChatGPT" } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "assistant_dom_fallback",
+                    text: "I",
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: false,
+                    turn_index: 0,
+                    conversation_id: "conv-still-frozen",
+                    diagnostics: { counts: { stop_controls: 0, copy_buttons: 1 } }
+                  }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, user_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?render_refresh_bounded=${Date.now()}`);
+    port.emit(envelope("job_start", "job_render_refresh_bounded", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1800
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_render_refresh_bounded", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_render_refresh_bounded.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"), 5000);
+    assert.equal(updates.length, 1);
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    assert.equal(port.messages.filter((message) => message.type === "job_progress" && message.payload.phase === "render_refreshing").length, 1);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker rejects stale copy-button extraction from a pre-send assistant turn", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

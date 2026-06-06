@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- ChatGPT native-extension runs now refresh the owned conversation tab when a
+  background live-stream render freezes on a short idle assistant prefix without
+  final scoped copy controls. The refresh is bounded, reloads the same
+  conversation URL with the Yoetz run marker, rebinds/revalidates the content
+  script, and then resumes normal final-response polling so completed Pro
+  answers can be captured instead of timing out on a frozen `"I"`.
 
 ## [0.5.26] - 2026-06-06
 ### Fixed
