@@ -67,6 +67,12 @@ const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
 );
 const WAITING_RESPONSE_PROGRESS_INTERVAL_MS = Math.max(50, Number(globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS ?? 60000) || 60000);
+const BACKEND_API_FETCH_COOLDOWN_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS))
+    ? Number(globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS)
+    : 60000
+);
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
 // Cap for the tail of last_response_progress_text persisted to chrome.storage.session.
@@ -1437,7 +1443,9 @@ async function waitForResponse(job) {
       && extractionIdle
       && extraction?.method !== "page_text_fallback"
     );
+    const backendApiFinal = Boolean(scopedExtractionCandidate && isFreshBackendApiExtraction(extraction));
     const finalAffordance = Boolean(scopedExtractionCandidate && hasFinalAssistantAffordance(extraction));
+    const finalStructuralResponse = finalAffordance || backendApiFinal;
     // Broad page text is diagnostic only; final controls without scoped text
     // means extraction failed, not that page chrome is safe to return.
     const finalAffordanceWithoutScopedText = Boolean(
@@ -1448,19 +1456,22 @@ async function waitForResponse(job) {
     );
     const stableIdleUnscopedCopy = Boolean(
       scopedExtractionCandidate
-      && !finalAffordance
+      && !finalStructuralResponse
       && hasStableIdleUnscopedCopyAffordance(job, extraction)
     );
     const renderRefreshCandidateEligible = isRenderFreezeRefreshCandidate(
       job,
       extraction,
       scopedExtractionCandidate,
-      finalAffordance
+      finalStructuralResponse
     );
     let stableForMs = 0;
     let unscopedCopyStableForMs = 0;
     let renderRefreshStableForMs = 0;
-    if (finalAffordance) {
+    if (backendApiFinal) {
+      return completedExtraction(extraction, "backend_api", 0);
+    }
+    if (finalStructuralResponse) {
       // Once ChatGPT exposes final assistant controls, scope and turn checks
       // have already ruled out pre-send content. From here we track the best
       // scoped candidate by text growth so late page chrome cannot replace a
@@ -1486,7 +1497,11 @@ async function waitForResponse(job) {
       // for the short confirm window, the response is settled — emit instead of
       // burning the full idle floor.
       if (stableForMs >= affordanceConfirmMs) {
-        return completedExtraction(finalAffordanceCandidate, "copy_button", stableForMs);
+        return completedExtraction(
+          finalAffordanceCandidate,
+          completionReasonForFinalCandidate(finalAffordanceCandidate),
+          stableForMs
+        );
       }
       unscopedCopyCandidate = null;
       bestUnscopedCopyCandidate = null;
@@ -1525,7 +1540,7 @@ async function waitForResponse(job) {
       if (unscopedCopyStableForMs >= finalAffordanceIdleMs) {
         return completedExtraction(unscopedCopyCandidate, "stable_idle_unscoped_copy_button", unscopedCopyStableForMs);
       }
-    } else if (!finalAffordance) {
+    } else if (!finalStructuralResponse) {
       unscopedCopyCandidate = null;
       unscopedCopyCandidateSinceMs = 0;
       if (!postSendAssistantActivity) {
@@ -1554,7 +1569,7 @@ async function waitForResponse(job) {
       renderRefreshCandidate = null;
       renderRefreshCandidateSinceMs = 0;
     }
-    const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalAffordance);
+    const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalStructuralResponse);
     if (finalAffordanceWithoutScopedText) {
       if (!extractionFailureSinceMs) {
         extractionFailureSinceMs = Date.now();
@@ -1594,6 +1609,7 @@ async function waitForResponse(job) {
         next_poll_ms: nextDelay,
         stable_for_ms: Math.max(stableForMs, unscopedCopyStableForMs, renderRefreshStableForMs),
         final_affordance: finalAffordance,
+        backend_api_final: backendApiFinal,
         stable_idle_unscoped_copy_candidate: stableIdleUnscopedCopy,
         extraction_failure_candidate: finalAffordanceWithoutScopedText,
         render_refresh_candidate: renderRefreshCandidateEligible
@@ -1756,6 +1772,12 @@ function diagnosticPayload(diagnostics) {
 }
 
 async function extractResponseForJob(job) {
+  const domExtraction = await extractDomResponseForJob(job);
+  const backendExtraction = await maybeBackendApiExtractionForJob(job, domExtraction);
+  return backendExtraction ?? domExtraction;
+}
+
+async function extractDomResponseForJob(job) {
   try {
     return await sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
   } catch (error) {
@@ -1765,6 +1787,77 @@ async function extractResponseForJob(job) {
     await recoverContentScriptJob(job, error);
     return sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
   }
+}
+
+async function maybeBackendApiExtractionForJob(job, domExtraction) {
+  if (!shouldFetchBackendApi(job, domExtraction)) {
+    return null;
+  }
+  const conversationId = conversationIdForJob(job, domExtraction);
+  job.backend_api_last_fetch_at = Date.now();
+  job.updated_at = Date.now();
+  await persistJob(job);
+  try {
+    const backendExtraction = await sendToTab(job.tab_id, {
+      type: "yoetz_fetch_conversation",
+      job,
+      conversation_id: conversationId
+    });
+    const normalized = normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId);
+    return isFreshBackendApiExtraction(normalized) ? normalized : null;
+  } catch (error) {
+    if (!isBackendApiFallbackError(error)) {
+      throw error;
+    }
+    job.backend_api_disabled = true;
+    job.backend_api_disabled_reason = error?.code ?? String(error?.message ?? error);
+    job.updated_at = Date.now();
+    await persistJob(job);
+    return null;
+  }
+}
+
+function shouldFetchBackendApi(job, domExtraction) {
+  if (job?.backend_api_disabled) {
+    return false;
+  }
+  if (!domExtraction || domExtraction.manual_handoff || domExtraction.is_generating) {
+    return false;
+  }
+  if (!conversationIdForJob(job, domExtraction)) {
+    return false;
+  }
+  const lastFetchAt = Number(job.backend_api_last_fetch_at ?? 0);
+  return Date.now() - lastFetchAt >= BACKEND_API_FETCH_COOLDOWN_MS;
+}
+
+function normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId) {
+  const nodeFresh = Boolean(backendExtraction?.node_fresh);
+  const text = nodeFresh ? String(backendExtraction?.text ?? "") : "";
+  return {
+    ...backendExtraction,
+    method: "backend_api",
+    text,
+    is_generating: !nodeFresh || Boolean(backendExtraction?.is_generating),
+    node_fresh: nodeFresh,
+    conversation_id: conversationId,
+    assistant_count: backendExtraction?.assistant_count ?? domExtraction?.assistant_count ?? 0,
+    user_count: backendExtraction?.user_count ?? domExtraction?.user_count ?? 0,
+    preceding_user_count: backendExtraction?.preceding_user_count ?? domExtraction?.preceding_user_count,
+    turn_index: backendExtraction?.turn_index ?? domExtraction?.turn_index ?? -1,
+    copy_button_count: backendExtraction?.copy_button_count ?? domExtraction?.copy_button_count ?? 0,
+    has_copy_button: Boolean(backendExtraction?.has_copy_button),
+    diagnostics: backendExtraction?.diagnostics ?? domExtraction?.diagnostics
+  };
+}
+
+function isBackendApiFallbackError(error) {
+  const code = String(error?.code ?? "");
+  if (code.startsWith("backend_api_")) {
+    return true;
+  }
+  const message = String(error?.message ?? error);
+  return /unknown content-script command yoetz_fetch_conversation|unexpected tab message yoetz_fetch_conversation|401|unauthorized|conversation api|backend api/i.test(message);
 }
 
 async function recoverContentScriptJob(job, error) {
@@ -1791,12 +1884,18 @@ function isPostSendExtraction(job, extraction) {
   if (!extraction || extraction.method === "page_text_fallback") {
     return false;
   }
+  if (isFreshBackendApiExtraction(extraction)) {
+    return true;
+  }
   return isPostSendAssistantActivity(job, extraction);
 }
 
 function isPostSendAssistantActivity(job, extraction, allowUnknownTurnIndex = false) {
   if (!extraction) {
     return false;
+  }
+  if (isFreshBackendApiExtraction(extraction)) {
+    return true;
   }
   const submittedUserCount = nonNegativeFiniteNumber(job.submitted_user_count);
   const precedingUserCount = nonNegativeFiniteNumber(extraction.preceding_user_count);
@@ -1815,6 +1914,13 @@ function isPostSendAssistantActivity(job, extraction, allowUnknownTurnIndex = fa
     return true;
   }
   return baselineCount === 0 && currentCount > 0;
+}
+
+function isFreshBackendApiExtraction(extraction) {
+  return extraction?.method === "backend_api"
+    && extraction.node_fresh === true
+    && !extraction.is_generating
+    && Boolean(normalizedResponseText(extraction.text));
 }
 
 function nonNegativeFiniteNumber(value) {
@@ -1987,6 +2093,10 @@ function completedExtraction(extraction, completionReason, stableForMs) {
     assistant_turn_count: Number(extraction.assistant_count ?? 0),
     copy_button_count: Number(extraction.copy_button_count ?? 0)
   };
+}
+
+function completionReasonForFinalCandidate(extraction) {
+  return isFreshBackendApiExtraction(extraction) ? "backend_api" : "copy_button";
 }
 
 function enforceMessageCapability(message) {
