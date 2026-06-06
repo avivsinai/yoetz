@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 ### Fixed
 
+- ChatGPT native-extension capture now reads completed answers from ChatGPT's
+  same-origin backend conversation API after the DOM reports generation idle.
+  This is the primary recovery path for backgrounded Pro runs whose rendered
+  transcript freezes on the first token (for example `"I"`): the content script
+  resolves the active `current_node` lineage only, rejects stale/off-branch
+  answers, and returns the full backend answer to the service worker without
+  waiting for final copy controls that may never render while the tab is
+  backgrounded.
 - ChatGPT native-extension runs now refresh the owned conversation tab when a
   background live-stream render freezes on a short idle assistant prefix without
   final scoped copy controls. The refresh is bounded, reloads the same
