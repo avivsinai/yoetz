@@ -220,18 +220,12 @@ async function fetchConversationAnswer(job, requestedConversationId) {
     || expectedConversationIdForJob(job)
     || conversationIdFromUrl(location.href);
   if (!conversationId) {
-    throw commandError("backend_api_unavailable", "no conversation id available for backend-api read", {
-      phase: "wait_response",
-      side_effect_started: true
-    });
+    throw backendApiError("backend_api_unavailable", "no conversation id available for backend-api read");
   }
   // accessToken is fetched PER CALL — it expires and must never be cached.
   const token = await fetchChatgptAccessToken();
   if (!token) {
-    throw commandError("backend_api_unauthorized", "no ChatGPT access token (session expired or signed out)", {
-      phase: "wait_response",
-      side_effect_started: true
-    });
+    throw backendApiError("backend_api_unauthorized", "no ChatGPT access token (session expired or signed out)");
   }
   let res;
   try {
@@ -241,34 +235,28 @@ async function fetchConversationAnswer(job, requestedConversationId) {
       headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
     });
   } catch (error) {
-    throw commandError("backend_api_unavailable", `backend-api conversation fetch failed: ${String(error?.message ?? error)}`, {
-      phase: "wait_response",
-      side_effect_started: true
-    });
+    throw backendApiError("backend_api_unavailable", `backend-api conversation fetch failed: ${String(error?.message ?? error)}`);
   }
   // 401/403 -> auth lane (SW falls back to reload-to-render / DOM); other non-2xx -> unavailable.
   if (res.status === 401 || res.status === 403) {
-    throw commandError("backend_api_unauthorized", `backend-api conversation returned ${res.status}`, {
-      phase: "wait_response",
-      side_effect_started: true
-    });
+    throw backendApiError("backend_api_unauthorized", `backend-api conversation returned ${res.status}`);
   }
   if (!res.ok) {
-    throw commandError("backend_api_unavailable", `backend-api conversation returned ${res.status}`, {
-      phase: "wait_response",
-      side_effect_started: true
-    });
+    throw backendApiError("backend_api_unavailable", `backend-api conversation returned ${res.status}`);
   }
   let data;
   try {
     data = await res.json();
   } catch (error) {
-    throw commandError("backend_api_unavailable", `backend-api conversation returned non-JSON: ${String(error?.message ?? error)}`, {
-      phase: "wait_response",
-      side_effect_started: true
-    });
+    throw backendApiError("backend_api_unavailable", `backend-api conversation returned non-JSON: ${String(error?.message ?? error)}`);
   }
   return resolveBackendAnswer(job, conversationId, data);
+}
+
+// Backend-api read failures are all wait_response-phase, side-effect-started (the prompt was already
+// sent). The SW maps backend_api_* codes to its T2 reload / T3 DOM fallback.
+function backendApiError(code, message) {
+  return commandError(code, message, { phase: "wait_response", side_effect_started: true });
 }
 
 async function fetchChatgptAccessToken() {
