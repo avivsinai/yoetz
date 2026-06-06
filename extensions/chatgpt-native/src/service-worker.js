@@ -28,6 +28,20 @@ const MIN_UNSCOPED_COPY_STABLE_TEXT_CHARS = Math.max(
   1,
   Number(globalThis.__YOETZ_MIN_UNSCOPED_COPY_STABLE_TEXT_CHARS ?? 4096) || 4096
 );
+const RENDER_FREEZE_SHORT_RESPONSE_MAX_CHARS = Math.max(
+  1,
+  Number(globalThis.__YOETZ_RENDER_FREEZE_SHORT_RESPONSE_MAX_CHARS ?? 32) || 32
+);
+const MIN_RENDER_FREEZE_IDLE_MS = Math.max(
+  0,
+  Number(globalThis.__YOETZ_MIN_RENDER_FREEZE_IDLE_MS ?? MIN_STABLE_IDLE_MS) || MIN_STABLE_IDLE_MS
+);
+const MAX_RENDER_REFRESH_ATTEMPTS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_MAX_RENDER_REFRESH_ATTEMPTS))
+    ? Number(globalThis.__YOETZ_MAX_RENDER_REFRESH_ATTEMPTS)
+    : 1
+);
 // Once ChatGPT has exposed a final assistant affordance (copy control) AND scoped
 // text is extractable AND generation has stopped, the response is structurally
 // complete. Confirm it over a SHORT stable window at a FAST cadence instead of
@@ -53,6 +67,12 @@ const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
 );
 const WAITING_RESPONSE_PROGRESS_INTERVAL_MS = Math.max(50, Number(globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS ?? 60000) || 60000);
+const BACKEND_API_FETCH_COOLDOWN_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS))
+    ? Number(globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS)
+    : 60000
+);
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
 // Cap for the tail of last_response_progress_text persisted to chrome.storage.session.
@@ -1383,6 +1403,8 @@ async function waitForResponse(job) {
   let unscopedCopyCandidate = null;
   let bestUnscopedCopyCandidate = null;
   let unscopedCopyCandidateSinceMs = 0;
+  let renderRefreshCandidate = null;
+  let renderRefreshCandidateSinceMs = 0;
   let extractionFailureSinceMs = 0;
   let lastWaitingProgressAt = startedAt;
   const timeoutMs = responseWaitTimeoutMs(job);
@@ -1421,7 +1443,9 @@ async function waitForResponse(job) {
       && extractionIdle
       && extraction?.method !== "page_text_fallback"
     );
+    const backendApiFinal = Boolean(scopedExtractionCandidate && isFreshBackendApiExtraction(extraction));
     const finalAffordance = Boolean(scopedExtractionCandidate && hasFinalAssistantAffordance(extraction));
+    const finalStructuralResponse = finalAffordance || backendApiFinal;
     // Broad page text is diagnostic only; final controls without scoped text
     // means extraction failed, not that page chrome is safe to return.
     const finalAffordanceWithoutScopedText = Boolean(
@@ -1432,12 +1456,22 @@ async function waitForResponse(job) {
     );
     const stableIdleUnscopedCopy = Boolean(
       scopedExtractionCandidate
-      && !finalAffordance
+      && !finalStructuralResponse
       && hasStableIdleUnscopedCopyAffordance(job, extraction)
+    );
+    const renderRefreshCandidateEligible = isRenderFreezeRefreshCandidate(
+      job,
+      extraction,
+      scopedExtractionCandidate,
+      finalStructuralResponse
     );
     let stableForMs = 0;
     let unscopedCopyStableForMs = 0;
-    if (finalAffordance) {
+    let renderRefreshStableForMs = 0;
+    if (backendApiFinal) {
+      return completedExtraction(extraction, "backend_api", 0);
+    }
+    if (finalStructuralResponse) {
       // Once ChatGPT exposes final assistant controls, scope and turn checks
       // have already ruled out pre-send content. From here we track the best
       // scoped candidate by text growth so late page chrome cannot replace a
@@ -1480,6 +1514,8 @@ async function waitForResponse(job) {
       unscopedCopyCandidate = null;
       bestUnscopedCopyCandidate = null;
       unscopedCopyCandidateSinceMs = 0;
+      renderRefreshCandidate = null;
+      renderRefreshCandidateSinceMs = 0;
     }
     if (stableIdleUnscopedCopy) {
       const bestSelection = selectFinalAffordanceCandidate(bestUnscopedCopyCandidate, extraction);
@@ -1500,14 +1536,36 @@ async function waitForResponse(job) {
       if (unscopedCopyStableForMs >= finalAffordanceIdleMs) {
         return completedExtraction(unscopedCopyCandidate, "stable_idle_unscoped_copy_button", unscopedCopyStableForMs);
       }
-    } else if (!finalAffordance) {
+    } else if (!finalStructuralResponse) {
       unscopedCopyCandidate = null;
       unscopedCopyCandidateSinceMs = 0;
       if (!postSendAssistantActivity) {
         bestUnscopedCopyCandidate = null;
       }
     }
-    const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalAffordance);
+    if (renderRefreshCandidateEligible) {
+      if (!sameRenderRefreshCandidate(renderRefreshCandidate, extraction)) {
+        renderRefreshCandidate = extraction;
+        renderRefreshCandidateSinceMs = Date.now();
+      } else if (!renderRefreshCandidateSinceMs) {
+        renderRefreshCandidateSinceMs = Date.now();
+      }
+      renderRefreshStableForMs = Date.now() - renderRefreshCandidateSinceMs;
+      if (renderRefreshStableForMs >= MIN_RENDER_FREEZE_IDLE_MS && canRefreshFrozenRender(job)) {
+        await refreshFrozenRender(job, extraction, renderRefreshStableForMs);
+        renderRefreshCandidate = null;
+        renderRefreshCandidateSinceMs = 0;
+        finalAffordanceCandidate = null;
+        finalAffordanceCandidateSinceMs = 0;
+        unscopedCopyCandidate = null;
+        unscopedCopyCandidateSinceMs = 0;
+        continue;
+      }
+    } else {
+      renderRefreshCandidate = null;
+      renderRefreshCandidateSinceMs = 0;
+    }
+    const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalStructuralResponse);
     if (finalAffordanceWithoutScopedText) {
       if (!extractionFailureSinceMs) {
         extractionFailureSinceMs = Date.now();
@@ -1545,10 +1603,12 @@ async function waitForResponse(job) {
         elapsed_ms: elapsedMs,
         timeout_ms: timeoutMs,
         next_poll_ms: nextDelay,
-        stable_for_ms: Math.max(stableForMs, unscopedCopyStableForMs),
+        stable_for_ms: Math.max(stableForMs, unscopedCopyStableForMs, renderRefreshStableForMs),
         final_affordance: finalAffordance,
+        backend_api_final: backendApiFinal,
         stable_idle_unscoped_copy_candidate: stableIdleUnscopedCopy,
-        extraction_failure_candidate: finalAffordanceWithoutScopedText
+        extraction_failure_candidate: finalAffordanceWithoutScopedText,
+        render_refresh_candidate: renderRefreshCandidateEligible
       };
       if (awaitingFinalAffordance) {
         waitingDetail.awaiting_final_affordance = true;
@@ -1708,6 +1768,12 @@ function diagnosticPayload(diagnostics) {
 }
 
 async function extractResponseForJob(job) {
+  const domExtraction = await extractDomResponseForJob(job);
+  const backendExtraction = await maybeBackendApiExtractionForJob(job, domExtraction);
+  return backendExtraction ?? domExtraction;
+}
+
+async function extractDomResponseForJob(job) {
   try {
     return await sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
   } catch (error) {
@@ -1717,6 +1783,77 @@ async function extractResponseForJob(job) {
     await recoverContentScriptJob(job, error);
     return sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
   }
+}
+
+async function maybeBackendApiExtractionForJob(job, domExtraction) {
+  if (!shouldFetchBackendApi(job, domExtraction)) {
+    return null;
+  }
+  const conversationId = conversationIdForJob(job, domExtraction);
+  job.backend_api_last_fetch_at = Date.now();
+  job.updated_at = Date.now();
+  await persistJob(job);
+  try {
+    const backendExtraction = await sendToTab(job.tab_id, {
+      type: "yoetz_fetch_conversation",
+      job,
+      conversation_id: conversationId
+    });
+    const normalized = normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId);
+    return isFreshBackendApiExtraction(normalized) ? normalized : null;
+  } catch (error) {
+    if (!isBackendApiFallbackError(error)) {
+      throw error;
+    }
+    job.backend_api_disabled = true;
+    job.backend_api_disabled_reason = error?.code ?? String(error?.message ?? error);
+    job.updated_at = Date.now();
+    await persistJob(job);
+    return null;
+  }
+}
+
+function shouldFetchBackendApi(job, domExtraction) {
+  if (job?.backend_api_disabled) {
+    return false;
+  }
+  if (!domExtraction || domExtraction.manual_handoff || domExtraction.is_generating) {
+    return false;
+  }
+  if (!conversationIdForJob(job, domExtraction)) {
+    return false;
+  }
+  const lastFetchAt = Number(job.backend_api_last_fetch_at ?? 0);
+  return Date.now() - lastFetchAt >= BACKEND_API_FETCH_COOLDOWN_MS;
+}
+
+function normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId) {
+  const nodeFresh = Boolean(backendExtraction?.node_fresh);
+  const text = nodeFresh ? String(backendExtraction?.text ?? "") : "";
+  return {
+    ...backendExtraction,
+    method: "backend_api",
+    text,
+    is_generating: !nodeFresh || Boolean(backendExtraction?.is_generating),
+    node_fresh: nodeFresh,
+    conversation_id: conversationId,
+    assistant_count: backendExtraction?.assistant_count ?? domExtraction?.assistant_count ?? 0,
+    user_count: backendExtraction?.user_count ?? domExtraction?.user_count ?? 0,
+    preceding_user_count: backendExtraction?.preceding_user_count ?? domExtraction?.preceding_user_count,
+    turn_index: backendExtraction?.turn_index ?? domExtraction?.turn_index ?? -1,
+    copy_button_count: backendExtraction?.copy_button_count ?? domExtraction?.copy_button_count ?? 0,
+    has_copy_button: Boolean(backendExtraction?.has_copy_button),
+    diagnostics: backendExtraction?.diagnostics ?? domExtraction?.diagnostics
+  };
+}
+
+function isBackendApiFallbackError(error) {
+  const code = String(error?.code ?? "");
+  if (code.startsWith("backend_api_")) {
+    return true;
+  }
+  const message = String(error?.message ?? error);
+  return /unknown content-script command yoetz_fetch_conversation|unexpected tab message yoetz_fetch_conversation|401|unauthorized|conversation api|backend api/i.test(message);
 }
 
 async function recoverContentScriptJob(job, error) {
@@ -1743,12 +1880,18 @@ function isPostSendExtraction(job, extraction) {
   if (!extraction || extraction.method === "page_text_fallback") {
     return false;
   }
+  if (isFreshBackendApiExtraction(extraction)) {
+    return true;
+  }
   return isPostSendAssistantActivity(job, extraction);
 }
 
 function isPostSendAssistantActivity(job, extraction, allowUnknownTurnIndex = false) {
   if (!extraction) {
     return false;
+  }
+  if (isFreshBackendApiExtraction(extraction)) {
+    return true;
   }
   const submittedUserCount = nonNegativeFiniteNumber(job.submitted_user_count);
   const precedingUserCount = nonNegativeFiniteNumber(extraction.preceding_user_count);
@@ -1767,6 +1910,13 @@ function isPostSendAssistantActivity(job, extraction, allowUnknownTurnIndex = fa
     return true;
   }
   return baselineCount === 0 && currentCount > 0;
+}
+
+function isFreshBackendApiExtraction(extraction) {
+  return extraction?.method === "backend_api"
+    && extraction.node_fresh === true
+    && !extraction.is_generating
+    && Boolean(normalizedResponseText(extraction.text));
 }
 
 function nonNegativeFiniteNumber(value) {
@@ -1812,6 +1962,74 @@ function hasStableIdleUnscopedCopyAffordance(job, extraction) {
 function hasNoVisibleStopControls(extraction) {
   const stopControlCount = nonNegativeFiniteNumber(extraction?.diagnostics?.counts?.stop_controls);
   return stopControlCount === null || stopControlCount === 0;
+}
+
+function isRenderFreezeRefreshCandidate(job, extraction, scopedExtractionCandidate, finalAffordance) {
+  if (!scopedExtractionCandidate || finalAffordance) {
+    return false;
+  }
+  if (!canRefreshFrozenRender(job)) {
+    return false;
+  }
+  if (!hasExplicitlyNoVisibleStopControls(extraction)) {
+    return false;
+  }
+  const text = normalizedResponseText(extraction?.text);
+  if (!text || text.length > RENDER_FREEZE_SHORT_RESPONSE_MAX_CHARS) {
+    return false;
+  }
+  const conversationId = conversationIdForJob(job, extraction);
+  return Boolean(conversationId);
+}
+
+function hasExplicitlyNoVisibleStopControls(extraction) {
+  const stopControlCount = nonNegativeFiniteNumber(extraction?.diagnostics?.counts?.stop_controls);
+  return stopControlCount === 0;
+}
+
+function canRefreshFrozenRender(job) {
+  return Number(job?.render_refresh_attempts ?? 0) < MAX_RENDER_REFRESH_ATTEMPTS;
+}
+
+function sameRenderRefreshCandidate(candidate, extraction) {
+  if (!candidate || !extraction) {
+    return false;
+  }
+  return normalizedResponseText(candidate.text) === normalizedResponseText(extraction.text)
+    && Number(candidate.assistant_count ?? 0) === Number(extraction.assistant_count ?? 0)
+    && Number(candidate.turn_index ?? -1) === Number(extraction.turn_index ?? -1);
+}
+
+async function refreshFrozenRender(job, extraction, stableForMs) {
+  const conversationId = conversationIdForJob(job, extraction);
+  const url = chatgptConversationJobUrl(conversationId, job.run_id);
+  job.render_refresh_attempts = Number(job.render_refresh_attempts ?? 0) + 1;
+  job.updated_at = Date.now();
+  await persistJob(job);
+  postNative(progress(job, "render_refreshing", {
+    tab_id: job.tab_id,
+    conversation_id: conversationId,
+    conversation_url: url,
+    attempt: job.render_refresh_attempts,
+    max_attempts: MAX_RENDER_REFRESH_ATTEMPTS,
+    stable_for_ms: stableForMs,
+    response_length: extraction?.text?.length ?? 0,
+    extraction_method: extraction?.method ?? "none",
+    message: `refreshing owned ChatGPT conversation render after idle short response stayed frozen for ${formatDurationForMessage(stableForMs)}`
+  }));
+  await chrome.tabs.update(job.tab_id, { url, active: false });
+  await waitForChatgptTab(job.tab_id);
+  await waitForContentScript(job.tab_id);
+  const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
+  postNative(progress(job, "render_refreshed", {
+    tab_id: job.tab_id,
+    conversation_id: conversationId,
+    conversation_url: url,
+    attempt: job.render_refresh_attempts,
+    url: rebound?.url ?? null,
+    title: rebound?.title ?? null,
+    message: "owned ChatGPT conversation render refreshed; continuing final-response polling"
+  }));
 }
 
 function responseStableIdleThresholdMs(intervalMs) {

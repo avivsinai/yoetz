@@ -22,6 +22,8 @@ async function handleMessage(message) {
       return sendPrompt(message.job, message.prompt);
     case "yoetz_extract_response":
       return extractJobResponse(message.job);
+    case "yoetz_fetch_conversation":
+      return fetchConversationAnswer(message.job, message.conversation_id);
     case "yoetz_cancel_send":
       return cancelSend(message.job);
     case "yoetz_inspect_page":
@@ -199,6 +201,199 @@ async function extractJobResponse(job) {
     url: location.href,
     conversation_id: conversationId
   };
+}
+
+// T1 freeze-proof answer source: read the FINAL assistant answer from ChatGPT's backend
+// conversation API instead of the rendered DOM. The owned tab live-streams the answer while
+// BACKGROUNDED, where Chromium suspends rAF rendering, so the DOM freezes at the first token
+// ("I"); but a same-origin JSON GET runs on a task source Chrome does NOT throttle in background
+// tabs, so it returns the complete server-side answer (live-proven: full answer in a hidden tab
+// while the DOM was clipped). Same-origin fetch from this ISOLATED content script authenticates
+// with the page's httpOnly session cookie; host_permissions already covers chatgpt.com, so this
+// is zero new permission. The service worker owns WHEN to call this (gated on DOM idle) and the
+// T1->T2(reload)->T3(DOM) fallback; this function only reads + resolves the answer node.
+async function fetchConversationAnswer(job, requestedConversationId) {
+  const { parseOwnedWindowName } = await domHelpers();
+  // Ownership marker (window.name run/job) must still match — never read for the wrong job/tab.
+  assertJobOwnership(job, parseOwnedWindowName);
+  const conversationId = String(requestedConversationId ?? "").trim()
+    || expectedConversationIdForJob(job)
+    || conversationIdFromUrl(location.href);
+  if (!conversationId) {
+    throw backendApiError("backend_api_unavailable", "no conversation id available for backend-api read");
+  }
+  // accessToken is fetched PER CALL — it expires and must never be cached.
+  const token = await fetchChatgptAccessToken();
+  if (!token) {
+    throw backendApiError("backend_api_unauthorized", "no ChatGPT access token (session expired or signed out)");
+  }
+  let res;
+  try {
+    res = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
+      method: "GET",
+      credentials: "include",
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
+    });
+  } catch (error) {
+    throw backendApiError("backend_api_unavailable", `backend-api conversation fetch failed: ${String(error?.message ?? error)}`);
+  }
+  // 401/403 -> auth lane (SW falls back to reload-to-render / DOM); other non-2xx -> unavailable.
+  if (res.status === 401 || res.status === 403) {
+    throw backendApiError("backend_api_unauthorized", `backend-api conversation returned ${res.status}`);
+  }
+  if (!res.ok) {
+    throw backendApiError("backend_api_unavailable", `backend-api conversation returned ${res.status}`);
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch (error) {
+    throw backendApiError("backend_api_unavailable", `backend-api conversation returned non-JSON: ${String(error?.message ?? error)}`);
+  }
+  return resolveBackendAnswer(job, conversationId, data);
+}
+
+// Backend-api read failures are all wait_response-phase, side-effect-started (the prompt was already
+// sent). The SW maps backend_api_* codes to its T2 reload / T3 DOM fallback.
+function backendApiError(code, message) {
+  return commandError(code, message, { phase: "wait_response", side_effect_started: true });
+}
+
+async function fetchChatgptAccessToken() {
+  try {
+    const res = await fetch("/api/auth/session", {
+      method: "GET",
+      credentials: "include",
+      headers: { Accept: "application/json" }
+    });
+    if (!res.ok) {
+      return null;
+    }
+    const session = await res.json();
+    const token = session?.accessToken;
+    return typeof token === "string" && token.length > 0 ? token : null;
+  } catch {
+    return null;
+  }
+}
+
+// Resolve the FINAL assistant answer node from the conversation mapping. Returns an
+// extraction-shaped payload: node_fresh:true + is_generating:false when a NEW completed answer
+// exists; otherwise node_fresh:false + is_generating:true so the SW keeps waiting (never completes
+// on a stale/earlier turn). Never throws — a malformed/partial mapping is "not ready", not an
+// error.
+function resolveBackendAnswer(job, conversationId, data) {
+  const baseline = nonNegativeInt(job?.submitted_assistant_count ?? job?.response_baseline?.assistant_count ?? 0);
+  const notReady = (detail) => ({
+    method: "backend_api",
+    text: "",
+    is_generating: true,
+    conversation_id: conversationId,
+    node_fresh: false,
+    assistant_count: 0,
+    turn_index: -1,
+    has_copy_button: false,
+    copy_button_count: 0,
+    backend_api_detail: detail
+  });
+  const mapping = data && typeof data === "object" && data.mapping && typeof data.mapping === "object"
+    ? data.mapping
+    : null;
+  if (!mapping) {
+    return notReady("backend-api response had no conversation mapping");
+  }
+  // Freshness MUST be scoped to the ACTIVE current_node lineage, not the whole mapping. ChatGPT
+  // retains off-branch assistant answers (regenerations / abandoned / alternate branches) in the
+  // mapping; a global count could be inflated past the baseline by an off-branch node while the
+  // active lineage still points at a STALE earlier answer — returning that stale answer as fresh.
+  // So walk current_node -> root ONCE: the latest answer node on that path is THE answer, and the
+  // count of answer nodes on that path is what we compare against the pre-send baseline. current_node
+  // may be a tool/reasoning_recap node, so we cannot read it directly.
+  const { answerNode, count: lineageAnswerCount } = collectLineageAnswerNodes(mapping, data.current_node);
+  if (!answerNode) {
+    return notReady("no completed assistant answer node on the active lineage yet (still generating / tool-only)");
+  }
+  if (lineageAnswerCount <= baseline) {
+    return notReady(`assistant answer not fresh past baseline (active-lineage ${lineageAnswerCount} <= ${baseline})`);
+  }
+  const text = answerTextOf(answerNode.message);
+  if (!text) {
+    return notReady("latest active-lineage assistant answer node had no text parts");
+  }
+  return {
+    method: "backend_api",
+    text,
+    is_generating: false,
+    conversation_id: conversationId,
+    node_fresh: true,
+    assistant_count: lineageAnswerCount,
+    turn_index: Math.max(0, lineageAnswerCount - 1),
+    node_id: String(answerNode.id ?? answerNode.message?.id ?? ""),
+    has_copy_button: false,
+    copy_button_count: 0
+  };
+}
+
+// A node is a deliverable assistant answer ONLY if: assistant role, content_type 'text', addressed
+// to the user (recipient 'all'), end_turn true, and non-empty text. content_type+end_turn alone is
+// NOT sufficient — reasoning_recap nodes also carry end_turn:true (verified live), and tool turns
+// use non-'all' recipients.
+function isAssistantAnswerNode(message) {
+  if (!message || typeof message !== "object") {
+    return false;
+  }
+  if (message.author?.role !== "assistant") {
+    return false;
+  }
+  const content = message.content;
+  if (!content || content.content_type !== "text") {
+    return false;
+  }
+  if ((message.recipient ?? "all") !== "all") {
+    return false;
+  }
+  if (message.end_turn !== true) {
+    return false;
+  }
+  return answerTextOf(message).length > 0;
+}
+
+function answerTextOf(message) {
+  const parts = message?.content?.parts;
+  if (!Array.isArray(parts)) {
+    return "";
+  }
+  return parts.filter((part) => typeof part === "string").join("").trim();
+}
+
+// Walk current_node -> root once, collecting the COMPLETED assistant answer nodes that lie on the
+// ACTIVE lineage. Returns { answerNode: latest-on-lineage (closest to current_node), count }.
+// Off-branch answers (not on this path) are intentionally not seen here.
+function collectLineageAnswerNodes(mapping, currentNodeId) {
+  let id = currentNodeId;
+  let guard = 0;
+  let answerNode = null;
+  let count = 0;
+  while (id && guard < 2000) {
+    guard += 1;
+    const node = mapping[id];
+    if (!node) {
+      break;
+    }
+    if (isAssistantAnswerNode(node.message)) {
+      if (!answerNode) {
+        answerNode = node;
+      }
+      count += 1;
+    }
+    id = node.parent;
+  }
+  return { answerNode, count };
+}
+
+function nonNegativeInt(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
 async function inspectPage(runId, options = {}) {
