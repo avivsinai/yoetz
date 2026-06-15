@@ -1622,8 +1622,10 @@ async function waitForUploadComplete(root, file, options = {}) {
   const timeoutMs = Number(options.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS);
   const intervalMs = Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS);
   const baselineAttachments = options.baselineAttachments ?? new Set();
+  const requiredStableTicks = Math.max(1, Number(options.requiredStableTicks ?? 2));
   const startedAt = Date.now();
   let lastState = "";
+  let stableTicks = 0;
   while (Date.now() - startedAt < timeoutMs) {
     const error = uploadErrorText(root);
     if (error) {
@@ -1631,13 +1633,47 @@ async function waitForUploadComplete(root, file, options = {}) {
     }
     const attached = hasAttachmentNamed(root, file.name, baselineAttachments);
     const pending = hasUploadPending(root);
-    lastState = `attached=${attached}, pending=${pending}, diagnostics=${sendReadinessDiagnostics(root)}`;
-    if (attached && !pending) {
-      return true;
+    // ChatGPT renders the attachment chip almost immediately (~0.4s), long
+    // before the file finishes uploading server-side (often 10-30s). Returning
+    // at chip-appearance races the prompt-type + send that follow this step:
+    // the send button is briefly clickable (enabled by the typed prompt text)
+    // before ChatGPT re-gates it on the in-flight upload, so the message is
+    // submitted text-only and the attachment is silently dropped. ChatGPT keeps
+    // the send button disabled while an attachment is uploading and only
+    // re-enables it once the upload commits. waitForUploadComplete runs before
+    // any prompt text is inserted (the composer is still empty), so an enabled
+    // send button here is a reliable "upload committed" signal that does not
+    // depend on ChatGPT's progress-spinner markup. Requiring the chip to be
+    // present (`attached`) also rules out the pre-upload window where the send
+    // button is still enabled because ChatGPT has not yet registered the file.
+    const committed = uploadCommitted(root);
+    lastState = `attached=${attached}, pending=${pending}, committed=${committed}, diagnostics=${sendReadinessDiagnostics(root)}`;
+    if (attached && !pending && committed) {
+      stableTicks += 1;
+      if (stableTicks >= requiredStableTicks) {
+        return true;
+      }
+    } else {
+      stableTicks = 0;
     }
     await sleep(intervalMs);
   }
   throw new Error(`ChatGPT file upload did not complete for ${file.name} (${lastState})`);
+}
+
+// Upload commit signal: ChatGPT disables the send control while an attachment
+// uploads and re-enables it once the upload commits. This is checked while the
+// composer is still empty (before insertPrompt), so an enabled send button means
+// the attachment is ready, not that a prompt is ready to send. When ChatGPT
+// exposes no send control at all (an unexpected or minimal DOM), this signal is
+// unavailable and we fall back to treating the attachment chip as sufficient
+// rather than blocking the upload step indefinitely.
+function uploadCommitted(root) {
+  const present = findSendButtonControl(root, { requireEnabled: false });
+  if (!present) {
+    return true;
+  }
+  return Boolean(findSendButtonControl(root, { requireEnabled: true }));
 }
 
 async function openAttachmentUi(root, options = {}) {

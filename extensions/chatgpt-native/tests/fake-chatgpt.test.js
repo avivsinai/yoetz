@@ -209,6 +209,57 @@ test("fake ChatGPT page supports prompt upload send and stable extraction", asyn
   }
 });
 
+test("uploadFile waits for the upload to commit before returning", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  const previousInputEvent = globalThis.InputEvent;
+  globalThis.DataTransfer = FakeDataTransfer;
+  globalThis.InputEvent = class extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.inputType = init.inputType;
+      this.data = init.data;
+    }
+  };
+  try {
+    const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+    // ChatGPT renders the chip immediately but keeps the send button disabled
+    // until the upload commits server-side, then re-enables it. Model that race.
+    const send = new FakeElement("button", { "aria-label": "Send message" }, "Send");
+    send.disabled = true;
+    let committedAt = null;
+    const upload = new FakeElement("input", {
+      type: "file",
+      accept: "text/markdown",
+      onChange: () => {
+        body.append(new FakeElement("div", { "data-testid": "attachment-file" }, "fixture.md"));
+        setTimeout(() => {
+          send.disabled = false;
+          committedAt = Date.now();
+        }, 80);
+      }
+    });
+    const body = new FakeElement("body", {}, "Message ChatGPT").append(composer, upload, send);
+    const doc = new FakeDocument(body);
+
+    const file = new File(["bundle"], "fixture.md", { type: "text/markdown" });
+    await uploadFile(doc, file, { timeoutMs: 5000, intervalMs: 20, requiredStableTicks: 2 });
+    const returnedAt = Date.now();
+
+    // The previous implementation returned at chip-appearance, while the send
+    // button was still disabled (upload in flight), which dropped the attachment
+    // on the subsequent send. The fix must not return until the upload commits.
+    assert.equal(send.disabled, false, "uploadFile returned before the upload committed");
+    assert.ok(
+      committedAt !== null && returnedAt >= committedAt,
+      "uploadFile must wait for the send control to re-enable (upload committed)"
+    );
+    assert.equal(upload.files[0].name, "fixture.md");
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+    globalThis.InputEvent = previousInputEvent;
+  }
+});
+
 test("clickStopGenerating clicks a visible Stop streaming button and reports stopped", () => {
   const stop = new FakeElement("button", { "aria-label": "Stop streaming" }, "Stop");
   const body = new FakeElement("body", {}, "Stop").append(stop);
