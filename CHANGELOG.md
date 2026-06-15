@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.28] - 2026-06-15
 ### Fixed
 
 - ChatGPT native-extension uploads now wait for the attachment to commit before
@@ -13,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   immediately while the server-side upload is still in flight; Yoetz now waits
   for the composer send control to re-enable with the attachment present, which
   prevents text-only submissions that silently drop the uploaded bundle.
+
 
 ## [0.5.27] - 2026-06-06
 ### Fixed
