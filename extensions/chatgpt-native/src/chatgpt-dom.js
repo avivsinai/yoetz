@@ -1736,12 +1736,12 @@ function findAttachmentTiles(root, options = {}) {
 }
 
 function hasAttachmentNamed(root, filename, baselineAttachments = new Set()) {
-  const needle = normalizeText(filename).toLowerCase();
+  const needle = normalizedAttachmentText(filename);
   if (!needle) {
     return false;
   }
   const candidates = findAttachmentCandidates(root);
-  return candidates.some((node) => {
+  const nameMatched = candidates.some((node) => {
     if (baselineAttachments.has(attachmentNodeKey(node))) {
       return false;
     }
@@ -1750,8 +1750,47 @@ function hasAttachmentNamed(root, filename, baselineAttachments = new Set()) {
       node.getAttribute?.("aria-label"),
       node.getAttribute?.("title")
     ].filter(Boolean).join(" ");
-    return normalizeText(text).toLowerCase().includes(needle);
+    return attachmentTextMatchesFilename(text, needle);
   });
+  if (nameMatched) {
+    return true;
+  }
+
+  const newTiles = findAttachmentTiles(root, { composerOnly: true })
+    .filter((node) => !baselineAttachments.has(attachmentNodeKey(node)));
+  return newTiles.length === 1;
+}
+
+function attachmentTextMatchesFilename(text, filename) {
+  const haystack = normalizedAttachmentText(text);
+  if (!haystack || !filename) {
+    return false;
+  }
+  if (haystack.includes(filename)) {
+    return true;
+  }
+
+  const lastDot = filename.lastIndexOf(".");
+  const stem = lastDot > 0 ? filename.slice(0, lastDot) : filename;
+  const extension = lastDot > 0 ? filename.slice(lastDot) : "";
+  if (!stem) {
+    return false;
+  }
+
+  const boundary = "[^\\p{L}\\p{N}._-]";
+  const pattern = new RegExp(
+    `(^|${boundary})${escapeRegExp(stem)}\\s*\\(\\d+\\)${escapeRegExp(extension)}($|${boundary})`,
+    "iu"
+  );
+  return pattern.test(haystack);
+}
+
+function normalizedAttachmentText(value) {
+  return normalizeText(value).replace(/\s+/g, " ").toLowerCase();
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 // Broad candidate selector shared by upload baseline capture and the
