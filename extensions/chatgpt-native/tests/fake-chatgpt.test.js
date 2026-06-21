@@ -1631,6 +1631,62 @@ test("uploadFile waits for a new composer-scoped attachment tile", async () => {
   }
 });
 
+test("uploadFile accepts ChatGPT deduped attachment filenames", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+    const send = new FakeElement("button", { "aria-label": "Send message" }, "Send");
+    const upload = new FakeElement("input", {
+      type: "file",
+      accept: "text/markdown",
+      style: "display:none",
+      onChange: () => composer.parentElement.append(
+        new FakeElement("div", { "aria-label": "bundle(13).md", class: "file-tile" }, "bundle(13).md")
+      )
+    });
+    const body = new FakeElement("body", {}, "Message ChatGPT").append(composer, upload, send);
+    const doc = new FakeDocument(body);
+
+    await uploadFile(doc, new File(["bundle"], "bundle.md", { type: "text/markdown" }), {
+      timeoutMs: 250,
+      intervalMs: 10
+    });
+
+    assert.equal(upload.files[0].name, "bundle.md");
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
+test("uploadFile accepts one new attachment tile when ChatGPT hides the filename", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+    const send = new FakeElement("button", { "aria-label": "Send message" }, "Send");
+    const upload = new FakeElement("input", {
+      type: "file",
+      accept: "text/markdown",
+      style: "display:none",
+      onChange: () => composer.parentElement.append(
+        new FakeElement("div", { "aria-label": "Attached file", class: "file-tile" }, "File")
+      )
+    });
+    const body = new FakeElement("body", {}, "Message ChatGPT").append(composer, upload, send);
+    const doc = new FakeDocument(body);
+
+    await uploadFile(doc, new File(["bundle"], "bundle.md", { type: "text/markdown" }), {
+      timeoutMs: 250,
+      intervalMs: 10
+    });
+
+    assert.equal(upload.files[0].name, "bundle.md");
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
 test("uploadFile rejects a pre-existing composer-scoped node bearing only the filename", async () => {
   // Locks the regression behind H6: a composer-scoped node whose text
   // contains the bundle filename but which lacks any attachment-tile
