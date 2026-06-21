@@ -6,12 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.29] - 2026-06-21
 ### Fixed
 
 - ChatGPT native-extension uploads now recognize ChatGPT's deduplicated
   attachment filenames (for example `bundle(13).md` for `bundle.md`) and accept
   a single new composer-scoped attachment tile when Enterprise hides the
   filename, preventing false upload timeouts for repeated bundle submissions.
+
 
 ## [0.5.28] - 2026-06-15
 ### Fixed
