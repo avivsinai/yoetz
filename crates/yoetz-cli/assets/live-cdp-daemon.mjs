@@ -28,6 +28,7 @@ var LiveCdpSetInputFilesError = class extends Error {
     this.details = details;
     this.name = "LiveCdpSetInputFilesError";
   }
+  details;
 };
 var WebSocketLiveCdpTransport = class _WebSocketLiveCdpTransport {
   constructor(socket) {
@@ -53,6 +54,7 @@ var WebSocketLiveCdpTransport = class _WebSocketLiveCdpTransport {
       this.emitClose(typeof reason === "string" && reason.length > 0 ? reason : void 0);
     });
   }
+  socket;
   static async connect(endpoint) {
     const WebSocketConstructor = globalThis.WebSocket;
     if (!WebSocketConstructor) {
@@ -142,6 +144,7 @@ var CdpConnection = class _CdpConnection {
       this.markClosed(reason);
     });
   }
+  transport;
   static async connect(endpoint, transportFactory = (url) => WebSocketLiveCdpTransport.connect(url)) {
     return new _CdpConnection(await transportFactory(endpoint));
   }
@@ -296,6 +299,7 @@ var LiveCdpBrowserContext = class {
       this.handleEvent(event);
     });
   }
+  connection;
   #pagesByTargetId = /* @__PURE__ */ new Map();
   #pagesBySessionId = /* @__PURE__ */ new Map();
   pages() {
@@ -480,6 +484,7 @@ var LiveCdpKeyboard = class {
   constructor(page) {
     this.page = page;
   }
+  page;
   #modifiers = 0;
   async type(text) {
     for (const char of Array.from(text)) {
@@ -526,6 +531,7 @@ var LiveCdpMouse = class {
   constructor(page) {
     this.page = page;
   }
+  page;
   async click(x, y) {
     await this.page.clickPoint({ x, y });
   }
@@ -541,6 +547,9 @@ var LiveCdpPage = class extends EventEmitter {
     this.#url = targetInfo.url ?? "about:blank";
     this.#title = targetInfo.title ?? "";
   }
+  connection;
+  sessionId;
+  onClose;
   keyboard = new LiveCdpKeyboard(this);
   mouse = new LiveCdpMouse(this);
   #closed = false;
@@ -953,6 +962,8 @@ var LiveCdpLocator = class _LiveCdpLocator {
     this.page = page;
     this.descriptor = descriptor;
   }
+  page;
+  descriptor;
   async click(options = {}) {
     await this.waitFor({ state: "visible", timeout: options.timeout });
     const point = await this.page.locatorAction(this.descriptor, (element) => {
