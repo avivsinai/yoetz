@@ -205,6 +205,59 @@ test("service worker doctor auth probe prefers active non-owned ChatGPT tab and 
   }
 });
 
+test("service worker bridge_check is a no-op and does not recover jobs", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+  await storage.set({
+    "jobs.job_bridge_restore": {
+      job_id: "job_bridge_restore",
+      run_id: "run_job_bridge_restore",
+      workspace_id: "workspace_test",
+      status: "waiting_for_file",
+      prompt: "prompt",
+      tab_id: 42,
+      started_at: now,
+      updated_at: now
+    }
+  });
+
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {}
+  });
+
+  try {
+    await import(`../src/service-worker.js?bridge_check=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress"
+      && message.job_id === "job_bridge_restore"
+      && message.payload.phase === "ready_for_file"
+    ));
+    port.messages.length = 0;
+
+    port.emit(envelope("reconnect", "job_bridge_check", { intent: "bridge_check" }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_complete" && message.job_id === "job_bridge_check"
+    ));
+    const complete = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_bridge_check"
+    );
+    assert.equal(complete.payload.status, "ok");
+    assert.equal(Object.hasOwn(complete.payload, "restored_jobs"), false);
+    assert.equal(port.messages.some((message) => message.type === "reconnect"), false);
+    assert.equal(port.messages.some((message) =>
+      message.type === "job_progress" && message.job_id === "job_bridge_restore"
+    ), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker opens fresh and resume jobs in new owned tabs", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -625,6 +678,44 @@ test("service worker marks manual handoff as terminal after tab side effects", a
     assert.equal(error.payload.side_effect_started, true);
   } finally {
     globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker content-script readiness failure includes inspect context", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  const tabId = 920272522;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_content_script_missing" }),
+      sendMessage: async (_id, message) => {
+        if (message.type === "yoetz_probe") {
+          throw new Error("receiving end does not exist");
+        }
+        throw new Error(`unexpected tab message ${message.type}`);
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?content_script_missing=${Date.now()}`);
+    port.emit(envelope("job_start", "job_content_script_missing", { prompt: "prompt" }));
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.payload.code, "extension_error");
+    assert.equal(error.payload.phase, "upload");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.tab_id, tabId);
+    assert.equal(error.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_content_script_missing");
+    assert.match(error.payload.message, /Yoetz content script did not become ready in ChatGPT tab 920272522/);
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
   }
 });
 

@@ -268,9 +268,10 @@ yoetz browser recipe --recipe chatgpt --bundle ~/.yoetz/sessions/<id>/bundle.md 
 ```
 
 The default browser stack is extension-free unless the ChatGPT native extension
-is installed and connected. When connected, the ChatGPT recipe selects
-`chrome-extension-native` as the only default transport. Use an explicit
-`--transport <name>` when you want a different browser transport.
+is installed and connected. When connected, plain `yoetz browser check` uses a
+native dry-run and the ChatGPT recipe selects `chrome-extension-native` as the
+only default transport. Use an explicit `--transport <name>` when you want a
+different browser transport.
 
 Native extension happy path:
 

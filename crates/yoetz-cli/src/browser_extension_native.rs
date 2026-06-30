@@ -2081,11 +2081,16 @@ fn job_error_message(payload: &Value) -> String {
         .unwrap_or("chrome-extension-native job failed")
         .to_string();
     let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
+    let mut detail = Vec::new();
     if !code.starts_with("conversation_") {
+        append_job_error_detail(payload, &message, &mut detail);
+        if !detail.is_empty() {
+            message.push_str(". ");
+            message.push_str(&detail.join("; "));
+        }
         return message;
     }
 
-    let mut detail = Vec::new();
     if let Some(requested) = payload
         .get("requested_conversation_id")
         .and_then(Value::as_str)
@@ -2114,6 +2119,36 @@ fn job_error_message(payload: &Value) -> String {
             detail.push(phase_text);
         }
     }
+    append_job_error_detail(payload, &message, &mut detail);
+
+    if !detail.is_empty() {
+        message.push_str(". ");
+        message.push_str(&detail.join("; "));
+    }
+    message
+}
+
+fn append_job_error_detail(payload: &Value, message: &str, detail: &mut Vec<String>) {
+    if let Some(tab_id) = payload
+        .get("tab_id")
+        .and_then(Value::as_i64)
+        .filter(|value| *value >= 0)
+    {
+        let tab_text = format!("tab {tab_id}");
+        if !message.contains(&tab_text) {
+            detail.push(tab_text);
+        }
+    }
+    if let Some(phase) = payload
+        .get("phase")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        let phase_text = format!("phase {phase}");
+        if !message.contains(&phase_text) && !detail.iter().any(|item| item == &phase_text) {
+            detail.push(phase_text);
+        }
+    }
     if let Some(inspect_command) = payload
         .get("inspect_command")
         .and_then(Value::as_str)
@@ -2123,12 +2158,6 @@ fn job_error_message(payload: &Value) -> String {
             detail.push(format!("inspect with: {inspect_command}"));
         }
     }
-
-    if !detail.is_empty() {
-        message.push_str(". ");
-        message.push_str(&detail.join("; "));
-    }
-    message
 }
 
 fn emit_progress(format: OutputFormat, envelope: &ProtocolEnvelope) -> Result<()> {
@@ -4153,11 +4182,38 @@ mod tests {
                 "inspect_command": "yoetz browser extension inspect --chatgpt --run-id run_conv",
             }),
         ));
-        let text = err.to_string();
+        let text = format!("{err:#}");
 
         assert!(text.contains("requested conversation conv-404"));
         assert!(text.contains("current URL https://chatgpt.com/c/conv-404?_yoetz=run_conv"));
         assert!(text.contains("phase upload"));
         assert!(text.contains("yoetz browser extension inspect --chatgpt --run-id run_conv"));
+    }
+
+    #[test]
+    fn job_error_non_conversation_failures_surface_inspect_context() {
+        let err = job_error(ProtocolEnvelope::new(
+            "job_error",
+            Some("job_ready".to_string()),
+            Some("run_ready".to_string()),
+            json!({
+                "code": "extension_error",
+                "message": "Yoetz content script did not become ready in ChatGPT tab 920272522",
+                "phase": "upload",
+                "side_effect_started": true,
+                "tab_id": 920272522,
+                "inspect_command": "yoetz browser extension inspect --chatgpt --run-id run_ready",
+            }),
+        ));
+        let text = format!("{err:#}");
+
+        assert!(text.contains("Yoetz content script did not become ready"));
+        assert!(text.contains("tab 920272522"));
+        assert!(text.contains("phase upload"));
+        assert!(text.contains("yoetz browser extension inspect --chatgpt --run-id run_ready"));
+        assert_eq!(
+            crate::chatgpt_recipe::terminal_fallback_phase(&err),
+            Some(ChatgptTransportPhase::Upload)
+        );
     }
 }

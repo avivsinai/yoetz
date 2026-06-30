@@ -116,7 +116,7 @@ yoetz models list -s claude --format json
 | Bundle files | `yoetz bundle -p "context" -f "src/**/*.rs" --format json` |
 | Generate image | `yoetz generate image -p "description" --provider openai --model MODEL_ID --format json` |
 | Estimate cost | `yoetz pricing estimate --model MODEL_ID --input-tokens 1000 --output-tokens 500` |
-| Browser check (CDP/default) | `yoetz browser check --format json` |
+| Browser check (native if connected; CDP/default otherwise) | `yoetz browser check --format json` |
 | Extension check | `yoetz browser check --transport chrome-extension-native --format json` |
 | Browser attach | `yoetz browser attach --format json` |
 | Browser login | `yoetz browser login` |
@@ -339,10 +339,14 @@ yoetz browser extension grant-identity --chatgpt
 The extension transport is ChatGPT-only, native-host backed, and currently
 macOS/Linux-only. Do not use it as a general browser interpreter, and do not
 silently fall back to CDP after browser-side side effects have started.
-For extension-native workflows, do not run plain `yoetz browser check`; that
-checks the default CDP/browser stack and may trigger Chrome's remote-debugging
-approval. Use `yoetz browser check --transport chrome-extension-native --format json`
-or `yoetz browser extension doctor --chatgpt` instead.
+For extension-native workflows, plain `yoetz browser check --format json`
+auto-selects `chrome-extension-native` when the extension reports connected,
+returns `auto_selected: true`, and avoids Chrome's remote-debugging approval
+dialog. Use `yoetz browser check --transport chrome-extension-native --format json`
+for an explicit extension check, or `yoetz browser extension doctor --chatgpt`
+for deeper diagnostics. If you specifically need the CDP/browser stack, pass
+`--transport chrome-devtools-mcp`, `--transport dev-browser`,
+`--transport agent-browser`, `--cdp`, `--browser-id`, or a managed `--profile`.
 Do not run a live canary as a routine readiness step before ChatGPT Pro recipe
 runs; reserve it for explicit diagnostics.
 If `doctor` or `inspect` points to a live ChatGPT-side problem and the user
@@ -409,7 +413,7 @@ If auto-connect isn't available, cookie sync is still supported:
 ```bash
 # Log into ChatGPT in real Chrome, close Chrome, then:
 yoetz browser sync-cookies
-yoetz browser check --format json
+yoetz browser check --transport agent-browser --format json
 ```
 Requires Node >= 24.4. If macOS shows a Keychain prompt for `Chrome Safe Storage`, click `Always Allow`.
 
