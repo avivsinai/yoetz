@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.30] - 2026-06-30
 ### Changed
 
 - `yoetz browser check` now auto-selects the ChatGPT native extension dry-run
@@ -24,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   recovery context such as the ChatGPT tab id, terminal phase, and
   `inspect_command`.
 - Updated the locked `anyhow` version to address `RUSTSEC-2026-0190`.
+
 
 ## [0.5.29] - 2026-06-21
 ### Fixed
