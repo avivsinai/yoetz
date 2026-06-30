@@ -23,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Native extension failures after browser-side effects now include inspectable
   recovery context such as the ChatGPT tab id, terminal phase, and
   `inspect_command`.
+- Updated the locked `anyhow` version to address `RUSTSEC-2026-0190`.
 
 ## [0.5.29] - 2026-06-21
 ### Fixed
