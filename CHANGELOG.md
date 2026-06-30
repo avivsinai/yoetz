@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Changed
+
+- `yoetz browser check` now auto-selects the ChatGPT native extension dry-run
+  when the extension is installed and connected, reports whether the native path
+  was `auto_selected`, and avoids the CDP/dev-browser stack unless callers pass
+  an explicit transport, browser target, or managed profile.
+
+### Fixed
+
+- ChatGPT Pro browser recipes and checks now preserve explicit `--cdp`,
+  `--browser-id`, and managed `--profile` requests instead of hijacking them
+  into the native extension path.
+- Native extension `bridge_check` is now a side-effect-free readiness probe and
+  no longer resumes queued jobs while checking connectivity.
+- Native extension failures after browser-side effects now include inspectable
+  recovery context such as the ChatGPT tab id, terminal phase, and
+  `inspect_command`.
 
 ## [0.5.29] - 2026-06-21
 ### Fixed

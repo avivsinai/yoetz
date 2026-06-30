@@ -1167,6 +1167,22 @@ fn recipe_should_auto_discover_cdp_target(
         && (!extension_native_will_route || (requested_extension_native && allow_cdp_fallback))
 }
 
+fn recipe_should_auto_select_extension_native(
+    requested_transport: Option<browser::RecipeTransport>,
+    is_chatgpt: bool,
+    recipe_transports_pinned: bool,
+    managed_profile_only: bool,
+    explicit_browser_target: bool,
+    extension_connected: bool,
+) -> bool {
+    requested_transport.is_none()
+        && is_chatgpt
+        && !recipe_transports_pinned
+        && !managed_profile_only
+        && !explicit_browser_target
+        && extension_connected
+}
+
 fn manual_browser_recipe_fallback(recipe_path: &Path, bundle: Option<&Path>) -> String {
     let bundle_hint = bundle
         .map(|path| format!(" Upload or paste `{}` manually.", path.display()))
@@ -1487,6 +1503,30 @@ fn maybe_print_auto_selected_extension_native_transport(
     }
 }
 
+fn auto_selected_browser_check_extension_native_notice(
+    auto_selected: bool,
+) -> Option<&'static str> {
+    if auto_selected {
+        Some(
+            "info: auto-selected chrome-extension-native for browser check because the Yoetz Chrome extension is installed and connected (pass --transport chrome-devtools-mcp, --transport dev-browser, --transport agent-browser, --cdp, --browser-id, or --profile to check the CDP/browser stack)",
+        )
+    } else {
+        None
+    }
+}
+
+fn maybe_print_auto_selected_browser_check_extension_native(
+    auto_selected: bool,
+    format: OutputFormat,
+) {
+    if !matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+        return;
+    }
+    if let Some(notice) = auto_selected_browser_check_extension_native_notice(auto_selected) {
+        eprintln!("{notice}");
+    }
+}
+
 fn running_profile_recipe_transport_priority(transport: browser::RecipeTransport) -> u8 {
     match transport {
         browser::RecipeTransport::ChromeDevtoolsMcp => 0,
@@ -1603,7 +1643,11 @@ fn browser_check_transport_override(
         }
         browser::RecipeTransport::DevBrowser => Ok(Some(BrowserCheckTransport::DevBrowser)),
         browser::RecipeTransport::AgentBrowser => Ok(Some(BrowserCheckTransport::AgentBrowser)),
-        browser::RecipeTransport::ChromeExtensionNative => Ok(None),
+        browser::RecipeTransport::ChromeExtensionNative => {
+            bail!(
+                "chrome-extension-native check is handled before browser-stack fallback selection"
+            )
+        }
         browser::RecipeTransport::Manual => {
             bail!("manual transport is not valid for `yoetz browser check`")
         }
@@ -1690,6 +1734,7 @@ fn check_args_have_extension_selector(args: &BrowserCheckArgs) -> bool {
 fn handle_browser_extension_native_check(
     args: &BrowserCheckArgs,
     format: OutputFormat,
+    auto_selected: bool,
 ) -> Result<()> {
     if args.profile.is_some() || args.cdp.is_some() || args.browser_id.is_some() {
         bail!(
@@ -1706,6 +1751,7 @@ fn handle_browser_extension_native_check(
         "status": "ok",
         "method": "extension_native_dry_run",
         "transport": browser_extension_native::TRANSPORT_NAME,
+        "auto_selected": auto_selected,
         "live": false,
         "extension": bridge,
     });
@@ -1713,6 +1759,7 @@ fn handle_browser_extension_native_check(
         OutputFormat::Json => write_json(&payload),
         OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
         OutputFormat::Text | OutputFormat::Markdown => {
+            maybe_print_auto_selected_browser_check_extension_native(auto_selected, format);
             for line in browser_extension_native_check_text_lines() {
                 println!("{line}");
             }
@@ -1726,6 +1773,18 @@ fn browser_extension_native_check_text_lines() -> [&'static str; 2] {
         "Browser extension bridge ready via chrome-extension-native (dry-run bridge check; no CDP approval).",
         "No live canary is required before normal ChatGPT Pro recipe runs.",
     ]
+}
+
+fn browser_check_should_auto_select_extension_native(
+    requested_transport: Option<browser::RecipeTransport>,
+    managed_profile_only: bool,
+    explicit_browser_target: bool,
+    extension_connected: bool,
+) -> bool {
+    requested_transport.is_none()
+        && !managed_profile_only
+        && !explicit_browser_target
+        && extension_connected
 }
 
 fn maybe_print_auto_selected_cdp_target(
@@ -2940,8 +2999,27 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
         }
         BrowserCommand::Check(check_args) => {
             let requested_transport = check_args.transport;
-            if requested_transport == Some(browser::RecipeTransport::ChromeExtensionNative) {
-                return handle_browser_extension_native_check(&check_args, format);
+            let managed_profile_only = profile_forces_managed_browser(
+                check_args.profile.as_deref(),
+                check_args.cdp.as_deref(),
+                check_args.browser_id.as_deref(),
+            );
+            let explicit_browser_target =
+                check_args.cdp.is_some() || check_args.browser_id.is_some();
+            let auto_select_extension_native = browser_check_should_auto_select_extension_native(
+                requested_transport,
+                managed_profile_only,
+                explicit_browser_target,
+                extension_status_connected_for_auto_selection(),
+            );
+            if requested_transport == Some(browser::RecipeTransport::ChromeExtensionNative)
+                || auto_select_extension_native
+            {
+                return handle_browser_extension_native_check(
+                    &check_args,
+                    format,
+                    auto_select_extension_native,
+                );
             }
             if check_args_have_extension_selector(&check_args) {
                 bail!(
@@ -2952,13 +3030,6 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 .map(browser_check_transport_override)
                 .transpose()?
                 .flatten();
-            let managed_profile_only = profile_forces_managed_browser(
-                check_args.profile.as_deref(),
-                check_args.cdp.as_deref(),
-                check_args.browser_id.as_deref(),
-            );
-            let explicit_browser_target =
-                check_args.cdp.is_some() || check_args.browser_id.is_some();
             let mut resolved_cdp_target = browser::resolve_cdp_target_with_selector(
                 check_args.cdp.as_deref(),
                 check_args.browser_id.as_deref(),
@@ -3362,10 +3433,16 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 Some(browser::RecipeTransport::ChromeExtensionNative)
             );
             let recipe_transports_pinned = recipe.transports.is_some();
-            let extension_auto_selection_eligible = recipe_args.transport.is_none()
-                && is_chatgpt
-                && !recipe_transports_pinned
-                && extension_status_connected_for_auto_selection();
+            let explicit_browser_target =
+                recipe_args.cdp.is_some() || recipe_args.browser_id.is_some();
+            let extension_auto_selection_eligible = recipe_should_auto_select_extension_native(
+                recipe_args.transport,
+                is_chatgpt,
+                recipe_transports_pinned,
+                managed_profile_only,
+                explicit_browser_target,
+                extension_status_connected_for_auto_selection(),
+            );
             let extension_native_will_route =
                 requested_extension_native || extension_auto_selection_eligible;
             let effective_allow_cdp_fallback = recipe_effective_allow_cdp_fallback(
@@ -4756,6 +4833,30 @@ mod tests {
     }
 
     #[test]
+    fn recipe_native_auto_selection_respects_explicit_targets() {
+        assert!(recipe_should_auto_select_extension_native(
+            None, true, false, false, false, true
+        ));
+        assert!(!recipe_should_auto_select_extension_native(
+            None, true, false, false, true, true
+        ));
+        assert!(!recipe_should_auto_select_extension_native(
+            None, true, false, true, false, true
+        ));
+        assert!(!recipe_should_auto_select_extension_native(
+            Some(browser::RecipeTransport::ChromeDevtoolsMcp),
+            true,
+            false,
+            false,
+            false,
+            true,
+        ));
+        assert!(!recipe_should_auto_select_extension_native(
+            None, false, false, false, false, true
+        ));
+    }
+
+    #[test]
     fn cdp_auto_discovery_is_disabled_for_native_only_routes() {
         assert!(recipe_should_auto_discover_cdp_target(
             false, false, false, false
@@ -5187,6 +5288,28 @@ mod tests {
     }
 
     #[test]
+    fn browser_check_native_auto_selection_respects_explicit_targets() {
+        assert!(browser_check_should_auto_select_extension_native(
+            None, false, false, true
+        ));
+        assert!(!browser_check_should_auto_select_extension_native(
+            Some(browser::RecipeTransport::ChromeDevtoolsMcp),
+            false,
+            false,
+            true
+        ));
+        assert!(!browser_check_should_auto_select_extension_native(
+            None, true, false, true
+        ));
+        assert!(!browser_check_should_auto_select_extension_native(
+            None, false, true, true
+        ));
+        assert!(!browser_check_should_auto_select_extension_native(
+            None, false, false, false
+        ));
+    }
+
+    #[test]
     fn browser_check_transport_override_maps_recipe_transports() {
         assert_eq!(
             browser_check_transport_override(browser::RecipeTransport::ChromeDevtoolsMcp).unwrap(),
@@ -5200,10 +5323,9 @@ mod tests {
             browser_check_transport_override(browser::RecipeTransport::AgentBrowser).unwrap(),
             Some(BrowserCheckTransport::AgentBrowser)
         );
-        assert_eq!(
+        assert!(
             browser_check_transport_override(browser::RecipeTransport::ChromeExtensionNative)
-                .unwrap(),
-            None
+                .is_err()
         );
         assert!(browser_check_transport_override(browser::RecipeTransport::Manual).is_err());
     }
@@ -5215,6 +5337,15 @@ mod tests {
         assert!(text.contains("No live canary is required"));
         assert!(!text.contains("dry-run canary"));
         assert!(!text.contains("For a live ChatGPT auth probe"));
+    }
+
+    #[test]
+    fn browser_extension_native_check_notice_explains_auto_selection() {
+        assert!(auto_selected_browser_check_extension_native_notice(false).is_none());
+        let notice = auto_selected_browser_check_extension_native_notice(true).unwrap();
+        assert!(notice.contains("auto-selected chrome-extension-native"));
+        assert!(notice.contains("--transport chrome-devtools-mcp"));
+        assert!(notice.contains("--cdp"));
     }
 
     #[test]

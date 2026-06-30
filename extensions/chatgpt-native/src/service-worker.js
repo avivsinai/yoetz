@@ -675,6 +675,18 @@ async function handleReconnect(message) {
     await handleDoctorAuthProbe(message);
     return;
   }
+  if (message.payload?.intent === "bridge_check") {
+    postNative(makeEnvelope("job_complete", {
+      request_id: message.request_id,
+      job_id: message.job_id,
+      run_id: message.run_id,
+      workspace_id: message.workspace_id,
+      payload: {
+        status: "ok"
+      }
+    }));
+    return;
+  }
   await recoverJobs(message);
 }
 
@@ -1098,6 +1110,9 @@ function errorContextForJob(job, error = null) {
       ? error.side_effect_started
       : Boolean(job.tab_id)
   };
+  if (job.tab_id != null) {
+    detail.tab_id = job.tab_id;
+  }
   if (job.run_id) {
     detail.inspect_command = inspectCommandForJob(job);
   }
