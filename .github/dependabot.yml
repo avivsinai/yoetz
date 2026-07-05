@@ -15,6 +15,11 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # dtolnay/rust-toolchain is branch-oriented (stable/MSRV), not a normal
+      # semver release action, and Dependabot currently reports it as an
+      # unknown_error while refreshing the grouped GitHub Actions PR.
+      - dependency-name: "dtolnay/rust-toolchain"
     groups:
       actions:
         patterns: ["*"]
