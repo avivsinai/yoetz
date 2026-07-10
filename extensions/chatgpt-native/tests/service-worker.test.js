@@ -51,7 +51,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -136,7 +136,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     assert.equal(sentToTabs.filter((item) => item.message.type === "yoetz_upload_file").length, 2);
     assert.equal(
       sentToTabs.find((item) => item.message.type === "yoetz_configure_model" && item.message.job.job_id === "job_b")?.message.job.model,
-      "extended-pro"
+      "gpt-5-6-sol-pro"
     );
   } finally {
     globalThis.chrome = originalChrome;
@@ -286,7 +286,7 @@ test("service worker opens fresh and resume jobs in new owned tabs", async () =>
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -414,7 +414,7 @@ test("service worker trims a valid conversation id before opening the resume tab
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -459,7 +459,7 @@ test("service worker fails immediately when send reports the wrong resumed conve
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_extract_response":
@@ -530,7 +530,7 @@ test("service worker fails resumed jobs when post-send extraction omits the conv
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -736,7 +736,7 @@ test("service worker fails fast on metadata manual handoff detected while waitin
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -797,7 +797,7 @@ test("service worker fails fast on metadata manual handoff detected while waitin
   }
 });
 
-test("service worker fails closed when Pro Extended is unavailable", async () => {
+test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
@@ -820,9 +820,9 @@ test("service worker fails closed when Pro Extended is unavailable", async () =>
               payload: {
                 status: "unavailable",
                 model_used: "Default",
-                requested_model: "extended-pro",
+                requested_model: "gpt-5-6-sol-pro",
                 available_options: ["Default"],
-                warning: "ChatGPT Pro Extended was not visible in the model picker"
+                warning: "GPT-5.6 Sol was not visible in the family submenu"
               }
             };
           default:
@@ -850,7 +850,7 @@ test("service worker fails closed when Pro Extended is unavailable", async () =>
   }
 });
 
-test("service worker fails resumed jobs before upload when Pro Extended is unavailable", async () => {
+test("service worker fails resumed jobs before upload when GPT-5.6 Sol Pro is unavailable", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const createdTabs = [];
@@ -877,8 +877,9 @@ test("service worker fails resumed jobs before upload when Pro Extended is unava
               payload: {
                 status: "unavailable",
                 model_used: "Default",
-                requested_model: "extended-pro",
-                extended_status: "required",
+                requested_model: "gpt-5-6-sol-pro",
+                family_status: "unverified",
+                effort_status: "unverified",
                 available_options: ["Default"],
                 warning: "ChatGPT model selector button not found"
               }
@@ -914,7 +915,7 @@ test("service worker fails resumed jobs before upload when Pro Extended is unava
   }
 });
 
-test("service worker fails closed when Pro Extended selection is only kept_current", async () => {
+test("service worker fails closed when GPT-5.6 Sol Pro selection is only kept_current", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
@@ -956,7 +957,7 @@ test("service worker fails closed when Pro Extended selection is only kept_curre
   }
 });
 
-test("service worker fails closed when Pro Extended selection fails", async () => {
+test("service worker fails closed when GPT-5.6 Sol Pro selection fails", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -995,14 +996,14 @@ test("service worker fails closed when Pro Extended selection fails", async () =
     await eventually(() => port.messages.some((message) => message.type === "job_error"));
     const error = port.messages.find((message) => message.type === "job_error");
     assert.equal(error.payload.code, "model_selection_failed");
-    assert.equal(error.payload.requested_model, "extended-pro");
+    assert.equal(error.payload.requested_model, "gpt-5-6-sol-pro");
     assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
   } finally {
     globalThis.chrome = originalChrome;
   }
 });
 
-test("service worker fails closed when selected model proof is incomplete", async () => {
+test("service worker rejects the legacy extended_status selection proof", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
@@ -1024,7 +1025,9 @@ test("service worker fails closed when selected model proof is incomplete", asyn
               ok: true,
               payload: {
                 status: "selected",
-                model_used: "Pro Extended"
+                model_used: "Pro Extended",
+                requested_model: "extended-pro",
+                extended_status: "required"
               }
             };
           default:
@@ -1052,6 +1055,52 @@ test("service worker fails closed when selected model proof is incomplete", asyn
   }
 });
 
+test("service worker accepts only verified GPT-5.6 Sol Pro selection", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "selected",
+                model_used: "GPT-5.6 Sol Pro",
+                requested_model: "gpt-5-6-sol-pro",
+                family_status: "verified",
+                effort_status: "verified"
+              }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?sol_pro_verified=${Date.now()}`);
+    port.emit(envelope("job_start", "job_sol_pro_verified", { prompt: "prompt" }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    assert.equal(
+      port.messages.some((message) => message.type === "job_error" && message.payload.code === "model_selection_failed"),
+      false
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker rejects duplicate active job starts before opening another tab", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -1068,7 +1117,7 @@ test("service worker rejects duplicate active job starts before opening another 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -1106,7 +1155,7 @@ test("service worker rejects follow-on messages with the wrong capability token"
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -1273,7 +1322,7 @@ test("service worker allows matching extension instance id when profile identity
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -1349,7 +1398,7 @@ test("service worker allows matching profile email before opening a tab", async 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -1689,7 +1738,7 @@ test("service worker times out stale pre-send assistant text as job_error", asyn
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1748,7 +1797,7 @@ test("service worker classifies final affordance without scoped assistant text",
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1760,7 +1809,7 @@ test("service worker classifies final affordance without scoped assistant text",
               payload: sent
                 ? {
                     method: "page_text_fallback",
-                    text: "Skip to content\nbundle.md\nFile\nReview the attached file and provide your analysis.\n\nI\n\nExtended Pro",
+                    text: "Skip to content\nbundle.md\nFile\nReview the attached file and provide your analysis.\n\nI\n\nGPT-5.6 Sol Pro",
                     is_generating: false,
                     assistant_count: 1,
                     user_count: 1,
@@ -1832,7 +1881,7 @@ test("service worker fails extraction when final affordance page text alternates
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1917,7 +1966,7 @@ test("service worker completes post-send response when preceding user count is u
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1989,7 +2038,7 @@ test("service worker does not complete on brief stable assistant text without a 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2061,7 +2110,7 @@ test("service worker completes long stable assistant text with an unscoped copy 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2141,7 +2190,7 @@ test("service worker does not complete long idle assistant text with only baseli
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2224,7 +2273,7 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2310,7 +2359,7 @@ test("service worker completion is structural and does not classify response tex
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2380,7 +2429,7 @@ test("service worker accepts a scoped single-letter assistant markdown response"
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2456,7 +2505,7 @@ test("service worker reports oversized completed responses before native deliver
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2541,7 +2590,7 @@ test("service worker latches a completed scoped response when later ChatGPT DOM 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2621,7 +2670,7 @@ test("service worker preserves the best final response across a transient genera
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2714,8 +2763,8 @@ test("service worker preserves the best final response across a transient genera
   }
 });
 
-test("service worker labels interim Pro-Extended turns as non-final and completes on the later real answer", async () => {
-  // RC4 regression: ChatGPT Pro Extended streams the answer as MULTIPLE interim end_turn turns
+test("service worker labels interim Pro turns as non-final and completes on the later real answer", async () => {
+  // RC4 regression: ChatGPT Pro streams the answer as MULTIPLE interim end_turn turns
   // ("I'll review...", "I've narrowed...") before the real answer arrives minutes later. The first
   // interim turn's streaming head is a single "I" (observed live in conv 6a23a3a6). The waiter must
   // NOT surface that interim "I" as if it were the final response, and must complete on the later
@@ -2739,7 +2788,7 @@ test("service worker labels interim Pro-Extended turns as non-final and complete
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2838,7 +2887,7 @@ test("service worker settles same-length post-final text churn instead of timing
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -2916,7 +2965,7 @@ test("service worker waits for scoped response text bytes to stabilize after fin
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3001,7 +3050,7 @@ test("service worker waits for streaming one-letter prefix to reach final assist
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3092,7 +3141,7 @@ test("service worker does not complete when ChatGPT idles before final assistant
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3182,7 +3231,7 @@ test("service worker completes with backend-api text when the DOM answer turn ne
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3291,7 +3340,7 @@ test("service worker treats a stale backend-api node as still generating until a
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3430,7 +3479,7 @@ test("service worker still refreshes a frozen render while backend-api reads are
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3567,7 +3616,7 @@ test("service worker reloads an idle frozen short response and completes from th
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3685,7 +3734,7 @@ test("service worker refreshes a frozen short render at most once", async () => 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3763,7 +3812,7 @@ test("service worker rejects stale copy-button extraction from a pre-send assist
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3839,7 +3888,7 @@ test("service worker does not complete on copy button while response is still ge
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3908,7 +3957,7 @@ test("service worker does not complete long unscoped-copy text while response is
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3983,7 +4032,7 @@ test("service worker completes when a generating response becomes idle without t
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4056,7 +4105,7 @@ test("service worker does not complete only because post-send copy controls incr
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4129,7 +4178,7 @@ test("service worker rebinds owned tab after content script reload during respon
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4199,7 +4248,7 @@ test("service worker preserves content-script committed-send error metadata", as
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_extract_response":
@@ -4358,7 +4407,7 @@ test("service worker stops before upload when final chunk ack cannot reach nativ
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -4409,7 +4458,7 @@ test("service worker shards storage by job id so concurrent jobs do not clobber 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4493,7 +4542,7 @@ test("service worker caps last_response_progress_text on disk while keeping the 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4615,7 +4664,7 @@ test("service worker does not persist on every in-flight chunk", async () => {
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 16 } };
           case "yoetz_send_prompt":
@@ -4796,7 +4845,7 @@ test("service worker cancelJob clicks stop, removes tab, and evicts the in-memor
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4900,7 +4949,7 @@ test("service worker cancelJob still removes the tab when the content script is 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4990,7 +5039,7 @@ test("service worker cancelJob waits for cancelSend to resolve before removing t
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5086,7 +5135,7 @@ test("service worker cancelJob removes the tab but warns may_still_be_running wh
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5166,7 +5215,7 @@ test("service worker cancelJob on an already-idle response removes the tab and r
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: { status: "selected", model_used: "Pro Extended", requested_model: "extended-pro", extended_status: "required" } };
+            return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5459,6 +5508,16 @@ test("service worker still fails receiving_file jobs after service-worker restar
     globalThis.chrome = originalChrome;
   }
 });
+
+function verifiedSolProSelection() {
+  return {
+    status: "selected",
+    model_used: "GPT-5.6 Sol Pro",
+    requested_model: "gpt-5-6-sol-pro",
+    family_status: "verified",
+    effort_status: "verified"
+  };
+}
 
 function envelope(type, jobId, payload = {}, fields = {}) {
   return {

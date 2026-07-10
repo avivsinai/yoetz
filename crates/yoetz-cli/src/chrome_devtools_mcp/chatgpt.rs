@@ -32,7 +32,7 @@
 //! disappearing, moving into kebab menus, absent in Custom GPT / Canvas
 //! flows). Instead, we poll `.result-streaming` absence on the last
 //! assistant message plus stability of `(messageCount, textLength)` across
-//! N consecutive polls. This matches the heuristic yoetz's old Pro Extended
+//! N consecutive polls. This matches the heuristic yoetz's old Pro
 //! auto-poll already uses.
 
 use anyhow::{anyhow, Context, Result};
@@ -334,7 +334,7 @@ async fn run_attached_recipe_inner(
         .await
         .context("mark yoetz-owned ChatGPT tab with window.name")?;
 
-    // Step 2: wait for the composer to mount, then select ChatGPT Pro Extended
+    // Step 2: wait for the composer to mount, then verify GPT-5.6 Sol + Pro
     // before any upload/send side effects.
     wait_for_composer_ready(client, /* focus_composer */ true).await?;
     let model_selection = maybe_select_model(client, &ctx.model).await?;
@@ -409,7 +409,7 @@ async fn run_attached_recipe_inner(
 
     // Step 6: stable-idle polling for response completion.
     //
-    // Heuristic (ported from yoetz v0.2.33 Pro Extended auto-poll):
+    // Heuristic (ported from yoetz v0.2.33 Pro auto-poll):
     // - Absence of `.result-streaming` class on the last assistant message
     // - (messageCount, textLength) unchanged across N consecutive polls
     //
@@ -733,7 +733,6 @@ async fn maybe_select_model(
     client: &ChromeCdpClient,
     requested_model: &str,
 ) -> Result<ModelSelectionOutcome> {
-    let keep_current_model = chatgpt_web::should_keep_current_chatgpt_model(requested_model);
     let script = build_model_selection_script(requested_model);
     let selection = client
         .evaluate_script(&script, vec![])
@@ -750,14 +749,19 @@ async fn maybe_select_model(
     let model_selection_status =
         chatgpt_web::chatgpt_model_selection_status(&selection, requested_model);
     match status {
-        "selected" | "already-selected" => Ok(ModelSelectionOutcome {
-            model_used,
-            model_selection_status,
-        }),
-        "missing-selector" | "not-found" if keep_current_model => Ok(ModelSelectionOutcome {
-            model_used,
-            model_selection_status,
-        }),
+        "selected"
+            if model_selection_status == chatgpt_recipe::ChatgptModelSelectionStatus::Selected =>
+        {
+            Ok(ModelSelectionOutcome {
+                model_used,
+                model_selection_status,
+            })
+        }
+        "selected" => Err(anyhow!(
+            "ChatGPT reported selected without verified GPT-5.6 Sol + Pro proof.{} {}",
+            format_model_selection_diagnostics(&selection),
+            format_page_probe_summary(&selection)
+        )),
         "missing-selector" => Err(anyhow!(
             "ChatGPT model selector button not found. {}",
             format_page_probe_summary(&selection)
@@ -794,6 +798,15 @@ async fn maybe_select_model(
                 format_page_probe_summary(&selection)
             ))
         }
+        "legacy-picker" => Err(anyhow!(
+            "{}",
+            selection
+                .get("warning")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(
+                    "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI"
+                )
+        )),
         other => Err(anyhow!(
             "unexpected ChatGPT model selection status `{other}`"
         )),
@@ -801,65 +814,21 @@ async fn maybe_select_model(
 }
 
 fn format_model_selection_diagnostics(selection: &serde_json::Value) -> String {
-    let selected_label = selection
-        .get("selectedLabel")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" selected_label={value:?};"))
-        .unwrap_or_default();
-    let target_test_id = selection
-        .get("targetTestId")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" target_testid={value:?};"))
-        .unwrap_or_default();
-    let target_checked = selection
-        .get("targetChecked")
-        .and_then(serde_json::Value::as_bool)
-        .map(|value| format!(" target_checked={value};"))
-        .unwrap_or_default();
-    let menu_reopen_attempts = selection
-        .get("menuReopenAttempts")
-        .and_then(serde_json::Value::as_u64)
-        .map(|value| format!(" menu_reopen_attempts={value};"))
-        .unwrap_or_default();
-    let selector_expanded = selection
-        .get("selectorExpanded")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| format!(" selector_expanded={value:?};"))
-        .unwrap_or_default();
-    let item_count = selection
-        .get("itemCount")
-        .and_then(serde_json::Value::as_u64)
-        .map(|value| format!(" item_count={value};"))
-        .unwrap_or_default();
-    let available_items = selection
-        .get("availableItemsAfter")
-        .and_then(serde_json::Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .collect::<Vec<_>>()
-        })
-        .filter(|items| !items.is_empty())
-        .map(|items| format!(" available_after=[{}];", items.join(", ")))
-        .unwrap_or_default();
-
+    let text = |key: &str| {
+        selection
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
     format!(
-        "{}{}{}{}{}{}{}",
-        selected_label,
-        target_test_id,
-        target_checked,
-        menu_reopen_attempts,
-        selector_expanded,
-        item_count,
-        available_items
+        " family_status={:?}; effort_status={:?}; family_label={:?}; pill_text={:?}; warning={:?};",
+        text("familyStatus"),
+        text("effortStatus"),
+        text("familyLabel"),
+        text("pillText"),
+        text("warning")
     )
 }
 
@@ -2161,21 +2130,14 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_script_supports_auto_and_explicit_modes() {
-        let auto_script = build_model_selection_script("auto");
-        assert!(auto_script.contains(r#"const requested = "auto";"#));
-        assert!(!auto_script.contains(r#""kept-current-no-selector""#));
-        assert!(auto_script.contains("const deriveRequestedTier = (value) =>"));
-        assert!(auto_script.contains("const classifyTier = (item) =>"));
-        assert!(auto_script.contains("const buildTierRankings = (entries) =>"));
-
+    fn model_selection_script_requires_verified_sol_pro_contract() {
         let explicit_script =
-            build_model_selection_script(crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL);
-        assert!(explicit_script.contains(r#"const requested = "extended-pro";"#));
-        assert!(explicit_script.contains("targetCandidateForTier(entries, \"extended-pro\")"));
-        assert!(explicit_script.contains("\"gpt-5-pro\":\"gpt-5-4-pro\""));
-        assert!(!explicit_script.contains("\"gpt-5-3-pro\""));
-        assert!(explicit_script.contains("const selectBestTierItem = (entries, slug, rankings) =>"));
+            build_model_selection_script(crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL);
+        assert!(explicit_script.contains(r#"const requested = "gpt-5-6-sol-pro";"#));
+        assert!(explicit_script.contains("classList.contains(\"__composer-pill\")"));
+        assert!(explicit_script.contains("familyStatus"));
+        assert!(explicit_script.contains("effortStatus"));
+        assert!(explicit_script.contains("legacy-picker"));
         assert!(explicit_script.contains("availableItems"));
     }
 

@@ -258,7 +258,7 @@ Agent skill installation options are listed in [Agent Skills](#agent-skills).
 ## Browser Recipes And ChatGPT Pro
 
 Browser recipes let Yoetz use web-only model surfaces from the terminal. The
-built-in ChatGPT recipe targets ChatGPT Pro with Extended enabled and is
+built-in ChatGPT recipe targets GPT-5.6 Sol with Pro intelligence and is
 fail-closed: if Yoetz cannot prove the requested surface is available, it stops
 instead of silently downgrading.
 

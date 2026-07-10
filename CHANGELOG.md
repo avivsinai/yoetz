@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- The built-in ChatGPT recipe now targets GPT-5.6 Sol with Pro intelligence
+  across the native extension and CDP/dev-browser fallback transports. Model
+  selection results now carry separate verified family and effort proofs.
+
+### Fixed
+
+- Updated ChatGPT model selection for the new composer pill and Radix
+  Intelligence/family menus. Yoetz verifies GPT-5.6 Sol and Pro together before
+  upload, refuses the stale GPT-5.5 Pro Extended trap, and reports legacy picker
+  DOMs instead of silently downgrading.
+- ChatGPT response extraction now recognizes the new whole-line model chrome
+  labels such as `Sol`, `Extra High`, and `GPT-5.6 Sol` without stripping those
+  words from normal answer prose.
+
 ## [0.5.30] - 2026-06-30
 ### Changed
 

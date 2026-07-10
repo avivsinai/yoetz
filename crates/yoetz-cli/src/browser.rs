@@ -1586,7 +1586,7 @@ fn run_chatgpt_select_model(
     use_stealth: bool,
     headed: bool,
 ) -> Result<String> {
-    let requested_model = crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL;
+    let requested_model = crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL;
     let function = chatgpt_web::build_model_selection_function(requested_model);
     let expression = chatgpt_web::wrap_function_source_for_json_eval(&function)?;
     let stdout = run_agent_browser_with_connection_timeout(
@@ -1607,7 +1607,10 @@ fn run_chatgpt_select_model(
     let model_selection_status =
         chatgpt_web::chatgpt_model_selection_status(&selection, requested_model);
     match status {
-        "selected" | "already-selected" => {
+        "selected"
+            if model_selection_status
+                == chatgpt_recipe::ChatgptModelSelectionStatus::Selected =>
+        {
             Ok(json!({
                 "status": "ok",
                 "model_used": model_used,
@@ -1615,6 +1618,9 @@ fn run_chatgpt_select_model(
             })
             .to_string())
         }
+        "selected" => Err(anyhow!(
+            "ChatGPT reported selected without verified GPT-5.6 Sol + Pro proof"
+        )),
         "missing-selector" => Err(anyhow!(
             "ChatGPT model selector button not found. url={:?}, title={:?}",
             selection.get("url").and_then(Value::as_str).unwrap_or(""),
@@ -1640,24 +1646,22 @@ fn run_chatgpt_select_model(
                 .unwrap_or_else(|| "<unknown>".to_string())
         )),
         "selection-mismatch" => Err(anyhow!(
-            "requested ChatGPT model `{}` was not actually selected. selected_label={:?}; target_testid={:?}; available_after={}",
+            "requested ChatGPT model `{}` was not actually selected. family_status={:?}; effort_status={:?}; family_label={:?}; warning={:?}",
             selection
                 .get("requested")
                 .and_then(Value::as_str)
                 .unwrap_or(requested_model),
-            selection.get("selectedLabel").and_then(Value::as_str),
-            selection.get("targetTestId").and_then(Value::as_str),
+            selection.get("familyStatus").and_then(Value::as_str),
+            selection.get("effortStatus").and_then(Value::as_str),
+            selection.get("familyLabel").and_then(Value::as_str),
+            selection.get("warning").and_then(Value::as_str)
+        )),
+        "legacy-picker" => Err(anyhow!(
+            "{}",
             selection
-                .get("availableItemsAfter")
-                .and_then(Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .unwrap_or_default()
+                .get("warning")
+                .and_then(Value::as_str)
+                .unwrap_or("legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI")
         )),
         other => Err(anyhow!("unexpected ChatGPT model selection status `{other}`")),
     }
@@ -4967,7 +4971,10 @@ mod tests {
             use_stealth: true,
             headed: false,
             target_url: CHATGPT_URL.to_string(),
-            vars: BTreeMap::from([("model".to_string(), "gpt-5-4-pro".to_string())]),
+            vars: BTreeMap::from([(
+                "model".to_string(),
+                crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
+            )]),
         }
     }
 
@@ -5114,7 +5121,7 @@ case "$*" in
     count=$((count + 1))
     printf '%s' "$count" > "$EVAL_COUNT_PATH"
     if [ "$count" = "1" ]; then
-      printf '{"status":"already-selected","currentLabel":"Pro Extended"}'
+      printf '{"status":"selected","requested":"gpt-5-6-sol-pro","modelUsed":"GPT-5.6 Sol Pro","familyStatus":"verified","effortStatus":"verified"}'
     elif [ "$count" = "2" ]; then
       printf '{"status":"marked"}'
     else
@@ -5145,7 +5152,7 @@ if %errorlevel%==0 (
   set /a count=count+1
   > "%EVAL_COUNT_PATH%" echo !count!
   if "!count!"=="1" (
-    echo {"status":"already-selected","currentLabel":"Pro Extended"}
+    echo {"status":"selected","requested":"gpt-5-6-sol-pro","modelUsed":"GPT-5.6 Sol Pro","familyStatus":"verified","effortStatus":"verified"}
   ) else if "!count!"=="2" (
     echo {"status":"marked"}
   ) else (
@@ -6028,7 +6035,7 @@ browser_cdp = "http://evil.example.com:9222"
     fn interpolate_replaces_bundle_and_recipe_vars() {
         let ctx = recipe_context();
         let value = interpolate("open {{bundle_path}} {{model}}", &ctx, Some("ignored")).unwrap();
-        assert_eq!(value, "open /tmp/bundle.md gpt-5-4-pro");
+        assert_eq!(value, "open /tmp/bundle.md gpt-5-6-sol-pro");
     }
 
     #[test]
@@ -6299,7 +6306,7 @@ steps:
             r#"{"ref": "prompt-textarea", "text": ""}"#
         ));
         assert!(looks_authenticated(
-            r#"{"ref": "model-switcher-dropdown-button", "text": "ChatGPT"}"#
+            r#"{"class": "__composer-pill", "text": "Pro"}"#
         ));
         assert!(looks_authenticated(
             r#"{"ref": "composer-plus-btn", "text": ""}"#
@@ -6939,7 +6946,7 @@ steps:
                 "action": CHATGPT_SELECT_MODEL_ACTION,
                 "stdout": {
                     "status": "ok",
-                    "model_used": crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL,
+                    "model_used": "GPT-5.6 Sol Pro",
                     "model_selection_status": "selected"
                 }
             }),
@@ -6958,10 +6965,7 @@ steps:
         assert_eq!(payload["transport"], "agent-browser");
         assert_eq!(payload["backend"], "agent-browser");
         assert_eq!(payload["response"], "final answer");
-        assert_eq!(
-            payload["model_used"],
-            crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL
-        );
+        assert_eq!(payload["model_used"], "GPT-5.6 Sol Pro");
         assert_eq!(payload["model_selection_status"], "selected");
         assert_eq!(payload["fallback_used"], true);
         assert_eq!(payload["warnings"], json!(["used paste fallback"]));

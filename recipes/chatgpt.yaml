@@ -49,11 +49,11 @@ name: chatgpt
 # transports connect directly to Chrome via CDP.
 #
 # Variables:
-#   This recipe supports exactly one ChatGPT target: Pro with Extended enabled.
+#   This recipe supports exactly one ChatGPT target: GPT-5.6 Sol with Pro intelligence.
 #   `model` and `extended` overrides are intentionally unsupported.
-#   The Pro Extended selector must work against both ChatGPT Enterprise and
-#              personal ChatGPT accounts. Their picker DOM differs, but both
-#              are fail-closed if Pro Extended cannot be proven selected.
+#   Selection is fail-closed unless the picker proves both the GPT-5.6 Sol
+#              family and Pro effort in one verification pass. The legacy
+#              model-switcher DOM is rejected with a diagnostic breadcrumb.
 #   prompt   — prompt text to send with the attachment. For Yoetz bundle
 #              sessions, typed ChatGPT transports default this to bundle.json's
 #              stored user prompt unless --var prompt=... explicitly overrides.
@@ -165,7 +165,7 @@ steps:
   # Click send once the typed prompt has enabled the button.
   - action: chatgpt_send
 
-  # Poll for response completion. Default 90min timeout for Extended Pro;
+  # Poll for response completion. Default 90min timeout for GPT-5.6 Sol Pro;
   # override with --var wait_timeout_ms=N or --var wait_interval_ms=N.
   - action: chatgpt_wait_response
     args: ["--interval-ms", "{{wait_interval_ms}}", "--timeout-ms", "{{wait_timeout_ms}}"]

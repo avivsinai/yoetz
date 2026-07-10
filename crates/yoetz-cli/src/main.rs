@@ -2054,7 +2054,7 @@ fn build_chatgpt_recipe_spec(
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
 ) -> Result<chatgpt_recipe::ChatgptRecipeSpec> {
-    ensure_chatgpt_pro_extended_only_vars(recipe_vars)?;
+    ensure_chatgpt_sol_pro_only_vars(recipe_vars)?;
     let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
     let upload_timeout_ms =
         dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, recipe_args.bundle.as_deref())?;
@@ -2066,7 +2066,7 @@ fn build_chatgpt_recipe_spec(
         .transpose()?;
     Ok(chatgpt_recipe::ChatgptRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
-        model: chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL.to_string(),
+        model: chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
         prompt: recipe_vars
             .get("prompt")
             .cloned()
@@ -2100,7 +2100,7 @@ fn build_chatgpt_recipe_spec(
     })
 }
 
-fn ensure_chatgpt_pro_extended_only_vars(recipe_vars: &BTreeMap<String, String>) -> Result<()> {
+fn ensure_chatgpt_sol_pro_only_vars(recipe_vars: &BTreeMap<String, String>) -> Result<()> {
     let unsupported = ["model", "extended"]
         .into_iter()
         .filter(|key| recipe_vars.contains_key(*key))
@@ -2109,7 +2109,7 @@ fn ensure_chatgpt_pro_extended_only_vars(recipe_vars: &BTreeMap<String, String>)
         return Ok(());
     }
     bail!(
-        "ChatGPT recipe supports only ChatGPT Pro Extended; remove unsupported var(s): {}",
+        "ChatGPT recipe supports only GPT-5.6 Sol + Pro intelligence; remove unsupported var(s): {}",
         unsupported.join(", ")
     )
 }
@@ -5752,7 +5752,7 @@ mod tests {
 
         let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
         assert_eq!(spec.bundle_path, Some(PathBuf::from("/tmp/bundle.md")));
-        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL);
+        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_SOL_PRO_MODEL);
         assert_eq!(spec.prompt, "Review this repo");
         assert_eq!(spec.browser_context_id.as_deref(), Some("ctx-123"));
         assert_eq!(spec.profile_email.as_deref(), Some("user@example.com"));
@@ -5785,13 +5785,13 @@ mod tests {
 
         let err = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap_err();
         let message = format!("{err:#}");
-        assert!(message.contains("only ChatGPT Pro Extended"));
+        assert!(message.contains("only GPT-5.6 Sol + Pro intelligence"));
         assert!(message.contains("model"));
         assert!(message.contains("extended"));
     }
 
     #[test]
-    fn builtin_chatgpt_recipe_defaults_flow_into_shared_spec_with_extended_enabled() {
+    fn builtin_chatgpt_recipe_defaults_flow_into_shared_sol_pro_spec() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/chatgpt.yaml");
         let content = fs::read_to_string(&path).expect("read recipes/chatgpt.yaml");
         let recipe: browser::Recipe =
@@ -5811,7 +5811,7 @@ mod tests {
             .expect("build recipe vars");
         let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
 
-        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL);
+        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_SOL_PRO_MODEL);
         assert!(!recipe_vars.contains_key("model"));
         assert!(!recipe_vars.contains_key("extended"));
     }
@@ -5991,7 +5991,7 @@ mod tests {
             transport: "dev-browser".to_string(),
             backend: "dev-browser".to_string(),
             response: "ok".to_string(),
-            model_used: Some(chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL.to_string()),
+            model_used: Some("GPT-5.6 Sol Pro".to_string()),
             model_selection_status: crate::chatgpt_recipe::ChatgptModelSelectionStatus::Selected,
             warnings: vec!["clipboard fallback".to_string()],
             fallback_used: true,
