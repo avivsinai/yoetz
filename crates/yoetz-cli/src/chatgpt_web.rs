@@ -474,6 +474,15 @@ async () => {{
     return null;
   }}
 
+  async function waitForPill() {{
+    let pill = findPill();
+    for (let attempt = 0; attempt < 20 && !pill; attempt += 1) {{
+      await wait(250);
+      pill = findPill();
+    }}
+    return pill;
+  }}
+
   function visibleMenus() {{
     return Array.from(document.querySelectorAll("[role='menu']")).filter(isVisible);
   }}
@@ -629,11 +638,7 @@ async () => {{
     return failure;
   }}
 
-  let pill = findPill();
-  for (let attempt = 0; attempt < 20 && !pill; attempt += 1) {{
-    await wait(250);
-    pill = findPill();
-  }}
+  let pill = await waitForPill();
   if (!pill) {{
     const lateLegacy = legacyPickerMarkers();
     if (lateLegacy.length > 0) {{
@@ -660,6 +665,8 @@ async () => {{
     }}
     realClick(sol);
     await wait(250);
+    pill = await waitForPill();
+    if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol");
     menu = await openMain(pill);
     state = menu ? readState(menu) : null;
     if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting GPT-5.6 Sol");
@@ -673,6 +680,8 @@ async () => {{
     }}
     realClick(pro);
     await wait(250);
+    pill = await waitForPill();
+    if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting Pro intelligence");
     menu = await openMain(pill);
     state = menu ? readState(menu) : null;
     if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting Pro intelligence");
@@ -1317,6 +1326,13 @@ mod tests {
         assert!(script.contains(r#"fold(textOf(item)) === "pro""#));
         assert!(script.contains(r#"/^(?:gpt|o\d)\b/i.test(textOf(item))"#));
         assert!(script.contains("await openFamilyMenu"));
+        assert!(script.contains("async function waitForPill()"));
+        assert!(script.contains("pill = await waitForPill();"));
+        assert!(script
+            .contains("ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol"));
+        assert!(script.contains(
+            "ChatGPT composer model pill did not remount after selecting Pro intelligence"
+        ));
         assert!(script.contains("return visibleMenus().length === 0;"));
         assert!(script.contains("if (!await closeMenus(pill))"));
         assert!(!script.contains("if (families.length === 0 && state.familyTrigger)"));

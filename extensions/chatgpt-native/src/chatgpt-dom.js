@@ -413,7 +413,7 @@ async function selectSolProModel(root, options = {}) {
     };
   }
 
-  const modelButton = await waitForModelButton(root, options);
+  let modelButton = await waitForModelButton(root, options);
   if (!modelButton) {
     const lateLegacyMarkers = visibleLegacyPickerMarkers(root);
     if (lateLegacyMarkers.length > 0) {
@@ -446,6 +446,10 @@ async function selectSolProModel(root, options = {}) {
     }
     realClick(solOption);
     await sleep(Number(options.actionSettleMs ?? 250));
+    modelButton = await waitForModelButton(root, options);
+    if (!modelButton) {
+      return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol");
+    }
     state = await openAndReadModelPicker(root, modelButton, options);
     if (!state) {
       return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting GPT-5.6 Sol");
@@ -460,6 +464,10 @@ async function selectSolProModel(root, options = {}) {
     }
     realClick(proOption);
     await sleep(Number(options.actionSettleMs ?? 250));
+    modelButton = await waitForModelButton(root, options);
+    if (!modelButton) {
+      return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting Pro intelligence");
+    }
     state = await openAndReadModelPicker(root, modelButton, options);
     if (!state) {
       return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting Pro intelligence");

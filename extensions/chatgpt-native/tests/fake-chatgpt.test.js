@@ -1925,7 +1925,11 @@ test("GPT-5.6 Sol picker upgrades High effort to Pro and verifies both proofs", 
 });
 
 test("GPT-5.6 Sol picker switches GPT-5.5 Instant to Sol Pro", async () => {
-  const fixture = makeSolPickerFixture({ family: "GPT-5.5", effort: "Instant" });
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.5",
+    effort: "Instant",
+    remountPillOnSelection: true
+  });
 
   const result = await configureModelState(fixture.doc, {});
 
@@ -2007,7 +2011,12 @@ test("GPT-5.6 Sol picker fails loudly on the legacy model-switcher DOM", async (
   assert.equal(legacyButton.events.includes("pointerdown"), false);
 });
 
-function makeSolPickerFixture({ family, effort, escapeCloses = true }) {
+function makeSolPickerFixture({
+  family,
+  effort,
+  escapeCloses = true,
+  remountPillOnSelection = false
+}) {
   let currentFamily = family;
   let currentEffort = effort;
   let mainOpenCount = 0;
@@ -2015,6 +2024,7 @@ function makeSolPickerFixture({ family, effort, escapeCloses = true }) {
   let effortClickCount = 0;
   let mainMenu = null;
   let familyMenu = null;
+  let pill = null;
 
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
@@ -2031,9 +2041,20 @@ function makeSolPickerFixture({ family, effort, escapeCloses = true }) {
     mainMenu = null;
     familyMenu = null;
   };
-  const updatePill = () => {
+  const updatePill = (remount = false) => {
     const pillEffort = currentEffort === "Pro Extended" ? "Pro" : currentEffort;
     const label = currentFamily === "GPT-5.6 Sol" ? pillEffort : `5.5\n${pillEffort}`;
+    if (remount && remountPillOnSelection) {
+      const previousPill = pill;
+      pill = createPill();
+      const index = form.children.indexOf(previousPill);
+      form.children[index] = pill;
+      pill.parentElement = form;
+      pill.ownerDocument = form.ownerDocument;
+      previousPill.parentElement = null;
+      previousPill.onPointerDown = undefined;
+      previousPill.onKeyDown = undefined;
+    }
     pill.innerText = label;
     pill.textContent = label;
   };
@@ -2057,7 +2078,7 @@ function makeSolPickerFixture({ family, effort, escapeCloses = true }) {
               currentEffort = "Pro Extended";
             }
             familyClickCount += 1;
-            updatePill();
+            updatePill(true);
           }
           closeMenus();
         }
@@ -2086,7 +2107,7 @@ function makeSolPickerFixture({ family, effort, escapeCloses = true }) {
           } else {
             currentEffort = label;
           }
-          updatePill();
+          updatePill(true);
           closeMenus();
         }
       }, label);
@@ -2101,7 +2122,7 @@ function makeSolPickerFixture({ family, effort, escapeCloses = true }) {
     body.append(mainMenu);
   };
 
-  const pill = new FakeElement("button", {
+  const createPill = () => new FakeElement("button", {
     class: "__composer-pill __composer-pill--neutral text-body-regular! group/pill",
     "aria-haspopup": "menu",
     onPointerDown: openMainMenu,
@@ -2109,6 +2130,7 @@ function makeSolPickerFixture({ family, effort, escapeCloses = true }) {
       if (event.key === "Escape" && escapeCloses) closeMenus();
     }
   });
+  pill = createPill();
   form.append(pill);
   updatePill();
   const doc = new FakeDocument(body);
