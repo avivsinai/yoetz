@@ -535,7 +535,7 @@ fn parse_openrouter_capability(item: &Value) -> Option<ModelCapability> {
     let web_search = item
         .get("pricing")
         .and_then(|v| v.get("web_search"))
-        .and_then(|v| if v.is_null() { None } else { Some(v) })
+        .filter(|v| !v.is_null())
         .is_some();
     if web_search {
         cap.web_search = Some(true);
