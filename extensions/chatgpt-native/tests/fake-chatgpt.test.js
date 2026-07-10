@@ -1939,6 +1939,20 @@ test("GPT-5.6 Sol picker switches GPT-5.5 Instant to Sol Pro", async () => {
   assert.equal(fixture.menusOpen(), 0);
 });
 
+test("GPT-5.6 Sol picker recovers from the o3 family", async () => {
+  const fixture = makeSolPickerFixture({ family: "o3", effort: "High" });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(fixture.familyClicks(), 1);
+  assert.equal(fixture.effortClicks(), 1);
+  assert.equal(fixture.menusOpen(), 0);
+});
+
 test("GPT-5.6 Sol picker verifies already-correct state with one menu open", async () => {
   const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
 
@@ -1948,12 +1962,27 @@ test("GPT-5.6 Sol picker verifies already-correct state with one menu open", asy
   assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
-  assert.ok(result.available_families.includes("GPT-5.6 Sol"));
-  assert.ok(result.available_families.includes("GPT-5.5"));
+  assert.deepEqual(result.available_families, []);
   assert.equal(fixture.mainOpens(), 1);
   assert.equal(fixture.familyClicks(), 0);
   assert.equal(fixture.effortClicks(), 0);
   assert.equal(fixture.menusOpen(), 0);
+});
+
+test("GPT-5.6 Sol picker fails closed when Escape cannot close the menu", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    escapeCloses: false
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "verified");
+  assert.match(result.warning, /picker remained open/);
+  assert.equal(fixture.menusOpen(), 1);
 });
 
 test("GPT-5.6 Sol picker fails loudly on the legacy model-switcher DOM", async () => {
@@ -1978,7 +2007,7 @@ test("GPT-5.6 Sol picker fails loudly on the legacy model-switcher DOM", async (
   assert.equal(legacyButton.events.includes("pointerdown"), false);
 });
 
-function makeSolPickerFixture({ family, effort }) {
+function makeSolPickerFixture({ family, effort, escapeCloses = true }) {
   let currentFamily = family;
   let currentEffort = effort;
   let mainOpenCount = 0;
@@ -2077,7 +2106,7 @@ function makeSolPickerFixture({ family, effort }) {
     "aria-haspopup": "menu",
     onPointerDown: openMainMenu,
     onKeyDown: (event) => {
-      if (event.key === "Escape") closeMenus();
+      if (event.key === "Escape" && escapeCloses) closeMenus();
     }
   });
   form.append(pill);

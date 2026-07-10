@@ -468,13 +468,12 @@ async function selectSolProModel(root, options = {}) {
 
   const familyVerified = familyIsSol(state.family_label);
   const effortVerified = effortIsPro(state);
-  if (availableFamilies.length === 0 && state.family_trigger) {
-    const familyMenu = await openFamilyPicker(root, state.menu, state.family_trigger, options);
-    availableFamilies = familyMenuRadios(familyMenu).map((item) => textOf(item)).filter(Boolean);
-  }
-  await closeModelPicker(root, modelButton);
   if (!familyVerified || !effortVerified) {
+    await closeModelPicker(root, modelButton);
     return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol + Pro could not be verified in one picker pass");
+  }
+  if (!await closeModelPicker(root, modelButton)) {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification");
   }
 
   return {
@@ -649,6 +648,7 @@ async function closeModelPicker(root, modelButton) {
     pressActivationKey(modelButton, "Escape");
     await sleep(50);
   }
+  return visibleMenus(root).length === 0;
 }
 
 async function waitForPickerState(root, options = {}) {
@@ -694,7 +694,11 @@ function visibleMenus(root) {
 function readPickerState(menu) {
   const effortItems = menuRadioItems(menu);
   const familyTrigger = Array.from(menu.querySelectorAll('[role="menuitem"]'))
-    .find((item) => item.getAttribute?.("aria-haspopup") === "menu" && /^gpt\b/i.test(normalizeText(textOf(item))));
+    .find((item) => {
+      const label = normalizeText(textOf(item));
+      return item.getAttribute?.("aria-haspopup") === "menu"
+        && /^(?:gpt|o\d)\b/i.test(label);
+    });
   return {
     menu,
     family_trigger: familyTrigger ?? null,

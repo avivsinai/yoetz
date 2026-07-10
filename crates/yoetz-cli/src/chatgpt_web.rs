@@ -502,7 +502,7 @@ async () => {{
   function readState(menu) {{
     const effortItems = radios(menu);
     const familyTrigger = Array.from(menu?.querySelectorAll?.("[role='menuitem']") || [])
-      .find((item) => item.getAttribute("aria-haspopup") === "menu" && /^gpt\b/i.test(textOf(item))) || null;
+      .find((item) => item.getAttribute("aria-haspopup") === "menu" && /^(?:gpt|o\d)\b/i.test(textOf(item))) || null;
     return {{ menu, effortItems, familyTrigger, familyLabel: textOf(familyTrigger) }};
   }}
 
@@ -589,6 +589,7 @@ async () => {{
       keyPress(pill, "Escape", "Escape");
       await wait(100);
     }}
+    return visibleMenus().length === 0;
   }}
 
   function familyVerified(state) {{
@@ -679,18 +680,14 @@ async () => {{
 
   const familyIsVerified = familyVerified(state);
   const effortIsVerified = effortVerified(state);
-  if (families.length === 0 && state.familyTrigger) {{
-    const submenu = await openFamilyMenu(state);
-    families = radios(submenu).map(textOf).filter(Boolean);
+  if (!familyIsVerified || !effortIsVerified) {{
+    await closeMenus(pill);
+    return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol + Pro could not be verified in one picker pass");
   }}
-  await closeMenus(pill);
-  return result(
-    familyIsVerified && effortIsVerified ? "selected" : "selection-mismatch",
-    pill,
-    state,
-    families,
-    familyIsVerified && effortIsVerified ? null : "GPT-5.6 Sol + Pro could not be verified in one picker pass"
-  );
+  if (!await closeMenus(pill)) {{
+    return result("selection-mismatch", pill, state, families, "ChatGPT model picker remained open after verification");
+  }}
+  return result("selected", pill, state, families);
 }}
 "##,
         requested_model = requested_model,
@@ -1318,7 +1315,11 @@ mod tests {
         assert!(script.contains(r#"effortStatus: effortIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"fold(textOf(item)) === "gpt-5.6 sol""#));
         assert!(script.contains(r#"fold(textOf(item)) === "pro""#));
+        assert!(script.contains(r#"/^(?:gpt|o\d)\b/i.test(textOf(item))"#));
         assert!(script.contains("await openFamilyMenu"));
+        assert!(script.contains("return visibleMenus().length === 0;"));
+        assert!(script.contains("if (!await closeMenus(pill))"));
+        assert!(!script.contains("if (families.length === 0 && state.familyTrigger)"));
         assert!(script.contains("await closeMenus"));
         assert!(!script.contains("model-switcher-gpt-5-4"));
     }
