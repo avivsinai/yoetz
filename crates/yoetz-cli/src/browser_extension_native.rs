@@ -969,6 +969,7 @@ pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Val
     let spec = ChatgptRecipeSpec {
         bundle_path: Some(bundle_path),
         model: crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
+        model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
         prompt: "Reply with exactly OK.".to_string(),
         browser_context_id: None,
         profile_email: selector.profile_email.map(str::to_string),
@@ -1110,6 +1111,7 @@ fn chatgpt_job_start_payload(spec: &ChatgptRecipeSpec, bundle: &BundleInfo) -> V
         "mime": bundle.mime,
         "prompt": spec.prompt,
         "model": spec.model,
+        "model_strategy": spec.model_strategy,
         "browser_context_id": spec.browser_context_id,
         "profile_email": spec.profile_email,
         "extension_instance_id": spec.extension_instance_id,
@@ -2040,6 +2042,7 @@ fn parse_model_selection_status(value: Option<&str>) -> ChatgptModelSelectionSta
     match value.unwrap_or("unavailable") {
         "selected" => ChatgptModelSelectionStatus::Selected,
         "kept_current" => ChatgptModelSelectionStatus::KeptCurrent,
+        "current" => ChatgptModelSelectionStatus::Current,
         "mismatch" => ChatgptModelSelectionStatus::Mismatch,
         _ => ChatgptModelSelectionStatus::Unavailable,
     }
@@ -3237,6 +3240,7 @@ mod tests {
         let spec = ChatgptRecipeSpec {
             bundle_path: Some(bundle.path.clone()),
             model: crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
+            model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
             prompt: "continue".to_string(),
             browser_context_id: None,
             profile_email: None,

@@ -957,6 +957,89 @@ test("service worker fails closed when GPT-5.6 Sol Pro selection is only kept_cu
   }
 });
 
+test("service worker keeps the current-model warning to one final payload entry", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  const sentJobs = new Set();
+  const sentToTabs = [];
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        sentToTabs.push(message);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: currentSelection()
+            };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sentJobs.add(message.job.job_id);
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: "conv-current-warning"
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: {
+                method: "assistant_dom_fallback",
+                text: sentJobs.has(message.job.job_id) ? "answer" : "",
+                is_generating: false,
+                assistant_count: sentJobs.has(message.job.job_id) ? 1 : 0,
+                copy_button_count: sentJobs.has(message.job.job_id) ? 1 : 0,
+                has_copy_button: sentJobs.has(message.job.job_id),
+                turn_index: sentJobs.has(message.job.job_id) ? 0 : -1,
+                conversation_id: "conv-current-warning"
+              }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?current_warning=${Date.now()}`);
+    port.emit(envelope("job_start", "job_current_warning", {
+      prompt: "prompt",
+      model: "smuggled-value",
+      model_strategy: "current"
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_progress" && message.payload.phase === "ready_for_file"));
+    assert.equal(sentToTabs.find((message) => message.type === "yoetz_configure_model")?.job.model, "current");
+    port.emit(envelope("job_file_chunk", "job_current_warning", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete" && message.job_id === "job_current_warning"));
+    const complete = port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_current_warning");
+    assert.equal(complete.payload.model_selection_status, "current");
+    assert.deepEqual(complete.payload.warnings, ["model pinning bypassed — answer may come from any model"]);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker fails closed when GPT-5.6 Sol Pro selection fails", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -5516,6 +5599,18 @@ function verifiedSolProSelection() {
     requested_model: "gpt-5-6-sol-pro",
     family_status: "verified",
     effort_status: "verified"
+  };
+}
+
+function currentSelection() {
+  return {
+    status: "current",
+    model_used: "5.5 Instant",
+    requested_model: "current",
+    family_status: "skipped",
+    effort_status: "skipped",
+    warning: "model pinning bypassed — answer may come from any model",
+    warnings: []
   };
 }
 

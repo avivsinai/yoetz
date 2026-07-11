@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Council runs now write per-model result/error artifacts, include aggregate
   success, failure, cost, and elapsed-time summaries, and support
   `--partial fail` for strict partial-failure exit semantics.
+- ChatGPT browser recipes now support `--model-strategy current` as a
+  drift-window escape hatch that skips picker interaction, reports the pill
+  text best-effort, and preserves the existing pinned `select` path as the
+  default.
 - ChatGPT recipe follow-ups now support native-only resumes via
   `--followup <session-id|conversation-id|url>` plus
   `--allow-duplicate-prompt` for explicit replays. Session-id lookups resolve

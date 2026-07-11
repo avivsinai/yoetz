@@ -372,6 +372,9 @@ for deeper diagnostics. If you specifically need the CDP/browser stack, pass
 `--transport agent-browser`, `--cdp`, `--browser-id`, or a managed `--profile`.
 Do not run a live canary as a routine readiness step before ChatGPT Pro recipe
 runs; reserve it for explicit diagnostics.
+`--model-strategy current` is the drift-window escape hatch: it leaves the
+picker untouched, reports the pill text best-effort, and should not be used for
+routine pinned runs.
 If `doctor` or `inspect` points to a live ChatGPT-side problem and the user
 explicitly wants a diagnostic probe, run
 `yoetz browser extension canary --chatgpt --live`.

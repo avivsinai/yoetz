@@ -848,7 +848,10 @@ fn parse_response_baseline(state: &serde_json::Value) -> Result<ResponseBaseline
 }
 
 fn build_model_selection_script(requested_model: &str) -> String {
-    chatgpt_web::build_model_selection_function(requested_model)
+    chatgpt_web::build_model_selection_function(
+        requested_model,
+        crate::chatgpt_recipe::ChatgptModelStrategy::Select,
+    )
 }
 
 /// Rewrite a CDP attach failure with actionable guidance.

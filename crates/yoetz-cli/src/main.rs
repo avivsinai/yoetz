@@ -266,6 +266,10 @@ struct BrowserRecipeArgs {
     #[arg(long)]
     recipe: PathBuf,
 
+    /// Control whether ChatGPT is pinned to Sol+Pro or left on the current model.
+    #[arg(long, value_enum, default_value_t = chatgpt_recipe::ChatgptModelStrategy::Select)]
+    model_strategy: chatgpt_recipe::ChatgptModelStrategy,
+
     /// Explicitly select one browser recipe transport. When omitted, the
     /// chatgpt recipe selects only `chrome-extension-native` if the Yoetz
     /// Chrome extension is installed and reports `connected`; otherwise the
@@ -2055,6 +2059,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
         transport: "chrome-devtools-mcp".to_string(),
         backend: "chrome-devtools-mcp".to_string(),
         response: response.response,
+        model_strategy: recipe_spec.model_strategy,
         model_used: response.model_used,
         model_selection_status,
         warnings: Vec::new(),
@@ -2076,6 +2081,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
                 transport: "chrome-devtools-mcp".to_string(),
                 backend: "chrome-devtools-mcp".to_string(),
                 response: payload["response"].as_str().unwrap_or_default().to_string(),
+                model_strategy: recipe_spec.model_strategy,
                 model_used: payload["model_used"].as_str().map(str::to_owned),
                 model_selection_status,
                 warnings: payload["warnings"]
@@ -2129,7 +2135,13 @@ fn build_chatgpt_recipe_spec(
         .transpose()?;
     Ok(chatgpt_recipe::ChatgptRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
-        model: chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
+        model: match recipe_args.model_strategy {
+            chatgpt_recipe::ChatgptModelStrategy::Select => {
+                chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string()
+            }
+            chatgpt_recipe::ChatgptModelStrategy::Current => "current".to_string(),
+        },
+        model_strategy: recipe_args.model_strategy,
         prompt: recipe_vars
             .get("prompt")
             .cloned()
@@ -2281,6 +2293,7 @@ fn run_recipe_via_chrome_extension_native(
         transport: browser_extension_native::TRANSPORT_NAME.to_string(),
         backend: browser_extension_native::TRANSPORT_NAME.to_string(),
         response: response.response,
+        model_strategy: recipe_spec.model_strategy,
         model_used: response.model_used,
         model_selection_status: response.model_selection_status,
         warnings: response.warnings,
@@ -2461,6 +2474,7 @@ fn run_recipe_via_dev_browser(
         bundle_path: recipe_spec.bundle_path.clone(),
         bundle_text,
         model: recipe_spec.model.clone(),
+        model_strategy: recipe_spec.model_strategy,
         paste_mode,
         prompt: recipe_spec.prompt.clone(),
         run_id: recipe_spec.run_id.clone(),
@@ -2481,6 +2495,7 @@ fn run_recipe_via_dev_browser(
         transport: "dev-browser".to_string(),
         backend: "dev-browser".to_string(),
         response: response.response,
+        model_strategy: recipe_spec.model_strategy,
         model_used: response.model_used,
         model_selection_status: response.model_selection_status,
         warnings: response.warnings,
@@ -5721,6 +5736,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -5756,6 +5772,7 @@ mod tests {
             profile: Some(PathBuf::from("/tmp/ignored")),
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -5787,6 +5804,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -5819,6 +5837,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -5851,6 +5870,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -5883,6 +5903,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -5917,6 +5938,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -5945,6 +5967,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -5971,6 +5994,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -6019,6 +6043,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -6050,6 +6075,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -6094,6 +6120,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -6139,6 +6166,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec!["prompt=Explicit prompt".to_string()],
             followup: None,
             allow_duplicate_prompt: false,
@@ -6164,6 +6192,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -6196,6 +6225,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -6228,6 +6258,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -6255,6 +6286,7 @@ mod tests {
             transport: "dev-browser".to_string(),
             backend: "dev-browser".to_string(),
             response: "ok".to_string(),
+            model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
             model_used: Some("GPT-5.6 Sol Pro".to_string()),
             model_selection_status: crate::chatgpt_recipe::ChatgptModelSelectionStatus::Selected,
             warnings: vec!["clipboard fallback".to_string()],
@@ -6286,6 +6318,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
@@ -6317,6 +6350,7 @@ mod tests {
             profile: None,
             cdp: None,
             browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,

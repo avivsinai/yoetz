@@ -1,6 +1,7 @@
 //! ChatGPT recipe output types and terminal-fallback phase markers.
 
 use anyhow::Error as AnyhowError;
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fmt;
@@ -132,11 +133,19 @@ pub enum ChatgptDeliveryMode {
     Paste,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatgptModelStrategy {
+    Select,
+    Current,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChatgptModelSelectionStatus {
     Selected,
     KeptCurrent,
+    Current,
     Unavailable,
     Mismatch,
 }
@@ -154,6 +163,7 @@ impl ChatgptDeliveryMode {
 pub struct ChatgptRecipeSpec {
     pub bundle_path: Option<PathBuf>,
     pub model: String,
+    pub model_strategy: ChatgptModelStrategy,
     pub prompt: String,
     pub browser_context_id: Option<String>,
     pub profile_email: Option<String>,
@@ -172,6 +182,7 @@ pub struct ChatgptRecipeOutput {
     pub transport: String,
     pub backend: String,
     pub response: String,
+    pub model_strategy: ChatgptModelStrategy,
     pub model_used: Option<String>,
     pub model_selection_status: ChatgptModelSelectionStatus,
     pub warnings: Vec<String>,
@@ -189,6 +200,7 @@ impl ChatgptRecipeOutput {
             "transport": self.transport,
             "backend": self.backend,
             "response": self.response,
+            "model_strategy": self.model_strategy,
             "model_used": self.model_used,
             "model_selection_status": self.model_selection_status,
             "warnings": self.warnings,
@@ -206,6 +218,7 @@ impl ChatgptRecipeOutput {
             "transport": self.transport,
             "backend": self.backend,
             "response": self.response,
+            "model_strategy": self.model_strategy,
             "model_used": self.model_used,
             "model_selection_status": self.model_selection_status,
             "warnings": self.warnings,
@@ -229,6 +242,7 @@ mod tests {
             transport: "dev-browser".to_string(),
             backend: "dev-browser".to_string(),
             response: "ok".to_string(),
+            model_strategy: ChatgptModelStrategy::Select,
             model_used: Some("GPT-5.6 Sol Pro".to_string()),
             model_selection_status: ChatgptModelSelectionStatus::Selected,
             warnings: vec!["fallback".to_string()],
@@ -244,6 +258,7 @@ mod tests {
         assert_eq!(payload["transport"], "dev-browser");
         assert_eq!(payload["backend"], "dev-browser");
         assert_eq!(payload["response"], "ok");
+        assert_eq!(payload["model_strategy"], "select");
         assert_eq!(payload["model_used"], "GPT-5.6 Sol Pro");
         assert_eq!(payload["model_selection_status"], "selected");
         assert_eq!(payload["warnings"], json!(["fallback"]));

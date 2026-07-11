@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime};
 
-use crate::chatgpt_recipe::ChatgptModelSelectionStatus;
+use crate::chatgpt_recipe::{ChatgptModelSelectionStatus, ChatgptModelStrategy};
 
 pub const CHATGPT_URL: &str = "https://chatgpt.com/";
 const CHATGPT_LEGACY_HOST: &str = "chat.openai.com";
@@ -322,13 +322,15 @@ pub fn select_reported_chatgpt_model(
     selection: &serde_json::Value,
     requested_model: &str,
 ) -> Option<String> {
-    if !is_verified_sol_pro_selection(selection, requested_model) {
-        return None;
+    if is_current_model_selection(selection, requested_model)
+        || is_verified_sol_pro_selection(selection, requested_model)
+    {
+        return selection
+            .get("modelUsed")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
     }
-    selection
-        .get("modelUsed")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
+    None
 }
 
 pub(crate) fn chatgpt_model_selection_status(
@@ -344,9 +346,30 @@ pub(crate) fn chatgpt_model_selection_status(
             ChatgptModelSelectionStatus::Selected
         }
         "selected" | "selection-mismatch" => ChatgptModelSelectionStatus::Mismatch,
+        "current" if is_current_model_selection(selection, requested_model) => {
+            ChatgptModelSelectionStatus::Current
+        }
+        "current" => ChatgptModelSelectionStatus::Mismatch,
         "missing-selector" | "not-found" => ChatgptModelSelectionStatus::Unavailable,
         _ => ChatgptModelSelectionStatus::Unavailable,
     }
+}
+
+fn is_current_model_selection(selection: &serde_json::Value, requested_model: &str) -> bool {
+    selection.get("status").and_then(serde_json::Value::as_str) == Some("current")
+        && requested_model.trim() == "current"
+        && selection
+            .get("requested")
+            .and_then(serde_json::Value::as_str)
+            == Some("current")
+        && selection
+            .get("familyStatus")
+            .and_then(serde_json::Value::as_str)
+            == Some("skipped")
+        && selection
+            .get("effortStatus")
+            .and_then(serde_json::Value::as_str)
+            == Some("skipped")
 }
 
 fn is_verified_sol_pro_selection(selection: &serde_json::Value, requested_model: &str) -> bool {
@@ -405,15 +428,20 @@ pub fn upload_menu_text_pattern_json() -> String {
     serde_json::to_string(UPLOAD_MENU_TEXT_PATTERN).expect("serialize upload menu text pattern")
 }
 
-pub fn build_model_selection_function(requested_model: &str) -> String {
+pub fn build_model_selection_function(
+    requested_model: &str,
+    model_strategy: ChatgptModelStrategy,
+) -> String {
     let requested_model =
         serde_json::to_string(requested_model).expect("serialize requested model");
+    let model_strategy = serde_json::to_string(&model_strategy).expect("serialize model strategy");
     let model_button_selector = model_selector_button_selector_json();
     let composer_selector = composer_selector_json();
     format!(
         r##"
 async () => {{
   const requested = {requested_model};
+  const strategy = {model_strategy};
   const supported = "gpt-5-6-sol-pro";
   const MODEL_BUTTON_SELECTOR = {model_button_selector};
   const COMPOSER_SELECTOR = {composer_selector};
@@ -612,10 +640,13 @@ async () => {{
   function result(status, pill, state, families, warning = null) {{
     const familyIsVerified = familyVerified(state);
     const effortIsVerified = effortVerified(state);
+    const modelUsed = status === "current"
+      ? (pill ? textOf(pill) : "")
+      : (familyIsVerified && effortIsVerified ? "GPT-5.6 Sol Pro" : null);
     return {{
       requested,
       status,
-      modelUsed: familyIsVerified && effortIsVerified ? "GPT-5.6 Sol Pro" : null,
+      modelUsed,
       familyStatus: familyIsVerified ? "verified" : "unverified",
       effortStatus: effortIsVerified ? "verified" : "unverified",
       pillText: textOf(pill),
@@ -623,6 +654,24 @@ async () => {{
       availableItems: (state?.effortItems || []).map(textOf).filter(Boolean),
       availableFamilies: families || [],
       warning,
+      url: window.location.href || "",
+      title: document.title || ""
+    }};
+  }}
+
+  if (strategy === "current") {{
+    const pill = await waitForPill();
+    return {{
+      requested,
+      status: "current",
+      modelUsed: pill ? textOf(pill) : "",
+      familyStatus: "skipped",
+      effortStatus: "skipped",
+      pillText: pill ? textOf(pill) : "",
+      familyLabel: null,
+      availableItems: [],
+      availableFamilies: [],
+      warning: "model pinning bypassed — answer may come from any model",
       url: window.location.href || "",
       title: document.title || ""
     }};
@@ -1247,6 +1296,21 @@ mod tests {
     }
 
     #[test]
+    fn reported_chatgpt_model_returns_current_pill_text_without_picker_proof() {
+        let selection = serde_json::json!({
+            "status": "current",
+            "requested": "current",
+            "modelUsed": "5.5 Instant",
+            "familyStatus": "skipped",
+            "effortStatus": "skipped"
+        });
+        assert_eq!(
+            select_reported_chatgpt_model(&selection, "current"),
+            Some("5.5 Instant".to_string())
+        );
+    }
+
+    #[test]
     fn chatgpt_model_selection_status_reports_contract_values() {
         assert_eq!(
             chatgpt_model_selection_status(
@@ -1260,6 +1324,19 @@ mod tests {
                 "gpt-5-6-sol-pro"
             ),
             ChatgptModelSelectionStatus::Selected
+        );
+        assert_eq!(
+            chatgpt_model_selection_status(
+                &serde_json::json!({
+                    "status": "current",
+                    "requested": "current",
+                    "modelUsed": "5.5 Instant",
+                    "familyStatus": "skipped",
+                    "effortStatus": "skipped"
+                }),
+                "current"
+            ),
+            ChatgptModelSelectionStatus::Current
         );
         assert_eq!(
             chatgpt_model_selection_status(
@@ -1314,7 +1391,8 @@ mod tests {
 
     #[test]
     fn model_selection_function_requires_verified_sol_family_and_pro_effort() {
-        let script = build_model_selection_function("gpt-5-6-sol-pro");
+        let script =
+            build_model_selection_function("gpt-5-6-sol-pro", ChatgptModelStrategy::Select);
         assert!(script.contains(r#"const requested = "gpt-5-6-sol-pro";"#));
         assert!(script.contains("classList.contains(\"__composer-pill\")"));
         assert!(script.contains(
@@ -1338,6 +1416,17 @@ mod tests {
         assert!(!script.contains("if (families.length === 0 && state.familyTrigger)"));
         assert!(script.contains("await closeMenus"));
         assert!(!script.contains("model-switcher-gpt-5-4"));
+    }
+
+    #[test]
+    fn model_selection_function_current_bypasses_picker() {
+        let script = build_model_selection_function("current", ChatgptModelStrategy::Current);
+        assert!(script.contains(r#"const requested = "current";"#));
+        assert!(script.contains(r#"const strategy = "current";"#));
+        assert!(script.contains(r#"familyStatus: "skipped""#));
+        assert!(script.contains(r#"effortStatus: "skipped""#));
+        assert!(script.contains("model pinning bypassed — answer may come from any model"));
+        assert!(script.contains(r#"if (strategy === "current")"#));
     }
 
     #[test]

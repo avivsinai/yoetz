@@ -303,6 +303,7 @@ async function startJob(message) {
       phase: "model_selection",
       side_effect_started: false,
       requested_model: job.model,
+      model_strategy: job.model_strategy,
       model_used: job.model_used,
       model_selection_status: job.model_selection_status,
       model_selection: modelSelection
@@ -478,6 +479,7 @@ async function completeJobWithExtraction(job, extraction) {
       copy_button_count: extraction.copy_button_count ?? 0,
       conversation_id: conversationId,
       conversation_url: conversationUrlForId(conversationId),
+      model_strategy: job.model_strategy ?? "select",
       model_used: job.model_used ?? null,
       model_selection_status: job.model_selection_status ?? "unavailable",
       warnings: [
@@ -1051,7 +1053,8 @@ function normalizeJob(message) {
     capability_token: message.capability_token,
     request_id: message.request_id,
     prompt: payload.prompt ?? "",
-    model: "gpt-5-6-sol-pro",
+    model: payload.model_strategy === "current" ? "current" : "gpt-5-6-sol-pro",
+    model_strategy: payload.model_strategy ?? "select",
     wait_timeout_ms: payload.wait_timeout_ms ?? DEFAULT_WAIT_TIMEOUT_MS,
     wait_interval_ms: payload.wait_interval_ms ?? 30000,
     upload_timeout_ms: payload.upload_timeout_ms ?? 120000,
@@ -1940,6 +1943,11 @@ function nonNegativeFiniteNumber(value) {
 }
 
 function isAcceptableModelSelection(selection) {
+  if (selection?.status === "current") {
+    return selection?.requested_model === "current"
+      && selection?.family_status === "skipped"
+      && selection?.effort_status === "skipped";
+  }
   return selection?.status === "selected"
     && selection?.requested_model === "gpt-5-6-sol-pro"
     && selection?.family_status === "verified"
