@@ -85,7 +85,7 @@ export function progress(job, phase, detail = {}) {
   // INVARIANT: every job_progress event is non-final. The authoritative answer is only ever
   // delivered in the terminal job_complete envelope (payload.is_final=true). A machine consumer
   // (inspect/JSONL stream) must be able to trust is_final to never mistake a streaming/interim
-  // turn's partial text for the final response — ChatGPT Pro Extended streams the answer as several
+  // turn's partial text for the final response — ChatGPT Pro streams the answer as several
   // interim end_turn turns before the real one, so any progress text may be an interim turn's head
   // (observed live as a single "I"). Strip any caller-supplied is_final and force false LAST so no
   // call site can ever emit a final-looking progress event, now or in the future.

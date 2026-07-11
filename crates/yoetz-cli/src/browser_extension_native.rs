@@ -968,7 +968,7 @@ pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Val
     fs::write(&bundle_path, "Reply with exactly OK.\n")?;
     let spec = ChatgptRecipeSpec {
         bundle_path: Some(bundle_path),
-        model: crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL.to_string(),
+        model: crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
         prompt: "Reply with exactly OK.".to_string(),
         browser_context_id: None,
         profile_email: selector.profile_email.map(str::to_string),
@@ -3236,7 +3236,7 @@ mod tests {
         };
         let spec = ChatgptRecipeSpec {
             bundle_path: Some(bundle.path.clone()),
-            model: "extended-pro".to_string(),
+            model: crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
             prompt: "continue".to_string(),
             browser_context_id: None,
             profile_email: None,
@@ -3263,7 +3263,7 @@ mod tests {
             Some("run_1".to_string()),
             json!({
                 "response": "done",
-                "model_used": "Pro Extended",
+                "model_used": "GPT-5.6 Sol Pro",
                 "model_selection_status": "selected",
                 "warnings": ["kept current"],
                 "conversation_id": "conv-123",
@@ -3274,7 +3274,7 @@ mod tests {
         let result = parse_recipe_result(envelope).unwrap();
 
         assert_eq!(result.response, "done");
-        assert_eq!(result.model_used.as_deref(), Some("Pro Extended"));
+        assert_eq!(result.model_used.as_deref(), Some("GPT-5.6 Sol Pro"));
         assert_eq!(
             result.model_selection_status,
             ChatgptModelSelectionStatus::Selected

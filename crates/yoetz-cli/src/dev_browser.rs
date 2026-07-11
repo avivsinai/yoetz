@@ -907,8 +907,6 @@ struct ChatgptPrepareResult {
     logged_in: bool,
     #[serde(rename = "composerReady")]
     composer_ready: bool,
-    #[serde(rename = "modelUsed")]
-    model_used: Option<String>,
     #[serde(rename = "modelSelection")]
     model_selection: Option<Value>,
     url: String,
@@ -955,9 +953,6 @@ fn build_chatgpt_prepare_script(page_name: &str, model: &str, run_id: &str) -> S
         r##"
 const PAGE_NAME = {page_name_json};
 const MODEL = {model_json};
-const MODEL_TRIMMED = String(MODEL || "").trim();
-const MODEL_LOWER = MODEL_TRIMMED.toLowerCase();
-const KEEP_CURRENT_MODEL = !MODEL_TRIMMED || MODEL_LOWER === "current" || MODEL_LOWER === "keep-current";
 const MARKED_URL = {marked_url_json};
 const WINDOW_NAME = {window_name_json};
 const MODEL_SELECTION_FUNCTION_SOURCE = {model_selection_function_json};
@@ -1028,15 +1023,16 @@ if (loggedIn && composerReady) {{
   }}, MODEL_SELECTION_FUNCTION_SOURCE);
   const selectionStatus = selection?.status || "unknown";
   modelSelection = selection || null;
-  const keepCurrentModel = KEEP_CURRENT_MODEL && ["missing-selector", "not-found"].includes(selectionStatus);
-  if (!["selected", "already-selected"].includes(selectionStatus) && !keepCurrentModel) {{
+  if (selectionStatus !== "selected") {{
     const diagnostics = JSON.stringify({{
       status: selectionStatus,
       requested: selection?.requested || MODEL || "",
-      selectedLabel: selection?.selectedLabel || "",
-      targetTestId: selection?.targetTestId || "",
+      familyStatus: selection?.familyStatus || "unverified",
+      effortStatus: selection?.effortStatus || "unverified",
+      familyLabel: selection?.familyLabel || "",
+      warning: selection?.warning || "",
       availableItems: selection?.availableItems || [],
-      availableItemsAfter: selection?.availableItemsAfter || [],
+      availableFamilies: selection?.availableFamilies || [],
     }});
     if (selectionStatus === "missing-selector") {{
       throw new Error("model selector button not found (" + diagnostics + ")");
@@ -1049,12 +1045,7 @@ if (loggedIn && composerReady) {{
     }}
     throw new Error("unexpected model selection status '" + selectionStatus + "' (" + diagnostics + ")");
   }}
-  selectedModel =
-    selection?.targetTestId ||
-    selection?.modelUsed ||
-    selection?.selectedLabel ||
-    selection?.currentLabel ||
-    null;
+  selectedModel = selection?.modelUsed || null;
   await page.waitForTimeout(500);
 }}
 console.log(JSON.stringify({{
@@ -1579,15 +1570,9 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
             .clone()
             .unwrap_or_else(|| serde_json::json!({"status": "unknown"}));
         let model_used = prepare
-            .model_used
-            .as_deref()
-            .and_then(chatgpt_web::canonical_chatgpt_model_slug)
-            .or_else(|| {
-                prepare
-                    .model_selection
-                    .as_ref()
-                    .and_then(|selection| chatgpt_web::select_reported_chatgpt_model(selection, &ctx.model))
-            });
+            .model_selection
+            .as_ref()
+            .and_then(|selection| chatgpt_web::select_reported_chatgpt_model(selection, &ctx.model));
         let model_selection_status =
             chatgpt_web::chatgpt_model_selection_status(&model_selection, &ctx.model);
         let classified_issue =
@@ -1618,6 +1603,12 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
                     prepare.url
                 ));
             }
+        }
+        if model_selection_status != chatgpt_recipe::ChatgptModelSelectionStatus::Selected {
+            return Err(anyhow!(
+                "ChatGPT did not provide verified GPT-5.6 Sol + Pro selection proof: {}",
+                model_selection
+            ));
         }
 
         let send_script = build_chatgpt_send_script(
@@ -1982,15 +1973,12 @@ mod tests {
     fn build_chatgpt_prepare_script_uses_named_page_and_login_check() {
         let script = build_chatgpt_prepare_script(
             "yoetz-chatgpt-test",
-            crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL,
+            crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL,
             "run-123",
         );
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
-        assert!(script.contains("const MODEL = \"extended-pro\";"));
-        assert!(script.contains(
-            "const KEEP_CURRENT_MODEL = !MODEL_TRIMMED || MODEL_LOWER === \"current\" || MODEL_LOWER === \"keep-current\";"
-        ));
+        assert!(script.contains("const MODEL = \"gpt-5-6-sol-pro\";"));
         assert!(script.contains("const MARKED_URL = \"https://chatgpt.com/?_yoetz=run-123\";"));
         assert!(script.contains("const WINDOW_NAME = \"yoetz:run-123\";"));
         assert!(
@@ -2006,22 +1994,18 @@ mod tests {
         assert!(script.contains("state.assistantCount === 0"));
         assert!(script.contains("pathname.startsWith(\"/c/\")"));
         assert!(script.contains("const selection = await page.evaluate((functionSource) => {"));
-        assert!(script.contains("targetCandidateForTier(entries, \\\"extended-pro\\\")"));
-        assert!(script.contains("\\\"gpt-5-pro\\\":\\\"gpt-5-4-pro\\\""));
-        assert!(!script.contains("\\\"gpt-5-3-pro\\\""));
+        assert!(script.contains("classList.contains(\\\"__composer-pill\\\")"));
+        assert!(script.contains("familyStatus"));
+        assert!(script.contains("effortStatus"));
         assert!(script.contains(
             "requested model '\" + (selection?.requested || MODEL || \"\") + \"' was not selected"
         ));
         assert!(script.contains("let selectedModel = null;"));
         assert!(script.contains("let modelSelection = null;"));
-        assert!(script.contains(
-            "const keepCurrentModel = KEEP_CURRENT_MODEL && [\"missing-selector\", \"not-found\"].includes(selectionStatus);"
-        ));
         assert!(script.contains("modelSelection = selection || null;"));
         assert!(!script.contains("modelSelectionStatus ="));
-        assert!(!script.contains("? (KEEP_CURRENT_MODEL ? \"kept_current\" : \"selected\")"));
         assert!(script.contains("selectedModel ="));
-        assert!(script.contains("selection?.currentLabel ||"));
+        assert!(script.contains("selectedModel = selection?.modelUsed || null;"));
         assert!(script.contains("modelUsed: selectedModel,"));
         assert!(script.contains("modelSelection,"));
         assert!(script.contains("bodyText"));
@@ -2103,7 +2087,7 @@ mod tests {
     fn parse_script_json_reads_prepare_result() {
         let result: ChatgptPrepareResult = parse_script_json(
             "prepare",
-            r#"{"status":"ready","loggedIn":true,"composerReady":true,"modelUsed":"model-switcher-gpt-5-4-pro","modelSelection":{"status":"selected"},"url":"https://chatgpt.com/","title":"ChatGPT","bodyText":"Send a message"}"#,
+            r#"{"status":"ready","loggedIn":true,"composerReady":true,"modelUsed":"GPT-5.6 Sol Pro","modelSelection":{"status":"selected","requested":"gpt-5-6-sol-pro","modelUsed":"GPT-5.6 Sol Pro","familyStatus":"verified","effortStatus":"verified"},"url":"https://chatgpt.com/","title":"ChatGPT","bodyText":"Send a message"}"#,
         )
         .unwrap();
 
@@ -2111,16 +2095,20 @@ mod tests {
         assert!(result.logged_in);
         assert!(result.composer_ready);
         assert_eq!(
-            result.model_used.as_deref(),
-            Some("model-switcher-gpt-5-4-pro")
-        );
-        assert_eq!(
             result
                 .model_selection
                 .as_ref()
                 .and_then(|selection| selection.get("status"))
                 .and_then(Value::as_str),
             Some("selected")
+        );
+        assert_eq!(
+            result
+                .model_selection
+                .as_ref()
+                .and_then(|selection| selection.get("modelUsed"))
+                .and_then(Value::as_str),
+            Some("GPT-5.6 Sol Pro")
         );
         assert_eq!(result.title, "ChatGPT");
     }

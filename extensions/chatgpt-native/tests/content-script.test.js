@@ -74,7 +74,7 @@ export async function uploadFile(_document, file, options) {
 
 export function configureModelState(_document, job) {
   hooks.configureModelCalls.push(job);
-  return { status: "selected", model_used: "Pro • Extended", requested_model: "extended-pro", extended_status: "required" };
+  return { status: "selected", model_used: "GPT-5.6 Sol Pro", requested_model: "gpt-5-6-sol-pro", family_status: "verified", effort_status: "verified" };
 }
 
 export function sendAcceptanceBaseline() {

@@ -13,8 +13,7 @@ const CHATGPT_LEGACY_HOST: &str = "chat.openai.com";
 const CHATGPT_HOST: &str = "chatgpt.com";
 pub const COMPOSER_SELECTOR: &str =
     "#prompt-textarea, div[contenteditable='true'][role='textbox'], [role='textbox']";
-pub const MODEL_SELECTOR_BUTTON_SELECTOR: &str = "[data-testid='model-switcher-dropdown-button'], button[aria-label='Model selector'], button[aria-label='Model selector menu'], button:has([data-testid='selected-model']), button:has([data-testid='model-switcher-selected-model'])";
-pub const MODEL_ITEM_SELECTOR: &str = "[role='menuitem'], [role='menuitemradio'], [data-testid^='model-switcher-']:not([data-testid='model-switcher-selected-model'])";
+pub const MODEL_SELECTOR_BUTTON_SELECTOR: &str = "button[aria-haspopup='menu']";
 pub const ATTACHMENT_TILE_SELECTOR: &str = "[class*='file-tile'], [data-testid*='attachment']";
 pub const ATTACHMENT_TRIGGER_SELECTOR: &str = "button[data-testid='composer-plus-btn'], button[aria-label*='Attach'], button[aria-label*='attach'], button[data-testid*='attach']";
 pub const SEND_BUTTON_SELECTOR: &str =
@@ -73,8 +72,6 @@ const AUTH_MARKERS: &[&str] = &[
     "send-button",
     "prompt-textarea",
     "composer",
-    "model-switcher-dropdown-button",
-    "model-switcher-selected-model",
     "create-new-chat-button",
     "composer-plus-btn",
 ];
@@ -256,28 +253,17 @@ pub fn build_set_window_name_js(run_id: &str) -> String {
     )
 }
 
-pub fn model_testid_alias_map() -> BTreeMap<&'static str, &'static str> {
+pub fn model_alias_map() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
-        ("extended-pro", "extended-pro"),
-        ("pro", "gpt-5-4-pro"),
-        ("gpt-5-pro", "gpt-5-4-pro"),
-        ("thinking", "gpt-5-4-thinking"),
-        ("gpt-5-thinking", "gpt-5-4-thinking"),
-        ("instant", "gpt-5-3"),
+        ("gpt-5-6-sol-pro", "gpt-5-6-sol-pro"),
+        ("sol-pro", "gpt-5-6-sol-pro"),
     ])
 }
 
-pub fn model_testid_candidate_map() -> BTreeMap<&'static str, Vec<&'static str>> {
+pub fn model_candidate_map() -> BTreeMap<&'static str, Vec<&'static str>> {
     BTreeMap::from([
-        ("extended-pro", vec!["extended-pro"]),
-        ("pro", vec!["gpt-5-4-pro"]),
-        ("gpt-5-pro", vec!["gpt-5-4-pro"]),
-        ("gpt-5-4-pro", vec!["gpt-5-4-pro"]),
-        ("thinking", vec!["gpt-5-4-thinking"]),
-        ("gpt-5-thinking", vec!["gpt-5-4-thinking"]),
-        ("gpt-5-4-thinking", vec!["gpt-5-4-thinking"]),
-        ("instant", vec!["gpt-5-3"]),
-        ("gpt-5-3", vec!["gpt-5-3"]),
+        ("gpt-5-6-sol-pro", vec!["gpt-5-6-sol-pro"]),
+        ("sol-pro", vec!["gpt-5-6-sol-pro"]),
     ])
 }
 
@@ -311,18 +297,19 @@ fn is_low_signal_chatgpt_model_key(key: &str) -> bool {
             | "model-selector"
             | "selected-model"
             | "dropdown-button"
+            | "pro"
+            | "extended-pro"
+            | "thinking"
+            | "instant"
     )
 }
 
 pub fn canonical_chatgpt_model_slug(value: &str) -> Option<String> {
     let normalized = normalize_chatgpt_model_key(value)?;
-    if let Some(stripped) = normalized.strip_prefix("model-switcher-") {
-        return canonical_chatgpt_model_slug(stripped);
-    }
-    if let Some(candidates) = model_testid_candidate_map().get(normalized.as_str()) {
+    if let Some(candidates) = model_candidate_map().get(normalized.as_str()) {
         return candidates.first().map(|value| (*value).to_string());
     }
-    if let Some(alias) = model_testid_alias_map().get(normalized.as_str()) {
+    if let Some(alias) = model_alias_map().get(normalized.as_str()) {
         return Some((*alias).to_string());
     }
     if is_low_signal_chatgpt_model_key(&normalized) {
@@ -335,29 +322,13 @@ pub fn select_reported_chatgpt_model(
     selection: &serde_json::Value,
     requested_model: &str,
 ) -> Option<String> {
-    for field in ["targetTestId", "modelUsed", "selectedLabel", "currentLabel"] {
-        if let Some(model) = selection
-            .get(field)
-            .and_then(serde_json::Value::as_str)
-            .and_then(canonical_chatgpt_model_slug)
-        {
-            return Some(model);
-        }
+    if !is_verified_sol_pro_selection(selection, requested_model) {
+        return None;
     }
-
-    let requested_model = requested_model.trim();
-    if should_keep_current_chatgpt_model(requested_model) {
-        None
-    } else {
-        canonical_chatgpt_model_slug(requested_model)
-    }
-}
-
-pub fn should_keep_current_chatgpt_model(requested_model: &str) -> bool {
-    let requested_model = requested_model.trim();
-    requested_model.is_empty()
-        || requested_model.eq_ignore_ascii_case("current")
-        || requested_model.eq_ignore_ascii_case("keep-current")
+    selection
+        .get("modelUsed")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 pub(crate) fn chatgpt_model_selection_status(
@@ -368,15 +339,40 @@ pub(crate) fn chatgpt_model_selection_status(
         .get("status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    let keep_current_model = should_keep_current_chatgpt_model(requested_model);
     match status {
-        "selected" => ChatgptModelSelectionStatus::Selected,
-        "already-selected" if keep_current_model => ChatgptModelSelectionStatus::KeptCurrent,
-        "already-selected" => ChatgptModelSelectionStatus::Selected,
+        "selected" if is_verified_sol_pro_selection(selection, requested_model) => {
+            ChatgptModelSelectionStatus::Selected
+        }
+        "selected" | "selection-mismatch" => ChatgptModelSelectionStatus::Mismatch,
         "missing-selector" | "not-found" => ChatgptModelSelectionStatus::Unavailable,
-        "selection-mismatch" => ChatgptModelSelectionStatus::Mismatch,
         _ => ChatgptModelSelectionStatus::Unavailable,
     }
+}
+
+fn is_verified_sol_pro_selection(selection: &serde_json::Value, requested_model: &str) -> bool {
+    if selection.get("status").and_then(serde_json::Value::as_str) != Some("selected")
+        || requested_model.trim() != crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL
+        || selection
+            .get("requested")
+            .and_then(serde_json::Value::as_str)
+            != Some(crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL)
+        || selection
+            .get("familyStatus")
+            .and_then(serde_json::Value::as_str)
+            != Some("verified")
+        || selection
+            .get("effortStatus")
+            .and_then(serde_json::Value::as_str)
+            != Some("verified")
+    {
+        return false;
+    }
+    let model_used = selection
+        .get("modelUsed")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    canonical_chatgpt_model_slug(model_used).as_deref()
+        == Some(crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL)
 }
 
 pub fn model_selector_button_selector_json() -> String {
@@ -386,10 +382,6 @@ pub fn model_selector_button_selector_json() -> String {
 
 pub fn composer_selector_json() -> String {
     serde_json::to_string(COMPOSER_SELECTOR).expect("serialize composer selector")
-}
-
-pub fn model_item_selector_json() -> String {
-    serde_json::to_string(MODEL_ITEM_SELECTOR).expect("serialize model item selector")
 }
 
 pub fn attachment_tile_selector_json() -> String {
@@ -413,744 +405,303 @@ pub fn upload_menu_text_pattern_json() -> String {
     serde_json::to_string(UPLOAD_MENU_TEXT_PATTERN).expect("serialize upload menu text pattern")
 }
 
-pub fn model_testid_aliases_json() -> String {
-    serde_json::to_string(&model_testid_alias_map()).expect("serialize model alias map")
-}
-
-pub fn model_testid_candidates_json() -> String {
-    serde_json::to_string(&model_testid_candidate_map()).expect("serialize model candidate map")
-}
-
 pub fn build_model_selection_function(requested_model: &str) -> String {
     let requested_model =
         serde_json::to_string(requested_model).expect("serialize requested model");
     let model_button_selector = model_selector_button_selector_json();
     let composer_selector = composer_selector_json();
-    let model_item_selector = model_item_selector_json();
-    let model_testid_aliases = model_testid_aliases_json();
-    let model_testid_candidates = model_testid_candidates_json();
     format!(
         r##"
 async () => {{
   const requested = {requested_model};
+  const supported = "gpt-5-6-sol-pro";
   const MODEL_BUTTON_SELECTOR = {model_button_selector};
   const COMPOSER_SELECTOR = {composer_selector};
-  const MODEL_ITEM_SELECTOR = {model_item_selector};
-  const MODEL_TESTID_ALIASES = {model_testid_aliases};
-  const MODEL_TESTID_CANDIDATES = {model_testid_candidates};
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const fold = (value) => normalize(value).toLowerCase();
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-  const isCheckedState = (ariaChecked, dataState) => ariaChecked === "true" || dataState === "checked";
-  const hasSelectedCurrentMarker = (ariaSelected, ariaCurrent, dataSelected, dataCurrent) =>
-    ariaSelected === "true" ||
-    dataSelected === "true" ||
-    (!!ariaCurrent && ariaCurrent !== "false") ||
-    (!!dataCurrent && dataCurrent !== "false");
-    const itemIsSelected = (item) => !!item && (
-      isCheckedState(item.ariaChecked || "", item.dataState || "") ||
-      hasSelectedCurrentMarker(item.ariaSelected || "", item.ariaCurrent || "", item.dataSelected || "", item.dataCurrent || "")
-    );
+  const textOf = (node) => normalize(node?.innerText || node?.textContent || "");
 {visibility_helpers}
-  const composerScopes = () => {{
+
+  function classTokens(node) {{
+    return normalize(node?.getAttribute?.("class") || "").split(" ").filter(Boolean);
+  }}
+
+  function legacyPickerMarkers() {{
+    return Array.from(document.querySelectorAll(
+      "[data-testid='model-switcher-dropdown-button'], [data-testid='model-switcher-selected-model'], [data-testid^='model-switcher-']"
+    )).filter(isVisible).map((node) => node.getAttribute("data-testid") || "").filter(Boolean);
+  }}
+
+  function composerScopes() {{
     const composer = document.querySelector(COMPOSER_SELECTOR);
     const scopes = [];
-    const add = (scope) => {{
-      if (scope && !scopes.includes(scope)) scopes.push(scope);
-    }};
+    const add = (scope) => {{ if (scope && !scopes.includes(scope)) scopes.push(scope); }};
     add(composer?.closest("form"));
-    add(composer?.closest("[data-testid*='composer'], [class*='composer'], main, [role='main']"));
+    add(composer?.closest("[data-testid*='composer'], [class*='composer']"));
     add(composer?.parentElement);
+    const local = scopes.slice();
+    for (const scope of local) {{
+      const parent = scope?.parentElement;
+      if (!parent) continue;
+      for (const sibling of Array.from(parent.children || [])) {{
+        const marker = fold([
+          sibling.getAttribute?.("data-testid"),
+          sibling.getAttribute?.("class"),
+          sibling.getAttribute?.("aria-label")
+        ].filter(Boolean).join(" "));
+        if (sibling !== scope && /\b(composer|model|toolbar|controls|pill)\b/.test(marker)) add(sibling);
+      }}
+    }}
     return scopes;
-  }};
-  const modelCandidateText = (node, target = node) => normalize([
-    node?.getAttribute?.("aria-label"),
-    node?.getAttribute?.("title"),
-    node?.getAttribute?.("data-testid"),
-    node?.getAttribute?.("class"),
-    node?.innerText,
-    node?.textContent,
-    target?.getAttribute?.("aria-label"),
-    target?.getAttribute?.("title"),
-    target?.getAttribute?.("data-testid"),
-    target?.getAttribute?.("class"),
-    target?.innerText,
-    target?.textContent,
-  ].filter(Boolean).join(" ")).toLowerCase();
-  const isModelActionableElement = (node) => {{
-    const tag = String(node?.tagName || "").toLowerCase();
-    const role = normalize(node?.getAttribute?.("role") || "").toLowerCase();
-    return tag === "button" ||
-      role === "button" ||
-      node?.getAttribute?.("aria-haspopup") !== null ||
-      node?.getAttribute?.("tabindex") !== null;
-  }};
-  const isModelChipLike = (node) => {{
-    const marker = normalize([
-      node?.getAttribute?.("data-testid"),
-      node?.getAttribute?.("class"),
-      node?.getAttribute?.("aria-label"),
-      node?.getAttribute?.("title"),
-    ].filter(Boolean).join(" ")).toLowerCase();
-    return /\b(model|model-switcher)\b/.test(marker) && /\b(chip|pill|token|button|menu|dropdown|switcher)\b/.test(marker);
-  }};
-  const modelClickTarget = (node, stopAt) => {{
-    for (let current = node; current; current = current.parentElement) {{
-      if (isModelActionableElement(current) || isModelChipLike(current)) return current;
-      if (current === stopAt) return null;
-    }}
-    return null;
-  }};
-  const looksLikeModelControl = (text) =>
-    /\bextended\s+pro\b/.test(text) ||
-    /\bgpt[\s.-]*\d/.test(text) ||
-    /\b(pro|instant|thinking|model)\b/.test(text);
-  const findComposerModelControl = () => {{
+  }}
+
+  function summaryMatches(value) {{
+    const valueFolded = fold(value);
+    return /^(instant|medium|high|extra high|pro)$/.test(valueFolded)
+      || /^\d+(?:\.\d+)+ (instant|medium|high|extra high|pro)$/.test(valueFolded)
+      || /\bgpt[\s.-]*\d/.test(valueFolded);
+  }}
+
+  function findPill() {{
     for (const scope of composerScopes()) {{
-      const candidates = Array.from(scope.querySelectorAll("button, [role='button'], [aria-haspopup], [tabindex], [aria-label], [title], [data-testid], span, div"));
-      for (const node of candidates) {{
-        const target = modelClickTarget(node, scope);
-        if (!target || !isVisible(target)) continue;
-        const haystack = modelCandidateText(node, target);
-        if (!looksLikeModelControl(haystack)) continue;
-        if (/\b(send|stop|copy|share|new chat|attach|upload|search|history|dictation|voice|microphone|account|profile|settings|upgrade)\b/.test(haystack)) continue;
-        return target;
-      }}
+      const buttons = Array.from(scope.querySelectorAll(MODEL_BUTTON_SELECTOR)).filter(isVisible);
+      const exact = buttons.find((button) => button.classList.contains("__composer-pill"));
+      if (exact) return exact;
+      const fallback = buttons.find((button) => summaryMatches(textOf(button)));
+      if (fallback) return fallback;
     }}
     return null;
-  }};
-    const slugify = (value) => normalize(value).toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
-  const isLowSignalSelectorLabel = (value) => {{
-    const key = slugify(value);
-    return !key || key === "chatgpt" || key === "chat-gpt" || key === "openai" || key === "model-selector" || key === "selected-model";
-  }};
-  const selectorLabelMatchesTarget = (label, item, tierSlug, targetTestId, candidateTestIds) => {{
-    const labelText = normalize(label).toLowerCase();
-    const labelSlug = slugify(labelText);
-    if (isLowSignalSelectorLabel(labelText)) return false;
-    const candidates = [];
-    const add = (value) => {{
-      const raw = normalize(value || "");
-      const key = slugify(raw);
-      if (!key || isLowSignalSelectorLabel(raw)) return;
-      candidates.push({{ raw: raw.toLowerCase(), key }});
-    }};
-    add(tierSlug);
-    add(item?.text || "");
-    add((item?.testId || "").replace(/^model-switcher-/, ""));
-    add((targetTestId || "").replace(/^model-switcher-/, ""));
-    (candidateTestIds || []).forEach((value) => add(value));
-    return candidates.some((candidate) => {{
-      if (candidate.key === labelSlug) return true;
-      if (tierSlug && candidate.key === slugify(tierSlug)) {{
-        const escaped = candidate.raw.replace(/[.*+?^$()|[\]\\]/g, "\\$&");
-        return new RegExp(`(^|[^a-z0-9])${{escaped}}([^a-z0-9]|$)`).test(labelText);
-      }}
-      return candidate.key.length >= 4 && labelSlug.includes(candidate.key);
-    }});
-  }};
-  const realClick = (el) => {{
-    el.dispatchEvent(new PointerEvent("pointerdown", {{ bubbles: true, cancelable: true, pointerId: 1 }}));
-    el.dispatchEvent(new MouseEvent("mousedown", {{ bubbles: true, cancelable: true }}));
-    el.dispatchEvent(new PointerEvent("pointerup", {{ bubbles: true, cancelable: true, pointerId: 1 }}));
-    el.dispatchEvent(new MouseEvent("mouseup", {{ bubbles: true, cancelable: true }}));
-    el.dispatchEvent(new MouseEvent("click", {{ bubbles: true, cancelable: true }}));
-  }};
-  const keyPress = (el, key, code) => {{
-    el.dispatchEvent(new KeyboardEvent("keydown", {{ key, code, bubbles: true, cancelable: true }}));
-    el.dispatchEvent(new KeyboardEvent("keyup", {{ key, code, bubbles: true, cancelable: true }}));
-  }};
-  const isVersionedModelTestId = (value) => /^model-switcher-gpt-\d/.test(normalize(value).toLowerCase());
-  const findPreferredTestIdItem = (entries, orderedTestIds) => {{
-    for (const testId of orderedTestIds) {{
-      const match = entries.find((item) => item.testId.toLowerCase() === testId);
-      if (match) return match;
-    }}
-    return null;
-  }};
-  const findGenericNeedleItem = (entries, needles) =>
-    entries.find((item) =>
-      !isVersionedModelTestId(item.testId) &&
-      needles.some((needle) => item.haystack.includes(needle))
-    ) || null;
-  const hasExactTierLabel = (item, slug) => {{
-    const text = normalize(item?.text || "").toLowerCase();
-    if (slug === "extended-pro") return /\bextended\b/.test(text) && /\bpro\b/.test(text);
-    return text === slug || text.startsWith(`${{slug}} `);
-  }};
-  const deriveRequestedTier = (value) => {{
-    if (!value) return null;
-    if (/\bextended\b/.test(value) && /\bpro\b/.test(value)) return "extended-pro";
-    if (/\bthinking\b/.test(value)) return "thinking";
-    if (/\binstant\b/.test(value)) return "instant";
-    if (/\bpro\b/.test(value) && !/\b5[- .]?3\b/.test(value)) return "pro";
-    return null;
-  }};
-  const hasTrustedUserFacingTierLabel = (item, slug) => {{
-    const haystack = item?.haystack || "";
-    if (slug === "extended-pro") return /\bextended\b/.test(haystack) && /\bpro\b/.test(haystack);
-    if (slug === "pro") return /research-grade intelligence/.test(haystack);
-    if (slug === "thinking") return /for complex questions/.test(haystack);
-    if (slug === "instant") return /for everyday chats/.test(haystack);
-    return false;
-  }};
-  const classifyTier = (item) => {{
-    const haystack = item?.haystack || "";
-    if (hasTrustedUserFacingTierLabel(item, "extended-pro") || hasExactTierLabel(item, "extended-pro")) return "extended-pro";
-    if (hasTrustedUserFacingTierLabel(item, "pro") || /\bpro\b/.test(haystack)) return "pro";
-    if (hasTrustedUserFacingTierLabel(item, "thinking") || /thinking/.test(haystack)) return "thinking";
-    if (hasTrustedUserFacingTierLabel(item, "instant") || /instant/.test(haystack)) return "instant";
-    return null;
-  }};
-  const parseVersionParts = (item) => {{
-    const haystack = item?.haystack || "";
-    const match = haystack.match(/gpt[- ]?(\d+)(?:[- .]?(\d+))?/i);
-    return match ? [Number.parseInt(match[1], 10) || 0, Number.parseInt(match[2] || "0", 10) || 0] : [0, 0];
-  }};
-  const compareVersionParts = (left, right) => (left[0] - right[0]) || (left[1] - right[1]);
-  const maxVersionPartsForTier = (entries, tier) =>
-    entries
-      .filter((item) => classifyTier(item) === tier)
-      .map((item) => parseVersionParts(item))
-      .reduce((best, current) => compareVersionParts(current, best) > 0 ? current : best, [0, 0]);
-  const effectiveVersionParts = (item, tier, tierMaxVersions) => {{
-    const parsed = parseVersionParts(item);
-    if (!tier) return parsed;
-    if (hasTrustedUserFacingTierLabel(item, tier) && compareVersionParts(parsed, tierMaxVersions[tier] || [0, 0]) < 0) {{
-      return tierMaxVersions[tier] || parsed;
-    }}
-    return parsed;
-  }};
-  const hasConflictingTierHint = (item, slug) => {{
-    const haystack = item?.haystack || "";
-    if (hasTrustedUserFacingTierLabel(item, slug) || hasExactTierLabel(item, slug)) return false;
-    if (slug === "extended-pro") {{
-      return !(/\bextended\b/.test(haystack) && /\bpro\b/.test(haystack));
-    }}
-    if (slug === "pro") {{
-      return /\b5[- .]?3\b|gpt-5[- .]?3-pro/.test(haystack);
-    }}
-    if (slug === "thinking") {{
-      return /\b5[- .]?3\b|instant/.test(haystack);
-    }}
-    if (slug === "instant") {{
-      return /\bthinking\b|\bpro\b|gpt-5[- .]?4/.test(haystack);
-    }}
-    return false;
-  }};
-  const findSingleGenericTierItem = (entries, slug) => {{
-    if (!(slug === "extended-pro" || slug === "pro" || slug === "thinking" || slug === "instant")) return null;
-    const matches = entries.filter((item) =>
-      item.haystack.includes(slug) && !hasConflictingTierHint(item, slug)
-    );
-    return matches.length === 1 ? matches[0] : null;
-  }};
-  const findExactTierLabelItem = (entries, slug) => {{
-    if (!(slug === "extended-pro" || slug === "pro" || slug === "thinking" || slug === "instant")) return null;
-    return entries.find((item) => hasExactTierLabel(item, slug) && !hasConflictingTierHint(item, slug)) || null;
-  }};
-  const modelSlug = (value) => {{
-    let key = slugify(value);
-    if (key.startsWith("model-switcher-")) key = key.slice("model-switcher-".length);
-    if (!key || isLowSignalSelectorLabel(key)) return "";
-    if (key === "extended-pro") return "extended-pro";
-    return (MODEL_TESTID_CANDIDATES[key] || [MODEL_TESTID_ALIASES[key] || key])[0] || "";
-  }};
-  const currentLabelSatisfiesRequest = (label) => {{
-    const labelText = normalize(label).toLowerCase();
-    const labelSlug = modelSlug(labelText);
-    if (!labelSlug) return false;
-    const isProLabel = /\bextended\s+pro\b/.test(labelText) ||
-      /\bgpt[\s.-]*\d+(?:[\s.-]*\d+)*[\s.-]*pro\b/.test(labelText) ||
-      /\bpro\b/.test(labelText);
-    if (autoMode) return isProLabel;
-    if (requestedGenericTier === "extended-pro") return /\bextended\b/.test(labelText) && /\bpro\b/.test(labelText);
-    if (requestedGenericTier === "pro") return isProLabel;
-    if (requestedGenericTier === "thinking") return /\bthinking\b/.test(labelText);
-    if (requestedGenericTier === "instant") return /\binstant\b/.test(labelText);
-    const requestedKeys = Array.from(new Set(
-      (MODEL_TESTID_CANDIDATES[requestedLower] || [MODEL_TESTID_ALIASES[requestedLower] || requestedLower])
-        .map((value) => modelSlug(value))
-        .filter(Boolean)
-    ));
-    return requestedKeys.includes(labelSlug);
-  }};
-  const selectorLabelConfirmsTextTarget = (label, item, tierSlug, needles) => {{
-    if (!item || item.testId) return false;
-    return selectorLabelMatchesTarget(label, item, tierSlug, null, needles || []);
-  }};
-  const buildTierRankings = (entries) => {{
-    const tierMaxVersions = {{
-      "extended-pro": maxVersionPartsForTier(entries, "extended-pro"),
-      pro: maxVersionPartsForTier(entries, "pro"),
-      thinking: maxVersionPartsForTier(entries, "thinking"),
-      instant: maxVersionPartsForTier(entries, "instant"),
-    }};
-    const tierScore = (tier) => tier === "extended-pro" ? 400 : tier === "pro" ? 300 : tier === "thinking" ? 200 : tier === "instant" ? 100 : 0;
-    const candidateScore = (item) => {{
-      const tier = classifyTier(item);
-      const version = effectiveVersionParts(item, tier, tierMaxVersions);
-      const trusted = tier && hasTrustedUserFacingTierLabel(item, tier);
-      return {{
-        tier,
-        version,
-        trusted,
-        score: tierScore(tier) * 1_000_000 + version[0] * 1_000 + version[1] + (trusted ? 1 : 0),
-      }};
-    }};
-    return {{ tierMaxVersions, candidateScore }};
-  }};
-  const selectBestTierItem = (entries, slug, rankings) =>
-    entries
-      .map((item) => ({{ item, meta: rankings.candidateScore(item) }}))
-      .filter(({{ item, meta }}) => meta.tier === slug && !hasConflictingTierHint(item, slug))
-      .sort((left, right) =>
-        right.meta.score - left.meta.score ||
-        right.item.text.length - left.item.text.length
-      )
-      .map(({{ item }}) => item)[0] || null;
-  const findSelectorButton = () => document.querySelector(MODEL_BUTTON_SELECTOR) || findComposerModelControl();
-  const requestedTrimmed = normalize(requested);
-  const requestedLower = requestedTrimmed.toLowerCase();
-  const keepCurrentMode = !requestedTrimmed || requestedLower === "current" || requestedLower === "keep-current";
-  const autoMode = requestedLower === "auto";
-  const requestedGenericTier = deriveRequestedTier(requestedLower);
-  const waitForSelectorButton = async () => {{
-    let button = findSelectorButton();
-    if (button || keepCurrentMode) return button;
-    for (let attempt = 0; attempt < 5 && !button; attempt += 1) {{
-      await wait(1000);
-      button = findSelectorButton();
-    }}
-    return button;
-  }};
-  const selectorButton = await waitForSelectorButton();
-  const currentLabel = normalize(
-    selectorButton?.querySelector?.("[data-testid='selected-model'], [data-testid='model-switcher-selected-model']")?.textContent ||
-    selectorButton?.innerText ||
-    selectorButton?.textContent ||
-    selectorButton?.getAttribute?.("aria-label") ||
-    selectorButton?.getAttribute?.("title") ||
-    ""
-  );
-  const responseBase = {{
-    requested,
-    currentLabel,
-    url: window.location.href || "",
-    title: document.title || "",
-    bodyText: normalize(document.body?.innerText || "").slice(0, 240),
-  }};
-
-  if (keepCurrentMode) {{
-    return {{
-      ...responseBase,
-      status: "already-selected",
-      modelUsed: currentLabel || null,
-      keepCurrent: true,
-    }};
   }}
 
-  if (currentLabelSatisfiesRequest(currentLabel) && requestedGenericTier !== "extended-pro" && !autoMode) {{
-    return {{
-      ...responseBase,
-      status: "already-selected",
-      modelUsed: currentLabel,
-    }};
+  async function waitForPill() {{
+    let pill = findPill();
+    for (let attempt = 0; attempt < 20 && !pill; attempt += 1) {{
+      await wait(250);
+      pill = findPill();
+    }}
+    return pill;
   }}
 
-  if (!selectorButton) {{
-    return {{
-      ...responseBase,
-      status: "missing-selector",
-      modelUsed: currentLabel || null,
-    }};
+  function visibleMenus() {{
+    return Array.from(document.querySelectorAll("[role='menu']")).filter(isVisible);
   }}
 
-  const popupRoots = () => {{
-    const selectorButton = findSelectorButton();
-    const roots = [];
-    const add = (el) => {{
-      if (el && !roots.includes(el) && isVisible(el)) roots.push(el);
-    }};
-    const controlledId = selectorButton.getAttribute("aria-controls") || selectorButton.getAttribute("aria-owns");
-    if (controlledId) {{
-      add(document.getElementById(controlledId));
-    }}
-    Array.from(document.querySelectorAll("[role='menu'], [role='listbox'], [data-radix-popper-content-wrapper], [data-state='open']"))
-      .filter((el) => isVisible(el))
-      .forEach((el) => {{
-        if (el.querySelector(MODEL_ITEM_SELECTOR)) add(el);
-      }});
-    return roots;
-  }};
+  function radios(menu) {{
+    return Array.from(menu?.querySelectorAll?.("[role='menuitemradio']") || []).filter(isVisible);
+  }}
 
-  const readItems = () => {{
-    const selectorButton = findSelectorButton();
-    const roots = popupRoots();
-    let nodes = roots.flatMap((root) => Array.from(root.querySelectorAll(MODEL_ITEM_SELECTOR)));
-    if (nodes.length === 0) {{
-      nodes = Array.from(document.querySelectorAll(MODEL_ITEM_SELECTOR))
-        .filter((el) => !(selectorButton && selectorButton.contains(el)) && isVisible(el));
-    }}
-    const seen = new Set();
-    return nodes
-      .filter((el) => isVisible(el))
-      .map((el) => {{
-        const text = normalize(el.innerText || el.textContent || el.getAttribute?.("aria-label") || el.getAttribute?.("title") || "");
-        const testId = normalize(el.getAttribute?.("data-testid") || "");
-        const haystack = `${{testId}} ${{text}}`.toLowerCase();
-        const key = `${{testId}}|${{text}}`;
-        if (seen.has(key)) return null;
-        seen.add(key);
-        return {{
-          text,
-          testId,
-          haystack,
-          ariaChecked: normalize(el.getAttribute?.("aria-checked") || "").toLowerCase(),
-          dataState: normalize(el.getAttribute?.("data-state") || "").toLowerCase(),
-          ariaSelected: normalize(el.getAttribute?.("aria-selected") || "").toLowerCase(),
-          ariaCurrent: normalize(el.getAttribute?.("aria-current") || "").toLowerCase(),
-          dataSelected: normalize(el.getAttribute?.("data-selected") || "").toLowerCase(),
-          dataCurrent: normalize(el.getAttribute?.("data-current") || "").toLowerCase(),
-        }};
-      }})
-      .filter((item) => item && (item.text || item.testId));
-  }};
+  function isChecked(item) {{
+    return item?.getAttribute?.("aria-checked") === "true" || item?.getAttribute?.("data-state") === "checked";
+  }}
 
-  const openSelectorMenu = async () => {{
-    const button = findSelectorButton();
-    if (!button) return readItems();
-    const attempts = [
-      () => realClick(button),
-      () => button.click?.(),
-      () => {{
-        button.focus?.();
-        keyPress(button, "Enter", "Enter");
-      }},
-      () => {{
-        button.focus?.();
-        keyPress(button, " ", "Space");
-      }},
+  function mainMenu() {{
+    return visibleMenus().find((menu) => {{
+      const labels = radios(menu).map((item) => fold(textOf(item)));
+      return labels.includes("medium") && labels.includes("high")
+        && (labels.includes("pro") || labels.includes("pro extended"));
+    }}) || null;
+  }}
+
+  function familyMenu(main) {{
+    return visibleMenus().find((menu) => menu !== main
+      && radios(menu).some((item) => fold(textOf(item)) === "gpt-5.6 sol")) || null;
+  }}
+
+  function readState(menu) {{
+    const effortItems = radios(menu);
+    const familyTrigger = Array.from(menu?.querySelectorAll?.("[role='menuitem']") || [])
+      .find((item) => item.getAttribute("aria-haspopup") === "menu" && /^(?:gpt|o\d)\b/i.test(textOf(item))) || null;
+    return {{ menu, effortItems, familyTrigger, familyLabel: textOf(familyTrigger) }};
+  }}
+
+  function dispatch(element, type, kind, init = {{}}) {{
+    const Constructor = window[kind] || Event;
+    element.dispatchEvent(new Constructor(type, {{ bubbles: true, cancelable: true, composed: true, ...init }}));
+  }}
+
+  async function pointerOpen(element, mode, main) {{
+    element?.focus?.();
+    const phases = [
+      ["pointerdown", "PointerEvent", {{ button: 0, buttons: 1, pointerId: 1, pointerType: "mouse", isPrimary: true }}],
+      ["mousedown", "MouseEvent", {{ button: 0, buttons: 1 }}],
+      ["pointerup", "PointerEvent", {{ button: 0, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }}],
+      ["mouseup", "MouseEvent", {{ button: 0, buttons: 0 }}],
+      ["click", "MouseEvent", {{ button: 0, buttons: 0, detail: 1 }}]
     ];
-    let openedItems = readItems();
-    for (const attempt of attempts) {{
-      if (openedItems.length > 0) break;
-      attempt();
-      await wait(250);
-      openedItems = readItems();
+    for (const phase of phases) {{
+      dispatch(element, phase[0], phase[1], phase[2]);
+      await wait(125);
+      if (mode === "main" ? mainMenu() : familyMenu(main)) return true;
     }}
-    return openedItems;
-  }};
-  const readSelectorLabel = () => {{
-    const liveSelectorButton = findSelectorButton();
-    return normalize(
-      liveSelectorButton?.querySelector?.("[data-testid='selected-model'], [data-testid='model-switcher-selected-model']")?.textContent ||
-      liveSelectorButton?.innerText ||
-      liveSelectorButton?.textContent ||
-      liveSelectorButton?.getAttribute?.("aria-label") ||
-      liveSelectorButton?.getAttribute?.("title") ||
-      ""
-    ).toLowerCase();
-  }};
-  const targetCandidateForTier = (entries, slug) => {{
-    const rankings = buildTierRankings(entries);
-    return findExactTierLabelItem(entries, slug) ||
-      selectBestTierItem(entries, slug, rankings) ||
-      findSingleGenericTierItem(entries, slug) ||
-      null;
-  }};
-  const autoPreferredTargetCandidate = (entries) =>
-    targetCandidateForTier(entries, "extended-pro") ||
-    targetCandidateForTier(entries, "pro") ||
-    null;
-  const autoTargetCandidate = (entries) =>
-    autoPreferredTargetCandidate(entries) ||
-    targetCandidateForTier(entries, "thinking") ||
-    targetCandidateForTier(entries, "instant") ||
-    null;
-  const itemSetSignature = (entries) => entries
-    .map((item) => `${{item.testId}}|${{item.text}}|${{item.ariaChecked}}|${{item.dataState}}`)
-    .join("\n");
-  const waitForTargetOrStableItems = async (initialItems) => {{
-    let currentItems = initialItems;
-    let signature = itemSetSignature(currentItems);
-    let stableSince = signature ? Date.now() : null;
-    const deadline = Date.now() + 7000;
-    while (Date.now() < deadline) {{
-      if (requestedGenericTier && targetCandidateForTier(currentItems, requestedGenericTier)) {{
-        return currentItems;
-      }}
-      if (autoMode && autoPreferredTargetCandidate(currentItems)) {{
-        return currentItems;
-      }}
-      const nextSignature = itemSetSignature(currentItems);
-      if (nextSignature && nextSignature === signature) {{
-        if (stableSince !== null && Date.now() - stableSince >= 600) {{
-          return currentItems;
-        }}
-      }} else {{
-        signature = nextSignature;
-        stableSince = nextSignature ? Date.now() : null;
-      }}
+    return false;
+  }}
+
+  function realClick(element) {{
+    element?.focus?.();
+    dispatch(element, "pointerdown", "PointerEvent", {{ button: 0, buttons: 1, pointerId: 1, pointerType: "mouse", isPrimary: true }});
+    dispatch(element, "mousedown", "MouseEvent", {{ button: 0, buttons: 1 }});
+    dispatch(element, "pointerup", "PointerEvent", {{ button: 0, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }});
+    dispatch(element, "mouseup", "MouseEvent", {{ button: 0, buttons: 0 }});
+    dispatch(element, "click", "MouseEvent", {{ button: 0, buttons: 0, detail: 1 }});
+  }}
+
+  function keyPress(element, key, code) {{
+    dispatch(element, "keydown", "KeyboardEvent", {{ key, code }});
+    dispatch(element, "keyup", "KeyboardEvent", {{ key, code }});
+  }}
+
+  async function waitForMain() {{
+    for (let attempt = 0; attempt < 30; attempt += 1) {{
+      const menu = mainMenu();
+      if (menu) return menu;
       await wait(100);
-      currentItems = readItems();
-      if (currentItems.length === 0) {{
-        currentItems = await openSelectorMenu();
-      }}
     }}
-    return currentItems;
-  }};
-
-  let items = readItems();
-  if (items.length === 0) {{
-    items = await openSelectorMenu();
-    for (let attempt = 0; attempt < 20 && items.length === 0; attempt += 1) {{
-      await wait(250);
-      items = readItems();
-    }}
+    return null;
   }}
-  items = await waitForTargetOrStableItems(items);
 
-  if (items.length === 0) {{
+  async function openMain(pill) {{
+    const existing = mainMenu();
+    if (existing) return existing;
+    await pointerOpen(pill, "main", null);
+    let menu = await waitForMain();
+    if (menu) return menu;
+    keyPress(pill, "Enter", "Enter");
+    return waitForMain();
+  }}
+
+  async function openFamilyMenu(state) {{
+    if (!state?.familyTrigger) return null;
+    const hover = [
+      ["pointerenter", "PointerEvent", {{ pointerId: 1, pointerType: "mouse", isPrimary: true }}],
+      ["mouseenter", "MouseEvent", {{}}],
+      ["pointermove", "PointerEvent", {{ pointerId: 1, pointerType: "mouse", isPrimary: true }}],
+      ["mousemove", "MouseEvent", {{}}]
+    ];
+    for (const phase of hover) {{
+      dispatch(state.familyTrigger, phase[0], phase[1], phase[2]);
+      await wait(125);
+      const opened = familyMenu(state.menu);
+      if (opened) return opened;
+    }}
+    await pointerOpen(state.familyTrigger, "family", state.menu);
+    for (let attempt = 0; attempt < 20; attempt += 1) {{
+      const opened = familyMenu(state.menu);
+      if (opened) return opened;
+      await wait(100);
+    }}
+    return null;
+  }}
+
+  async function closeMenus(pill) {{
+    for (let attempt = 0; attempt < 3 && visibleMenus().length > 0; attempt += 1) {{
+      keyPress(pill, "Escape", "Escape");
+      await wait(100);
+    }}
+    return visibleMenus().length === 0;
+  }}
+
+  function familyVerified(state) {{
+    return fold(state?.familyLabel) === "gpt-5.6 sol";
+  }}
+
+  function effortVerified(state) {{
+    return state?.effortItems?.some((item) => fold(textOf(item)) === "pro" && isChecked(item)) || false;
+  }}
+
+  function result(status, pill, state, families, warning = null) {{
+    const familyIsVerified = familyVerified(state);
+    const effortIsVerified = effortVerified(state);
     return {{
-      ...responseBase,
-      status: "not-found",
-      availableItems: [],
-      selectorExpanded: normalize(findSelectorButton()?.getAttribute?.("aria-expanded") || "").toLowerCase(),
-      itemCount: 0,
-      modelUsed: currentLabel || null,
+      requested,
+      status,
+      modelUsed: familyIsVerified && effortIsVerified ? "GPT-5.6 Sol Pro" : null,
+      familyStatus: familyIsVerified ? "verified" : "unverified",
+      effortStatus: effortIsVerified ? "verified" : "unverified",
+      pillText: textOf(pill),
+      familyLabel: state?.familyLabel || null,
+      availableItems: (state?.effortItems || []).map(textOf).filter(Boolean),
+      availableFamilies: families || [],
+      warning,
+      url: window.location.href || "",
+      title: document.title || ""
     }};
   }}
 
-  const rankings = buildTierRankings(items);
-
-  let target = null;
-  let selectionNeedles = [];
-  let requestedTestIds = [];
-  if (autoMode) {{
-    target =
-      findExactTierLabelItem(items, "extended-pro") ||
-      selectBestTierItem(items, "extended-pro", rankings) ||
-      findSingleGenericTierItem(items, "extended-pro") ||
-      findExactTierLabelItem(items, "pro") ||
-      selectBestTierItem(items, "pro", rankings) ||
-      findSingleGenericTierItem(items, "pro") ||
-      findExactTierLabelItem(items, "thinking") ||
-      selectBestTierItem(items, "thinking", rankings) ||
-      findSingleGenericTierItem(items, "thinking") ||
-      findExactTierLabelItem(items, "instant") ||
-      selectBestTierItem(items, "instant", rankings) ||
-      findSingleGenericTierItem(items, "instant") ||
-      items
-        .map((item) => ({{ item, meta: rankings.candidateScore(item) }}))
-        .filter(({{ item, meta }}) => !meta.tier || !hasConflictingTierHint(item, meta.tier))
-        .sort((left, right) => right.meta.score - left.meta.score || right.item.text.length - left.item.text.length)
-        .map(({{ item }}) => item)[0] || null;
-    if (!target || rankings.candidateScore(target).score <= 0) {{
-      return {{
-        ...responseBase,
-        status: "not-found",
-        availableItems: items.map((item) => item.text || item.testId).filter(Boolean).slice(0, 12),
-        itemCount: items.length,
-        modelUsed: currentLabel || null,
-      }};
-    }}
-    selectionNeedles.push(target.testId.toLowerCase(), target.text.toLowerCase());
-  }} else {{
-    requestedTestIds = Array.from(new Set(
-      (MODEL_TESTID_CANDIDATES[requestedLower] || [MODEL_TESTID_ALIASES[requestedLower] || requestedLower])
-        .map((value) => normalize(value).toLowerCase())
-        .filter(Boolean)
-    ));
-    const exactTestIds = requestedTestIds.map((value) => `model-switcher-${{value}}`.toLowerCase());
-    const fallbackNeedles = Array.from(new Set([
-      requestedLower,
-      requestedLower.replace(/-/g, " "),
-      ...(requestedGenericTier ? [requestedGenericTier] : []),
-      ...requestedTestIds,
-      ...requestedTestIds.map((value) => value.replace(/-/g, " ")),
-      ...exactTestIds,
-    ])).filter(Boolean);
-    target = requestedGenericTier
-      ? findExactTierLabelItem(items, requestedGenericTier) ||
-        selectBestTierItem(items, requestedGenericTier, rankings) ||
-        findSingleGenericTierItem(items, requestedGenericTier) ||
-        null
-      : findPreferredTestIdItem(items, exactTestIds) ||
-        findGenericNeedleItem(items, fallbackNeedles) ||
-        null;
-    if (!target) {{
-      return {{
-        ...responseBase,
-        status: "not-found",
-        availableItems: items.map((item) => item.text || item.testId).filter(Boolean).slice(0, 12),
-        selectorExpanded: normalize(findSelectorButton()?.getAttribute?.("aria-expanded") || "").toLowerCase(),
-        itemCount: items.length,
-        modelUsed: currentLabel || null,
-      }};
-    }}
-    selectionNeedles.push(...fallbackNeedles, ...exactTestIds);
+  if (requested !== supported) {{
+    return result("not-found", null, null, [], "this recipe supports only GPT-5.6 Sol + Pro intelligence");
+  }}
+  const legacy = legacyPickerMarkers();
+  if (legacy.length > 0) {{
+    const failure = result("legacy-picker", null, null, [], "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI");
+    failure.legacyPicker = legacy.slice(0, 10);
+    return failure;
   }}
 
-  const targetTestId = target.testId || null;
-  if (itemIsSelected(target) && classifyTier(target) !== "extended-pro") {{
-    return {{
-      ...responseBase,
-      status: "already-selected",
-      modelUsed: target.text || currentLabel || requestedTrimmed || null,
-      targetTestId,
-    }};
+  let pill = await waitForPill();
+  if (!pill) {{
+    const lateLegacy = legacyPickerMarkers();
+    if (lateLegacy.length > 0) {{
+      const failure = result("legacy-picker", null, null, [], "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI");
+      failure.legacyPicker = lateLegacy.slice(0, 10);
+      return failure;
+    }}
+    return result("missing-selector", null, null, [], "ChatGPT GPT-5.6 composer model pill not found");
   }}
 
-  let selectionConfirmed = false;
-  let selectedLabel = "";
-  let targetChecked = false;
-  let menuReopenAttempts = 0;
-  const targetTierSlug = autoMode ? classifyTier(target) : (requestedGenericTier || classifyTier(target));
-  for (let attempt = 0; attempt < 20; attempt += 1) {{
-    realClick(findSelectorButton());
+  let menu = await openMain(pill);
+  let state = menu ? readState(menu) : null;
+  let families = [];
+  if (!state) return result("not-found", pill, null, families, "ChatGPT GPT-5.6 model picker did not open");
+
+  if (!familyVerified(state)) {{
+    const submenu = await openFamilyMenu(state);
+    const familyItems = radios(submenu);
+    families = familyItems.map(textOf).filter(Boolean);
+    const sol = familyItems.find((item) => fold(textOf(item)) === "gpt-5.6 sol") || null;
+    if (!sol) {{
+      await closeMenus(pill);
+      return result("not-found", pill, state, families, "GPT-5.6 Sol was not visible in the family submenu");
+    }}
+    realClick(sol);
     await wait(250);
-    const currentItems = readItems();
-    let currentTarget = targetTierSlug
-      ? findExactTierLabelItem(currentItems, targetTierSlug) ||
-        selectBestTierItem(currentItems, targetTierSlug, buildTierRankings(currentItems)) ||
-        findSingleGenericTierItem(currentItems, targetTierSlug) ||
-        null
-      : targetTestId
-        ? findPreferredTestIdItem(currentItems, [targetTestId.toLowerCase()]) || null
-        : findGenericNeedleItem(currentItems, selectionNeedles) || null;
-    if (!currentTarget && currentItems.length === 0 && menuReopenAttempts < 3) {{
-      await openSelectorMenu();
-      menuReopenAttempts += 1;
-      continue;
-    }}
-    const selectorButton = findSelectorButton();
-    if (currentTarget) {{
-      realClick(document.querySelector(`[data-testid="${{currentTarget.testId}}"]`) || Array.from(document.querySelectorAll(MODEL_ITEM_SELECTOR)).find((el) => {{
-        const text = normalize(el.innerText || el.textContent || "");
-        const testId = normalize(el.getAttribute?.("data-testid") || "");
-        return testId === currentTarget.testId || text === currentTarget.text;
-      }}) || selectorButton);
-    }}
-    // Verify polling: after clicking the menu item, the menu usually closes,
-    // Radix propagates aria-checked, and ChatGPT's selector button label
-    // updates on its own schedule (sometimes >1s after the click). Poll up to
-    // ~3s on this attempt before re-opening/re-clicking on the next outer
-    // iteration.
-    let verifyConfirmed = false;
-    let updatedItems = [];
-    let updatedTarget = null;
-    for (let verify = 0; verify < 12 && !verifyConfirmed; verify += 1) {{
-      await wait(250);
-      updatedItems = readItems();
-      const updatedRankings = buildTierRankings(updatedItems);
-      updatedTarget = targetTierSlug
-        ? findExactTierLabelItem(updatedItems, targetTierSlug) ||
-          selectBestTierItem(updatedItems, targetTierSlug, updatedRankings) ||
-          findSingleGenericTierItem(updatedItems, targetTierSlug) ||
-          null
-        : targetTestId
-          ? findPreferredTestIdItem(updatedItems, [targetTestId.toLowerCase()]) || null
-          : findGenericNeedleItem(updatedItems, selectionNeedles) || null;
-      const targetNode = targetTestId
-        ? Array.from(document.querySelectorAll(`[data-testid="${{targetTestId}}"]`)).find((el) => isVisible(el)) || null
-        : null;
-      targetChecked = isCheckedState(
-        normalize(targetNode?.getAttribute?.("aria-checked") || "").toLowerCase(),
-        normalize(targetNode?.getAttribute?.("data-state") || "").toLowerCase(),
-      ) ||
-        hasSelectedCurrentMarker(
-          normalize(targetNode?.getAttribute?.("aria-selected") || "").toLowerCase(),
-          normalize(targetNode?.getAttribute?.("aria-current") || "").toLowerCase(),
-          normalize(targetNode?.getAttribute?.("data-selected") || "").toLowerCase(),
-          normalize(targetNode?.getAttribute?.("data-current") || "").toLowerCase(),
-        ) ||
-        itemIsSelected(updatedTarget);
-      selectedLabel = readSelectorLabel();
-      const textTargetLabelConfirmed = selectorLabelConfirmsTextTarget(
-        selectedLabel,
-        updatedTarget || currentTarget || target,
-        targetTierSlug,
-        selectionNeedles
-      );
-      if (targetChecked) {{
-        verifyConfirmed = true;
-      }} else if (textTargetLabelConfirmed) {{
-        verifyConfirmed = true;
-      }}
-    }}
-    if (verifyConfirmed) {{
-      selectionConfirmed = true;
-      return {{
-        ...responseBase,
-        status: "selected",
-        modelUsed: updatedTarget?.text || target.text || requestedTrimmed || currentLabel || null,
-        selectedLabel: selectedLabel || null,
-        targetTestId,
-        targetChecked,
-        menuReopenAttempts,
-        selectorExpanded: normalize(findSelectorButton()?.getAttribute?.("aria-expanded") || "").toLowerCase(),
-        availableItemsAfter: updatedItems.map((item) => item.text || item.testId).filter(Boolean).slice(0, 12),
-      }};
-    }}
-    const reopenedItems = await openSelectorMenu();
-    if (reopenedItems.length > 0) {{
-      menuReopenAttempts += 1;
-    }}
-    const reopenedRankings = buildTierRankings(reopenedItems);
-    const reopenedTarget = targetTierSlug
-      ? findExactTierLabelItem(reopenedItems, targetTierSlug) ||
-        selectBestTierItem(reopenedItems, targetTierSlug, reopenedRankings) ||
-        findSingleGenericTierItem(reopenedItems, targetTierSlug) ||
-        null
-      : targetTestId
-        ? findPreferredTestIdItem(reopenedItems, [targetTestId.toLowerCase()]) ||
-          findGenericNeedleItem(reopenedItems, selectionNeedles) ||
-          null
-        : findGenericNeedleItem(reopenedItems, selectionNeedles) || null;
-    const reopenedChecked = isCheckedState(
-      reopenedTarget?.ariaChecked || "",
-      reopenedTarget?.dataState || "",
-    ) || itemIsSelected(reopenedTarget);
-    const reopenedLabel = readSelectorLabel();
-    if (reopenedChecked) {{
-      selectionConfirmed = true;
-      updatedItems = reopenedItems;
-      updatedTarget = reopenedTarget;
-      targetChecked = reopenedChecked;
-      selectedLabel = reopenedLabel;
-      return {{
-        ...responseBase,
-        status: "selected",
-        modelUsed: reopenedTarget?.text || target.text || requestedTrimmed || currentLabel || null,
-        selectedLabel: reopenedLabel || null,
-        targetTestId,
-        targetChecked: reopenedChecked,
-        menuReopenAttempts,
-        selectorExpanded: normalize(findSelectorButton()?.getAttribute?.("aria-expanded") || "").toLowerCase(),
-        availableItemsAfter: reopenedItems.map((item) => item.text || item.testId).filter(Boolean).slice(0, 12),
-      }};
-    }}
+    pill = await waitForPill();
+    if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol");
+    menu = await openMain(pill);
+    state = menu ? readState(menu) : null;
+    if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting GPT-5.6 Sol");
   }}
 
-  return {{
-    ...responseBase,
-    status: selectionConfirmed ? "selected" : "selection-mismatch",
-    modelUsed: selectedLabel || target.text || null,
-    selectedLabel: selectedLabel || null,
-    targetTestId,
-    targetChecked,
-    menuReopenAttempts,
-    selectorExpanded: normalize(findSelectorButton()?.getAttribute?.("aria-expanded") || "").toLowerCase(),
-    itemCount: items.length,
-    availableItems: items.map((item) => item.text || item.testId).filter(Boolean).slice(0, 12),
-  }};
+  if (!effortVerified(state)) {{
+    const pro = state.effortItems.find((item) => fold(textOf(item)) === "pro") || null;
+    if (!pro) {{
+      await closeMenus(pill);
+      return result("not-found", pill, state, families, "Pro intelligence was not visible for GPT-5.6 Sol");
+    }}
+    realClick(pro);
+    await wait(250);
+    pill = await waitForPill();
+    if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting Pro intelligence");
+    menu = await openMain(pill);
+    state = menu ? readState(menu) : null;
+    if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting Pro intelligence");
+  }}
+
+  const familyIsVerified = familyVerified(state);
+  const effortIsVerified = effortVerified(state);
+  if (!familyIsVerified || !effortIsVerified) {{
+    await closeMenus(pill);
+    return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol + Pro could not be verified in one picker pass");
+  }}
+  if (!await closeMenus(pill)) {{
+    return result("selection-mismatch", pill, state, families, "ChatGPT model picker remained open after verification");
+  }}
+  return result("selected", pill, state, families);
 }}
 "##,
+        requested_model = requested_model,
         model_button_selector = model_button_selector,
         composer_selector = composer_selector,
-        model_item_selector = model_item_selector,
-        model_testid_aliases = model_testid_aliases,
-        model_testid_candidates = model_testid_candidates,
         visibility_helpers = JS_VISIBILITY_HELPERS,
     )
 }
@@ -1642,85 +1193,85 @@ mod tests {
 
     #[test]
     fn model_aliases_cover_shortcuts() {
-        let aliases = model_testid_alias_map();
-        assert_eq!(aliases.get("extended-pro"), Some(&"extended-pro"));
-        assert_eq!(aliases.get("pro"), Some(&"gpt-5-4-pro"));
-        assert_eq!(aliases.get("gpt-5-thinking"), Some(&"gpt-5-4-thinking"));
-        assert_eq!(aliases.get("instant"), Some(&"gpt-5-3"));
-        let candidates = model_testid_candidate_map();
-        assert_eq!(candidates.get("extended-pro"), Some(&vec!["extended-pro"]));
-        assert_eq!(candidates.get("pro"), Some(&vec!["gpt-5-4-pro"]));
-        assert_eq!(candidates.get("gpt-5-3-pro"), None);
+        let aliases = model_alias_map();
+        assert_eq!(aliases.get("gpt-5-6-sol-pro"), Some(&"gpt-5-6-sol-pro"));
+        assert_eq!(aliases.get("sol-pro"), Some(&"gpt-5-6-sol-pro"));
+        assert_eq!(aliases.get("gpt-5-4-pro"), None);
+        let candidates = model_candidate_map();
+        assert_eq!(
+            candidates.get("gpt-5-6-sol-pro"),
+            Some(&vec!["gpt-5-6-sol-pro"])
+        );
+        assert_eq!(candidates.get("gpt-5-4-pro"), None);
     }
 
     #[test]
     fn canonical_chatgpt_model_slug_rejects_generic_labels() {
         assert_eq!(canonical_chatgpt_model_slug("ChatGPT"), None);
         assert_eq!(canonical_chatgpt_model_slug("Configure..."), None);
+        assert_eq!(canonical_chatgpt_model_slug("Pro"), None);
+        assert_eq!(canonical_chatgpt_model_slug("Extended Pro"), None);
         assert_eq!(
-            canonical_chatgpt_model_slug("Pro"),
-            Some("gpt-5-4-pro".to_string())
-        );
-        assert_eq!(
-            canonical_chatgpt_model_slug("Extended Pro"),
-            Some("extended-pro".to_string())
-        );
-        assert_eq!(
-            canonical_chatgpt_model_slug("model-switcher-gpt-5-4-thinking"),
-            Some("gpt-5-4-thinking".to_string())
+            canonical_chatgpt_model_slug("GPT-5.6 Sol Pro"),
+            Some("gpt-5-6-sol-pro".to_string())
         );
     }
 
     #[test]
-    fn reported_chatgpt_model_prefers_target_test_id_over_generic_button_label() {
+    fn reported_chatgpt_model_requires_verified_sol_and_pro_proofs() {
         let selection = serde_json::json!({
             "status": "selected",
-            "modelUsed": "chatgpt",
-            "selectedLabel": "chatgpt",
-            "currentLabel": "chatgpt",
-            "targetTestId": "model-switcher-gpt-5-4-pro"
+            "requested": "gpt-5-6-sol-pro",
+            "modelUsed": "GPT-5.6 Sol Pro",
+            "familyStatus": "verified",
+            "effortStatus": "verified"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&selection, "pro"),
-            Some("gpt-5-4-pro".to_string())
+            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-pro"),
+            Some("GPT-5.6 Sol Pro".to_string())
         );
     }
 
     #[test]
-    fn reported_chatgpt_model_falls_back_to_requested_alias_when_ui_label_is_generic() {
+    fn reported_chatgpt_model_never_echoes_an_unverified_request() {
         let selection = serde_json::json!({
             "status": "selected",
-            "modelUsed": "chatgpt",
-            "selectedLabel": "chatgpt",
-            "currentLabel": "chatgpt"
+            "requested": "gpt-5-6-sol-pro",
+            "modelUsed": "Pro Extended",
+            "extendedStatus": "required"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&selection, "pro"),
-            Some("gpt-5-4-pro".to_string())
+            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-pro"),
+            None
         );
-    }
-
-    #[test]
-    fn keep_current_chatgpt_model_detects_current_and_empty_requests() {
-        assert!(should_keep_current_chatgpt_model(""));
-        assert!(should_keep_current_chatgpt_model("current"));
-        assert!(should_keep_current_chatgpt_model(" KEEP-CURRENT "));
-        assert!(!should_keep_current_chatgpt_model("auto"));
-        assert!(!should_keep_current_chatgpt_model("pro"));
     }
 
     #[test]
     fn chatgpt_model_selection_status_reports_contract_values() {
         assert_eq!(
-            chatgpt_model_selection_status(&serde_json::json!({"status": "selected"}), "pro"),
+            chatgpt_model_selection_status(
+                &serde_json::json!({
+                    "status": "selected",
+                    "requested": "gpt-5-6-sol-pro",
+                    "modelUsed": "GPT-5.6 Sol Pro",
+                    "familyStatus": "verified",
+                    "effortStatus": "verified"
+                }),
+                "gpt-5-6-sol-pro"
+            ),
             ChatgptModelSelectionStatus::Selected
         );
         assert_eq!(
             chatgpt_model_selection_status(
-                &serde_json::json!({"status": "already-selected"}),
-                "current"
+                &serde_json::json!({
+                    "status": "selected",
+                    "requested": "extended-pro",
+                    "modelUsed": "Pro Extended",
+                    "extendedStatus": "required"
+                }),
+                "gpt-5-6-sol-pro"
             ),
-            ChatgptModelSelectionStatus::KeptCurrent
+            ChatgptModelSelectionStatus::Mismatch
         );
         assert_eq!(
             chatgpt_model_selection_status(
@@ -1732,7 +1283,7 @@ mod tests {
         assert_eq!(
             chatgpt_model_selection_status(
                 &serde_json::json!({"status": "selection-mismatch"}),
-                "pro"
+                "gpt-5-6-sol-pro"
             ),
             ChatgptModelSelectionStatus::Mismatch
         );
@@ -1762,179 +1313,40 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_auto_mode_filters_conflicting_tier_items() {
-        // Regression guard: auto mode must honor hasConflictingTierHint so
-        // items like `model-switcher-gpt-5-3-pro` are never auto-selected over
-        // the real current Pro. The explicit-model path already did this;
-        // the auto branch was missing the filter and would pick 5-3-pro when
-        // 5-4-pro wasn't visibly tagged.
-        let script = build_model_selection_function("auto");
-        assert!(
-            script
-                .contains(".filter(({ item, meta }) => !meta.tier || !hasConflictingTierHint(item, meta.tier))"),
-            "auto-mode ranking missing hasConflictingTierHint filter"
-        );
+    fn model_selection_function_requires_verified_sol_family_and_pro_effort() {
+        let script = build_model_selection_function("gpt-5-6-sol-pro");
+        assert!(script.contains(r#"const requested = "gpt-5-6-sol-pro";"#));
+        assert!(script.contains("classList.contains(\"__composer-pill\")"));
+        assert!(script.contains(
+            "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI"
+        ));
+        assert!(script.contains(r#"familyStatus: familyIsVerified ? "verified" : "unverified""#));
+        assert!(script.contains(r#"effortStatus: effortIsVerified ? "verified" : "unverified""#));
+        assert!(script.contains(r#"fold(textOf(item)) === "gpt-5.6 sol""#));
+        assert!(script.contains(r#"fold(textOf(item)) === "pro""#));
+        assert!(script.contains(r#"/^(?:gpt|o\d)\b/i.test(textOf(item))"#));
+        assert!(script.contains("await openFamilyMenu"));
+        assert!(script.contains("async function waitForPill()"));
+        assert!(script.contains("pill = await waitForPill();"));
+        assert!(script
+            .contains("ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol"));
+        assert!(script.contains(
+            "ChatGPT composer model pill did not remount after selecting Pro intelligence"
+        ));
+        assert!(script.contains("return visibleMenus().length === 0;"));
+        assert!(script.contains("if (!await closeMenus(pill))"));
+        assert!(!script.contains("if (families.length === 0 && state.familyTrigger)"));
+        assert!(script.contains("await closeMenus"));
+        assert!(!script.contains("model-switcher-gpt-5-4"));
     }
 
     #[test]
     fn scope_composer_file_input_function_targets_composer_form_only() {
-        // The upload scoping helper must bind to the composer's own form and
-        // write the shared marker — otherwise yoetz can tag a page-wide hidden
-        // file input and inject the bundle there (review finding #10).
         let script = build_scope_composer_file_input_function();
-        assert!(
-            script.contains("composer.closest(\"form\")"),
-            "scope helper must walk to the composer's form ancestor"
-        );
-        assert!(
-            script.contains("form.querySelector(\"input[type='file']\")"),
-            "scope helper must restrict search to the composer form"
-        );
-        assert!(
-            script.contains(&format!("\"{}\"", COMPOSER_FILE_INPUT_MARKER)),
-            "scope helper must write the shared marker value"
-        );
-        assert!(
-            script.contains("status: \"marked\""),
-            "scope helper must report a `marked` status on success"
-        );
-    }
-
-    #[test]
-    fn model_selection_function_polls_verification_beyond_initial_click() {
-        // The verify loop must poll up to ~3s per outer attempt to let Radix
-        // propagate aria-checked and ChatGPT update the selector button label.
-        // A single 250ms wait is not enough on the live Pro UI.
-        let script = build_model_selection_function("auto");
-        assert!(
-            script.contains("verify < 12 && !verifyConfirmed"),
-            "verify loop missing or sized wrong; saw: {script}"
-        );
-        assert!(
-            script.contains("let verifyConfirmed = false;"),
-            "verify confirmation flag missing"
-        );
-    }
-
-    #[test]
-    fn model_selection_function_waits_for_selector_button_before_failing() {
-        // Fresh ChatGPT tabs can render the shell before the model selector
-        // exists in the React tree. Explicit model selection should wait
-        // briefly for that button instead of failing on the first probe.
-        let script = build_model_selection_function("pro");
-        assert!(script.contains("const waitForSelectorButton = async () =>"));
-        assert!(script.contains("attempt < 5 && !button"));
-        assert!(script.contains("await wait(1000);"));
-        assert!(script.contains("if (button || keepCurrentMode) return button;"));
-        assert!(script.contains("const selectorButton = await waitForSelectorButton();"));
-    }
-
-    #[test]
-    fn model_selection_function_supports_personal_composer_model_control() {
-        // Personal ChatGPT can expose the selected model as a composer pop-up
-        // labeled `Extended Pro` instead of the enterprise
-        // model-switcher-dropdown-button. The shared script must support that
-        // surface without removing the battle-tested enterprise selector.
-        let script = build_model_selection_function("auto");
-        assert!(script.contains("const findComposerModelControl = () =>"));
-        assert!(script.contains(
-            "document.querySelector(MODEL_BUTTON_SELECTOR) || findComposerModelControl()"
-        ));
-        assert!(script.contains("const currentLabelSatisfiesRequest = (label) =>"));
-        assert!(script.contains(r#"if (key === "extended-pro") return "extended-pro";"#));
-        assert!(script.contains("return isProLabel;"));
-    }
-
-    #[test]
-    fn model_selection_function_prefers_exact_tier_labels_before_fuzzy_matching() {
-        // Live ChatGPT currently exposes generic tier labels like
-        // `Pro Research-grade intelligence` while the selector button itself
-        // often stays labeled `ChatGPT`. The explicit-model branch must first
-        // match the visible tier label before falling back to broader haystack
-        // heuristics, otherwise `model=pro` can falsely report not-found.
-        let script = build_model_selection_function("gpt-5-4-pro");
-        assert!(script.contains("const findExactTierLabelItem = (entries, slug) =>"));
-        assert!(script.contains("text === slug || text.startsWith(`${slug} `)"));
-        assert!(script.contains("findExactTierLabelItem(items, requestedGenericTier) ||"));
-    }
-
-    #[test]
-    fn model_selection_function_exact_labels_override_stale_testid_conflicts() {
-        // Live ChatGPT currently exposes `Pro` / `Thinking` on menu items whose
-        // testids still look like `gpt-5-3-pro` / `gpt-5-3-thinking`. The
-        // visible tier label must win over the stale suffix or auto/pro
-        // selection falls back to Instant.
-        let script = build_model_selection_function("pro");
-        assert!(script.contains("const hasExactTierLabel = (item, slug) =>"));
-        assert!(script.contains(
-            "hasTrustedUserFacingTierLabel(item, slug) || hasExactTierLabel(item, slug)"
-        ));
-    }
-
-    #[test]
-    fn model_selection_function_reopens_menu_when_button_label_stays_generic() {
-        // Live ChatGPT can keep the selector button text at `ChatGPT` even
-        // after the right radio item is checked. Reopen the menu once more and
-        // inspect the visible checked state before returning mismatch.
-        let script = build_model_selection_function("auto");
-        assert!(script.contains("const reopenedItems = await openSelectorMenu();"));
-        assert!(script.contains("const reopenedChecked = isCheckedState("));
-        assert!(script.contains("const reopenedLabel = readSelectorLabel();"));
-    }
-
-    #[test]
-    fn model_selection_function_does_not_confirm_visible_unchecked_pro_with_generic_label() {
-        let visible_unchecked_pro_fixture = r#"
-<button data-testid="model-switcher-dropdown-button">
-  <span data-testid="model-switcher-selected-model">ChatGPT</span>
-</button>
-<div role="menuitemradio" data-testid="model-switcher-gpt-5-4-pro" aria-checked="false">
-  Pro Research-grade intelligence
-</div>
-"#;
-        assert!(visible_unchecked_pro_fixture.contains("aria-checked=\"false\""));
-        assert!(visible_unchecked_pro_fixture.contains(">ChatGPT<"));
-
-        let script = build_model_selection_function("pro");
-        assert!(
-            script.contains("if (targetChecked)"),
-            "model selection must require checked/current menu state, not only selector label text"
-        );
-        assert!(
-            !script.contains("targetChecked || selectorLabelConfirmed"),
-            "selector label text must not confirm model selection without checked/current state"
-        );
-        assert!(
-            !script.contains("reopenedChecked ||"),
-            "reopened selector label text must not confirm model selection without checked/current state"
-        );
-        assert!(
-            !script.contains("trustedTierSelected"),
-            "visible trusted tier menu text must not confirm selection by itself"
-        );
-        assert!(
-            !script.contains("reopenedTrustedTierSelected"),
-            "visible trusted tier menu text must not confirm selection after reopen"
-        );
-    }
-
-    #[test]
-    fn model_selection_function_supports_auto_and_explicit_modes() {
-        let auto_script = build_model_selection_function("auto");
-        assert!(auto_script.contains(r#"const requested = "auto";"#));
-        assert!(!auto_script.contains(r#""kept-current-no-selector""#));
-        assert!(auto_script.contains("const deriveRequestedTier = (value) =>"));
-        assert!(auto_script.contains("const classifyTier = (item) =>"));
-        assert!(auto_script.contains("const buildTierRankings = (entries) =>"));
-        assert!(auto_script.contains("const waitForTargetOrStableItems = async (initialItems) =>"));
-        assert!(auto_script.contains("targetCandidateForTier(entries, \"extended-pro\")"));
-
-        let explicit_script =
-            build_model_selection_function(crate::chatgpt_recipe::CHATGPT_PRO_EXTENDED_MODEL);
-        assert!(explicit_script.contains(r#"const requested = "extended-pro";"#));
-        assert!(explicit_script.contains("\"extended-pro\":\"extended-pro\""));
-        assert!(explicit_script.contains("\"gpt-5-pro\":\"gpt-5-4-pro\""));
-        assert!(!explicit_script.contains("\"gpt-5-3-pro\""));
+        assert!(script.contains("composer.closest(\"form\")"));
+        assert!(script.contains("form.querySelector(\"input[type='file']\")"));
+        assert!(script.contains(&format!("\"{}\"", COMPOSER_FILE_INPUT_MARKER)));
+        assert!(script.contains("status: \"marked\""));
     }
 
     #[test]

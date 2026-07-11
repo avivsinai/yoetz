@@ -796,7 +796,7 @@ async function handleInspectRun(message) {
         tab_id: tab.id,
         url: tab.url ?? inspection?.url ?? null,
         title: tab.title ?? inspection?.title ?? null,
-        // Non-final marker for inspect read mid-stream. ChatGPT Pro Extended streams several interim
+        // Non-final marker for inspect read mid-stream. ChatGPT Pro streams several interim
         // turns before the answer; while generating, inspection.extraction.text is a partial/interim
         // turn's body (observed live as a single "I"), NOT the verdict. Wait for generation to stop.
         response_in_progress: responseInProgress,
@@ -1051,7 +1051,7 @@ function normalizeJob(message) {
     capability_token: message.capability_token,
     request_id: message.request_id,
     prompt: payload.prompt ?? "",
-    model: "extended-pro",
+    model: "gpt-5-6-sol-pro",
     wait_timeout_ms: payload.wait_timeout_ms ?? DEFAULT_WAIT_TIMEOUT_MS,
     wait_interval_ms: payload.wait_interval_ms ?? 30000,
     upload_timeout_ms: payload.upload_timeout_ms ?? 120000,
@@ -1667,14 +1667,14 @@ async function waitForResponse(job) {
 
 // How many assistant turns have appeared since the prompt was sent. The post-send baseline is
 // captured before send; the first turn beyond it is the response's first turn, and any turn beyond
-// THAT (while still generating) means the earlier turns were interim Pro-Extended status posts.
+// THAT (while still generating) means the earlier turns were interim Pro status posts.
 function assistantTurnsSinceSend(job, extraction) {
   const baseline = Number(job.response_baseline?.assistant_count ?? 0);
   const current = Number(extraction?.assistant_count ?? 0);
   return Math.max(0, current - baseline);
 }
 
-// Single source of truth for "is this progress an interim Pro-Extended turn, not the answer?".
+// Single source of truth for "is this progress an interim Pro turn, not the answer?".
 // A second-or-later assistant turn appearing while generation is still active proves the earlier
 // turn(s) were interim status posts ("I'll review...", "I've narrowed..."), not the final answer.
 function interimTurnState(job, extraction) {
@@ -1941,14 +1941,15 @@ function nonNegativeFiniteNumber(value) {
 
 function isAcceptableModelSelection(selection) {
   return selection?.status === "selected"
-    && selection?.requested_model === "extended-pro"
-    && selection?.extended_status === "required"
-    && modelUsedLooksLikeProExtended(selection?.model_used);
+    && selection?.requested_model === "gpt-5-6-sol-pro"
+    && selection?.family_status === "verified"
+    && selection?.effort_status === "verified"
+    && modelUsedLooksLikeSolPro(selection?.model_used);
 }
 
-function modelUsedLooksLikeProExtended(value) {
+function modelUsedLooksLikeSolPro(value) {
   const folded = String(value ?? "").toLowerCase();
-  return /\bpro\b/.test(folded) && /\bextended\b/.test(folded);
+  return /\bsol\b/.test(folded) && /\bpro\b/.test(folded);
 }
 
 function hasFinalAssistantAffordance(extraction) {
