@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -116,6 +117,9 @@ impl ModelPricing {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ModelEntry {
     pub id: String,
+    /// Upstream catalog creation time as a Unix timestamp, when available.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub created: Option<u64>,
     pub context_length: Option<usize>,
     pub max_output_tokens: Option<usize>,
     pub pricing: ModelPricing,
@@ -156,6 +160,9 @@ impl ModelEntry {
         debug_assert_eq!(self.id, other.id);
         if other.context_length.is_some() {
             self.context_length = other.context_length;
+        }
+        if other.created.is_some() {
+            self.created = other.created;
         }
         if other.max_output_tokens.is_some() {
             self.max_output_tokens = other.max_output_tokens;
@@ -335,11 +342,16 @@ impl ModelRegistry {
     /// Only considers properly namespaced models (`provider/model` format).
     pub fn frontier(&self) -> Vec<FrontierEntry> {
         let registry = self.clone().with_inferred_tiers();
-        let mut best: HashMap<String, FrontierEntry> = HashMap::new();
+        let mut best_by_line: HashMap<(String, String), RankedFrontierEntry> = HashMap::new();
 
         for model in &registry.models {
-            // Skip models without provider/model format (litellm duplicates)
-            if !model.id.contains('/') {
+            let Some(parsed) = ParsedModelId::parse(&model.id) else {
+                continue;
+            };
+            // `~vendor/*-latest` entries are moving pointers, not concrete
+            // models. They remain resolvable through normal lookup, but a
+            // frontier listing must return an inspectable model ID.
+            if parsed.alias {
                 continue;
             }
             let tier = match model.tier {
@@ -366,37 +378,40 @@ impl ModelRegistry {
             if !chat_eligible {
                 continue;
             }
-            let family = model.family().to_string();
-            let dominated = best.get(&family).is_some_and(|existing| {
-                let existing_ver = extract_version(&existing.model.id);
-                let new_ver = extract_version(&model.id);
 
-                // Primary: higher version number wins (newer model is the frontier pick)
-                if existing_ver != new_ver {
-                    return existing_ver >= new_ver;
-                }
-                // Same version: higher tier wins (flagship > preview of same version)
-                if existing.tier != tier {
-                    return existing.tier > tier;
-                }
-                // Same version + tier: higher context length wins
-                let existing_ctx = existing.model.context_length.unwrap_or(0);
-                let new_ctx = model.context_length.unwrap_or(0);
-                if existing_ctx != new_ctx {
-                    return existing_ctx >= new_ctx;
-                }
-                // Same everything: shorter name wins (base model over specialized variant)
-                existing.model.id.len() <= model.id.len()
+            let line_key = (parsed.family.clone(), parsed.product_line.clone());
+            let dominates = best_by_line.get(&line_key).is_none_or(|existing| {
+                within_product_line_is_better(
+                    model,
+                    tier,
+                    &parsed,
+                    &existing.entry.model,
+                    existing.entry.tier,
+                    &existing.parsed,
+                )
             });
-            if !dominated {
-                best.insert(
-                    family.clone(),
-                    FrontierEntry {
-                        family,
-                        model: model.clone(),
-                        tier,
+            if dominates {
+                best_by_line.insert(
+                    line_key,
+                    RankedFrontierEntry {
+                        entry: FrontierEntry {
+                            family: parsed.family.clone(),
+                            model: model.clone(),
+                            tier,
+                        },
+                        parsed,
                     },
                 );
+            }
+        }
+
+        let mut best: HashMap<String, FrontierEntry> = HashMap::new();
+        for candidate in best_by_line.into_values() {
+            let dominates = best
+                .get(&candidate.entry.family)
+                .is_none_or(|existing| across_product_lines_is_better(&candidate.entry, existing));
+            if dominates {
+                best.insert(candidate.entry.family.clone(), candidate.entry);
             }
         }
 
@@ -406,37 +421,189 @@ impl ModelRegistry {
     }
 }
 
-/// Extract version numbers from a model ID for comparison.
-/// E.g. "anthropic/claude-opus-4.6" → [4, 6], "openai/gpt-5.4-pro" → [5, 4]
-/// Only extracts from pure numeric tokens and dotted versions.
-/// Skips date suffixes (4+ digit numbers) and parameter counts (e.g. "70b").
-fn extract_version(id: &str) -> Vec<u32> {
-    let name_part = id.rsplit('/').next().unwrap_or(id);
-    let name_part = name_part.split(':').next().unwrap_or(name_part);
-    let mut versions = Vec::new();
-    for token in name_part.split(['-', '_']) {
-        // Stop at date-like tokens (4+ digit pure numbers like 2024, 0528)
-        if token.len() >= 4 && token.chars().all(|c| c.is_ascii_digit()) {
-            break;
+#[derive(Debug, Clone)]
+struct RankedFrontierEntry {
+    entry: FrontierEntry,
+    parsed: ParsedModelId,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ParsedModelId {
+    family: String,
+    product_line: String,
+    version: Option<ModelVersion>,
+    alias: bool,
+}
+
+impl ParsedModelId {
+    fn parse(id: &str) -> Option<Self> {
+        let concrete_id = id.strip_prefix('~').unwrap_or(id);
+        let (family, model_name) = concrete_id.split_once('/')?;
+        let model_name = model_name.split(':').next().unwrap_or(model_name);
+        let alias = id.starts_with('~') || model_name.ends_with("-latest");
+        let tokens: Vec<&str> = model_name.split(['-', '_']).collect();
+        let numeric_token = tokens
+            .iter()
+            .position(|token| token.chars().any(|ch| ch.is_ascii_digit()));
+
+        let mut line = Vec::new();
+        for token in tokens.iter().take(numeric_token.unwrap_or(tokens.len())) {
+            line.push(*token);
         }
-        // Strip leading 'v' prefix (e.g. "v3.2" → "3.2")
-        let token = token.strip_prefix('v').unwrap_or(token);
-        // Dotted version like "5.4" or "3.1"
-        if token.contains('.') {
-            for part in token.split('.') {
-                if let Ok(n) = part.parse::<u32>() {
-                    versions.push(n);
+        if let Some(token) = numeric_token.and_then(|index| tokens.get(index)) {
+            if let Some(numeric_start) = token.find(|ch: char| ch.is_ascii_digit()) {
+                let prefix = &token[..numeric_start];
+                if !prefix.is_empty() && prefix != "v" {
+                    line.push(prefix);
                 }
             }
-        } else if let Ok(n) = token.parse::<u32>() {
-            // Pure number token (e.g. "4" in "grok-4")
-            if n < 100 {
-                versions.push(n);
-            }
         }
-        // Skip mixed tokens like "4o", "20b", "70b" — not version numbers
+
+        let product_line = if line.is_empty() {
+            model_name.to_string()
+        } else {
+            line.join("-")
+        };
+
+        Some(Self {
+            family: family.to_string(),
+            product_line,
+            version: ModelVersion::parse(&tokens, numeric_token),
+            alias,
+        })
     }
-    versions
+}
+
+/// Product versions use decimal notation rather than semantic-version
+/// segments: 4.5 is newer than 4.20, and 5 equals 5.0.
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ModelVersion {
+    major: u32,
+    fraction: String,
+}
+
+impl ModelVersion {
+    fn parse(tokens: &[&str], numeric_token: Option<usize>) -> Option<Self> {
+        let index = numeric_token?;
+        let token = tokens.get(index)?;
+        let numeric_start = token.find(|ch: char| ch.is_ascii_digit())?;
+        let numeric = &token[numeric_start..];
+        if !numeric.chars().all(|ch| ch.is_ascii_digit() || ch == '.') {
+            return None;
+        }
+
+        let mut parts = numeric.split('.');
+        let major_text = parts.next()?;
+        if major_text.len() >= 4 {
+            return None;
+        }
+        let major = major_text.parse().ok()?;
+        let mut fraction = parts.collect::<String>();
+        if fraction.is_empty() {
+            fraction = tokens
+                .get(index + 1)
+                .filter(|next| next.len() < 4 && next.chars().all(|ch| ch.is_ascii_digit()))
+                .copied()
+                .unwrap_or_default()
+                .to_string();
+        }
+        while fraction.ends_with('0') {
+            fraction.pop();
+        }
+
+        Some(Self { major, fraction })
+    }
+}
+
+impl Ord for ModelVersion {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.major
+            .cmp(&other.major)
+            .then_with(|| compare_decimal_fractions(&self.fraction, &other.fraction))
+    }
+}
+
+impl PartialOrd for ModelVersion {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn within_product_line_is_better(
+    candidate: &ModelEntry,
+    candidate_tier: ModelTier,
+    candidate_parsed: &ParsedModelId,
+    existing: &ModelEntry,
+    existing_tier: ModelTier,
+    existing_parsed: &ParsedModelId,
+) -> bool {
+    candidate_parsed
+        .version
+        .cmp(&existing_parsed.version)
+        .then_with(|| serving_variant_rank(&existing.id).cmp(&serving_variant_rank(&candidate.id)))
+        .then(candidate_tier.cmp(&existing_tier))
+        .then_with(|| compare_completion_price(candidate, existing))
+        .then(candidate.created.cmp(&existing.created))
+        .then(
+            candidate
+                .context_length
+                .unwrap_or(0)
+                .cmp(&existing.context_length.unwrap_or(0)),
+        )
+        .then(existing.id.len().cmp(&candidate.id.len()))
+        .then_with(|| existing.id.cmp(&candidate.id))
+        .is_gt()
+}
+
+/// Serving/deployment decorations, not capability tiers. Extend this policy
+/// only when the catalog introduces another concrete serving-only suffix.
+const SERVING_VARIANT_SUFFIXES: &[&str] = &["customtools", "fast"];
+
+fn serving_variant_rank(id: &str) -> u8 {
+    model_name(id)
+        .rsplit('-')
+        .next()
+        .is_some_and(|suffix| SERVING_VARIANT_SUFFIXES.contains(&suffix)) as u8
+}
+
+fn model_name(id: &str) -> &str {
+    id.rsplit_once('/')
+        .map_or(id, |(_, name)| name)
+        .split(':')
+        .next()
+        .unwrap_or(id)
+}
+
+fn across_product_lines_is_better(candidate: &FrontierEntry, existing: &FrontierEntry) -> bool {
+    candidate
+        .tier
+        .cmp(&existing.tier)
+        .then_with(|| compare_completion_price(&candidate.model, &existing.model))
+        .then(
+            candidate
+                .model
+                .context_length
+                .unwrap_or(0)
+                .cmp(&existing.model.context_length.unwrap_or(0)),
+        )
+        .then(existing.model.id.len().cmp(&candidate.model.id.len()))
+        .then_with(|| existing.model.id.cmp(&candidate.model.id))
+        .is_gt()
+}
+
+fn compare_completion_price(candidate: &ModelEntry, existing: &ModelEntry) -> Ordering {
+    candidate
+        .pricing
+        .completion_per_1k
+        .unwrap_or(0.0)
+        .total_cmp(&existing.pricing.completion_per_1k.unwrap_or(0.0))
+}
+
+fn compare_decimal_fractions(candidate: &str, existing: &str) -> Ordering {
+    let width = candidate.len().max(existing.len());
+    let candidate = format!("{candidate:0<width$}");
+    let existing = format!("{existing:0<width$}");
+    candidate.cmp(&existing)
 }
 
 /// Check if a model is a reasoning-specific model (expensive due to thinking tokens).
@@ -504,6 +671,7 @@ mod tests {
         let mut base = ModelRegistry {
             models: vec![ModelEntry {
                 id: "openai/gpt-5".to_string(),
+                created: Some(100),
                 context_length: Some(128_000),
                 max_output_tokens: Some(16_384),
                 pricing: ModelPricing {
@@ -527,6 +695,7 @@ mod tests {
         let mut update = ModelRegistry {
             models: vec![ModelEntry {
                 id: "openai/gpt-5".to_string(),
+                created: None,
                 context_length: None,
                 max_output_tokens: Some(8_192),
                 pricing: ModelPricing {
@@ -550,6 +719,7 @@ mod tests {
         base.merge(update);
 
         let entry = base.find("openai/gpt-5").unwrap();
+        assert_eq!(entry.created, Some(100));
         assert_eq!(entry.context_length, Some(128_000));
         assert_eq!(entry.max_output_tokens, Some(8_192));
         assert_eq!(entry.pricing.prompt_per_1k, Some(0.01));
@@ -794,6 +964,539 @@ mod tests {
         let google_frontier = frontier.iter().find(|e| e.family == "google").unwrap();
         assert_eq!(google_frontier.model.id, "google/gemini-3.1-pro-preview");
         assert_eq!(google_frontier.tier, ModelTier::Flagship);
+    }
+
+    #[test]
+    fn frontier_excludes_aliases_and_returns_concrete_models() {
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "openai/gpt-5.6-sol-pro".to_string(),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.020),
+                        ..Default::default()
+                    },
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "~openai/gpt-latest".to_string(),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.030),
+                        ..Default::default()
+                    },
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "~openai/internal-pointer".to_string(),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.004),
+                        ..Default::default()
+                    },
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "openai/gpt-chat-latest".to_string(),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.030),
+                        ..Default::default()
+                    },
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "google/gemini-3.1-pro-preview".to_string(),
+                    max_output_tokens: Some(64_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.012),
+                        ..Default::default()
+                    },
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "~google/gemini-pro-latest".to_string(),
+                    max_output_tokens: Some(64_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.012),
+                        ..Default::default()
+                    },
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "x-ai/grok-4.5".to_string(),
+                    max_output_tokens: Some(64_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.003),
+                        ..Default::default()
+                    },
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "~x-ai/grok-latest".to_string(),
+                    max_output_tokens: Some(64_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.006),
+                        ..Default::default()
+                    },
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "z-ai/glm-5.2".to_string(),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.002),
+                        ..Default::default()
+                    },
+                    provider: Some("openrouter".to_string()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|entry| entry.family == "openai")
+                .unwrap()
+                .model
+                .id,
+            "openai/gpt-5.6-sol-pro"
+        );
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|entry| entry.family == "google")
+                .unwrap()
+                .model
+                .id,
+            "google/gemini-3.1-pro-preview"
+        );
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|entry| entry.family == "x-ai")
+                .unwrap()
+                .model
+                .id,
+            "x-ai/grok-4.5"
+        );
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|entry| entry.family == "z-ai")
+                .unwrap()
+                .model
+                .id,
+            "z-ai/glm-5.2"
+        );
+        assert!(
+            frontier.iter().all(|entry| {
+                !entry.family.starts_with('~') && !entry.model.id.starts_with('~')
+            }),
+            "frontier entries must be concrete models, never moving aliases"
+        );
+    }
+
+    #[test]
+    fn frontier_compares_versions_only_within_product_lines() {
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "google/gemma-4-31b-it".to_string(),
+                    created: Some(200),
+                    max_output_tokens: Some(32_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.00035),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "google/gemini-3.1-pro-preview".to_string(),
+                    created: Some(100),
+                    max_output_tokens: Some(64_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.012),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "x-ai/grok-4.20".to_string(),
+                    created: Some(200),
+                    max_output_tokens: Some(64_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.003),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "x-ai/grok-4.5".to_string(),
+                    created: Some(100),
+                    max_output_tokens: Some(64_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.006),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "z-ai/glm-5-turbo".to_string(),
+                    created: Some(200),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.004),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "z-ai/glm-5.2".to_string(),
+                    created: Some(100),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.0011),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|entry| entry.family == "google")
+                .unwrap()
+                .model
+                .id,
+            "google/gemini-3.1-pro-preview"
+        );
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|entry| entry.family == "x-ai")
+                .unwrap()
+                .model
+                .id,
+            "x-ai/grok-4.5"
+        );
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|entry| entry.family == "z-ai")
+                .unwrap()
+                .model
+                .id,
+            "z-ai/glm-5.2"
+        );
+    }
+
+    #[test]
+    fn frontier_decimal_versions_use_fraction_semantics_without_release_dates() {
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "x-ai/grok-4.20".to_string(),
+                    max_output_tokens: Some(64_000),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "x-ai/grok-4.5".to_string(),
+                    max_output_tokens: Some(64_000),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|entry| entry.family == "x-ai")
+                .unwrap()
+                .model
+                .id,
+            "x-ai/grok-4.5"
+        );
+    }
+
+    #[test]
+    fn model_version_ordering_laws() {
+        let version = |id: &str| ParsedModelId::parse(id).unwrap().version;
+        let cases = [
+            ("test/model-4.5", "test/model-4.20", Ordering::Greater),
+            ("test/model-5.2", "test/model-5.1", Ordering::Greater),
+            ("test/model-5.1", "test/model-5", Ordering::Greater),
+            ("test/model-5", "test/model-5.0", Ordering::Equal),
+            ("test/model-3.1", "test/model-4", Ordering::Less),
+            ("test/model", "test/model-1", Ordering::Less),
+            (
+                "anthropic/claude-opus-4-8",
+                "anthropic/claude-opus-4.8",
+                Ordering::Equal,
+            ),
+        ];
+
+        for (left, right, expected) in cases {
+            assert_eq!(
+                version(left).cmp(&version(right)),
+                expected,
+                "{left} vs {right}"
+            );
+        }
+    }
+
+    #[test]
+    fn frontier_uses_created_only_after_equal_versions_within_a_line() {
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "vendor/model-5.2-snapshot-a".to_string(),
+                    created: Some(200),
+                    max_output_tokens: Some(8_192),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "vendor/model-5.2-snapshot-b".to_string(),
+                    created: Some(100),
+                    max_output_tokens: Some(8_192),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        assert_eq!(frontier[0].model.id, "vendor/model-5.2-snapshot-a");
+    }
+
+    #[test]
+    fn frontier_prefers_canonical_base_models_over_newer_serving_variants() {
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "google/gemini-3.1-pro-preview".to_string(),
+                    created: Some(100),
+                    context_length: Some(1_048_576),
+                    max_output_tokens: Some(65_536),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.012),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "google/gemini-3.1-pro-preview-customtools".to_string(),
+                    created: Some(200),
+                    context_length: Some(1_048_576),
+                    max_output_tokens: Some(65_536),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.012),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "anthropic/claude-opus-4.8".to_string(),
+                    created: Some(100),
+                    context_length: Some(1_000_000),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.05),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "anthropic/claude-opus-4.8-fast".to_string(),
+                    created: Some(200),
+                    context_length: Some(1_000_000),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.05),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|entry| entry.family == "google")
+                .unwrap()
+                .model
+                .id,
+            "google/gemini-3.1-pro-preview"
+        );
+        assert_eq!(
+            frontier
+                .iter()
+                .find(|entry| entry.family == "anthropic")
+                .unwrap()
+                .model
+                .id,
+            "anthropic/claude-opus-4.8"
+        );
+    }
+
+    #[test]
+    fn frontier_keeps_legitimate_tier_variants_and_skips_latest_pointers() {
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "openai/gpt-5.6-luna".to_string(),
+                    created: Some(100),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.006),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "openai/gpt-5.6-luna-pro".to_string(),
+                    created: Some(200),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.006),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "openai/gpt-5.6-sol-pro".to_string(),
+                    created: Some(50),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.03),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "openai/gpt-chat-latest".to_string(),
+                    created: Some(400),
+                    max_output_tokens: Some(128_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.03),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        assert_eq!(frontier[0].model.id, "openai/gpt-5.6-sol-pro");
+    }
+
+    #[test]
+    fn within_line_ranking_is_stable_across_input_permutations() {
+        let models = [
+            ModelEntry {
+                id: "vendor/model-5.2".to_string(),
+                created: Some(100),
+                max_output_tokens: Some(8_192),
+                ..Default::default()
+            },
+            ModelEntry {
+                id: "vendor/model-5.2-fast".to_string(),
+                created: Some(300),
+                max_output_tokens: Some(8_192),
+                ..Default::default()
+            },
+            ModelEntry {
+                id: "vendor/model-5.2-snapshot-b".to_string(),
+                created: Some(200),
+                max_output_tokens: Some(8_192),
+                ..Default::default()
+            },
+        ];
+        let permutations = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+
+        for order in permutations {
+            let mut reg = ModelRegistry {
+                models: order
+                    .into_iter()
+                    .map(|index| models[index].clone())
+                    .collect(),
+                ..Default::default()
+            };
+            reg.rebuild_index();
+            assert_eq!(reg.frontier()[0].model.id, "vendor/model-5.2-snapshot-b");
+        }
+    }
+
+    #[test]
+    fn frontier_ignores_version_and_created_across_product_lines() {
+        let mut reg = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "vendor/alpha-9".to_string(),
+                    created: Some(200),
+                    context_length: Some(8_192),
+                    max_output_tokens: Some(8_192),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.01),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "vendor/gamma-1".to_string(),
+                    created: Some(100),
+                    context_length: Some(16_384),
+                    max_output_tokens: Some(8_192),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.01),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        reg.rebuild_index();
+
+        let frontier = reg.frontier();
+        assert_eq!(frontier[0].model.id, "vendor/gamma-1");
     }
 
     #[test]
@@ -1221,56 +1924,22 @@ mod tests {
     }
 
     #[test]
-    fn extract_version_dotted() {
-        assert_eq!(extract_version("openai/gpt-5.4-pro"), vec![5, 4]);
-        assert_eq!(extract_version("anthropic/claude-opus-4.6"), vec![4, 6]);
-        assert_eq!(extract_version("google/gemini-3.1-pro-preview"), vec![3, 1]);
-        assert_eq!(extract_version("x-ai/grok-4.20-beta"), vec![4, 20]);
-    }
+    fn model_created_serialization_roundtrip() {
+        let mut registry = ModelRegistry::default();
+        registry.models.push(ModelEntry {
+            id: "openai/gpt-latest".to_string(),
+            created: Some(1_783_590_854),
+            ..Default::default()
+        });
 
-    #[test]
-    fn extract_version_bare_numbers() {
-        assert_eq!(extract_version("x-ai/grok-4"), vec![4]);
-        assert_eq!(extract_version("anthropic/claude-opus-4-6"), vec![4, 6]);
-    }
+        let json = serde_json::to_string(&registry).unwrap();
+        let roundtrip: ModelRegistry = serde_json::from_str(&json).unwrap();
 
-    #[test]
-    fn extract_version_v_prefix() {
         assert_eq!(
-            extract_version("deepseek/deepseek-v3.2-speciale"),
-            vec![3, 2]
+            roundtrip
+                .find("openai/gpt-latest")
+                .and_then(|model| model.created),
+            Some(1_783_590_854)
         );
-        assert_eq!(extract_version("deepseek/deepseek-v3-chat"), vec![3]);
-    }
-
-    #[test]
-    fn extract_version_stops_at_dates() {
-        // Date suffix should not contribute to version
-        assert_eq!(
-            extract_version("openai/gpt-4o-2024-11-20"),
-            Vec::<u32>::new()
-        );
-        assert_eq!(extract_version("deepseek/deepseek-chat-v3-0324"), vec![3]);
-        assert_eq!(
-            extract_version("mistralai/mistral-large-2411"),
-            Vec::<u32>::new()
-        );
-    }
-
-    #[test]
-    fn extract_version_skips_param_counts() {
-        // "70b", "20b", "27b", "405b" are parameter counts, not versions
-        assert_eq!(extract_version("meta-llama/llama-3.1-405b"), vec![3, 1]);
-        assert_eq!(
-            extract_version("deepseek/deepseek-r1-distill-llama-70b"),
-            Vec::<u32>::new() // "r1" is a series name, not a version
-        );
-        assert_eq!(extract_version("google/gemma-3-27b-it"), vec![3]);
-    }
-
-    #[test]
-    fn extract_version_empty() {
-        assert_eq!(extract_version("openai/gpt-oss"), Vec::<u32>::new());
-        assert_eq!(extract_version("mancer/weaver"), Vec::<u32>::new());
     }
 }

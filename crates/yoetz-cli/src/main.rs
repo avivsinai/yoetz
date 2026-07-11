@@ -6429,6 +6429,7 @@ mod tests {
         let mut registry = ModelRegistry::default();
         registry.models.push(yoetz_core::registry::ModelEntry {
             id: id.to_string(),
+            created: None,
             context_length: None,
             max_output_tokens: None,
             pricing: Default::default(),
@@ -6466,6 +6467,7 @@ mod tests {
             registry_with_provider_model("google/gemini-3.1-pro-preview", "openrouter");
         registry.models.push(yoetz_core::registry::ModelEntry {
             id: "openrouter/google/gemini-3.1-pro-preview".to_string(),
+            created: None,
             context_length: None,
             max_output_tokens: None,
             pricing: Default::default(),
@@ -6509,6 +6511,7 @@ mod tests {
         let mut registry = ModelRegistry::default();
         registry.models.push(yoetz_core::registry::ModelEntry {
             id: "gemini/gemini-3-pro-preview".to_string(),
+            created: None,
             context_length: None,
             max_output_tokens: Some(65535),
             pricing: Default::default(),
@@ -6535,6 +6538,7 @@ mod tests {
         let mut registry = ModelRegistry::default();
         registry.models.push(yoetz_core::registry::ModelEntry {
             id: "test/small-model".to_string(),
+            created: None,
             context_length: None,
             max_output_tokens: Some(4096),
             pricing: Default::default(),
@@ -6570,6 +6574,7 @@ mod tests {
         let mut registry = ModelRegistry::default();
         registry.models.push(yoetz_core::registry::ModelEntry {
             id: "x-ai/grok-4".to_string(),
+            created: None,
             context_length: None,
             max_output_tokens: None,
             pricing: Default::default(),
@@ -6600,6 +6605,7 @@ mod tests {
         let mut registry = ModelRegistry::default();
         registry.models.push(yoetz_core::registry::ModelEntry {
             id: "gemini/gemini-3-pro-preview".to_string(),
+            created: None,
             context_length: None,
             max_output_tokens: None,
             pricing: Default::default(),
@@ -6619,6 +6625,7 @@ mod tests {
         let mut registry = ModelRegistry::default();
         registry.models.push(yoetz_core::registry::ModelEntry {
             id: "gpt-5.2".to_string(),
+            created: None,
             context_length: None,
             max_output_tokens: None,
             pricing: Default::default(),
