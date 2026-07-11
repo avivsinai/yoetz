@@ -1,6 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use jsonschema::Validator;
 use litellm_rust::{
     ChatContentPart, ChatContentPartFile, ChatContentPartImageUrl, ChatContentPartText, ChatFile,
@@ -520,6 +520,10 @@ struct CouncilArgs {
     #[arg(long, default_value = "4")]
     max_parallel: usize,
 
+    /// Whether a council with some failed models exits successfully.
+    #[arg(long, value_enum, default_value = "ok")]
+    partial: PartialPolicy,
+
     #[arg(long)]
     dry_run: bool,
 
@@ -537,6 +541,12 @@ struct CouncilArgs {
 
     #[arg(long)]
     response_schema_name: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum PartialPolicy {
+    Ok,
+    Fail,
 }
 
 #[derive(Args)]
@@ -853,18 +863,40 @@ struct CouncilResult {
     results: Vec<CouncilModelResult>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     errors: Vec<CouncilModelError>,
+    summary: CouncilSummary,
     pricing: CouncilPricing,
     usage: Usage,
     artifacts: ArtifactPaths,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 struct CouncilModelResult {
     model: String,
     content: String,
     usage: Usage,
     pricing: PricingEstimate,
     response_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CouncilSummary {
+    succeeded: usize,
+    failed: usize,
+    total: usize,
+    cost_usd: f64,
+    elapsed_ms: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct CouncilModelArtifact {
+    status: &'static str,
+    model: String,
+    provider: String,
+    content: Option<String>,
+    usage: Usage,
+    pricing: PricingEstimate,
+    response_id: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

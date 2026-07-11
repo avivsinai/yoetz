@@ -231,7 +231,8 @@ fn council_help() {
         .args(["council", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("--models"));
+        .stdout(predicate::str::contains("--models"))
+        .stdout(predicate::str::contains("--partial"));
 }
 
 #[test]

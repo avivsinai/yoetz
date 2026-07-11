@@ -4,12 +4,15 @@ use crate::{
     add_usage, call_litellm, maybe_write_output, normalize_model_name_with_aliases,
     render_bundle_md, resolve_max_output_tokens, resolve_prompt, resolve_provider_from_registry,
     resolve_registry_model_id, resolve_response_format, AppContext, CouncilArgs,
-    CouncilModelResult, CouncilPricing, ModelEstimate,
+    CouncilModelArtifact, CouncilModelResult, CouncilPricing, CouncilSummary, ModelEstimate,
+    PartialPolicy,
 };
 use crate::{budget, registry};
 use crate::{CouncilModelError, CouncilResult};
-use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 use yoetz_core::bundle::{build_bundle, estimate_tokens, BundleOptions};
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::session::{create_session_dir, write_json as write_json_file, write_text};
@@ -20,6 +23,7 @@ pub(crate) async fn handle_council(
     args: CouncilArgs,
     format: OutputFormat,
 ) -> Result<()> {
+    let started_at = Instant::now();
     let prompt = resolve_prompt(args.prompt.clone(), args.prompt_file.clone())?;
     let config = &ctx.config;
 
@@ -113,6 +117,7 @@ pub(crate) async fn handle_council(
         .collect();
 
     let mut per_model = Vec::new();
+    let mut per_model_pricing = Vec::new();
     let mut estimate_sum = 0.0;
     let mut estimate_complete = true;
     for (idx, (model, _provider)) in resolved_models.iter().enumerate() {
@@ -124,6 +129,7 @@ pub(crate) async fn handle_council(
             input_tokens,
             output_tokens,
         )?;
+        per_model_pricing.push(estimate.clone());
         if let Some(cost) = estimate.estimate_usd {
             estimate_sum += cost;
         } else {
@@ -165,6 +171,7 @@ pub(crate) async fn handle_council(
     let mut results = Vec::new();
     let mut total_usage = Usage::default();
     let mut errors = Vec::new();
+    let mut model_artifacts = Vec::new();
     let model_prompt = std::sync::Arc::new(if let Some(bundle_ref) = &bundle {
         render_bundle_md(bundle_ref)
     } else {
@@ -176,7 +183,7 @@ pub(crate) async fn handle_council(
             let registry_id =
                 resolve_registry_model_id(Some(provider), Some(model), registry_cache.as_ref());
             let output_tokens = per_model_max_output_tokens[idx].unwrap_or(4096);
-            results.push(CouncilModelResult {
+            let result = CouncilModelResult {
                 model: model.clone(),
                 content: "(dry-run) no provider call executed".to_string(),
                 usage: Usage::default(),
@@ -187,7 +194,12 @@ pub(crate) async fn handle_council(
                     output_tokens,
                 )?,
                 response_id: None,
-            });
+            };
+            model_artifacts.push((
+                idx,
+                successful_model_artifact(model.clone(), provider.clone(), &result),
+            ));
+            results.push(result);
         }
     } else {
         let max_parallel = args.max_parallel.max(1);
@@ -204,6 +216,7 @@ pub(crate) async fn handle_council(
             join_set.spawn(async move {
                 let _permit = semaphore.acquire_owned().await.map_err(|err| {
                     (
+                        idx,
                         model.clone(),
                         provider.clone(),
                         anyhow!("failed to acquire council permit: {err}"),
@@ -223,7 +236,7 @@ pub(crate) async fn handle_council(
                 .await;
                 match call {
                     Ok(call) => Ok((idx, model, provider, call)),
-                    Err(err) => Err((model, provider, err)),
+                    Err(err) => Err((idx, model, provider, err)),
                 }
             });
         }
@@ -262,40 +275,67 @@ pub(crate) async fn handle_council(
                         output_tokens,
                     )?;
 
-                    ordered[idx] = Some(CouncilModelResult {
-                        model,
+                    let result = CouncilModelResult {
+                        model: model.clone(),
                         content: call.content,
                         usage,
                         pricing,
                         response_id: call.response_id,
-                    });
+                    };
+                    model_artifacts
+                        .push((idx, successful_model_artifact(model, provider, &result)));
+                    ordered[idx] = Some(result);
                 }
-                Ok(Err((model, provider, err))) => {
+                Ok(Err((idx, model, provider, err))) => {
+                    let error = err.to_string();
+                    model_artifacts.push((
+                        idx,
+                        failed_model_artifact(
+                            model.clone(),
+                            provider.clone(),
+                            per_model_pricing[idx].clone(),
+                            error.clone(),
+                        ),
+                    ));
                     errors.push(CouncilModelError {
                         model,
                         provider,
-                        error: err.to_string(),
+                        error,
                     });
                 }
                 Err(err) => {
+                    let error = err.to_string();
+                    model_artifacts.push((
+                        usize::MAX,
+                        failed_model_artifact(
+                            "<task>".to_string(),
+                            "internal".to_string(),
+                            Default::default(),
+                            error.clone(),
+                        ),
+                    ));
                     errors.push(CouncilModelError {
                         model: "<task>".to_string(),
                         provider: "internal".to_string(),
-                        error: err.to_string(),
+                        error,
                     });
                 }
             }
         }
 
         results = ordered.into_iter().flatten().collect();
-        if results.is_empty() && !errors.is_empty() {
-            let joined = errors
-                .iter()
-                .map(|error| format!("- {} ({}): {}", error.model, error.provider, error.error))
-                .collect::<Vec<_>>()
-                .join("\n");
-            return Err(anyhow!("all council models failed:\n{joined}"));
-        }
+    }
+
+    model_artifacts.sort_by_key(|(index, _)| *index);
+
+    if results.is_empty() && !errors.is_empty() {
+        write_model_artifacts(&session.path, &model_artifacts);
+        let joined = errors
+            .iter()
+            .map(|error| format!("- {} ({}): {}", error.model, error.provider, error.error))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(anyhow!("all council models failed:\n{joined}"));
     }
 
     if budget_enabled && !args.dry_run {
@@ -318,12 +358,25 @@ pub(crate) async fn handle_council(
         }
     }
 
+    let summary = CouncilSummary {
+        succeeded: results.len(),
+        failed: errors.len(),
+        total: results.len() + errors.len(),
+        cost_usd: results
+            .iter()
+            .filter_map(|result| result.usage.cost_usd)
+            .sum(),
+        elapsed_ms: u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    };
+    let strict_partial_failure = matches!(args.partial, PartialPolicy::Fail) && !errors.is_empty();
+
     let mut council = CouncilResult {
         id: session.id,
         provider: council_provider,
         bundle,
         results,
         errors,
+        summary,
         pricing: CouncilPricing {
             estimate_usd_total: total_estimate,
             per_model,
@@ -337,6 +390,7 @@ pub(crate) async fn handle_council(
     write_json_file(&response_json, &council)?;
 
     maybe_write_output(ctx, &council)?;
+    write_model_artifacts(&session.path, &model_artifacts);
 
     // Omit bundle from stdout to keep JSON output compact (full result is in session file)
     council.bundle = None;
@@ -370,6 +424,99 @@ pub(crate) async fn handle_council(
             }
             Ok(())
         }
+    }?;
+
+    if strict_partial_failure {
+        return Err(anyhow!(
+            "council completed with {} failed model(s) under --partial fail",
+            council.summary.failed
+        ));
+    }
+    Ok(())
+}
+
+fn write_model_artifacts(session_dir: &Path, artifacts: &[(usize, CouncilModelArtifact)]) {
+    let models_dir = session_dir.join("models");
+    if let Err(error) = fs::create_dir_all(&models_dir) {
+        eprintln!(
+            "warning: could not create council model artifact directory {}: {error}",
+            models_dir.display()
+        );
+        return;
+    }
+    let mut slug_counts = BTreeMap::new();
+    for (_, artifact) in artifacts {
+        let slug = model_artifact_slug(&artifact.model);
+        let count = slug_counts.entry(slug.clone()).or_insert(0_usize);
+        *count += 1;
+        let filename = if *count == 1 {
+            format!("{slug}.json")
+        } else {
+            format!("{slug}-{}.json", *count)
+        };
+        let path = models_dir.join(filename);
+        if let Err(error) = write_json_file(&path, artifact) {
+            eprintln!(
+                "warning: could not write council model artifact {}: {error}",
+                path.display()
+            );
+        }
+    }
+}
+
+fn successful_model_artifact(
+    model: String,
+    provider: String,
+    result: &CouncilModelResult,
+) -> CouncilModelArtifact {
+    CouncilModelArtifact {
+        status: "succeeded",
+        model,
+        provider,
+        content: Some(result.content.clone()),
+        usage: result.usage.clone(),
+        pricing: result.pricing.clone(),
+        response_id: result.response_id.clone(),
+        error: None,
+    }
+}
+
+fn failed_model_artifact(
+    model: String,
+    provider: String,
+    pricing: yoetz_core::types::PricingEstimate,
+    error: String,
+) -> CouncilModelArtifact {
+    CouncilModelArtifact {
+        status: "failed",
+        model,
+        provider,
+        content: None,
+        usage: Usage::default(),
+        pricing,
+        response_id: None,
+        error: Some(error),
+    }
+}
+
+fn model_artifact_slug(model: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_separator = false;
+    for ch in model.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if pending_separator && !slug.is_empty() {
+                slug.push('-');
+            }
+            slug.push(ch.to_ascii_lowercase());
+            pending_separator = false;
+        } else {
+            pending_separator = true;
+        }
+    }
+    if slug.is_empty() {
+        "model".to_string()
+    } else {
+        slug
     }
 }
 
@@ -401,4 +548,42 @@ fn prefixed_council_provider(model: &str) -> Option<String> {
         return None;
     }
     Some(prefix.to_lowercase())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{model_artifact_slug, write_model_artifacts, CouncilModelArtifact};
+    use std::fs;
+    use yoetz_core::types::{PricingEstimate, Usage};
+
+    #[test]
+    fn model_artifact_slug_is_safe_for_provider_qualified_ids() {
+        assert_eq!(
+            model_artifact_slug("openai/gpt-5.4-pro"),
+            "openai-gpt-5-4-pro"
+        );
+        assert_eq!(model_artifact_slug("///"), "model");
+    }
+
+    #[test]
+    fn model_artifact_write_failure_is_best_effort() {
+        let session = tempfile::tempdir().unwrap();
+        fs::write(session.path().join("models"), "not a directory").unwrap();
+        let artifacts = vec![(
+            0,
+            CouncilModelArtifact {
+                status: "succeeded",
+                model: "test/model".to_string(),
+                provider: "test".to_string(),
+                content: Some("paid result".to_string()),
+                usage: Usage::default(),
+                pricing: PricingEstimate::default(),
+                response_id: None,
+                error: None,
+            },
+        )];
+
+        write_model_artifacts(session.path(), &artifacts);
+        assert!(session.path().join("models").is_file());
+    }
 }
