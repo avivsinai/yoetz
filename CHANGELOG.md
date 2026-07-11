@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Council runs now write per-model result/error artifacts, include aggregate
+  success, failure, cost, and elapsed-time summaries, and support
+  `--partial fail` for strict partial-failure exit semantics.
+
 ## [0.5.31] - 2026-07-11
 ### Changed
 

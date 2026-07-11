@@ -150,6 +150,12 @@ Use the returned model IDs verbatim. Do not add provider prefixes, nested
 OpenRouter wrappers, or old example names around IDs returned by `frontier` or
 `resolve`.
 
+Council JSON keeps successful `results` before `errors`, includes aggregate
+`summary` counts/cost/elapsed time, and writes one full result or error artifact
+per model under `<session_dir>/models/`. Partial success exits zero by default;
+pass `--partial fail` when any failed model must make the command nonzero while
+still emitting the complete council result.
+
 ## Ask (Single Model)
 
 Quick question with file context:
