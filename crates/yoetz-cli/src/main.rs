@@ -958,6 +958,7 @@ const BASE_PROTECTED_DOTENV_ENV_VARS: &[&str] = &[
     "GEMINI_API_KEY",
     "OPENROUTER_API_KEY",
     "XAI_API_KEY",
+    "ZAI_API_KEY",
     "LITELLM_API_KEY",
 ];
 
@@ -4684,6 +4685,7 @@ mod tests {
             "YOETZ_BROWSER_CDP",
             "YOETZ_BROWSER_TARGET_PATH",
             "YOETZ_BROWSER_PROFILE",
+            "ZAI_API_KEY",
             "LITELLM_API_KEY",
         ] {
             assert!(

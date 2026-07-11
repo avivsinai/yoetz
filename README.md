@@ -309,10 +309,11 @@ pinning examples.
 | OpenRouter | Yes | Model-dependent | No | No | No |
 | OpenAI | Yes | Yes | Yes | Yes (Sora) | No |
 | Gemini | Yes | Yes | No | Yes (Veo) | Yes |
+| Z.AI | Yes | Model-dependent | No | No | No |
 | LiteLLM-compatible | Yes | Model-dependent | No | No | No |
 
-Anthropic and xAI models are commonly reached through OpenRouter, but can also
-be configured as direct providers when you need provider-specific routing.
+Anthropic, xAI, and Z.AI models are commonly reached through OpenRouter, but can
+also be configured as direct providers when you need provider-specific routing.
 
 Common API key variables:
 
@@ -323,6 +324,7 @@ Common API key variables:
 | `GEMINI_API_KEY` | Gemini |
 | `ANTHROPIC_API_KEY` | Direct Anthropic-compatible provider configs |
 | `XAI_API_KEY` | Direct xAI/OpenAI-compatible provider configs |
+| `ZAI_API_KEY` | Direct Z.AI/OpenAI-compatible routing |
 | `LITELLM_API_KEY` | LiteLLM proxy |
 
 ## Safety And Trust
