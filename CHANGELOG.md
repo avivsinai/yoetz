@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.31] - 2026-07-11
 ### Changed
 
 - The built-in ChatGPT recipe now targets GPT-5.6 Sol with Pro intelligence
@@ -22,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - ChatGPT response extraction now recognizes the new whole-line model chrome
   labels such as `Sol`, `Extra High`, and `GPT-5.6 Sol` without stripping those
   words from normal answer prose.
+
 
 ## [0.5.30] - 2026-06-30
 ### Changed
