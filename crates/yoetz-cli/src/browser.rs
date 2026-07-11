@@ -990,6 +990,7 @@ fn chatgpt_recipe_payload_from_steps(steps: &[Value], fallback_used: bool) -> Va
         transport: "agent-browser".to_string(),
         backend: "agent-browser".to_string(),
         response: response.as_str().unwrap_or_default().to_string(),
+        model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
         model_used: model_used.as_str().map(str::to_owned),
         model_selection_status,
         warnings,
@@ -1587,7 +1588,10 @@ fn run_chatgpt_select_model(
     headed: bool,
 ) -> Result<String> {
     let requested_model = crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL;
-    let function = chatgpt_web::build_model_selection_function(requested_model);
+    let function = chatgpt_web::build_model_selection_function(
+        requested_model,
+        chatgpt_recipe::ChatgptModelStrategy::Select,
+    );
     let expression = chatgpt_web::wrap_function_source_for_json_eval(&function)?;
     let stdout = run_agent_browser_with_connection_timeout(
         vec!["eval".to_string(), expression],

@@ -2011,6 +2011,30 @@ test("GPT-5.6 Sol picker fails loudly on the legacy model-switcher DOM", async (
   assert.equal(legacyButton.events.includes("pointerdown"), false);
 });
 
+test("current model strategy waits briefly for the pill and reads it without picker clicks", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask anything").append(form);
+  const doc = new FakeDocument(body);
+  const pill = new FakeElement("button", { "aria-haspopup": "menu", class: "__composer-pill" }, "5.5\nInstant");
+
+  setTimeout(() => {
+    form.append(pill);
+  }, 300);
+
+  const result = await configureModelState(doc, { model_strategy: "current" });
+
+  assert.equal(result.status, "current");
+  assert.equal(result.model_used, "5.5\nInstant");
+  assert.equal(result.requested_model, "current");
+  assert.equal(result.pill_text, "5.5\nInstant");
+  assert.equal(result.family_status, "skipped");
+  assert.equal(result.effort_status, "skipped");
+  assert.deepEqual(result.warnings, []);
+  assert.equal(pill.events.length, 0);
+  assert.equal(pill.clicked, false);
+});
+
 function makeSolPickerFixture({
   family,
   effort,

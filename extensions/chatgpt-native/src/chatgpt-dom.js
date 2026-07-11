@@ -303,6 +303,25 @@ function conversationUnavailableError(conversationId, currentConversationId, win
 }
 
 export async function configureModelState(root, job = {}) {
+  if (modelSelectionStrategyForJob(job) === "current") {
+    const modelButton = await waitForModelButton(root, { timeoutMs: 1500, intervalMs: 250 });
+    const pillText = modelControlLabel(modelButton);
+    return {
+      status: "current",
+      model_used: pillText ?? "",
+      requested_model: "current",
+      available_options: [],
+      available_families: [],
+      family_status: "skipped",
+      effort_status: "skipped",
+      pill_text: pillText ?? "",
+      family_label: null,
+      effort_options: [],
+      warning: "model pinning bypassed — answer may come from any model",
+      warnings: []
+    };
+  }
+
   const selection = await selectSolProModel(root, modelSelectionOptionsForJob(job));
   const warnings = selection.warning ? [selection.warning] : [];
   return {
@@ -332,6 +351,12 @@ function modelSelectionOptionsForJob(job = {}) {
     options.intervalMs = intervalMs;
   }
   return options;
+}
+
+function modelSelectionStrategyForJob(job = {}) {
+  return String(job?.model_strategy ?? "select").trim().toLowerCase() === "current"
+    ? "current"
+    : "select";
 }
 
 function modelControlScopes(root) {

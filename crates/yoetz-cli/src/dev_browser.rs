@@ -681,6 +681,8 @@ pub struct DevBrowserRecipeContext {
     pub bundle_text: Option<String>,
     /// ChatGPT model slug to select.
     pub model: String,
+    /// ChatGPT model selection strategy.
+    pub model_strategy: chatgpt_recipe::ChatgptModelStrategy,
     /// Whether to paste text instead of uploading as file.
     pub paste_mode: bool,
     /// Custom prompt text.
@@ -705,6 +707,7 @@ impl Default for DevBrowserRecipeContext {
             bundle_path: None,
             bundle_text: None,
             model: String::new(),
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             prompt: "Review the attached file and provide your analysis.".to_string(),
             run_id: String::new(),
             paste_mode: false,
@@ -940,19 +943,28 @@ fn classify_dev_browser_page_issue(
     chatgpt_web::detect_auth_issue_text(&haystack, true)
 }
 
-fn build_chatgpt_prepare_script(page_name: &str, model: &str, run_id: &str) -> String {
+fn build_chatgpt_prepare_script(
+    page_name: &str,
+    model: &str,
+    model_strategy: chatgpt_recipe::ChatgptModelStrategy,
+    run_id: &str,
+) -> String {
     let page_name_json = serde_json::to_string(page_name).unwrap();
     let model_json = serde_json::to_string(model).unwrap();
+    let model_strategy_json = serde_json::to_string(&model_strategy).unwrap();
     let marked_url_json = serde_json::to_string(&chatgpt_web::mark_chatgpt_url(run_id)).unwrap();
     let window_name_json =
         serde_json::to_string(&format!("yoetz:{run_id}")).expect("serialize yoetz window name");
-    let model_selection_function_json =
-        serde_json::to_string(&chatgpt_web::build_model_selection_function(model)).unwrap();
+    let model_selection_function_json = serde_json::to_string(
+        &chatgpt_web::build_model_selection_function(model, model_strategy),
+    )
+    .unwrap();
     let composer_selector_json = chatgpt_web::composer_selector_json();
     format!(
         r##"
 const PAGE_NAME = {page_name_json};
 const MODEL = {model_json};
+const MODEL_STRATEGY = {model_strategy_json};
 const MARKED_URL = {marked_url_json};
 const WINDOW_NAME = {window_name_json};
 const MODEL_SELECTION_FUNCTION_SOURCE = {model_selection_function_json};
@@ -1023,7 +1035,22 @@ if (loggedIn && composerReady) {{
   }}, MODEL_SELECTION_FUNCTION_SOURCE);
   const selectionStatus = selection?.status || "unknown";
   modelSelection = selection || null;
-  if (selectionStatus !== "selected") {{
+  if (MODEL_STRATEGY === "current") {{
+    if (selectionStatus !== "current") {{
+      const diagnostics = JSON.stringify({{
+        status: selectionStatus,
+        requested: selection?.requested || MODEL || "",
+        familyStatus: selection?.familyStatus || "skipped",
+        effortStatus: selection?.effortStatus || "skipped",
+        pillText: selection?.pillText || "",
+        warning: selection?.warning || "",
+        availableItems: selection?.availableItems || [],
+        availableFamilies: selection?.availableFamilies || [],
+      }});
+      throw new Error("unexpected model selection status '" + selectionStatus + "' (" + diagnostics + ")");
+    }}
+    selectedModel = selection?.modelUsed ?? "";
+  }} else if (selectionStatus !== "selected") {{
     const diagnostics = JSON.stringify({{
       status: selectionStatus,
       requested: selection?.requested || MODEL || "",
@@ -1045,7 +1072,7 @@ if (loggedIn && composerReady) {{
     }}
     throw new Error("unexpected model selection status '" + selectionStatus + "' (" + diagnostics + ")");
   }}
-  selectedModel = selection?.modelUsed || null;
+  selectedModel = selection?.modelUsed ?? null;
   await page.waitForTimeout(500);
 }}
 console.log(JSON.stringify({{
@@ -1548,7 +1575,12 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
             ctx.prompt.clone()
         };
 
-        let prepare_script = build_chatgpt_prepare_script(&page_name, &ctx.model, &ctx.run_id);
+        let prepare_script = build_chatgpt_prepare_script(
+            &page_name,
+            &ctx.model,
+            ctx.model_strategy,
+            &ctx.run_id,
+        );
         let prepare_stdout = {
             let attach_attempt_lock = browser::acquire_attach_attempt_lock()?;
             if ctx.show_approval_guidance {
@@ -1974,11 +2006,13 @@ mod tests {
         let script = build_chatgpt_prepare_script(
             "yoetz-chatgpt-test",
             crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL,
+            crate::chatgpt_recipe::ChatgptModelStrategy::Select,
             "run-123",
         );
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
         assert!(script.contains("const MODEL = \"gpt-5-6-sol-pro\";"));
+        assert!(script.contains("const MODEL_STRATEGY = \"select\";"));
         assert!(script.contains("const MARKED_URL = \"https://chatgpt.com/?_yoetz=run-123\";"));
         assert!(script.contains("const WINDOW_NAME = \"yoetz:run-123\";"));
         assert!(
@@ -2005,7 +2039,7 @@ mod tests {
         assert!(script.contains("modelSelection = selection || null;"));
         assert!(!script.contains("modelSelectionStatus ="));
         assert!(script.contains("selectedModel ="));
-        assert!(script.contains("selectedModel = selection?.modelUsed || null;"));
+        assert!(script.contains("selectedModel = selection?.modelUsed ?? null;"));
         assert!(script.contains("modelUsed: selectedModel,"));
         assert!(script.contains("modelSelection,"));
         assert!(script.contains("bodyText"));
@@ -2016,13 +2050,33 @@ mod tests {
 
     #[test]
     fn build_chatgpt_prepare_script_marks_a_yoetz_owned_tab() {
-        let script = build_chatgpt_prepare_script("yoetz-chatgpt-test", "pro", "run-456");
+        let script = build_chatgpt_prepare_script(
+            "yoetz-chatgpt-test",
+            "pro",
+            crate::chatgpt_recipe::ChatgptModelStrategy::Select,
+            "run-456",
+        );
         assert!(script.contains("const MARKED_URL = \"https://chatgpt.com/?_yoetz=run-456\";"));
         assert!(script.contains("const WINDOW_NAME = \"yoetz:run-456\";"));
         assert!(
             script.contains("await page.goto(MARKED_URL, { waitUntil: \"domcontentloaded\" });")
         );
         assert!(script.contains("window.name = name;"));
+    }
+
+    #[test]
+    fn build_chatgpt_prepare_script_current_skips_picker_selection() {
+        let script = build_chatgpt_prepare_script(
+            "yoetz-chatgpt-test",
+            "current",
+            crate::chatgpt_recipe::ChatgptModelStrategy::Current,
+            "run-789",
+        );
+        assert!(script.contains("const MODEL = \"current\";"));
+        assert!(script.contains("const MODEL_STRATEGY = \"current\";"));
+        assert!(script.contains(r#"MODEL_STRATEGY === "current""#));
+        assert!(script.contains(r#"selectedModel = selection?.modelUsed ?? "";"#));
+        assert!(script.contains("model pinning bypassed — answer may come from any model"));
     }
 
     #[test]
