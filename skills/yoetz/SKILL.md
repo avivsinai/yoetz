@@ -455,6 +455,14 @@ yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --format json
 # new owned tab for that conversation.
 ```
 
+For follow-up resumes, use `--followup <session-id|conversation-id|url>`.
+That path is native-only, is mutually exclusive with `--var conversation=`,
+and `session-id` lookups resume from that session's stored conversation
+metadata. `--allow-duplicate-prompt` is only for intentionally replaying the
+same prompt+bundle hash to the same conversation. A session-id follow-up
+compares against that session's last recorded prompt hash, not the current
+conversation head.
+
 The wait loop reports `completion_reason` in its JSON output:
 - `copy_button` — the strong signal: a copy control rendered on the new
   assistant message (response is fully streamed).

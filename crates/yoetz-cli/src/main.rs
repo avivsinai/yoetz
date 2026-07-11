@@ -25,6 +25,7 @@ mod chatgpt_web;
 mod chrome_devtools_mcp;
 mod commands;
 mod dev_browser;
+mod followup;
 mod fuzzy;
 mod http;
 mod live_attach;
@@ -289,6 +290,14 @@ struct BrowserRecipeArgs {
     /// Set recipe variables. For ChatGPT, profile_email selects/verifies the target Chrome profile.
     #[arg(long = "var", value_name = "KEY=VALUE")]
     vars: Vec<String>,
+
+    /// Resume from a session id, conversation id, or ChatGPT conversation URL.
+    #[arg(long)]
+    followup: Option<String>,
+
+    /// Allow the same prompt hash to be submitted to the same conversation.
+    #[arg(long)]
+    allow_duplicate_prompt: bool,
 }
 
 #[derive(Args)]
@@ -2314,6 +2323,52 @@ fn browser_recipe_artifact_paths(bundle_path: Option<&Path>) -> Option<ArtifactP
     })
 }
 
+fn maybe_write_followup_session_metadata(
+    recipe_args: &BrowserRecipeArgs,
+    current_prompt_hash: Option<&str>,
+    payload: &Value,
+) {
+    let Some(current_prompt_hash) = current_prompt_hash else {
+        return;
+    };
+    let Some(session_artifacts) = browser_recipe_artifact_paths(recipe_args.bundle.as_deref())
+    else {
+        return;
+    };
+    let Some(conversation_raw) = payload
+        .get("conversation_url")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("conversation_id").and_then(Value::as_str))
+    else {
+        return;
+    };
+
+    let session_dir = PathBuf::from(session_artifacts.session_dir);
+    let session_id = session_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("session")
+        .to_string();
+    let Ok(conversation) = chatgpt_web::normalize_conversation(conversation_raw) else {
+        eprintln!(
+            "warning: could not normalize followup conversation for metadata {}",
+            session_dir.join("followup.json").display()
+        );
+        return;
+    };
+    if let Err(err) = followup::write_followup_metadata(
+        &session_dir,
+        &session_id,
+        &conversation,
+        current_prompt_hash,
+    ) {
+        eprintln!(
+            "warning: could not write followup metadata {}: {err}",
+            session_dir.join("followup.json").display()
+        );
+    }
+}
+
 fn resolve_dev_browser_delivery_mode(
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
@@ -3452,9 +3507,40 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             let profile_dir =
                 browser::resolve_profile_dir(&ctx.browser_defaults, recipe_args.profile.as_ref())?;
             let is_chatgpt = is_chatgpt_recipe(&recipe, &recipe_path);
-            if is_chatgpt {
+            let current_prompt_hash = if is_chatgpt {
                 apply_chatgpt_prompt_default(&recipe_args, &mut recipe_vars)?;
-            }
+                let current_prompt_hash = followup::compute_prompt_hash(
+                    recipe_vars
+                        .get("prompt")
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                    recipe_args.bundle.as_deref(),
+                )?;
+                if let Some(followup_raw) = recipe_args.followup.as_deref() {
+                    followup::validate_followup_args(
+                        Some(followup_raw),
+                        recipe_vars.get("conversation").map(String::as_str),
+                    )?;
+                    let resolved_followup = followup::resolve_followup_target(
+                        followup_raw,
+                        &yoetz_core::session::session_base_dir(),
+                    )?;
+                    followup::guard_duplicate_prompt(
+                        &current_prompt_hash,
+                        resolved_followup.prior_prompt_hash.as_deref(),
+                        recipe_args.allow_duplicate_prompt,
+                        &resolved_followup.conversation.id,
+                        resolved_followup.source_session_id.as_deref(),
+                    )?;
+                    recipe_vars.insert(
+                        "conversation".to_string(),
+                        resolved_followup.conversation.url.clone(),
+                    );
+                }
+                Some(current_prompt_hash)
+            } else {
+                None
+            };
             let managed_profile_only = profile_forces_managed_browser(
                 recipe_args.profile.as_deref(),
                 recipe_args.cdp.as_deref(),
@@ -3634,6 +3720,13 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                 | browser::RecipeTransport::AgentBrowser
                         ) {
                             maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
+                        }
+                        if is_chatgpt {
+                            maybe_write_followup_session_metadata(
+                                &recipe_args,
+                                current_prompt_hash.as_deref(),
+                                &_payload,
+                            );
                         }
                         return Ok(());
                     }
@@ -5538,6 +5631,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::new();
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5570,6 +5665,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::new();
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5598,6 +5695,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::from([("paste".to_string(), "true".to_string())]);
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5627,6 +5726,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::new();
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5656,6 +5757,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::from([("thread".to_string(), "sideways".to_string())]);
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5685,6 +5788,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::from([("thread".to_string(), "reuse".to_string())]);
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5716,6 +5821,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::new();
 
@@ -5741,6 +5848,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::from([("paste".to_string(), "true".to_string())]);
 
@@ -5764,6 +5873,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::from([
             ("prompt".to_string(), "Review this repo".to_string()),
@@ -5809,6 +5920,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::from([
             ("model".to_string(), "auto".to_string()),
@@ -5837,6 +5950,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
 
         let recipe_vars = browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)
@@ -5878,6 +5993,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let mut recipe_vars = BTreeMap::from([(
             "prompt".to_string(),
@@ -5920,6 +6037,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec!["prompt=Explicit prompt".to_string()],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let mut recipe_vars =
             BTreeMap::from([("prompt".to_string(), "Explicit prompt".to_string())]);
@@ -5942,6 +6061,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars =
             BTreeMap::from([("profile_email".to_string(), "work@example.com".to_string())]);
@@ -5971,6 +6092,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars =
             BTreeMap::from([("extension_instance_id".to_string(), "ext_work".to_string())]);
@@ -6000,6 +6123,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars =
             BTreeMap::from([("browser_context_id".to_string(), "ctx-work".to_string())]);
@@ -6055,6 +6180,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::from([("thread".to_string(), "sideways".to_string())]);
         let err = run_recipe_via_dev_browser(
@@ -6083,6 +6210,8 @@ mod tests {
             cdp: None,
             browser_id: None,
             vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
         };
         let recipe_vars = BTreeMap::from([("thread".to_string(), "reuse".to_string())]);
         let err = run_recipe_via_dev_browser(

@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Council runs now write per-model result/error artifacts, include aggregate
   success, failure, cost, and elapsed-time summaries, and support
   `--partial fail` for strict partial-failure exit semantics.
+- ChatGPT recipe follow-ups now support native-only resumes via
+  `--followup <session-id|conversation-id|url>` plus
+  `--allow-duplicate-prompt` for explicit replays. Session-id lookups resolve
+  stored conversation metadata and fail clearly when a session has no
+  follow-up record.
 
 ## [0.5.31] - 2026-07-11
 ### Changed
