@@ -13,8 +13,12 @@ static TS_FORMAT: &[FormatItem<'static>] =
 /// Create a new timestamped session directory under `~/.yoetz/sessions/`.
 pub fn create_session_dir() -> Result<SessionInfo> {
     let root = yoetz_root_dir();
-    fs::create_dir_all(&root).with_context(|| format!("create yoetz dir {}", root.display()))?;
-    chmod_owner_only_dir(&root)?;
+    create_session_dir_in(&root)
+}
+
+pub fn create_session_dir_in(root: &Path) -> Result<SessionInfo> {
+    fs::create_dir_all(root).with_context(|| format!("create yoetz dir {}", root.display()))?;
+    chmod_owner_only_dir(root)?;
 
     let base = root.join("sessions");
     fs::create_dir_all(&base).with_context(|| format!("create sessions dir {}", base.display()))?;
@@ -75,12 +79,15 @@ pub fn write_text(path: &Path, text: &str) -> Result<()> {
 }
 
 pub fn list_sessions() -> Result<Vec<SessionInfo>> {
-    let base = session_base_dir();
+    list_sessions_in(&session_base_dir())
+}
+
+pub fn list_sessions_in(base: &Path) -> Result<Vec<SessionInfo>> {
     if !base.exists() {
         return Ok(Vec::new());
     }
     let mut items = Vec::new();
-    for entry in fs::read_dir(&base).with_context(|| format!("read {}", base.display()))? {
+    for entry in fs::read_dir(base).with_context(|| format!("read {}", base.display()))? {
         let entry = entry?;
         if entry.file_type()?.is_dir() {
             let id = entry.file_name().to_string_lossy().to_string();
