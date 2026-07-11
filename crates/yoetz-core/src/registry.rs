@@ -80,6 +80,10 @@ pub struct FrontierEntry {
     pub family: String,
     pub model: ModelEntry,
     pub tier: ModelTier,
+    /// Policy-ranked moving pointer when its product line differs from `model`.
+    /// Observability only; aliases never participate in frontier selection.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub alias_disagreement: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -343,21 +347,54 @@ impl ModelRegistry {
     pub fn frontier(&self) -> Vec<FrontierEntry> {
         let registry = self.clone().with_inferred_tiers();
         let mut best_by_line: HashMap<(String, String), RankedFrontierEntry> = HashMap::new();
+        let mut best_alias: HashMap<String, RankedFrontierEntry> = HashMap::new();
+        let mut alias_candidates: HashMap<String, Vec<RankedFrontierEntry>> = HashMap::new();
+        let mut concrete_lines: HashMap<String, HashSet<String>> = HashMap::new();
 
         for model in &registry.models {
             let Some(parsed) = ParsedModelId::parse(&model.id) else {
                 continue;
             };
-            // `~vendor/*-latest` entries are moving pointers, not concrete
-            // models. They remain resolvable through normal lookup, but a
-            // frontier listing must return an inspectable model ID.
-            if parsed.alias {
-                continue;
+            if !parsed.alias && !parsed.product_line.is_empty() {
+                concrete_lines
+                    .entry(parsed.family.clone())
+                    .or_default()
+                    .insert(parsed.product_line.clone());
             }
             let tier = match model.tier {
                 Some(t) => t,
                 None => continue,
             };
+            // `~vendor/*-latest` entries are moving pointers, not concrete
+            // models. They remain resolvable through normal lookup, but a
+            // frontier listing must return an inspectable model ID.
+            if parsed.alias {
+                if tier != ModelTier::Mini {
+                    let candidate = RankedFrontierEntry {
+                        entry: FrontierEntry {
+                            family: parsed.family.clone(),
+                            model: model.clone(),
+                            tier,
+                            alias_disagreement: None,
+                        },
+                        parsed,
+                    };
+                    alias_candidates
+                        .entry(candidate.entry.family.clone())
+                        .or_default()
+                        .push(candidate.clone());
+                    let dominates =
+                        best_alias
+                            .get(&candidate.entry.family)
+                            .is_none_or(|existing| {
+                                across_product_lines_is_better(&candidate.entry, &existing.entry)
+                            });
+                    if dominates {
+                        best_alias.insert(candidate.entry.family.clone(), candidate);
+                    }
+                }
+                continue;
+            }
             // Skip mini-tier models — they're explicitly small/cheap, not frontier picks.
             if tier == ModelTier::Mini {
                 continue;
@@ -398,6 +435,7 @@ impl ModelRegistry {
                             family: parsed.family.clone(),
                             model: model.clone(),
                             tier,
+                            alias_disagreement: None,
                         },
                         parsed,
                     },
@@ -415,10 +453,107 @@ impl ModelRegistry {
             }
         }
 
-        let mut entries: Vec<FrontierEntry> = best.into_values().collect();
+        let mut entries: Vec<FrontierEntry> = best
+            .into_values()
+            .map(|mut entry| {
+                let selected_line = ParsedModelId::parse(&entry.model.id)
+                    .map(|parsed| parsed.product_line)
+                    .unwrap_or_default();
+                if let Some(alias) = best_alias.get(&entry.family) {
+                    let alias_disagrees = alias_line_definitely_disagrees(
+                        &alias.parsed.product_line,
+                        &selected_line,
+                        concrete_lines.get(&entry.family),
+                    );
+                    // A priced winner is rankable by policy. For an unpriced
+                    // winner, the lexical tail is deterministic but not
+                    // evidence: warn only when every signal-tied pointer disagrees.
+                    let alias_choice_is_definite =
+                        alias.entry.model.pricing.completion_per_1k.is_some()
+                            || alias_candidates
+                                .get(&entry.family)
+                                .is_none_or(|candidates| {
+                                    candidates
+                                        .iter()
+                                        .filter(|candidate| {
+                                            alias_rank_signals_equal(candidate, alias)
+                                        })
+                                        .all(|candidate| {
+                                            alias_line_definitely_disagrees(
+                                                &candidate.parsed.product_line,
+                                                &selected_line,
+                                                concrete_lines.get(&entry.family),
+                                            )
+                                        })
+                                });
+                    if alias_disagrees && alias_choice_is_definite {
+                        entry.alias_disagreement = Some(alias.entry.model.id.clone());
+                    }
+                }
+                entry
+            })
+            .collect();
         entries.sort_by(|a, b| a.family.cmp(&b.family));
         entries
     }
+}
+
+fn alias_rank_signals_equal(candidate: &RankedFrontierEntry, best: &RankedFrontierEntry) -> bool {
+    candidate.entry.tier == best.entry.tier
+        && compare_completion_price(&candidate.entry.model, &best.entry.model).is_eq()
+        && candidate.entry.model.context_length.unwrap_or(0)
+            == best.entry.model.context_length.unwrap_or(0)
+}
+
+fn alias_line_definitely_disagrees(
+    alias_line: &str,
+    selected_line: &str,
+    concrete_lines: Option<&HashSet<String>>,
+) -> bool {
+    !selected_line.is_empty()
+        && resolve_alias_product_line(alias_line, concrete_lines)
+            .is_some_and(|resolved| resolved != selected_line)
+}
+
+fn resolve_alias_product_line<'a>(
+    alias_line: &'a str,
+    concrete_lines: Option<&HashSet<String>>,
+) -> Option<&'a str> {
+    if alias_line.is_empty() {
+        return None;
+    }
+    let Some(concrete_lines) = concrete_lines else {
+        return Some(alias_line);
+    };
+
+    if concrete_lines.contains(alias_line) {
+        return Some(alias_line);
+    }
+
+    if let Some(line) = concrete_lines
+        .iter()
+        .filter(|line| {
+            alias_line
+                .strip_prefix(line.as_str())
+                .is_some_and(|suffix| suffix.starts_with('-'))
+        })
+        .max_by(|a, b| a.len().cmp(&b.len()).then_with(|| b.cmp(a)))
+    {
+        let resolved_len = line.len();
+        return Some(&alias_line[..resolved_len]);
+    }
+
+    // A generic pointer stem such as `claude-latest` may cover several
+    // concrete lines (`claude-opus`, `claude-sonnet`). Its target line is not
+    // knowable from registry metadata, so observability must fail quiet.
+    if concrete_lines.iter().any(|line| {
+        line.strip_prefix(alias_line)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+    }) {
+        return None;
+    }
+
+    Some(alias_line)
 }
 
 #[derive(Debug, Clone)]
@@ -441,6 +576,7 @@ impl ParsedModelId {
         let (family, model_name) = concrete_id.split_once('/')?;
         let model_name = model_name.split(':').next().unwrap_or(model_name);
         let alias = id.starts_with('~') || model_name.ends_with("-latest");
+        let model_name = model_name.strip_suffix("-latest").unwrap_or(model_name);
         let tokens: Vec<&str> = model_name.split(['-', '_']).collect();
         let numeric_token = tokens
             .iter()
@@ -1109,6 +1245,200 @@ mod tests {
             }),
             "frontier entries must be concrete models, never moving aliases"
         );
+    }
+
+    fn frontier_alias_observability_registry(aliases: &[(&str, f64)]) -> ModelRegistry {
+        let mut models = vec![ModelEntry {
+            id: "openai/gpt-5.6-sol-pro".to_string(),
+            context_length: Some(128_000),
+            max_output_tokens: Some(32_000),
+            pricing: ModelPricing {
+                completion_per_1k: Some(0.03),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        models.extend(aliases.iter().map(|(id, price)| ModelEntry {
+            id: (*id).to_string(),
+            max_output_tokens: Some(32_000),
+            pricing: ModelPricing {
+                completion_per_1k: Some(*price),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+
+        ModelRegistry {
+            models,
+            ..Default::default()
+        }
+    }
+
+    fn serialized_openai_frontier(aliases: &[(&str, f64)]) -> serde_json::Value {
+        let registry = frontier_alias_observability_registry(aliases);
+        serde_json::to_value(
+            registry
+                .frontier()
+                .into_iter()
+                .find(|entry| entry.family == "openai")
+                .expect("openai frontier entry"),
+        )
+        .expect("frontier entry serializes")
+    }
+
+    #[test]
+    fn frontier_omits_alias_disagreement_when_best_pointer_agrees() {
+        let frontier = serialized_openai_frontier(&[("~openai/gpt-latest", 0.04)]);
+
+        assert!(frontier.get("alias_disagreement").is_none());
+    }
+
+    #[test]
+    fn frontier_exposes_exact_disagreeing_best_pointer() {
+        let frontier = serialized_openai_frontier(&[("openai/chatgpt-latest", 0.04)]);
+
+        assert_eq!(
+            frontier.get("alias_disagreement"),
+            Some(&serde_json::json!("openai/chatgpt-latest"))
+        );
+    }
+
+    #[test]
+    fn frontier_ignores_lower_ranked_disagreeing_pointer() {
+        let frontier = serialized_openai_frontier(&[
+            ("~openai/chatgpt-mini-latest", 0.50),
+            ("openai/chatgpt-latest", 0.02),
+            ("~openai/gpt-latest", 0.04),
+        ]);
+
+        assert!(frontier.get("alias_disagreement").is_none());
+    }
+
+    #[test]
+    fn frontier_relates_pointer_stem_to_known_concrete_product_line() {
+        let registry = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "google/gemini-3.1-pro-preview".to_string(),
+                    max_output_tokens: Some(32_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.03),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "~google/gemini-pro-latest".to_string(),
+                    max_output_tokens: Some(32_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.04),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let frontier = serde_json::to_value(&registry.frontier()[0]).unwrap();
+        assert!(frontier.get("alias_disagreement").is_none());
+    }
+
+    #[test]
+    fn frontier_keeps_distinct_pointer_line_as_definite_disagreement() {
+        let registry = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "anthropic/claude-opus-4-6".to_string(),
+                    max_output_tokens: Some(32_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.03),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "~anthropic/claude-fable-latest".to_string(),
+                    max_output_tokens: Some(32_000),
+                    pricing: ModelPricing {
+                        completion_per_1k: Some(0.04),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let frontier = serde_json::to_value(&registry.frontier()[0]).unwrap();
+        assert_eq!(
+            frontier.get("alias_disagreement"),
+            Some(&serde_json::json!("~anthropic/claude-fable-latest"))
+        );
+    }
+
+    #[test]
+    fn frontier_fails_quiet_when_unpriced_best_pointer_is_ambiguous() {
+        let registry = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "openai/gpt-5.6-sol-pro".to_string(),
+                    max_output_tokens: Some(32_000),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "~openai/x-latest".to_string(),
+                    max_output_tokens: Some(32_000),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "~openai/gpt-latest".to_string(),
+                    max_output_tokens: Some(32_000),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let frontier = serde_json::to_value(&registry.frontier()[0]).unwrap();
+        assert!(frontier.get("alias_disagreement").is_none());
+    }
+
+    #[test]
+    fn frontier_warns_when_every_unpriced_best_pointer_disagrees() {
+        let registry = ModelRegistry {
+            models: vec![
+                ModelEntry {
+                    id: "openai/gpt-5.6-sol-pro".to_string(),
+                    max_output_tokens: Some(32_000),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "~openai/x-latest".to_string(),
+                    max_output_tokens: Some(32_000),
+                    ..Default::default()
+                },
+                ModelEntry {
+                    id: "~openai/y-latest".to_string(),
+                    max_output_tokens: Some(32_000),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let frontier = serde_json::to_value(&registry.frontier()[0]).unwrap();
+        assert_eq!(
+            frontier.get("alias_disagreement"),
+            Some(&serde_json::json!("~openai/x-latest"))
+        );
+    }
+
+    #[test]
+    fn frontier_omits_alias_disagreement_without_pointers() {
+        let frontier = serialized_openai_frontier(&[]);
+
+        assert!(frontier.get("alias_disagreement").is_none());
     }
 
     #[test]

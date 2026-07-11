@@ -177,9 +177,14 @@ async fn handle_frontier(
                         .completion_per_1k
                         .map(|p| format!("${:.3}", p))
                         .unwrap_or_else(|| "-".to_string());
+                    let alias_note = e
+                        .alias_disagreement
+                        .as_deref()
+                        .map(|alias| format!("  [alias disagreement: {alias}]"))
+                        .unwrap_or_default();
                     println!(
-                        "{:<13}{:<43}{:<9}{}",
-                        e.family, e.model.id, ctx_str, price_str
+                        "{:<13}{:<43}{:<9}{}{}",
+                        e.family, e.model.id, ctx_str, price_str, alias_note
                     );
                 }
             }
