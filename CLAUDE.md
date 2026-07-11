@@ -25,47 +25,25 @@ Tests use `assert_cmd`, `predicates`, and `serial_test` — no API keys needed f
 
 ## Release
 
-### Release Contract
-
-- Release from `main` only through `./scripts/release.sh X.Y.Z` and the resulting release PR; do not create manual tags or GitHub releases.
-- A push to `main` updates the AvivSinai marketplace immediately for the `yoetz` skill.
-- Keep one version across `CHANGELOG.md`, workspace metadata, skill/plugin metadata, and the release commit; after merge, CI validates the merged commit, creates the tag, publishes the GitHub release from the committed changelog entry, and updates Homebrew/Scoop.
-
-Use the fast release path:
-
-```bash
-./scripts/release.sh 0.2.24
-```
-
-This script updates `CHANGELOG.md`, bumps `[workspace.package].version`,
-aligns skill/plugin metadata, runs `cargo check --workspace`, creates
-`release/vX.Y.Z`, commits
-`chore(release): vX.Y.Z`, pushes the branch, and opens a PR with `gh`.
-
-After the release PR merges:
-- `.github/workflows/release.yml` detects the merged `chore(release): vX.Y.Z`
-  commit on `main`, creates/pushes the matching tag, publishes artifacts,
-  uses `CHANGELOG.md` for the GitHub release notes, and updates Homebrew/Scoop
-- Release verification also runs
-  `./scripts/build-chatgpt-native-extension.sh --check`; the release publishes
-  the experimental ChatGPT native extension as a separate
-  `yoetz-chatgpt-native-extension-X.Y.Z.zip` artifact when the extension source
-  is present.
-- `.github/workflows/release.yml` also supports `workflow_dispatch` as a retry
-  path for an existing tag if a release job needs to be rerun manually
-
-Repository setup for the fast path:
-- `gh auth login`: needed locally if you want `./scripts/release.sh` to open the
-  PR automatically after pushing the release branch
-
-`CHANGELOG.md` is part of release prep again. The release commit is the source
-of truth, and CI republishes that same changelog entry in the GitHub release.
-
-We intentionally keep the custom GitHub Actions release flow instead of adopting
-`release-plz`/`release-please` wholesale: this repo ships GitHub release
-artifacts plus Homebrew/Scoop updates, but does not use crates.io publishing as
-its primary release path. The fastest fit here is letting the merged release
-commit drive the entire pipeline, not replacing the release pipeline.
+- Release from `main` only through `./scripts/release.sh [options] X.Y.Z`
+  (the parser consumes options before the positional version) and the
+  resulting release PR. Never create
+  manual tags or GitHub releases; never push directly to `main`.
+- Populate `## [Unreleased]` in `CHANGELOG.md` BEFORE running the script: the
+  release commit's changelog section becomes the GitHub release notes.
+- The script moves the Unreleased section, bumps and aligns ALL version
+  metadata (workspace, plugin.json files, SKILL.md frontmatter, extension
+  manifest — CI validates consistency), runs `cargo check --workspace`, pushes
+  `release/vX.Y.Z`, and opens the PR with `gh`.
+- After the release PR merges, `release.yml` detects `chore(release): vX.Y.Z`
+  on `main`, creates the tag, publishes artifacts (including the ChatGPT
+  native extension zip when the extension source is present), and updates
+  Homebrew/Scoop. `workflow_dispatch` is the retry path for an existing tag.
+- A push to `main` also updates the AvivSinai marketplace immediately for the
+  `yoetz` skill.
+- We deliberately keep this custom release flow over release-plz/release-please:
+  the repo ships GitHub artifacts plus Homebrew/Scoop, not crates.io, and the
+  merged release commit driving the whole pipeline is the fastest fit.
 
 ## Code Style
 
@@ -102,54 +80,37 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 
 ## Browser Architecture
 
-Yoetz browser integrations are extension-free by default unless the Yoetz
-Chrome extension is installed and connected, in which case the `chatgpt`
-recipe selects it as the only default transport.
-
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
-- Preferred transport order for live Chrome work is `chrome-devtools-mcp`
-  first, `dev-browser` second, `agent-browser` third. Keep the non-extension
-  stack extension-free.
-- For the `chatgpt` recipe specifically, when `yoetz browser extension
-  status --chatgpt` reports `connected`, `chrome-extension-native` is
-  auto-selected as the only default transport and fails closed instead of
-  falling through to CDP/dev-browser transports; pass `--transport <other>` or
-  pin `transports:` in the recipe yaml to opt out. CDP fallback after a native
-  extension failure requires the explicit
-  `--transport chrome-extension-native --allow-cdp-fallback` opt-in.
-  Non-ChatGPT recipes and unhealthy/missing extensions are not affected.
-- The `chrome-extension-native` path stays the explicit choice when callers
-  want it regardless of detection, via
-  `yoetz browser recipe --recipe chatgpt --transport chrome-extension-native`,
-  and is managed with `yoetz browser extension install-host --chatgpt`,
-  `setup --chatgpt --open-chrome`, `doctor --chatgpt`, `status --chatgpt`,
-  `reconnect --chatgpt`, `update --chatgpt`,
-  `inspect --chatgpt --run-id <id>`, and `grant-identity --chatgpt`. Use
-  `yoetz browser check --transport chrome-extension-native` for explicit
-  extension readiness. Plain `yoetz browser check` auto-selects the native
-  extension check when the extension reports connected; pass `--transport
-  chrome-devtools-mcp`, `--transport dev-browser`, `--transport agent-browser`,
-  `--cdp`, `--browser-id`, or a managed `--profile` when you specifically need
-  to verify the CDP/browser stack.
-- ChatGPT conversation resume uses `--var conversation=<id|url>` with the
-  `conversation_id` / `conversation_url` fields returned by earlier runs. It is
-  native-extension only and does not manage context automatically; callers own
-  the decision to resume a saved conversation or start fresh.
-- For multiple loaded Chrome extension profiles, route extension-native jobs by
-  `profile_email` when Chrome exposes it, or by the stable
-  `extension_instance_id` shown in `status --chatgpt` when it does not.
-- Extension setup materializes packaged source into the stable
-  `$YOETZ_DIR/chatgpt-native-extension` directory. Users load that unpacked
-  directory once; future updates use
-  `yoetz browser extension update --chatgpt`, which re-syncs the managed copy,
-  reloads the extension, and verifies the loaded version.
+- Extension-free by default. Preferred live-Chrome transport order:
+  `chrome-devtools-mcp`, then `dev-browser`, then `agent-browser`.
+- ChatGPT recipe exception: when `yoetz browser extension status --chatgpt`
+  reports `connected`, `chrome-extension-native` is auto-selected as the only
+  default transport and fails closed instead of falling through to CDP
+  transports. Opt out with `--transport <other>` or a pinned `transports:` in
+  the recipe yaml; CDP fallback after a native failure requires the explicit
+  `--transport chrome-extension-native --allow-cdp-fallback`. Non-ChatGPT
+  recipes and unhealthy/missing extensions are unaffected. Plain
+  `yoetz browser check` follows the same auto-selection; pass an explicit
+  `--transport`, `--cdp`, `--browser-id`, or `--profile` to verify the CDP
+  stack instead.
+- Extension lifecycle: `setup --chatgpt` materializes packaged source into the
+  stable `$YOETZ_DIR/chatgpt-native-extension` directory, loaded unpacked in
+  Chrome exactly once; `update --chatgpt` re-syncs the managed copy, reloads
+  the extension, and verifies the loaded version. Never hand-patch the managed
+  directory. Other subcommands (`doctor`, `status`, `inspect`, ...) are listed
+  in `yoetz browser extension --help`.
+- ChatGPT conversation resume uses `--var conversation=<id|url>`
+  (native-extension only, no automatic context management); callers own the
+  resume-vs-fresh decision.
+- Multiple loaded extension profiles route by `profile_email` when Chrome
+  exposes it, else by the stable `extension_instance_id` from
+  `status --chatgpt`.
 - Default mode is connect-first: attach to the user's already running Chrome
-  session (`--connect`, auto-connect, or explicit `--cdp`) before considering
-  cookie sync or managed-profile fallbacks.
-- The daemon is trusted by default. Do not silently recycle live-attach daemons
-  during normal attach/check/recipe flows. If recovery is needed, require an
-  explicit `yoetz browser reset`.
+  before considering cookie sync or managed-profile fallbacks.
+- The daemon is trusted by default. Do not silently recycle live-attach
+  daemons during normal attach/check/recipe flows; recovery is an explicit
+  `yoetz browser reset`.
 
 ## Provider Configuration
 

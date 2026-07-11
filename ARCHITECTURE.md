@@ -89,9 +89,9 @@ Daily spend is tracked in a local JSON file. The `--max-cost-usd` flag estimates
 
 ### Browser Mode
 
-For models without API access (e.g., ChatGPT Pro), yoetz bundles files into markdown, then connects to the user's running Chrome via CDP (Chrome DevTools Protocol) and submits the bundle through the web UI.
+For models without API access (e.g., ChatGPT Pro), yoetz bundles files into markdown and submits the bundle through the web UI in the user's running Chrome — via the ChatGPT native extension when it is connected, otherwise via CDP (Chrome DevTools Protocol) transports.
 
-Browser integrations are extension-free by default. Yoetz prefers to act as a wrapper over the underlying transport rather than reimplementing transport logic itself:
+Outside the connected-ChatGPT-extension exception described below, the browser transport stack is extension-free. Yoetz prefers to act as a wrapper over the underlying transport rather than reimplementing transport logic itself:
 
 - `chrome-devtools-mcp` is the primary live-Chrome transport for ChatGPT recipes.
 - `dev-browser` is the secondary live-Chrome transport.
@@ -106,24 +106,26 @@ for the ownership model behind the live Chrome attach path.
 
 Chrome 146+ may show a one-time "Allow remote debugging?" approval dialog for a new CDP session. The acceptance criterion is one approval per browser session, not per yoetz invocation, so yoetz avoids silently tearing down live-attach daemons in normal attach/check/recipe flows. Recovery is explicit via `yoetz browser reset`.
 
-The experimental `chrome-extension-native` transport is the only browser
-extension exception. It is ChatGPT-only, opt-in via
-`yoetz browser recipe --recipe chatgpt --transport chrome-extension-native`, and
-is not part of the default transport order. Its lifecycle is explicit:
-`yoetz browser extension install-host --chatgpt`,
-`doctor --chatgpt`, `status --chatgpt`, `reconnect --chatgpt`, and
-`update --chatgpt`; `inspect --chatgpt --run-id <id>` is the read-only
-diagnostic path for failed runs, `canary --chatgpt --live` is reserved for
-explicit diagnostic probes, and `grant-identity --chatgpt` opts into Chrome's
-`identity.email` permission when `profile_email` routing is required.
-Release builds package it as a separate versioned extension zip so the CLI
-archives do not make the extension path implicit. Manual Chrome-side
-install/update is intentionally explicit: unzip the release artifact, load the
-extracted extension via `chrome://extensions` Developer mode, reload the
-extension after replacing files, then use `reconnect` and `doctor` to confirm the
-native bridge and extension protocol version agree. The native-host install and
-runtime are currently macOS/Linux-only; Windows requires registry-based native
-messaging host registration before this transport can run there.
+The `chrome-extension-native` transport is the only browser extension
+exception, and it is ChatGPT-only. When the extension is installed and
+`yoetz browser extension status --chatgpt` reports `connected`, the ChatGPT
+recipe auto-selects it as the only default transport and fails closed instead
+of falling through to CDP transports; `--transport <other>` opts out, and CDP
+fallback after a native failure requires the explicit
+`--transport chrome-extension-native --allow-cdp-fallback`. Unhealthy or
+missing extensions leave the default CDP transport order untouched.
+
+Its lifecycle is managed by `yoetz browser extension <subcommand> --chatgpt`
+(see `--help` for the full set). `setup` materializes the packaged extension
+source into the stable `$YOETZ_DIR/chatgpt-native-extension` directory; users
+load that unpacked directory in Chrome once, and `update --chatgpt` afterwards
+re-syncs the managed copy atomically, reloads the extension over the native
+bridge, and verifies the loaded version. Recipe dispatch auto-heals version
+skew the same way. Release builds still package the extension as a separate
+versioned zip so the CLI archives do not make the extension path implicit.
+The native-host install and runtime are currently macOS/Linux-only; Windows
+requires registry-based native messaging host registration before this
+transport can run there.
 
 The native host manifest follows Chrome's Native Messaging lookup rules: the
 default Google Chrome profile is automatic, while custom `--user-data-dir`,
@@ -170,9 +172,12 @@ runner relies on. A run never returns success unless every gate below holds.
 - Completion gate: `extractResponse` rejects "thought/status chrome only"
   bodies (`Thought for ...`, `Reasoned for ...`, `Analyzing...`, etc.) and
   the SW refuses completion when extracted text is chrome-only, even if a
-  copy button is visible. Stable-idle completion still requires the
-  90-second `MIN_STABLE_IDLE_MS` floor; copy-button completion now also
-  requires that floor so an early-arriving Copy cannot bypass safety.
+  copy button is visible. Turns with a response-scoped copy affordance
+  confirm over the `MIN_AFFORDANCE_CONFIRM_MS` window; the only
+  long-floor path is stable-idle-with-unscoped-copy, which requires scoped
+  idle text, a new unscoped copy affordance above the baseline count, no
+  visible stop controls, a minimum text length, and the `MIN_STABLE_IDLE_MS`
+  floor. There is no pure text-stability completion path.
 - Send acceptance: when `clickSend` commits but `waitForSendAccepted`
   cannot confirm a post-click signal within budget, the run fails with
   `send_acceptance_unknown` carrying `side_effect_started: true`. The
