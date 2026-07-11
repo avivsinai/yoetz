@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Upgrade `litellm-rust` to `v0.3.0`, bringing current embedded model metadata,
+  normalized tool calls, and built-in direct Z.AI routing through `ZAI_API_KEY`.
+
 ### Added
 
 - Persist OpenRouter model creation timestamps and allow trusted config to
