@@ -13,6 +13,7 @@ pub struct Config {
     pub defaults: Defaults,
     pub providers: HashMap<String, ProviderConfig>,
     pub registry: RegistryConfig,
+    pub frontier: FrontierConfig,
     pub notifications: NotificationsConfig,
     #[serde(default)]
     pub aliases: HashMap<String, String>,
@@ -45,6 +46,12 @@ pub struct RegistryConfig {
     pub auto_sync_secs: Option<u64>,
 }
 
+/// Controls which provider families appear in the default frontier view.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FrontierConfig {
+    pub families: Option<Vec<String>>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NotificationsConfig {
     pub enabled: Option<bool>,
@@ -56,6 +63,7 @@ struct ConfigFile {
     pub defaults: Option<Defaults>,
     pub providers: Option<HashMap<String, ProviderConfig>>,
     pub registry: Option<RegistryConfig>,
+    pub frontier: Option<FrontierConfig>,
     pub notifications: Option<NotificationsConfig>,
     pub aliases: Option<HashMap<String, String>>,
 }
@@ -108,6 +116,16 @@ impl Config {
             } else {
                 eprintln!(
                     "warning: ignoring [registry] from untrusted config {}",
+                    source.display()
+                );
+            }
+        }
+        if let Some(frontier) = other.frontier {
+            if trusted {
+                merge_frontier(&mut self.frontier, frontier);
+            } else {
+                eprintln!(
+                    "warning: ignoring [frontier] from untrusted config {}",
                     source.display()
                 );
             }
@@ -249,6 +267,9 @@ model = "gpt-5-4-pro"
                 openrouter_models_url: Some("http://evil.example.com/models".to_string()),
                 ..Default::default()
             }),
+            frontier: Some(FrontierConfig {
+                families: Some(vec!["evil".to_string()]),
+            }),
             notifications: None,
             aliases: Some(HashMap::from([(
                 "fast".to_string(),
@@ -264,6 +285,7 @@ model = "gpt-5-4-pro"
         // Restricted fields skipped
         assert!(config.providers.is_empty());
         assert!(config.registry.openrouter_models_url.is_none());
+        assert!(config.frontier.families.is_none());
         assert!(config.notifications.enabled.is_none());
     }
 
@@ -284,6 +306,7 @@ model = "gpt-5-4-pro"
                 openrouter_models_url: Some("https://openrouter.ai/api/v1/models".to_string()),
                 ..Default::default()
             }),
+            frontier: None,
             notifications: None,
             aliases: None,
         };
@@ -303,6 +326,7 @@ model = "gpt-5-4-pro"
             defaults: None,
             providers: None,
             registry: None,
+            frontier: None,
             notifications: Some(NotificationsConfig {
                 enabled: Some(false),
                 notify_threshold_secs: Some(90),
@@ -312,6 +336,32 @@ model = "gpt-5-4-pro"
         config.merge(file, false, Path::new("./yoetz.toml"));
         assert_eq!(config.notifications.enabled, Some(false));
         assert_eq!(config.notifications.notify_threshold_secs, Some(90));
+    }
+
+    #[test]
+    fn trusted_config_applies_frontier_families() {
+        let mut config = Config::default();
+        let file = ConfigFile {
+            defaults: None,
+            providers: None,
+            registry: None,
+            frontier: Some(FrontierConfig {
+                families: Some(vec!["openai".to_string(), "z-ai".to_string()]),
+            }),
+            notifications: None,
+            aliases: None,
+        };
+
+        config.merge(
+            file,
+            true,
+            Path::new("/home/user/.config/yoetz/config.toml"),
+        );
+
+        assert_eq!(
+            config.frontier.families,
+            Some(vec!["openai".to_string(), "z-ai".to_string()])
+        );
     }
 }
 
@@ -339,6 +389,12 @@ fn merge_registry(target: &mut RegistryConfig, other: RegistryConfig) {
     }
     if other.auto_sync_secs.is_some() {
         target.auto_sync_secs = other.auto_sync_secs;
+    }
+}
+
+fn merge_frontier(target: &mut FrontierConfig, other: FrontierConfig) {
+    if other.families.is_some() {
+        target.families = other.families;
     }
 }
 

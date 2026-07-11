@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Persist OpenRouter model creation timestamps and allow trusted config to
+  replace the default `models frontier` family list with `[frontier].families`.
+- Include Z.AI in the default frontier families.
+
+### Fixed
+
+- Make `models frontier` return concrete models instead of moving `~latest`
+  aliases, compare versions only within a product line, and use decimal model
+  version semantics so Grok 4.5 ranks above Grok 4.20.
+
 ## [0.5.32] - 2026-07-11
 ### Added
 

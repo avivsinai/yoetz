@@ -142,6 +142,9 @@ Yoetz also supports `YOETZ_CONFIG_PATH`, repo-local `./yoetz.toml`, and config
 profiles. See [docs/config.example.toml](docs/config.example.toml) for the
 shape.
 
+The default `models frontier` lab list is configurable with
+`[frontier].families`; `--all` and `--family` continue to bypass that list.
+
 Resolve live model IDs before putting them in scripts:
 
 ```bash

@@ -224,6 +224,7 @@ fn embedded_gemini_registry() -> Result<ModelRegistry> {
 
         registry.models.push(ModelEntry {
             id: canonical_embedded_model_id(&name).to_string(),
+            created: None,
             context_length,
             max_output_tokens,
             pricing: ModelPricing {
@@ -350,6 +351,7 @@ fn parse_openrouter_models(value: &Value) -> OpenRouterCatalog {
         let capability = parse_openrouter_capability(&item);
         registry.models.push(ModelEntry {
             id: id.to_string(),
+            created: item.get("created").and_then(|v| v.as_u64()),
             context_length,
             max_output_tokens,
             pricing,
@@ -432,6 +434,7 @@ fn parse_litellm_models(value: &Value) -> ModelRegistry {
 
         registry.models.push(ModelEntry {
             id,
+            created: None,
             context_length: max_tokens,
             max_output_tokens,
             pricing: ModelPricing {
@@ -744,6 +747,7 @@ mod tests {
         let catalog = parse_openrouter_models(&json!({
             "data": [{
                 "id": "google/gemini-3.1-pro-preview",
+                "created": 1771509627,
                 "context_length": 1048576,
                 "architecture": {"input_modalities": ["text", "image"], "output_modalities": ["text"]},
                 "pricing": {"prompt": "0.00000125", "completion": "0.00001"},
@@ -760,6 +764,13 @@ mod tests {
             .registry
             .find("openrouter/google/gemini-3.1-pro-preview")
             .is_none());
+        assert_eq!(
+            catalog
+                .registry
+                .find("google/gemini-3.1-pro-preview")
+                .and_then(|model| model.created),
+            Some(1771509627)
+        );
     }
 
     #[test]

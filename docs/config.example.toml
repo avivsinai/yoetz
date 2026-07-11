@@ -22,3 +22,6 @@ kind = "gemini"
 openrouter_models_url = "https://openrouter.ai/api/v1/models"
 litellm_models_url = "http://localhost:4000/model/info"
 org_registry_path = "./registry.json"
+
+[frontier]
+families = ["openai", "anthropic", "google", "x-ai", "z-ai", "meta-llama", "deepseek", "mistralai", "qwen", "moonshotai"]

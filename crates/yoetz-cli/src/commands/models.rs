@@ -104,13 +104,14 @@ async fn handle_resolve(
     }
 }
 
-/// Major frontier lab families, in display order.
-/// Last reviewed: 2026-03-20. Update when a new frontier lab emerges.
+/// Major frontier lab families, in display order. Users can replace this list
+/// with `[frontier].families` in their trusted config.
 const MAJOR_FAMILIES: &[&str] = &[
     "openai",
     "anthropic",
     "google",
     "x-ai",
+    "z-ai",
     "meta-llama",
     "deepseek",
     "mistralai",
@@ -146,10 +147,10 @@ async fn handle_frontier(
     } else if args.all {
         all_entries
     } else {
-        // Default: curated major labs in fixed order
-        MAJOR_FAMILIES
+        // Default: configured or built-in major labs in fixed order.
+        frontier_families(&ctx.config)
             .iter()
-            .filter_map(|&fam| all_entries.iter().find(|e| e.family == fam).cloned())
+            .filter_map(|fam| all_entries.iter().find(|e| e.family == *fam).cloned())
             .collect()
     };
 
@@ -185,6 +186,15 @@ async fn handle_frontier(
             Ok(())
         }
     }
+}
+
+fn frontier_families(config: &yoetz_core::config::Config) -> Vec<String> {
+    config.frontier.families.clone().unwrap_or_else(|| {
+        MAJOR_FAMILIES
+            .iter()
+            .map(|family| (*family).to_string())
+            .collect()
+    })
 }
 
 fn normalize_family_name(family: &str) -> String {
@@ -281,4 +291,22 @@ fn filter_registry(registry: &ModelRegistry, args: &ModelsListArgs) -> ModelRegi
     filtered.models = models;
     filtered.rebuild_index();
     filtered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frontier_families_include_zai_by_default_and_allow_override() {
+        let defaults = frontier_families(&yoetz_core::config::Config::default());
+        assert!(defaults.iter().any(|family| family == "z-ai"));
+
+        let mut config = yoetz_core::config::Config::default();
+        config.frontier.families = Some(vec!["openai".to_string(), "anthropic".to_string()]);
+        assert_eq!(
+            frontier_families(&config),
+            vec!["openai".to_string(), "anthropic".to_string()]
+        );
+    }
 }
