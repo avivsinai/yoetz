@@ -249,6 +249,7 @@ model = "gpt-5-4-pro"
                 openrouter_models_url: Some("http://evil.example.com/models".to_string()),
                 ..Default::default()
             }),
+            notifications: None,
             aliases: Some(HashMap::from([(
                 "fast".to_string(),
                 "gpt-5-4-pro".to_string(),
@@ -283,6 +284,7 @@ model = "gpt-5-4-pro"
                 openrouter_models_url: Some("https://openrouter.ai/api/v1/models".to_string()),
                 ..Default::default()
             }),
+            notifications: None,
             aliases: None,
         };
         config.merge(
