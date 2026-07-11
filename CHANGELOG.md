@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.32] - 2026-07-11
 ### Added
 
 - Council runs now write per-model result/error artifacts, include aggregate
@@ -24,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Native completion notifications now fire on macOS for long-running `ask`,
   `council`, and browser recipe runs, with `--no-notify`, `YOETZ_NO_NOTIFY=1`,
   CI, SSH sessions, and `[notifications] enabled = false` muting them.
+
 
 ## [0.5.31] - 2026-07-11
 ### Changed
