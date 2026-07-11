@@ -13,6 +13,7 @@ pub struct Config {
     pub defaults: Defaults,
     pub providers: HashMap<String, ProviderConfig>,
     pub registry: RegistryConfig,
+    pub notifications: NotificationsConfig,
     #[serde(default)]
     pub aliases: HashMap<String, String>,
 }
@@ -45,10 +46,17 @@ pub struct RegistryConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotificationsConfig {
+    pub enabled: Option<bool>,
+    pub notify_threshold_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ConfigFile {
     pub defaults: Option<Defaults>,
     pub providers: Option<HashMap<String, ProviderConfig>>,
     pub registry: Option<RegistryConfig>,
+    pub notifications: Option<NotificationsConfig>,
     pub aliases: Option<HashMap<String, String>>,
 }
 
@@ -103,6 +111,9 @@ impl Config {
                     source.display()
                 );
             }
+        }
+        if let Some(notifications) = other.notifications {
+            merge_notifications(&mut self.notifications, notifications);
         }
         if let Some(aliases) = other.aliases {
             if trusted {
@@ -252,6 +263,7 @@ model = "gpt-5-4-pro"
         // Restricted fields skipped
         assert!(config.providers.is_empty());
         assert!(config.registry.openrouter_models_url.is_none());
+        assert!(config.notifications.enabled.is_none());
     }
 
     #[test]
@@ -281,6 +293,24 @@ model = "gpt-5-4-pro"
         assert!(config.providers.contains_key("openai"));
         assert!(config.registry.openrouter_models_url.is_some());
     }
+
+    #[test]
+    fn notifications_merge_from_any_config_scope() {
+        let mut config = Config::default();
+        let file = ConfigFile {
+            defaults: None,
+            providers: None,
+            registry: None,
+            notifications: Some(NotificationsConfig {
+                enabled: Some(false),
+                notify_threshold_secs: Some(90),
+            }),
+            aliases: None,
+        };
+        config.merge(file, false, Path::new("./yoetz.toml"));
+        assert_eq!(config.notifications.enabled, Some(false));
+        assert_eq!(config.notifications.notify_threshold_secs, Some(90));
+    }
 }
 
 fn merge_provider(target: &mut ProviderConfig, other: &ProviderConfig) {
@@ -307,5 +337,14 @@ fn merge_registry(target: &mut RegistryConfig, other: RegistryConfig) {
     }
     if other.auto_sync_secs.is_some() {
         target.auto_sync_secs = other.auto_sync_secs;
+    }
+}
+
+fn merge_notifications(target: &mut NotificationsConfig, other: NotificationsConfig) {
+    if other.enabled.is_some() {
+        target.enabled = other.enabled;
+    }
+    if other.notify_threshold_secs.is_some() {
+        target.notify_threshold_secs = other.notify_threshold_secs;
     }
 }

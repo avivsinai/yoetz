@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 
+use crate::notifications;
 use crate::providers::{gemini, openai};
 use crate::{
     apply_capability_warnings, call_litellm, maybe_write_output, normalize_model_name_with_aliases,
@@ -10,6 +11,7 @@ use crate::{
 use crate::{budget, providers, registry};
 use std::env;
 use std::path::PathBuf;
+use std::time::Instant;
 use yoetz_core::bundle::{build_bundle, estimate_tokens, BundleOptions};
 use yoetz_core::media::MediaType;
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
@@ -55,6 +57,7 @@ pub(crate) async fn handle_ask(
     args: AskArgs,
     format: OutputFormat,
 ) -> Result<()> {
+    let started_at = Instant::now();
     let prompt = resolve_prompt(args.prompt.clone(), args.prompt_file.clone())?;
     let config = &ctx.config;
     let response_format = resolve_response_format(
@@ -360,6 +363,16 @@ pub(crate) async fn handle_ask(
     write_json_file(&response_json, &result)?;
 
     maybe_write_output(ctx, &result)?;
+    notifications::maybe_notify_completion(
+        &ctx.config,
+        args.no_notify,
+        "ask",
+        result.model.as_deref().unwrap_or("model"),
+        &result.content,
+        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        result.usage.cost_usd,
+        ctx.debug,
+    );
 
     // Omit bundle from stdout to keep JSON output compact (full result is in session file)
     result.bundle = None;

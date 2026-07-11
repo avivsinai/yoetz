@@ -15,7 +15,7 @@ use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod browser;
 mod browser_extension_native;
@@ -30,6 +30,7 @@ mod fuzzy;
 mod http;
 mod live_attach;
 mod live_cdp_daemon;
+mod notifications;
 mod providers;
 mod registry;
 
@@ -183,6 +184,10 @@ struct AskArgs {
 
     #[arg(long)]
     response_schema_name: Option<String>,
+
+    /// Suppress native completion notifications for this run.
+    #[arg(long)]
+    no_notify: bool,
 }
 
 #[derive(Args)]
@@ -298,6 +303,10 @@ struct BrowserRecipeArgs {
     /// Allow the same prompt hash to be submitted to the same conversation.
     #[arg(long)]
     allow_duplicate_prompt: bool,
+
+    /// Suppress native completion notifications for this run.
+    #[arg(long)]
+    no_notify: bool,
 }
 
 #[derive(Args)]
@@ -550,6 +559,10 @@ struct CouncilArgs {
 
     #[arg(long)]
     response_schema_name: Option<String>,
+
+    /// Suppress native completion notifications for this run.
+    #[arg(long)]
+    no_notify: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -2013,6 +2026,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
             "chrome-devtools-mcp transport requires `--bundle`; it does not support inline paste mode"
         ));
     }
+    let started_at = Instant::now();
 
     let recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
     let recipe_ctx = chrome_devtools_mcp::DevtoolsMcpRecipeContext {
@@ -2087,6 +2101,14 @@ async fn run_recipe_via_chrome_devtools_mcp(
             println!("{}", payload["response"].as_str().unwrap_or_default());
         }
     }
+    maybe_notify_browser_recipe_completion(
+        ctx,
+        recipe_args.no_notify,
+        recipe_spec.model.as_str(),
+        &payload,
+        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        None,
+    );
 
     Ok(payload)
 }
@@ -2251,6 +2273,7 @@ fn run_recipe_via_chrome_extension_native(
             "chrome-extension-native transport requires `--bundle`; it does not support inline paste mode"
         ));
     }
+    let started_at = Instant::now();
 
     let recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
     let response = browser_extension_native::run_chatgpt_recipe(&recipe_spec, format)?;
@@ -2281,6 +2304,14 @@ fn run_recipe_via_chrome_extension_native(
             println!("{}", payload["response"].as_str().unwrap_or_default());
         }
     }
+    maybe_notify_browser_recipe_completion(
+        ctx,
+        recipe_args.no_notify,
+        recipe_spec.model.as_str(),
+        &payload,
+        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        None,
+    );
     Ok(payload)
 }
 
@@ -2415,6 +2446,7 @@ fn run_recipe_via_dev_browser(
             "dev-browser transport does not support `--profile`; use `--cdp` to target a specific Chrome instance/profile"
         ));
     }
+    let started_at = Instant::now();
 
     // The recipe prepare micro-script already verifies ChatGPT login state on the
     // named page. Avoid a separate pre-flight attach here because it can trigger
@@ -2476,6 +2508,14 @@ fn run_recipe_via_dev_browser(
             println!("{}", payload["response"].as_str().unwrap_or_default());
         }
     }
+    maybe_notify_browser_recipe_completion(
+        ctx,
+        recipe_args.no_notify,
+        recipe_spec.model.as_str(),
+        &payload,
+        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        None,
+    );
 
     Ok(payload)
 }
@@ -2522,6 +2562,11 @@ fn run_recipe_via_agent_browser(
     } else {
         browser::BrowserProfileMode::ProfileOnly
     };
+    let recipe_target = recipe
+        .name
+        .clone()
+        .unwrap_or_else(|| "browser recipe".to_string());
+    let started_at = Instant::now();
 
     let needs_bundle_text = recipe.steps.iter().any(|step| {
         step.args
@@ -2557,12 +2602,58 @@ fn run_recipe_via_agent_browser(
         let payload =
             browser::run_recipe_with_live_connection(recipe, recipe_ctx, &connection, format)?;
         maybe_write_output(ctx, &payload)?;
+        maybe_notify_browser_recipe_completion(
+            ctx,
+            recipe_args.no_notify,
+            &recipe_target,
+            &payload,
+            started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            None,
+        );
         Ok(payload)
     } else {
         let payload = browser::run_recipe(recipe, recipe_ctx, format)?;
         maybe_write_output(ctx, &payload)?;
+        maybe_notify_browser_recipe_completion(
+            ctx,
+            recipe_args.no_notify,
+            &recipe_target,
+            &payload,
+            started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            None,
+        );
         Ok(payload)
     }
+}
+
+fn maybe_notify_browser_recipe_completion(
+    ctx: &AppContext,
+    no_notify: bool,
+    target: &str,
+    payload: &Value,
+    elapsed_ms: u64,
+    cost_usd: Option<f64>,
+) {
+    let preview = payload
+        .get("response")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("stdout").and_then(Value::as_str))
+        .unwrap_or_default();
+    let resolved_target = payload
+        .get("model_used")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(target);
+    notifications::maybe_notify_completion(
+        &ctx.config,
+        no_notify,
+        "browser recipe",
+        resolved_target,
+        preview,
+        elapsed_ms,
+        cost_usd,
+        ctx.debug,
+    );
 }
 
 fn ensure_chatgpt_extension_scope(chatgpt: bool) -> Result<()> {
@@ -5633,6 +5724,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::new();
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5667,6 +5759,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::new();
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5697,6 +5790,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::from([("paste".to_string(), "true".to_string())]);
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5728,6 +5822,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::new();
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5759,6 +5854,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::from([("thread".to_string(), "sideways".to_string())]);
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5790,6 +5886,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::from([("thread".to_string(), "reuse".to_string())]);
         let err = run_recipe_via_chrome_devtools_mcp(
@@ -5823,6 +5920,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::new();
 
@@ -5850,6 +5948,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::from([("paste".to_string(), "true".to_string())]);
 
@@ -5875,6 +5974,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::from([
             ("prompt".to_string(), "Review this repo".to_string()),
@@ -5922,6 +6022,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::from([
             ("model".to_string(), "auto".to_string()),
@@ -5952,6 +6053,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
 
         let recipe_vars = browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)
@@ -5995,6 +6097,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let mut recipe_vars = BTreeMap::from([(
             "prompt".to_string(),
@@ -6039,6 +6142,7 @@ mod tests {
             vars: vec!["prompt=Explicit prompt".to_string()],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let mut recipe_vars =
             BTreeMap::from([("prompt".to_string(), "Explicit prompt".to_string())]);
@@ -6063,6 +6167,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars =
             BTreeMap::from([("profile_email".to_string(), "work@example.com".to_string())]);
@@ -6094,6 +6199,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars =
             BTreeMap::from([("extension_instance_id".to_string(), "ext_work".to_string())]);
@@ -6125,6 +6231,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars =
             BTreeMap::from([("browser_context_id".to_string(), "ctx-work".to_string())]);
@@ -6182,6 +6289,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::from([("thread".to_string(), "sideways".to_string())]);
         let err = run_recipe_via_dev_browser(
@@ -6212,6 +6320,7 @@ mod tests {
             vars: vec![],
             followup: None,
             allow_duplicate_prompt: false,
+            no_notify: false,
         };
         let recipe_vars = BTreeMap::from([("thread".to_string(), "reuse".to_string())]);
         let err = run_recipe_via_dev_browser(

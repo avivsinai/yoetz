@@ -156,6 +156,11 @@ per model under `<session_dir>/models/`. Partial success exits zero by default;
 pass `--partial fail` when any failed model must make the command nonzero while
 still emitting the complete council result.
 
+Long-running `ask`, `council`, and browser recipe runs emit a native macOS
+completion notification after they clear the runtime threshold (default 60s).
+Mute with `--no-notify`, `YOETZ_NO_NOTIFY=1`, CI, SSH, or
+`[notifications] enabled = false` in config.toml.
+
 ## Ask (Single Model)
 
 Quick question with file context:
@@ -176,6 +181,9 @@ yoetz ask -p "Review this" -f "src/*.rs" \
   --provider openrouter --model "$MODEL_ID" \
   --format json
 ```
+
+Long-running `ask` runs use the same native completion notification path and
+respect the same mute rules as `council`.
 
 ## Review
 

@@ -17,6 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `--allow-duplicate-prompt` for explicit replays. Session-id lookups resolve
   stored conversation metadata and fail clearly when a session has no
   follow-up record.
+- Native completion notifications now fire on macOS for long-running `ask`,
+  `council`, and browser recipe runs, with `--no-notify`, `YOETZ_NO_NOTIFY=1`,
+  CI, SSH sessions, and `[notifications] enabled = false` muting them.
 
 ## [0.5.31] - 2026-07-11
 ### Changed
