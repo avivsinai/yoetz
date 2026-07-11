@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 
+use crate::notifications;
 use crate::{
     add_usage, call_litellm, maybe_write_output, normalize_model_name_with_aliases,
     render_bundle_md, resolve_max_output_tokens, resolve_prompt, resolve_provider_from_registry,
@@ -391,6 +392,36 @@ pub(crate) async fn handle_council(
 
     maybe_write_output(ctx, &council)?;
     write_model_artifacts(&session.path, &model_artifacts);
+    let notified_target = if council.summary.total == 1 {
+        council
+            .results
+            .first()
+            .map(|result| result.model.as_str())
+            .unwrap_or("model")
+            .to_string()
+    } else {
+        format!("{} models", council.summary.total)
+    };
+    let notified_preview = council
+        .results
+        .first()
+        .map(|result| result.content.as_str())
+        .unwrap_or("");
+    let notified_cost = council
+        .results
+        .iter()
+        .any(|result| result.usage.cost_usd.is_some())
+        .then_some(council.summary.cost_usd);
+    notifications::maybe_notify_completion(
+        &ctx.config,
+        args.no_notify,
+        "council",
+        &notified_target,
+        notified_preview,
+        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+        notified_cost,
+        ctx.debug,
+    );
 
     // Omit bundle from stdout to keep JSON output compact (full result is in session file)
     council.bundle = None;
