@@ -16,6 +16,10 @@ struct FrontierFixture {
 }
 
 fn frontier_fixture() -> FrontierFixture {
+    frontier_fixture_with_registry(frontier_registry_json())
+}
+
+fn frontier_fixture_with_registry(registry_json: String) -> FrontierFixture {
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("yoetz.toml");
     let registry_path = dir.path().join("registry.json");
@@ -29,13 +33,27 @@ auto_sync_secs = 0
     )
     .unwrap();
 
-    fs::write(&registry_path, frontier_registry_json()).unwrap();
+    fs::write(&registry_path, registry_json).unwrap();
 
     FrontierFixture {
         _dir: dir,
         config_path,
         registry_path,
     }
+}
+
+fn frontier_fixture_with_aliases(aliases: &[(&str, f64)]) -> FrontierFixture {
+    let mut registry: serde_json::Value = serde_json::from_str(&frontier_registry_json()).unwrap();
+    let models = registry["models"].as_array_mut().unwrap();
+    models.extend(aliases.iter().map(|(id, price)| {
+        serde_json::json!({
+            "id": id,
+            "max_output_tokens": 16384,
+            "pricing": {"completion_per_1k": price},
+            "provider": "openrouter"
+        })
+    }));
+    frontier_fixture_with_registry(registry.to_string())
 }
 
 fn frontier_registry_json() -> String {
@@ -653,6 +671,50 @@ fn models_frontier_all_shows_every_family() {
         .stdout(predicate::str::contains("openai/gpt-5.4-pro"))
         .stdout(predicate::str::contains("anthropic/claude-opus-4-6"))
         .stdout(predicate::str::contains("reseller/one-off-model"));
+}
+
+#[test]
+fn models_frontier_json_and_jsonl_expose_exact_alias_disagreement() {
+    let fixture = frontier_fixture_with_aliases(&[("openai/chatgpt-latest", 0.20)]);
+
+    let json_output = yoetz_with_frontier_fixture(&fixture)
+        .args([
+            "--format", "json", "models", "frontier", "--family", "openai",
+        ])
+        .output()
+        .unwrap();
+    assert!(json_output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(
+        json[0]["alias_disagreement"],
+        serde_json::json!("openai/chatgpt-latest")
+    );
+
+    let jsonl_output = yoetz_with_frontier_fixture(&fixture)
+        .args([
+            "--format", "jsonl", "models", "frontier", "--family", "openai",
+        ])
+        .output()
+        .unwrap();
+    assert!(jsonl_output.status.success());
+    let jsonl: serde_json::Value = serde_json::from_slice(&jsonl_output.stdout).unwrap();
+    assert_eq!(
+        jsonl["data"][0]["alias_disagreement"],
+        serde_json::json!("openai/chatgpt-latest")
+    );
+}
+
+#[test]
+fn models_frontier_text_flags_alias_disagreement_on_warned_entry() {
+    let fixture = frontier_fixture_with_aliases(&[("openai/chatgpt-latest", 0.20)]);
+
+    yoetz_with_frontier_fixture(&fixture)
+        .args(["models", "frontier", "--family", "openai"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "[alias disagreement: openai/chatgpt-latest]",
+        ));
 }
 
 #[test]
