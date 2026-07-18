@@ -61,8 +61,9 @@ for (const permission of requiredPermissions) {
     throw new Error(`missing required permission: ${permission}`);
   }
 }
-if (JSON.stringify(hostPermissions) !== JSON.stringify(["https://chatgpt.com/*"])) {
-  throw new Error(`host_permissions must be exactly ["https://chatgpt.com/*"], got ${JSON.stringify(hostPermissions)}`);
+const expectedHostPermissions = ["https://chatgpt.com/*", "https://claude.ai/*"];
+if (JSON.stringify(hostPermissions) !== JSON.stringify(expectedHostPermissions)) {
+  throw new Error(`host_permissions must be exactly ${JSON.stringify(expectedHostPermissions)}, got ${JSON.stringify(hostPermissions)}`);
 }
 if (
   optionalPermissions.length !== expectedOptionalPermissions.size
@@ -166,6 +167,9 @@ required = {
     "src/content-script.js",
     "src/protocol.js",
     "src/service-worker.js",
+    "src/sites/chatgpt-backend.js",
+    "src/sites/chatgpt.js",
+    "src/sites/index.js",
 }
 with zipfile.ZipFile(zip_path) as archive:
     names = archive.namelist()
