@@ -1,7 +1,8 @@
 const activeJobs = new Map();
 const siteAdapterPromises = new Map();
 const siteAdapterModules = Object.freeze({
-  chatgpt: "src/sites/chatgpt.js"
+  chatgpt: "src/sites/chatgpt.js",
+  claude: "src/sites/claude.js"
 });
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
@@ -288,8 +289,10 @@ async function authProbe(recipe) {
 }
 
 async function probe(recipe) {
-  const { getPageText } = await domHelpers(recipe);
+  const adapter = await siteAdapter(recipe);
+  const { getPageText } = adapter.dom;
   return {
+    recipe: adapter.recipe,
     url: location.href,
     title: document.title,
     text: getPageText(document).slice(0, 2000)

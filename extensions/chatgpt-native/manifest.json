@@ -44,8 +44,10 @@
     {
       "resources": [
         "src/chatgpt-dom.js",
+        "src/claude-dom.js",
         "src/sites/chatgpt.js",
-        "src/sites/chatgpt-backend.js"
+        "src/sites/chatgpt-backend.js",
+        "src/sites/claude.js"
       ],
       "matches": [
         "https://chatgpt.com/*",

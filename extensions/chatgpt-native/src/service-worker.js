@@ -43,15 +43,11 @@ const MAX_RENDER_REFRESH_ATTEMPTS = Math.max(
     ? Number(globalThis.__YOETZ_MAX_RENDER_REFRESH_ATTEMPTS)
     : 1
 );
-// Once a site adapter has exposed its final assistant affordance AND scoped
-// text is extractable AND generation has stopped, the response is structurally
-// complete. Confirm it over a SHORT stable window at a FAST cadence instead of
-// waiting out the full MIN_STABLE_IDLE_MS late-hydration floor. The dual-candidate
-// latch still re-arms this window on any text growth (selectFinalAffordanceCandidate
-// -> resetTimer), so a still-hydrating response cannot complete early; this only
-// removes the dead wall-clock wait after the text has genuinely settled. This is the
-// post-affordance confirm window and is always clamped to the slower idle floor so it
-// can only ever shorten the wait, never lengthen it.
+// Once a site adapter exposes its final structural signal with scoped text and
+// generation stopped, the candidate is sampled at a fast cadence. Adapters with
+// a durable final affordance may use the short confirmation window; adapters
+// whose signal is idle DOM state require the full stable-idle window. In both
+// cases text growth re-arms the candidate timer, so late hydration cannot win.
 const MIN_AFFORDANCE_CONFIRM_MS = Math.max(
   0,
   Number(globalThis.__YOETZ_MIN_AFFORDANCE_CONFIRM_MS ?? 8000)
@@ -1332,7 +1328,7 @@ async function waitForSiteTab(tabId, adapter) {
 async function waitForContentScript(tabId, adapter) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
-      await sendToTab(tabId, { type: "yoetz_probe" });
+      await sendToTab(tabId, { type: "yoetz_probe", recipe: adapter.recipe });
       return;
     } catch {
       await sleep(500);
@@ -1400,6 +1396,9 @@ async function waitForResponse(job) {
   // ceiling (and so test envs that drive MIN_STABLE_IDLE_MS below the confirm default
   // still complete promptly).
   const affordanceConfirmMs = Math.min(MIN_AFFORDANCE_CONFIRM_MS, finalAffordanceIdleMs);
+  const finalStructuralConfirmMs = completion.finalAffordanceRequiresStableIdle
+    ? finalAffordanceIdleMs
+    : affordanceConfirmMs;
   let best = { method: "none", text: "", is_generating: true };
   let last = { method: "none", text: "", is_generating: true };
   let finalAffordanceCandidate = null;
@@ -1486,8 +1485,8 @@ async function waitForResponse(job) {
       return completion.completedExtraction(extraction, "backend_api", 0);
     }
     if (finalStructuralResponse) {
-      // Once the adapter exposes final assistant controls, scope and turn checks
-      // have already ruled out pre-send content. From here we track the best
+      // Once the adapter exposes its final structural signal, scope and turn
+      // checks have already ruled out pre-send content. From here we track the best
       // scoped candidate by text growth so late page chrome cannot replace a
       // completed response, and transient generating blips cannot forget it.
       const bestSelection = completion.selectFinalAffordanceCandidate(bestFinalAffordanceCandidate, extraction);
@@ -1510,8 +1509,11 @@ async function waitForResponse(job) {
       // stableForMs is "time since the scoped text last grew". Once that has held
       // for the short confirm window, the response is settled — emit instead of
       // burning the full idle floor.
-      if (stableForMs >= affordanceConfirmMs) {
-        return completion.completedExtraction(finalAffordanceCandidate, "copy_button", stableForMs);
+      if (stableForMs >= finalStructuralConfirmMs) {
+        const completionReason = finalAffordanceCandidate?.has_copy_button
+          ? "copy_button"
+          : "stable_idle";
+        return completion.completedExtraction(finalAffordanceCandidate, completionReason, stableForMs);
       }
       unscopedCopyCandidate = null;
       bestUnscopedCopyCandidate = null;

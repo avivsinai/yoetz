@@ -19,7 +19,13 @@ test("manifest is one multi-site transport package", () => {
   );
   assert.deepEqual(
     new Set(manifest.web_accessible_resources[0].resources),
-    new Set(["src/chatgpt-dom.js", "src/sites/chatgpt.js", "src/sites/chatgpt-backend.js"])
+    new Set([
+      "src/chatgpt-dom.js",
+      "src/claude-dom.js",
+      "src/sites/chatgpt.js",
+      "src/sites/chatgpt-backend.js",
+      "src/sites/claude.js"
+    ])
   );
 });
 

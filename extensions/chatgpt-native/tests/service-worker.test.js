@@ -87,7 +87,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     assert.equal(port.messages[0].payload.profile_email, "work@example.com");
     assert.equal(port.messages[0].payload.profile_id, "gaia-work");
     assert.match(port.messages[0].payload.extension_instance_id, /^ext_/);
-    assert.deepEqual(port.messages[0].payload.recipes, ["chatgpt"]);
+    assert.deepEqual(port.messages[0].payload.recipes, ["chatgpt", "claude"]);
 
     port.emit(envelope("reconnect", "job_reconnect"));
     await eventually(() => port.messages.some((message) => message.type === "reconnect" && message.job_id === "job_reconnect"));
@@ -143,6 +143,130 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     globalThis.chrome = originalChrome;
     globalThis.setInterval = originalSetInterval;
     globalThis.clearInterval = originalClearInterval;
+  }
+});
+
+test("service worker runs a Claude job through its adapter and probes the selected recipe", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  let sent = false;
+  const conversationId = "123e4567-e89b-12d3-a456-426614174000";
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async ({ url, active }) => {
+        assert.equal(url, "https://claude.ai/new?_yoetz=run_job_claude");
+        assert.equal(active, false);
+        return { id: 71 };
+      },
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new?_yoetz=run_job_claude" }),
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude", url: "https://claude.ai/new" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "selected",
+                requested_model: "fable-5-max",
+                modelVerified: true,
+                maxVerified: true,
+                thinkingChecked: true,
+                model_used: "Fable 5 Max"
+              }
+            };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: conversationId,
+                submitted_user_count: 1,
+                submitted_assistant_count: 0
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "assistant_dom",
+                    text: "Claude answer",
+                    is_generating: false,
+                    assistant_count: 1,
+                    copy_button_count: 0,
+                    has_copy_button: false,
+                    turn_index: 0,
+                    conversation_id: conversationId
+                  }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      },
+      group: async () => 1
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_job=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    assert.deepEqual(
+      port.messages.find((message) => message.type === "hello")?.payload.recipes,
+      ["chatgpt", "claude"]
+    );
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_claude", {
+      recipe: "claude",
+      prompt: "review",
+      wait_interval_ms: 500,
+      wait_timeout_ms: 2500
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.job_id === "job_claude"
+      && (message.type === "job_error" || message.payload?.phase === "ready_for_file")
+    ));
+    const startError = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_claude"
+    );
+    assert.equal(startError, undefined, JSON.stringify(startError?.payload));
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_probe")?.message.recipe,
+      "claude"
+    );
+
+    port.emit(envelope("job_file_chunk", "job_claude", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_complete" && message.job_id === "job_claude"
+    ));
+    const complete = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_claude"
+    );
+    assert.equal(complete.payload.response, "Claude answer");
+    assert.equal(complete.payload.model_used, "Fable 5 Max");
+    assert.equal(complete.payload.completion_reason, "stable_idle");
+    assert.equal(complete.payload.conversation_id, conversationId);
+    assert.equal(complete.payload.conversation_url, `https://claude.ai/chat/${conversationId}`);
+  } finally {
+    globalThis.chrome = originalChrome;
   }
 });
 
@@ -396,7 +520,7 @@ test("service worker rejects invalid conversation ids before opening a tab", asy
 });
 
 test("service worker rejects unavailable recipes before opening a tab", async () => {
-  for (const recipe of ["claude", "unknown"]) {
+  for (const recipe of ["unknown"]) {
     const originalChrome = globalThis.chrome;
     const port = makePort();
     const createdTabs = [];
@@ -1557,7 +1681,7 @@ test("service worker hello falls back with instance id when profile identity fai
     assert.match(hello.payload.extension_instance_id, /^ext_/);
     assert.equal(hello.payload.profile_email, null);
     assert.equal(hello.payload.profile_id, null);
-    assert.deepEqual(hello.payload.recipes, ["chatgpt"]);
+    assert.deepEqual(hello.payload.recipes, ["chatgpt", "claude"]);
   } finally {
     globalThis.chrome = originalChrome;
   }

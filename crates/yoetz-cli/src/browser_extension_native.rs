@@ -18,6 +18,8 @@ use thiserror::Error;
 use crate::chatgpt_recipe::{
     ChatgptModelSelectionStatus, ChatgptRecipeSpec, ChatgptTransportPhase,
 };
+use crate::claude_recipe::ClaudeRecipeSpec;
+use crate::web_recipe::BuiltinWebRecipe;
 use yoetz_core::output::{write_jsonl, OutputFormat};
 use yoetz_core::paths::home_dir;
 
@@ -553,13 +555,20 @@ fn extension_manifest_version(extension_dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn extension_version_skew_message(extension_version: Option<&str>) -> Option<String> {
+fn extension_version_skew_message(
+    extension_version: Option<&str>,
+    site_flag: Option<&str>,
+) -> Option<String> {
     let extension_version = extension_version?.trim();
     if extension_version.is_empty() || extension_version == YOETZ_CLI_VERSION {
         return None;
     }
+    let update_hint = match site_flag {
+        Some(site_flag) => format!("`yoetz browser extension update {site_flag}`"),
+        None => "`yoetz browser extension update --chatgpt` or `yoetz browser extension update --claude`".to_string(),
+    };
     Some(format!(
-        "loaded chrome-extension-native extension version {extension_version} does not match yoetz CLI {YOETZ_CLI_VERSION}; run `yoetz browser extension update --chatgpt`"
+        "loaded chrome-extension-native extension version {extension_version} does not match yoetz CLI {YOETZ_CLI_VERSION}; run {update_hint}"
     ))
 }
 
@@ -618,7 +627,8 @@ pub fn status() -> Result<ExtensionStatus> {
         .and_then(|value| value.get("version_mismatch"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let extension_version_mismatch = extension_version_skew_message(extension_version.as_deref());
+    let extension_version_mismatch =
+        extension_version_skew_message(extension_version.as_deref(), None);
     let version_mismatch = protocol_version_mismatch
         .clone()
         .or_else(|| extension_version_mismatch.clone());
@@ -771,7 +781,7 @@ pub fn doctor() -> Result<DoctorReport> {
             legacy_extension_status_string(legacy_hello_seen, extension_value, "extension_version")
         });
     let extension_version_mismatch =
-        extension_version_skew_message(observed_extension_version.as_deref());
+        extension_version_skew_message(observed_extension_version.as_deref(), None);
     let extension_instance_id = latest_instance_with_hello
         .and_then(|instance| instance.extension_instance_id.clone())
         .or_else(|| {
@@ -847,25 +857,39 @@ pub fn doctor() -> Result<DoctorReport> {
     Ok(DoctorReport { ok, checks })
 }
 
-pub fn doctor_with_auth_probe(selector: ExtensionInstanceSelector<'_>) -> Result<DoctorReport> {
+pub fn doctor_with_auth_probe(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<DoctorReport> {
     let mut report = doctor()?;
-    report.checks.push(chatgpt_auth_doctor_check(selector));
+    report.checks.push(site_auth_doctor_check(selector, recipe));
     report.ok = report.checks.iter().all(|check| check.ok);
     Ok(report)
 }
 
-fn chatgpt_auth_doctor_check(selector: ExtensionInstanceSelector<'_>) -> DoctorCheck {
-    match chatgpt_auth_probe(selector) {
-        Ok(payload) => chatgpt_auth_doctor_check_from_payload(&payload),
+fn site_auth_doctor_check(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> DoctorCheck {
+    match site_auth_probe(selector, recipe) {
+        Ok(payload) => auth_doctor_check_from_payload(&payload, recipe),
         Err(error) => DoctorCheck {
-            name: "chatgpt_auth",
-            ok: true,
+            name: match recipe {
+                BuiltinWebRecipe::Chatgpt => "chatgpt_auth",
+                BuiltinWebRecipe::Claude => "claude_auth",
+            },
+            ok: recipe == BuiltinWebRecipe::Chatgpt,
             detail: format!("status=probe_unavailable, auth probe unavailable: {error}"),
         },
     }
 }
 
+#[cfg(test)]
 fn chatgpt_auth_doctor_check_from_payload(payload: &Value) -> DoctorCheck {
+    auth_doctor_check_from_payload(payload, BuiltinWebRecipe::Chatgpt)
+}
+
+fn auth_doctor_check_from_payload(payload: &Value, recipe: BuiltinWebRecipe) -> DoctorCheck {
     let status = payload
         .get("status")
         .and_then(Value::as_str)
@@ -892,7 +916,10 @@ fn chatgpt_auth_doctor_check_from_payload(payload: &Value) -> DoctorCheck {
         detail.push(format!("url={url}"));
     }
     DoctorCheck {
-        name: "chatgpt_auth",
+        name: match recipe {
+            BuiltinWebRecipe::Chatgpt => "chatgpt_auth",
+            BuiltinWebRecipe::Claude => "claude_auth",
+        },
         ok: authenticated || !is_confirmed_unusable_chatgpt_auth_status(status),
         detail: detail.join(", "),
     }
@@ -906,11 +933,15 @@ fn is_confirmed_unusable_chatgpt_auth_status(status: &str) -> bool {
     )
 }
 
-pub fn chatgpt_auth_probe(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
-    let response = send_control_job(
+pub fn site_auth_probe(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    let response = send_site_control_job(
         "reconnect",
-        json!({ "intent": "doctor_auth_probe" }),
+        json!({ "intent": "doctor_auth_probe", "recipe": recipe.as_str() }),
         selector,
+        recipe,
     )?;
     Ok(response.payload)
 }
@@ -974,34 +1005,82 @@ pub fn bridge_check(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
     }))
 }
 
-pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
+fn bridge_check_for_recipe(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    let response = send_site_control_job(
+        "reconnect",
+        json!({ "intent": "bridge_check", "recipe": recipe.as_str() }),
+        selector,
+        recipe,
+    )?;
+    Ok(json!({
+        "status": "ok",
+        "transport": TRANSPORT_NAME,
+        "recipe": recipe.as_str(),
+        "live": false,
+        "response": response.payload,
+    }))
+}
+
+pub fn canary(
+    live: bool,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
     if !live {
-        return bridge_check(selector);
+        return bridge_check_for_recipe(selector, recipe);
     }
     let dir = tempfile::tempdir()?;
-    let bundle_path = dir.path().join("yoetz-chatgpt-native-canary.md");
+    let bundle_path = dir
+        .path()
+        .join(format!("yoetz-{}-native-canary.md", recipe.as_str()));
     fs::write(&bundle_path, "Reply with exactly OK.\n")?;
-    let spec = ChatgptRecipeSpec {
-        bundle_path: Some(bundle_path),
-        model: crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
-        model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
-        prompt: "Reply with exactly OK.".to_string(),
-        browser_context_id: None,
-        profile_email: selector.profile_email.map(str::to_string),
-        extension_instance_id: selector.extension_instance_id.map(str::to_string),
-        extension_profile_id: selector.extension_profile_id.map(str::to_string),
-        conversation_id: None,
-        run_id: new_id("canary"),
-        wait_timeout_ms: 180_000,
-        wait_interval_ms: 1_000,
-        upload_timeout_ms: 30_000,
-        send_timeout_ms: 120_000,
+    let response = match recipe {
+        BuiltinWebRecipe::Chatgpt => run_chatgpt_recipe(
+            &ChatgptRecipeSpec {
+                bundle_path: Some(bundle_path),
+                model: crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
+                model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
+                prompt: "Reply with exactly OK.".to_string(),
+                browser_context_id: None,
+                profile_email: selector.profile_email.map(str::to_string),
+                extension_instance_id: selector.extension_instance_id.map(str::to_string),
+                extension_profile_id: selector.extension_profile_id.map(str::to_string),
+                conversation_id: None,
+                run_id: new_id("canary"),
+                wait_timeout_ms: 180_000,
+                wait_interval_ms: 1_000,
+                upload_timeout_ms: 30_000,
+                send_timeout_ms: 120_000,
+            },
+            OutputFormat::Json,
+        )?,
+        BuiltinWebRecipe::Claude => run_claude_recipe(
+            &ClaudeRecipeSpec {
+                bundle_path: Some(bundle_path),
+                prompt: "Reply with exactly OK.".to_string(),
+                browser_context_id: None,
+                profile_email: selector.profile_email.map(str::to_string),
+                extension_instance_id: selector.extension_instance_id.map(str::to_string),
+                extension_profile_id: selector.extension_profile_id.map(str::to_string),
+                conversation_id: None,
+                run_id: new_id("canary"),
+                wait_timeout_ms: 180_000,
+                wait_interval_ms: 1_000,
+                upload_timeout_ms: 30_000,
+                send_timeout_ms: 120_000,
+                warnings: Vec::new(),
+            },
+            OutputFormat::Json,
+        )?,
     };
-    let response = run_chatgpt_recipe(&spec, OutputFormat::Json)?;
     validate_canary_response(&response.response)?;
     Ok(json!({
         "status": "ok",
         "transport": TRANSPORT_NAME,
+        "recipe": recipe.as_str(),
         "live": true,
         "expected_response": "OK",
         "response": response.response,
@@ -1011,15 +1090,25 @@ pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Val
     }))
 }
 
-pub fn inspect_run(run_id: &str, selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
+pub fn inspect_run(
+    run_id: &str,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
     let trimmed = run_id.trim();
     if trimmed.is_empty() {
         bail!("--run-id is required");
     }
-    let response = send_control_job("inspect_run", json!({ "run_id": trimmed }), selector)?;
+    let response = send_site_control_job(
+        "inspect_run",
+        json!({ "run_id": trimmed, "recipe": recipe.as_str() }),
+        selector,
+        recipe,
+    )?;
     Ok(json!({
         "status": "ok",
         "transport": TRANSPORT_NAME,
+        "recipe": recipe.as_str(),
         "response": response.payload,
     }))
 }
@@ -1051,7 +1140,9 @@ pub fn run_chatgpt_recipe(
             extension_profile_id: spec.extension_profile_id.as_deref(),
         },
     )?;
-    if let Some(message) = extension_version_skew_message(instance.extension_version.as_deref()) {
+    if let Some(message) =
+        extension_version_skew_message(instance.extension_version.as_deref(), Some("--chatgpt"))
+    {
         eprintln!("warning: {message}");
         let selector = ExtensionInstanceSelector {
             profile_email: spec.profile_email.as_deref(),
@@ -1106,6 +1197,77 @@ pub fn run_chatgpt_recipe(
     }
 }
 
+pub fn run_claude_recipe(
+    spec: &ClaudeRecipeSpec,
+    format: OutputFormat,
+) -> Result<ExtensionRecipeResult> {
+    let bundle_path = spec
+        .bundle_path
+        .as_deref()
+        .context("chrome-extension-native transport requires `--bundle`")?;
+    let bundle = validate_bundle_path(bundle_path)?;
+    let paths = extension_paths()?;
+    let selector = ExtensionInstanceSelector {
+        profile_email: spec.profile_email.as_deref(),
+        extension_instance_id: spec.extension_instance_id.as_deref(),
+        extension_profile_id: spec.extension_profile_id.as_deref(),
+    };
+    let mut instance = select_extension_instance(&paths, selector)?;
+    if let Some(message) =
+        extension_version_skew_message(instance.extension_version.as_deref(), Some("--claude"))
+    {
+        eprintln!("warning: {message}");
+        match auto_heal_extension_version_skew(&paths, selector) {
+            Ok(Some(healed_instance)) => {
+                eprintln!(
+                    "info: refreshed and reloaded chrome-extension-native extension from packaged source"
+                );
+                instance = healed_instance;
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("warning: automatic extension update failed: {err:#}"),
+        }
+    }
+    // Capability is checked on the exact routed extension instance after any
+    // best-effort heal and before opening the socket or emitting job_start.
+    ensure_instance_supports_recipe(&instance, "claude")?;
+    let token = read_capability_token(&paths.token_path)?;
+    let mut stream = connect_socket(&instance.socket_path).with_context(|| {
+        format!(
+            "chrome-extension-native bridge is not connected at {}. Run `yoetz browser extension doctor --claude`, then open Chrome with the Yoetz extension enabled.",
+            instance.socket_path.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(
+        Duration::from_millis(spec.wait_timeout_ms).saturating_add(RECIPE_READ_GRACE),
+    ))?;
+
+    let job_id = new_id("job");
+    let start = ProtocolEnvelope::new(
+        "job_start",
+        Some(job_id),
+        Some(spec.run_id.clone()),
+        claude_job_start_payload(spec, &bundle),
+    )
+    .with_token(token);
+    write_json_frame(&mut stream, &start)?;
+
+    loop {
+        let envelope = read_json_frame(&mut stream)?;
+        validate_inbound_envelope(&envelope)?;
+        match envelope.kind.as_str() {
+            "job_progress" => emit_progress(format, &envelope)?,
+            "job_complete" => return parse_recipe_result(envelope),
+            "job_error" => return Err(job_error_for_recipe(envelope, BuiltinWebRecipe::Claude)),
+            other => {
+                if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+                    eprintln!("info: ignored chrome-extension-native event `{other}`");
+                }
+            }
+        }
+    }
+}
+
 pub fn serve_native_host_chatgpt() -> Result<()> {
     #[cfg(unix)]
     {
@@ -1127,6 +1289,28 @@ fn chatgpt_job_start_payload(spec: &ChatgptRecipeSpec, bundle: &BundleInfo) -> V
         "prompt": spec.prompt,
         "model": spec.model,
         "model_strategy": spec.model_strategy,
+        "browser_context_id": spec.browser_context_id,
+        "profile_email": spec.profile_email,
+        "extension_instance_id": spec.extension_instance_id,
+        "extension_profile_id": spec.extension_profile_id,
+        "conversation_id": spec.conversation_id,
+        "wait_timeout_ms": spec.wait_timeout_ms,
+        "wait_interval_ms": spec.wait_interval_ms,
+        "upload_timeout_ms": spec.upload_timeout_ms,
+        "send_timeout_ms": spec.send_timeout_ms,
+    })
+}
+
+fn claude_job_start_payload(spec: &ClaudeRecipeSpec, bundle: &BundleInfo) -> Value {
+    json!({
+        "recipe": "claude",
+        "bundle_path": bundle.path,
+        "file_name": bundle.file_name,
+        "bundle_size": bundle.size,
+        "mime": bundle.mime,
+        "prompt": spec.prompt,
+        "model": crate::claude_recipe::CLAUDE_FABLE_MAX_MODEL,
+        "model_strategy": "select",
         "browser_context_id": spec.browser_context_id,
         "profile_email": spec.profile_email,
         "extension_instance_id": spec.extension_instance_id,
@@ -1458,6 +1642,19 @@ fn select_extension_instance(
             observed_extension_profiles(&instances)
         ),
     }
+}
+
+fn ensure_instance_supports_recipe(instance: &ExtensionInstanceStatus, recipe: &str) -> Result<()> {
+    if instance.recipes.iter().any(|value| value == recipe) {
+        return Ok(());
+    }
+    bail!(
+        "selected chrome-extension-native instance {} does not advertise recipe `{recipe}`; refusing before job_start. Run `yoetz browser extension update --{recipe}` and reload the selected Chrome profile",
+        instance
+            .extension_instance_id
+            .as_deref()
+            .unwrap_or(instance.native_instance_id.as_str())
+    )
 }
 
 fn auto_heal_extension_version_skew(
@@ -1927,8 +2124,29 @@ fn send_control_job(
     payload: Value,
     selector: ExtensionInstanceSelector<'_>,
 ) -> Result<ProtocolEnvelope> {
+    send_control_job_with_recipe(kind, payload, selector, None)
+}
+
+fn send_site_control_job(
+    kind: &str,
+    payload: Value,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<ProtocolEnvelope> {
+    send_control_job_with_recipe(kind, payload, selector, Some(recipe.as_str()))
+}
+
+fn send_control_job_with_recipe(
+    kind: &str,
+    payload: Value,
+    selector: ExtensionInstanceSelector<'_>,
+    required_recipe: Option<&str>,
+) -> Result<ProtocolEnvelope> {
     let paths = extension_paths()?;
     let instance = select_extension_instance(&paths, selector)?;
+    if let Some(recipe) = required_recipe {
+        ensure_instance_supports_recipe(&instance, recipe)?;
+    }
     let token = read_capability_token(&paths.token_path)?;
     let job_id = new_id(kind);
     let mut stream = connect_socket(&instance.socket_path).with_context(|| {
@@ -2081,6 +2299,10 @@ fn parse_model_selection_status(value: Option<&str>) -> ChatgptModelSelectionSta
 }
 
 fn job_error(envelope: ProtocolEnvelope) -> anyhow::Error {
+    job_error_for_recipe(envelope, BuiltinWebRecipe::Chatgpt)
+}
+
+fn job_error_for_recipe(envelope: ProtocolEnvelope, recipe: BuiltinWebRecipe) -> anyhow::Error {
     let message = job_error_message(&envelope.payload);
     let phase = envelope.payload.get("phase").and_then(Value::as_str);
     let side_effect_started = envelope
@@ -2092,21 +2314,12 @@ fn job_error(envelope: ProtocolEnvelope) -> anyhow::Error {
     if !side_effect_started {
         return err;
     }
-    match phase {
-        Some("upload") => {
-            crate::chatgpt_recipe::mark_terminal_fallback_phase(err, ChatgptTransportPhase::Upload)
-        }
-        Some("send") => {
-            crate::chatgpt_recipe::mark_terminal_fallback_phase(err, ChatgptTransportPhase::Send)
-        }
-        Some("wait_response") => crate::chatgpt_recipe::mark_terminal_fallback_phase(
-            err,
-            ChatgptTransportPhase::WaitResponse,
-        ),
-        _ => {
-            crate::chatgpt_recipe::mark_terminal_fallback_phase(err, ChatgptTransportPhase::Upload)
-        }
-    }
+    let phase = match phase {
+        Some("send") => ChatgptTransportPhase::Send,
+        Some("wait_response") => ChatgptTransportPhase::WaitResponse,
+        _ => ChatgptTransportPhase::Upload,
+    };
+    crate::web_recipe::mark_terminal_fallback_phase(err, recipe, phase)
 }
 
 fn job_error_message(payload: &Value) -> String {
@@ -3292,6 +3505,69 @@ mod tests {
         let payload = chatgpt_job_start_payload(&spec, &bundle);
 
         assert_eq!(payload["conversation_id"], "conv-123");
+    }
+
+    #[test]
+    fn claude_job_start_payload_carries_recipe_model_and_conversation() {
+        let bundle = BundleInfo {
+            path: PathBuf::from("/tmp/yoetz-bundle.md"),
+            file_name: "yoetz-bundle.md".to_string(),
+            size: 42,
+            mime: "text/markdown".to_string(),
+        };
+        let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
+        let spec = crate::claude_recipe::ClaudeRecipeSpec {
+            bundle_path: Some(bundle.path.clone()),
+            prompt: "continue".to_string(),
+            browser_context_id: None,
+            profile_email: None,
+            extension_instance_id: Some("ext_claude".to_string()),
+            extension_profile_id: None,
+            conversation_id: Some(conversation_id.to_string()),
+            run_id: "run-claude".to_string(),
+            wait_timeout_ms: 10_000,
+            wait_interval_ms: 1_000,
+            upload_timeout_ms: 2_000,
+            send_timeout_ms: 3_000,
+            warnings: vec!["size warning".to_string()],
+        };
+
+        let payload = claude_job_start_payload(&spec, &bundle);
+
+        assert_eq!(payload["recipe"], "claude");
+        assert_eq!(
+            payload["model"],
+            crate::claude_recipe::CLAUDE_FABLE_MAX_MODEL
+        );
+        assert_eq!(payload["model_strategy"], "select");
+        assert_eq!(payload["conversation_id"], conversation_id);
+        assert_eq!(payload["extension_instance_id"], "ext_claude");
+    }
+
+    #[test]
+    fn selected_instance_capability_gate_is_recipe_specific_and_legacy_safe() {
+        let mut instance = ExtensionInstanceStatus {
+            native_instance_id: "native_claude".to_string(),
+            socket_path: PathBuf::from("/tmp/claude.sock"),
+            pid: 1,
+            extension_instance_id: Some("ext_claude".to_string()),
+            extension_version: Some("0.5.33".to_string()),
+            profile_email: None,
+            profile_id: None,
+            recipes: vec!["chatgpt".to_string()],
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1,
+        };
+
+        ensure_instance_supports_recipe(&instance, "chatgpt").unwrap();
+        let error = ensure_instance_supports_recipe(&instance, "claude").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not advertise recipe `claude`"));
+        assert!(error.to_string().contains("before job_start"));
+
+        instance.recipes.push("claude".to_string());
+        ensure_instance_supports_recipe(&instance, "claude").unwrap();
     }
 
     #[test]

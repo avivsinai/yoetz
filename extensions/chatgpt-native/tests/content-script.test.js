@@ -194,7 +194,7 @@ test("content script rejects an unavailable site adapter before DOM side effects
   try {
     const response = await send({
       type: "yoetz_prepare_job",
-      job: { ...resumeJob(), recipe: "claude" }
+      job: { ...resumeJob(), recipe: "unknown" }
     });
 
     assert.equal(response.ok, false);

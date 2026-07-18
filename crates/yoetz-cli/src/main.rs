@@ -406,12 +406,16 @@ enum BrowserExtensionCommand {
 struct BrowserExtensionScopeArgs {
     #[arg(long)]
     chatgpt: bool,
+    #[arg(long)]
+    claude: bool,
 }
 
 #[derive(Args)]
 struct BrowserExtensionSetupArgs {
     #[arg(long)]
     chatgpt: bool,
+    #[arg(long)]
+    claude: bool,
 
     /// Open chrome://extensions after preparing the native host.
     #[arg(long)]
@@ -422,16 +426,18 @@ struct BrowserExtensionSetupArgs {
 struct BrowserExtensionMaintenanceArgs {
     #[arg(long)]
     chatgpt: bool,
+    #[arg(long)]
+    claude: bool,
 
-    /// Route to a Chrome profile email reported by `status --chatgpt`.
+    /// Route to a Chrome profile email reported by extension status.
     #[arg(long, alias = "profile_email")]
     profile_email: Option<String>,
 
-    /// Route to the stable extension instance id reported by `status --chatgpt`.
+    /// Route to the stable extension instance id reported by extension status.
     #[arg(long, alias = "extension_instance_id")]
     extension_instance_id: Option<String>,
 
-    /// Route to a Chrome extension profile id reported by `status --chatgpt`.
+    /// Route to a Chrome extension profile id reported by extension status.
     #[arg(long, alias = "extension_profile_id")]
     extension_profile_id: Option<String>,
 }
@@ -440,20 +446,22 @@ struct BrowserExtensionMaintenanceArgs {
 struct BrowserExtensionCanaryArgs {
     #[arg(long)]
     chatgpt: bool,
+    #[arg(long)]
+    claude: bool,
 
-    /// Run a real ChatGPT canary job. Without this flag, this is a dry-run bridge probe.
+    /// Run a real site canary job. Without this flag, this is a dry-run bridge probe.
     #[arg(long)]
     live: bool,
 
-    /// Route to a Chrome profile email reported by `status --chatgpt`.
+    /// Route to a Chrome profile email reported by extension status.
     #[arg(long, alias = "profile_email")]
     profile_email: Option<String>,
 
-    /// Route to the stable extension instance id reported by `status --chatgpt`.
+    /// Route to the stable extension instance id reported by extension status.
     #[arg(long, alias = "extension_instance_id")]
     extension_instance_id: Option<String>,
 
-    /// Route to a Chrome extension profile id reported by `status --chatgpt`.
+    /// Route to a Chrome extension profile id reported by extension status.
     #[arg(long, alias = "extension_profile_id")]
     extension_profile_id: Option<String>,
 }
@@ -462,20 +470,22 @@ struct BrowserExtensionCanaryArgs {
 struct BrowserExtensionInspectArgs {
     #[arg(long)]
     chatgpt: bool,
+    #[arg(long)]
+    claude: bool,
 
     /// Yoetz run id from a failed/manual-recovery browser recipe message.
     #[arg(long, alias = "run_id")]
     run_id: String,
 
-    /// Route to a Chrome profile email reported by `status --chatgpt`.
+    /// Route to a Chrome profile email reported by extension status.
     #[arg(long, alias = "profile_email")]
     profile_email: Option<String>,
 
-    /// Route to the stable extension instance id reported by `status --chatgpt`.
+    /// Route to the stable extension instance id reported by extension status.
     #[arg(long, alias = "extension_instance_id")]
     extension_instance_id: Option<String>,
 
-    /// Route to a Chrome extension profile id reported by `status --chatgpt`.
+    /// Route to a Chrome extension profile id reported by extension status.
     #[arg(long, alias = "extension_profile_id")]
     extension_profile_id: Option<String>,
 }
@@ -1210,8 +1220,8 @@ fn recipe_transports_with_explicit_override<R: IntoBuiltinWebRecipe>(
         return Ok(transports);
     };
     if matches!(requested, browser::RecipeTransport::ChromeExtensionNative) {
-        if builtin_recipe != Some(web_recipe::BuiltinWebRecipe::Chatgpt) {
-            bail!("chrome-extension-native transport currently supports only the built-in `chatgpt` recipe");
+        if builtin_recipe.is_none() {
+            bail!("chrome-extension-native transport supports only built-in web recipes");
         }
         let mut selected = vec![browser::RecipeTransport::ChromeExtensionNative];
         if allow_cdp_fallback {
@@ -1255,7 +1265,7 @@ fn recipe_should_auto_select_extension_native<R: IntoBuiltinWebRecipe>(
 ) -> bool {
     let builtin_recipe = builtin_recipe.into_builtin_web_recipe();
     requested_transport.is_none()
-        && builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Chatgpt)
+        && builtin_recipe.is_some()
         && !recipe_transports_pinned
         && !managed_profile_only
         && !explicit_browser_target
@@ -1550,7 +1560,7 @@ fn ensure_chatgpt_transport_constraints_allow_any<R: IntoBuiltinWebRecipe>(
         let setup = if recipe == web_recipe::BuiltinWebRecipe::Chatgpt {
             "Install the Yoetz Chrome extension (`yoetz browser extension setup --chatgpt`) or pass --transport chrome-extension-native."
         } else {
-            "Claude native-extension conversation support is not available in Wave 1; start a fresh Claude run without conversation/followup."
+            "Install or update the Yoetz Chrome extension (`yoetz browser extension setup --claude`) so the selected instance advertises Claude support."
         };
         bail!(
             "{} conversation requires chrome-extension-native; {requested} is not compatible. {setup}",
@@ -1608,6 +1618,19 @@ fn maybe_print_running_profile_auto_connect_preference(
 fn extension_status_connected_for_auto_selection() -> bool {
     browser_extension_native::status()
         .map(|status| status.status == "connected")
+        .unwrap_or(false)
+}
+
+fn extension_recipe_ready_for_auto_selection(recipe: Option<web_recipe::BuiltinWebRecipe>) -> bool {
+    browser_extension_native::status()
+        .map(|status| {
+            status.status == "connected"
+                && match recipe {
+                    Some(web_recipe::BuiltinWebRecipe::Claude) => status.claude_ready,
+                    Some(web_recipe::BuiltinWebRecipe::Chatgpt) => true,
+                    None => false,
+                }
+        })
         .unwrap_or(false)
 }
 
@@ -2324,7 +2347,12 @@ fn build_claude_recipe_spec(
     let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
     let upload_timeout_ms =
         dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, recipe_args.bundle.as_deref())?;
+    let send_timeout_ms = dev_browser::resolve_chatgpt_send_timeout_ms(recipe_vars)?;
     claude_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
+    let conversation = recipe_vars
+        .get("conversation")
+        .map(|value| claude_web::normalize_conversation(value))
+        .transpose()?;
     Ok(claude_recipe::ClaudeRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
         prompt: recipe_vars
@@ -2339,6 +2367,15 @@ fn build_claude_recipe_spec(
             .get("profile_email")
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
+        extension_instance_id: recipe_vars
+            .get("extension_instance_id")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        extension_profile_id: recipe_vars
+            .get("extension_profile_id")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        conversation_id: conversation.map(|value| value.id),
         run_id: recipe_vars
             .get("run_id")
             .cloned()
@@ -2347,6 +2384,7 @@ fn build_claude_recipe_spec(
         wait_timeout_ms: poll_settings.timeout_ms,
         wait_interval_ms: poll_settings.interval_ms,
         upload_timeout_ms,
+        send_timeout_ms,
         warnings: warnings.to_vec(),
     })
 }
@@ -2464,13 +2502,14 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
     recipe_vars: &BTreeMap<String, String>,
     format: OutputFormat,
     builtin_recipe: R,
+    preflight_warnings: &[String],
     fallback_used: bool,
 ) -> Result<Value> {
-    if builtin_recipe.into_builtin_web_recipe() != Some(web_recipe::BuiltinWebRecipe::Chatgpt) {
+    let Some(builtin_recipe) = builtin_recipe.into_builtin_web_recipe() else {
         return Err(anyhow!(
-            "chrome-extension-native transport currently supports only the built-in `chatgpt` recipe"
+            "chrome-extension-native transport supports only built-in web recipes"
         ));
-    }
+    };
     if recipe_args.profile.is_some()
         || recipe_args.cdp.is_some()
         || recipe_args.browser_id.is_some()
@@ -2499,23 +2538,58 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
     }
     let started_at = Instant::now();
 
-    let recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
-    let response = browser_extension_native::run_chatgpt_recipe(&recipe_spec, format)?;
-    let output = chatgpt_recipe::ChatgptRecipeOutput {
-        transport: browser_extension_native::TRANSPORT_NAME.to_string(),
-        backend: browser_extension_native::TRANSPORT_NAME.to_string(),
-        response: response.response,
-        model_strategy: recipe_spec.model_strategy,
-        model_used: response.model_used,
-        model_selection_status: response.model_selection_status,
-        warnings: response.warnings,
-        fallback_used,
-        delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
-        auto_paste_fallback: false,
-        conversation_id: response.conversation_id,
-        conversation_url: response.conversation_url,
+    let (mut payload, jsonl_event, notification_target) = match builtin_recipe {
+        web_recipe::BuiltinWebRecipe::Chatgpt => {
+            let recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
+            let response = browser_extension_native::run_chatgpt_recipe(&recipe_spec, format)?;
+            let output = chatgpt_recipe::ChatgptRecipeOutput {
+                transport: browser_extension_native::TRANSPORT_NAME.to_string(),
+                backend: browser_extension_native::TRANSPORT_NAME.to_string(),
+                response: response.response,
+                model_strategy: recipe_spec.model_strategy,
+                model_used: response.model_used,
+                model_selection_status: response.model_selection_status,
+                warnings: response.warnings,
+                fallback_used,
+                delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
+                auto_paste_fallback: false,
+                conversation_id: response.conversation_id,
+                conversation_url: response.conversation_url,
+            };
+            (
+                output.to_value(),
+                output.to_recipe_complete_event(),
+                recipe_spec.model,
+            )
+        }
+        web_recipe::BuiltinWebRecipe::Claude => {
+            let recipe_spec =
+                build_claude_recipe_spec(recipe_args, recipe_vars, preflight_warnings)?;
+            let response = browser_extension_native::run_claude_recipe(&recipe_spec, format)?;
+            let mut warnings = recipe_spec.warnings.clone();
+            warnings.extend(response.warnings);
+            warnings.sort();
+            warnings.dedup();
+            let output = claude_recipe::ClaudeRecipeOutput {
+                transport: browser_extension_native::TRANSPORT_NAME.to_string(),
+                backend: browser_extension_native::TRANSPORT_NAME.to_string(),
+                response: response.response,
+                model_used: response.model_used,
+                model_selection_status: response.model_selection_status,
+                warnings,
+                fallback_used,
+                conversation_id: response.conversation_id,
+                conversation_url: response.conversation_url,
+                run_id: recipe_spec.run_id,
+                elapsed_ms: started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            };
+            (
+                output.to_value(),
+                output.to_recipe_complete_event(),
+                claude_recipe::CLAUDE_REPORTED_MODEL.to_string(),
+            )
+        }
     };
-    let mut payload = output.to_value();
     attach_browser_recipe_artifacts(&mut payload, recipe_args.bundle.as_deref())?;
     maybe_write_output(ctx, &payload)?;
     match format {
@@ -2523,7 +2597,7 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
             write_json(&payload)?;
         }
         OutputFormat::Jsonl => {
-            write_jsonl("browser.recipe", &output.to_recipe_complete_event())?;
+            write_jsonl("browser.recipe", &jsonl_event)?;
         }
         OutputFormat::Text | OutputFormat::Markdown => {
             println!("{}", payload["response"].as_str().unwrap_or_default());
@@ -2532,7 +2606,7 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
     maybe_notify_browser_recipe_completion(
         ctx,
         recipe_args.no_notify,
-        recipe_spec.model.as_str(),
+        notification_target.as_str(),
         &payload,
         started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
         None,
@@ -2905,11 +2979,13 @@ fn maybe_notify_browser_recipe_completion(
     );
 }
 
-fn ensure_chatgpt_extension_scope(chatgpt: bool) -> Result<()> {
-    if !chatgpt {
-        bail!("chrome-extension-native V1 is ChatGPT-only; pass --chatgpt");
+fn extension_site_scope(chatgpt: bool, claude: bool) -> Result<web_recipe::BuiltinWebRecipe> {
+    match (chatgpt, claude) {
+        (true, false) => Ok(web_recipe::BuiltinWebRecipe::Chatgpt),
+        (false, true) => Ok(web_recipe::BuiltinWebRecipe::Claude),
+        (false, false) => bail!("pass exactly one site scope: --chatgpt or --claude"),
+        (true, true) => bail!("--chatgpt and --claude are mutually exclusive"),
     }
-    Ok(())
 }
 
 fn extension_selector_from_parts<'a>(
@@ -2932,7 +3008,7 @@ fn handle_browser_extension(
     let mut text_output = None;
     let (kind, payload) = match args.command {
         BrowserExtensionCommand::Setup(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            let recipe = extension_site_scope(args.chatgpt, args.claude)?;
             let install = browser_extension_native::install_host()?;
             let extension_update = browser_extension_native::prepare_managed_chatgpt_extension()?;
             let extension_dir = extension_update.extension_dir.clone();
@@ -2960,38 +3036,38 @@ fn handle_browser_extension(
                     "enable Developer mode",
                     "click Load unpacked",
                     "select extension_dir",
-                    "run yoetz browser extension doctor --chatgpt"
+                    format!("run yoetz browser extension doctor --{}", recipe.as_str())
                 ],
             });
-            text_output = Some(format_extension_setup(&payload));
+            text_output = Some(format_extension_setup(&payload, recipe));
             ("browser.extension.setup", payload)
         }
         BrowserExtensionCommand::InstallHost(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            extension_site_scope(args.chatgpt, args.claude)?;
             (
                 "browser.extension.install_host",
                 serde_json::to_value(browser_extension_native::install_host()?)?,
             )
         }
         BrowserExtensionCommand::Status(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            let recipe = extension_site_scope(args.chatgpt, args.claude)?;
             let status = browser_extension_native::status()?;
-            text_output = Some(format_extension_status(&status));
+            text_output = Some(format_extension_status(&status, recipe));
             ("browser.extension.status", serde_json::to_value(status)?)
         }
         BrowserExtensionCommand::Doctor(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            let recipe = extension_site_scope(args.chatgpt, args.claude)?;
             let selector = extension_selector_from_parts(
                 args.profile_email.as_ref(),
                 args.extension_instance_id.as_ref(),
                 args.extension_profile_id.as_ref(),
             );
-            let report = browser_extension_native::doctor_with_auth_probe(selector)?;
-            text_output = Some(format_extension_doctor(&report));
+            let report = browser_extension_native::doctor_with_auth_probe(selector, recipe)?;
+            text_output = Some(format_extension_doctor(&report, recipe));
             ("browser.extension.doctor", serde_json::to_value(report)?)
         }
         BrowserExtensionCommand::Reconnect(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            extension_site_scope(args.chatgpt, args.claude)?;
             let selector = extension_selector_from_parts(
                 args.profile_email.as_ref(),
                 args.extension_instance_id.as_ref(),
@@ -3003,7 +3079,7 @@ fn handle_browser_extension(
             )
         }
         BrowserExtensionCommand::Reload(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            extension_site_scope(args.chatgpt, args.claude)?;
             let selector = extension_selector_from_parts(
                 args.profile_email.as_ref(),
                 args.extension_instance_id.as_ref(),
@@ -3015,7 +3091,7 @@ fn handle_browser_extension(
             )
         }
         BrowserExtensionCommand::Update(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            extension_site_scope(args.chatgpt, args.claude)?;
             let selector = extension_selector_from_parts(
                 args.profile_email.as_ref(),
                 args.extension_instance_id.as_ref(),
@@ -3027,7 +3103,7 @@ fn handle_browser_extension(
             )
         }
         BrowserExtensionCommand::Canary(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            let recipe = extension_site_scope(args.chatgpt, args.claude)?;
             let selector = extension_selector_from_parts(
                 args.profile_email.as_ref(),
                 args.extension_instance_id.as_ref(),
@@ -3035,11 +3111,11 @@ fn handle_browser_extension(
             );
             (
                 "browser.extension.canary",
-                browser_extension_native::canary(args.live, selector)?,
+                browser_extension_native::canary(args.live, selector, recipe)?,
             )
         }
         BrowserExtensionCommand::Inspect(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            let recipe = extension_site_scope(args.chatgpt, args.claude)?;
             let selector = extension_selector_from_parts(
                 args.profile_email.as_ref(),
                 args.extension_instance_id.as_ref(),
@@ -3047,11 +3123,11 @@ fn handle_browser_extension(
             );
             (
                 "browser.extension.inspect",
-                browser_extension_native::inspect_run(&args.run_id, selector)?,
+                browser_extension_native::inspect_run(&args.run_id, selector, recipe)?,
             )
         }
         BrowserExtensionCommand::GrantIdentity(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            extension_site_scope(args.chatgpt, args.claude)?;
             let selector = extension_selector_from_parts(
                 args.profile_email.as_ref(),
                 args.extension_instance_id.as_ref(),
@@ -3111,7 +3187,14 @@ fn open_chrome_extensions_page() -> Result<()> {
     Ok(())
 }
 
-fn format_extension_setup(payload: &Value) -> String {
+fn extension_site_display_name(recipe: web_recipe::BuiltinWebRecipe) -> &'static str {
+    match recipe {
+        web_recipe::BuiltinWebRecipe::Chatgpt => "ChatGPT",
+        web_recipe::BuiltinWebRecipe::Claude => "Claude",
+    }
+}
+
+fn format_extension_setup(payload: &Value, recipe: web_recipe::BuiltinWebRecipe) -> String {
     let extension_dir = payload
         .get("extension_dir")
         .and_then(Value::as_str)
@@ -3147,7 +3230,10 @@ fn format_extension_setup(payload: &Value) -> String {
         .unwrap_or("<unknown>");
 
     let mut lines = vec![
-        "Yoetz ChatGPT native extension setup prepared.".to_string(),
+        format!(
+            "Yoetz native extension setup prepared for {}.",
+            extension_site_display_name(recipe)
+        ),
         format!("native_host_manifest: {native_manifest}"),
         format!("extension_id: {}", browser_extension_native::EXTENSION_ID),
         format!("extension_dir: {extension_dir}"),
@@ -3156,7 +3242,10 @@ fn format_extension_setup(payload: &Value) -> String {
         format!("chrome_extensions_url: {}", browser_extension_native::CHROME_EXTENSIONS_URL),
         format!("opened_chrome: {opened}"),
         format!("current_bridge_status: {status}"),
-        "next: in Chrome, enable Developer mode, click Load unpacked, select extension_dir, then run `yoetz browser extension doctor --chatgpt`.".to_string(),
+        format!(
+            "next: in Chrome, enable Developer mode, click Load unpacked, select extension_dir, then run `yoetz browser extension doctor --{}`.",
+            recipe.as_str()
+        ),
     ];
     if payload
         .get("extension_dir")
@@ -3171,9 +3260,23 @@ fn format_extension_setup(payload: &Value) -> String {
     lines.join("\n")
 }
 
-fn format_extension_status(status: &browser_extension_native::ExtensionStatus) -> String {
+fn format_extension_status(
+    status: &browser_extension_native::ExtensionStatus,
+    recipe: web_recipe::BuiltinWebRecipe,
+) -> String {
+    let recipe_ready = status.status == "connected"
+        && status
+            .recipes
+            .iter()
+            .any(|candidate| candidate == recipe.as_str());
     let mut lines = vec![
-        format!("Yoetz ChatGPT native extension: {}", status.status),
+        format!(
+            "Yoetz native extension for {}: {}",
+            extension_site_display_name(recipe),
+            status.status
+        ),
+        format!("site_scope: {}", recipe.as_str()),
+        format!("site_ready: {}", if recipe_ready { "yes" } else { "no" }),
         format!("detail: {}", status.detail),
         format!("extension_id: {}", status.extension_id),
         format!(
@@ -3248,9 +3351,13 @@ fn format_extension_status(status: &browser_extension_native::ExtensionStatus) -
     lines.join("\n")
 }
 
-fn format_extension_doctor(report: &browser_extension_native::DoctorReport) -> String {
+fn format_extension_doctor(
+    report: &browser_extension_native::DoctorReport,
+    recipe: web_recipe::BuiltinWebRecipe,
+) -> String {
     let mut lines = vec![format!(
-        "Yoetz ChatGPT native extension doctor: {}",
+        "Yoetz native extension doctor for {}: {}",
+        extension_site_display_name(recipe),
         if report.ok { "ok" } else { "failed" }
     )];
     for check in &report.checks {
@@ -3292,7 +3399,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
     match args.command {
         BrowserCommand::LiveAttachDaemon(_) => live_attach::serve_daemon().await,
         BrowserCommand::ChromeNativeHost(args) => {
-            ensure_chatgpt_extension_scope(args.chatgpt)?;
+            extension_site_scope(args.chatgpt, false)?;
             browser_extension_native::serve_native_host_chatgpt()
         }
         BrowserCommand::Exec(exec) => {
@@ -3914,7 +4021,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 recipe_transports_pinned,
                 managed_profile_only,
                 explicit_browser_target,
-                extension_status_connected_for_auto_selection(),
+                extension_recipe_ready_for_auto_selection(builtin_recipe),
             );
             let extension_native_will_route =
                 requested_extension_native || extension_auto_selection_eligible;
@@ -3925,13 +4032,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             );
             if recipe_uses_extension_instance_selector(&recipe_vars) && !extension_native_will_route
             {
-                if is_claude {
-                    bail!("extension_instance_id and extension_profile_id require Claude chrome-extension-native support, which is not available in Wave 1")
-                } else {
-                    bail!(
-                        "extension_instance_id and extension_profile_id selectors require chrome-extension-native; install the Yoetz Chrome extension (`yoetz browser extension setup --chatgpt`) or pass --transport chrome-extension-native"
-                    );
-                }
+                let site_flag = if is_claude { "--claude" } else { "--chatgpt" };
+                bail!(
+                    "extension_instance_id and extension_profile_id selectors require chrome-extension-native; install or update the Yoetz Chrome extension (`yoetz browser extension setup {site_flag}`) or pass --transport chrome-extension-native"
+                );
             }
             if is_chatgpt {
                 chatgpt_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
@@ -3971,7 +4075,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 ),
             )?;
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
-            let base_transports = browser::maybe_select_extension_native_for_chatgpt(
+            let base_transports = browser::maybe_select_extension_native_for_builtin(
                 browser::recipe_transports(&recipe, builtin_recipe),
                 builtin_recipe,
                 recipe_transports_pinned,
@@ -4090,6 +4194,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             &recipe_vars,
                             format,
                             builtin_recipe,
+                            &preflight_warnings,
                             fallback_used,
                         )
                     }
@@ -5362,6 +5467,20 @@ mod tests {
     }
 
     #[test]
+    fn explicit_chrome_extension_transport_accepts_claude_builtin() {
+        assert_eq!(
+            recipe_transports_with_explicit_override(
+                vec![browser::RecipeTransport::ChromeDevtoolsMcp],
+                Some(browser::RecipeTransport::ChromeExtensionNative),
+                false,
+                Some(web_recipe::BuiltinWebRecipe::Claude),
+            )
+            .unwrap(),
+            vec![browser::RecipeTransport::ChromeExtensionNative]
+        );
+    }
+
+    #[test]
     fn explicit_chrome_extension_transport_cdp_fallback_is_opt_in() {
         let default = vec![
             browser::RecipeTransport::ChromeDevtoolsMcp,
@@ -5432,6 +5551,14 @@ mod tests {
         ));
         assert!(!recipe_should_auto_select_extension_native(
             None, false, false, false, false, true
+        ));
+        assert!(recipe_should_auto_select_extension_native(
+            None,
+            Some(web_recipe::BuiltinWebRecipe::Claude),
+            false,
+            false,
+            false,
+            true,
         ));
     }
 
@@ -6480,7 +6607,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_conversation_is_rejected_before_non_native_side_effects_in_wave_one() {
+    fn claude_conversation_requires_native_extension_capability() {
         let vars = BTreeMap::from([(
             "conversation".to_string(),
             "123e4567-e89b-12d3-a456-426614174000".to_string(),
@@ -6505,7 +6632,7 @@ mod tests {
         .unwrap_err();
         let message = err.to_string();
         assert!(message.contains("Claude conversation requires chrome-extension-native"));
-        assert!(message.contains("not available in Wave 1"));
+        assert!(message.contains("setup --claude"));
     }
 
     #[test]
@@ -6654,6 +6781,7 @@ mod tests {
             &recipe_vars,
             OutputFormat::Json,
             true,
+            &[],
             false,
         )
         .unwrap_err();
@@ -6687,6 +6815,7 @@ mod tests {
             &recipe_vars,
             OutputFormat::Json,
             true,
+            &[],
             false,
         )
         .unwrap_err();
@@ -6720,6 +6849,7 @@ mod tests {
             &recipe_vars,
             OutputFormat::Json,
             true,
+            &[],
             false,
         )
         .unwrap_err();

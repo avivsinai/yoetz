@@ -248,21 +248,18 @@ pub fn recipe_transports(
     })
 }
 
-/// Select `chrome-extension-native` as the only ChatGPT recipe transport when
+/// Select `chrome-extension-native` as the only built-in web recipe transport when
 /// the Yoetz Chrome extension is installed and connected and the recipe author
 /// did not pin their own transport order. The list is returned unchanged for
 /// any other recipe, when the recipe pinned `transports:`, or when the extension
 /// is unhealthy.
-pub fn maybe_select_extension_native_for_chatgpt(
+pub fn maybe_select_extension_native_for_builtin(
     transports: Vec<RecipeTransport>,
     builtin_recipe: Option<crate::web_recipe::BuiltinWebRecipe>,
     recipe_transports_pinned: bool,
     extension_connected: bool,
 ) -> Vec<RecipeTransport> {
-    if builtin_recipe != Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt)
-        || recipe_transports_pinned
-        || !extension_connected
-    {
+    if builtin_recipe.is_none() || recipe_transports_pinned || !extension_connected {
         return transports;
     }
     vec![RecipeTransport::ChromeExtensionNative]
@@ -7378,20 +7375,27 @@ steps:
     }
 
     #[test]
-    fn maybe_select_extension_native_requires_native_only_for_chatgpt_when_connected() {
+    fn maybe_select_extension_native_requires_native_only_for_supported_builtins_when_connected() {
         let base = vec![
             RecipeTransport::ChromeDevtoolsMcp,
             RecipeTransport::DevBrowser,
             RecipeTransport::AgentBrowser,
             RecipeTransport::Manual,
         ];
-        let promoted = maybe_select_extension_native_for_chatgpt(
+        let promoted = maybe_select_extension_native_for_builtin(
             base,
             Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt),
             false,
             true,
         );
         assert_eq!(promoted, vec![RecipeTransport::ChromeExtensionNative]);
+        let claude = maybe_select_extension_native_for_builtin(
+            vec![RecipeTransport::ChromeDevtoolsMcp, RecipeTransport::Manual],
+            Some(crate::web_recipe::BuiltinWebRecipe::Claude),
+            false,
+            true,
+        );
+        assert_eq!(claude, vec![RecipeTransport::ChromeExtensionNative]);
     }
 
     #[test]
@@ -7400,7 +7404,7 @@ steps:
             RecipeTransport::ChromeDevtoolsMcp,
             RecipeTransport::DevBrowser,
         ];
-        let result = maybe_select_extension_native_for_chatgpt(
+        let result = maybe_select_extension_native_for_builtin(
             base.clone(),
             Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt),
             false,
@@ -7412,7 +7416,7 @@ steps:
     #[test]
     fn maybe_select_extension_native_noop_when_recipe_pinned_transports() {
         let base = vec![RecipeTransport::ChromeDevtoolsMcp, RecipeTransport::Manual];
-        let result = maybe_select_extension_native_for_chatgpt(
+        let result = maybe_select_extension_native_for_builtin(
             base.clone(),
             Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt),
             true,
@@ -7424,7 +7428,7 @@ steps:
     #[test]
     fn maybe_select_extension_native_noop_for_non_chatgpt() {
         let base = vec![RecipeTransport::AgentBrowser];
-        let result = maybe_select_extension_native_for_chatgpt(base.clone(), None, false, true);
+        let result = maybe_select_extension_native_for_builtin(base.clone(), None, false, true);
         assert_eq!(result, base);
     }
 
@@ -7435,7 +7439,7 @@ steps:
             RecipeTransport::ChromeExtensionNative,
             RecipeTransport::Manual,
         ];
-        let result = maybe_select_extension_native_for_chatgpt(
+        let result = maybe_select_extension_native_for_builtin(
             base,
             Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt),
             false,
@@ -7517,7 +7521,7 @@ steps:
         );
 
         let base = recipe_transports(&recipe, Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt));
-        let promoted = maybe_select_extension_native_for_chatgpt(
+        let promoted = maybe_select_extension_native_for_builtin(
             base,
             Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt),
             recipe.transports.is_some(),

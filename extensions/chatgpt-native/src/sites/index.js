@@ -1,7 +1,9 @@
 import { chatgptSiteAdapter } from "./chatgpt.js";
+import { claudeSiteAdapter } from "./claude.js";
 
 const adapters = new Map([
-  [chatgptSiteAdapter.recipe, chatgptSiteAdapter]
+  [chatgptSiteAdapter.recipe, chatgptSiteAdapter],
+  [claudeSiteAdapter.recipe, claudeSiteAdapter]
 ]);
 
 export function advertisedRecipes() {

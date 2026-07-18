@@ -163,12 +163,14 @@ required = {
     "icons/icon-48.png",
     "icons/icon-128.png",
     "src/chatgpt-dom.js",
+    "src/claude-dom.js",
     "src/chunks.js",
     "src/content-script.js",
     "src/protocol.js",
     "src/service-worker.js",
     "src/sites/chatgpt-backend.js",
     "src/sites/chatgpt.js",
+    "src/sites/claude.js",
     "src/sites/index.js",
 }
 with zipfile.ZipFile(zip_path) as archive:
