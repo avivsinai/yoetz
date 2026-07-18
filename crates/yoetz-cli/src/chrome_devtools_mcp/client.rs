@@ -169,6 +169,26 @@ impl Snapshot {
         })
     }
 
+    pub fn find_uid_by_role_and_text(&self, role: &str, text: &str) -> Option<String> {
+        let wanted_role = role.trim();
+        let wanted_text = text.trim().to_ascii_lowercase();
+        if wanted_role.is_empty() || wanted_text.is_empty() {
+            return None;
+        }
+
+        walk_snapshot(&self.raw, &mut |node| {
+            if node.get("role").and_then(Value::as_str) != Some(wanted_role)
+                || !node_contains_text(node, &wanted_text)
+            {
+                return None;
+            }
+
+            node.get("id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+    }
+
     pub fn find_uid_by_text(&self, text: &str) -> Option<String> {
         let wanted = text.trim().to_ascii_lowercase();
         if wanted.is_empty() {
@@ -586,6 +606,52 @@ impl ChromeCdpClient {
         })
     }
 
+    /// Open a recipe-owned sibling tab through an already attached tab from
+    /// the same site. The anchor is never navigated or otherwise mutated.
+    pub async fn open_recipe_page_via_existing_site_anchor(
+        &self,
+        url: &str,
+        site_host: &str,
+        background: bool,
+        timeout_ms: u64,
+        browser_context_id: Option<&str>,
+    ) -> Result<NewPageResult> {
+        let targets = self
+            .wait_for_recovery_anchor_candidates(browser_context_id, timeout_ms.min(3_000))
+            .await?;
+        let anchor = targets
+            .iter()
+            .find(|target| url_has_host(&target.url, site_host))
+            .or_else(|| {
+                targets
+                    .iter()
+                    .filter_map(|target| context_tab_reuse_rank(&target.url).map(|rank| (rank, target)))
+                    .min_by_key(|(rank, _)| *rank)
+                    .map(|(_, target)| target)
+            })
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} has no existing `{site_host}` or yoetz-safe tab to use as a window.open anchor for `{url}`",
+                    browser_context_label(browser_context_id)
+                )
+            })?;
+        let tab = self
+            .open_page_via_anchor_target(
+                anchor,
+                url,
+                background,
+                timeout_ms,
+                browser_context_id,
+                "existing same-site recipe tab",
+            )
+            .await?;
+        configure_tab_timeout(&tab, timeout_ms);
+        self.set_selected_tab(tab.clone());
+        Ok(NewPageResult {
+            page_id: tab.get_target_id().to_string(),
+        })
+    }
+
     pub async fn select_chatgpt_page_for_probe(
         &self,
         timeout_ms: u64,
@@ -667,6 +733,17 @@ impl ChromeCdpClient {
                 .click()
                 .with_context(|| format!("double-clicking snapshot element `{uid}` failed"))?;
         }
+        Ok(())
+    }
+
+    /// Dispatch a real CDP mouse-moved event over a snapshot element. This is
+    /// required for hover-only menus that ignore synthetic JavaScript events.
+    pub async fn hover(&self, uid: &str) -> Result<()> {
+        let tab = self.selected_tab()?;
+        let element = find_snapshot_element(&tab, uid)?;
+        element
+            .move_mouse_over()
+            .with_context(|| format!("moving mouse over snapshot element `{uid}` failed"))?;
         Ok(())
     }
 
@@ -2486,6 +2563,13 @@ fn is_chatgpt_url(url: &str) -> bool {
     )
 }
 
+fn url_has_host(url: &str, expected_host: &str) -> bool {
+    Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_owned))
+        .is_some_and(|host| host.eq_ignore_ascii_case(expected_host))
+}
+
 fn yoetz_run_id_from_url(url: &str) -> Option<String> {
     let parsed = Url::parse(url).ok()?;
     parsed
@@ -3500,6 +3584,27 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_find_uid_by_role_and_text_uses_visible_text_when_aria_name_differs() {
+        let snapshot = Snapshot {
+            raw: json!({
+                "id": "root",
+                "role": "root_web_area",
+                "children": [{
+                    "id": "effort-trigger",
+                    "role": "menuitem",
+                    "name": "Change effort level",
+                    "text": "Effort High"
+                }]
+            }),
+        };
+
+        assert_eq!(
+            snapshot.find_uid_by_role_and_text("menuitem", "Effort"),
+            Some("effort-trigger".to_owned())
+        );
+    }
+
+    #[test]
     fn snapshot_find_uid_by_text_searches_all_string_fields() {
         let snapshot = snapshot_fixture();
         assert_eq!(
@@ -3866,6 +3971,16 @@ mod tests {
         assert!(is_chatgpt_title(Some("ChatGPT Workspace")));
         assert!(!is_chatgpt_title(Some("Notes about ChatGPT pricing")));
         assert!(!is_chatgpt_title(Some("Docs")));
+    }
+
+    #[test]
+    fn generic_recipe_anchor_host_match_is_exact() {
+        assert!(url_has_host("https://claude.ai/chat/example", "claude.ai"));
+        assert!(!url_has_host(
+            "https://claude.ai.evil.example/chat/example",
+            "claude.ai"
+        ));
+        assert!(!url_has_host("https://chatgpt.com/", "claude.ai"));
     }
 
     #[test]

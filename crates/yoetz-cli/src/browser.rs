@@ -222,9 +222,12 @@ pub fn use_dev_browser() -> bool {
     crate::dev_browser::has_any_backend()
 }
 
-pub fn recipe_transports(recipe: &Recipe, is_chatgpt: bool) -> Vec<RecipeTransport> {
+pub fn recipe_transports(
+    recipe: &Recipe,
+    builtin_recipe: Option<crate::web_recipe::BuiltinWebRecipe>,
+) -> Vec<RecipeTransport> {
     recipe.transports.clone().unwrap_or_else(|| {
-        if is_chatgpt {
+        if builtin_recipe.is_some() {
             // Chrome 147+ compat waterfall. chrome-devtools-mcp is primary
             // because it is the only tier that works against a running
             // logged-in Chrome 147 default profile (Playwright-based
@@ -252,11 +255,14 @@ pub fn recipe_transports(recipe: &Recipe, is_chatgpt: bool) -> Vec<RecipeTranspo
 /// is unhealthy.
 pub fn maybe_select_extension_native_for_chatgpt(
     transports: Vec<RecipeTransport>,
-    is_chatgpt: bool,
+    builtin_recipe: Option<crate::web_recipe::BuiltinWebRecipe>,
     recipe_transports_pinned: bool,
     extension_connected: bool,
 ) -> Vec<RecipeTransport> {
-    if !is_chatgpt || recipe_transports_pinned || !extension_connected {
+    if builtin_recipe != Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt)
+        || recipe_transports_pinned
+        || !extension_connected
+    {
         return transports;
     }
     vec![RecipeTransport::ChromeExtensionNative]
@@ -7335,7 +7341,7 @@ steps:
         // then dev-browser for Chrome ≤ 146 / Chrome for Testing, then
         // agent-browser for cookie/profile managed flows, then manual.
         assert_eq!(
-            recipe_transports(&recipe, true),
+            recipe_transports(&recipe, Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt)),
             vec![
                 RecipeTransport::ChromeDevtoolsMcp,
                 RecipeTransport::DevBrowser,
@@ -7344,8 +7350,30 @@ steps:
             ]
         );
         assert_eq!(
-            recipe_transports(&recipe, false),
+            recipe_transports(&recipe, None),
             vec![RecipeTransport::AgentBrowser]
+        );
+    }
+
+    #[test]
+    fn recipe_transports_default_to_same_builtin_claude_funnel() {
+        let recipe = serde_yaml_ng::from_str::<Recipe>(
+            r#"
+name: claude
+steps:
+  - action: open
+    args: ["https://claude.ai/new"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            recipe_transports(&recipe, Some(crate::web_recipe::BuiltinWebRecipe::Claude)),
+            vec![
+                RecipeTransport::ChromeDevtoolsMcp,
+                RecipeTransport::DevBrowser,
+                RecipeTransport::AgentBrowser,
+                RecipeTransport::Manual,
+            ]
         );
     }
 
@@ -7357,7 +7385,12 @@ steps:
             RecipeTransport::AgentBrowser,
             RecipeTransport::Manual,
         ];
-        let promoted = maybe_select_extension_native_for_chatgpt(base, true, false, true);
+        let promoted = maybe_select_extension_native_for_chatgpt(
+            base,
+            Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt),
+            false,
+            true,
+        );
         assert_eq!(promoted, vec![RecipeTransport::ChromeExtensionNative]);
     }
 
@@ -7367,21 +7400,31 @@ steps:
             RecipeTransport::ChromeDevtoolsMcp,
             RecipeTransport::DevBrowser,
         ];
-        let result = maybe_select_extension_native_for_chatgpt(base.clone(), true, false, false);
+        let result = maybe_select_extension_native_for_chatgpt(
+            base.clone(),
+            Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt),
+            false,
+            false,
+        );
         assert_eq!(result, base);
     }
 
     #[test]
     fn maybe_select_extension_native_noop_when_recipe_pinned_transports() {
         let base = vec![RecipeTransport::ChromeDevtoolsMcp, RecipeTransport::Manual];
-        let result = maybe_select_extension_native_for_chatgpt(base.clone(), true, true, true);
+        let result = maybe_select_extension_native_for_chatgpt(
+            base.clone(),
+            Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt),
+            true,
+            true,
+        );
         assert_eq!(result, base);
     }
 
     #[test]
     fn maybe_select_extension_native_noop_for_non_chatgpt() {
         let base = vec![RecipeTransport::AgentBrowser];
-        let result = maybe_select_extension_native_for_chatgpt(base.clone(), false, false, true);
+        let result = maybe_select_extension_native_for_chatgpt(base.clone(), None, false, true);
         assert_eq!(result, base);
     }
 
@@ -7392,7 +7435,12 @@ steps:
             RecipeTransport::ChromeExtensionNative,
             RecipeTransport::Manual,
         ];
-        let result = maybe_select_extension_native_for_chatgpt(base, true, false, true);
+        let result = maybe_select_extension_native_for_chatgpt(
+            base,
+            Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt),
+            false,
+            true,
+        );
         assert_eq!(result, vec![RecipeTransport::ChromeExtensionNative]);
     }
 
@@ -7468,10 +7516,10 @@ steps:
              chrome-extension-native auto-selection gates correctly"
         );
 
-        let base = recipe_transports(&recipe, true);
+        let base = recipe_transports(&recipe, Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt));
         let promoted = maybe_select_extension_native_for_chatgpt(
             base,
-            true,
+            Some(crate::web_recipe::BuiltinWebRecipe::Chatgpt),
             recipe.transports.is_some(),
             true,
         );
@@ -7482,6 +7530,33 @@ steps:
              auto-select chrome-extension-native and fail closed instead of \
              silently falling through to CDP/dev-browser transports"
         );
+    }
+
+    #[test]
+    fn builtin_claude_recipe_declares_typed_defaults_without_pinning_transports() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/claude.yaml");
+        let content = fs::read_to_string(&path).expect("read recipes/claude.yaml");
+        let recipe: Recipe = serde_yaml_ng::from_str(&content).expect("parse claude.yaml");
+        assert!(recipe.transports.is_none());
+        let defaults = recipe.defaults.expect("Claude defaults");
+        assert_eq!(defaults.get("thread").map(String::as_str), Some("fresh"));
+        assert_eq!(
+            defaults.get("inline_warn_tokens").map(String::as_str),
+            Some("150000")
+        );
+        for action in [
+            "claude_select_model",
+            "claude_open_attachment_ui",
+            "claude_upload_bundle",
+            "claude_wait_upload",
+            "claude_send",
+            "claude_wait_response",
+        ] {
+            assert!(
+                content.contains(&format!("- action: {action}")),
+                "missing {action}"
+            );
+        }
     }
 
     #[test]

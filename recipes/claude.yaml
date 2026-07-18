@@ -1,16 +1,59 @@
 name: claude
+# Authoritative typed contract: crates/yoetz-cli/src/claude_recipe.rs.
+#
+# Default extension-free transport order:
+#   chrome-devtools-mcp -> dev-browser -> agent-browser -> manual.
+# Wave 1 implements the CDP vertical slice. The literal claude_* actions below
+# reserve the same contract for the fallback transports delivered in Wave 3.
+#
+# Exact model policy: Fable 5, Effort=Max, Thinking=on. Selection is
+# fail-closed. `--model-strategy current` and vars model/effort/thinking are
+# rejected. The picker diagnostics list the live options when Fable is absent.
+#
+# Conversation/followup: `conversation=<uuid|https://claude.ai/chat/<uuid>>`
+# and `--followup` are native-extension-only. Wave 1 rejects them before CDP or
+# other fallback side effects; omitting them creates a fresh marked `/new` tab.
+#
+# inline_warn_tokens is a heuristic quality guard, not a documented Claude
+# cutoff. Above it, claude.ai may use retrieval-backed file access. Set 0 to
+# disable. Existing bundle byte caps are unchanged.
+
+defaults:
+  prompt: Review the attached file and provide your analysis.
+  thread: "fresh"
+  upload_timeout_ms: "120000"
+  upload_interval_ms: "2000"
+  send_timeout_ms: "120000"
+  wait_timeout_ms: "5400000"
+  wait_interval_ms: "30000"
+  inline_warn_tokens: "150000"
+
 steps:
   - action: open
-    args: ["https://claude.ai/new"]
-  - action: wait
-    args: ["--load", "domcontentloaded"]
+    args: ["https://claude.ai/new?_yoetz={{run_id}}"]
+  - sleep_ms: 4000
+
+  - action: eval
+    args:
+      - |
+        (() => {
+          window.name = "yoetz:{{run_id}}";
+          return "marked yoetz-owned claude tab";
+        })()
+  - sleep_ms: 500
+
+  - action: claude_select_model
+  - action: claude_open_attachment_ui
+  - action: claude_upload_bundle
+  - action: claude_wait_upload
+    args: ["--interval-ms", "{{upload_interval_ms}}", "--timeout-ms", "{{upload_timeout_ms}}"]
+
+  - action: type
+    args: ["[data-testid='chat-input']", "{{prompt}}"]
+  - action: claude_send
+  - action: claude_wait_response
+    args: ["--interval-ms", "{{wait_interval_ms}}", "--timeout-ms", "{{wait_timeout_ms}}"]
+    timeout_ms: 10000
+
   - action: snapshot
-    args: ["-i", "-c", "--json"]
-  - action: find
-    args: ["placeholder", "Message", "fill", "{{bundle_text}}"]
-  - action: find
-    args: ["role", "button", "click", "--name", "Send"]
-  - action: wait
-    args: ["--load", "networkidle"]
-  - action: snapshot
-    args: ["-i", "-c", "--json"]
+    args: ["-c", "--json"]

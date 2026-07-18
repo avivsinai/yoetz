@@ -33,11 +33,7 @@
 pub mod client;
 
 pub mod chatgpt;
-
-// `pub mod claude;` and `pub mod gemini;` land after the chatgpt recipe is
-// proven end-to-end against live Chrome 147. They share the same seven-step
-// shape (new_page → focus → upload → type → click → wait → extract) with
-// per-LLM selectors — trivial to add once the client plumbing is verified.
+pub mod claude;
 
 use crate::chatgpt_web;
 use anyhow::Result;

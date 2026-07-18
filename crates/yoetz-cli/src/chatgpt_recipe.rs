@@ -1,20 +1,16 @@
 //! ChatGPT recipe output types and terminal-fallback phase markers.
 
 use anyhow::Error as AnyhowError;
-use clap::ValueEnum;
-use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::fmt;
 use std::path::PathBuf;
 
-pub const CHATGPT_SOL_PRO_MODEL: &str = "gpt-5-6-sol-pro";
+use crate::web_recipe::{self, BuiltinWebRecipe};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ChatgptTransportPhase {
-    Upload,
-    Send,
-    WaitResponse,
-}
+pub type ChatgptTransportPhase = web_recipe::WebRecipeTransportPhase;
+pub type ChatgptModelStrategy = web_recipe::WebModelStrategy;
+pub type ChatgptModelSelectionStatus = web_recipe::WebModelSelectionStatus;
+
+pub const CHATGPT_SOL_PRO_MODEL: &str = "gpt-5-6-sol-pro";
 
 pub(crate) trait AnyhowResultExt<T> {
     fn with_chatgpt_phase(self, phase: ChatgptTransportPhase) -> Result<T, AnyhowError>;
@@ -26,43 +22,13 @@ impl<T> AnyhowResultExt<T> for Result<T, AnyhowError> {
     }
 }
 
-impl fmt::Display for ChatgptTransportPhase {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Upload => "upload",
-            Self::Send => "send",
-            Self::WaitResponse => "wait_response",
-        })
-    }
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error(
-    "ChatGPT {phase} phase failed after browser side effects; automatic transport fallback is disabled"
-)]
-pub struct ChatgptTerminalFallbackError {
-    phase: ChatgptTransportPhase,
-}
-
-impl ChatgptTerminalFallbackError {
-    pub fn phase(&self) -> ChatgptTransportPhase {
-        self.phase
-    }
-}
-
 pub fn mark_terminal_fallback_phase(err: AnyhowError, phase: ChatgptTransportPhase) -> AnyhowError {
-    err.context(ChatgptTerminalFallbackError { phase })
+    web_recipe::mark_terminal_fallback_phase(err, BuiltinWebRecipe::Chatgpt, phase)
 }
 
 pub fn terminal_fallback_phase(err: &AnyhowError) -> Option<ChatgptTransportPhase> {
-    if let Some(marker) = err.downcast_ref::<ChatgptTerminalFallbackError>() {
-        return Some(marker.phase());
-    }
-
-    for cause in err.chain() {
-        if let Some(marker) = cause.downcast_ref::<ChatgptTerminalFallbackError>() {
-            return Some(marker.phase());
-        }
+    if let Some((BuiltinWebRecipe::Chatgpt, phase)) = web_recipe::terminal_fallback_marker(err) {
+        return Some(phase);
     }
 
     classify_terminal_fallback_phase_message(&format!("{err:#}"))
@@ -131,23 +97,6 @@ pub(crate) fn classify_terminal_fallback_phase_message(
 pub enum ChatgptDeliveryMode {
     FileUpload,
     Paste,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize, ValueEnum)]
-#[serde(rename_all = "snake_case")]
-pub enum ChatgptModelStrategy {
-    Select,
-    Current,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ChatgptModelSelectionStatus {
-    Selected,
-    KeptCurrent,
-    Current,
-    Unavailable,
-    Mismatch,
 }
 
 impl ChatgptDeliveryMode {
