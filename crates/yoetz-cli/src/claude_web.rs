@@ -294,9 +294,13 @@ pub fn build_attachment_probe_function(file_name: &str) -> Result<String> {
     String(node.querySelector("h3")?.textContent || "").trim() === expected &&
     !!node.querySelector("button[aria-label='Remove']")
   );
+  const pastedContent = nodes.find((node) =>
+    String(node.querySelector("h3")?.textContent || node.textContent || "").replace(/\s+/g, " ").trim().toLowerCase().includes("pasted content") &&
+    !!node.querySelector("button[aria-label='Remove']")
+  );
   const send = document.querySelector("button[aria-label='Send message']");
   const sendEnabled = !!send && !send.disabled && send.getAttribute("aria-disabled") !== "true";
-  return {{ status: matched && sendEnabled ? "candidate" : "pending", count: nodes.length, labels, sendEnabled }};
+  return {{ status: (matched || pastedContent) && sendEnabled ? "candidate" : "pending", count: nodes.length, labels, sendEnabled, pastedContent: !!pastedContent }};
 }}"##,
         attachment_selector = ATTACHMENT_SELECTOR
     ))
@@ -434,6 +438,7 @@ mod tests {
         assert!(build_scope_file_input_function().contains("file-upload"));
         let attachment = build_attachment_probe_function("bundle.md").unwrap();
         assert!(attachment.contains("file-thumbnail"));
+        assert!(attachment.contains("pasted content"));
         assert!(attachment.contains("querySelector(\"h3\")"));
         assert!(attachment.contains("button[aria-label='Remove']"));
         assert!(attachment.contains("sendEnabled ? \"candidate\""));

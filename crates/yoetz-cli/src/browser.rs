@@ -19,6 +19,9 @@ use crate::chrome_devtools_mcp::client::{
     discover_local_chromium_processes, discover_running_chrome_targets, infer_email_hints,
     ChromiumProcessSummary, DevtoolsActivePortFile, RunningChromeTarget,
 };
+use crate::claude_recipe::AnyhowResultExt as ClaudeAnyhowResultExt;
+use crate::web_recipe::{WebModelSelectionStatus, WebRecipeTransportPhase};
+use crate::{claude_recipe, claude_web};
 use yoetz_core::output::{write_json, write_jsonl_event, OutputFormat};
 use yoetz_core::paths::home_dir;
 
@@ -37,6 +40,12 @@ const CHATGPT_SELECT_MODEL_ACTION: &str = "chatgpt_select_model";
 const CHATGPT_OPEN_ATTACHMENT_UI_ACTION: &str = "chatgpt_open_attachment_ui";
 const CHATGPT_UPLOAD_BUNDLE_ACTION: &str = "chatgpt_upload_bundle";
 const CHATGPT_SEND_ACTION: &str = "chatgpt_send";
+const CLAUDE_WAIT_ACTION: &str = "claude_wait_response";
+const CLAUDE_WAIT_UPLOAD_ACTION: &str = "claude_wait_upload";
+const CLAUDE_SELECT_MODEL_ACTION: &str = "claude_select_model";
+const CLAUDE_OPEN_ATTACHMENT_UI_ACTION: &str = "claude_open_attachment_ui";
+const CLAUDE_UPLOAD_BUNDLE_ACTION: &str = "claude_upload_bundle";
+const CLAUDE_SEND_ACTION: &str = "claude_send";
 const CHATGPT_POLL_ATTEMPTS_DEFAULT: usize = 60;
 const CHATGPT_POLL_INTERVAL_MS_DEFAULT: u64 = 30_000;
 const CHATGPT_POLL_TOTAL_TIMEOUT_MS_DEFAULT: u64 = 5_400_000;
@@ -109,6 +118,7 @@ pub struct RecipeContext {
     pub use_stealth: bool,
     pub headed: bool,
     pub vars: BTreeMap<String, String>,
+    pub warnings: Vec<String>,
     /// Target URL for captcha recovery (defaults to CHATGPT_URL).
     pub target_url: String,
 }
@@ -530,12 +540,19 @@ fn run_recipe_with_connection(
         .name
         .as_deref()
         .is_some_and(|name| name.eq_ignore_ascii_case("chatgpt"));
-    let collect_step_events = wants_json || (wants_jsonl && is_chatgpt_recipe);
+    let is_claude_recipe = recipe
+        .name
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case("claude"));
+    let collect_step_events = wants_json || is_claude_recipe || (wants_jsonl && is_chatgpt_recipe);
     let mut events: Vec<Value> = Vec::new();
     let mut headed = ctx.headed;
     let mut pending_chatgpt_send_baseline: Option<ChatgptResponseBaseline> = None;
+    let mut pending_claude_send_baseline: Option<ClaudeResponseBaseline> = None;
     let mut chatgpt_stage = ChatgptRecipeStage::Idle;
+    let mut claude_stage = ClaudeRecipeStage::Idle;
     let mut chatgpt_focus_cache = ChatgptRunTabFocusCache::default();
+    let recipe_started_at = Instant::now();
 
     if let Some(connection) = connection {
         if connection.is_live_attach() {
@@ -821,16 +838,148 @@ fn run_recipe_with_connection(
             continue;
         }
 
+        if action == CLAUDE_SELECT_MODEL_ACTION {
+            let stdout = run_claude_select_model(connection, ctx.use_stealth, headed)
+                .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+            record_builtin_step_event(
+                &mut events,
+                wants_json,
+                wants_jsonl,
+                collect_step_events,
+                idx,
+                action,
+                step,
+                &stdout,
+            )?;
+            continue;
+        }
+
+        if action == CLAUDE_OPEN_ATTACHMENT_UI_ACTION {
+            let stdout = run_claude_open_attachment_ui(connection, ctx.use_stealth, headed)
+                .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+            record_builtin_step_event(
+                &mut events,
+                wants_json,
+                wants_jsonl,
+                collect_step_events,
+                idx,
+                action,
+                step,
+                &stdout,
+            )?;
+            continue;
+        }
+
+        if action == CLAUDE_UPLOAD_BUNDLE_ACTION {
+            claude_stage.mark_upload_started();
+            let stdout = run_claude_upload_bundle(&ctx, connection, ctx.use_stealth, headed)
+                .with_claude_phase(WebRecipeTransportPhase::Upload)
+                .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+            record_builtin_step_event(
+                &mut events,
+                wants_json,
+                wants_jsonl,
+                collect_step_events,
+                idx,
+                action,
+                step,
+                &stdout,
+            )?;
+            continue;
+        }
+
+        if action == CLAUDE_WAIT_UPLOAD_ACTION {
+            claude_stage.mark_upload_started();
+            let stdout = run_claude_wait_upload(
+                &ctx,
+                step.args.as_deref(),
+                connection,
+                ctx.use_stealth,
+                headed,
+            )
+            .with_claude_phase(WebRecipeTransportPhase::Upload)
+            .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+            record_builtin_step_event(
+                &mut events,
+                wants_json,
+                wants_jsonl,
+                collect_step_events,
+                idx,
+                action,
+                step,
+                &stdout,
+            )?;
+            continue;
+        }
+
+        if action == CLAUDE_SEND_ACTION {
+            let stdout = run_claude_send(connection, ctx.use_stealth, headed)
+                .with_claude_phase(WebRecipeTransportPhase::Send)
+                .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+            pending_claude_send_baseline = parse_claude_send_baseline_from_stdout(&stdout);
+            claude_stage.mark_send_succeeded();
+            record_builtin_step_event(
+                &mut events,
+                wants_json,
+                wants_jsonl,
+                collect_step_events,
+                idx,
+                action,
+                step,
+                &stdout,
+            )?;
+            continue;
+        }
+
+        if action == CLAUDE_WAIT_ACTION {
+            let interpolated_args: Option<Vec<String>> = step
+                .args
+                .as_ref()
+                .map(|args| {
+                    args.iter()
+                        .map(|arg| interpolate(arg, &ctx, None))
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()
+                .with_claude_phase(WebRecipeTransportPhase::WaitResponse)
+                .with_context(|| format!("recipe step {idx} ({action}) var interpolation"))?;
+            let stdout = run_claude_wait_response(
+                interpolated_args.as_deref(),
+                connection,
+                pending_claude_send_baseline.take(),
+                ctx.use_stealth,
+                headed,
+            )
+            .with_claude_phase(WebRecipeTransportPhase::WaitResponse)
+            .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+            record_builtin_step_event(
+                &mut events,
+                wants_json,
+                wants_jsonl,
+                collect_step_events,
+                idx,
+                action,
+                step,
+                &stdout,
+            )?;
+            continue;
+        }
+
         if is_chatgpt_recipe && action == "upload" {
             chatgpt_stage.mark_upload_started();
         }
-        let action_terminal_phase = if is_chatgpt_recipe {
-            chatgpt_stage.terminal_phase(action)
-        } else {
-            None
-        };
+        if is_claude_recipe && action == "upload" {
+            claude_stage.mark_upload_started();
+        }
+        let action_terminal_phase = is_chatgpt_recipe
+            .then(|| chatgpt_stage.terminal_phase(action))
+            .flatten();
+        let claude_action_terminal_phase = is_claude_recipe
+            .then(|| claude_stage.terminal_phase(action))
+            .flatten();
         let commands = expand_step(action, step.args.as_deref(), &ctx)
             .map_err(|err| mark_chatgpt_error_after_side_effect(err, action_terminal_phase))
+            .map_err(|err| mark_claude_error_after_side_effect(err, claude_action_terminal_phase))
             .with_context(|| format!("recipe step {idx} ({action}) expand failed"))?;
 
         for args in commands {
@@ -876,18 +1025,24 @@ fn run_recipe_with_connection(
                             step.timeout_ms,
                         )
                         .map_err(|err| {
-                            mark_chatgpt_error_after_side_effect(err, action_terminal_phase)
+                            let err =
+                                mark_chatgpt_error_after_side_effect(err, action_terminal_phase);
+                            mark_claude_error_after_side_effect(err, claude_action_terminal_phase)
                         })?
                     } else {
-                        return Err(mark_chatgpt_error_after_side_effect(
+                        let err = mark_chatgpt_error_after_side_effect(
                             err.context(format!("recipe step {idx} ({action}) failed")),
                             action_terminal_phase,
+                        );
+                        return Err(mark_claude_error_after_side_effect(
+                            err,
+                            claude_action_terminal_phase,
                         ));
                     }
                 }
             };
 
-            if wants_json || wants_jsonl {
+            if wants_json || wants_jsonl || is_claude_recipe {
                 let stdout_value =
                     parse_stdout_json(&stdout).unwrap_or(Value::String(stdout.clone()));
                 let event = json!({
@@ -909,8 +1064,23 @@ fn run_recipe_with_connection(
         }
     }
 
+    let elapsed_ms = recipe_started_at
+        .elapsed()
+        .as_millis()
+        .min(u128::from(u64::MAX)) as u64;
     let payload = if is_chatgpt_recipe {
         chatgpt_recipe_payload_from_steps(&events, ctx.fallback_used)
+    } else if is_claude_recipe {
+        claude_recipe_payload_from_steps(
+            &events,
+            ctx.fallback_used,
+            ctx.vars
+                .get("run_id")
+                .map(String::as_str)
+                .unwrap_or_default(),
+            elapsed_ms,
+            &ctx.warnings,
+        )
     } else {
         json!({
             "name": recipe.name,
@@ -948,7 +1118,51 @@ fn run_recipe_with_connection(
         write_jsonl_event(&event)?;
     }
 
+    if wants_jsonl && is_claude_recipe {
+        let mut event = payload.clone();
+        if let Some(object) = event.as_object_mut() {
+            object.remove("status");
+            object.remove("steps");
+            object.insert("type".to_string(), "recipe_complete".into());
+        }
+        write_jsonl_event(&event)?;
+    }
+
+    if !wants_json && !wants_jsonl && is_claude_recipe {
+        println!("{}", payload["response"].as_str().unwrap_or_default());
+    }
+
     Ok(payload)
+}
+
+fn record_builtin_step_event(
+    events: &mut Vec<Value>,
+    wants_json: bool,
+    wants_jsonl: bool,
+    collect_step_events: bool,
+    index: usize,
+    action: &str,
+    step: &RecipeStep,
+    stdout: &str,
+) -> Result<()> {
+    if !wants_json && !wants_jsonl && !collect_step_events {
+        return Ok(());
+    }
+    let stdout_value = parse_stdout_json(stdout).unwrap_or(Value::String(stdout.to_string()));
+    let event = json!({
+        "type": "browser_step",
+        "index": index,
+        "action": action,
+        "args": step.args,
+        "stdout": stdout_value,
+    });
+    if wants_jsonl {
+        write_jsonl_event(&event)?;
+    }
+    if collect_step_events {
+        events.push(event);
+    }
+    Ok(())
 }
 
 fn chatgpt_recipe_payload_from_steps(steps: &[Value], fallback_used: bool) -> Value {
@@ -1002,6 +1216,83 @@ fn chatgpt_recipe_payload_from_steps(steps: &[Value], fallback_used: bool) -> Va
         auto_paste_fallback: false,
         conversation_id: None,
         conversation_url: None,
+    };
+    let mut payload = output.to_value();
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("steps".to_string(), json!(steps));
+    }
+    payload
+}
+
+fn claude_recipe_payload_from_steps(
+    steps: &[Value],
+    fallback_used: bool,
+    run_id: &str,
+    elapsed_ms: u64,
+    preflight_warnings: &[String],
+) -> Value {
+    let mut response = String::new();
+    let mut model_used = None;
+    let mut model_selection_status = WebModelSelectionStatus::Unavailable;
+    let mut warnings = preflight_warnings.to_vec();
+    let mut conversation_id = None;
+    let mut conversation_url = None;
+
+    for step in steps {
+        let action = step
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let stdout = step.get("stdout").unwrap_or(&Value::Null);
+        if action == CLAUDE_SELECT_MODEL_ACTION {
+            model_used = stdout
+                .get("model_used")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(value) = stdout.get("model_selection_status").cloned() {
+                if let Ok(status) = serde_json::from_value(value) {
+                    model_selection_status = status;
+                }
+            }
+        }
+        if action == CLAUDE_WAIT_ACTION {
+            response = stdout
+                .get("response")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            conversation_id = stdout
+                .get("conversation_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            conversation_url = stdout
+                .get("conversation_url")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if let Some(items) = stdout.get("warnings").and_then(Value::as_array) {
+                warnings.extend(
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(str::to_string),
+                );
+            }
+        }
+    }
+
+    let output = claude_recipe::ClaudeRecipeOutput {
+        transport: "agent-browser".to_string(),
+        backend: "agent-browser".to_string(),
+        response,
+        model_used,
+        model_selection_status,
+        warnings,
+        fallback_used,
+        conversation_id,
+        conversation_url,
+        run_id: run_id.to_string(),
+        elapsed_ms,
     };
     let mut payload = output.to_value();
     if let Some(object) = payload.as_object_mut() {
@@ -1082,6 +1373,54 @@ fn mark_chatgpt_error_after_side_effect(
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaudeRecipeStage {
+    Idle,
+    UploadStarted,
+    SendSucceeded,
+}
+
+impl ClaudeRecipeStage {
+    fn mark_upload_started(&mut self) {
+        if *self == Self::Idle {
+            *self = Self::UploadStarted;
+        }
+    }
+
+    fn mark_send_succeeded(&mut self) {
+        *self = Self::SendSucceeded;
+    }
+
+    fn terminal_phase(self, action: &str) -> Option<WebRecipeTransportPhase> {
+        if self == Self::SendSucceeded {
+            return Some(WebRecipeTransportPhase::WaitResponse);
+        }
+        match action {
+            CLAUDE_WAIT_ACTION => Some(WebRecipeTransportPhase::WaitResponse),
+            CLAUDE_SEND_ACTION => Some(WebRecipeTransportPhase::Send),
+            CLAUDE_WAIT_UPLOAD_ACTION | CLAUDE_UPLOAD_BUNDLE_ACTION | "upload" => {
+                Some(WebRecipeTransportPhase::Upload)
+            }
+            _ if self == Self::UploadStarted => Some(WebRecipeTransportPhase::Upload),
+            _ => None,
+        }
+    }
+}
+
+fn mark_claude_error_after_side_effect(
+    err: anyhow::Error,
+    phase: Option<WebRecipeTransportPhase>,
+) -> anyhow::Error {
+    match phase {
+        Some(phase) => crate::web_recipe::mark_terminal_fallback_phase(
+            err,
+            crate::web_recipe::BuiltinWebRecipe::Claude,
+            phase,
+        ),
+        None => err,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ChatgptSendState {
     Enabled,
     Disabled,
@@ -1101,6 +1440,31 @@ struct ChatgptDomState {
     assistant_last_len: usize,
     /// Error text from scoped toast/alert containers (empty = no error).
     error: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClaudeResponseBaseline {
+    count: i64,
+    last_length: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ClaudeResponseState {
+    count: i64,
+    last_length: i64,
+    text: String,
+    streaming: bool,
+    stop: bool,
+    thinking: bool,
+    copy_buttons: usize,
+    error: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaudeCompletionVerdict {
+    Generating,
+    CopyButton,
+    Idle,
 }
 
 /// Per-poll classification of ChatGPT response state.
@@ -1958,6 +2322,433 @@ fn parse_chatgpt_send_baseline(result: &Value) -> Option<ChatgptResponseBaseline
 fn parse_chatgpt_send_baseline_from_stdout(stdout: &str) -> Option<ChatgptResponseBaseline> {
     let payload = parse_stdout_json(stdout)?;
     parse_chatgpt_send_baseline(&payload)
+}
+
+fn run_claude_dom_function(
+    function_source: &str,
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<Value> {
+    let expression = chatgpt_web::wrap_function_source_for_json_eval(function_source)?;
+    let stdout = run_agent_browser_with_connection_timeout(
+        vec!["eval".to_string(), expression],
+        OutputFormat::Text,
+        connection,
+        use_stealth,
+        headed,
+        Some(CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT),
+    )?;
+    parse_stdout_json(&stdout).with_context(|| format!("parse Claude DOM action result: {stdout}"))
+}
+
+fn require_claude_status(value: &Value, expected: &[&str], operation: &str) -> Result<()> {
+    let status = value
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    if expected.contains(&status) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Claude {operation} failed with status `{status}`; diagnostics={value}"
+    ))
+}
+
+fn hover_claude_effort(
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<()> {
+    let marked = run_claude_dom_function(
+        &claude_web::build_mark_effort_parent_function(),
+        connection,
+        use_stealth,
+        headed,
+    )?;
+    require_claude_status(&marked, &["marked"], "Effort menu discovery")?;
+    let selector = format!("[title='{}']", claude_web::EFFORT_HOVER_MARKER);
+    run_agent_browser_with_connection_timeout(
+        vec!["hover".to_string(), selector],
+        OutputFormat::Text,
+        connection,
+        use_stealth,
+        headed,
+        Some(CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT),
+    )?;
+    thread::sleep(Duration::from_millis(400));
+    Ok(())
+}
+
+fn open_claude_model_menu(
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<()> {
+    let state = run_claude_dom_function(
+        &claude_web::build_open_model_menu_function(),
+        connection,
+        use_stealth,
+        headed,
+    )?;
+    require_claude_status(&state, &["opened", "opening"], "model menu open")?;
+    thread::sleep(Duration::from_millis(250));
+    Ok(())
+}
+
+fn run_claude_select_model(
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<String> {
+    let readiness = run_claude_dom_function(
+        &claude_web::build_wait_for_composer_function(),
+        connection,
+        use_stealth,
+        headed,
+    )?;
+    match readiness.get("status").and_then(Value::as_str) {
+        Some("ready") => {}
+        Some("login") => bail!("Claude login is required in this browser profile"),
+        Some("challenge") => bail!(
+            "Cloudflare challenge detected on claude.ai; solve it in this browser profile and retry"
+        ),
+        other => {
+            bail!("Claude composer did not become ready; status={other:?}, diagnostics={readiness}")
+        }
+    }
+    open_claude_model_menu(connection, use_stealth, headed)?;
+    let fable = run_claude_dom_function(
+        &claude_web::build_select_fable_function(),
+        connection,
+        use_stealth,
+        headed,
+    )?;
+    require_claude_status(&fable, &["selected"], "Fable 5 selection")?;
+    thread::sleep(Duration::from_millis(300));
+
+    open_claude_model_menu(connection, use_stealth, headed)?;
+    hover_claude_effort(connection, use_stealth, headed)?;
+    let max = run_claude_dom_function(
+        &claude_web::build_select_max_function(),
+        connection,
+        use_stealth,
+        headed,
+    )?;
+    require_claude_status(&max, &["selected"], "Max effort selection")?;
+    thread::sleep(Duration::from_millis(300));
+
+    open_claude_model_menu(connection, use_stealth, headed)?;
+    hover_claude_effort(connection, use_stealth, headed)?;
+    let thinking = run_claude_dom_function(
+        &claude_web::build_ensure_thinking_on_function(),
+        connection,
+        use_stealth,
+        headed,
+    )?;
+    require_claude_status(&thinking, &["already_on", "clicked"], "Thinking enable")?;
+    thread::sleep(Duration::from_millis(300));
+
+    let _ = run_claude_dom_function(
+        &claude_web::build_close_model_menu_function(),
+        connection,
+        use_stealth,
+        headed,
+    );
+    thread::sleep(Duration::from_millis(250));
+    open_claude_model_menu(connection, use_stealth, headed)?;
+    hover_claude_effort(connection, use_stealth, headed)?;
+    let verification = run_claude_dom_function(
+        &claude_web::build_verify_fable_max_thinking_function(),
+        connection,
+        use_stealth,
+        headed,
+    )?;
+    let status = claude_web::model_selection_status(&verification);
+    let _ = run_claude_dom_function(
+        &claude_web::build_close_model_menu_function(),
+        connection,
+        use_stealth,
+        headed,
+    );
+    if status != WebModelSelectionStatus::Selected {
+        bail!(
+            "Claude exact model contract is unavailable or mismatched; required Fable 5 + Max + Thinking on; diagnostics={verification}"
+        );
+    }
+    Ok(json!({
+        "status": "ok",
+        "model_used": claude_recipe::CLAUDE_REPORTED_MODEL,
+        "model_selection_status": status,
+    })
+    .to_string())
+}
+
+fn run_claude_open_attachment_ui(
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<String> {
+    let state = run_claude_dom_function(
+        &claude_web::build_scope_file_input_function(),
+        connection,
+        use_stealth,
+        headed,
+    )?;
+    require_claude_status(&state, &["marked"], "file input discovery")?;
+    Ok(json!({"status":"ok","selector":claude_web::FILE_INPUT_SELECTOR}).to_string())
+}
+
+fn run_claude_upload_bundle(
+    ctx: &RecipeContext,
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<String> {
+    let bundle_path = ctx
+        .bundle_path
+        .as_deref()
+        .context("Claude upload requires `bundle_path` in the recipe context")?;
+    run_claude_open_attachment_ui(connection, use_stealth, headed)?;
+    let selector = format!(
+        "input[data-testid='file-upload'][title='{}']",
+        claude_web::FILE_INPUT_MARKER
+    );
+    run_agent_browser_with_connection_timeout(
+        vec![
+            "upload".to_string(),
+            selector.clone(),
+            bundle_path.to_string(),
+        ],
+        OutputFormat::Text,
+        connection,
+        use_stealth,
+        headed,
+        Some(CHATGPT_POLL_COMMAND_TIMEOUT_MS_DEFAULT),
+    )
+    .with_context(|| format!("upload `{bundle_path}` through {selector}"))?;
+    Ok(json!({"status":"ok","selector":selector}).to_string())
+}
+
+fn run_claude_wait_upload(
+    ctx: &RecipeContext,
+    args: Option<&[String]>,
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<String> {
+    let options = parse_chatgpt_poll_args(CLAUDE_WAIT_UPLOAD_ACTION, args)?;
+    let bundle_path = ctx
+        .bundle_path
+        .as_deref()
+        .context("Claude upload waiter requires `bundle_path` in the recipe context")?;
+    let file_name = Path::new(bundle_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("Claude bundle path must end in a UTF-8 filename")?;
+    let probe = claude_web::build_attachment_probe_function(file_name)?;
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(options.timeout_ms);
+    let mut stable_candidates = 0_u8;
+    for attempt in 1..=options.attempts {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if attempt > 1 {
+            thread::sleep(Duration::from_millis(options.interval_ms));
+        }
+        let state = run_claude_dom_function(&probe, connection, use_stealth, headed)?;
+        if state.get("status").and_then(Value::as_str) == Some("candidate") {
+            stable_candidates = stable_candidates.saturating_add(1);
+            if stable_candidates >= 2 {
+                return Ok(json!({"status":"ok","polls":attempt,"attachment":state}).to_string());
+            }
+        } else {
+            stable_candidates = 0;
+        }
+    }
+    Err(anyhow!(
+        "Claude attachment `{file_name}` did not become ready within {}ms",
+        options.timeout_ms
+    ))
+}
+
+fn run_claude_send(
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<String> {
+    let started = Instant::now();
+    loop {
+        let result = run_claude_dom_function(
+            &claude_web::build_send_function(),
+            connection,
+            use_stealth,
+            headed,
+        )?;
+        match result.get("status").and_then(Value::as_str) {
+            Some("sent") => {
+                return Ok(json!({
+                    "status":"ok",
+                    "assistantCountBeforeSend":result.get("assistantCount").and_then(Value::as_i64).unwrap_or(0),
+                    "assistantLastLenBeforeSend":result.get("assistantLastLength").and_then(Value::as_i64).unwrap_or(0),
+                }).to_string());
+            }
+            Some("disabled" | "missing")
+                if started.elapsed() < Duration::from_millis(CHATGPT_SEND_ENABLE_TIMEOUT_MS) =>
+            {
+                thread::sleep(Duration::from_millis(CHATGPT_SEND_ENABLE_POLL_INTERVAL_MS));
+            }
+            _ => bail!("Claude send button did not become enabled; diagnostics={result}"),
+        }
+    }
+}
+
+fn parse_claude_send_baseline_from_stdout(stdout: &str) -> Option<ClaudeResponseBaseline> {
+    let value = parse_stdout_json(stdout)?;
+    Some(ClaudeResponseBaseline {
+        count: value.get("assistantCountBeforeSend")?.as_i64()?,
+        last_length: value.get("assistantLastLenBeforeSend")?.as_i64()?,
+    })
+}
+
+fn parse_claude_response_state(value: &Value) -> Result<ClaudeResponseState> {
+    Ok(ClaudeResponseState {
+        count: value.get("count").and_then(Value::as_i64).unwrap_or(0),
+        last_length: value.get("length").and_then(Value::as_i64).unwrap_or(0),
+        text: value
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        streaming: value
+            .get("streaming")
+            .and_then(Value::as_bool)
+            .unwrap_or(true),
+        stop: value
+            .get("hasStopButton")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        thinking: value
+            .get("thinking")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        copy_buttons: value
+            .get("copyButtons")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize,
+        error: value
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    })
+}
+
+fn classify_claude_completion(
+    state: &ClaudeResponseState,
+    baseline: ClaudeResponseBaseline,
+) -> ClaudeCompletionVerdict {
+    if state.streaming || state.stop || state.thinking {
+        return ClaudeCompletionVerdict::Generating;
+    }
+    let grew = state.count > baseline.count
+        || (state.count == baseline.count && state.last_length > baseline.last_length);
+    if !grew || state.last_length == 0 {
+        return ClaudeCompletionVerdict::Generating;
+    }
+    if state.copy_buttons > 0 {
+        ClaudeCompletionVerdict::CopyButton
+    } else {
+        ClaudeCompletionVerdict::Idle
+    }
+}
+
+fn run_claude_wait_response(
+    args: Option<&[String]>,
+    connection: Option<&BrowserConnection>,
+    baseline: Option<ClaudeResponseBaseline>,
+    use_stealth: bool,
+    headed: bool,
+) -> Result<String> {
+    let options = parse_chatgpt_poll_args(CLAUDE_WAIT_ACTION, args)?;
+    let baseline = baseline.context("Claude response wait requires a send baseline")?;
+    let probe = claude_web::build_response_poll_function();
+    let started = Instant::now();
+    let stable_threshold =
+        Duration::from_millis(claude_web::stable_idle_threshold_ms(options.interval_ms));
+    let mut stable_since: Option<Instant> = None;
+    let mut stable_anchor: Option<(i64, i64)> = None;
+    let mut no_progress_polls = 0_u8;
+
+    for attempt in 1..=options.attempts {
+        if started.elapsed() >= Duration::from_millis(options.timeout_ms) {
+            break;
+        }
+        if attempt > 1 {
+            thread::sleep(Duration::from_millis(options.interval_ms));
+        }
+        let value = run_claude_dom_function(&probe, connection, use_stealth, headed)?;
+        let state = parse_claude_response_state(&value)?;
+        if !state.error.is_empty() {
+            bail!("Claude page error: {}", state.error);
+        }
+        let verdict = classify_claude_completion(&state, baseline);
+        let inactive_without_progress = !state.streaming
+            && !state.stop
+            && !state.thinking
+            && verdict == ClaudeCompletionVerdict::Generating;
+        if inactive_without_progress {
+            no_progress_polls = no_progress_polls.saturating_add(1);
+            if no_progress_polls >= 5 {
+                bail!(
+                    "Claude response made no post-send progress for 5 polls after generation became idle"
+                );
+            }
+        } else {
+            no_progress_polls = 0;
+        }
+        match verdict {
+            ClaudeCompletionVerdict::Generating => {
+                stable_since = None;
+                stable_anchor = None;
+            }
+            ClaudeCompletionVerdict::CopyButton | ClaudeCompletionVerdict::Idle => {
+                let anchor = (state.count, state.last_length);
+                let stable_for = match (stable_since, stable_anchor) {
+                    (Some(since), Some(previous)) if previous == anchor => since.elapsed(),
+                    _ => {
+                        stable_since = Some(Instant::now());
+                        stable_anchor = Some(anchor);
+                        Duration::ZERO
+                    }
+                };
+                if stable_for >= stable_threshold {
+                    let url = run_claude_dom_function(
+                        "() => window.location.href || ''",
+                        connection,
+                        use_stealth,
+                        headed,
+                    )?
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                    let conversation = claude_web::normalize_conversation(&url).ok();
+                    return Ok(json!({
+                        "status":"ok",
+                        "response":state.text,
+                        "conversation_id":conversation.as_ref().map(|value| value.id.clone()),
+                        "conversation_url":conversation.map(|value| value.url),
+                    })
+                    .to_string());
+                }
+            }
+        }
+    }
+    Err(anyhow!(
+        "Claude response did not complete within {}ms",
+        options.timeout_ms
+    ))
 }
 
 fn baseline_dom_state(baseline: ChatgptResponseBaseline) -> ChatgptDomState {
@@ -4118,6 +4909,55 @@ pub fn resolve_auth(profile_dir: &Path, headed: bool) -> Result<BrowserConnectio
     resolve_browser_connection_fallback(profile_dir, headed, CHATGPT_URL)
 }
 
+pub fn resolve_claude_auth(profile_dir: &Path, headed: bool) -> Result<BrowserConnection> {
+    if !profile_dir.exists() {
+        return Err(anyhow!(
+            "browser profile not found at {}. Run `yoetz browser login` to authenticate.",
+            profile_dir.display()
+        ));
+    }
+    let cookie_state = BrowserConnection::CookieState {
+        state_file: state_file(profile_dir),
+    };
+    if matches!(
+        &cookie_state,
+        BrowserConnection::CookieState { state_file } if state_file.exists()
+    ) && check_claude_auth_with_connection(&cookie_state, headed).is_ok()
+    {
+        return Ok(cookie_state);
+    }
+    let profile = BrowserConnection::Profile {
+        profile_dir: profile_dir.to_path_buf(),
+    };
+    check_claude_auth_with_connection(&profile, headed)?;
+    Ok(profile)
+}
+
+pub fn resolve_claude_browser_connection(
+    browser_defaults: &BrowserDefaults,
+    cdp_override: Option<&str>,
+    profile_dir: &Path,
+) -> Result<BrowserConnection> {
+    if let Some(endpoint) = resolve_cdp_endpoint(cdp_override, browser_defaults) {
+        let connection = BrowserConnection::Cdp {
+            endpoint,
+            run_id: None,
+        };
+        match check_claude_auth_with_connection(&connection, false) {
+            Ok(()) => return Ok(connection),
+            Err(err) if should_stop_live_attach_fallback(&err) => return Err(err),
+            Err(_) => {}
+        }
+    }
+    let auto = BrowserConnection::AutoConnect;
+    match check_claude_auth_with_connection(&auto, false) {
+        Ok(()) => return Ok(auto),
+        Err(err) if should_stop_live_attach_fallback(&err) => return Err(err),
+        Err(_) => {}
+    }
+    resolve_claude_auth(profile_dir, false)
+}
+
 pub fn resolve_auth_mode(profile_dir: &Path, headed: bool) -> Result<BrowserProfileMode> {
     match resolve_auth(profile_dir, headed)? {
         BrowserConnection::CookieState { .. } => Ok(BrowserProfileMode::PreferState),
@@ -4128,9 +4968,84 @@ pub fn resolve_auth_mode(profile_dir: &Path, headed: bool) -> Result<BrowserProf
     }
 }
 
+pub fn resolve_claude_auth_mode(profile_dir: &Path, headed: bool) -> Result<BrowserProfileMode> {
+    match resolve_claude_auth(profile_dir, headed)? {
+        BrowserConnection::CookieState { .. } => Ok(BrowserProfileMode::PreferState),
+        BrowserConnection::Profile { .. } => Ok(BrowserProfileMode::ProfileOnly),
+        BrowserConnection::Cdp { .. } | BrowserConnection::AutoConnect => Err(anyhow!(
+            "managed Claude auth mode cannot map a live browser connection"
+        )),
+    }
+}
+
 pub fn check_auth(profile_dir: &Path, headed: bool) -> Result<()> {
     let connection = resolve_auth(profile_dir, headed)?;
     check_auth_with_connection(&connection, headed, CHATGPT_URL)
+}
+
+pub fn check_claude_auth_with_connection(
+    connection: &BrowserConnection,
+    headed: bool,
+) -> Result<()> {
+    if !connection.is_live_attach() {
+        let _ = close_browser_for_connection(connection);
+    }
+    let use_stealth = !connection.is_live_attach();
+    let command_timeout_ms = connection
+        .is_live_attach()
+        .then_some(LIVE_ATTACH_COMMAND_TIMEOUT_MS);
+    let verification_tab = if connection.is_live_attach() {
+        open_live_attach_verification_tab(
+            connection,
+            use_stealth,
+            headed,
+            claude_web::CLAUDE_URL,
+            command_timeout_ms,
+        )?
+    } else {
+        run_agent_browser_with_connection_timeout(
+            vec!["open".to_string(), claude_web::CLAUDE_URL.to_string()],
+            OutputFormat::Text,
+            Some(connection),
+            use_stealth,
+            headed,
+            command_timeout_ms,
+        )?;
+        None
+    };
+    let expression = chatgpt_web::wrap_function_source_for_json_eval(
+        &claude_web::build_wait_for_composer_function(),
+    )?;
+    let result = run_agent_browser_with_connection_timeout(
+        vec!["eval".to_string(), expression],
+        OutputFormat::Text,
+        Some(connection),
+        use_stealth,
+        headed,
+        Some(LIVE_ATTACH_COMMAND_TIMEOUT_MS),
+    )
+    .and_then(|stdout| {
+        parse_stdout_json(&stdout)
+            .with_context(|| format!("parse Claude auth check result: {stdout}"))
+    });
+    close_live_attach_verification_tab(
+        connection,
+        use_stealth,
+        headed,
+        verification_tab.as_ref(),
+        command_timeout_ms,
+    );
+    let state = result?;
+    match state.get("status").and_then(Value::as_str) {
+        Some("ready") => Ok(()),
+        Some("login") => bail!("Claude login is required in this browser profile"),
+        Some("challenge") => bail!(
+            "Cloudflare challenge detected on claude.ai; solve it in this browser profile and retry"
+        ),
+        other => {
+            bail!("Claude composer did not become ready; status={other:?}, diagnostics={state}")
+        }
+    }
 }
 
 fn check_auth_with_connection(
@@ -4978,6 +5893,7 @@ mod tests {
             use_stealth: true,
             headed: false,
             target_url: CHATGPT_URL.to_string(),
+            warnings: Vec::new(),
             vars: BTreeMap::from([(
                 "model".to_string(),
                 crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
@@ -6984,6 +7900,87 @@ steps:
         assert_eq!(primary_payload["fallback_used"], false);
     }
 
+    #[test]
+    fn claude_recipe_payload_extracts_typed_result_from_literal_actions() {
+        let steps = vec![
+            json!({
+                "type": "browser_step",
+                "action": CLAUDE_SELECT_MODEL_ACTION,
+                "stdout": {
+                    "status": "ok",
+                    "model_used": "Fable 5 Max",
+                    "model_selection_status": "selected"
+                }
+            }),
+            json!({
+                "type": "browser_step",
+                "action": CLAUDE_WAIT_ACTION,
+                "stdout": {
+                    "status": "ok",
+                    "response": "final answer",
+                    "conversation_id": "123e4567-e89b-12d3-a456-426614174000",
+                    "conversation_url": "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174000"
+                }
+            }),
+        ];
+
+        let payload =
+            claude_recipe_payload_from_steps(&steps, true, "20260718T102228Z_ab12cd", 1234, &[]);
+        assert_eq!(payload["transport"], "agent-browser");
+        assert_eq!(payload["backend"], "agent-browser");
+        assert_eq!(payload["response"], "final answer");
+        assert_eq!(payload["model_used"], "Fable 5 Max");
+        assert_eq!(payload["model_selection_status"], "selected");
+        assert_eq!(payload["fallback_used"], true);
+        assert_eq!(payload["run_id"], "20260718T102228Z_ab12cd");
+        assert_eq!(payload["elapsed_ms"], 1234);
+        assert_eq!(payload["delivery_mode"], "file_upload");
+        assert_eq!(payload["steps"], json!(steps));
+    }
+
+    #[test]
+    fn claude_completion_requires_idle_growth_and_keeps_copy_as_candidate() {
+        let baseline = ClaudeResponseBaseline {
+            count: 1,
+            last_length: 100,
+        };
+        let mut state = parse_claude_response_state(&json!({
+            "count":2,"length":200,"text":"answer","streaming":false,
+            "hasStopButton":false,"thinking":false,"copyButtons":0,"error":""
+        }))
+        .unwrap();
+        assert_eq!(
+            classify_claude_completion(&state, baseline),
+            ClaudeCompletionVerdict::Idle
+        );
+        state.copy_buttons = 1;
+        assert_eq!(
+            classify_claude_completion(&state, baseline),
+            ClaudeCompletionVerdict::CopyButton
+        );
+        state.streaming = true;
+        assert_eq!(
+            classify_claude_completion(&state, baseline),
+            ClaudeCompletionVerdict::Generating
+        );
+    }
+
+    #[test]
+    fn claude_terminal_stage_marks_upload_send_and_wait() {
+        let mut stage = ClaudeRecipeStage::Idle;
+        assert_eq!(stage.terminal_phase(CLAUDE_SELECT_MODEL_ACTION), None);
+        stage.mark_upload_started();
+        assert_eq!(
+            stage.terminal_phase("type"),
+            Some(WebRecipeTransportPhase::Upload)
+        );
+        stage.mark_send_succeeded();
+        assert_eq!(
+            stage.terminal_phase(CLAUDE_WAIT_ACTION),
+            Some(WebRecipeTransportPhase::WaitResponse)
+        );
+    }
+
     fn dom(send: ChatgptSendState, stop: bool, thinking: bool, copy: usize) -> ChatgptDomState {
         ChatgptDomState {
             send_state: send,
@@ -7542,6 +8539,21 @@ steps:
         let content = fs::read_to_string(&path).expect("read recipes/claude.yaml");
         let recipe: Recipe = serde_yaml_ng::from_str(&content).expect("parse claude.yaml");
         assert!(recipe.transports.is_none());
+        let actions = recipe
+            .steps
+            .iter()
+            .filter_map(|step| step.action.as_deref())
+            .collect::<Vec<_>>();
+        for action in [
+            CLAUDE_SELECT_MODEL_ACTION,
+            CLAUDE_OPEN_ATTACHMENT_UI_ACTION,
+            CLAUDE_UPLOAD_BUNDLE_ACTION,
+            CLAUDE_WAIT_UPLOAD_ACTION,
+            CLAUDE_SEND_ACTION,
+            CLAUDE_WAIT_ACTION,
+        ] {
+            assert!(actions.contains(&action), "missing literal action {action}");
+        }
         let defaults = recipe.defaults.expect("Claude defaults");
         assert_eq!(defaults.get("thread").map(String::as_str), Some("fresh"));
         assert_eq!(

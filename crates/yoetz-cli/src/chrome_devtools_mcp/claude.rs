@@ -73,6 +73,22 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ClaudeRunResult> {
     run_with_client(&mut client, ctx, bundle_path, browser_context_id.as_deref()).await
 }
 
+pub async fn check_auth(cdp_endpoint: Option<&str>, show_approval_guidance: bool) -> Result<()> {
+    let client = crate::chrome_devtools_mcp::chatgpt::connect_client_with_attach_attempt_lock(
+        cdp_endpoint,
+        show_approval_guidance,
+    )
+    .await?;
+    let run_id = claude_web::generate_run_id();
+    let marked_url = claude_web::mark_claude_url(&run_id)?;
+    open_claude_page(&client, &marked_url, None)
+        .await
+        .context("open Claude auth-check page")?;
+    let result = wait_for_composer(&client).await;
+    let _ = client.close_selected_page(false);
+    result
+}
+
 async fn run_with_client(
     client: &mut ChromeCdpClient,
     ctx: &DevtoolsMcpRecipeContext,

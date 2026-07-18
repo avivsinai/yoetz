@@ -1010,17 +1010,7 @@ pub fn update_extension(
     }))
 }
 
-pub fn bridge_check(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
-    let response = send_control_job("reconnect", json!({ "intent": "bridge_check" }), selector)?;
-    Ok(json!({
-        "status": "ok",
-        "transport": TRANSPORT_NAME,
-        "live": false,
-        "response": response.payload,
-    }))
-}
-
-fn bridge_check_for_recipe(
+pub fn bridge_check_for_recipe(
     selector: ExtensionInstanceSelector<'_>,
     recipe: BuiltinWebRecipe,
 ) -> Result<Value> {
@@ -1037,6 +1027,25 @@ fn bridge_check_for_recipe(
         "live": false,
         "response": response.payload,
     }))
+}
+
+fn instance_advertises_recipe(
+    instance: &ExtensionInstanceStatus,
+    recipe: BuiltinWebRecipe,
+) -> bool {
+    instance
+        .recipes
+        .iter()
+        .any(|value| value == recipe.as_str())
+}
+
+pub fn recipe_ready(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<bool> {
+    let paths = extension_paths()?;
+    let instance = select_extension_instance(&paths, selector)?;
+    Ok(instance_advertises_recipe(&instance, recipe))
 }
 
 pub fn canary(
@@ -4135,6 +4144,30 @@ mod tests {
             extension_hello.detail,
             "extension_version=0.2.0, extension_instance_id=ext_123, chrome_profile_email=work@example.com"
         );
+    }
+
+    #[test]
+    fn selected_instance_capability_is_recipe_exact() {
+        let instance = ExtensionInstanceStatus {
+            native_instance_id: "native_1".to_string(),
+            socket_path: PathBuf::from("/tmp/native_1.sock"),
+            pid: process::id(),
+            extension_instance_id: Some("ext_1".to_string()),
+            extension_version: Some("0.5.33".to_string()),
+            profile_email: None,
+            profile_id: None,
+            recipes: vec!["chatgpt".to_string()],
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1,
+        };
+        assert!(instance_advertises_recipe(
+            &instance,
+            BuiltinWebRecipe::Chatgpt
+        ));
+        assert!(!instance_advertises_recipe(
+            &instance,
+            BuiltinWebRecipe::Claude
+        ));
     }
 
     #[test]

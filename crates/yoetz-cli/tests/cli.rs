@@ -293,7 +293,9 @@ fn browser_check_help_shows_cdp_flag() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--cdp"))
-        .stdout(predicate::str::contains("--transport"));
+        .stdout(predicate::str::contains("--transport"))
+        .stdout(predicate::str::contains("--chatgpt"))
+        .stdout(predicate::str::contains("--claude"));
 }
 
 #[test]

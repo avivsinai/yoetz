@@ -330,6 +330,12 @@ struct BrowserLoginArgs {
 
 #[derive(Args)]
 struct BrowserCheckArgs {
+    /// Check ChatGPT browser readiness (default when no site flag is passed).
+    #[arg(long, conflicts_with = "claude")]
+    chatgpt: bool,
+    /// Check Claude browser readiness and capability selection.
+    #[arg(long, conflicts_with = "chatgpt")]
+    claude: bool,
     #[arg(long)]
     profile: Option<PathBuf>,
     /// Select the browser check transport. Use chrome-extension-native to check
@@ -344,7 +350,7 @@ struct BrowserCheckArgs {
     #[arg(long)]
     browser_id: Option<String>,
     /// Route an extension-native check to a Chrome profile email reported by
-    /// `yoetz browser extension status --chatgpt`.
+    /// `yoetz browser extension status --chatgpt` or `--claude`.
     #[arg(long, alias = "profile_email")]
     profile_email: Option<String>,
     /// Route an extension-native check to the stable extension instance id.
@@ -353,6 +359,14 @@ struct BrowserCheckArgs {
     /// Route an extension-native check to a Chrome extension profile id.
     #[arg(long, alias = "extension_profile_id")]
     extension_profile_id: Option<String>,
+}
+
+fn browser_check_site_scope(args: &BrowserCheckArgs) -> Result<web_recipe::BuiltinWebRecipe> {
+    match (args.chatgpt, args.claude) {
+        (false, false) | (true, false) => Ok(web_recipe::BuiltinWebRecipe::Chatgpt),
+        (false, true) => Ok(web_recipe::BuiltinWebRecipe::Claude),
+        (true, true) => bail!("--chatgpt and --claude are mutually exclusive"),
+    }
 }
 
 #[derive(Args)]
@@ -1615,12 +1629,6 @@ fn maybe_print_running_profile_auto_connect_preference(
 /// treated as not available for auto-selection. The probe is filesystem-local
 /// (status file + Unix socket reachability) and is cheap enough to run on
 /// every `yoetz browser recipe` invocation.
-fn extension_status_connected_for_auto_selection() -> bool {
-    browser_extension_native::status()
-        .map(|status| status.status == "connected")
-        .unwrap_or(false)
-}
-
 fn extension_recipe_ready_for_auto_selection(recipe: Option<web_recipe::BuiltinWebRecipe>) -> bool {
     browser_extension_native::status()
         .map(|status| {
@@ -1653,11 +1661,17 @@ fn maybe_print_auto_selected_extension_native_transport(
 
 fn auto_selected_browser_check_extension_native_notice(
     auto_selected: bool,
-) -> Option<&'static str> {
+    recipe: web_recipe::BuiltinWebRecipe,
+) -> Option<String> {
     if auto_selected {
-        Some(
-            "info: auto-selected chrome-extension-native for browser check because the Yoetz Chrome extension is installed and connected (pass --transport chrome-devtools-mcp, --transport dev-browser, --transport agent-browser, --cdp, --browser-id, or --profile to check the CDP/browser stack)",
-        )
+        Some(match recipe {
+            web_recipe::BuiltinWebRecipe::Chatgpt =>
+                "info: auto-selected chrome-extension-native for browser check because the Yoetz Chrome extension is installed and connected (pass --transport chrome-devtools-mcp, --transport dev-browser, --transport agent-browser, --cdp, --browser-id, or --profile to check the CDP/browser stack)".to_string(),
+            web_recipe::BuiltinWebRecipe::Claude => format!(
+                "info: auto-selected chrome-extension-native for Claude browser check because the selected Yoetz extension instance advertises `{}` (pass --transport chrome-devtools-mcp, --transport dev-browser, --transport agent-browser, --cdp, --browser-id, or --profile to check the CDP/browser stack)",
+                recipe.as_str(),
+            ),
+        })
     } else {
         None
     }
@@ -1666,11 +1680,13 @@ fn auto_selected_browser_check_extension_native_notice(
 fn maybe_print_auto_selected_browser_check_extension_native(
     auto_selected: bool,
     format: OutputFormat,
+    recipe: web_recipe::BuiltinWebRecipe,
 ) {
     if !matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
         return;
     }
-    if let Some(notice) = auto_selected_browser_check_extension_native_notice(auto_selected) {
+    if let Some(notice) = auto_selected_browser_check_extension_native_notice(auto_selected, recipe)
+    {
         eprintln!("{notice}");
     }
 }
@@ -1809,6 +1825,27 @@ fn browser_check_live_method(target: Option<&browser::ResolvedCdpTarget>) -> Str
     }
 }
 
+async fn ensure_browser_check_site_via_chrome_devtools(
+    recipe: web_recipe::BuiltinWebRecipe,
+    target: Option<&browser::ResolvedCdpTarget>,
+    show_approval_guidance: bool,
+) -> Result<()> {
+    match recipe {
+        web_recipe::BuiltinWebRecipe::Chatgpt => {
+            live_attach::ensure_chatgpt_session(target, None, None, show_approval_guidance)
+                .await
+                .map(|_| ())
+        }
+        web_recipe::BuiltinWebRecipe::Claude => {
+            chrome_devtools_mcp::claude::check_auth(
+                target.map(|value| value.endpoint.as_str()),
+                show_approval_guidance,
+            )
+            .await
+        }
+    }
+}
+
 fn remember_browser_check_live_attach_failure(slot: &mut Option<String>, err: &anyhow::Error) {
     if slot.is_none() && browser::is_chrome_cdp_unreachable_error(err) {
         *slot = Some(format!("{err:#}"));
@@ -1879,10 +1916,26 @@ fn check_args_have_extension_selector(args: &BrowserCheckArgs) -> bool {
             .is_some_and(|value| !value.trim().is_empty())
 }
 
+fn browser_check_extension_recipe_ready(
+    args: &BrowserCheckArgs,
+    recipe: web_recipe::BuiltinWebRecipe,
+) -> bool {
+    browser_extension_native::recipe_ready(
+        extension_selector_from_parts(
+            args.profile_email.as_ref(),
+            args.extension_instance_id.as_ref(),
+            args.extension_profile_id.as_ref(),
+        ),
+        recipe,
+    )
+    .unwrap_or(false)
+}
+
 fn handle_browser_extension_native_check(
     args: &BrowserCheckArgs,
     format: OutputFormat,
     auto_selected: bool,
+    recipe: web_recipe::BuiltinWebRecipe,
 ) -> Result<()> {
     if args.profile.is_some() || args.cdp.is_some() || args.browser_id.is_some() {
         bail!(
@@ -1894,21 +1947,22 @@ fn handle_browser_extension_native_check(
         args.extension_instance_id.as_ref(),
         args.extension_profile_id.as_ref(),
     );
-    let bridge = browser_extension_native::bridge_check(selector)?;
+    let bridge = browser_extension_native::bridge_check_for_recipe(selector, recipe)?;
     let payload = json!({
         "status": "ok",
         "method": "extension_native_dry_run",
         "transport": browser_extension_native::TRANSPORT_NAME,
         "auto_selected": auto_selected,
         "live": false,
+        "recipe": recipe.as_str(),
         "extension": bridge,
     });
     match format {
         OutputFormat::Json => write_json(&payload),
         OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
         OutputFormat::Text | OutputFormat::Markdown => {
-            maybe_print_auto_selected_browser_check_extension_native(auto_selected, format);
-            for line in browser_extension_native_check_text_lines() {
+            maybe_print_auto_selected_browser_check_extension_native(auto_selected, format, recipe);
+            for line in browser_extension_native_check_text_lines(recipe) {
                 println!("{line}");
             }
             Ok(())
@@ -1916,11 +1970,17 @@ fn handle_browser_extension_native_check(
     }
 }
 
-fn browser_extension_native_check_text_lines() -> [&'static str; 2] {
-    [
-        "Browser extension bridge ready via chrome-extension-native (dry-run bridge check; no CDP approval).",
-        "No live canary is required before normal ChatGPT Pro recipe runs.",
-    ]
+fn browser_extension_native_check_text_lines(recipe: web_recipe::BuiltinWebRecipe) -> [String; 2] {
+    match recipe {
+        web_recipe::BuiltinWebRecipe::Chatgpt => [
+            "Browser extension bridge ready via chrome-extension-native (dry-run bridge check; no CDP approval).".to_string(),
+            "No live canary is required before normal ChatGPT Pro recipe runs.".to_string(),
+        ],
+        web_recipe::BuiltinWebRecipe::Claude => [
+            "Claude extension bridge ready via chrome-extension-native (dry-run bridge check; no CDP approval).".to_string(),
+            "The selected extension instance advertises the `claude` recipe capability.".to_string(),
+        ],
+    }
 }
 
 fn browser_check_should_auto_select_extension_native(
@@ -2747,11 +2807,24 @@ fn run_recipe_via_dev_browser<R: IntoBuiltinWebRecipe>(
     cdp_endpoint: Option<&str>,
     format: OutputFormat,
     builtin_recipe: R,
+    preflight_warnings: &[String],
     fallback_used: bool,
 ) -> Result<Value> {
-    if builtin_recipe.into_builtin_web_recipe() != Some(web_recipe::BuiltinWebRecipe::Chatgpt) {
+    let builtin_recipe = builtin_recipe.into_builtin_web_recipe();
+    if builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Claude) {
+        return run_claude_recipe_via_dev_browser(
+            ctx,
+            recipe_args,
+            recipe_vars,
+            cdp_endpoint,
+            format,
+            preflight_warnings,
+            fallback_used,
+        );
+    }
+    if builtin_recipe != Some(web_recipe::BuiltinWebRecipe::Chatgpt) {
         return Err(anyhow!(
-            "dev-browser transport currently supports only the built-in `chatgpt` recipe"
+            "dev-browser transport supports only built-in web recipes"
         ));
     }
     chatgpt_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
@@ -2836,6 +2909,90 @@ fn run_recipe_via_dev_browser<R: IntoBuiltinWebRecipe>(
     Ok(payload)
 }
 
+fn run_claude_recipe_via_dev_browser(
+    ctx: &AppContext,
+    recipe_args: &BrowserRecipeArgs,
+    recipe_vars: &BTreeMap<String, String>,
+    cdp_endpoint: Option<&str>,
+    format: OutputFormat,
+    preflight_warnings: &[String],
+    fallback_used: bool,
+) -> Result<Value> {
+    claude_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
+    if recipe_args.profile.is_some() {
+        return Err(anyhow!(
+            "dev-browser transport does not support `--profile`; use `--cdp` to target a specific Chrome instance/profile"
+        ));
+    }
+    let started_at = Instant::now();
+    let recipe_spec = build_claude_recipe_spec(recipe_args, recipe_vars, preflight_warnings)?;
+    let recipe_ctx = dev_browser::ClaudeDevBrowserRecipeContext {
+        bundle_path: recipe_spec.bundle_path.clone(),
+        prompt: recipe_spec.prompt.clone(),
+        run_id: recipe_spec.run_id.clone(),
+        poll_settings: dev_browser::ChatgptPollSettings {
+            timeout_ms: recipe_spec.wait_timeout_ms,
+            interval_ms: recipe_spec.wait_interval_ms,
+        },
+        cdp_endpoint: cdp_endpoint.map(str::to_owned),
+        show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
+        upload_timeout_ms: recipe_spec.upload_timeout_ms,
+        send_timeout_ms: recipe_spec.send_timeout_ms,
+        warnings: recipe_spec.warnings.clone(),
+    };
+    let response = dev_browser::run_claude_recipe(&recipe_ctx)?;
+    let (delivery_mode, auto_paste_fallback) =
+        claude_dev_browser_delivery_metadata(response.used_clipboard);
+    let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+    let output = claude_recipe::ClaudeRecipeOutput {
+        transport: "dev-browser".to_string(),
+        backend: "dev-browser".to_string(),
+        response: response.response,
+        model_used: response.model_used,
+        model_selection_status: response.model_selection_status,
+        warnings: response.warnings,
+        fallback_used,
+        conversation_id: response.conversation_id,
+        conversation_url: response.conversation_url,
+        run_id: recipe_spec.run_id,
+        elapsed_ms,
+    };
+    let mut payload = output.to_value();
+    payload["delivery_mode"] = Value::String(delivery_mode.to_string());
+    payload["auto_paste_fallback"] = Value::Bool(auto_paste_fallback);
+    attach_browser_recipe_artifacts(&mut payload, recipe_args.bundle.as_deref())?;
+    maybe_write_output(ctx, &payload)?;
+    match format {
+        OutputFormat::Json => write_json(&payload)?,
+        OutputFormat::Jsonl => {
+            let mut event = output.to_recipe_complete_event();
+            event["delivery_mode"] = Value::String(delivery_mode.to_string());
+            event["auto_paste_fallback"] = Value::Bool(auto_paste_fallback);
+            write_jsonl("browser.recipe", &event)?;
+        }
+        OutputFormat::Text | OutputFormat::Markdown => {
+            println!("{}", payload["response"].as_str().unwrap_or_default());
+        }
+    }
+    maybe_notify_browser_recipe_completion(
+        ctx,
+        recipe_args.no_notify,
+        claude_recipe::CLAUDE_REPORTED_MODEL,
+        &payload,
+        elapsed_ms,
+        None,
+    );
+    Ok(payload)
+}
+
+fn claude_dev_browser_delivery_metadata(used_clipboard: bool) -> (&'static str, bool) {
+    if used_clipboard {
+        ("paste", true)
+    } else {
+        ("inline", false)
+    }
+}
+
 fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
     ctx: &AppContext,
     recipe: browser::Recipe,
@@ -2844,18 +3001,20 @@ fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
     profile_dir: PathBuf,
     format: OutputFormat,
     builtin_recipe: R,
+    preflight_warnings: &[String],
     fallback_used: bool,
     prefer_auto_connect: bool,
     selected_cdp_target: &mut Option<browser::ResolvedCdpTarget>,
 ) -> Result<Value> {
     let builtin_recipe = builtin_recipe.into_builtin_web_recipe();
-    if builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Claude) {
-        return Err(anyhow!(
-            "agent-browser transport for the built-in `claude` recipe is reserved for Wave 3; Wave 1 supports chrome-devtools-mcp"
-        ));
-    }
     let is_chatgpt = builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Chatgpt);
-    let needs_auth = is_chatgpt;
+    let is_claude = builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Claude);
+    let needs_auth = is_chatgpt || is_claude;
+    let target_url = if is_claude {
+        claude_web::CLAUDE_URL
+    } else {
+        browser::CHATGPT_URL
+    };
     let live_connection = if needs_auth {
         if profile_forces_managed_browser(
             recipe_args.profile.as_deref(),
@@ -2881,7 +3040,11 @@ fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
     let profile_mode = if live_connection.is_some() {
         browser::BrowserProfileMode::ProfileOnly
     } else if needs_auth {
-        browser::resolve_auth_mode(&profile_dir, /* headed */ false)?
+        if is_claude {
+            browser::resolve_claude_auth_mode(&profile_dir, /* headed */ false)?
+        } else {
+            browser::resolve_auth_mode(&profile_dir, /* headed */ false)?
+        }
     } else {
         browser::BrowserProfileMode::ProfileOnly
     };
@@ -2917,7 +3080,8 @@ fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
         fallback_used,
         use_stealth: needs_auth,
         headed: needs_auth,
-        target_url: browser::CHATGPT_URL.to_string(),
+        target_url: target_url.to_string(),
+        warnings: preflight_warnings.to_vec(),
         vars: recipe_vars,
     };
 
@@ -3532,6 +3696,11 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             }
         }
         BrowserCommand::Check(check_args) => {
+            let check_recipe = browser_check_site_scope(&check_args)?;
+            let check_target_url = match check_recipe {
+                web_recipe::BuiltinWebRecipe::Chatgpt => browser::CHATGPT_URL,
+                web_recipe::BuiltinWebRecipe::Claude => claude_web::CLAUDE_URL,
+            };
             let requested_transport = check_args.transport;
             let managed_profile_only = profile_forces_managed_browser(
                 check_args.profile.as_deref(),
@@ -3544,7 +3713,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 requested_transport,
                 managed_profile_only,
                 explicit_browser_target,
-                extension_status_connected_for_auto_selection(),
+                browser_check_extension_recipe_ready(&check_args, check_recipe),
             );
             if requested_transport == Some(browser::RecipeTransport::ChromeExtensionNative)
                 || auto_select_extension_native
@@ -3553,6 +3722,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     &check_args,
                     format,
                     auto_select_extension_native,
+                    check_recipe,
                 );
             }
             if check_args_have_extension_selector(&check_args) {
@@ -3578,10 +3748,9 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     .as_ref()
                     .map(|target| target.endpoint.as_str())
                     .expect("explicit browser target should resolve");
-                live_attach::ensure_chatgpt_session(
+                ensure_browser_check_site_via_chrome_devtools(
+                    check_recipe,
                     resolved_cdp_target.as_ref(),
-                    None,
-                    None,
                     show_approval_guidance,
                 )
                 .await
@@ -3589,6 +3758,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
                 let payload = json!({
                     "status": "ok",
+                    "recipe": check_recipe.as_str(),
                     "method": if check_args.cdp.is_some() {
                         format!("cdp: {cdp_url}")
                     } else {
@@ -3604,7 +3774,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
                     OutputFormat::Text | OutputFormat::Markdown => {
                         println!(
-                            "Browser authenticated via {} (chrome-devtools-mcp)",
+                            "{} browser authenticated via {} (chrome-devtools-mcp)",
+                            check_recipe.display_name(),
                             if check_args.cdp.is_some() {
                                 format!("cdp: {cdp_url}")
                             } else {
@@ -3645,10 +3816,9 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             for transport in transports {
                 match transport {
                     BrowserCheckTransport::ChromeDevtoolsMcp => {
-                        match live_attach::ensure_chatgpt_session(
+                        match ensure_browser_check_site_via_chrome_devtools(
+                            check_recipe,
                             resolved_cdp_target.as_ref(),
-                            None,
-                            None,
                             show_approval_guidance,
                         )
                         .await
@@ -3659,6 +3829,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                     browser_check_live_method(resolved_cdp_target.as_ref());
                                 let payload = json!({
                                     "status": "ok",
+                                    "recipe": check_recipe.as_str(),
                                     "method": method,
                                     "transport": browser_check_transport_name(transport),
                                 });
@@ -3667,7 +3838,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                     OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
                                     OutputFormat::Text | OutputFormat::Markdown => {
                                         println!(
-                                            "Browser authenticated via {} ({})",
+                                            "{} browser authenticated via {} ({})",
+                                            check_recipe.display_name(),
                                             payload["method"].as_str().unwrap_or("auto_connect"),
                                             browser_check_transport_name(transport)
                                         );
@@ -3720,12 +3892,23 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         let cdp_endpoint = resolved_cdp_target
                             .as_ref()
                             .map(|target| target.endpoint.as_str());
-                        match dev_browser::ensure_chatgpt_auth_with_page_check_and_endpoint(
-                            cdp_endpoint,
-                        ) {
+                        let auth_result = match check_recipe {
+                            web_recipe::BuiltinWebRecipe::Chatgpt => {
+                                dev_browser::ensure_chatgpt_auth_with_page_check_and_endpoint(
+                                    cdp_endpoint,
+                                )
+                            }
+                            web_recipe::BuiltinWebRecipe::Claude => {
+                                dev_browser::ensure_claude_auth_with_page_check_and_endpoint(
+                                    cdp_endpoint,
+                                )
+                            }
+                        };
+                        match auth_result {
                             Ok(()) => {
                                 let payload = json!({
                                     "status": "ok",
+                                    "recipe": check_recipe.as_str(),
                                     "method": if cdp_endpoint.is_some() {
                                         "cdp"
                                     } else {
@@ -3739,7 +3922,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                                     OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
                                     OutputFormat::Text | OutputFormat::Markdown => {
                                         println!(
-                                            "Browser authenticated via {} ({})",
+                                            "{} browser authenticated via {} ({})",
+                                            check_recipe.display_name(),
                                             payload["method"].as_str().unwrap_or("auto_connect"),
                                             browser_check_transport_name(transport)
                                         );
@@ -3784,9 +3968,22 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                     }
                     BrowserCheckTransport::AgentBrowser => {
                         let connection = if managed_profile_only {
-                            browser::resolve_auth(&profile_dir, /* headed */ false)?
+                            if check_recipe == web_recipe::BuiltinWebRecipe::Claude {
+                                browser::resolve_claude_auth(&profile_dir, /* headed */ false)?
+                            } else {
+                                browser::resolve_auth(&profile_dir, /* headed */ false)?
+                            }
                         } else if prefer_auto_connect {
-                            browser::try_auto_connect("https://chatgpt.com/").map_err(|e| {
+                            let auto_connect_result =
+                                if check_recipe == web_recipe::BuiltinWebRecipe::Claude {
+                                    browser::check_claude_auth_with_connection(
+                                        &browser::BrowserConnection::AutoConnect,
+                                        false,
+                                    )
+                                } else {
+                                    browser::try_auto_connect(check_target_url)
+                                };
+                            auto_connect_result.map_err(|e| {
                                 if let Some(recovery) = default_daemon_recovery_error(Some(&e)) {
                                     return recovery;
                                 }
@@ -3802,13 +3999,21 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             let fallback_cdp = resolved_cdp_target
                                 .as_ref()
                                 .map(|target| target.endpoint.as_str());
-                            browser::resolve_browser_connection(
-                                &ctx.browser_defaults,
-                                fallback_cdp.or(check_args.cdp.as_deref()),
-                                &profile_dir,
-                                "https://chatgpt.com/",
-                            )
-                            .map_err(|e| {
+                            let resolved = if check_recipe == web_recipe::BuiltinWebRecipe::Claude {
+                                browser::resolve_claude_browser_connection(
+                                    &ctx.browser_defaults,
+                                    fallback_cdp.or(check_args.cdp.as_deref()),
+                                    &profile_dir,
+                                )
+                            } else {
+                                browser::resolve_browser_connection(
+                                    &ctx.browser_defaults,
+                                    fallback_cdp.or(check_args.cdp.as_deref()),
+                                    &profile_dir,
+                                    check_target_url,
+                                )
+                            };
+                            resolved.map_err(|e| {
                                 if let Some(recovery) = default_daemon_recovery_error(Some(&e)) {
                                     return recovery;
                                 }
@@ -3830,6 +4035,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         };
                         let payload = json!({
                             "status": "ok",
+                            "recipe": check_recipe.as_str(),
                             "profile": profile_dir.to_string_lossy(),
                             "method": method,
                             "transport": browser_check_transport_name(transport),
@@ -3842,7 +4048,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             OutputFormat::Jsonl => write_jsonl("browser.check", &payload),
                             OutputFormat::Text | OutputFormat::Markdown => {
                                 println!(
-                                    "Browser authenticated via {} ({})",
+                                    "{} browser authenticated via {} ({})",
+                                    check_recipe.display_name(),
                                     payload["method"].as_str().unwrap_or("auto_connect"),
                                     browser_check_transport_name(transport)
                                 );
@@ -4160,6 +4367,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         cdp_endpoint.as_deref(),
                         format,
                         builtin_recipe,
+                        &preflight_warnings,
                         fallback_used,
                     ),
                     browser::RecipeTransport::AgentBrowser => run_recipe_via_agent_browser(
@@ -4170,6 +4378,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         profile_dir.clone(),
                         format,
                         builtin_recipe,
+                        &preflight_warnings,
                         fallback_used,
                         prefer_auto_connect,
                         &mut resolved_cdp_target,
@@ -5994,6 +6203,39 @@ mod tests {
     }
 
     #[test]
+    fn browser_check_site_scope_defaults_chatgpt_and_accepts_claude() {
+        let default = BrowserCheckArgs {
+            profile: None,
+            transport: None,
+            cdp: None,
+            browser_id: None,
+            profile_email: None,
+            extension_instance_id: None,
+            extension_profile_id: None,
+            chatgpt: false,
+            claude: false,
+        };
+        assert_eq!(
+            browser_check_site_scope(&default).unwrap(),
+            web_recipe::BuiltinWebRecipe::Chatgpt
+        );
+        let claude = BrowserCheckArgs {
+            claude: true,
+            ..default
+        };
+        assert_eq!(
+            browser_check_site_scope(&claude).unwrap(),
+            web_recipe::BuiltinWebRecipe::Claude
+        );
+        let both = BrowserCheckArgs {
+            chatgpt: true,
+            claude: true,
+            ..claude
+        };
+        assert!(browser_check_site_scope(&both).is_err());
+    }
+
+    #[test]
     fn browser_check_native_auto_selection_respects_explicit_targets() {
         assert!(browser_check_should_auto_select_extension_native(
             None, false, false, true
@@ -6038,18 +6280,29 @@ mod tests {
 
     #[test]
     fn browser_extension_native_check_text_avoids_live_canary_nudge() {
-        let text = browser_extension_native_check_text_lines().join("\n");
+        let text = browser_extension_native_check_text_lines(web_recipe::BuiltinWebRecipe::Claude)
+            .join("\n");
         assert!(text.contains("dry-run bridge check"));
-        assert!(text.contains("No live canary is required"));
+        assert!(text.contains("advertises the `claude` recipe capability"));
         assert!(!text.contains("dry-run canary"));
         assert!(!text.contains("For a live ChatGPT auth probe"));
     }
 
     #[test]
     fn browser_extension_native_check_notice_explains_auto_selection() {
-        assert!(auto_selected_browser_check_extension_native_notice(false).is_none());
-        let notice = auto_selected_browser_check_extension_native_notice(true).unwrap();
+        assert!(auto_selected_browser_check_extension_native_notice(
+            false,
+            web_recipe::BuiltinWebRecipe::Claude,
+        )
+        .is_none());
+        let notice = auto_selected_browser_check_extension_native_notice(
+            true,
+            web_recipe::BuiltinWebRecipe::Claude,
+        )
+        .unwrap();
         assert!(notice.contains("auto-selected chrome-extension-native"));
+        assert!(notice.contains("Claude"));
+        assert!(notice.contains("`claude`"));
         assert!(notice.contains("--transport chrome-devtools-mcp"));
         assert!(notice.contains("--cdp"));
     }
@@ -6909,12 +7162,57 @@ mod tests {
             None,
             OutputFormat::Text,
             /* is_chatgpt */ true,
+            &[],
             /* fallback_used */ false,
         )
         .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("thread"));
         assert!(msg.contains("fresh"));
+    }
+
+    #[test]
+    fn run_recipe_via_dev_browser_routes_claude_before_validating_delivery() {
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/claude.yaml"),
+            transport: Some(browser::RecipeTransport::DevBrowser),
+            allow_cdp_fallback: false,
+            bundle: Some(PathBuf::from("/tmp/claude-bundle.md")),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
+            vars: vec![],
+            followup: None,
+            allow_duplicate_prompt: false,
+            no_notify: false,
+        };
+        let recipe_vars = BTreeMap::from([("thread".to_string(), "sideways".to_string())]);
+        let err = run_recipe_via_dev_browser(
+            &test_app_context(),
+            &recipe_args,
+            &recipe_vars,
+            None,
+            OutputFormat::Text,
+            Some(web_recipe::BuiltinWebRecipe::Claude),
+            &[],
+            false,
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("thread"));
+        assert!(message.contains("fresh"));
+        assert!(!message.contains("dev-browser transport supports only built-in web recipes"));
+    }
+
+    #[test]
+    fn claude_dev_browser_delivery_metadata_tracks_clipboard_use() {
+        assert_eq!(claude_dev_browser_delivery_metadata(true), ("paste", true));
+        assert_eq!(
+            claude_dev_browser_delivery_metadata(false),
+            ("inline", false)
+        );
     }
 
     #[test]
@@ -6941,6 +7239,7 @@ mod tests {
             None,
             OutputFormat::Text,
             /* is_chatgpt */ true,
+            &[],
             /* fallback_used */ false,
         )
         .unwrap_err();

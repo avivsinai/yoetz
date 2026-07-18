@@ -3,16 +3,18 @@ name: claude
 #
 # Default extension-free transport order:
 #   chrome-devtools-mcp -> dev-browser -> agent-browser -> manual.
-# Wave 1 implements the CDP vertical slice. The literal claude_* actions below
-# reserve the same contract for the fallback transports delivered in Wave 3.
+# The typed CDP/dev-browser paths and the literal claude_* agent-browser actions
+# below implement the same fail-closed contract. dev-browser uses a macOS
+# clipboard fallback because its QuickJS runner cannot drive file inputs;
+# non-macOS dev-browser delivery degrades to inline text with a warning.
 #
 # Exact model policy: Fable 5, Effort=Max, Thinking=on. Selection is
 # fail-closed. `--model-strategy current` and vars model/effort/thinking are
 # rejected. The picker diagnostics list the live options when Fable is absent.
 #
 # Conversation/followup: `conversation=<uuid|https://claude.ai/chat/<uuid>>`
-# and `--followup` are native-extension-only. Wave 1 rejects them before CDP or
-# other fallback side effects; omitting them creates a fresh marked `/new` tab.
+# and `--followup` are native-extension-only. Fallback transports reject them
+# before browser side effects; omitting them creates a fresh marked `/new` tab.
 #
 # inline_warn_tokens is a heuristic quality guard, not a documented Claude
 # cutoff. Above it, claude.ai may use retrieval-backed file access. Set 0 to
