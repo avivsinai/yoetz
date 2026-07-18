@@ -46,6 +46,10 @@ const EXTENSION_RELOAD_VERIFY_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
 
+fn default_extension_recipes() -> Vec<String> {
+    vec!["chatgpt".to_string()]
+}
+
 #[derive(Debug, Error)]
 #[error("frame is too large: {len} bytes, max {max} bytes")]
 struct FrameTooLargeError {
@@ -90,6 +94,8 @@ pub struct ExtensionStatus {
     pub status_file_present: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub connected_instances: Vec<ExtensionInstanceStatus>,
+    pub recipes: Vec<String>,
+    pub claude_ready: bool,
     pub protocol_version: u32,
     pub detail: String,
 }
@@ -107,6 +113,8 @@ pub struct ExtensionInstanceStatus {
     pub profile_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    #[serde(default = "default_extension_recipes")]
+    pub recipes: Vec<String>,
     pub protocol_version: u32,
     pub last_seen_ms: u128,
 }
@@ -600,6 +608,11 @@ pub fn status() -> Result<ExtensionStatus> {
         .or_else(|| {
             legacy_extension_status_string(legacy_hello_seen, extension_value, "profile_id")
         });
+    let recipes = latest_instance_with_hello
+        .map(|instance| instance.recipes.clone())
+        .unwrap_or_else(|| legacy_extension_recipes(extension_value));
+    let claude_ready =
+        socket_reachable && hello_seen && recipes.iter().any(|recipe| recipe == "claude");
     let protocol_version_mismatch = status_value
         .as_ref()
         .and_then(|value| value.get("version_mismatch"))
@@ -677,6 +690,8 @@ pub fn status() -> Result<ExtensionStatus> {
         status_path: paths.status_path,
         status_file_present,
         connected_instances,
+        recipes,
+        claude_ready,
         protocol_version: PROTOCOL_VERSION,
         detail,
     })
@@ -1233,6 +1248,22 @@ fn legacy_extension_status_string(
     }
 }
 
+fn legacy_extension_recipes(
+    extension_value: Option<&serde_json::Map<String, Value>>,
+) -> Vec<String> {
+    let Some(value) = extension_value.and_then(|value| value.get("recipes")) else {
+        return default_extension_recipes();
+    };
+    let Some(values) = value.as_array() else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
 fn status_file_has_extension_hello(
     extension_value: Option<&serde_json::Map<String, Value>>,
 ) -> bool {
@@ -1531,6 +1562,7 @@ fn connect_legacy_socket_instance(paths: &ExtensionPaths) -> Result<ExtensionIns
         extension_version: None,
         profile_email: None,
         profile_id: None,
+        recipes: default_extension_recipes(),
         protocol_version: PROTOCOL_VERSION,
         last_seen_ms: 0,
     })
@@ -3035,6 +3067,7 @@ mod native_host_unix {
                         "extension_instance_id": envelope.payload.get("extension_instance_id").cloned().unwrap_or(Value::Null),
                         "profile_email": envelope.payload.get("profile_email").cloned().unwrap_or(Value::Null),
                         "profile_id": envelope.payload.get("profile_id").cloned().unwrap_or(Value::Null),
+                        "recipes": envelope.payload.get("recipes").cloned().unwrap_or_else(|| json!(default_extension_recipes())),
                         "seen_at_ms": now_millis(),
                     },
                     "version_mismatch": Value::Null,
@@ -3063,6 +3096,7 @@ mod native_host_unix {
                     "extension_version": envelope.payload.get("extension_version").cloned().unwrap_or(Value::Null),
                     "profile_email": envelope.payload.get("profile_email").cloned().unwrap_or(Value::Null),
                     "profile_id": envelope.payload.get("profile_id").cloned().unwrap_or(Value::Null),
+                    "recipes": envelope.payload.get("recipes").cloned().unwrap_or_else(|| json!(default_extension_recipes())),
                     "protocol_version": envelope.payload.get("protocol_version").cloned().unwrap_or(json!(PROTOCOL_VERSION)),
                 }),
             ),
@@ -3085,6 +3119,7 @@ mod native_host_unix {
             "extension_version": Value::Null,
             "profile_email": Value::Null,
             "profile_id": Value::Null,
+            "recipes": default_extension_recipes(),
             "protocol_version": PROTOCOL_VERSION,
             "last_seen_ms": now_millis(),
         });
@@ -3640,6 +3675,8 @@ mod tests {
         assert!(!payload.hello_seen);
         assert_eq!(payload.extension_version, None);
         assert_eq!(payload.extension_instance_id, None);
+        assert_eq!(payload.recipes, vec!["chatgpt"]);
+        assert!(!payload.claude_ready);
 
         let extension_hello = doctor()
             .unwrap()
@@ -3677,6 +3714,7 @@ mod tests {
                 extension_version: Some("0.2.0".to_string()),
                 profile_email: Some("work@example.com".to_string()),
                 profile_id: Some("gaia_123".to_string()),
+                recipes: vec!["chatgpt".to_string(), "claude".to_string()],
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1234,
             },
@@ -3692,6 +3730,8 @@ mod tests {
             Some("work@example.com")
         );
         assert_eq!(payload.extension_profile_id.as_deref(), Some("gaia_123"));
+        assert_eq!(payload.recipes, vec!["chatgpt", "claude"]);
+        assert!(payload.claude_ready);
 
         let extension_hello = doctor()
             .unwrap()
@@ -3732,6 +3772,7 @@ mod tests {
                 extension_version: Some("0.5.13".to_string()),
                 profile_email: Some("work@example.com".to_string()),
                 profile_id: Some("gaia_123".to_string()),
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1234,
             },
@@ -3872,6 +3913,7 @@ mod tests {
                 extension_version: Some(YOETZ_CLI_VERSION.to_string()),
                 profile_email: None,
                 profile_id: None,
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
             },
@@ -3915,6 +3957,7 @@ mod tests {
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: Some("stale@example.com".to_string()),
                 profile_id: Some("stale_profile".to_string()),
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1234,
             },
@@ -3959,6 +4002,7 @@ mod tests {
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: Some("work@example.com".to_string()),
                 profile_id: Some("work_profile".to_string()),
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 2,
             },
@@ -3973,6 +4017,7 @@ mod tests {
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: Some("personal@example.com".to_string()),
                 profile_id: Some("personal_profile".to_string()),
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
             },
@@ -4023,6 +4068,7 @@ mod tests {
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: None,
                 profile_id: None,
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 2,
             },
@@ -4037,6 +4083,7 @@ mod tests {
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: None,
                 profile_id: None,
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
             },

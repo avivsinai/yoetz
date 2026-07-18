@@ -7,11 +7,20 @@ import { EXTENSION_ID } from "../src/protocol.js";
 const manifest = JSON.parse(await readFile(new URL("../manifest.json", import.meta.url), "utf8"));
 const nativeHostManifest = JSON.parse(await readFile(new URL("../native-host-manifest.template.json", import.meta.url), "utf8"));
 
-test("manifest is MV3 and scoped only to ChatGPT", () => {
+test("manifest is one multi-site transport package", () => {
   assert.equal(manifest.manifest_version, 3);
   assert.equal(manifest.minimum_chrome_version, "120");
-  assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*"]);
-  assert.deepEqual(manifest.content_scripts[0].matches, ["https://chatgpt.com/*"]);
+  assert.equal(manifest.name, "Yoetz Native Transport");
+  assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "https://claude.ai/*"]);
+  assert.deepEqual(manifest.content_scripts[0].matches, ["https://chatgpt.com/*", "https://claude.ai/*"]);
+  assert.deepEqual(
+    manifest.web_accessible_resources[0].matches,
+    ["https://chatgpt.com/*", "https://claude.ai/*"]
+  );
+  assert.deepEqual(
+    new Set(manifest.web_accessible_resources[0].resources),
+    new Set(["src/chatgpt-dom.js", "src/sites/chatgpt.js", "src/sites/chatgpt-backend.js"])
+  );
 });
 
 test("manifest declares the required narrow permission set", () => {

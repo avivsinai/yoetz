@@ -1,5 +1,8 @@
 const activeJobs = new Map();
-let domHelpersPromise = null;
+const siteAdapterPromises = new Map();
+const siteAdapterModules = Object.freeze({
+  chatgpt: "src/sites/chatgpt.js"
+});
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   handleMessage(message)
@@ -23,24 +26,25 @@ async function handleMessage(message) {
     case "yoetz_extract_response":
       return extractJobResponse(message.job);
     case "yoetz_fetch_conversation":
-      return fetchConversationAnswer(message.job, message.conversation_id);
+      return fetchSiteConversationAnswer(message.job, message.conversation_id);
     case "yoetz_cancel_send":
       return cancelSend(message.job);
     case "yoetz_inspect_page":
       return inspectPage(message.run_id, {
         conversation_id: message.conversation_id,
-        include_page_text: Boolean(message.include_page_text)
+        include_page_text: Boolean(message.include_page_text),
+        recipe: message.recipe
       });
     case "yoetz_auth_probe":
-      return authProbe();
+      return authProbe(message.recipe);
     case "yoetz_probe":
-      return probe();
+      return probe(message.recipe);
     default:
       throw new Error(`unknown content-script command ${message?.type}`);
   }
 }
 
-// Best-effort cancel: click ChatGPT's stop control, then WAIT for generation to
+// Best-effort cancel: click the site's stop control, then WAIT for generation to
 // actually go idle before returning so the service worker does not remove the
 // tab while the abort request to OpenAI is still in flight (closing the tab
 // early lets the server keep generating). Returns confirmed_idle so the worker
@@ -52,8 +56,8 @@ async function handleMessage(message) {
 // safe-tab-only operation; the service worker is already going to remove the
 // tab right after this regardless of outcome. confirmGenerationStopped never
 // throws, so cancel stays best-effort.
-async function cancelSend(_job) {
-  const { confirmGenerationStopped } = await domHelpers();
+async function cancelSend(job) {
+  const { confirmGenerationStopped } = await domHelpers(job);
   const result = await confirmGenerationStopped(document);
   return {
     stopped: Boolean(result?.stopped),
@@ -70,7 +74,7 @@ async function prepareJob(job) {
     getPageText,
     markOwnership,
     ownedWindowName
-  } = await domHelpers();
+  } = await domHelpers(job);
   activeJobs.delete(job.job_id);
   const handoff = classifyManualHandoff({
     url: location.href,
@@ -106,8 +110,9 @@ async function prepareJob(job) {
 }
 
 async function uploadJobFile(job, filePayload) {
-  const { parseOwnedWindowName, uploadFile } = await domHelpers();
-  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "upload"));
+  const { parseOwnedWindowName, uploadFile } = await domHelpers(job);
+  const adapter = await siteAdapter(job);
+  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "upload", adapter));
   const bytes = base64ToUint8Array(filePayload.bytes_base64);
   const file = new File([bytes], filePayload.filename || "yoetz-bundle.md", {
     type: filePayload.mime_type || "text/markdown"
@@ -117,23 +122,25 @@ async function uploadJobFile(job, filePayload) {
 }
 
 async function configureModel(job) {
-  const { configureModelState, parseOwnedWindowName } = await domHelpers();
-  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "model_selection"));
+  const { configureModelState, parseOwnedWindowName } = await domHelpers(job);
+  const adapter = await siteAdapter(job);
+  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "model_selection", adapter));
   return configureModelState(document, job);
 }
 
 async function sendPrompt(job, prompt) {
+  const adapter = await siteAdapter(job);
   const {
     clickSend,
     insertPrompt,
     parseOwnedWindowName,
     sendAcceptanceBaseline,
     waitForSendAccepted
-  } = await domHelpers();
-  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send"));
+  } = await domHelpers(job);
+  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send", adapter));
   const baseline = sendAcceptanceBaseline(document);
   await insertPrompt(document, prompt, { timeoutMs: 20000 });
-  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send"));
+  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send", adapter));
   const clickOptions = { timeoutMs: Number(job.send_timeout_ms) || 120000 };
   const expectedConversationId = expectedConversationIdForJob(job);
   if (expectedConversationId) {
@@ -148,7 +155,7 @@ async function sendPrompt(job, prompt) {
   } catch (error) {
     throw commandError(
       "send_acceptance_unknown",
-      `ChatGPT send click was committed, but Yoetz could not confirm ChatGPT accepted the prompt before timeout. If a response eventually appears, do not rerun automatically: ${String(error?.message ?? error)}`,
+      `${adapter.displayName} send click was committed, but Yoetz could not confirm ${adapter.displayName} accepted the prompt before timeout. If a response eventually appears, do not rerun automatically: ${String(error?.message ?? error)}`,
       {
         phase: "send",
         side_effect_started: true
@@ -160,25 +167,26 @@ async function sendPrompt(job, prompt) {
     sent: true,
     ...accepted,
     url: location.href,
-    conversation_id: conversationIdFromUrl(location.href),
+    conversation_id: adapter.conversationIdFromUrl(location.href),
     submitted_user_count: submitted.user_count,
     submitted_assistant_count: submitted.assistant_count
   };
 }
 
 async function extractJobResponse(job) {
+  const adapter = await siteAdapter(job);
   const {
     classifyWaitManualHandoff,
     extractResponse,
     parseOwnedWindowName
-  } = await domHelpers();
-  assertJobOwnership(job, parseOwnedWindowName);
-  const conversationId = conversationIdFromUrl(location.href);
+  } = await domHelpers(job);
+  assertJobOwnership(job, parseOwnedWindowName, { adapter });
+  const conversationId = adapter.conversationIdFromUrl(location.href);
   const expectedConversationId = expectedConversationIdForJob(job);
   if (expectedConversationId && conversationId !== expectedConversationId) {
     throw commandError(
       "conversation_changed",
-      `tab moved from ChatGPT conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
+      `tab moved from ${adapter.displayName} conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
       {
         phase: "wait_response",
         side_effect_started: true,
@@ -203,204 +211,28 @@ async function extractJobResponse(job) {
   };
 }
 
-// T1 freeze-proof answer source: read the FINAL assistant answer from ChatGPT's backend
-// conversation API instead of the rendered DOM. The owned tab live-streams the answer while
-// BACKGROUNDED, where Chromium suspends rAF rendering, so the DOM freezes at the first token
-// ("I"); but a same-origin JSON GET runs on a task source Chrome does NOT throttle in background
-// tabs, so it returns the complete server-side answer (live-proven: full answer in a hidden tab
-// while the DOM was clipped). Same-origin fetch from this ISOLATED content script authenticates
-// with the page's httpOnly session cookie; host_permissions already covers chatgpt.com, so this
-// is zero new permission. The service worker owns WHEN to call this (gated on DOM idle) and the
-// T1->T2(reload)->T3(DOM) fallback; this function only reads + resolves the answer node.
-async function fetchConversationAnswer(job, requestedConversationId) {
-  const { parseOwnedWindowName } = await domHelpers();
-  // Ownership marker (window.name run/job) must still match — never read for the wrong job/tab.
-  assertJobOwnership(job, parseOwnedWindowName);
-  const conversationId = String(requestedConversationId ?? "").trim()
-    || expectedConversationIdForJob(job)
-    || conversationIdFromUrl(location.href);
-  if (!conversationId) {
-    throw backendApiError("backend_api_unavailable", "no conversation id available for backend-api read");
-  }
-  // accessToken is fetched PER CALL — it expires and must never be cached.
-  const token = await fetchChatgptAccessToken();
-  if (!token) {
-    throw backendApiError("backend_api_unauthorized", "no ChatGPT access token (session expired or signed out)");
-  }
-  let res;
-  try {
-    res = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
-      method: "GET",
-      credentials: "include",
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
-    });
-  } catch (error) {
-    throw backendApiError("backend_api_unavailable", `backend-api conversation fetch failed: ${String(error?.message ?? error)}`);
-  }
-  // 401/403 -> auth lane (SW falls back to reload-to-render / DOM); other non-2xx -> unavailable.
-  if (res.status === 401 || res.status === 403) {
-    throw backendApiError("backend_api_unauthorized", `backend-api conversation returned ${res.status}`);
-  }
-  if (!res.ok) {
-    throw backendApiError("backend_api_unavailable", `backend-api conversation returned ${res.status}`);
-  }
-  let data;
-  try {
-    data = await res.json();
-  } catch (error) {
-    throw backendApiError("backend_api_unavailable", `backend-api conversation returned non-JSON: ${String(error?.message ?? error)}`);
-  }
-  return resolveBackendAnswer(job, conversationId, data);
-}
-
-// Backend-api read failures are all wait_response-phase, side-effect-started (the prompt was already
-// sent). The SW maps backend_api_* codes to its T2 reload / T3 DOM fallback.
-function backendApiError(code, message) {
-  return commandError(code, message, { phase: "wait_response", side_effect_started: true });
-}
-
-async function fetchChatgptAccessToken() {
-  try {
-    const res = await fetch("/api/auth/session", {
-      method: "GET",
-      credentials: "include",
-      headers: { Accept: "application/json" }
-    });
-    if (!res.ok) {
-      return null;
-    }
-    const session = await res.json();
-    const token = session?.accessToken;
-    return typeof token === "string" && token.length > 0 ? token : null;
-  } catch {
-    return null;
-  }
-}
-
-// Resolve the FINAL assistant answer node from the conversation mapping. Returns an
-// extraction-shaped payload: node_fresh:true + is_generating:false when a NEW completed answer
-// exists; otherwise node_fresh:false + is_generating:true so the SW keeps waiting (never completes
-// on a stale/earlier turn). Never throws — a malformed/partial mapping is "not ready", not an
-// error.
-function resolveBackendAnswer(job, conversationId, data) {
-  const baseline = nonNegativeInt(job?.submitted_assistant_count ?? job?.response_baseline?.assistant_count ?? 0);
-  const notReady = (detail) => ({
-    method: "backend_api",
-    text: "",
-    is_generating: true,
-    conversation_id: conversationId,
-    node_fresh: false,
-    assistant_count: 0,
-    turn_index: -1,
-    has_copy_button: false,
-    copy_button_count: 0,
-    backend_api_detail: detail
+// Ask the selected adapter for a backend answer when its finality strategy supports one.
+// The worker owns when to call this fallback; the adapter owns site-specific API semantics.
+async function fetchSiteConversationAnswer(job, requestedConversationId) {
+  const adapter = await siteAdapter(job);
+  const { parseOwnedWindowName } = adapter.dom;
+  return adapter.fetchConversationAnswer({
+    job,
+    requestedConversationId,
+    parseOwnedWindowName,
+    assertJobOwnership,
+    expectedConversationId: expectedConversationIdForJob(job),
+    locationHref: location.href,
+    commandError
   });
-  const mapping = data && typeof data === "object" && data.mapping && typeof data.mapping === "object"
-    ? data.mapping
-    : null;
-  if (!mapping) {
-    return notReady("backend-api response had no conversation mapping");
-  }
-  // Freshness MUST be scoped to the ACTIVE current_node lineage, not the whole mapping. ChatGPT
-  // retains off-branch assistant answers (regenerations / abandoned / alternate branches) in the
-  // mapping; a global count could be inflated past the baseline by an off-branch node while the
-  // active lineage still points at a STALE earlier answer — returning that stale answer as fresh.
-  // So walk current_node -> root ONCE: the latest answer node on that path is THE answer, and the
-  // count of answer nodes on that path is what we compare against the pre-send baseline. current_node
-  // may be a tool/reasoning_recap node, so we cannot read it directly.
-  const { answerNode, count: lineageAnswerCount } = collectLineageAnswerNodes(mapping, data.current_node);
-  if (!answerNode) {
-    return notReady("no completed assistant answer node on the active lineage yet (still generating / tool-only)");
-  }
-  if (lineageAnswerCount <= baseline) {
-    return notReady(`assistant answer not fresh past baseline (active-lineage ${lineageAnswerCount} <= ${baseline})`);
-  }
-  const text = answerTextOf(answerNode.message);
-  if (!text) {
-    return notReady("latest active-lineage assistant answer node had no text parts");
-  }
-  return {
-    method: "backend_api",
-    text,
-    is_generating: false,
-    conversation_id: conversationId,
-    node_fresh: true,
-    assistant_count: lineageAnswerCount,
-    turn_index: Math.max(0, lineageAnswerCount - 1),
-    node_id: String(answerNode.id ?? answerNode.message?.id ?? ""),
-    has_copy_button: false,
-    copy_button_count: 0
-  };
-}
-
-// A node is a deliverable assistant answer ONLY if: assistant role, content_type 'text', addressed
-// to the user (recipient 'all'), end_turn true, and non-empty text. content_type+end_turn alone is
-// NOT sufficient — reasoning_recap nodes also carry end_turn:true (verified live), and tool turns
-// use non-'all' recipients.
-function isAssistantAnswerNode(message) {
-  if (!message || typeof message !== "object") {
-    return false;
-  }
-  if (message.author?.role !== "assistant") {
-    return false;
-  }
-  const content = message.content;
-  if (!content || content.content_type !== "text") {
-    return false;
-  }
-  if ((message.recipient ?? "all") !== "all") {
-    return false;
-  }
-  if (message.end_turn !== true) {
-    return false;
-  }
-  return answerTextOf(message).length > 0;
-}
-
-function answerTextOf(message) {
-  const parts = message?.content?.parts;
-  if (!Array.isArray(parts)) {
-    return "";
-  }
-  return parts.filter((part) => typeof part === "string").join("").trim();
-}
-
-// Walk current_node -> root once, collecting the COMPLETED assistant answer nodes that lie on the
-// ACTIVE lineage. Returns { answerNode: latest-on-lineage (closest to current_node), count }.
-// Off-branch answers (not on this path) are intentionally not seen here.
-function collectLineageAnswerNodes(mapping, currentNodeId) {
-  let id = currentNodeId;
-  let guard = 0;
-  let answerNode = null;
-  let count = 0;
-  while (id && guard < 2000) {
-    guard += 1;
-    const node = mapping[id];
-    if (!node) {
-      break;
-    }
-    if (isAssistantAnswerNode(node.message)) {
-      if (!answerNode) {
-        answerNode = node;
-      }
-      count += 1;
-    }
-    id = node.parent;
-  }
-  return { answerNode, count };
-}
-
-function nonNegativeInt(value) {
-  const n = Number(value);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
 }
 
 async function inspectPage(runId, options = {}) {
-  const { extractResponse, getPageText, modelSelectionDiagnostics, parseOwnedWindowName } = await domHelpers();
+  const adapter = await siteAdapter(options.recipe);
+  const { extractResponse, getPageText, modelSelectionDiagnostics, parseOwnedWindowName } = await domHelpers(options.recipe);
   const parsed = parseOwnedWindowName(window.name);
   const urlRunId = runIdFromUrl(location.href);
-  const conversationId = conversationIdFromUrl(location.href);
+  const conversationId = adapter.conversationIdFromUrl(location.href);
   const conversationTarget = String(options.conversation_id ?? "").trim();
   const runMatches = !runId || parsed?.run_id === runId || urlRunId === runId;
   const conversationMatches = Boolean(conversationTarget && conversationId === conversationTarget);
@@ -432,8 +264,9 @@ async function inspectPage(runId, options = {}) {
   return result;
 }
 
-async function authProbe() {
-  const { classifyManualHandoff, getPageText } = await domHelpers();
+async function authProbe(recipe) {
+  const adapter = await siteAdapter(recipe);
+  const { classifyManualHandoff, getPageText } = await domHelpers(recipe);
   const text = getPageText(document);
   const handoff = classifyManualHandoff({
     url: location.href,
@@ -446,7 +279,7 @@ async function authProbe() {
     authenticated,
     manual_handoff: handoff,
     message: authenticated
-      ? "ChatGPT authenticated in this Chrome profile"
+      ? `${adapter.displayName} authenticated in this Chrome profile`
       : handoff.message,
     url: location.href,
     title: document.title,
@@ -454,8 +287,8 @@ async function authProbe() {
   };
 }
 
-async function probe() {
-  const { getPageText } = await domHelpers();
+async function probe(recipe) {
+  const { getPageText } = await domHelpers(recipe);
   return {
     url: location.href,
     title: document.title,
@@ -464,7 +297,8 @@ async function probe() {
 }
 
 async function bindJob(job) {
-  const { markOwnership, parseOwnedWindowName } = await domHelpers();
+  const adapter = await siteAdapter(job);
+  const { markOwnership, parseOwnedWindowName } = await domHelpers(job);
   const parsed = parseOwnedWindowName(window.name);
   if (parsed?.job_id !== job.job_id || parsed?.run_id !== job.run_id) {
     throw commandError(
@@ -487,12 +321,12 @@ async function bindJob(job) {
       }
     );
   }
-  const conversationId = conversationIdFromUrl(location.href);
+  const conversationId = adapter.conversationIdFromUrl(location.href);
   const expectedConversationId = expectedConversationIdForJob(job);
   if (expectedConversationId && conversationId !== expectedConversationId) {
     throw commandError(
       "conversation_changed",
-      `tab moved from ChatGPT conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
+      `tab moved from ${adapter.displayName} conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
       {
         phase: "wait_response",
         side_effect_started: true,
@@ -521,14 +355,14 @@ function assertJobOwnership(job, parseOwnedWindowName, options = {}) {
     throw new Error(`tab ownership marker mismatch for job ${job.job_id}`);
   }
   if (options.requireConversation) {
-    const actualConversationId = conversationIdFromUrl(location.href);
+    const actualConversationId = options.adapter.conversationIdFromUrl(location.href);
     if (actualConversationId === options.requireConversation) {
       return;
     }
     const code = actualConversationId ? "conversation_changed" : "conversation_not_loaded";
     throw commandError(
       code,
-      `job ${job.job_id} expected ChatGPT conversation ${options.requireConversation}, current conversation is ${actualConversationId ?? "(none)"}`,
+      `job ${job.job_id} expected ${options.adapter.displayName} conversation ${options.requireConversation}, current conversation is ${actualConversationId ?? "(none)"}`,
       {
         phase: options.phase ?? "upload",
         side_effect_started: false,
@@ -537,19 +371,19 @@ function assertJobOwnership(job, parseOwnedWindowName, options = {}) {
       }
     );
   }
-  if (options.requireFresh && String(location.pathname ?? "").startsWith("/c/")) {
-    throw commandError("fresh_chat_lost", `job ${job.job_id} is no longer on a fresh ChatGPT page`, {
+  if (options.requireFresh && options.adapter.isConversationUrl(location.href)) {
+    throw commandError("fresh_chat_lost", `job ${job.job_id} is no longer on a fresh ${options.adapter.displayName} page`, {
       phase: "upload",
       side_effect_started: false
     });
   }
 }
 
-function ownershipOptionsForJob(job, phase) {
+function ownershipOptionsForJob(job, phase, adapter) {
   const conversationId = conversationIdForJob(job);
   return conversationId
-    ? { requireConversation: conversationId, phase }
-    : { requireFresh: true, phase };
+    ? { adapter, requireConversation: conversationId, phase }
+    : { adapter, requireFresh: true, phase };
 }
 
 function assertUrlRunMarker(job) {
@@ -583,11 +417,35 @@ function conversationLoadOptionsForJob(job) {
   return options;
 }
 
-async function domHelpers() {
-  if (!domHelpersPromise) {
-    domHelpersPromise = import(chrome.runtime.getURL("src/chatgpt-dom.js"));
+async function domHelpers(jobOrRecipe) {
+  return (await siteAdapter(jobOrRecipe)).dom;
+}
+
+async function siteAdapter(jobOrRecipe) {
+  const requested = typeof jobOrRecipe === "string"
+    ? jobOrRecipe
+    : jobOrRecipe?.recipe;
+  const recipe = requested == null ? "chatgpt" : requested;
+  const modulePath = typeof recipe === "string" ? siteAdapterModules[recipe] : null;
+  if (!modulePath) {
+    throw commandError(
+      "unsupported_recipe",
+      `recipe ${JSON.stringify(recipe)} is not available in this content-script build; rejected before side effects`,
+      { phase: "profile", side_effect_started: false }
+    );
   }
-  return domHelpersPromise;
+  if (!siteAdapterPromises.has(recipe)) {
+    siteAdapterPromises.set(recipe, import(chrome.runtime.getURL(modulePath)));
+  }
+  const module = await siteAdapterPromises.get(recipe);
+  if (!module?.siteAdapter) {
+    throw commandError(
+      "unsupported_recipe",
+      `recipe ${JSON.stringify(recipe)} did not expose a site adapter; rejected before side effects`,
+      { phase: "profile", side_effect_started: false }
+    );
+  }
+  return module.siteAdapter;
 }
 
 function base64ToUint8Array(value) {
@@ -636,16 +494,6 @@ function contentScriptBuild() {
 function runIdFromUrl(value) {
   try {
     return new URL(value).searchParams.get("_yoetz");
-  } catch {
-    return null;
-  }
-}
-
-function conversationIdFromUrl(value) {
-  try {
-    const pathname = new URL(value, location.href).pathname;
-    const match = pathname.match(/^\/c\/([^/?#]+)$/);
-    return match ? decodeURIComponent(match[1]) : null;
   } catch {
     return null;
   }

@@ -9,7 +9,7 @@ import {
   progress,
   validateEnvelope
 } from "./protocol.js";
-import { chatgptConversationJobUrl, chatgptJobUrl } from "./chatgpt-dom.js";
+import { advertisedRecipes, siteAdapterForRecipe } from "./sites/index.js";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 90 * 60 * 1000;
 const JOB_TTL_MS = 3 * 60 * 60 * 1000;
@@ -17,6 +17,7 @@ const HEARTBEAT_ALARM = "yoetz-heartbeat";
 const RECONNECT_ALARM = "yoetz-reconnect";
 const TERMINAL_STATUSES = new Set(["complete", "cancelled", "failed", "manual_handoff", "state_lost", "terminal_delivery_lost"]);
 const EXTENSION_ID_STORAGE_KEY = "yoetz_extension_instance_id";
+const ADVERTISED_RECIPES = Object.freeze(advertisedRecipes());
 const MIN_STABLE_IDLE_MS = Number(globalThis.__YOETZ_MIN_STABLE_IDLE_MS ?? 90000);
 // Require multiple stable polls so final controls cannot win before late text hydration.
 const STABLE_IDLE_INTERVAL_MULTIPLIER = Number(globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER ?? 3);
@@ -42,7 +43,7 @@ const MAX_RENDER_REFRESH_ATTEMPTS = Math.max(
     ? Number(globalThis.__YOETZ_MAX_RENDER_REFRESH_ATTEMPTS)
     : 1
 );
-// Once ChatGPT has exposed a final assistant affordance (copy control) AND scoped
+// Once a site adapter has exposed its final assistant affordance AND scoped
 // text is extractable AND generation has stopped, the response is structurally
 // complete. Confirm it over a SHORT stable window at a FAST cadence instead of
 // waiting out the full MIN_STABLE_IDLE_MS late-hydration floor. The dual-candidate
@@ -232,7 +233,18 @@ async function startJob(message) {
     }));
     return;
   }
-  const job = normalizeJob(message);
+  let adapter;
+  try {
+    adapter = siteAdapterForRecipe(message.payload?.recipe);
+  } catch (error) {
+    postNative(errorEnvelope(messageJob(message), error?.code ?? "unsupported_recipe", String(error?.message ?? error), {
+      request_id: message.request_id,
+      phase: "profile",
+      side_effect_started: false
+    }));
+    return;
+  }
+  const job = normalizeJob(message, adapter);
   job.started_at = Date.now();
   job.updated_at = Date.now();
   job.connection_generation = connectionGeneration;
@@ -257,8 +269,8 @@ async function startJob(message) {
   await persistJob(job);
 
   const url = job.expected_conversation_id
-    ? chatgptConversationJobUrl(job.expected_conversation_id, job.run_id)
-    : chatgptJobUrl(job.run_id);
+    ? adapter.conversationJobUrl(job.expected_conversation_id, job.run_id)
+    : adapter.jobUrl(job.run_id);
   const tab = await chrome.tabs.create({ url, active: false });
   job.tab_id = tab.id;
   job.updated_at = Date.now();
@@ -268,14 +280,14 @@ async function startJob(message) {
     tab_id: tab.id,
     url,
     inspect_command: inspectCommand,
-    message: `opened yoetz-owned ChatGPT tab ${url}; inspect with: ${inspectCommand}`
+    message: `opened yoetz-owned ${adapter.displayName} tab ${url}; inspect with: ${inspectCommand}`
   }))) {
     await recordTerminalDeliveryLost(job, "upload");
     return;
   }
 
-  await waitForChatgptTab(tab.id);
-  await waitForContentScript(tab.id);
+  await waitForSiteTab(tab.id, adapter);
+  await waitForContentScript(tab.id, adapter);
   const prepared = await sendToTab(tab.id, { type: "yoetz_prepare_job", job });
   if (prepared.manual_handoff) {
     postNative(progress(job, "manual_handoff", prepared.manual_handoff));
@@ -298,8 +310,8 @@ async function startJob(message) {
     await recordTerminalDeliveryLost(job, "model_selection");
     return;
   }
-  if (!isAcceptableModelSelection(modelSelection)) {
-    await failJob(job, "model_selection_failed", `Requested ChatGPT model was not selected: ${modelSelection.status ?? "unknown"}`, {
+  if (!adapter.isAcceptableModelSelection(modelSelection)) {
+    await failJob(job, "model_selection_failed", `Requested ${adapter.displayName} model was not selected: ${modelSelection.status ?? "unknown"}`, {
       phase: "model_selection",
       side_effect_started: false,
       requested_model: job.model,
@@ -315,7 +327,7 @@ async function startJob(message) {
   job.status = "waiting_for_file";
   job.updated_at = Date.now();
   await persistJob(job);
-  if (!postNative(progress(job, "ready_for_file", { tab_id: tab.id, message: "ChatGPT tab is ready for bundle upload" }))) {
+  if (!postNative(progress(job, "ready_for_file", { tab_id: tab.id, message: `${adapter.displayName} tab is ready for bundle upload` }))) {
     await recordTerminalDeliveryLost(job, "upload");
   }
 }
@@ -428,11 +440,11 @@ async function runJobWithFile(job, file) {
     if (!postNative(progress(job, "prompt_sent", {
       timeout_ms: responseWaitTimeoutMs(job),
       inspect_command: inspectCommand,
-      yoetz_url: chatgptJobUrl(job.run_id),
+      yoetz_url: adapterForJob(job).jobUrl(job.run_id),
       submitted_url: job.submitted_url,
       conversation_id: conversationIdForJob(job),
-      conversation_url: conversationUrlForId(conversationIdForJob(job)),
-      message: `prompt sent; waiting for ChatGPT response (timeout ${formatDurationForMessage(responseWaitTimeoutMs(job))}); inspect with: ${inspectCommand}`
+      conversation_url: conversationUrlForJob(job, conversationIdForJob(job)),
+      message: `prompt sent; waiting for ${adapterForJob(job).displayName} response (timeout ${formatDurationForMessage(responseWaitTimeoutMs(job))}); inspect with: ${inspectCommand}`
     }))) {
       await recordTerminalDeliveryLost(job, "send");
       return;
@@ -478,24 +490,25 @@ async function completeJobWithExtraction(job, extraction) {
       assistant_turn_count: extraction.assistant_turn_count ?? extraction.assistant_count ?? 0,
       copy_button_count: extraction.copy_button_count ?? 0,
       conversation_id: conversationId,
-      conversation_url: conversationUrlForId(conversationId),
+      conversation_url: conversationUrlForJob(job, conversationId),
       model_strategy: job.model_strategy ?? "select",
       model_used: job.model_used ?? null,
       model_selection_status: job.model_selection_status ?? "unavailable",
       warnings: [
         ...(job.warnings ?? []),
-        ...(extraction.text ? [] : ["empty ChatGPT response extracted"]),
+        ...(extraction.text ? [] : [adapterForJob(job).completion.emptyResponseWarning]),
         ...(extraction.warning ? [extraction.warning] : [])
       ]
     }
   });
   const completeBytes = nativeEnvelopeByteLength(completeEnvelope);
   if (completeBytes > MAX_NATIVE_OUTBOUND_BYTES) {
+    const adapter = adapterForJob(job);
     const inspectCommand = inspectCommandForJob(job);
     await failJob(
       job,
       "response_too_large",
-      `ChatGPT response is too large to deliver through chrome-extension-native (${completeBytes} bytes > ${MAX_NATIVE_OUTBOUND_BYTES}); inspect the owned tab with: ${inspectCommand}`,
+      `${adapter.displayName} response is too large to deliver through chrome-extension-native (${completeBytes} bytes > ${MAX_NATIVE_OUTBOUND_BYTES}); inspect the owned tab with: ${inspectCommand}`,
       {
         phase: "wait_response",
         side_effect_started: true,
@@ -526,17 +539,15 @@ function conversationIdForJob(job, extraction = null) {
   return job?.submitted_conversation_id ?? extraction?.conversation_id ?? job?.conversation_id ?? null;
 }
 
-function conversationUrlForId(conversationId) {
-  if (!conversationId) {
-    return null;
-  }
-  return `https://chatgpt.com/c/${encodeURIComponent(conversationId)}`;
+function conversationUrlForJob(job, conversationId) {
+  return adapterForJob(job).conversationUrl(conversationId);
 }
 
 async function resumeWaitingResponseJob(job) {
   try {
-    await waitForChatgptTab(job.tab_id);
-    await waitForContentScript(job.tab_id);
+    const adapter = adapterForJob(job);
+    await waitForSiteTab(job.tab_id, adapter);
+    await waitForContentScript(job.tab_id, adapter);
     const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
     postNative(progress(job, "content_script_recovered", {
       restored: true,
@@ -569,9 +580,9 @@ async function cancelJob(message) {
   chunks.discard(job.job_id);
   await persistJob(job);
 
-  // Best-effort: tell the content script to click ChatGPT's stop control AND
+  // Best-effort: tell the content script to click the site's stop control AND
   // wait for generation to actually go idle before we tear the tab down — a bare
-  // stop click only initiates ChatGPT's abort to OpenAI, and removing the tab
+  // a stop click only initiates the site's abort, and removing the tab
   // microseconds later races/drops that request so the server keeps generating.
   // We await cancelSend so chrome.tabs.remove below runs only AFTER the stop is
   // confirmed (or its bounded ~5s idle-wait elapses). The content script's
@@ -693,28 +704,29 @@ async function handleReconnect(message) {
 }
 
 async function handleDoctorAuthProbe(message) {
+  const adapter = siteAdapterForRecipe(message.payload?.recipe);
   postNative(makeEnvelope("job_complete", {
     request_id: message.request_id,
     job_id: message.job_id,
     run_id: message.run_id,
     workspace_id: message.workspace_id,
-    payload: await probeChatgptAuthentication()
+    payload: await probeSiteAuthentication(adapter)
   }));
 }
 
-async function probeChatgptAuthentication() {
-  const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
-  const selected = selectChatgptAuthProbeTab(tabs);
+async function probeSiteAuthentication(adapter) {
+  const tabs = await chrome.tabs.query({ url: adapter.tabQueryPattern });
+  const selected = selectSiteAuthProbeTab(tabs, adapter);
   if (!selected) {
     return {
-      status: "no_chatgpt_tab",
+      status: adapter.auth.noTabStatus,
       authenticated: false,
-      message: "No ChatGPT tab is open in this Chrome profile; open https://chatgpt.com/ and rerun doctor",
+      message: `No ${adapter.displayName} tab is open in this Chrome profile; open ${adapter.homeUrl} and rerun doctor`,
       inspected_tabs: 0
     };
   }
   try {
-    const probe = await sendToTab(selected.tab.id, { type: "yoetz_auth_probe" });
+    const probe = await sendToTab(selected.tab.id, { type: "yoetz_auth_probe", recipe: adapter.recipe });
     return {
       ...probe,
       tab_id: selected.tab.id,
@@ -727,7 +739,7 @@ async function probeChatgptAuthentication() {
     return {
       status: "content_script_unavailable",
       authenticated: false,
-      message: `Yoetz content script is not ready in selected ChatGPT tab: ${String(error?.message ?? error)}`,
+      message: `Yoetz content script is not ready in selected ${adapter.displayName} tab: ${String(error?.message ?? error)}`,
       tab_id: selected.tab.id,
       tab_url: selected.tab.url ?? null,
       tab_title: selected.tab.title ?? null,
@@ -737,9 +749,9 @@ async function probeChatgptAuthentication() {
   }
 }
 
-function selectChatgptAuthProbeTab(tabs) {
+function selectSiteAuthProbeTab(tabs, adapter) {
   const candidates = (tabs ?? [])
-    .filter((tab) => tab?.id && String(tab.url ?? "").startsWith("https://chatgpt.com/"))
+    .filter((tab) => tab?.id && adapter.isAllowedTabUrl(tab.url))
     .map((tab) => ({
       tab,
       yoetzOwned: new URL(tab.url).searchParams.has("_yoetz")
@@ -754,25 +766,13 @@ function selectChatgptAuthProbeTab(tabs) {
     ?? candidates[0];
   return {
     tab: candidate.tab,
-    selection: chatgptAuthProbeSelection(candidate),
+    selection: adapter.auth.selection(candidate),
     total: candidates.length
   };
 }
 
-function chatgptAuthProbeSelection(candidate) {
-  if (candidate.tab.active && !candidate.yoetzOwned) {
-    return "active_non_yoetz_chatgpt_tab";
-  }
-  if (!candidate.yoetzOwned) {
-    return "non_yoetz_chatgpt_tab";
-  }
-  if (candidate.tab.active) {
-    return "active_yoetz_job_tab";
-  }
-  return "yoetz_job_tab";
-}
-
 async function handleInspectRun(message) {
+  const adapter = siteAdapterForRecipe(message.payload?.recipe);
   const runId = String(message.payload?.run_id ?? "").trim();
   if (!runId) {
     postNative(errorEnvelope(messageJob(message), "missing_run_id", "inspect_run requires payload.run_id", {
@@ -780,7 +780,7 @@ async function handleInspectRun(message) {
     }));
     return;
   }
-  const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+  const tabs = await chrome.tabs.query({ url: adapter.tabQueryPattern });
   const matches = [];
   const errors = [];
   for (const tab of tabs) {
@@ -791,16 +791,15 @@ async function handleInspectRun(message) {
       const inspection = sanitizeInspection(await sendToTab(tab.id, {
         type: "yoetz_inspect_page",
         run_id: runId,
-        conversation_id: runId
+        conversation_id: runId,
+        recipe: adapter.recipe
       }));
       const responseInProgress = Boolean(inspection?.extraction?.is_generating);
       matches.push({
         tab_id: tab.id,
         url: tab.url ?? inspection?.url ?? null,
         title: tab.title ?? inspection?.title ?? null,
-        // Non-final marker for inspect read mid-stream. ChatGPT Pro streams several interim
-        // turns before the answer; while generating, inspection.extraction.text is a partial/interim
-        // turn's body (observed live as a single "I"), NOT the verdict. Wait for generation to stop.
+        // Non-final marker for an inspect read while the site still reports generation.
         response_in_progress: responseInProgress,
         note: responseInProgress
           ? "response still generating; extraction.text is a partial/interim assistant turn, not the final answer"
@@ -820,7 +819,7 @@ async function handleInspectRun(message) {
     }
   }
   if (matches.length === 0) {
-    postNative(errorEnvelope(messageJob(message), "run_not_found", `no Yoetz ChatGPT tab found for run ${runId}`, {
+    postNative(errorEnvelope(messageJob(message), "run_not_found", `no Yoetz ${adapter.displayName} tab found for run ${runId}`, {
       request_id: message.request_id,
       run_id: runId,
       inspected_tabs: errors
@@ -988,7 +987,7 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
       postNative(progress(job, "ready_for_file", {
         tab_id: job.tab_id,
         restored: true,
-        message: "ChatGPT tab is ready for bundle upload"
+        message: `${adapterForJob(job).displayName} tab is ready for bundle upload`
       }));
       continue;
     }
@@ -1008,7 +1007,7 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
         tab_id: job.tab_id,
         restored: true,
         inspect_command: inspectCommandForJob(job),
-        message: "restored ChatGPT response wait after service-worker restart"
+        message: `restored ${adapterForJob(job).displayName} response wait after service-worker restart`
       }))) {
         await recordTerminalDeliveryLost(job, "wait_response");
         continue;
@@ -1037,23 +1036,24 @@ function canResumeJobAfterWorkerRestart(job) {
 }
 
 function canResumeWaitingResponseAfterWorkerRestart(job) {
-  // The prompt has already been accepted by ChatGPT and the only remaining
+  // The prompt has already been accepted by the site and the only remaining
   // mutable state is the DOM polling loop. Rebind the content script to the
   // persisted owned tab and continue structural-finality polling.
   return job.status === "waiting_response" && Boolean(job.tab_id);
 }
 
-function normalizeJob(message) {
+function normalizeJob(message, adapter) {
   const payload = message.payload ?? {};
-  const conversation = normalizeConversationId(payload.conversation_id);
+  const conversation = adapter.normalizeConversationId(payload.conversation_id);
   return {
     job_id: message.job_id,
     run_id: message.run_id,
     workspace_id: message.workspace_id,
     capability_token: message.capability_token,
     request_id: message.request_id,
+    recipe: adapter.recipe,
     prompt: payload.prompt ?? "",
-    model: payload.model_strategy === "current" ? "current" : "gpt-5-6-sol-pro",
+    model: payload.model_strategy === "current" ? "current" : adapter.defaultModel,
     model_strategy: payload.model_strategy ?? "select",
     wait_timeout_ms: payload.wait_timeout_ms ?? DEFAULT_WAIT_TIMEOUT_MS,
     wait_interval_ms: payload.wait_interval_ms ?? 30000,
@@ -1074,24 +1074,8 @@ function normalizeJob(message) {
   };
 }
 
-function normalizeConversationId(value) {
-  if (value == null) {
-    return { ok: true, id: null };
-  }
-  if (typeof value !== "string") {
-    return { ok: false, message: "invalid `conversation_id`: expected a string ChatGPT conversation id" };
-  }
-  const id = value.trim();
-  if (!id || id === "." || id === "..") {
-    return { ok: false, message: "invalid `conversation_id`: expected a non-empty ChatGPT conversation id" };
-  }
-  if (id.length > 256) {
-    return { ok: false, message: "invalid `conversation_id`: expected at most 256 characters" };
-  }
-  if (!/^[A-Za-z0-9_.-]+$/.test(id)) {
-    return { ok: false, message: "invalid `conversation_id`: expected ASCII letters, digits, `_`, `.`, or `-`" };
-  }
-  return { ok: true, id };
+function adapterForJob(job) {
+  return siteAdapterForRecipe(job?.recipe);
 }
 
 function requireJob(jobId) {
@@ -1159,7 +1143,8 @@ function postHello() {
         protocol_version: PROTOCOL_VERSION,
         extension_instance_id: identity.extension_instance_id,
         profile_email: identity.profile_email || null,
-        profile_id: identity.profile_id || null
+        profile_id: identity.profile_id || null,
+        recipes: [...ADVERTISED_RECIPES]
       }
     }));
   }).catch(async (error) => {
@@ -1180,7 +1165,8 @@ function postHello() {
         protocol_version: PROTOCOL_VERSION,
         extension_instance_id: extensionInstanceId,
         profile_email: null,
-        profile_id: null
+        profile_id: null,
+        recipes: [...ADVERTISED_RECIPES]
       }
     }));
   });
@@ -1332,18 +1318,18 @@ function cryptoRandomId() {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
-async function waitForChatgptTab(tabId) {
+async function waitForSiteTab(tabId, adapter) {
   for (let attempt = 0; attempt < 60; attempt += 1) {
     const tab = await chrome.tabs.get(tabId);
-    if (tab.status === "complete" && tab.url?.startsWith("https://chatgpt.com/")) {
+    if (tab.status === "complete" && adapter.isAllowedTabUrl(tab.url)) {
       return;
     }
     await sleep(500);
   }
-  throw new Error(`ChatGPT tab ${tabId} did not load`);
+  throw new Error(`${adapter.displayName} tab ${tabId} did not load`);
 }
 
-async function waitForContentScript(tabId) {
+async function waitForContentScript(tabId, adapter) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
       await sendToTab(tabId, { type: "yoetz_probe" });
@@ -1352,7 +1338,7 @@ async function waitForContentScript(tabId) {
       await sleep(500);
     }
   }
-  throw new Error(`Yoetz content script did not become ready in ChatGPT tab ${tabId}`);
+  throw new Error(`Yoetz content script did not become ready in ${adapter.displayName} tab ${tabId}`);
 }
 
 async function sendToTab(tabId, message) {
@@ -1404,6 +1390,7 @@ async function maybeGroupTab(tabId, job) {
 }
 
 async function waitForResponse(job) {
+  const completion = adapterForJob(job).completion;
   const startedAt = Number(job.response_wait_started_at) || Date.now();
   job.response_wait_started_at = startedAt;
   const interval = Math.max(500, Math.min(Number(job.wait_interval_ms) || 30000, 30000));
@@ -1461,8 +1448,8 @@ async function waitForResponse(job) {
       && extractionIdle
       && extraction?.method !== "page_text_fallback"
     );
-    const backendApiFinal = Boolean(scopedExtractionCandidate && isFreshBackendApiExtraction(extraction));
-    const finalAffordance = Boolean(scopedExtractionCandidate && hasFinalAssistantAffordance(extraction));
+    const backendApiFinal = Boolean(scopedExtractionCandidate && completion.isFreshBackendApiExtraction(extraction));
+    const finalAffordance = Boolean(scopedExtractionCandidate && completion.hasFinalAssistantAffordance(extraction));
     const finalStructuralResponse = finalAffordance || backendApiFinal;
     // Broad page text is diagnostic only; final controls without scoped text
     // means extraction failed, not that page chrome is safe to return.
@@ -1470,33 +1457,42 @@ async function waitForResponse(job) {
       postSendAssistantActivity
       && extraction?.method === "page_text_fallback"
       && !extraction?.is_generating
-      && hasFinalAssistantAffordance(extraction)
+      && completion.hasFinalAssistantAffordance(extraction)
     );
     const stableIdleUnscopedCopy = Boolean(
       scopedExtractionCandidate
       && !finalStructuralResponse
-      && hasStableIdleUnscopedCopyAffordance(job, extraction)
+      && completion.hasStableIdleUnscopedCopyAffordance(
+        job,
+        extraction,
+        MIN_UNSCOPED_COPY_STABLE_TEXT_CHARS
+      )
     );
-    const renderRefreshCandidateEligible = isRenderFreezeRefreshCandidate(
+    const renderRefreshCandidateEligible = completion.isRenderFreezeRefreshCandidate(
       job,
       extraction,
       scopedExtractionCandidate,
-      finalStructuralResponse
+      finalStructuralResponse,
+      {
+        conversationId: conversationIdForJob(job, extraction),
+        shortResponseMaxChars: RENDER_FREEZE_SHORT_RESPONSE_MAX_CHARS,
+        maxRefreshAttempts: MAX_RENDER_REFRESH_ATTEMPTS
+      }
     );
     let stableForMs = 0;
     let unscopedCopyStableForMs = 0;
     let renderRefreshStableForMs = 0;
     if (backendApiFinal) {
-      return completedExtraction(extraction, "backend_api", 0);
+      return completion.completedExtraction(extraction, "backend_api", 0);
     }
     if (finalStructuralResponse) {
-      // Once ChatGPT exposes final assistant controls, scope and turn checks
+      // Once the adapter exposes final assistant controls, scope and turn checks
       // have already ruled out pre-send content. From here we track the best
       // scoped candidate by text growth so late page chrome cannot replace a
       // completed response, and transient generating blips cannot forget it.
-      const bestSelection = selectFinalAffordanceCandidate(bestFinalAffordanceCandidate, extraction);
+      const bestSelection = completion.selectFinalAffordanceCandidate(bestFinalAffordanceCandidate, extraction);
       bestFinalAffordanceCandidate = bestSelection.candidate;
-      const candidateSelection = selectFinalAffordanceCandidate(
+      const candidateSelection = completion.selectFinalAffordanceCandidate(
         finalAffordanceCandidate ?? bestFinalAffordanceCandidate,
         extraction
       );
@@ -1515,7 +1511,7 @@ async function waitForResponse(job) {
       // for the short confirm window, the response is settled — emit instead of
       // burning the full idle floor.
       if (stableForMs >= affordanceConfirmMs) {
-        return completedExtraction(finalAffordanceCandidate, "copy_button", stableForMs);
+        return completion.completedExtraction(finalAffordanceCandidate, "copy_button", stableForMs);
       }
       unscopedCopyCandidate = null;
       bestUnscopedCopyCandidate = null;
@@ -1536,9 +1532,9 @@ async function waitForResponse(job) {
       renderRefreshCandidateSinceMs = 0;
     }
     if (stableIdleUnscopedCopy) {
-      const bestSelection = selectFinalAffordanceCandidate(bestUnscopedCopyCandidate, extraction);
+      const bestSelection = completion.selectFinalAffordanceCandidate(bestUnscopedCopyCandidate, extraction);
       bestUnscopedCopyCandidate = bestSelection.candidate;
-      const candidateSelection = selectFinalAffordanceCandidate(
+      const candidateSelection = completion.selectFinalAffordanceCandidate(
         unscopedCopyCandidate ?? bestUnscopedCopyCandidate,
         extraction
       );
@@ -1552,7 +1548,11 @@ async function waitForResponse(job) {
       }
       unscopedCopyStableForMs = Date.now() - unscopedCopyCandidateSinceMs;
       if (unscopedCopyStableForMs >= finalAffordanceIdleMs) {
-        return completedExtraction(unscopedCopyCandidate, "stable_idle_unscoped_copy_button", unscopedCopyStableForMs);
+        return completion.completedExtraction(
+          unscopedCopyCandidate,
+          "stable_idle_unscoped_copy_button",
+          unscopedCopyStableForMs
+        );
       }
     } else if (!finalStructuralResponse) {
       unscopedCopyCandidate = null;
@@ -1562,14 +1562,15 @@ async function waitForResponse(job) {
       }
     }
     if (renderRefreshCandidateEligible) {
-      if (!sameRenderRefreshCandidate(renderRefreshCandidate, extraction)) {
+      if (!completion.sameRenderRefreshCandidate(renderRefreshCandidate, extraction)) {
         renderRefreshCandidate = extraction;
         renderRefreshCandidateSinceMs = Date.now();
       } else if (!renderRefreshCandidateSinceMs) {
         renderRefreshCandidateSinceMs = Date.now();
       }
       renderRefreshStableForMs = Date.now() - renderRefreshCandidateSinceMs;
-      if (renderRefreshStableForMs >= MIN_RENDER_FREEZE_IDLE_MS && canRefreshFrozenRender(job)) {
+      if (renderRefreshStableForMs >= MIN_RENDER_FREEZE_IDLE_MS
+          && completion.canRefreshFrozenRender(job, MAX_RENDER_REFRESH_ATTEMPTS)) {
         await refreshFrozenRender(job, extraction, renderRefreshStableForMs);
         renderRefreshCandidate = null;
         renderRefreshCandidateSinceMs = 0;
@@ -1590,7 +1591,16 @@ async function waitForResponse(job) {
       }
       const extractionFailureStableForMs = Date.now() - extractionFailureSinceMs;
       if (extractionFailureStableForMs >= finalAffordanceIdleMs) {
-        await failJob(job, "response_extraction_failed", finalAffordanceExtractionFailureMessage(job, extraction, extractionFailureStableForMs), {
+        await failJob(
+          job,
+          "response_extraction_failed",
+          completion.finalAffordanceExtractionFailureMessage(
+            job,
+            extraction,
+            extractionFailureStableForMs,
+            inspectCommandForJob(job)
+          ),
+          {
           phase: "wait_response",
           side_effect_started: true,
           completion_reason: "final_affordance_without_scoped_text",
@@ -1601,7 +1611,8 @@ async function waitForResponse(job) {
           turn_index: extraction.turn_index ?? -1,
           copy_button_count: extraction.copy_button_count ?? 0,
           diagnostics: diagnosticPayload(extraction.diagnostics)
-        });
+          }
+        );
         return null;
       }
     } else {
@@ -1638,7 +1649,8 @@ async function waitForResponse(job) {
     await sleep(nextDelay);
   }
   const inspectCommand = inspectCommandForJob(job);
-  const timeoutSummary = `ChatGPT response did not reach stable completion before timeout (baseline_assistant_count=${job.response_baseline?.assistant_count ?? 0}, best_method=${best.method}, best_text_chars=${best.text?.length ?? 0}, best_assistant_count=${best.assistant_count ?? 0}, best_turn_index=${best.turn_index ?? -1}, best_copy_button_count=${best.copy_button_count ?? 0}, best_is_generating=${Boolean(best.is_generating)}, last_method=${last.method}, last_text_chars=${last.text?.length ?? 0}, last_assistant_count=${last.assistant_count ?? 0}, last_turn_index=${last.turn_index ?? -1}, last_copy_button_count=${last.copy_button_count ?? 0}, last_is_generating=${Boolean(last.is_generating)}, last_diagnostics=${diagnosticSummary(last.diagnostics)}). The owned ChatGPT tab is left open; if it finishes later, recover with: ${inspectCommand}`;
+  const adapter = adapterForJob(job);
+  const timeoutSummary = `${adapter.displayName} response did not reach stable completion before timeout (baseline_assistant_count=${job.response_baseline?.assistant_count ?? 0}, best_method=${best.method}, best_text_chars=${best.text?.length ?? 0}, best_assistant_count=${best.assistant_count ?? 0}, best_turn_index=${best.turn_index ?? -1}, best_copy_button_count=${best.copy_button_count ?? 0}, best_is_generating=${Boolean(best.is_generating)}, last_method=${last.method}, last_text_chars=${last.text?.length ?? 0}, last_assistant_count=${last.assistant_count ?? 0}, last_turn_index=${last.turn_index ?? -1}, last_copy_button_count=${last.copy_button_count ?? 0}, last_is_generating=${Boolean(last.is_generating)}, last_diagnostics=${diagnosticSummary(last.diagnostics)}). The owned ${adapter.displayName} tab is left open; if it finishes later, recover with: ${inspectCommand}`;
   await failJob(job, "response_timeout", timeoutSummary, {
     phase: "wait_response",
     side_effect_started: true,
@@ -1715,6 +1727,7 @@ function postResponseProgress(job, extraction) {
 }
 
 function postWaitingResponseProgress(job, extraction, detail = {}) {
+  const adapter = adapterForJob(job);
   const elapsedMs = Number(detail.elapsed_ms ?? 0);
   const timeoutMs = Number(detail.timeout_ms ?? responseWaitTimeoutMs(job));
   const finalityStatus = detail.awaiting_final_affordance ? ", waiting for final assistant controls" : "";
@@ -1724,7 +1737,7 @@ function postWaitingResponseProgress(job, extraction, detail = {}) {
   postNative(progress(job, "waiting_response", {
     ...detail,
     inspect_command: detail.inspect_command ?? inspectCommandForJob(job),
-    message: `waiting for ChatGPT response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${scopedCopyStatus}${generating ? ", generating" : ""}${interimStatus}${finalityStatus})`,
+    message: `waiting for ${adapter.displayName} response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${scopedCopyStatus}${generating ? ", generating" : ""}${interimStatus}${finalityStatus})`,
     extraction_method: extraction?.method ?? "none",
     response_in_progress: generating,
     interim_assistant_turn: interimAssistantTurn,
@@ -1744,7 +1757,7 @@ function responseWaitTimeoutMs(job) {
 
 function inspectCommandForJob(job) {
   const selector = job.extension_instance_id ? ` --extension-instance-id ${job.extension_instance_id}` : "";
-  return `yoetz browser extension inspect --chatgpt --run-id ${job.run_id}${selector}`;
+  return `yoetz browser extension inspect ${adapterForJob(job).inspectScope} --run-id ${job.run_id}${selector}`;
 }
 
 function formatDurationForMessage(ms) {
@@ -1804,6 +1817,7 @@ async function extractDomResponseForJob(job) {
 }
 
 async function maybeBackendApiExtractionForJob(job, domExtraction) {
+  const completion = adapterForJob(job).completion;
   if (!shouldFetchBackendApi(job, domExtraction)) {
     return null;
   }
@@ -1818,9 +1832,9 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
       conversation_id: conversationId
     });
     const normalized = normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId);
-    return isFreshBackendApiExtraction(normalized) ? normalized : null;
+    return completion.isFreshBackendApiExtraction(normalized) ? normalized : null;
   } catch (error) {
-    if (!isBackendApiFallbackError(error)) {
+    if (!completion.isBackendApiFallbackError(error)) {
       throw error;
     }
     job.backend_api_disabled = true;
@@ -1832,7 +1846,7 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
 }
 
 function shouldFetchBackendApi(job, domExtraction) {
-  if (job?.backend_api_disabled) {
+  if (!adapterForJob(job).completion.supportsBackendApiFallback || job?.backend_api_disabled) {
     return false;
   }
   if (!domExtraction || domExtraction.manual_handoff || domExtraction.is_generating) {
@@ -1865,15 +1879,6 @@ function normalizeBackendApiExtraction(backendExtraction, domExtraction, convers
   };
 }
 
-function isBackendApiFallbackError(error) {
-  const code = String(error?.code ?? "");
-  if (code.startsWith("backend_api_")) {
-    return true;
-  }
-  const message = String(error?.message ?? error);
-  return /unknown content-script command yoetz_fetch_conversation|unexpected tab message yoetz_fetch_conversation|401|unauthorized|conversation api|backend api/i.test(message);
-}
-
 async function recoverContentScriptJob(job, error) {
   job.content_script_recovery_attempted = true;
   job.updated_at = Date.now();
@@ -1881,7 +1886,7 @@ async function recoverContentScriptJob(job, error) {
   postNative(progress(job, "content_script_recovering", {
     reason: String(error?.message ?? error)
   }));
-  await waitForContentScript(job.tab_id);
+  await waitForContentScript(job.tab_id, adapterForJob(job));
   const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
   postNative(progress(job, "content_script_recovered", {
     url: rebound?.url ?? null,
@@ -1898,7 +1903,7 @@ function isPostSendExtraction(job, extraction) {
   if (!extraction || extraction.method === "page_text_fallback") {
     return false;
   }
-  if (isFreshBackendApiExtraction(extraction)) {
+  if (adapterForJob(job).completion.isFreshBackendApiExtraction(extraction)) {
     return true;
   }
   return isPostSendAssistantActivity(job, extraction);
@@ -1908,7 +1913,7 @@ function isPostSendAssistantActivity(job, extraction, allowUnknownTurnIndex = fa
   if (!extraction) {
     return false;
   }
-  if (isFreshBackendApiExtraction(extraction)) {
+  if (adapterForJob(job).completion.isFreshBackendApiExtraction(extraction)) {
     return true;
   }
   const submittedUserCount = nonNegativeFiniteNumber(job.submitted_user_count);
@@ -1930,103 +1935,15 @@ function isPostSendAssistantActivity(job, extraction, allowUnknownTurnIndex = fa
   return baselineCount === 0 && currentCount > 0;
 }
 
-function isFreshBackendApiExtraction(extraction) {
-  return extraction?.method === "backend_api"
-    && extraction.node_fresh === true
-    && !extraction.is_generating
-    && Boolean(normalizedResponseText(extraction.text));
-}
-
 function nonNegativeFiniteNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
-function isAcceptableModelSelection(selection) {
-  if (selection?.status === "current") {
-    return selection?.requested_model === "current"
-      && selection?.family_status === "skipped"
-      && selection?.effort_status === "skipped";
-  }
-  return selection?.status === "selected"
-    && selection?.requested_model === "gpt-5-6-sol-pro"
-    && selection?.family_status === "verified"
-    && selection?.effort_status === "verified"
-    && modelUsedLooksLikeSolPro(selection?.model_used);
-}
-
-function modelUsedLooksLikeSolPro(value) {
-  const folded = String(value ?? "").toLowerCase();
-  return /\bsol\b/.test(folded) && /\bpro\b/.test(folded);
-}
-
-function hasFinalAssistantAffordance(extraction) {
-  // ChatGPT shows assistant copy controls when a turn is externally complete.
-  // Pair this with the scoped extraction and !is_generating checks above.
-  return Boolean(!extraction?.is_generating && extraction?.has_copy_button);
-}
-
-function hasStableIdleUnscopedCopyAffordance(job, extraction) {
-  if (hasFinalAssistantAffordance(extraction)) {
-    return false;
-  }
-  if (!hasNoVisibleStopControls(extraction)) {
-    return false;
-  }
-  if (normalizedResponseText(extraction?.text).length < MIN_UNSCOPED_COPY_STABLE_TEXT_CHARS) {
-    return false;
-  }
-  const baselineCopyButtonCount = nonNegativeFiniteNumber(job.response_baseline?.copy_button_count);
-  const copyButtonCount = nonNegativeFiniteNumber(extraction?.copy_button_count);
-  return baselineCopyButtonCount !== null
-    && copyButtonCount !== null
-    && copyButtonCount > baselineCopyButtonCount;
-}
-
-function hasNoVisibleStopControls(extraction) {
-  const stopControlCount = nonNegativeFiniteNumber(extraction?.diagnostics?.counts?.stop_controls);
-  return stopControlCount === null || stopControlCount === 0;
-}
-
-function isRenderFreezeRefreshCandidate(job, extraction, scopedExtractionCandidate, finalAffordance) {
-  if (!scopedExtractionCandidate || finalAffordance) {
-    return false;
-  }
-  if (!canRefreshFrozenRender(job)) {
-    return false;
-  }
-  if (!hasExplicitlyNoVisibleStopControls(extraction)) {
-    return false;
-  }
-  const text = normalizedResponseText(extraction?.text);
-  if (!text || text.length > RENDER_FREEZE_SHORT_RESPONSE_MAX_CHARS) {
-    return false;
-  }
-  const conversationId = conversationIdForJob(job, extraction);
-  return Boolean(conversationId);
-}
-
-function hasExplicitlyNoVisibleStopControls(extraction) {
-  const stopControlCount = nonNegativeFiniteNumber(extraction?.diagnostics?.counts?.stop_controls);
-  return stopControlCount === 0;
-}
-
-function canRefreshFrozenRender(job) {
-  return Number(job?.render_refresh_attempts ?? 0) < MAX_RENDER_REFRESH_ATTEMPTS;
-}
-
-function sameRenderRefreshCandidate(candidate, extraction) {
-  if (!candidate || !extraction) {
-    return false;
-  }
-  return normalizedResponseText(candidate.text) === normalizedResponseText(extraction.text)
-    && Number(candidate.assistant_count ?? 0) === Number(extraction.assistant_count ?? 0)
-    && Number(candidate.turn_index ?? -1) === Number(extraction.turn_index ?? -1);
-}
-
 async function refreshFrozenRender(job, extraction, stableForMs) {
   const conversationId = conversationIdForJob(job, extraction);
-  const url = chatgptConversationJobUrl(conversationId, job.run_id);
+  const adapter = adapterForJob(job);
+  const url = adapter.conversationJobUrl(conversationId, job.run_id);
   job.render_refresh_attempts = Number(job.render_refresh_attempts ?? 0) + 1;
   job.updated_at = Date.now();
   await persistJob(job);
@@ -2039,11 +1956,11 @@ async function refreshFrozenRender(job, extraction, stableForMs) {
     stable_for_ms: stableForMs,
     response_length: extraction?.text?.length ?? 0,
     extraction_method: extraction?.method ?? "none",
-    message: `refreshing owned ChatGPT conversation render after idle short response stayed frozen for ${formatDurationForMessage(stableForMs)}`
+    message: `refreshing owned ${adapter.displayName} conversation render after idle short response stayed frozen for ${formatDurationForMessage(stableForMs)}`
   }));
   await chrome.tabs.update(job.tab_id, { url, active: false });
-  await waitForChatgptTab(job.tab_id);
-  await waitForContentScript(job.tab_id);
+  await waitForSiteTab(job.tab_id, adapter);
+  await waitForContentScript(job.tab_id, adapter);
   const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
   postNative(progress(job, "render_refreshed", {
     tab_id: job.tab_id,
@@ -2052,7 +1969,7 @@ async function refreshFrozenRender(job, extraction, stableForMs) {
     attempt: job.render_refresh_attempts,
     url: rebound?.url ?? null,
     title: rebound?.title ?? null,
-    message: "owned ChatGPT conversation render refreshed; continuing final-response polling"
+    message: `owned ${adapter.displayName} conversation render refreshed; continuing final-response polling`
   }));
 }
 
@@ -2064,55 +1981,12 @@ function responseStableIdleThresholdMs(intervalMs) {
   );
 }
 
-function selectFinalAffordanceCandidate(candidate, extraction) {
-  const candidateText = normalizedResponseText(candidate?.text);
-  const nextText = normalizedResponseText(extraction?.text);
-  if (!candidate && extraction) {
-    return { candidate: extraction, resetTimer: true };
-  }
-  if (!nextText) {
-    return { candidate, resetTimer: false };
-  }
-  if (!candidateText) {
-    return { candidate: extraction, resetTimer: true };
-  }
-  if (nextText.length < candidateText.length) {
-    return { candidate, resetTimer: false };
-  }
-  if (nextText === candidateText) {
-    return { candidate, resetTimer: false };
-  }
-  return { candidate: extraction, resetTimer: nextText.length > candidateText.length };
-}
-
-function normalizedResponseText(value) {
-  return String(value ?? "")
-    .replace(/\r\n/g, "\n")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 function nativeEnvelopeByteLength(message) {
   const json = JSON.stringify(message);
   if (typeof TextEncoder !== "undefined") {
     return new TextEncoder().encode(json).byteLength;
   }
   return json.length;
-}
-
-function finalAffordanceExtractionFailureMessage(job, extraction, stableForMs) {
-  return `ChatGPT rendered a final assistant affordance but Yoetz could not extract scoped assistant text (method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, turn_index=${extraction?.turn_index ?? -1}, copy_button_count=${extraction?.copy_button_count ?? 0}, stable_for_ms=${stableForMs}). Inspect the owned tab with \`yoetz browser extension inspect --chatgpt --run-id ${job.run_id}\` before rerunning.`;
-}
-
-function completedExtraction(extraction, completionReason, stableForMs) {
-  return {
-    ...extraction,
-    completion_reason: completionReason,
-    stable_for_ms: stableForMs,
-    assistant_turn_count: Number(extraction.assistant_count ?? 0),
-    copy_button_count: Number(extraction.copy_button_count ?? 0)
-  };
 }
 
 function enforceMessageCapability(message) {
@@ -2153,7 +2027,7 @@ function assertSubmittedConversationCurrent(job, sendResult) {
   }
   throw commandError(
     "conversation_changed",
-    `job ${job.job_id} sent in ChatGPT conversation ${currentConversationId ?? "(none)"} instead of ${expectedConversationId}`,
+    `job ${job.job_id} sent in ${adapterForJob(job).displayName} conversation ${currentConversationId ?? "(none)"} instead of ${expectedConversationId}`,
     {
       phase: "send",
       side_effect_started: true,
@@ -2175,7 +2049,7 @@ function assertJobConversationCurrent(job, extraction) {
   }
   throw commandError(
     "conversation_changed",
-    `job ${job.job_id} moved from ChatGPT conversation ${expectedConversationId} to ${currentConversationId ?? "(none)"}`,
+    `job ${job.job_id} moved from ${adapterForJob(job).displayName} conversation ${expectedConversationId} to ${currentConversationId ?? "(none)"}`,
     {
       phase: "wait_response",
       side_effect_started: true,

@@ -87,6 +87,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     assert.equal(port.messages[0].payload.profile_email, "work@example.com");
     assert.equal(port.messages[0].payload.profile_id, "gaia-work");
     assert.match(port.messages[0].payload.extension_instance_id, /^ext_/);
+    assert.deepEqual(port.messages[0].payload.recipes, ["chatgpt"]);
 
     port.emit(envelope("reconnect", "job_reconnect"));
     await eventually(() => port.messages.some((message) => message.type === "reconnect" && message.job_id === "job_reconnect"));
@@ -386,6 +387,41 @@ test("service worker rejects invalid conversation ids before opening a tab", asy
       const error = port.messages.find((message) => message.type === "job_error");
       assert.equal(error.payload.code, "invalid_conversation");
       assert.equal(error.payload.phase, "upload");
+      assert.equal(error.payload.side_effect_started, false);
+      assert.deepEqual(createdTabs, []);
+    } finally {
+      globalThis.chrome = originalChrome;
+    }
+  }
+});
+
+test("service worker rejects unavailable recipes before opening a tab", async () => {
+  for (const recipe of ["claude", "unknown"]) {
+    const originalChrome = globalThis.chrome;
+    const port = makePort();
+    const createdTabs = [];
+    globalThis.chrome = chromeStub({
+      port,
+      tabs: {
+        create: async (opts) => {
+          createdTabs.push(opts);
+          return { id: createdTabs.length, ...opts };
+        },
+        get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+        sendMessage: async () => {
+          throw new Error("unsupported recipes must fail before tab messaging");
+        }
+      }
+    });
+
+    try {
+      await import(`../src/service-worker.js?unsupported_recipe=${recipe}_${Date.now()}`);
+      port.emit(envelope("job_start", `job_${recipe}`, { recipe, prompt: "review" }));
+
+      await eventually(() => port.messages.some((message) => message.type === "job_error"));
+      const error = port.messages.find((message) => message.type === "job_error");
+      assert.equal(error.payload.code, "unsupported_recipe");
+      assert.equal(error.payload.phase, "profile");
       assert.equal(error.payload.side_effect_started, false);
       assert.deepEqual(createdTabs, []);
     } finally {
@@ -1521,6 +1557,7 @@ test("service worker hello falls back with instance id when profile identity fai
     assert.match(hello.payload.extension_instance_id, /^ext_/);
     assert.equal(hello.payload.profile_email, null);
     assert.equal(hello.payload.profile_id, null);
+    assert.deepEqual(hello.payload.recipes, ["chatgpt"]);
   } finally {
     globalThis.chrome = originalChrome;
   }
