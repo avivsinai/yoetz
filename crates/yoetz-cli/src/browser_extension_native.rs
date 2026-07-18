@@ -975,12 +975,27 @@ pub fn reload_extension(selector: ExtensionInstanceSelector<'_>) -> Result<Value
     }))
 }
 
-pub fn update_extension(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
+pub fn update_extension(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    let paths = extension_paths()?;
+    let previous_instance = select_extension_instance(&paths, selector)?;
     let update = prepare_managed_chatgpt_extension()?;
     let reload = reload_extension(selector)?;
-    let paths = extension_paths()?;
-    let instance = wait_for_extension_version(&paths, selector, YOETZ_CLI_VERSION)
-        .context("wait for reloaded extension to report the current CLI version")?;
+    let instance = wait_for_extension_update(
+        &paths,
+        selector,
+        YOETZ_CLI_VERSION,
+        recipe.as_str(),
+        &previous_instance.native_instance_id,
+    )
+    .with_context(|| {
+        format!(
+            "managed extension source {} was copied, but the loaded extension did not activate the requested site capability",
+            update.source_dir.display()
+        )
+    })?;
     Ok(json!({
         "status": "updated",
         "transport": TRANSPORT_NAME,
@@ -1696,6 +1711,58 @@ fn wait_for_extension_version(
         }
         thread::sleep(EXTENSION_RELOAD_VERIFY_INTERVAL);
     }
+}
+
+fn wait_for_extension_update(
+    paths: &ExtensionPaths,
+    selector: ExtensionInstanceSelector<'_>,
+    expected_version: &str,
+    expected_recipe: &str,
+    previous_native_instance_id: &str,
+) -> Result<ExtensionInstanceStatus> {
+    let deadline = Instant::now() + EXTENSION_RELOAD_VERIFY_TIMEOUT;
+    loop {
+        let current_state = match select_extension_instance(paths, selector) {
+            Ok(instance)
+                if extension_update_is_active(
+                    &instance,
+                    expected_version,
+                    expected_recipe,
+                    previous_native_instance_id,
+                ) =>
+            {
+                return Ok(instance)
+            }
+            Ok(instance) => format!(
+                "native_instance_id={}, extension_version={}, recipes={:?}",
+                instance.native_instance_id,
+                instance.extension_version.as_deref().unwrap_or("<unknown>"),
+                instance.recipes
+            ),
+            Err(err) => err.to_string(),
+        };
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for a new chrome-extension-native instance to advertise recipe `{expected_recipe}` at extension version {expected_version}; last state: {current_state}. Chrome may retain a same-version unpacked module cache: open chrome://extensions, click Reload for `Yoetz Native Transport`, then run `yoetz browser extension status --{expected_recipe}`"
+            );
+        }
+        thread::sleep(EXTENSION_RELOAD_VERIFY_INTERVAL);
+    }
+}
+
+fn extension_update_is_active(
+    instance: &ExtensionInstanceStatus,
+    expected_version: &str,
+    expected_recipe: &str,
+    previous_native_instance_id: &str,
+) -> bool {
+    instance.native_instance_id != previous_native_instance_id
+        && instance.extension_version.as_deref() == Some(expected_version)
+        && instance_has_extension_hello(instance)
+        && instance
+            .recipes
+            .iter()
+            .any(|recipe| recipe == expected_recipe)
 }
 
 fn non_empty_selector(value: Option<&str>) -> Option<&str> {
@@ -3568,6 +3635,54 @@ mod tests {
 
         instance.recipes.push("claude".to_string());
         ensure_instance_supports_recipe(&instance, "claude").unwrap();
+    }
+
+    #[test]
+    fn extension_update_readiness_requires_new_instance_version_and_recipe() {
+        let mut instance = ExtensionInstanceStatus {
+            native_instance_id: "native_before".to_string(),
+            socket_path: PathBuf::from("/tmp/claude.sock"),
+            pid: 1,
+            extension_instance_id: Some("ext_claude".to_string()),
+            extension_version: Some(YOETZ_CLI_VERSION.to_string()),
+            profile_email: None,
+            profile_id: None,
+            recipes: vec!["chatgpt".to_string(), "claude".to_string()],
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1,
+        };
+
+        assert!(!extension_update_is_active(
+            &instance,
+            YOETZ_CLI_VERSION,
+            "claude",
+            "native_before"
+        ));
+
+        instance.native_instance_id = "native_after".to_string();
+        instance.recipes = vec!["chatgpt".to_string()];
+        assert!(!extension_update_is_active(
+            &instance,
+            YOETZ_CLI_VERSION,
+            "claude",
+            "native_before"
+        ));
+
+        instance.recipes.push("claude".to_string());
+        assert!(extension_update_is_active(
+            &instance,
+            YOETZ_CLI_VERSION,
+            "claude",
+            "native_before"
+        ));
+
+        instance.extension_version = Some("0.0.0".to_string());
+        assert!(!extension_update_is_active(
+            &instance,
+            YOETZ_CLI_VERSION,
+            "claude",
+            "native_before"
+        ));
     }
 
     #[test]

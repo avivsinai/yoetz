@@ -3091,7 +3091,7 @@ fn handle_browser_extension(
             )
         }
         BrowserExtensionCommand::Update(args) => {
-            extension_site_scope(args.chatgpt, args.claude)?;
+            let recipe = extension_site_scope(args.chatgpt, args.claude)?;
             let selector = extension_selector_from_parts(
                 args.profile_email.as_ref(),
                 args.extension_instance_id.as_ref(),
@@ -3099,7 +3099,7 @@ fn handle_browser_extension(
             );
             (
                 "browser.extension.update",
-                browser_extension_native::update_extension(selector)?,
+                browser_extension_native::update_extension(selector, recipe)?,
             )
         }
         BrowserExtensionCommand::Canary(args) => {
