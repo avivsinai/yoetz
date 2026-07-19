@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.36] - 2026-07-19
 ### Fixed
 
 - Kept ChatGPT Pro reasoning turns in progress while the `Answer now`
@@ -14,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Canonicalized native-extension bundle paths before crossing the host socket,
   and return a structured pre-side-effect job error when host-side bundle
   validation fails instead of dropping the connection with an opaque EOF.
+
 
 ## [0.5.35] - 2026-07-19
 ### Fixed
