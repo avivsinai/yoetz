@@ -148,8 +148,12 @@ pub struct ExtensionRecipeResult {
 pub struct ManagedExtensionUpdateResult {
     pub status: &'static str,
     pub source_dir: PathBuf,
+    pub source_version: String,
+    pub source_provenance: &'static str,
     pub extension_dir: PathBuf,
     pub loaded_extension_dirs: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_manifest_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_version: Option<String>,
     pub copied_files: usize,
@@ -335,13 +339,20 @@ fn sync_managed_chatgpt_extension_from(
             source_dir.display()
         );
     }
+    let source_version = required_extension_manifest_version(source_dir)?;
+    let source_provenance = extension_source_provenance(source_dir);
+    ensure_extension_source_matches_cli(source_dir, &source_version, source_provenance)?;
+    let previous_manifest_version = extension_manifest_version(extension_dir);
     if paths_refer_to_same_location(source_dir, extension_dir) {
         return Ok(ManagedExtensionUpdateResult {
             status: "current",
             source_dir: source_dir.to_path_buf(),
+            source_version,
+            source_provenance,
             extension_dir: extension_dir.to_path_buf(),
             loaded_extension_dirs: vec![extension_dir.to_path_buf()],
-            manifest_version: extension_manifest_version(extension_dir),
+            previous_manifest_version: previous_manifest_version.clone(),
+            manifest_version: previous_manifest_version,
             copied_files: count_regular_files(extension_dir)?,
         });
     }
@@ -350,26 +361,36 @@ fn sync_managed_chatgpt_extension_from(
         return Ok(ManagedExtensionUpdateResult {
             status: "current",
             source_dir: source_dir.to_path_buf(),
+            source_version,
+            source_provenance,
             extension_dir: extension_dir.to_path_buf(),
             loaded_extension_dirs: vec![extension_dir.to_path_buf()],
-            manifest_version: extension_manifest_version(extension_dir),
+            previous_manifest_version: previous_manifest_version.clone(),
+            manifest_version: previous_manifest_version,
             copied_files: 0,
         });
     }
 
-    let source_version = required_extension_manifest_version(source_dir)?;
-    let stamped_version = next_managed_extension_version(
-        &source_version,
-        extension_manifest_version(extension_dir).as_deref(),
-    )?;
+    let stamped_version =
+        next_managed_extension_version(&source_version, previous_manifest_version.as_deref())?;
+    let status = if is_chatgpt_extension_source_dir(extension_dir)
+        && previous_manifest_version.as_deref() == Some(source_version.as_str())
+    {
+        "restamped"
+    } else {
+        "updated"
+    };
     let copied_files =
         copy_extension_dir_atomically(source_dir, extension_dir, Some(stamped_version.as_str()))?;
 
     Ok(ManagedExtensionUpdateResult {
-        status: "updated",
+        status,
         source_dir: source_dir.to_path_buf(),
+        source_version,
+        source_provenance,
         extension_dir: extension_dir.to_path_buf(),
         loaded_extension_dirs: vec![extension_dir.to_path_buf()],
+        previous_manifest_version,
         manifest_version: Some(stamped_version),
         copied_files,
     })
@@ -624,6 +645,82 @@ fn required_extension_manifest_version(extension_dir: &Path) -> Result<String> {
             extension_dir.join("manifest.json").display()
         )
     })
+}
+
+fn extension_source_provenance(source_dir: &Path) -> &'static str {
+    if env::var(CHATGPT_EXTENSION_DIR_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some_and(|value| paths_refer_to_same_location(source_dir, Path::new(value.trim())))
+    {
+        return "environment_override";
+    }
+    if env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join("extensions").join("chatgpt-native"))
+        .is_some_and(|candidate| paths_refer_to_same_location(source_dir, &candidate))
+    {
+        return "working_directory";
+    }
+    let crate_source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("extensions")
+        .join("chatgpt-native");
+    if paths_refer_to_same_location(source_dir, &crate_source) {
+        return "source_checkout";
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(prefix) = exe.parent().and_then(Path::parent) {
+            for candidate in [
+                prefix
+                    .join("share")
+                    .join("yoetz")
+                    .join("extensions")
+                    .join("chatgpt-native"),
+                prefix.join("share").join("yoetz").join("chatgpt-native"),
+            ] {
+                if paths_refer_to_same_location(source_dir, &candidate) {
+                    return "installed_share";
+                }
+            }
+        }
+    }
+    "explicit_path"
+}
+
+fn ensure_extension_source_matches_cli(
+    source_dir: &Path,
+    source_version: &str,
+    source_provenance: &str,
+) -> Result<()> {
+    let source_parts = chrome_extension_version_parts(source_version).with_context(|| {
+        format!("extension source version `{source_version}` is not a valid Chrome version")
+    })?;
+    let cli_parts = chrome_extension_version_parts(YOETZ_CLI_VERSION).with_context(|| {
+        format!("yoetz CLI version `{YOETZ_CLI_VERSION}` is not a valid Chrome version")
+    })?;
+    if source_parts.len() != 3 {
+        bail!(
+            "refusing to sync extension source version `{source_version}` from {} ({source_provenance}); source versions must have exactly three components for yoetz CLI {YOETZ_CLI_VERSION}",
+            source_dir.display()
+        );
+    }
+    if cli_parts.len() < 3 {
+        bail!("yoetz CLI version `{YOETZ_CLI_VERSION}` must have at least three components");
+    }
+    if source_parts[..3] == cli_parts[..3] {
+        return Ok(());
+    }
+    let relationship = if source_parts[..3] < cli_parts[..3] {
+        "older than"
+    } else {
+        "newer than"
+    };
+    bail!(
+        "refusing to sync extension source version {source_version} from {} ({source_provenance}); it is {relationship} yoetz CLI {YOETZ_CLI_VERSION}",
+        source_dir.display()
+    )
 }
 
 fn chrome_extension_version_parts(version: &str) -> Option<Vec<u16>> {
@@ -1233,11 +1330,7 @@ pub fn update_extension(
         .manifest_version
         .as_deref()
         .context("managed extension copy has no stamped manifest version")?;
-    ensure_reload_can_reach_managed_copy(
-        &previous_instance,
-        expected_version,
-        &update.extension_dir,
-    )?;
+    ensure_reload_can_reach_managed_copy(&previous_instance, &update)?;
     let reload = reload_extension(selector)?;
     let instance = wait_for_extension_update(
         &paths,
@@ -1257,7 +1350,10 @@ pub fn update_extension(
         "transport": TRANSPORT_NAME,
         "extension_dir": update.extension_dir,
         "source_dir": update.source_dir,
+        "source_version": update.source_version,
+        "source_provenance": update.source_provenance,
         "loaded_extension_dirs": update.loaded_extension_dirs,
+        "previous_manifest_version": update.previous_manifest_version,
         "manifest_version": update.manifest_version,
         "copy_status": update.status,
         "copied_files": update.copied_files,
@@ -1952,20 +2048,19 @@ fn auto_heal_extension_version_skew(
         .manifest_version
         .as_deref()
         .context("managed extension copy has no stamped manifest version")?;
-    ensure_reload_can_reach_managed_copy(
-        &previous_instance,
-        expected_version,
-        &update.extension_dir,
-    )?;
+    ensure_reload_can_reach_managed_copy(&previous_instance, &update)?;
     reload_extension(selector)?;
     wait_for_extension_version(paths, selector, expected_version).map(Some)
 }
 
 fn ensure_reload_can_reach_managed_copy(
     instance: &ExtensionInstanceStatus,
-    expected_version: &str,
-    managed_dir: &Path,
+    update: &ManagedExtensionUpdateResult,
 ) -> Result<()> {
+    let expected_version = update
+        .manifest_version
+        .as_deref()
+        .context("managed extension copy has no stamped manifest version")?;
     let observed_parts = instance
         .extension_version
         .as_deref()
@@ -1978,10 +2073,18 @@ fn ensure_reload_can_reach_managed_copy(
             .as_ref()
             .is_some_and(|parts| parts.len() == 4)
     {
+        // A 3-part live version that exactly matches the managed path before
+        // this restamp is the clobbered-managed case: reload still reaches the
+        // same path, so do not misclassify it as a separately loaded source copy.
+        let restamped_loaded_managed_copy = update.status == "restamped"
+            && instance.extension_version.as_deref() == update.previous_manifest_version.as_deref();
+        if restamped_loaded_managed_copy {
+            return Ok(());
+        }
         if let Some(message) = managed_extension_identity_message(
             instance.extension_version.as_deref(),
             Some(expected_version),
-            managed_dir,
+            &update.extension_dir,
         ) {
             bail!(message);
         }
@@ -4682,6 +4785,73 @@ mod tests {
 
     #[test]
     #[serial]
+    fn sync_managed_extension_rejects_an_older_source_before_mutation() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        write_extension_source_fixture(&source, "0.5.32");
+        let target = dir.path().join("managed");
+        write_extension_source_fixture(&target, YOETZ_CLI_VERSION);
+        fs::write(
+            target.join("src").join("sentinel.js"),
+            "keep-newer-managed-copy",
+        )
+        .unwrap();
+
+        let err = sync_managed_chatgpt_extension_from(&source, &target).unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains("refusing to sync"));
+        assert!(message.contains("0.5.32"));
+        assert!(message.contains(YOETZ_CLI_VERSION));
+        assert!(message.contains(source.to_string_lossy().as_ref()));
+        assert_eq!(
+            fs::read_to_string(target.join("src").join("sentinel.js")).unwrap(),
+            "keep-newer-managed-copy"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn sync_managed_extension_classifies_an_unstamped_managed_target_as_restamped() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        write_extension_source_fixture(&source, YOETZ_CLI_VERSION);
+        fs::write(
+            source.join("src").join("service-worker.js"),
+            "service-worker:new-source",
+        )
+        .unwrap();
+        let target = dir.path().join("managed");
+        write_extension_source_fixture(&target, YOETZ_CLI_VERSION);
+
+        let result = sync_managed_chatgpt_extension_from(&source, &target).unwrap();
+
+        assert_eq!(result.status, "restamped");
+        assert_eq!(
+            result.manifest_version.as_deref(),
+            Some(format!("{YOETZ_CLI_VERSION}.1").as_str())
+        );
+        assert_eq!(
+            result.previous_manifest_version.as_deref(),
+            Some(YOETZ_CLI_VERSION)
+        );
+        let loaded_before_restamp = ExtensionInstanceStatus {
+            native_instance_id: "native_restamped".to_string(),
+            socket_path: dir.path().join("native.sock"),
+            pid: process::id(),
+            extension_instance_id: Some("ext_restamped".to_string()),
+            extension_version: result.previous_manifest_version.clone(),
+            profile_email: None,
+            profile_id: None,
+            recipes: default_extension_recipes(),
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1,
+        };
+        assert!(ensure_reload_can_reach_managed_copy(&loaded_before_restamp, &result).is_ok());
+    }
+
+    #[test]
+    #[serial]
     fn managed_extension_stamp_increments_only_when_source_changes() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
@@ -4731,6 +4901,9 @@ mod tests {
         assert_eq!(result.source_dir, source.canonicalize().unwrap());
         assert_eq!(result.extension_dir, state.join("chatgpt-native-extension"));
         assert!(is_chatgpt_extension_source_dir(&result.extension_dir));
+        let payload = serde_json::to_value(&result).unwrap();
+        assert_eq!(payload["source_version"], YOETZ_CLI_VERSION);
+        assert_eq!(payload["source_provenance"], "environment_override");
     }
 
     #[test]

@@ -8,6 +8,7 @@ const FILE_INPUT_SELECTOR = "input[data-testid='file-upload']";
 const ATTACHMENT_SELECTOR = "[data-testid='file-thumbnail']";
 const COPY_ACTION_SELECTOR = "[data-testid='action-bar-copy']";
 const ASSISTANT_SELECTOR = "[data-is-streaming]";
+const MODEL_MENU_SETTLE_MS = 300;
 
 export function ownedWindowName(job) {
   return `${YOETZ_WINDOW_PREFIX}${job.run_id}:${job.job_id}`;
@@ -209,7 +210,7 @@ export async function ensureConversationLoaded(root = document, conversationId, 
 export async function configureModelState(root, job = {}) {
   const timeoutMs = Number(job.model_selection_timeout_ms) || 10000;
   const modelButton = await waitFor(() => root.querySelector(MODEL_SELECTOR), 20000);
-  clickIfClosed(modelButton);
+  await openModelMenu(modelButton, timeoutMs);
   const fable = await waitForOptional(() => visibleElements(root, "[role='menuitemradio']")
     .find((element) => normalizeText(element.innerText || element.textContent).toLowerCase().startsWith("fable 5")), timeoutMs);
   if (!fable) {
@@ -224,33 +225,41 @@ export async function configureModelState(root, job = {}) {
       ...diagnostics
     };
   }
-  fable.click();
 
-  clickIfClosed(modelButton);
+  const alreadySelected = await verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs);
+  if (alreadySelected) {
+    return alreadySelected;
+  }
+
+  fable.click();
+  await settleAfterMenuSelection(modelButton, timeoutMs);
+
+  await openModelMenu(modelButton, timeoutMs);
   let effortTrigger = await waitFor(() => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
   dispatchHover(effortTrigger);
   const max = await waitFor(() => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"), timeoutMs);
   max.click();
+  await settleAfterMenuSelection(modelButton, timeoutMs);
 
-  clickIfClosed(modelButton);
+  await openModelMenu(modelButton, timeoutMs);
   effortTrigger = await waitFor(() => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
   dispatchHover(effortTrigger);
-  const thinking = await waitFor(() => visibleElements(root, "span[role='switch'][aria-checked]")
-    .find((element) => /Thinking/i.test(normalizeText(
-      element.getAttribute("aria-label")
-      || element.closest("[role='menuitem']")?.innerText
-      || element.parentElement?.innerText
-    ))), timeoutMs);
+  const thinking = await waitFor(() => findThinkingSwitch(root), timeoutMs);
   if (thinking.getAttribute("aria-checked") !== "true") {
     thinking.click();
   }
+  await sleep(MODEL_MENU_SETTLE_MS);
 
-  clickIfClosed(modelButton);
+  await closeModelMenu(root, modelButton);
+  await sleep(MODEL_MENU_SETTLE_MS);
+  await openModelMenu(modelButton, timeoutMs);
   const verificationEffort = await waitFor(() => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
   dispatchHover(verificationEffort);
   await waitFor(() => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"), timeoutMs);
+  await waitFor(() => findThinkingSwitch(root), timeoutMs);
   const diagnostics = modelSelectionDiagnostics(root);
   const menuClosed = await closeModelMenu(root, modelButton);
+  await sleep(MODEL_MENU_SETTLE_MS);
   return {
     status: diagnostics.modelVerified && diagnostics.maxVerified && diagnostics.thinkingChecked && menuClosed
       ? "selected"
@@ -379,12 +388,7 @@ export function modelSelectionDiagnostics(root = document) {
     && selectedModels.some((element) => normalizeText(element.innerText || element.textContent).toLowerCase().startsWith("fable 5"));
   const maxOption = root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']");
   const maxVerified = maxOption?.getAttribute("aria-checked") === "true" && /\bMax\b/i.test(modelChip);
-  const switches = visibleElements(root, "span[role='switch'][aria-checked]");
-  const thinking = switches.find((element) => /Thinking/i.test(normalizeText(
-    element.getAttribute("aria-label")
-    || element.closest("[role='menuitem']")?.innerText
-    || element.parentElement?.innerText
-  )));
+  const thinking = findThinkingSwitch(root);
   const thinkingChecked = thinking?.getAttribute("aria-checked") === "true";
   const options = visibleElements(root, "[role='menuitem'], [role='menuitemradio'], button, [role='switch']")
     .map((element) => normalizeText(element.innerText || element.textContent))
@@ -434,10 +438,82 @@ function conversationIdFromLocation() {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-function clickIfClosed(button) {
-  if (button.getAttribute("aria-expanded") !== "true") {
-    button.click();
+async function openModelMenu(button, timeoutMs) {
+  if (button.getAttribute("aria-expanded") === "true") {
+    await sleep(MODEL_MENU_SETTLE_MS);
+    if (button.getAttribute("aria-expanded") === "true") {
+      return;
+    }
   }
+
+  const attemptTimeoutMs = Math.max(100, Math.min(timeoutMs, 1000));
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    button.click();
+    const opened = await waitForOptional(
+      () => button.getAttribute("aria-expanded") === "true",
+      attemptTimeoutMs
+    );
+    if (opened) {
+      await sleep(MODEL_MENU_SETTLE_MS);
+      if (button.getAttribute("aria-expanded") === "true") {
+        return;
+      }
+    }
+  }
+  throw new Error(`Claude model menu did not open within ${timeoutMs}ms`);
+}
+
+async function settleAfterMenuSelection(modelButton, timeoutMs) {
+  await waitFor(() => modelButton.getAttribute("aria-expanded") !== "true", timeoutMs);
+  await sleep(MODEL_MENU_SETTLE_MS);
+}
+
+async function verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs) {
+  const modelChip = normalizeText(modelButton.innerText || modelButton.textContent);
+  if (fable.getAttribute("aria-checked") !== "true" || !/\bFable 5\b.*\bMax\b/i.test(modelChip)) {
+    return null;
+  }
+
+  const effortTrigger = root.querySelector("[data-testid='effort-menu-trigger']");
+  if (!effortTrigger) {
+    return null;
+  }
+  dispatchHover(effortTrigger);
+  const max = await waitForOptional(
+    () => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"),
+    timeoutMs
+  );
+  if (!max) {
+    return null;
+  }
+  const thinking = await waitForOptional(() => findThinkingSwitch(root), timeoutMs);
+  if (!thinking) {
+    return null;
+  }
+
+  const diagnostics = modelSelectionDiagnostics(root);
+  if (!diagnostics.modelVerified || !diagnostics.maxVerified || !diagnostics.thinkingChecked) {
+    return null;
+  }
+  const menuClosed = await closeModelMenu(root, modelButton);
+  await sleep(MODEL_MENU_SETTLE_MS);
+  return {
+    status: menuClosed ? "selected" : "mismatch",
+    requested_model: "fable-5-max",
+    model_used: "Fable 5 Max",
+    menuClosed,
+    ...(menuClosed ? {} : { warning: "Claude model menu remained open after Escape; refusing to send" }),
+    ...diagnostics
+  };
+}
+
+function findThinkingSwitch(root) {
+  return visibleElements(root, "span[role='switch'][aria-checked]")
+    .find((element) => /Thinking/i.test(normalizeText(
+      element.getAttribute("aria-label")
+      || element.closest("[role='menuitem']")?.innerText
+      || element.parentElement?.innerText
+    )));
 }
 
 function dispatchHover(element) {
@@ -471,6 +547,14 @@ async function closeModelMenu(root, modelButton) {
     bubbles: true,
     cancelable: true
   }));
+  const escaped = await waitForOptional(
+    () => modelButton.getAttribute("aria-expanded") !== "true",
+    1000
+  );
+  if (escaped) {
+    return true;
+  }
+  modelButton.click();
   return Boolean(await waitForOptional(
     () => modelButton.getAttribute("aria-expanded") !== "true",
     2000

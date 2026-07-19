@@ -330,6 +330,77 @@ test("service worker reports a generic Claude model timeout as model_selection",
   }
 });
 
+test("service worker surfaces Claude model mismatch legs in the job error", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      query: async () => [{ id: 17, active: true }],
+      create: async (options) => ({ id: 71, ...options }),
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new?_yoetz=run_job_claude_mismatch" }),
+      update: async (id, options) => ({ id, ...options }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "mismatch",
+                requested_model: "fable-5-max",
+                model_used: "Fable 5 Max",
+                modelVerified: true,
+                maxVerified: true,
+                thinkingChecked: false,
+                modelChip: "Fable 5 Max",
+                thinkingAriaChecked: null,
+                options: ["Fable 5", "Max", "Thinking"]
+              }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_model_mismatch_detail=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_claude_mismatch", {
+      recipe: "claude",
+      prompt: "review"
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_mismatch"
+    ));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_mismatch"
+    );
+    assert.match(error.payload.message, /modelVerified=true/);
+    assert.match(error.payload.message, /maxVerified=true/);
+    assert.match(error.payload.message, /thinkingChecked=false/);
+    assert.deepEqual(error.payload.model_selection_diagnostics, {
+      modelVerified: true,
+      maxVerified: true,
+      thinkingChecked: false,
+      modelChip: "Fable 5 Max",
+      thinkingAriaChecked: null,
+      options: ["Fable 5", "Max", "Thinking"]
+    });
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker doctor auth probe prefers active non-owned ChatGPT tab and surfaces login", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

@@ -316,14 +316,20 @@ async function startJob(message) {
     return;
   }
   if (!adapter.isAcceptableModelSelection(modelSelection)) {
-    await failJob(job, "model_selection_failed", `Requested ${adapter.displayName} model was not selected: ${modelSelection.status ?? "unknown"}`, {
+    const diagnostics = modelSelectionFailureDiagnostics(modelSelection);
+    const diagnosticSummary = formatModelSelectionFailureDiagnostics(diagnostics);
+    await failJob(job, "model_selection_failed", [
+      `Requested ${adapter.displayName} model was not selected: ${modelSelection.status ?? "unknown"}`,
+      diagnosticSummary ? `diagnostics: ${diagnosticSummary}` : null
+    ].filter(Boolean).join(". "), {
       phase: "model_selection",
       side_effect_started: false,
       requested_model: job.model,
       model_strategy: job.model_strategy,
       model_used: job.model_used,
       model_selection_status: job.model_selection_status,
-      model_selection: modelSelection
+      model_selection: modelSelection,
+      ...(Object.keys(diagnostics).length > 0 ? { model_selection_diagnostics: diagnostics } : {})
     });
     return;
   }
@@ -335,6 +341,31 @@ async function startJob(message) {
   if (!postNative(progress(job, "ready_for_file", { tab_id: tab.id, message: `${adapter.displayName} tab is ready for bundle upload` }))) {
     await recordTerminalDeliveryLost(job, "upload");
   }
+}
+
+function modelSelectionFailureDiagnostics(selection) {
+  const diagnostics = {};
+  for (const key of [
+    "modelVerified",
+    "maxVerified",
+    "thinkingChecked",
+    "modelChip",
+    "thinkingAriaChecked"
+  ]) {
+    if (Object.prototype.hasOwnProperty.call(selection ?? {}, key)) {
+      diagnostics[key] = selection[key];
+    }
+  }
+  if (Array.isArray(selection?.options)) {
+    diagnostics.options = selection.options.slice(0, 50);
+  }
+  return diagnostics;
+}
+
+function formatModelSelectionFailureDiagnostics(diagnostics) {
+  return Object.entries(diagnostics)
+    .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
+    .join(", ");
 }
 
 async function acceptFileChunk(message) {

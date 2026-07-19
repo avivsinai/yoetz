@@ -133,6 +133,94 @@ test("fake Claude model picker drives hover-only Max and Thinking then closes", 
   }
 });
 
+test("fake Claude model picker waits for a delayed menu close before reopening", async () => {
+  const fixture = makeClaudeModelFixture({ delayedSelectionClose: true });
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    const result = await configureModelState(fixture.root, { model_selection_timeout_ms: 250 });
+
+    assert.equal(result.status, "selected");
+    assert.equal(result.model_used, "Fable 5 Max");
+    assert.equal(fixture.modelButton.getAttribute("aria-expanded"), "false");
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
+test("fake Claude model picker waits for Thinking to render before verification", async () => {
+  const fixture = makeClaudeModelFixture({ delayedThinkingRender: true });
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    const result = await configureModelState(fixture.root, { model_selection_timeout_ms: 250 });
+
+    assert.equal(result.status, "selected");
+    assert.equal(result.thinkingChecked, true);
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
+test("fake Claude model picker preserves an already exact selection without clicking options", async () => {
+  const fixture = makeClaudeModelFixture({ initiallyConfigured: true, delayedThinkingRender: true });
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    const result = await configureModelState(fixture.root, { model_selection_timeout_ms: 250 });
+
+    assert.equal(result.status, "selected");
+    assert.equal(result.model_used, "Fable 5 Max");
+    assert.equal(fixture.fableClicks, 0);
+    assert.equal(fixture.maxClicks, 0);
+    assert.equal(fixture.thinkingClicks, 0);
+    assert.equal(fixture.modelButton.getAttribute("aria-expanded"), "false");
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
+test("fake Claude full and already-exact paths both return adapter-acceptable results", async () => {
+  const fullSelection = makeClaudeModelFixture();
+  const alreadyExact = makeClaudeModelFixture({ initiallyConfigured: true, ignoreEscape: true });
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    const fullResult = await configureModelState(fullSelection.root, { model_selection_timeout_ms: 250 });
+    const exactResult = await configureModelState(alreadyExact.root, { model_selection_timeout_ms: 250 });
+
+    assert.equal(claudeSiteAdapter.isAcceptableModelSelection(fullResult), true);
+    assert.equal(claudeSiteAdapter.isAcceptableModelSelection(exactResult), true);
+    assert.deepEqual(Object.keys(exactResult).sort(), Object.keys(fullResult).sort());
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
 test("fake Claude missing Fable returns unavailable with live options", async () => {
   const fixture = makeClaudeModelFixture({ includeFable: false });
   const previousPointerEvent = globalThis.PointerEvent;
@@ -341,11 +429,21 @@ class FakeKeyboardEvent extends Event {
   }
 }
 
-function makeClaudeModelFixture({ includeFable = true } = {}) {
+function makeClaudeModelFixture({
+  includeFable = true,
+  delayedSelectionClose = false,
+  delayedThinkingRender = false,
+  ignoreEscape = false,
+  initiallyConfigured = false
+} = {}) {
   let menuOpen = false;
   let effortHovered = false;
+  let thinkingVisible = false;
   let hoverEvents = 0;
   let sawMousePointer = false;
+  let fableClicks = 0;
+  let maxClicks = 0;
+  let thinkingClicks = 0;
 
   const control = (attrs, text, onClick = () => {}) => ({
     attrs: { ...attrs },
@@ -376,9 +474,14 @@ function makeClaudeModelFixture({ includeFable = true } = {}) {
         if (event.pointerType === "mouse" && event.pointerId === 1 && event.clientX > 0 && event.clientY > 0) {
           sawMousePointer = true;
           effortHovered = true;
+          if (delayedThinkingRender) {
+            setTimeout(() => { thinkingVisible = true; }, 10);
+          } else {
+            thinkingVisible = true;
+          }
         }
       }
-      if (event.type === "keydown" && event.key === "Escape") {
+      if (event.type === "keydown" && event.key === "Escape" && !ignoreEscape) {
         menuOpen = false;
         modelButton.setAttribute("aria-expanded", "false");
       }
@@ -386,29 +489,52 @@ function makeClaudeModelFixture({ includeFable = true } = {}) {
     }
   });
 
-  const modelButton = control({ "data-testid": "model-selector-dropdown", "aria-expanded": "false" }, "Sonnet 5 High", () => {
-    menuOpen = true;
-    effortHovered = false;
-    modelButton.setAttribute("aria-expanded", "true");
-  });
-  const fable = control({ role: "menuitemradio", "aria-checked": "false" }, "Fable 5", (element) => {
+  const modelButton = control(
+    { "data-testid": "model-selector-dropdown", "aria-expanded": "false" },
+    initiallyConfigured ? "Fable 5 Max" : "Sonnet 5 High",
+    () => {
+      if (modelButton.getAttribute("aria-expanded") === "true") {
+        menuOpen = false;
+        effortHovered = false;
+        thinkingVisible = false;
+        modelButton.setAttribute("aria-expanded", "false");
+        return;
+      }
+      menuOpen = true;
+      effortHovered = false;
+      thinkingVisible = false;
+      modelButton.setAttribute("aria-expanded", "true");
+    }
+  );
+  const closeAfterSelection = () => {
+    menuOpen = false;
+    const markClosed = () => modelButton.setAttribute("aria-expanded", "false");
+    if (delayedSelectionClose) {
+      setTimeout(markClosed, 10);
+    } else {
+      markClosed();
+    }
+  };
+  const fable = control({ role: "menuitemradio", "aria-checked": initiallyConfigured ? "true" : "false" }, "Fable 5", (element) => {
+    fableClicks += 1;
     element.setAttribute("aria-checked", "true");
     modelButton.innerText = "Fable 5 High";
     modelButton.textContent = modelButton.innerText;
-    menuOpen = false;
-    modelButton.setAttribute("aria-expanded", "false");
+    closeAfterSelection();
   });
   const sonnet = control({ role: "menuitemradio", "aria-checked": includeFable ? "false" : "true" }, "Sonnet 5");
   const effort = control({ "data-testid": "effort-menu-trigger" }, "Effort");
-  const max = control({ role: "menuitemradio", "data-testid": "effort-option-max", "aria-checked": "false" }, "Max", (element) => {
+  const max = control({ role: "menuitemradio", "data-testid": "effort-option-max", "aria-checked": initiallyConfigured ? "true" : "false" }, "Max", (element) => {
+    maxClicks += 1;
     element.setAttribute("aria-checked", "true");
     modelButton.innerText = "Fable 5 Max";
     modelButton.textContent = modelButton.innerText;
-    menuOpen = false;
     effortHovered = false;
-    modelButton.setAttribute("aria-expanded", "false");
+    thinkingVisible = false;
+    closeAfterSelection();
   });
-  const thinking = control({ role: "switch", "aria-label": "Thinking", "aria-checked": "false" }, "Thinking", (element) => {
+  const thinking = control({ role: "switch", "aria-label": "Thinking", "aria-checked": initiallyConfigured ? "true" : "false" }, "Thinking", (element) => {
+    thinkingClicks += 1;
     element.setAttribute("aria-checked", "true");
   });
   const root = {
@@ -431,10 +557,16 @@ function makeClaudeModelFixture({ includeFable = true } = {}) {
         return [fable, sonnet, max].filter((element) => element.getAttribute("aria-checked") === "true");
       }
       if (selector === "span[role='switch'][aria-checked]") {
-        return effortHovered ? [thinking] : [];
+        return effortHovered && thinkingVisible ? [thinking] : [];
       }
       if (selector === "[role='menuitem'], [role='menuitemradio'], button, [role='switch']") {
-        return [includeFable ? fable : null, sonnet, effort, effortHovered ? max : null, effortHovered ? thinking : null].filter(Boolean);
+        return [
+          includeFable ? fable : null,
+          sonnet,
+          effort,
+          effortHovered ? max : null,
+          effortHovered && thinkingVisible ? thinking : null
+        ].filter(Boolean);
       }
       return [];
     }
@@ -444,7 +576,16 @@ function makeClaudeModelFixture({ includeFable = true } = {}) {
     hoverEvents: { get: () => hoverEvents },
     sawMousePointer: { get: () => sawMousePointer }
   });
-  return { root, modelButton, thinking, get hoverEvents() { return hoverEvents; }, get sawMousePointer() { return sawMousePointer; } };
+  return {
+    root,
+    modelButton,
+    thinking,
+    get fableClicks() { return fableClicks; },
+    get maxClicks() { return maxClicks; },
+    get thinkingClicks() { return thinkingClicks; },
+    get hoverEvents() { return hoverEvents; },
+    get sawMousePointer() { return sawMousePointer; }
+  };
 }
 
 function fakeConversationRoot(text) {

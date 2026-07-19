@@ -3177,6 +3177,8 @@ fn handle_browser_extension(
             let extension_update = browser_extension_native::prepare_managed_chatgpt_extension()?;
             let extension_dir = extension_update.extension_dir.clone();
             let source_dir = extension_update.source_dir.clone();
+            let source_version = extension_update.source_version.clone();
+            let source_provenance = extension_update.source_provenance;
             let opened_chrome = if args.open_chrome {
                 open_chrome_extensions_page()?;
                 true
@@ -3190,6 +3192,8 @@ fn handle_browser_extension(
                 "extension_id": browser_extension_native::EXTENSION_ID,
                 "extension_dir": extension_dir,
                 "source_dir": source_dir,
+                "source_version": source_version,
+                "source_provenance": source_provenance,
                 "extension_copy": extension_update,
                 "extension_dir_env": browser_extension_native::CHATGPT_EXTENSION_DIR_ENV,
                 "chrome_extensions_url": browser_extension_native::CHROME_EXTENSIONS_URL,
@@ -3382,6 +3386,14 @@ fn format_extension_setup(payload: &Value, recipe: web_recipe::BuiltinWebRecipe)
         .get("source_dir")
         .and_then(Value::as_str)
         .unwrap_or("<unknown>");
+    let source_version = payload
+        .get("source_version")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let source_provenance = payload
+        .get("source_provenance")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
     let copy_status = payload
         .get("extension_copy")
         .and_then(|value| value.get("status"))
@@ -3402,6 +3414,8 @@ fn format_extension_setup(payload: &Value, recipe: web_recipe::BuiltinWebRecipe)
         format!("extension_id: {}", browser_extension_native::EXTENSION_ID),
         format!("extension_dir: {extension_dir}"),
         format!("source_dir: {source_dir}"),
+        format!("source_version: {source_version}"),
+        format!("source_provenance: {source_provenance}"),
         format!("extension_copy: {copy_status}"),
         format!("chrome_extensions_url: {}", browser_extension_native::CHROME_EXTENSIONS_URL),
         format!("opened_chrome: {opened}"),
