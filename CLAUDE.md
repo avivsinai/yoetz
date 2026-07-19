@@ -138,7 +138,8 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   verification leg. Early-exit and full-selection results must have the same
   acceptable shape.
 - Claude finality requires the last assistant turn to be non-streaming and no
-  `Stop response` control, with bounded no-progress failure. The copy control
+  `Stop response` control; the CDP path adds a bounded no-progress failure,
+  while the native path fails at the response deadline. The copy control
   is hover-dependent and is not a primary finality anchor. Exclude cloned
   `group/status` thinking rows from response text without mutating the live DOM.
 - Multiple loaded extension profiles route by `profile_email` when Chrome

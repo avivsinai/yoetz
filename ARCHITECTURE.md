@@ -32,12 +32,17 @@ yoetz/
 │       │   ├── openai.rs     # OpenAI/OpenRouter API client
 │       │   └── gemini.rs     # Google Gemini API client
 │       ├── browser.rs        # Browser automation (CDP via agent-browser)
-│       ├── browser_extension_native.rs  # ChatGPT native extension bridge
+│       ├── browser_extension_native.rs  # Multi-site native extension bridge
+│       ├── web_recipe.rs     # Shared built-in web-recipe orchestration seam
 │       ├── chatgpt_recipe.rs # ChatGPT recipe spec assembly
 │       ├── chatgpt_web.rs    # ChatGPT DOM/web helpers
+│       ├── claude_recipe.rs  # Claude recipe contract and preflight policy
+│       ├── claude_web.rs     # Claude DOM/web helpers
+│       ├── followup.rs       # Site-keyed conversation followup metadata
 │       ├── chrome_devtools_mcp/
 │       │   ├── client.rs     # CDP transport client
 │       │   ├── chatgpt.rs    # ChatGPT CDP recipe flow
+│       │   ├── claude.rs     # Claude CDP recipe flow
 │       │   └── mod.rs
 │       ├── dev_browser.rs    # QuickJS/WASM browser recipe runner
 │       ├── fuzzy.rs          # Lightweight matching helpers
@@ -89,13 +94,13 @@ Daily spend is tracked in a local JSON file. The `--max-cost-usd` flag estimates
 
 ### Browser Mode
 
-For models without API access (e.g., ChatGPT Pro), yoetz bundles files into markdown and submits the bundle through the web UI in the user's running Chrome — via the ChatGPT native extension when it is connected, otherwise via CDP (Chrome DevTools Protocol) transports.
+For models without API access (e.g., ChatGPT Pro or Claude's Fable 5 Max), yoetz bundles files into markdown and submits the bundle through the web UI in the user's running Chrome — via the multi-site native extension when it is connected, otherwise via CDP (Chrome DevTools Protocol) transports.
 
-Outside the connected-ChatGPT-extension exception described below, the browser transport stack is extension-free. Yoetz prefers to act as a wrapper over the underlying transport rather than reimplementing transport logic itself:
+Outside the connected-extension exception described below, the browser transport stack is extension-free. Yoetz prefers to act as a wrapper over the underlying transport rather than reimplementing transport logic itself:
 
-- `chrome-devtools-mcp` is the primary live-Chrome transport for ChatGPT recipes.
+- `chrome-devtools-mcp` is the primary live-Chrome transport for the built-in web recipes (ChatGPT and Claude).
 - `dev-browser` is the secondary live-Chrome transport.
-- `agent-browser` remains the tertiary / legacy fallback when the first two transports are unavailable or a non-ChatGPT path still depends on it.
+- `agent-browser` remains the tertiary / legacy fallback when the first two transports are unavailable or a path still depends on its literal YAML steps.
 - `manual` is the explicit final fallback; it tells the user to complete the web flow manually and does not need CDP.
 - Explicit CDP endpoints are forwarded to the transport unchanged; the transport owns `/json/version`, `DevToolsActivePort`, and related connection logic.
 
@@ -107,18 +112,23 @@ for the ownership model behind the live Chrome attach path.
 Chrome 146+ may show a one-time "Allow remote debugging?" approval dialog for a new CDP session. The acceptance criterion is one approval per browser session, not per yoetz invocation, so yoetz avoids silently tearing down live-attach daemons in normal attach/check/recipe flows. Recovery is explicit via `yoetz browser reset`.
 
 The `chrome-extension-native` transport is the only browser extension
-exception, and it is ChatGPT-only. When the extension is installed and
-`yoetz browser extension status --chatgpt` reports `connected`, the ChatGPT
-recipe auto-selects it as the only default transport and fails closed instead
-of falling through to CDP transports; `--transport <other>` opts out, and CDP
+exception. It is one pinned multi-site package: site adapters under
+`extensions/chatgpt-native/src/sites/` route ChatGPT and Claude jobs via the
+`job_start.payload.recipe` discriminator, and the extension `hello` advertises
+a `recipes` capability list (site readiness derives from that capability,
+never from version comparison). When the extension is installed and
+`yoetz browser extension status --chatgpt` (or `--claude`) reports
+`connected` for the selected site, the matching built-in recipe auto-selects
+it as the only default transport and fails closed instead of falling through
+to CDP transports; `--transport <other>` opts out, and CDP
 fallback after a native failure requires the explicit
 `--transport chrome-extension-native --allow-cdp-fallback`. Unhealthy or
 missing extensions leave the default CDP transport order untouched.
 
-Its lifecycle is managed by `yoetz browser extension <subcommand> --chatgpt`
+Its lifecycle is managed by `yoetz browser extension <subcommand> --chatgpt|--claude`
 (see `--help` for the full set). `setup` materializes the packaged extension
 source into the stable `$YOETZ_DIR/chatgpt-native-extension` directory; users
-load that unpacked directory in Chrome once, and `update --chatgpt` afterwards
+load that unpacked directory in Chrome once, and `update` afterwards
 re-syncs the managed copy atomically, reloads the extension over the native
 bridge, and verifies the loaded version. Recipe dispatch auto-heals version
 skew the same way. Release builds still package the extension as a separate
@@ -134,7 +144,7 @@ Chrome for Testing, and Chromium profiles can be targeted with
 separate local bridge instance under the Yoetz state directory. If one instance
 is connected, the CLI uses it. If several are connected, recipe execution must
 specify `profile_email` or the stable `extension_instance_id` published by
-`status --chatgpt` so the CLI can route to the matching Chrome profile. It fails
+`status --chatgpt` (or `--claude`) so the CLI can route to the matching Chrome profile. It fails
 closed if no selector matches; when Chrome does not expose a verifiable profile
 email, `extension_instance_id` remains the deterministic selector. The local CLI
 bridge sockets normally live under the Yoetz state directory, but fall back to
@@ -144,7 +154,10 @@ reject the bind.
 #### V1 contract for chrome-extension-native
 
 The extension transport ships a typed correctness contract that the recipe
-runner relies on. A run never returns success unless every gate below holds.
+runner relies on. The shared gates below hold for every site adapter; the
+conversation and completion gates are adapter-specific and are
+listed per site. A run never returns success unless every applicable gate
+holds.
 
 - Capability token: every `job_*` envelope after `job_start` must carry the
   job's capability token. Mismatches fail with `capability_mismatch` and
@@ -158,18 +171,22 @@ runner relies on. A run never returns success unless every gate below holds.
   the generation before any state mutation, so a job started under
   generation N cannot post `job_complete` after a `state_lost` was emitted
   on generation N+1.
-- Conversation pinning: `sendPrompt` returns `conversation_id` and
-  `submitted_user_count`. Subsequent extractions are gated against both —
+- Conversation pinning (ChatGPT): `sendPrompt` returns `conversation_id`
+  and `submitted_user_count`. Subsequent extractions are gated against both —
   a tab navigation to another `/c/<id>` mid-run, or an extraction whose
   `preceding_user_count` precedes the submitted user turn, fails with
   `conversation_changed`. Late-pinning fills in `conversation_id` once
   ChatGPT redirects from `/` to `/c/<id>` after the first streamed token.
+- Conversation pinning (Claude): the same `conversation_changed` /
+  `conversation_unavailable` / `conversation_not_loaded` taxonomy applies to
+  `/chat/<uuid>` URLs; late-pinning fills in `conversation_id` once claude.ai
+  navigates from `/new` to `/chat/<uuid>`.
 - Storage shape: `chrome.storage.session` is sharded as `jobs.<id>` keys
   with a one-time legacy `jobs` map migration on restart. The on-disk job
   shape strips `last_response_progress_text` to an 8KB tail; the in-memory
   job retains the full text for `response_delta` calculation. The TTL
   sweep runs on the heartbeat alarm tick, not per save.
-- Completion gate: `extractResponse` rejects "thought/status chrome only"
+- Completion gate (ChatGPT): `extractResponse` rejects "thought/status chrome only"
   bodies (`Thought for ...`, `Reasoned for ...`, `Analyzing...`, etc.) and
   the SW refuses completion when extracted text is chrome-only, even if a
   copy button is visible. Turns with a response-scoped copy affordance
@@ -178,14 +195,22 @@ runner relies on. A run never returns success unless every gate below holds.
   idle text, a new unscoped copy affordance above the baseline count, no
   visible stop controls, a minimum text length, and the `MIN_STABLE_IDLE_MS`
   floor. There is no pure text-stability completion path.
+- Completion gate (Claude): finality requires scoped assistant-DOM text with
+  the last turn non-streaming and no `Stop response` control, held through
+  the stable-idle window. If that condition is not reached before
+  `responseWaitTimeoutMs`, the job fails with `response_timeout`. The
+  hover-dependent copy control is never a primary anchor; cloned
+  `group/status` thinking rows are excluded from response text. Claude jobs
+  open the tab active, stay foreground through upload and accepted send, and
+  restore the previous tab before the response wait.
 - Send acceptance: when `clickSend` commits but `waitForSendAccepted`
   cannot confirm a post-click signal within budget, the run fails with
   `send_acceptance_unknown` carrying `side_effect_started: true`. The
   recipe runner treats this as a terminal Send-phase error and does not
-  fall back to another transport, since ChatGPT may still process the
+  fall back to another transport, since the site may still process the
   prompt asynchronously. The error message tells the caller not to rerun
   blindly.
-- Cancel: `cancelJob` clicks ChatGPT's stop control via the content
+- Cancel: `cancelJob` clicks the site's stop control via the content
   script (best-effort), removes the owned tab, marks the job terminal,
   and adds it to `terminalJobIds`. Subsequent extracts for the cancelled
   `job_id` surface `unknown_job`.
@@ -193,12 +218,13 @@ runner relies on. A run never returns success unless every gate below holds.
   uses `extension_instance_id` (per-Chrome-profile, persisted in
   `chrome.storage.local`). Pass `--var profile_email` only when you want
   a fail-closed verifier; the user must run
-  `yoetz browser extension grant-identity --chatgpt` first.
+  `yoetz browser extension grant-identity --chatgpt` (or `--claude`) first.
 
 The runner's contract under this transport: it never returns success on
-partial or chrome-only ChatGPT output, never automatically retries via a
-different transport once a side effect has landed in the user's tab, and
-never silently re-submits a prompt that ChatGPT may already be processing.
+partial or status-chrome-only output for either site, never automatically
+retries via a different transport once a side effect has landed in the
+user's tab, and never silently re-submits a prompt the site may already be
+processing.
 
 ## Data Flow
 
