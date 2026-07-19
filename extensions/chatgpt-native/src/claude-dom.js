@@ -310,7 +310,7 @@ export function extractResponse(root = document) {
   const last = assistants.at(-1) ?? null;
   const turn = last?.closest?.("[data-testid*='turn'], article") ?? last;
   const body = last?.querySelector?.(".font-claude-response") ?? null;
-  const text = normalizeResponseText(body?.innerText || body?.textContent || "");
+  const text = responseBodyText(body);
   const globalCopyButtons = root.querySelectorAll(COPY_ACTION_SELECTOR).length;
   const scopedCopyButtons = turn?.querySelectorAll?.(COPY_ACTION_SELECTOR)?.length ?? 0;
   const isGenerating = isResponseGenerating(root);
@@ -414,6 +414,18 @@ function normalizeResponseText(value) {
     .replace(/[ \t]+\n/g, "\n")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
+}
+
+function responseBodyText(body) {
+  if (!body) return "";
+  const sanitized = body.cloneNode?.(true);
+  if (!sanitized) {
+    return normalizeResponseText(body.innerText || body.textContent || "");
+  }
+  for (const statusRow of sanitized.querySelectorAll?.("button[class*='group/status']") ?? []) {
+    statusRow.remove();
+  }
+  return normalizeResponseText(sanitized.innerText || sanitized.textContent || "");
 }
 
 function assistantRoots(root) {

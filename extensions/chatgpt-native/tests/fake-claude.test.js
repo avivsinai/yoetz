@@ -276,6 +276,37 @@ test("fake Claude Thinking row keeps the response non-final until tool use and s
   assert.equal(claudeSiteAdapter.completion.hasFinalAssistantAffordance(complete), true);
 });
 
+test("fake Claude extraction excludes collapsed thinking status text from the answer", () => {
+  const answer = "Final answer without thinking chrome.";
+  const contaminated = [
+    "Thinking about concerns with this request",
+    "Thinking about concerns with this request",
+    "⌄",
+    answer
+  ].join("\n");
+  const page = fakeClaudePage({ text: contaminated, streaming: false, copy: true });
+  page.body.cloneNode = () => {
+    let text = contaminated;
+    return {
+      get innerText() {
+        return text;
+      },
+      get textContent() {
+        return text;
+      },
+      querySelectorAll(selector) {
+        return selector === "button[class*='group/status']"
+          ? [{ remove: () => { text = answer; } }]
+          : [];
+      }
+    };
+  };
+
+  const extraction = extractResponse(page.root);
+
+  assert.equal(extraction.text, answer);
+});
+
 test("fake Claude extraction fails closed when final controls are not scoped to the answer", () => {
   const page = fakeClaudePage({ text: "", streaming: false, copy: false });
   page.root.body.innerText = "possibly clipped page text";
