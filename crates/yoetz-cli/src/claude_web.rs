@@ -168,8 +168,8 @@ pub fn build_select_fable_function() -> String {
 }"##.to_string()
 }
 
-/// Mark the visible Effort parent row so the CDP driver can dispatch a real
-/// mouse-moved event to it. JS-synthesized hover is not sufficient for Radix.
+/// Mark the visible Effort parent row so the CDP driver can try a physical
+/// mouse move before falling back to the DOM hover sequence below.
 pub fn build_mark_effort_parent_function() -> String {
     format!(
         r##"() => {{
@@ -187,6 +187,44 @@ pub fn build_mark_effort_parent_function() -> String {
   return {{ status: "marked", marker: "{marker}", text: effortText, options: options.map(({{ text }}) => text).slice(0, 40) }};
 }}"##,
         marker = EFFORT_HOVER_MARKER,
+        effort_trigger = EFFORT_TRIGGER_SELECTOR,
+    )
+}
+
+/// Open Claude's Effort submenu with the attributed pointer/mouse sequence
+/// used by the native extension. Claude's Base UI hover intent can ignore a
+/// single physical mouse teleport while the model menu is still animating.
+pub fn build_open_effort_submenu_function() -> String {
+    format!(
+        r##"() => {{
+  const visible = (el) => !!el && el.getClientRects().length > 0;
+  const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+  const effortOptions = () => Array.from(document.querySelectorAll("[role='menuitemradio'][data-testid^='effort-option-']"))
+    .filter(visible)
+    .map((el) => normalize(el.innerText || el.textContent))
+    .filter(Boolean);
+  const existing = effortOptions();
+  if (existing.length > 0) return {{ status: "already_open", effortOptions: existing }};
+  const effort = document.querySelector("{effort_trigger}");
+  if (!visible(effort)) return {{ status: "unavailable", effortOptions: existing }};
+  const rect = effort.getBoundingClientRect?.() || {{ left: 0, top: 0, width: 1, height: 1 }};
+  const clientX = Number(rect.left || 0) + Math.max(1, Number(rect.width || 1) / 2);
+  const clientY = Number(rect.top || 0) + Math.max(1, Number(rect.height || 1) / 2);
+  for (const type of ["pointerover", "pointerenter", "pointermove", "mouseover", "mouseenter", "mousemove"]) {{
+    const pointer = type.startsWith("pointer") && typeof globalThis.PointerEvent !== "undefined";
+    const EventType = pointer ? globalThis.PointerEvent : globalThis.MouseEvent;
+    if (typeof EventType !== "function") continue;
+    effort.dispatchEvent(new EventType(type, {{
+      bubbles: true,
+      cancelable: true,
+      view: globalThis.window,
+      clientX,
+      clientY,
+      ...(pointer ? {{ pointerType: "mouse", pointerId: 1, isPrimary: true }} : {{}})
+    }}));
+  }}
+  return {{ status: "dispatched", effort: normalize(effort.innerText || effort.textContent), effortOptions: existing }};
+}}"##,
         effort_trigger = EFFORT_TRIGGER_SELECTOR,
     )
 }
@@ -273,10 +311,11 @@ pub fn model_selection_status(value: &Value) -> WebModelSelectionStatus {
 pub fn build_scope_file_input_function() -> String {
     format!(
         r##"() => {{
-  const input = document.querySelector({selector});
-  if (!input) return {{ status: "missing", selector: {selector} }};
+  const inputs = Array.from(document.querySelectorAll({selector}));
+  if (inputs.length !== 1) return {{ status: "unavailable", selector: {selector}, count: inputs.length }};
+  const input = inputs[0];
   input.setAttribute("title", "{marker}");
-  return {{ status: "marked", marker: "{marker}" }};
+  return {{ status: "marked", marker: "{marker}", count: inputs.length }};
 }}"##,
         selector = serde_json::to_string(FILE_INPUT_SELECTOR).expect("selector JSON"),
         marker = FILE_INPUT_MARKER
@@ -400,10 +439,23 @@ mod tests {
     }
 
     #[test]
-    fn model_scripts_bind_fable_max_real_hover_and_thinking_postcondition() {
+    fn model_scripts_bind_fable_max_hover_fallback_and_thinking_postcondition() {
         assert!(build_open_model_menu_function().contains("model-selector-dropdown"));
         assert!(build_select_fable_function().contains("fable 5"));
         assert!(build_mark_effort_parent_function().contains(EFFORT_HOVER_MARKER));
+        let hover = build_open_effort_submenu_function();
+        for event in [
+            "pointerover",
+            "pointerenter",
+            "pointermove",
+            "mouseover",
+            "mouseenter",
+            "mousemove",
+        ] {
+            assert!(hover.contains(event));
+        }
+        assert!(hover.contains("already_open"));
+        assert!(hover.contains("effort-option-"));
         assert!(build_select_max_function().contains("Max"));
         let thinking = build_ensure_thinking_on_function();
         assert!(thinking.contains("Thinking"));
@@ -435,7 +487,11 @@ mod tests {
 
     #[test]
     fn upload_send_and_response_scripts_use_claude_testids() {
-        assert!(build_scope_file_input_function().contains("file-upload"));
+        let scope = build_scope_file_input_function();
+        assert!(scope.contains("file-upload"));
+        assert!(scope.contains("querySelectorAll"));
+        assert!(scope.contains("inputs.length !== 1"));
+        assert!(scope.contains("count: inputs.length"));
         let attachment = build_attachment_probe_function("bundle.md").unwrap();
         assert!(attachment.contains("file-thumbnail"));
         assert!(attachment.contains("pasted content"));

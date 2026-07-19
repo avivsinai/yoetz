@@ -300,12 +300,36 @@ async fn open_effort_submenu(client: &ChromeCdpClient) -> Result<()> {
         .or_else(|| snapshot.find_uid_by_role_and_text("menuitem", "Effort"))
         .or_else(|| snapshot.find_uid_by_text(claude_web::EFFORT_HOVER_MARKER))
         .ok_or_else(|| anyhow!("marked Claude Effort menu trigger was missing from snapshot"))?;
-    client
+    let physical_hover_error = client
         .hover(&uid)
         .await
-        .context("dispatch real CDP mouse movement over Claude Effort menu trigger")?;
+        .err()
+        .map(|error| error.to_string());
     tokio::time::sleep(Duration::from_millis(400)).await;
-    Ok(())
+    let hover = client
+        .evaluate_script(&claude_web::build_open_effort_submenu_function(), vec![])
+        .await
+        .context("verify Claude Effort submenu or dispatch DOM hover fallback")?;
+    match hover.get("status").and_then(Value::as_str) {
+        Some("already_open") => Ok(()),
+        Some("dispatched") => {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            let verification = client
+                .evaluate_script(&claude_web::build_open_effort_submenu_function(), vec![])
+                .await
+                .context("verify Claude Effort submenu after DOM hover fallback")?;
+            if verification.get("status").and_then(Value::as_str) == Some("already_open") {
+                Ok(())
+            } else {
+                bail!(
+                    "Claude Effort submenu did not open after physical and DOM hover; physicalHoverError={physical_hover_error:?}, diagnostics={verification}"
+                )
+            }
+        }
+        _ => bail!(
+            "Claude Effort submenu hover target was unavailable; physicalHoverError={physical_hover_error:?}, diagnostics={hover}"
+        ),
+    }
 }
 
 fn require_status(
@@ -337,18 +361,11 @@ async fn upload_bundle(
         .evaluate_script(&claude_web::build_scope_file_input_function(), vec![])
         .await
         .context("scope Claude composer file input")?;
-    require_status(&scope, "marked", "file input", "selector")?;
-    let snapshot = client
-        .take_snapshot(false)
-        .await
-        .context("snapshot Claude file input")?;
-    let uid = snapshot
-        .find_marked_file_input_uid(claude_web::FILE_INPUT_MARKER)
-        .ok_or_else(|| anyhow!("marked Claude file input was missing from snapshot"))?;
+    require_status(&scope, "marked", "file input", "count")?;
     client
-        .upload_file(&uid, bundle_path)
+        .upload_file_by_selector(claude_web::FILE_INPUT_SELECTOR, bundle_path)
         .await
-        .context("upload file through Claude composer input")?;
+        .context("upload file through hidden Claude composer input")?;
 
     let probe = claude_web::build_attachment_probe_function(file_name)?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);

@@ -760,22 +760,14 @@ impl ChromeCdpClient {
 
     pub async fn upload_file(&self, uid: &str, file_path: &Path) -> Result<()> {
         let tab = self.selected_tab()?;
-        let file_path = file_path
-            .canonicalize()
-            .with_context(|| format!("resolving upload path `{}` failed", file_path.display()))?;
-        let file_path = file_path.to_str().ok_or_else(|| {
-            anyhow!(
-                "upload_file path is not valid UTF-8: {}",
-                file_path.display()
-            )
-        })?;
+        let file_path = canonical_upload_path(file_path)?;
 
         let _ = tab.set_file_chooser_dialog_interception(true, None);
         if let Ok(element) = find_snapshot_element(&tab, uid) {
             if element.tag_name.eq_ignore_ascii_case("input")
                 && element.get_attribute_value("type")?.as_deref() == Some("file")
             {
-                let result = inject_files_on_input(&tab, &element, file_path, uid);
+                let result = inject_files_on_input(&tab, &element, &file_path, uid);
                 let _ = tab.set_file_chooser_dialog_interception(false, None);
                 return result;
             }
@@ -796,7 +788,30 @@ impl ChromeCdpClient {
                 "no composer-scoped file input (`{marker_selector}`) was available after clicking the upload affordance"
             )
         })?;
-        let result = inject_files_on_input(&tab, &input, file_path, uid);
+        let result = inject_files_on_input(&tab, &input, &file_path, uid);
+        let _ = tab.set_file_chooser_dialog_interception(false, None);
+        result
+    }
+
+    /// Upload through an exact CSS selector without relying on the accessibility
+    /// snapshot. This is required for intentionally hidden file inputs that are
+    /// present in the DOM but omitted from the snapshot tree.
+    pub async fn upload_file_by_selector(&self, selector: &str, file_path: &Path) -> Result<()> {
+        let tab = self.selected_tab()?;
+        let file_path = canonical_upload_path(file_path)?;
+
+        let _ = tab.set_file_chooser_dialog_interception(true, None);
+        let result = (|| -> Result<()> {
+            let input = tab
+                .find_element(selector)
+                .with_context(|| format!("file input `{selector}` was not present in the DOM"))?;
+            if !input.tag_name.eq_ignore_ascii_case("input")
+                || input.get_attribute_value("type")?.as_deref() != Some("file")
+            {
+                bail!("upload selector `{selector}` did not resolve to an input[type=file]");
+            }
+            inject_files_on_input(&tab, &input, &file_path, selector)
+        })();
         let _ = tab.set_file_chooser_dialog_interception(false, None);
         result
     }
@@ -1885,6 +1900,18 @@ fn inject_files_on_input(
             }
         }
     }
+}
+
+fn canonical_upload_path(file_path: &Path) -> Result<String> {
+    let file_path = file_path
+        .canonicalize()
+        .with_context(|| format!("resolving upload path `{}` failed", file_path.display()))?;
+    file_path.to_str().map(ToOwned::to_owned).ok_or_else(|| {
+        anyhow!(
+            "upload_file path is not valid UTF-8: {}",
+            file_path.display()
+        )
+    })
 }
 
 fn resolve_browser_websocket(parsed: &Url) -> Result<String> {

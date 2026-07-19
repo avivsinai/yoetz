@@ -1516,6 +1516,8 @@ fn build_claude_model_script(page_name: &str) -> String {
         .expect("Fable function JSON");
     let mark_effort_json = serde_json::to_string(&claude_web::build_mark_effort_parent_function())
         .expect("mark effort function JSON");
+    let open_effort_json = serde_json::to_string(&claude_web::build_open_effort_submenu_function())
+        .expect("open effort function JSON");
     let max_json =
         serde_json::to_string(&claude_web::build_select_max_function()).expect("Max function JSON");
     let thinking_json = serde_json::to_string(&claude_web::build_ensure_thinking_on_function())
@@ -1523,9 +1525,6 @@ fn build_claude_model_script(page_name: &str) -> String {
     let verify_json =
         serde_json::to_string(&claude_web::build_verify_fable_max_thinking_function())
             .expect("verification function JSON");
-    let effort_selector_json =
-        serde_json::to_string(&format!("[title='{}']", claude_web::EFFORT_HOVER_MARKER))
-            .expect("effort selector JSON");
     format!(
         r#"
 const PAGE_NAME = {page_name_json};
@@ -1533,10 +1532,10 @@ const OPEN = {open_json};
 const CLOSE = {close_json};
 const SELECT_FABLE = {fable_json};
 const MARK_EFFORT = {mark_effort_json};
+const OPEN_EFFORT = {open_effort_json};
 const SELECT_MAX = {max_json};
 const ENABLE_THINKING = {thinking_json};
 const VERIFY = {verify_json};
-const EFFORT_SELECTOR = {effort_selector_json};
 const page = await browser.getPage(PAGE_NAME);
 let state = await page.evaluate((source) => eval("(" + source + ")")(), OPEN);
 if (!['opened', 'opening'].includes(state?.status)) {{
@@ -1556,7 +1555,11 @@ if (state?.status !== 'marked') {{
   console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu unavailable', diagnostics: state }}));
   return;
 }}
-await page.locator(EFFORT_SELECTOR).first().hover();
+state = await page.evaluate((source) => eval("(" + source + ")")(), OPEN_EFFORT);
+if (!['already_open', 'dispatched'].includes(state?.status)) {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu hover target unavailable', diagnostics: state }}));
+  return;
+}}
 await page.waitForTimeout(400);
 state = await page.evaluate((source) => eval("(" + source + ")")(), SELECT_MAX);
 if (state?.status !== 'selected') {{
@@ -1566,7 +1569,11 @@ if (state?.status !== 'selected') {{
 await page.waitForTimeout(300);
 await page.evaluate((source) => eval("(" + source + ")")(), OPEN);
 await page.evaluate((source) => eval("(" + source + ")")(), MARK_EFFORT);
-await page.locator(EFFORT_SELECTOR).first().hover();
+state = await page.evaluate((source) => eval("(" + source + ")")(), OPEN_EFFORT);
+if (!['already_open', 'dispatched'].includes(state?.status)) {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu hover target unavailable', diagnostics: state }}));
+  return;
+}}
 await page.waitForTimeout(400);
 state = await page.evaluate((source) => eval("(" + source + ")")(), ENABLE_THINKING);
 if (!['already_on', 'clicked'].includes(state?.status)) {{
@@ -1582,7 +1589,11 @@ if (state?.status !== 'marked') {{
   console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu unavailable during verification', diagnostics: state }}));
   return;
 }}
-await page.locator(EFFORT_SELECTOR).first().hover();
+state = await page.evaluate((source) => eval("(" + source + ")")(), OPEN_EFFORT);
+if (!['already_open', 'dispatched'].includes(state?.status)) {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu hover target unavailable during verification', diagnostics: state }}));
+  return;
+}}
 await page.waitForTimeout(400);
 const verification = await page.evaluate((source) => eval("(" + source + ")")(), VERIFY);
 await page.evaluate((source) => eval("(" + source + ")")(), CLOSE);
@@ -1596,12 +1607,15 @@ fn build_claude_delivery_script(
     delivery_text: &str,
     bundle_file_name: Option<&str>,
     use_clipboard: bool,
+    inline_fallback_text: Option<&str>,
     upload_timeout_ms: u64,
     send_timeout_ms: u64,
 ) -> String {
     let page_name_json = serde_json::to_string(page_name).expect("page name JSON");
     let delivery_text_json = serde_json::to_string(delivery_text).expect("delivery text JSON");
     let bundle_name_json = serde_json::to_string(&bundle_file_name).expect("bundle file name JSON");
+    let inline_fallback_json =
+        serde_json::to_string(&inline_fallback_text).expect("inline fallback JSON");
     let composer_json =
         serde_json::to_string(claude_web::COMPOSER_SELECTOR).expect("composer selector JSON");
     let send_json =
@@ -1618,6 +1632,7 @@ const PAGE_NAME = {page_name_json};
 const DELIVERY_TEXT = {delivery_text_json};
 const BUNDLE_FILE_NAME = {bundle_name_json};
 const USE_CLIPBOARD = {use_clipboard};
+const INLINE_FALLBACK_TEXT = {inline_fallback_json};
 const UPLOAD_TIMEOUT_MS = {upload_timeout_ms};
 const SEND_TIMEOUT_MS = {send_timeout_ms};
 const COMPOSER_SELECTOR = {composer_json};
@@ -1627,6 +1642,8 @@ const page = await browser.getPage(PAGE_NAME);
 const composer = page.locator(COMPOSER_SELECTOR).first();
 await composer.waitFor({{ state: "visible", timeout: 20000 }});
 await composer.click();
+let usedClipboard = false;
+let usedInlineFallback = false;
 if (USE_CLIPBOARD) {{
   await page.keyboard.press("Meta+V");
   const deadline = Date.now() + UPLOAD_TIMEOUT_MS;
@@ -1636,15 +1653,33 @@ if (USE_CLIPBOARD) {{
     lastState = ATTACHMENT_FUNCTION_SOURCE
       ? await page.evaluate((source) => eval("(" + source + ")")(), ATTACHMENT_FUNCTION_SOURCE)
       : null;
-    const composerLength = await composer.evaluate((el) => String(el.innerText || el.textContent || '').trim().length);
+    const composerLength = await page.evaluate((selector) => {{
+      const el = document.querySelector(selector);
+      return String(el?.innerText || el?.textContent || '').trim().length;
+    }}, COMPOSER_SELECTOR);
     if (lastState?.status === 'candidate' || lastState?.pastedContent || composerLength > 0) {{ ready = true; break; }}
     await page.waitForTimeout(250);
   }}
+  if (!ready && INLINE_FALLBACK_TEXT) {{
+    await composer.pressSequentially(INLINE_FALLBACK_TEXT, {{ delay: 1 }});
+    const inlineDeadline = Date.now() + SEND_TIMEOUT_MS;
+    while (Date.now() < inlineDeadline) {{
+      const composerLength = await page.evaluate((selector) => {{
+        const el = document.querySelector(selector);
+        return String(el?.innerText || el?.textContent || '').trim().length;
+      }}, COMPOSER_SELECTOR);
+      if (composerLength > 0) {{ ready = true; usedInlineFallback = true; break; }}
+      await page.waitForTimeout(250);
+    }}
+  }}
   if (!ready) {{
-    console.log(JSON.stringify({{ status: 'error', phase: 'upload', error: 'Claude clipboard paste did not become inline content or a pasted content attachment', diagnostics: lastState }}));
+    console.log(JSON.stringify({{ status: 'error', phase: 'upload', error: 'Claude clipboard paste and inline fallback did not become composer content', diagnostics: lastState }}));
     return;
   }}
-  await composer.pressSequentially("\n\n" + DELIVERY_TEXT, {{ delay: 5 }});
+  if (!usedInlineFallback) {{
+    usedClipboard = true;
+    await composer.pressSequentially("\n\n" + DELIVERY_TEXT, {{ delay: 5 }});
+  }}
 }} else {{
   await composer.pressSequentially(DELIVERY_TEXT, {{ delay: 1 }});
 }}
@@ -1666,6 +1701,7 @@ console.log(JSON.stringify({{
   assistantLastLenBeforeSend: send.assistantLastLength || 0,
   copyButtonsBeforeSend: send.copyButtons || 0,
   bundleFileName: BUNDLE_FILE_NAME,
+  usedClipboard,
 }}));
 "#
     )
@@ -2031,16 +2067,22 @@ fn stage_macos_clipboard_from_file(path: &Path) -> Result<()> {
 fn claude_delivery_text(
     bundle_path: &Path,
     prompt: &str,
-    warnings: &mut Vec<String>,
-) -> Result<(String, bool)> {
+    _warnings: &mut Vec<String>,
+) -> Result<(String, bool, Option<String>)> {
     #[cfg(target_os = "macos")]
     {
+        let bundle = fs::read_to_string(bundle_path).with_context(|| {
+            format!(
+                "read Claude bundle {} for inline clipboard fallback",
+                bundle_path.display()
+            )
+        })?;
         stage_macos_clipboard_from_file(bundle_path)?;
-        warnings.push(
-            "dev-browser delivered the Claude bundle through the macOS clipboard because the QuickJS transport cannot drive a file input; claude.ai may convert large pastes into a pasted content attachment."
-                .to_string(),
-        );
-        Ok((prompt.to_string(), true))
+        Ok((
+            prompt.to_string(),
+            true,
+            Some(format!("{prompt}\n\n{bundle}")),
+        ))
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -2051,11 +2093,11 @@ fn claude_delivery_text(
                 bundle_path.display()
             )
         })?;
-        warnings.push(
+        _warnings.push(
             "dev-browser cannot drive Claude file inputs on this platform; the bundle was inserted inline and may be slow or exceed composer limits. Use chrome-devtools-mcp or chrome-extension-native for file upload."
                 .to_string(),
         );
-        Ok((format!("{prompt}\n\n{bundle}"), false))
+        Ok((format!("{prompt}\n\n{bundle}"), false, None))
     }
 }
 
@@ -2136,7 +2178,7 @@ pub fn run_claude_recipe(ctx: &ClaudeDevBrowserRecipeContext) -> Result<ClaudeRe
         .and_then(|value| value.to_str())
         .context("Claude bundle path must end in a UTF-8 filename")?;
     let mut warnings = ctx.warnings.clone();
-    let (delivery_text, use_clipboard) =
+    let (delivery_text, use_clipboard, inline_fallback_text) =
         claude_delivery_text(bundle_path, &ctx.prompt, &mut warnings)?;
     let page_name = format!("{}-{}", CLAUDE_RECIPE_PAGE_NAME_PREFIX, ctx.run_id);
     let cdp_endpoint = ctx.cdp_endpoint.as_deref();
@@ -2193,6 +2235,7 @@ pub fn run_claude_recipe(ctx: &ClaudeDevBrowserRecipeContext) -> Result<ClaudeRe
         &delivery_text,
         Some(bundle_file_name),
         use_clipboard,
+        inline_fallback_text.as_deref(),
         ctx.upload_timeout_ms,
         ctx.send_timeout_ms,
     );
@@ -2218,6 +2261,21 @@ pub fn run_claude_recipe(ctx: &ClaudeDevBrowserRecipeContext) -> Result<ClaudeRe
         } else {
             Err(error).with_claude_phase(WebRecipeTransportPhase::Upload)
         };
+    }
+    let used_clipboard = delivery
+        .get("usedClipboard")
+        .and_then(Value::as_bool)
+        .unwrap_or(use_clipboard);
+    if used_clipboard {
+        warnings.push(
+            "dev-browser delivered the Claude bundle through the macOS clipboard because the QuickJS transport cannot drive a file input; claude.ai may convert large pastes into a pasted content attachment."
+                .to_string(),
+        );
+    } else if use_clipboard {
+        warnings.push(
+            "Claude ignored the macOS clipboard paste, so dev-browser inserted the bundle inline; this may be slow or exceed composer limits. Use chrome-devtools-mcp or chrome-extension-native for file upload."
+                .to_string(),
+        );
     }
     let baseline_count = delivery
         .get("assistantCountBeforeSend")
@@ -2255,7 +2313,7 @@ pub fn run_claude_recipe(ctx: &ClaudeDevBrowserRecipeContext) -> Result<ClaudeRe
         warnings,
         conversation_id: conversation.as_ref().map(|value| value.id.clone()),
         conversation_url: conversation.map(|value| value.url),
-        used_clipboard: use_clipboard,
+        used_clipboard,
     })
 }
 
@@ -2656,7 +2714,10 @@ mod tests {
         assert!(model.contains("Fable 5"));
         assert!(model.contains("effort-option-max"));
         assert!(model.contains("aria-checked"));
-        assert!(model.contains(".hover()"));
+        assert!(!model.contains(".hover()"));
+        assert!(model.contains("pointerover"));
+        assert!(model.contains("pointerenter"));
+        assert!(model.contains("mousemove"));
         assert!(model.contains("Effort menu unavailable during verification"));
 
         let delivery = build_claude_delivery_script(
@@ -2664,12 +2725,18 @@ mod tests {
             "Review this bundle.",
             Some("bundle.md"),
             true,
+            Some("Review this bundle.\n\n# Bundle"),
             120_000,
             120_000,
         );
         assert!(delivery.contains("Meta+V"));
         assert!(delivery.contains("pasted content"));
+        assert!(delivery.contains("INLINE_FALLBACK_TEXT"));
+        assert!(delivery.contains("usedInlineFallback"));
+        assert!(delivery.contains("usedClipboard"));
         assert!(delivery.contains("pressSequentially"));
+        assert!(!delivery.contains("composer.evaluate"));
+        assert!(delivery.contains("page.evaluate((selector)"));
 
         let poll = build_claude_poll_script(
             "yoetz-claude-test",
@@ -2682,6 +2749,31 @@ mod tests {
         );
         assert!(poll.contains("STABLE_IDLE_THRESHOLD_MS"));
         assert!(poll.contains("console.log(JSON.stringify"));
+
+        let scripts = [&prepare, &model, &delivery, &poll];
+        let locator_lines = scripts
+            .iter()
+            .flat_map(|script| script.lines())
+            .map(str::trim)
+            .filter(|line| line.contains(".locator("))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            locator_lines,
+            vec!["const composer = page.locator(COMPOSER_SELECTOR).first();"]
+        );
+        for line in scripts
+            .iter()
+            .flat_map(|script| script.lines())
+            .map(str::trim)
+            .filter(|line| line.contains("composer."))
+        {
+            assert!(
+                line.starts_with("await composer.waitFor(")
+                    || line.starts_with("await composer.click(")
+                    || line.starts_with("await composer.pressSequentially("),
+                "unsupported Claude dev-browser locator method: {line}"
+            );
+        }
     }
 
     #[test]
