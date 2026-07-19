@@ -267,7 +267,8 @@ async function startJob(message) {
   const url = job.expected_conversation_id
     ? adapter.conversationJobUrl(job.expected_conversation_id, job.run_id)
     : adapter.jobUrl(job.run_id);
-  const tab = await chrome.tabs.create({ url, active: false });
+  const tabActivation = await createJobTab(url, adapter);
+  const tab = tabActivation.tab;
   job.tab_id = tab.id;
   job.updated_at = Date.now();
   await persistJob(job);
@@ -282,20 +283,28 @@ async function startJob(message) {
     return;
   }
 
-  await waitForSiteTab(tab.id, adapter);
-  await waitForContentScript(tab.id, adapter);
-  const prepared = await sendToTab(tab.id, { type: "yoetz_prepare_job", job });
-  if (prepared.manual_handoff) {
-    postNative(progress(job, "manual_handoff", prepared.manual_handoff));
-    await failJob(job, "manual_handoff", prepared.manual_handoff.message, {
-      state: prepared.manual_handoff.state,
-      phase: "upload",
-      side_effect_started: true,
-      terminal_status: "manual_handoff"
-    });
-    return;
+  let modelSelection;
+  try {
+    await waitForSiteTab(tab.id, adapter);
+    await waitForContentScript(tab.id, adapter);
+    const prepared = await sendToTab(tab.id, { type: "yoetz_prepare_job", job });
+    if (prepared.manual_handoff) {
+      postNative(progress(job, "manual_handoff", prepared.manual_handoff));
+      await failJob(job, "manual_handoff", prepared.manual_handoff.message, {
+        state: prepared.manual_handoff.state,
+        phase: "upload",
+        side_effect_started: true,
+        terminal_status: "manual_handoff"
+      });
+      return;
+    }
+    job.status = "selecting_model";
+    job.updated_at = Date.now();
+    await persistJob(job);
+    modelSelection = await sendToTab(tab.id, { type: "yoetz_configure_model", job });
+  } finally {
+    await restorePreviousTab(tabActivation);
   }
-  const modelSelection = await sendToTab(tab.id, { type: "yoetz_configure_model", job });
   job.model_used = modelSelection.model_used ?? null;
   job.model_selection_status = modelSelection.status ?? "unavailable";
   job.warnings = [
@@ -1325,6 +1334,33 @@ async function waitForSiteTab(tabId, adapter) {
   throw new Error(`${adapter.displayName} tab ${tabId} did not load`);
 }
 
+async function createJobTab(url, adapter) {
+  const policy = adapter.tabActivation ?? {};
+  const activateOnCreate = policy.activateOnCreate === true;
+  let previousTabId = null;
+  if (activateOnCreate && policy.restorePreviousAfterModelSelection === true) {
+    try {
+      const [previousTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      previousTabId = previousTab?.id ?? null;
+    } catch {
+      // Capturing focus is best effort; mounting the site is the correctness gate.
+    }
+  }
+  const tab = await chrome.tabs.create({ url, active: activateOnCreate });
+  return { tab, previousTabId };
+}
+
+async function restorePreviousTab({ tab, previousTabId }) {
+  if (previousTabId == null || previousTabId === tab?.id) {
+    return;
+  }
+  try {
+    await chrome.tabs.update(previousTabId, { active: true });
+  } catch {
+    // The user may have closed or moved the prior tab while the site mounted.
+  }
+}
+
 async function waitForContentScript(tabId, adapter) {
   for (let attempt = 0; attempt < 40; attempt += 1) {
     try {
@@ -2237,6 +2273,7 @@ function phaseForStatus(status) {
   const phaseByStatus = {
     starting: "upload",
     opening_tab: "upload",
+    selecting_model: "model_selection",
     waiting_for_file: "upload",
     receiving_file: "upload",
     file_received: "upload",

@@ -3567,12 +3567,13 @@ mod native_host_unix {
             return;
         }
         match envelope.payload.get("phase").and_then(Value::as_str) {
-            Some(
-                "tab_opened" | "model_selection" | "tab_grouped" | "ready_for_file"
-                | "file_uploaded",
-            ) => {
+            Some("tab_opened" | "tab_grouped" | "ready_for_file" | "file_uploaded") => {
                 client.side_effect_started = true;
                 client.fallback_phase = Some("upload");
+            }
+            Some("model_selection") => {
+                client.side_effect_started = true;
+                client.fallback_phase = Some("model_selection");
             }
             Some("prompt_sent") => {
                 client.side_effect_started = true;
@@ -3814,6 +3815,37 @@ mod native_host_unix {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn model_selection_progress_preserves_the_diagnostic_phase() {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut client = ClientJob {
+                stream,
+                job_id: "job_model".to_string(),
+                run_id: Some("run_model".to_string()),
+                chunks: Vec::new(),
+                next_chunk: 0,
+                side_effect_started: false,
+                fallback_phase: None,
+                cancel_on_disconnect: true,
+            };
+            let envelope = ProtocolEnvelope::new(
+                "job_progress",
+                Some("job_model".to_string()),
+                Some("run_model".to_string()),
+                json!({ "phase": "model_selection" }),
+            );
+
+            update_client_effect_state(&mut client, &envelope);
+
+            assert!(client.side_effect_started);
+            assert_eq!(client.fallback_phase, Some("model_selection"));
+        }
     }
 }
 

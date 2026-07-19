@@ -150,18 +150,27 @@ test("service worker runs a Claude job through its adapter and probes the select
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
+  const updatedTabs = [];
   let sent = false;
   const conversationId = "123e4567-e89b-12d3-a456-426614174000";
 
   globalThis.chrome = chromeStub({
     port,
     tabs: {
+      query: async (query) => {
+        assert.deepEqual(query, { active: true, currentWindow: true });
+        return [{ id: 17, active: true }];
+      },
       create: async ({ url, active }) => {
         assert.equal(url, "https://claude.ai/new?_yoetz=run_job_claude");
-        assert.equal(active, false);
+        assert.equal(active, true);
         return { id: 71 };
       },
       get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new?_yoetz=run_job_claude" }),
+      update: async (id, options) => {
+        updatedTabs.push({ id, options });
+        return { id, ...options };
+      },
       sendMessage: async (id, message) => {
         sentToTabs.push({ id, message });
         switch (message.type) {
@@ -245,6 +254,7 @@ test("service worker runs a Claude job through its adapter and probes the select
       sentToTabs.find((item) => item.message.type === "yoetz_probe")?.message.recipe,
       "claude"
     );
+    assert.deepEqual(updatedTabs, [{ id: 17, options: { active: true } }]);
 
     port.emit(envelope("job_file_chunk", "job_claude", {
       sequence: 0,
@@ -265,6 +275,56 @@ test("service worker runs a Claude job through its adapter and probes the select
     assert.equal(complete.payload.completion_reason, "stable_idle");
     assert.equal(complete.payload.conversation_id, conversationId);
     assert.equal(complete.payload.conversation_url, `https://claude.ai/chat/${conversationId}`);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker reports a generic Claude model timeout as model_selection", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      query: async () => [{ id: 17, active: true }],
+      create: async (options) => ({ id: 71, ...options }),
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new?_yoetz=run_job_claude_model_timeout" }),
+      update: async (id, options) => ({ id, ...options }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: false, error: "Claude page did not reach the requested state within 10000ms" };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_model_timeout_phase=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_claude_model_timeout", {
+      recipe: "claude",
+      prompt: "review"
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_model_timeout"
+    ));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_model_timeout"
+    );
+    assert.equal(error.payload.code, "extension_error");
+    assert.equal(error.payload.phase, "model_selection");
+    assert.equal(error.payload.side_effect_started, true);
   } finally {
     globalThis.chrome = originalChrome;
   }

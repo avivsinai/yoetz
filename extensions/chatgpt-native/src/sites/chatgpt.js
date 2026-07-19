@@ -198,6 +198,10 @@ export const chatgptSiteAdapter = Object.freeze({
   isAllowedTabUrl: (url) => String(url ?? "").startsWith(`${CHATGPT_ORIGIN}/`),
   isAcceptableModelSelection,
   fetchConversationAnswer,
+  tabActivation: Object.freeze({
+    activateOnCreate: false,
+    restorePreviousAfterModelSelection: false
+  }),
   auth: Object.freeze({
     noTabStatus: "no_chatgpt_tab",
     selection(candidate) {

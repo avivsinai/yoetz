@@ -94,6 +94,10 @@ export const claudeSiteAdapter = Object.freeze({
   normalizeConversationId,
   isAllowedTabUrl: (url) => String(url ?? "").startsWith(`${CLAUDE_ORIGIN}/`),
   isAcceptableModelSelection,
+  tabActivation: Object.freeze({
+    activateOnCreate: true,
+    restorePreviousAfterModelSelection: true
+  }),
   auth: Object.freeze({
     noTabStatus: "no_claude_tab",
     selection(candidate) {
