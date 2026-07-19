@@ -200,7 +200,7 @@ export const chatgptSiteAdapter = Object.freeze({
   fetchConversationAnswer,
   tabActivation: Object.freeze({
     activateOnCreate: false,
-    restorePreviousAfterModelSelection: false
+    restorePreviousAfter: null
   }),
   auth: Object.freeze({
     noTabStatus: "no_chatgpt_tab",

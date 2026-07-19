@@ -270,6 +270,8 @@ async function startJob(message) {
   const tabActivation = await createJobTab(url, adapter);
   const tab = tabActivation.tab;
   job.tab_id = tab.id;
+  job.previous_active_tab_id = tabActivation.previousTabId;
+  job.restore_previous_after = tabActivation.restorePreviousAfter;
   job.updated_at = Date.now();
   await persistJob(job);
   const inspectCommand = inspectCommandForJob(job);
@@ -283,28 +285,23 @@ async function startJob(message) {
     return;
   }
 
-  let modelSelection;
-  try {
-    await waitForSiteTab(tab.id, adapter);
-    await waitForContentScript(tab.id, adapter);
-    const prepared = await sendToTab(tab.id, { type: "yoetz_prepare_job", job });
-    if (prepared.manual_handoff) {
-      postNative(progress(job, "manual_handoff", prepared.manual_handoff));
-      await failJob(job, "manual_handoff", prepared.manual_handoff.message, {
-        state: prepared.manual_handoff.state,
-        phase: "upload",
-        side_effect_started: true,
-        terminal_status: "manual_handoff"
-      });
-      return;
-    }
-    job.status = "selecting_model";
-    job.updated_at = Date.now();
-    await persistJob(job);
-    modelSelection = await sendToTab(tab.id, { type: "yoetz_configure_model", job });
-  } finally {
-    await restorePreviousTab(tabActivation);
+  await waitForSiteTab(tab.id, adapter);
+  await waitForContentScript(tab.id, adapter);
+  const prepared = await sendToTab(tab.id, { type: "yoetz_prepare_job", job });
+  if (prepared.manual_handoff) {
+    postNative(progress(job, "manual_handoff", prepared.manual_handoff));
+    await failJob(job, "manual_handoff", prepared.manual_handoff.message, {
+      state: prepared.manual_handoff.state,
+      phase: "upload",
+      side_effect_started: true,
+      terminal_status: "manual_handoff"
+    });
+    return;
   }
+  job.status = "selecting_model";
+  job.updated_at = Date.now();
+  await persistJob(job);
+  const modelSelection = await sendToTab(tab.id, { type: "yoetz_configure_model", job });
   job.model_used = modelSelection.model_used ?? null;
   job.model_selection_status = modelSelection.status ?? "unavailable";
   job.warnings = [
@@ -472,6 +469,7 @@ async function runJobWithFile(job, file) {
     assertSubmittedConversationCurrent(job, sendResult);
     assertJobConnectionCurrent(job);
     if (job.cancelled) return;
+    await restorePreviousTabForJob(job, "send");
     const inspectCommand = inspectCommandForJob(job);
     if (!postNative(progress(job, "prompt_sent", {
       timeout_ms: responseWaitTimeoutMs(job),
@@ -1368,8 +1366,11 @@ async function waitForSiteTab(tabId, adapter) {
 async function createJobTab(url, adapter) {
   const policy = adapter.tabActivation ?? {};
   const activateOnCreate = policy.activateOnCreate === true;
+  const restorePreviousAfter = typeof policy.restorePreviousAfter === "string"
+    ? policy.restorePreviousAfter
+    : null;
   let previousTabId = null;
-  if (activateOnCreate && policy.restorePreviousAfterModelSelection === true) {
+  if (activateOnCreate && restorePreviousAfter) {
     try {
       const [previousTab] = await chrome.tabs.query({ active: true, currentWindow: true });
       previousTabId = previousTab?.id ?? null;
@@ -1378,7 +1379,21 @@ async function createJobTab(url, adapter) {
     }
   }
   const tab = await chrome.tabs.create({ url, active: activateOnCreate });
-  return { tab, previousTabId };
+  return { tab, previousTabId, restorePreviousAfter };
+}
+
+async function restorePreviousTabForJob(job, phase) {
+  if (job.restore_previous_after !== phase) {
+    return;
+  }
+  await restorePreviousTab({
+    tab: { id: job.tab_id },
+    previousTabId: job.previous_active_tab_id
+  });
+  job.previous_active_tab_id = null;
+  job.restore_previous_after = null;
+  job.updated_at = Date.now();
+  await persistJob(job);
 }
 
 async function restorePreviousTab({ tab, previousTabId }) {

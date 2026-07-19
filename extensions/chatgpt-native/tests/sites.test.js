@@ -41,6 +41,10 @@ test("Claude adapter owns UUID conversations, exact model policy, and DOM-only f
   assert.equal(adapter.normalizeConversationId("conv-123").ok, false);
   assert.equal(adapter.isAllowedTabUrl(`https://claude.ai/chat/${conversationId}`), true);
   assert.equal(adapter.isAllowedTabUrl("https://chatgpt.com/"), false);
+  assert.deepEqual(adapter.tabActivation, {
+    activateOnCreate: true,
+    restorePreviousAfter: "send"
+  });
   assert.equal(adapter.isAcceptableModelSelection({
     status: "selected",
     requested_model: "fable-5-max",
@@ -77,6 +81,10 @@ test("Claude adapter owns UUID conversations, exact model policy, and DOM-only f
 
 test("ChatGPT adapter owns conversation and model policy", () => {
   const adapter = siteAdapterForRecipe("chatgpt");
+  assert.deepEqual(adapter.tabActivation, {
+    activateOnCreate: false,
+    restorePreviousAfter: null
+  });
   assert.deepEqual(adapter.normalizeConversationId(" conv-123 "), { ok: true, id: "conv-123" });
   assert.equal(adapter.conversationUrl("conv-123"), "https://chatgpt.com/c/conv-123");
   assert.equal(adapter.isAcceptableModelSelection({

@@ -96,7 +96,7 @@ export const claudeSiteAdapter = Object.freeze({
   isAcceptableModelSelection,
   tabActivation: Object.freeze({
     activateOnCreate: true,
-    restorePreviousAfterModelSelection: true
+    restorePreviousAfter: "send"
   }),
   auth: Object.freeze({
     noTabStatus: "no_claude_tab",

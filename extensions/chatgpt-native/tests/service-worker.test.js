@@ -191,8 +191,10 @@ test("service worker runs a Claude job through its adapter and probes the select
               }
             };
           case "yoetz_upload_file":
+            assert.deepEqual(updatedTabs, []);
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
+            assert.deepEqual(updatedTabs, []);
             sent = true;
             return {
               ok: true,
@@ -204,6 +206,10 @@ test("service worker runs a Claude job through its adapter and probes the select
               }
             };
           case "yoetz_extract_response":
+            assert.deepEqual(
+              updatedTabs,
+              sent ? [{ id: 17, options: { active: true } }] : []
+            );
             return {
               ok: true,
               payload: sent
@@ -254,7 +260,7 @@ test("service worker runs a Claude job through its adapter and probes the select
       sentToTabs.find((item) => item.message.type === "yoetz_probe")?.message.recipe,
       "claude"
     );
-    assert.deepEqual(updatedTabs, [{ id: 17, options: { active: true } }]);
+    assert.deepEqual(updatedTabs, []);
 
     port.emit(envelope("job_file_chunk", "job_claude", {
       sequence: 0,
@@ -275,6 +281,7 @@ test("service worker runs a Claude job through its adapter and probes the select
     assert.equal(complete.payload.completion_reason, "stable_idle");
     assert.equal(complete.payload.conversation_id, conversationId);
     assert.equal(complete.payload.conversation_url, `https://claude.ai/chat/${conversationId}`);
+    assert.deepEqual(updatedTabs, [{ id: 17, options: { active: true } }]);
   } finally {
     globalThis.chrome = originalChrome;
   }
