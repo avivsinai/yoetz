@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- Kept ChatGPT Pro reasoning turns in progress while the `Answer now`
+  affordance is visible, including transitions where the Stop control is
+  temporarily disabled, instead of returning interim review text as final.
 
 ## [0.5.35] - 2026-07-19
 ### Fixed
