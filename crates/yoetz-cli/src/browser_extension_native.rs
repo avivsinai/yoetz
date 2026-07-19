@@ -2557,9 +2557,12 @@ fn validate_private_token_file(path: &Path) -> Result<()> {
 }
 
 fn validate_bundle_path(path: &Path) -> Result<BundleInfo> {
-    let metadata = fs::metadata(path).with_context(|| format!("read bundle {}", path.display()))?;
+    let canonical_path =
+        fs::canonicalize(path).with_context(|| format!("resolve bundle {}", path.display()))?;
+    let metadata = fs::metadata(&canonical_path)
+        .with_context(|| format!("read bundle {}", canonical_path.display()))?;
     if !metadata.is_file() {
-        bail!("bundle path is not a file: {}", path.display());
+        bail!("bundle path is not a file: {}", canonical_path.display());
     }
     if metadata.len() > MAX_BUNDLE_BYTES {
         bail!(
@@ -2568,7 +2571,7 @@ fn validate_bundle_path(path: &Path) -> Result<BundleInfo> {
             MAX_BUNDLE_BYTES
         );
     }
-    let file_name = path
+    let file_name = canonical_path
         .file_name()
         .and_then(|name| name.to_str())
         .context("bundle path must end in a UTF-8 filename")?
@@ -2580,7 +2583,7 @@ fn validate_bundle_path(path: &Path) -> Result<BundleInfo> {
     }
     .to_string();
     Ok(BundleInfo {
-        path: path.to_path_buf(),
+        path: canonical_path,
         file_name,
         size: metadata.len(),
         mime,
@@ -3334,7 +3337,23 @@ mod native_host_unix {
             .job_id
             .clone()
             .context("local client message must include job_id")?;
-        let (forwarded, chunks) = prepare_local_message(envelope.clone())?;
+        let (forwarded, chunks) = match prepare_local_message(envelope.clone()) {
+            Ok(prepared) => prepared,
+            Err(err) if envelope.kind == "job_start" => {
+                let error = client_error_envelope_from_parts(
+                    &job_id,
+                    envelope.run_id.clone(),
+                    "bundle_validation_failed",
+                    &format!("native host could not prepare job bundle: {err:#}"),
+                    Some("upload"),
+                    false,
+                );
+                write_json_frame(&mut stream, &error)
+                    .context("write bundle validation error to local client")?;
+                return Ok(());
+            }
+            Err(err) => return Err(err),
+        };
         let client = ClientJob {
             stream: stream.try_clone()?,
             job_id: job_id.clone(),
@@ -3923,6 +3942,49 @@ mod native_host_unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn invalid_local_bundle_returns_structured_job_error() {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+            let handler_clients = Arc::clone(&clients);
+            let token = "test-token".to_string();
+            let handler_token = token.clone();
+            let handler = thread::spawn(move || {
+                handle_client(
+                    server,
+                    &handler_token,
+                    Arc::new(Mutex::new(io::stdout())),
+                    handler_clients,
+                )
+            });
+            let start = ProtocolEnvelope::new(
+                "job_start",
+                Some("job_invalid_bundle".to_string()),
+                Some("run_invalid_bundle".to_string()),
+                json!({
+                    "bundle_path": "/definitely/missing/yoetz-bundle.md",
+                    "bundle_size": 42,
+                }),
+            )
+            .with_token(token);
+
+            write_json_frame(&mut client, &start).unwrap();
+            let error = read_json_frame(&mut client).unwrap();
+
+            assert_eq!(error.kind, "job_error");
+            assert_eq!(error.job_id.as_deref(), Some("job_invalid_bundle"));
+            assert_eq!(error.run_id.as_deref(), Some("run_invalid_bundle"));
+            assert_eq!(error.payload["code"], "bundle_validation_failed");
+            assert_eq!(error.payload["phase"], "upload");
+            assert_eq!(error.payload["side_effect_started"], false);
+            assert!(error.payload["message"]
+                .as_str()
+                .unwrap()
+                .contains("/definitely/missing/yoetz-bundle.md"));
+            assert!(handler.join().unwrap().is_ok());
+            assert!(clients.lock().unwrap().is_empty());
+        }
 
         #[test]
         fn model_selection_progress_preserves_the_diagnostic_phase() {
@@ -5198,6 +5260,23 @@ mod tests {
         assert!(err
             .to_string()
             .contains("above chrome-extension-native limit"));
+    }
+
+    #[test]
+    fn validate_bundle_canonicalizes_relative_path_before_job_start() {
+        let cwd = env::current_dir().unwrap();
+        let dir = tempfile::Builder::new()
+            .prefix("yoetz-relative-bundle-")
+            .tempdir_in(&cwd)
+            .unwrap();
+        let path = dir.path().join("bundle.md");
+        fs::write(&path, "review me").unwrap();
+        let relative = path.strip_prefix(&cwd).unwrap();
+
+        let bundle = validate_bundle_path(relative).unwrap();
+
+        assert!(bundle.path.is_absolute());
+        assert_eq!(bundle.path, fs::canonicalize(&path).unwrap());
     }
 
     #[test]
