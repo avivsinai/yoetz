@@ -307,6 +307,37 @@ test("fake Claude extraction excludes collapsed thinking status text from the an
   assert.equal(extraction.text, answer);
 });
 
+test("fake Claude extraction strips a duplicated collapsed thinking caption prefix", () => {
+  const caption = "Scrutinizing verification request authenticity and token protocol";
+  const answer = "YOETZ-EXT-VERIFY-20260719-QOPHET";
+  const contaminated = `${caption}${answer}`;
+  const page = fakeClaudePage({ text: contaminated, streaming: false, copy: true });
+  page.body.cloneNode = () => {
+    let text = `${caption}\n${caption}\n${answer}`;
+    return {
+      get innerText() {
+        return text;
+      },
+      get textContent() {
+        return text;
+      },
+      querySelectorAll(selector) {
+        return selector === "button[class*='group/status']"
+          ? [{
+              innerText: caption,
+              textContent: caption,
+              remove: () => { text = contaminated; }
+            }]
+          : [];
+      }
+    };
+  };
+
+  const extraction = extractResponse(page.root);
+
+  assert.equal(extraction.text, answer);
+});
+
 test("fake Claude extraction fails closed when final controls are not scoped to the answer", () => {
   const page = fakeClaudePage({ text: "", streaming: false, copy: false });
   page.root.body.innerText = "possibly clipped page text";

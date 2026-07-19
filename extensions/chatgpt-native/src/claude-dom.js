@@ -422,10 +422,21 @@ function responseBodyText(body) {
   if (!sanitized) {
     return normalizeResponseText(body.innerText || body.textContent || "");
   }
+  const statusCaptions = [];
   for (const statusRow of sanitized.querySelectorAll?.("button[class*='group/status']") ?? []) {
+    const caption = normalizeResponseText(statusRow.innerText || statusRow.textContent || "");
+    if (caption) statusCaptions.push(caption);
     statusRow.remove();
   }
-  return normalizeResponseText(sanitized.innerText || sanitized.textContent || "");
+  let text = normalizeResponseText(sanitized.innerText || sanitized.textContent || "");
+  for (const caption of statusCaptions) {
+    // Completed thinking can leave a hidden copy of the collapsed caption before the answer.
+    // Strip only an exact leading copy anchored to a status row observed in this response body.
+    if (text.startsWith(caption)) {
+      text = normalizeResponseText(text.slice(caption.length));
+    }
+  }
+  return text;
 }
 
 function assistantRoots(root) {
