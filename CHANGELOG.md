@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added a built-in `claude` browser recipe at parity with `chatgpt`, covering
+  `chrome-devtools-mcp`, `dev-browser`, `agent-browser`, and
+  `chrome-extension-native`. It fails closed unless the live picker proves
+  Fable 5, Effort Max, and Thinking on; `--model-strategy current` and
+  `model`/`effort`/`thinking` overrides are rejected.
+- Turned the native extension into one pinned multi-site Yoetz Native Transport
+  package. Site adapters route ChatGPT and Claude jobs, while
+  `hello` and `status` advertise recipe capabilities and reject unknown sites
+  before browser side effects. Existing installations keep the same extension
+  ID and legacy extensions remain ChatGPT-only.
+- Added native-only Claude conversation resume through
+  `--var conversation=<uuid|url>` and `--followup`, with follow-up history keyed
+  by site and conversation ID. Legacy follow-up records default to ChatGPT.
+- Added the `inline_warn_tokens` Claude recipe variable (default 150,000; `0`
+  disables it) to warn when a bundle is likely to use retrieval-backed access.
+  The heuristic does not change existing bundle byte limits.
+- Added `--claude` scope to the native-extension lifecycle and browser checks,
+  including an exact-output `browser extension canary --claude`.
+
+### Changed
+
+- Shared built-in ChatGPT and Claude orchestration behind `BuiltinWebRecipe`;
+  ChatGPT behavior remains locked by its existing suites and live canary.
+- Managed extension syncs now stamp a monotonic fourth version segment so
+  programmatic reloads observe each changed artifact. `status` and `doctor`
+  report `managed_copy_mismatch` for wrong-path or unstamped loads and provide
+  the one-time remove-card/load-unpacked migration instruction.
+- Dev-browser generated scripts are lint-locked to QuickJS-supported locator
+  verbs, and Claude delivery reports truthful `delivery_mode` and
+  `auto_paste_fallback` metadata, including inline fallback when clipboard
+  upload produces no file.
+
+### Fixed
+
+- Hardened Claude's live UI path: jobs stay foreground through upload and
+  accepted send, hidden file inputs use the cross-world native `files` setter,
+  Base UI model selection uses paced state verification with complete
+  diagnostics, and early/full selection return the same accepted result shape.
+- Excluded collapsed Claude thinking/status rows from final response text by
+  sanitizing a cloned response subtree without mutating the live page.
+
 ## [0.5.33] - 2026-07-11
 ### Changed
 
