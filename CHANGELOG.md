@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.35] - 2026-07-19
 ### Fixed
 
 - Prevented collapsed claude.ai thinking captions from leaking into extracted
   response text.
+
 
 ## [0.5.34] - 2026-07-19
 ### Added
