@@ -413,6 +413,33 @@ test("extractResponse treats Thinking page text as complete without a stop contr
   assert.equal(extraction.is_generating, false);
 });
 
+test("extractResponse keeps an Answer now reasoning turn in progress while the stop control is transitional", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user" }, "Review the attached bundle");
+  const assistant = new FakeElement("div", { class: "agent-turn" }, [
+    "I’ll verify the artifact identity, then run the adversarial review.",
+    "Answer now",
+    "Verified patch hash and extracted patch data",
+    "Checked repository state"
+  ].join("\n\n"))
+    .append(
+      new FakeElement("div", { class: "markdown prose" }, "I’ll verify the artifact identity, then run the adversarial review."),
+      new FakeElement("button", {}, "Answer now"),
+      new FakeElement("div", { class: "markdown prose" }, "Verified patch hash and extracted patch data")
+    );
+  const conversation = new FakeElement("main", { role: "main" }, "Review the attached bundle").append(user, assistant);
+  const stop = new FakeElement("button", {
+    "aria-label": "Stop answering",
+    "aria-disabled": "true",
+    "data-testid": "stop-button"
+  }, "");
+  const doc = new FakeDocument(new FakeElement("body", {}, "Review the attached bundle").append(conversation, stop));
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "assistant_dom_fallback");
+  assert.equal(extraction.is_generating, true);
+});
+
 test("extractResponse prefers the newest assistant turn over an older copy button", () => {
   const oldCopy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
   const oldAssistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Old answer")
@@ -2247,6 +2274,9 @@ function matchesSimpleSelector(element, selector) {
   }
   if (selector.includes('[data-testid*="attachment"]')) {
     return String(attr("data-testid") ?? "").includes("attachment");
+  }
+  if (selector.includes('[data-testid*="stop"]')) {
+    return tag === "button" && String(attr("data-testid") ?? "").includes("stop");
   }
   if (selector.includes('[class*="code"]')) {
     return String(attr("class") ?? "").includes("code");

@@ -1323,11 +1323,22 @@ function isThoughtStatusLine(line) {
 }
 
 export function isResponseGenerating(root = document) {
-  return Boolean(firstVisible(root, [
+  if (firstVisible(root, [
     'button[data-testid*="stop"]',
     'button[aria-label*="Stop generating" i]',
     'button[aria-label*="Stop streaming" i]'
-  ]));
+  ])) {
+    return true;
+  }
+
+  // ChatGPT Pro can disable its composer Stop button while continuing a
+  // same-turn reasoning pass. During that transition the assistant turn keeps
+  // an exact "Answer now" control visible; treating the disabled Stop button as
+  // idle otherwise lets the waiter return the preceding interim markdown.
+  const latestAssistantTurn = findAssistantTurns(root).at(-1);
+  return Boolean(latestAssistantTurn && Array.from(latestAssistantTurn.querySelectorAll("button"))
+    .some((button) => normalizeText(textOf(button)) === "Answer now"
+      && isVisible(button, { allowDisabled: true, allowNoLayout: true })));
 }
 
 // Best-effort: click ChatGPT's visible stop-streaming/stop-generating control if
