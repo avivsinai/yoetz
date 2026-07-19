@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.34] - 2026-07-19
 ### Added
 
 - Added a built-in `claude` browser recipe at parity with `chatgpt`, covering
@@ -49,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   diagnostics, and early/full selection return the same accepted result shape.
 - Excluded collapsed Claude thinking/status rows from final response text by
   sanitizing a cloned response subtree without mutating the live page.
+
 
 ## [0.5.33] - 2026-07-11
 ### Changed
