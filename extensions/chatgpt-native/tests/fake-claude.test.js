@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
   configureModelState,
@@ -9,6 +10,16 @@ import {
   uploadFile
 } from "../src/claude-dom.js";
 import { claudeSiteAdapter } from "../src/sites/claude.js";
+
+const claudeDomSource = await readFile(new URL("../src/claude-dom.js", import.meta.url), "utf8");
+
+test("Claude upload uses the native files setter for page-world visibility", () => {
+  assert.doesNotMatch(
+    claudeDomSource,
+    /Object\.defineProperty\(\s*input\s*,\s*["']files["']/
+  );
+  assert.match(claudeDomSource, /\binput\.files\s*=\s*transfer\.files\b/);
+});
 
 test("fake Claude background turn returns the complete scoped response only after final controls", () => {
   const terminalMarker = "YOETZ TERMINAL MARKER";

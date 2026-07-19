@@ -119,7 +119,7 @@ export async function uploadFile(root, file, options = {}) {
   const input = await waitFor(() => findFileInput(root), Math.min(timeoutMs, 20000));
   const transfer = new DataTransfer();
   transfer.items.add(file);
-  Object.defineProperty(input, "files", { configurable: true, value: transfer.files });
+  input.files = transfer.files;
   input.dispatchEvent(new Event("change", { bubbles: true }));
   await waitFor(() => {
     const attachment = Array.from(root.querySelectorAll(ATTACHMENT_SELECTOR)).find((node) =>
