@@ -4,12 +4,16 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 use crate::chatgpt_web::{self, ChatgptConversation};
+use crate::web_recipe::{BuiltinWebRecipe, WebConversation};
 use yoetz_core::session::{list_sessions_in, write_json};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct FollowupMetadata {
     pub session_id: String,
+    #[serde(default)]
+    pub recipe: BuiltinWebRecipe,
     pub conversation_id: String,
     pub conversation_url: String,
     pub prompt_hash: String,
@@ -17,31 +21,62 @@ pub(crate) struct FollowupMetadata {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedFollowup {
-    pub conversation: ChatgptConversation,
+    pub recipe: BuiltinWebRecipe,
+    pub conversation: WebConversation,
     pub source_session_id: Option<String>,
     pub prior_prompt_hash: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_followup_target(raw: &str, sessions_base: &Path) -> Result<ResolvedFollowup> {
+    resolve_followup_target_for_recipe(raw, sessions_base, BuiltinWebRecipe::Chatgpt, |value| {
+        let conversation = chatgpt_web::normalize_conversation(value)?;
+        Ok(WebConversation {
+            id: conversation.id,
+            url: conversation.url,
+        })
+    })
+}
+
+pub(crate) fn resolve_followup_target_for_recipe<F>(
+    raw: &str,
+    sessions_base: &Path,
+    recipe: BuiltinWebRecipe,
+    normalize: F,
+) -> Result<ResolvedFollowup>
+where
+    F: Fn(&str) -> Result<WebConversation>,
+{
     let sessions = list_sessions_in(sessions_base)?;
     if let Some(session) = sessions.iter().find(|session| session.id == raw) {
         let metadata = read_followup_metadata(&session.path)?.ok_or_else(|| {
             anyhow!(
-                "session `{}` does not contain followup metadata; followup only works for ChatGPT browser recipe runs that wrote session metadata",
-                session.id
+                "session `{}` does not contain followup metadata; followup only works for browser recipe runs that wrote session metadata",
+                session.id,
             )
         })?;
-        let conversation = chatgpt_web::normalize_conversation(&metadata.conversation_id)?;
+        if metadata.recipe != recipe {
+            bail!(
+                "session `{}` belongs to the `{}` browser recipe and cannot be used as a `{}` followup",
+                session.id,
+                metadata.recipe.as_str(),
+                recipe.as_str(),
+            );
+        }
+        let conversation = normalize(&metadata.conversation_url)?;
         return Ok(ResolvedFollowup {
+            recipe,
             conversation,
             source_session_id: Some(metadata.session_id),
             prior_prompt_hash: Some(metadata.prompt_hash),
         });
     }
 
-    let conversation = chatgpt_web::normalize_conversation(raw)?;
-    let previous = find_latest_followup_metadata_for_conversation(&conversation.id, &sessions)?;
+    let conversation = normalize(raw)?;
+    let previous =
+        find_latest_followup_metadata_for_conversation(recipe, &conversation.id, &sessions)?;
     Ok(ResolvedFollowup {
+        recipe,
         conversation,
         source_session_id: previous
             .as_ref()
@@ -103,15 +138,36 @@ pub(crate) fn validate_followup_args(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn write_followup_metadata(
     session_dir: &Path,
     session_id: &str,
     conversation: &ChatgptConversation,
     prompt_hash: &str,
 ) -> Result<()> {
+    write_followup_metadata_for_recipe(
+        session_dir,
+        session_id,
+        BuiltinWebRecipe::Chatgpt,
+        &WebConversation {
+            id: conversation.id.clone(),
+            url: conversation.url.clone(),
+        },
+        prompt_hash,
+    )
+}
+
+pub(crate) fn write_followup_metadata_for_recipe(
+    session_dir: &Path,
+    session_id: &str,
+    recipe: BuiltinWebRecipe,
+    conversation: &WebConversation,
+    prompt_hash: &str,
+) -> Result<()> {
     let path = followup_metadata_path(session_dir);
     let metadata = FollowupMetadata {
         session_id: session_id.to_string(),
+        recipe,
         conversation_id: conversation.id.clone(),
         conversation_url: conversation.url.clone(),
         prompt_hash: prompt_hash.to_string(),
@@ -137,12 +193,13 @@ fn followup_metadata_path(session_dir: &Path) -> PathBuf {
 }
 
 fn find_latest_followup_metadata_for_conversation(
+    recipe: BuiltinWebRecipe,
     conversation_id: &str,
     sessions: &[yoetz_core::types::SessionInfo],
 ) -> Result<Option<FollowupMetadata>> {
     for session in sessions {
         if let Some(metadata) = read_followup_metadata(&session.path)? {
-            if metadata.conversation_id == conversation_id {
+            if metadata.recipe == recipe && metadata.conversation_id == conversation_id {
                 return Ok(Some(metadata));
             }
         }
@@ -262,6 +319,76 @@ mod tests {
         assert_eq!(
             resolved.source_session_id.as_deref(),
             Some("20260711_010000_bbbbbb")
+        );
+    }
+
+    #[test]
+    fn legacy_followup_metadata_defaults_to_chatgpt() {
+        let root = tempdir().unwrap();
+        fs::write(
+            root.path().join("followup.json"),
+            r#"{
+              "session_id": "legacy-session",
+              "conversation_id": "conv-legacy",
+              "conversation_url": "https://chatgpt.com/c/conv-legacy",
+              "prompt_hash": "legacy-hash"
+            }"#,
+        )
+        .unwrap();
+
+        let metadata = read_followup_metadata(root.path()).unwrap().unwrap();
+        assert_eq!(metadata.recipe, BuiltinWebRecipe::Chatgpt);
+    }
+
+    #[test]
+    fn direct_followup_lookup_is_keyed_by_recipe_and_conversation_id() {
+        let root = tempdir().unwrap();
+        let sessions_dir = root.path().join("sessions");
+        let chatgpt_session = sessions_dir.join("20260711_000000_chatgpt");
+        let claude_session = sessions_dir.join("20260711_010000_claude");
+        fs::create_dir_all(&chatgpt_session).unwrap();
+        fs::create_dir_all(&claude_session).unwrap();
+        write_followup_metadata_for_recipe(
+            &chatgpt_session,
+            "20260711_000000_chatgpt",
+            BuiltinWebRecipe::Chatgpt,
+            &WebConversation {
+                id: "shared-id".to_string(),
+                url: "https://chatgpt.com/c/shared-id".to_string(),
+            },
+            "chatgpt-hash",
+        )
+        .unwrap();
+        write_followup_metadata_for_recipe(
+            &claude_session,
+            "20260711_010000_claude",
+            BuiltinWebRecipe::Claude,
+            &WebConversation {
+                id: "shared-id".to_string(),
+                url: "https://claude.ai/chat/shared-id".to_string(),
+            },
+            "claude-hash",
+        )
+        .unwrap();
+
+        let resolved = resolve_followup_target_for_recipe(
+            "shared-id",
+            &sessions_dir,
+            BuiltinWebRecipe::Claude,
+            |raw| {
+                Ok(WebConversation {
+                    id: raw.to_string(),
+                    url: format!("https://claude.ai/chat/{raw}"),
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resolved.recipe, BuiltinWebRecipe::Claude);
+        assert_eq!(resolved.prior_prompt_hash.as_deref(), Some("claude-hash"));
+        assert_eq!(
+            resolved.source_session_id.as_deref(),
+            Some("20260711_010000_claude")
         );
     }
 }

@@ -11,7 +11,7 @@
 
 Fast CLI for routing code and media work through the right LLM path: direct API
 calls when available, multi-model councils when you need agreement, and browser
-recipes for web-only models such as ChatGPT Pro.
+recipes for web-only models such as ChatGPT Pro and Claude's Fable 5.
 
 Yoetz is built for coding agents and terminal workflows: gitignore-aware
 bundles, structured JSON output, reproducible session artifacts, live model
@@ -258,33 +258,59 @@ Useful agent-facing guarantees:
 
 Agent skill installation options are listed in [Agent Skills](#agent-skills).
 
-## Browser Recipes And ChatGPT Pro
+## Browser Recipes: ChatGPT Pro And Claude
 
 Browser recipes let Yoetz use web-only model surfaces from the terminal. The
 built-in ChatGPT recipe targets GPT-5.6 Sol with Pro intelligence and is
 fail-closed: if Yoetz cannot prove the requested surface is available, it stops
-instead of silently downgrading.
+instead of silently downgrading. The built-in Claude recipe applies the same
+contract to claude.ai with exactly Fable 5, Effort Max, and Thinking enabled.
 
 ```bash
 yoetz browser check --format json
 yoetz browser recipe --recipe chatgpt --bundle ~/.yoetz/sessions/<id>/bundle.md --format json
+yoetz browser check --claude --format json
+yoetz browser recipe --recipe claude --bundle ~/.yoetz/sessions/<id>/bundle.md --format json
 ```
 
-The default browser stack is extension-free unless the ChatGPT native extension
-is installed and connected. When connected, plain `yoetz browser check` uses a
-native dry-run and the ChatGPT recipe selects `chrome-extension-native` as the
-only default transport. Use an explicit `--transport <name>` when you want a
-different browser transport.
+Both recipes support `chrome-devtools-mcp`, `dev-browser`, `agent-browser`, and
+`chrome-extension-native`. The default browser stack is extension-free unless a
+connected native extension advertises the selected site. That recipe then
+selects `chrome-extension-native` as its only default transport and fails
+closed. Use an explicit `--transport <name>` to select another browser
+transport.
 
-Native extension happy path:
+The native path is one pinned multi-site package named Yoetz Native Transport,
+so existing ChatGPT installations keep the same extension ID and
+gain Claude support without re-pairing. Choose the site scope when managing or
+checking it:
 
 ```bash
 yoetz browser extension setup --chatgpt --open-chrome
 yoetz browser extension doctor --chatgpt
 yoetz browser extension status --chatgpt --format json
-yoetz browser check --transport chrome-extension-native --format json
 yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md --format json
+
+yoetz browser extension setup --claude --open-chrome
+yoetz browser extension doctor --claude
+yoetz browser extension status --claude --format json
+yoetz browser extension canary --claude
+yoetz browser recipe --recipe claude --transport chrome-extension-native --bundle bundle.md --format json
 ```
+
+Load the managed `$YOETZ_DIR/chatgpt-native-extension` directory unpacked in
+the Chrome profile that hosts the target AI sessions; do not load a repo
+checkout. Setup, update, and reload share machine-global native-host and managed
+extension state, so serialize those operations across agent lanes. Recipe runs
+may proceed concurrently only against one frozen loaded artifact.
+
+Upgrade the installed CLI before another lane runs extension auto-heal after a
+release. An older CLI can overwrite the newer stamped managed copy.
+
+Claude conversation resume supports `--var conversation=<uuid|url>` and
+`--followup` on the native transport. `inline_warn_tokens` defaults to 150,000
+and warns when a bundle is likely to become retrieval-backed; set it to `0` to
+disable the heuristic. This warning does not change Yoetz's byte limits.
 
 The native-host extension transport is currently macOS/Linux-only. Windows CLI
 and Scoop installs work for the API-backed Yoetz flows, but
@@ -293,8 +319,8 @@ registration is implemented.
 
 For multiple loaded Chrome profiles, select the connected bridge with
 `--var extension_instance_id=<id>` from `yoetz browser extension status
---chatgpt`, or opt into `profile_email` routing with `yoetz browser extension
-grant-identity --chatgpt`.
+--chatgpt` (or `--claude`), or opt into `profile_email` routing with
+`yoetz browser extension grant-identity --chatgpt` (or `--claude`).
 
 The detailed browser transport model lives in [ARCHITECTURE.md](ARCHITECTURE.md).
 

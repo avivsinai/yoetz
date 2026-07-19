@@ -293,7 +293,9 @@ fn browser_check_help_shows_cdp_flag() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--cdp"))
-        .stdout(predicate::str::contains("--transport"));
+        .stdout(predicate::str::contains("--transport"))
+        .stdout(predicate::str::contains("--chatgpt"))
+        .stdout(predicate::str::contains("--claude"));
 }
 
 #[test]
@@ -316,7 +318,7 @@ fn browser_recipe_help_shows_explicit_transport_flag() {
 }
 
 #[test]
-fn browser_extension_help_shows_chatgpt_lifecycle() {
+fn browser_extension_help_shows_multi_site_lifecycle() {
     yoetz()
         .args(["browser", "extension", "--help"])
         .assert()
@@ -339,7 +341,8 @@ fn browser_extension_setup_help_shows_open_chrome() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--open-chrome"))
-        .stdout(predicate::str::contains("--chatgpt"));
+        .stdout(predicate::str::contains("--chatgpt"))
+        .stdout(predicate::str::contains("--claude"));
 }
 
 #[test]
@@ -348,6 +351,8 @@ fn browser_extension_maintenance_help_shows_instance_selectors() {
         .args(["browser", "extension", "doctor", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("--chatgpt"))
+        .stdout(predicate::str::contains("--claude"))
         .stdout(predicate::str::contains("--profile-email"))
         .stdout(predicate::str::contains("--extension-instance-id"))
         .stdout(predicate::str::contains("--extension-profile-id"));
@@ -364,18 +369,30 @@ fn browser_extension_maintenance_help_shows_instance_selectors() {
         .args(["browser", "extension", "canary", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("--chatgpt"))
+        .stdout(predicate::str::contains("--claude"))
+        .stdout(predicate::str::contains("--profile-email"))
+        .stdout(predicate::str::contains("--extension-instance-id"))
+        .stdout(predicate::str::contains("--extension-profile-id"));
+
+    yoetz()
+        .args(["browser", "extension", "inspect", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--chatgpt"))
+        .stdout(predicate::str::contains("--claude"))
         .stdout(predicate::str::contains("--profile-email"))
         .stdout(predicate::str::contains("--extension-instance-id"))
         .stdout(predicate::str::contains("--extension-profile-id"));
 }
 
 #[test]
-fn browser_extension_status_requires_chatgpt_scope() {
+fn browser_extension_status_requires_exactly_one_site_scope() {
     yoetz()
         .args(["browser", "extension", "status", "--format", "json"])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("pass --chatgpt"));
+        .stderr(predicate::str::contains("--chatgpt or --claude"));
 }
 
 #[test]
@@ -406,17 +423,26 @@ fn browser_extension_status_text_is_copy_paste_friendly() {
     let dir = tempfile::tempdir().unwrap();
     let native_hosts = dir.path().join("native-hosts");
     let state = dir.path().join("state");
-    yoetz()
-        .env("YOETZ_CHROME_NATIVE_MESSAGING_DIR", &native_hosts)
-        .env("YOETZ_DIR", &state)
-        .args(["browser", "extension", "status", "--chatgpt"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains(
-            "Yoetz ChatGPT native extension: not_installed",
-        ))
-        .stdout(predicate::str::contains("extension_instance_id:"))
-        .stdout(predicate::str::contains("connected_instances: none"));
+    for (site_flag, display_name, site_scope) in [
+        ("--chatgpt", "ChatGPT", "chatgpt"),
+        ("--claude", "Claude", "claude"),
+    ] {
+        yoetz()
+            .env("YOETZ_CHROME_NATIVE_MESSAGING_DIR", &native_hosts)
+            .env("YOETZ_DIR", &state)
+            .args(["browser", "extension", "status", site_flag])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(format!(
+                "Yoetz native extension for {display_name}: not_installed"
+            )))
+            .stdout(predicate::str::contains(format!(
+                "site_scope: {site_scope}"
+            )))
+            .stdout(predicate::str::contains("site_ready: no"))
+            .stdout(predicate::str::contains("extension_instance_id:"))
+            .stdout(predicate::str::contains("connected_instances: none"));
+    }
 }
 
 #[test]

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Yoetz ChatGPT Native Transport",
-  "short_name": "Yoetz ChatGPT",
-  "description": "Experimental Yoetz native transport for ChatGPT recipe jobs.",
+  "name": "Yoetz Native Transport",
+  "short_name": "Yoetz Transport",
+  "description": "Yoetz native transport for supported web recipe jobs.",
   "version": "0.5.33",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAujviQNA7EjHnfqpn3TM5IfgmHzOnvtu5pXg3Y1rS5koNJBT2PSG7FTGi9wD4oqNLVFehKm5h46vq1u1ACsMjAUrqMMUVvf7RUeqieUmfbtKRmx24N2blfz4b8KYpMlNUhf8IZ5TAFbvzy9NEO2KHAHCV6pP84E4lLBW2OQIDhqJd0FfS3Ecn91pbsH3tcsU6Gu+WiPEHLXZjPj85KcgQ+8qL0Xz83V5hEXIocMlCQ0RnMOfQIp5qUEIKgZ7qKqEjW2czNz48s5Fdgzbv95Lf09vat1NWiDHXZtDPWIa6TRjlKAAXIwsz5A/DJibzWiCgKiuOWmCgQPJgDidoyj/7RQIDAQAB",
   "icons": {
@@ -21,7 +21,8 @@
     "tabGroups"
   ],
   "host_permissions": [
-    "https://chatgpt.com/*"
+    "https://chatgpt.com/*",
+    "https://claude.ai/*"
   ],
   "background": {
     "service_worker": "src/service-worker.js",
@@ -30,7 +31,8 @@
   "content_scripts": [
     {
       "matches": [
-        "https://chatgpt.com/*"
+        "https://chatgpt.com/*",
+        "https://claude.ai/*"
       ],
       "js": [
         "src/content-script.js"
@@ -41,10 +43,15 @@
   "web_accessible_resources": [
     {
       "resources": [
-        "src/chatgpt-dom.js"
+        "src/chatgpt-dom.js",
+        "src/claude-dom.js",
+        "src/sites/chatgpt.js",
+        "src/sites/chatgpt-backend.js",
+        "src/sites/claude.js"
       ],
       "matches": [
-        "https://chatgpt.com/*"
+        "https://chatgpt.com/*",
+        "https://claude.ai/*"
       ]
     }
   ],
@@ -55,7 +62,7 @@
       "48": "icons/icon-48.png",
       "128": "icons/icon-128.png"
     },
-    "default_title": "Yoetz ChatGPT Native Transport",
+    "default_title": "Yoetz Native Transport",
     "default_popup": "popup.html"
   },
   "minimum_chrome_version": "120"

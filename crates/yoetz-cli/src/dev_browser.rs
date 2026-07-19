@@ -13,7 +13,7 @@
 //! - Daemon-managed browser instances with auto-reconnect
 //! - Single script executes batch operations (fewer IPC round-trips)
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::Url;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -31,7 +31,9 @@ use std::time::{Duration, Instant};
 use yoetz_core::paths::home_dir;
 
 use crate::chatgpt_recipe::AnyhowResultExt;
-use crate::{browser, chatgpt_recipe, chatgpt_web};
+use crate::claude_recipe::AnyhowResultExt as ClaudeAnyhowResultExt;
+use crate::web_recipe::{WebModelSelectionStatus, WebRecipeTransportPhase};
+use crate::{browser, chatgpt_recipe, chatgpt_web, claude_recipe, claude_web};
 
 /// Cached dev-browser resolution.
 static DEV_BROWSER: OnceLock<String> = OnceLock::new();
@@ -55,6 +57,10 @@ const CHATGPT_SEND_TIMEOUT_MS_DEFAULT: u64 = 120_000;
 const CHATGPT_BROWSER_NAME: &str = "yoetz-chatgpt";
 const CHATGPT_AUTH_PROBE_PAGE_NAME: &str = "yoetz-chatgpt-main";
 const CHATGPT_RECIPE_PAGE_NAME_PREFIX: &str = "yoetz-chatgpt-run";
+const CLAUDE_BROWSER_NAME: &str = "yoetz-claude";
+const CLAUDE_AUTH_PROBE_PAGE_NAME: &str = "yoetz-claude-main";
+const CLAUDE_RECIPE_PAGE_NAME_PREFIX: &str = "yoetz-claude-run";
+const CLAUDE_NO_PROGRESS_POLL_LIMIT: u8 = 5;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChatgptPollSettings {
@@ -68,6 +74,17 @@ pub struct ChatgptRecipeRunResult {
     pub model_used: Option<String>,
     pub model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus,
     pub warnings: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaudeRecipeRunResult {
+    pub response: String,
+    pub model_used: Option<String>,
+    pub model_selection_status: WebModelSelectionStatus,
+    pub warnings: Vec<String>,
+    pub conversation_id: Option<String>,
+    pub conversation_url: Option<String>,
+    pub used_clipboard: bool,
 }
 
 impl Default for ChatgptPollSettings {
@@ -699,6 +716,19 @@ pub struct DevBrowserRecipeContext {
     pub cdp_endpoint: Option<String>,
     /// Whether to print interactive Chrome-approval guidance to stderr.
     pub show_approval_guidance: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct ClaudeDevBrowserRecipeContext {
+    pub bundle_path: Option<PathBuf>,
+    pub prompt: String,
+    pub run_id: String,
+    pub poll_settings: ChatgptPollSettings,
+    pub cdp_endpoint: Option<String>,
+    pub show_approval_guidance: bool,
+    pub upload_timeout_ms: u64,
+    pub send_timeout_ms: u64,
+    pub warnings: Vec<String>,
 }
 
 impl Default for DevBrowserRecipeContext {
@@ -1450,6 +1480,294 @@ console.log(JSON.stringify({{
     )
 }
 
+fn build_claude_prepare_script(page_name: &str, run_id: &str) -> String {
+    let page_name_json = serde_json::to_string(page_name).expect("page name JSON");
+    let marked_url_json = serde_json::to_string(
+        &claude_web::mark_claude_url(run_id).expect("validated Claude run id"),
+    )
+    .expect("Claude URL JSON");
+    let window_name_json =
+        serde_json::to_string(&format!("yoetz:{run_id}")).expect("window name JSON");
+    let wait_function_json = serde_json::to_string(&claude_web::build_wait_for_composer_function())
+        .expect("wait function JSON");
+    format!(
+        r#"
+const PAGE_NAME = {page_name_json};
+const MARKED_URL = {marked_url_json};
+const WINDOW_NAME = {window_name_json};
+const WAIT_FUNCTION_SOURCE = {wait_function_json};
+const page = await browser.getPage(PAGE_NAME);
+await page.goto(MARKED_URL, {{ waitUntil: "domcontentloaded" }});
+await page.waitForTimeout(800);
+await page.evaluate((name) => {{ window.name = name; return window.name; }}, WINDOW_NAME);
+const state = await page.evaluate((source) => eval("(" + source + ")")(), WAIT_FUNCTION_SOURCE);
+console.log(JSON.stringify(state));
+"#
+    )
+}
+
+fn build_claude_model_script(page_name: &str) -> String {
+    let page_name_json = serde_json::to_string(page_name).expect("page name JSON");
+    let open_json = serde_json::to_string(&claude_web::build_open_model_menu_function())
+        .expect("open model function JSON");
+    let close_json = serde_json::to_string(&claude_web::build_close_model_menu_function())
+        .expect("close model function JSON");
+    let fable_json = serde_json::to_string(&claude_web::build_select_fable_function())
+        .expect("Fable function JSON");
+    let mark_effort_json = serde_json::to_string(&claude_web::build_mark_effort_parent_function())
+        .expect("mark effort function JSON");
+    let open_effort_json = serde_json::to_string(&claude_web::build_open_effort_submenu_function())
+        .expect("open effort function JSON");
+    let max_json =
+        serde_json::to_string(&claude_web::build_select_max_function()).expect("Max function JSON");
+    let thinking_json = serde_json::to_string(&claude_web::build_ensure_thinking_on_function())
+        .expect("Thinking function JSON");
+    let verify_json =
+        serde_json::to_string(&claude_web::build_verify_fable_max_thinking_function())
+            .expect("verification function JSON");
+    format!(
+        r#"
+const PAGE_NAME = {page_name_json};
+const OPEN = {open_json};
+const CLOSE = {close_json};
+const SELECT_FABLE = {fable_json};
+const MARK_EFFORT = {mark_effort_json};
+const OPEN_EFFORT = {open_effort_json};
+const SELECT_MAX = {max_json};
+const ENABLE_THINKING = {thinking_json};
+const VERIFY = {verify_json};
+const page = await browser.getPage(PAGE_NAME);
+let state = await page.evaluate((source) => eval("(" + source + ")")(), OPEN);
+if (!['opened', 'opening'].includes(state?.status)) {{
+  console.log(JSON.stringify({{ status: 'error', error: 'Claude model selector unavailable', diagnostics: state }}));
+  return;
+}}
+await page.waitForTimeout(250);
+state = await page.evaluate((source) => eval("(" + source + ")")(), SELECT_FABLE);
+if (state?.status !== 'selected') {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Fable 5 is unavailable', diagnostics: state }}));
+  return;
+}}
+await page.waitForTimeout(300);
+await page.evaluate((source) => eval("(" + source + ")")(), OPEN);
+state = await page.evaluate((source) => eval("(" + source + ")")(), MARK_EFFORT);
+if (state?.status !== 'marked') {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu unavailable', diagnostics: state }}));
+  return;
+}}
+state = await page.evaluate((source) => eval("(" + source + ")")(), OPEN_EFFORT);
+if (!['already_open', 'dispatched'].includes(state?.status)) {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu hover target unavailable', diagnostics: state }}));
+  return;
+}}
+await page.waitForTimeout(400);
+state = await page.evaluate((source) => eval("(" + source + ")")(), SELECT_MAX);
+if (state?.status !== 'selected') {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Max effort unavailable', diagnostics: state }}));
+  return;
+}}
+await page.waitForTimeout(300);
+await page.evaluate((source) => eval("(" + source + ")")(), OPEN);
+await page.evaluate((source) => eval("(" + source + ")")(), MARK_EFFORT);
+state = await page.evaluate((source) => eval("(" + source + ")")(), OPEN_EFFORT);
+if (!['already_open', 'dispatched'].includes(state?.status)) {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu hover target unavailable', diagnostics: state }}));
+  return;
+}}
+await page.waitForTimeout(400);
+state = await page.evaluate((source) => eval("(" + source + ")")(), ENABLE_THINKING);
+if (!['already_on', 'clicked'].includes(state?.status)) {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Thinking switch unavailable', diagnostics: state }}));
+  return;
+}}
+await page.waitForTimeout(300);
+await page.evaluate((source) => eval("(" + source + ")")(), CLOSE);
+await page.waitForTimeout(250);
+await page.evaluate((source) => eval("(" + source + ")")(), OPEN);
+state = await page.evaluate((source) => eval("(" + source + ")")(), MARK_EFFORT);
+if (state?.status !== 'marked') {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu unavailable during verification', diagnostics: state }}));
+  return;
+}}
+state = await page.evaluate((source) => eval("(" + source + ")")(), OPEN_EFFORT);
+if (!['already_open', 'dispatched'].includes(state?.status)) {{
+  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu hover target unavailable during verification', diagnostics: state }}));
+  return;
+}}
+await page.waitForTimeout(400);
+const verification = await page.evaluate((source) => eval("(" + source + ")")(), VERIFY);
+await page.evaluate((source) => eval("(" + source + ")")(), CLOSE);
+console.log(JSON.stringify(verification));
+"#
+    )
+}
+
+fn build_claude_delivery_script(
+    page_name: &str,
+    delivery_text: &str,
+    bundle_file_name: Option<&str>,
+    use_clipboard: bool,
+    inline_fallback_text: Option<&str>,
+    upload_timeout_ms: u64,
+    send_timeout_ms: u64,
+) -> String {
+    let page_name_json = serde_json::to_string(page_name).expect("page name JSON");
+    let delivery_text_json = serde_json::to_string(delivery_text).expect("delivery text JSON");
+    let bundle_name_json = serde_json::to_string(&bundle_file_name).expect("bundle file name JSON");
+    let inline_fallback_json =
+        serde_json::to_string(&inline_fallback_text).expect("inline fallback JSON");
+    let composer_json =
+        serde_json::to_string(claude_web::COMPOSER_SELECTOR).expect("composer selector JSON");
+    let send_json =
+        serde_json::to_string(&claude_web::build_send_function()).expect("send function JSON");
+    let attachment_json = bundle_file_name
+        .map(claude_web::build_attachment_probe_function)
+        .transpose()
+        .expect("attachment probe")
+        .map(|source| serde_json::to_string(&source).expect("attachment probe JSON"))
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        r#"
+const PAGE_NAME = {page_name_json};
+const DELIVERY_TEXT = {delivery_text_json};
+const BUNDLE_FILE_NAME = {bundle_name_json};
+const USE_CLIPBOARD = {use_clipboard};
+const INLINE_FALLBACK_TEXT = {inline_fallback_json};
+const UPLOAD_TIMEOUT_MS = {upload_timeout_ms};
+const SEND_TIMEOUT_MS = {send_timeout_ms};
+const COMPOSER_SELECTOR = {composer_json};
+const SEND_FUNCTION_SOURCE = {send_json};
+const ATTACHMENT_FUNCTION_SOURCE = {attachment_json};
+const page = await browser.getPage(PAGE_NAME);
+const composer = page.locator(COMPOSER_SELECTOR).first();
+await composer.waitFor({{ state: "visible", timeout: 20000 }});
+await composer.click();
+let usedClipboard = false;
+let usedInlineFallback = false;
+if (USE_CLIPBOARD) {{
+  await page.keyboard.press("Meta+V");
+  const deadline = Date.now() + UPLOAD_TIMEOUT_MS;
+  let ready = false;
+  let lastState = null;
+  while (Date.now() < deadline) {{
+    lastState = ATTACHMENT_FUNCTION_SOURCE
+      ? await page.evaluate((source) => eval("(" + source + ")")(), ATTACHMENT_FUNCTION_SOURCE)
+      : null;
+    const composerLength = await page.evaluate((selector) => {{
+      const el = document.querySelector(selector);
+      return String(el?.innerText || el?.textContent || '').trim().length;
+    }}, COMPOSER_SELECTOR);
+    if (lastState?.status === 'candidate' || lastState?.pastedContent || composerLength > 0) {{ ready = true; break; }}
+    await page.waitForTimeout(250);
+  }}
+  if (!ready && INLINE_FALLBACK_TEXT) {{
+    await composer.pressSequentially(INLINE_FALLBACK_TEXT, {{ delay: 1 }});
+    const inlineDeadline = Date.now() + SEND_TIMEOUT_MS;
+    while (Date.now() < inlineDeadline) {{
+      const composerLength = await page.evaluate((selector) => {{
+        const el = document.querySelector(selector);
+        return String(el?.innerText || el?.textContent || '').trim().length;
+      }}, COMPOSER_SELECTOR);
+      if (composerLength > 0) {{ ready = true; usedInlineFallback = true; break; }}
+      await page.waitForTimeout(250);
+    }}
+  }}
+  if (!ready) {{
+    console.log(JSON.stringify({{ status: 'error', phase: 'upload', error: 'Claude clipboard paste and inline fallback did not become composer content', diagnostics: lastState }}));
+    return;
+  }}
+  if (!usedInlineFallback) {{
+    usedClipboard = true;
+    await composer.pressSequentially("\n\n" + DELIVERY_TEXT, {{ delay: 5 }});
+  }}
+}} else {{
+  await composer.pressSequentially(DELIVERY_TEXT, {{ delay: 1 }});
+}}
+const enableDeadline = Date.now() + SEND_TIMEOUT_MS;
+let send = null;
+while (Date.now() < enableDeadline) {{
+  send = await page.evaluate((source) => eval("(" + source + ")")(), SEND_FUNCTION_SOURCE);
+  if (send?.status === 'sent') break;
+  if (!['disabled', 'missing'].includes(send?.status)) break;
+  await page.waitForTimeout(250);
+}}
+if (send?.status !== 'sent') {{
+  console.log(JSON.stringify({{ status: 'error', phase: 'send', error: 'Claude send button did not become enabled', diagnostics: send }}));
+  return;
+}}
+console.log(JSON.stringify({{
+  status: 'sent',
+  assistantCountBeforeSend: send.assistantCount || 0,
+  assistantLastLenBeforeSend: send.assistantLastLength || 0,
+  copyButtonsBeforeSend: send.copyButtons || 0,
+  bundleFileName: BUNDLE_FILE_NAME,
+  usedClipboard,
+}}));
+"#
+    )
+}
+
+fn build_claude_poll_script(
+    page_name: &str,
+    assistant_count_before_send: i64,
+    assistant_last_len_before_send: i64,
+    poll_settings: ChatgptPollSettings,
+) -> String {
+    let page_name_json = serde_json::to_string(page_name).expect("page name JSON");
+    let probe_json = serde_json::to_string(&claude_web::build_response_poll_function())
+        .expect("response probe JSON");
+    let stable_idle_threshold_ms = claude_web::stable_idle_threshold_ms(poll_settings.interval_ms);
+    format!(
+        r#"
+const PAGE_NAME = {page_name_json};
+const BASELINE_COUNT = {assistant_count_before_send};
+const BASELINE_LENGTH = {assistant_last_len_before_send};
+const POLL_TIMEOUT_MS = {poll_timeout_ms};
+const POLL_INTERVAL_MS = {poll_interval_ms};
+const STABLE_IDLE_THRESHOLD_MS = {stable_idle_threshold_ms};
+const NO_PROGRESS_POLL_LIMIT = {no_progress_limit};
+const PROBE_FUNCTION_SOURCE = {probe_json};
+const page = await browser.getPage(PAGE_NAME);
+const started = Date.now();
+let stableSince = null;
+let stableKey = null;
+let noProgressPolls = 0;
+while (Date.now() - started < POLL_TIMEOUT_MS) {{
+  await page.waitForTimeout(POLL_INTERVAL_MS);
+  const state = await page.evaluate((source) => eval("(" + source + ")")(), PROBE_FUNCTION_SOURCE);
+  if (state?.error) {{
+    console.log(JSON.stringify({{ status: 'error', error: 'Claude page error: ' + state.error }}));
+    return;
+  }}
+  const inactive = !state?.streaming && !state?.hasStopButton && !state?.thinking;
+  const grew = Number(state?.count || 0) > BASELINE_COUNT ||
+    (Number(state?.count || 0) === BASELINE_COUNT && Number(state?.length || 0) > BASELINE_LENGTH);
+  const candidate = inactive && grew && Number(state?.length || 0) > 0;
+  if (inactive && !grew) noProgressPolls += 1; else noProgressPolls = 0;
+  if (noProgressPolls >= NO_PROGRESS_POLL_LIMIT) {{
+    console.log(JSON.stringify({{ status: 'error', error: 'Claude response made no post-send progress after generation became idle', diagnostics: state }}));
+    return;
+  }}
+  if (!candidate) {{ stableSince = null; stableKey = null; continue; }}
+  const key = `${{state.count}}:${{state.length}}:${{String(state.text || '').slice(-256)}}`;
+  if (stableKey !== key) {{ stableKey = key; stableSince = Date.now(); continue; }}
+  if (stableSince !== null && Date.now() - stableSince >= STABLE_IDLE_THRESHOLD_MS) {{
+    console.log(JSON.stringify({{
+      status: 'ok', response: state.text, url: await page.url(),
+      stable_for_ms: Date.now() - stableSince,
+      stable_idle_threshold_ms: STABLE_IDLE_THRESHOLD_MS,
+    }}));
+    return;
+  }}
+}}
+console.log(JSON.stringify({{ status: 'timeout', error: `Claude response timed out after ${{POLL_TIMEOUT_MS}}ms` }}));
+"#,
+        poll_timeout_ms = poll_settings.timeout_ms,
+        poll_interval_ms = poll_settings.interval_ms,
+        no_progress_limit = CLAUDE_NO_PROGRESS_POLL_LIMIT,
+    )
+}
+
 fn parse_chatgpt_recipe_result(
     stdout: &str,
     poll_timeout_ms: u64,
@@ -1716,6 +2034,286 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
         model_used,
         model_selection_status,
         warnings,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn stage_macos_clipboard_from_file(path: &Path) -> Result<()> {
+    let mut bundle = fs::File::open(path)
+        .with_context(|| format!("open Claude bundle for clipboard: {}", path.display()))?;
+    let mut child = Command::new("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("stage Claude bundle on the macOS clipboard")?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .context("open pbcopy stdin for Claude bundle")?;
+    std::io::copy(&mut bundle, &mut stdin).context("write Claude bundle to the macOS clipboard")?;
+    drop(stdin);
+    let output = child
+        .wait_with_output()
+        .context("wait for macOS clipboard staging")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "could not stage Claude bundle on the macOS clipboard: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    ))
+}
+
+fn claude_delivery_text(
+    bundle_path: &Path,
+    prompt: &str,
+    _warnings: &mut Vec<String>,
+) -> Result<(String, bool, Option<String>)> {
+    #[cfg(target_os = "macos")]
+    {
+        let bundle = fs::read_to_string(bundle_path).with_context(|| {
+            format!(
+                "read Claude bundle {} for inline clipboard fallback",
+                bundle_path.display()
+            )
+        })?;
+        stage_macos_clipboard_from_file(bundle_path)?;
+        Ok((
+            prompt.to_string(),
+            true,
+            Some(format!("{prompt}\n\n{bundle}")),
+        ))
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let bundle = fs::read_to_string(bundle_path).with_context(|| {
+            format!(
+                "read Claude bundle {} for dev-browser inline delivery",
+                bundle_path.display()
+            )
+        })?;
+        _warnings.push(
+            "dev-browser cannot drive Claude file inputs on this platform; the bundle was inserted inline and may be slow or exceed composer limits. Use chrome-devtools-mcp or chrome-extension-native for file upload."
+                .to_string(),
+        );
+        Ok((format!("{prompt}\n\n{bundle}"), false, None))
+    }
+}
+
+fn parse_claude_poll_result(stdout: &str, timeout_ms: u64) -> Result<(String, Option<String>)> {
+    let value: Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("parse Claude dev-browser response result: {stdout}"))?;
+    match value.get("status").and_then(Value::as_str) {
+        Some("ok") => {
+            let response = value
+                .get("response")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .context("Claude stable-idle result did not contain response text")?;
+            Ok((
+                response.to_string(),
+                value.get("url").and_then(Value::as_str).map(str::to_string),
+            ))
+        }
+        Some("error") => Err(anyhow!(
+            "{}",
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Claude response polling failed")
+        )),
+        Some("timeout") => {
+            let message = value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    format!("Claude response polling timed out after {timeout_ms}ms")
+                });
+            Err(anyhow!(message))
+        }
+        other => Err(anyhow!(
+            "unexpected Claude dev-browser response status {other:?}: {value}"
+        )),
+    }
+}
+
+pub fn ensure_claude_auth_with_page_check_and_endpoint(cdp_endpoint: Option<&str>) -> Result<()> {
+    let run_id = claude_web::generate_run_id();
+    let script = build_claude_prepare_script(CLAUDE_AUTH_PROBE_PAGE_NAME, &run_id);
+    eprintln!("info: probing Claude auth state via dev-browser");
+    let stdout = run_script_connect_with_browser_and_endpoint(
+        &script,
+        Some(60),
+        Some(CLAUDE_BROWSER_NAME),
+        cdp_endpoint,
+    )
+    .map_err(maybe_add_dev_browser_connect_guidance)?;
+    let state: Value = serde_json::from_str(stdout.trim())
+        .with_context(|| format!("parse Claude auth probe result: {stdout}"))?;
+    match state.get("status").and_then(Value::as_str) {
+        Some("ready") => Ok(()),
+        Some("login") => Err(anyhow!(
+            "Claude login is required in the attached Chrome profile"
+        )),
+        Some("challenge") => Err(anyhow!(
+            "Cloudflare challenge detected on claude.ai; solve it in the attached Chrome window and retry"
+        )),
+        other => Err(anyhow!(
+            "Claude did not finish loading the composer; status={other:?}, diagnostics={state}"
+        )),
+    }
+}
+
+/// Run the Claude fallback through small QuickJS scripts. Rust owns phase
+/// orchestration and every script communicates through one JSON stdout value.
+pub fn run_claude_recipe(ctx: &ClaudeDevBrowserRecipeContext) -> Result<ClaudeRecipeRunResult> {
+    let bundle_path = ctx
+        .bundle_path
+        .as_deref()
+        .context("Claude dev-browser transport requires `--bundle`")?;
+    let bundle_file_name = bundle_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .context("Claude bundle path must end in a UTF-8 filename")?;
+    let mut warnings = ctx.warnings.clone();
+    let (delivery_text, use_clipboard, inline_fallback_text) =
+        claude_delivery_text(bundle_path, &ctx.prompt, &mut warnings)?;
+    let page_name = format!("{}-{}", CLAUDE_RECIPE_PAGE_NAME_PREFIX, ctx.run_id);
+    let cdp_endpoint = ctx.cdp_endpoint.as_deref();
+    let run_script = |script: &str, timeout_secs: Option<u64>| {
+        run_script_connect_with_browser_and_endpoint(
+            script,
+            timeout_secs,
+            Some(CLAUDE_BROWSER_NAME),
+            cdp_endpoint,
+        )
+    };
+
+    let prepare_script = build_claude_prepare_script(&page_name, &ctx.run_id);
+    let prepare_stdout = {
+        let attach_attempt_lock = browser::acquire_attach_attempt_lock()?;
+        if ctx.show_approval_guidance {
+            if attach_attempt_lock.waited() {
+                eprintln!(
+                    "info: another yoetz process is already starting a Chrome attach attempt; waiting before trying Claude via dev-browser"
+                );
+            }
+            eprintln!(
+                "info: connecting to Chrome — if prompted, click Allow in Chrome's remote debugging dialog"
+            );
+        }
+        run_script(&prepare_script, Some(60)).map_err(maybe_add_dev_browser_connect_guidance)?
+    };
+    let prepare: Value = serde_json::from_str(prepare_stdout.trim())
+        .with_context(|| format!("parse Claude prepare result: {prepare_stdout}"))?;
+    match prepare.get("status").and_then(Value::as_str) {
+        Some("ready") => {}
+        Some("login") => bail!("Claude login is required in the attached Chrome profile"),
+        Some("challenge") => bail!(
+            "Cloudflare challenge detected on claude.ai; solve it in the attached Chrome window and retry"
+        ),
+        other => bail!(
+            "Claude composer did not become ready; status={other:?}, diagnostics={prepare}"
+        ),
+    }
+
+    let model_script = build_claude_model_script(&page_name);
+    let model_stdout = run_script(&model_script, Some(120))?;
+    let model: Value = serde_json::from_str(model_stdout.trim())
+        .with_context(|| format!("parse Claude model selection result: {model_stdout}"))?;
+    let model_selection_status = claude_web::model_selection_status(&model);
+    if model_selection_status != WebModelSelectionStatus::Selected {
+        bail!(
+            "Claude exact model contract is unavailable or mismatched; required Fable 5 + Max + Thinking on; diagnostics={model}"
+        );
+    }
+
+    let delivery_script = build_claude_delivery_script(
+        &page_name,
+        &delivery_text,
+        Some(bundle_file_name),
+        use_clipboard,
+        inline_fallback_text.as_deref(),
+        ctx.upload_timeout_ms,
+        ctx.send_timeout_ms,
+    );
+    let delivery_stdout = run_script(
+        &delivery_script,
+        Some(chatgpt_script_timeout_secs(
+            ctx.upload_timeout_ms.saturating_add(ctx.send_timeout_ms),
+        )),
+    )
+    .with_claude_phase(WebRecipeTransportPhase::Upload)?;
+    let delivery: Value = serde_json::from_str(delivery_stdout.trim())
+        .with_context(|| format!("parse Claude delivery result: {delivery_stdout}"))?;
+    if delivery.get("status").and_then(Value::as_str) != Some("sent") {
+        let error = anyhow!(
+            "{}; diagnostics={delivery}",
+            delivery
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("Claude delivery failed")
+        );
+        return if delivery.get("phase").and_then(Value::as_str) == Some("send") {
+            Err(error).with_claude_phase(WebRecipeTransportPhase::Send)
+        } else {
+            Err(error).with_claude_phase(WebRecipeTransportPhase::Upload)
+        };
+    }
+    let used_clipboard = delivery
+        .get("usedClipboard")
+        .and_then(Value::as_bool)
+        .unwrap_or(use_clipboard);
+    if used_clipboard {
+        warnings.push(
+            "dev-browser delivered the Claude bundle through the macOS clipboard because the QuickJS transport cannot drive a file input; claude.ai may convert large pastes into a pasted content attachment."
+                .to_string(),
+        );
+    } else if use_clipboard {
+        warnings.push(
+            "Claude ignored the macOS clipboard paste, so dev-browser inserted the bundle inline; this may be slow or exceed composer limits. Use chrome-devtools-mcp or chrome-extension-native for file upload."
+                .to_string(),
+        );
+    }
+    let baseline_count = delivery
+        .get("assistantCountBeforeSend")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let baseline_length = delivery
+        .get("assistantLastLenBeforeSend")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+
+    let poll_script = build_claude_poll_script(
+        &page_name,
+        baseline_count,
+        baseline_length,
+        ctx.poll_settings,
+    );
+    let poll_stdout = run_script(
+        &poll_script,
+        Some(chatgpt_script_timeout_secs(ctx.poll_settings.timeout_ms)),
+    )
+    .with_claude_phase(WebRecipeTransportPhase::WaitResponse)?;
+    let (response, conversation_url) =
+        parse_claude_poll_result(&poll_stdout, ctx.poll_settings.timeout_ms)
+            .with_claude_phase(WebRecipeTransportPhase::WaitResponse)?;
+    let conversation = conversation_url
+        .as_deref()
+        .and_then(|url| claude_web::normalize_conversation(url).ok());
+    for warning in &warnings {
+        eprintln!("warn: {warning}");
+    }
+    Ok(ClaudeRecipeRunResult {
+        response,
+        model_used: Some(claude_recipe::CLAUDE_REPORTED_MODEL.to_string()),
+        model_selection_status,
+        warnings,
+        conversation_id: conversation.as_ref().map(|value| value.id.clone()),
+        conversation_url: conversation.map(|value| value.url),
+        used_clipboard,
     })
 }
 
@@ -2101,6 +2699,81 @@ mod tests {
         assert_eq!(CHATGPT_AUTH_PROBE_PAGE_NAME, "yoetz-chatgpt-main");
         assert_eq!(CHATGPT_RECIPE_PAGE_NAME_PREFIX, "yoetz-chatgpt-run");
         assert!(!CHATGPT_AUTH_PROBE_PAGE_NAME.contains("pid"));
+    }
+
+    #[test]
+    fn claude_recipe_uses_named_page_json_micro_scripts() {
+        let prepare = build_claude_prepare_script("yoetz-claude-test", "20260718T102228Z_ab12cd");
+        assert!(prepare.contains("const PAGE_NAME = \"yoetz-claude-test\";"));
+        assert!(prepare.contains("await browser.getPage(PAGE_NAME)"));
+        assert!(prepare.contains("console.log(JSON.stringify"));
+        assert!(!prepare.contains("require("));
+        assert!(!prepare.contains("fetch("));
+
+        let model = build_claude_model_script("yoetz-claude-test");
+        assert!(model.contains("Fable 5"));
+        assert!(model.contains("effort-option-max"));
+        assert!(model.contains("aria-checked"));
+        assert!(!model.contains(".hover()"));
+        assert!(model.contains("pointerover"));
+        assert!(model.contains("pointerenter"));
+        assert!(model.contains("mousemove"));
+        assert!(model.contains("Effort menu unavailable during verification"));
+
+        let delivery = build_claude_delivery_script(
+            "yoetz-claude-test",
+            "Review this bundle.",
+            Some("bundle.md"),
+            true,
+            Some("Review this bundle.\n\n# Bundle"),
+            120_000,
+            120_000,
+        );
+        assert!(delivery.contains("Meta+V"));
+        assert!(delivery.contains("pasted content"));
+        assert!(delivery.contains("INLINE_FALLBACK_TEXT"));
+        assert!(delivery.contains("usedInlineFallback"));
+        assert!(delivery.contains("usedClipboard"));
+        assert!(delivery.contains("pressSequentially"));
+        assert!(!delivery.contains("composer.evaluate"));
+        assert!(delivery.contains("page.evaluate((selector)"));
+
+        let poll = build_claude_poll_script(
+            "yoetz-claude-test",
+            2,
+            100,
+            ChatgptPollSettings {
+                timeout_ms: 540_000,
+                interval_ms: 30_000,
+            },
+        );
+        assert!(poll.contains("STABLE_IDLE_THRESHOLD_MS"));
+        assert!(poll.contains("console.log(JSON.stringify"));
+
+        let scripts = [&prepare, &model, &delivery, &poll];
+        let locator_lines = scripts
+            .iter()
+            .flat_map(|script| script.lines())
+            .map(str::trim)
+            .filter(|line| line.contains(".locator("))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            locator_lines,
+            vec!["const composer = page.locator(COMPOSER_SELECTOR).first();"]
+        );
+        for line in scripts
+            .iter()
+            .flat_map(|script| script.lines())
+            .map(str::trim)
+            .filter(|line| line.contains("composer."))
+        {
+            assert!(
+                line.starts_with("await composer.waitFor(")
+                    || line.starts_with("await composer.click(")
+                    || line.starts_with("await composer.pressSequentially("),
+                "unsupported Claude dev-browser locator method: {line}"
+            );
+        }
     }
 
     #[test]

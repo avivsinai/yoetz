@@ -63,6 +63,8 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 - Use named pages via `browser.getPage(name)` / `browser.listPages()` to carry
   state across scripts.
 - Use `console.log(JSON.stringify(...))` as the script-to-Rust IPC boundary.
+- Keep generated scripts within the locator verbs supported by the QuickJS
+  bridge; the script-source lint is the compatibility lock for that surface.
 - Prefer Playwright actions on the page plus Rust orchestration. Do not assume
   Node features such as `require`, arbitrary `fs`, or `fetch`.
 - For contenteditable ChatGPT inputs, use typing APIs such as
@@ -75,6 +77,8 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   clipboard paste via `osascript` because QuickJS cannot drive
   `setInputFiles`; this is a dev-browser-specific workaround and is not the
   default upload path. Non-macOS dev-browser runs degrade to inline paste.
+  Always report the actual `delivery_mode` and `auto_paste_fallback`, including
+  inline fallback when a clipboard gesture produces no upload.
 - The QuickJS GC crash recovery in `dev_browser.rs` can salvage stdout from a
   completed script, but recipe correctness must not depend on that recovery.
 
@@ -84,28 +88,62 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   yoetz must own behavior for correctness or UX.
 - Extension-free by default. Preferred live-Chrome transport order:
   `chrome-devtools-mcp`, then `dev-browser`, then `agent-browser`.
-- ChatGPT recipe exception: when `yoetz browser extension status --chatgpt`
+- The `claude` recipe mirrors `chatgpt` end to end through the typed contract in
+  `crates/yoetz-cli/src/claude_recipe.rs` and DOM builders in `claude_web.rs`.
+  Its only model target is Fable 5 + Effort Max + Thinking on. Selection is
+  fail-closed: re-read the model radio, `effort-option-max`, and Thinking
+  switch state; a successful click is never proof.
+- Built-in web-recipe exception: when extension status for the selected site
   reports `connected`, `chrome-extension-native` is auto-selected as the only
   default transport and fails closed instead of falling through to CDP
   transports. Opt out with `--transport <other>` or a pinned `transports:` in
   the recipe yaml; CDP fallback after a native failure requires the explicit
-  `--transport chrome-extension-native --allow-cdp-fallback`. Non-ChatGPT
-  recipes and unhealthy/missing extensions are unaffected. Plain
-  `yoetz browser check` follows the same auto-selection; pass an explicit
+  `--transport chrome-extension-native --allow-cdp-fallback`. Other recipes
+  and unhealthy/missing extensions are unaffected. Plain `yoetz browser check`
+  remains ChatGPT-scoped; use `--claude` for Claude. Pass an explicit
   `--transport`, `--cdp`, `--browser-id`, or `--profile` to verify the CDP
   stack instead.
-- Extension lifecycle: `setup --chatgpt` materializes packaged source into the
-  stable `$YOETZ_DIR/chatgpt-native-extension` directory, loaded unpacked in
-  Chrome exactly once; `update --chatgpt` re-syncs the managed copy, reloads
-  the extension, and verifies the loaded version. Never hand-patch the managed
-  directory. Other subcommands (`doctor`, `status`, `inspect`, ...) are listed
-  in `yoetz browser extension --help`.
-- ChatGPT conversation resume uses `--var conversation=<id|url>`
+- The native extension is one pinned multi-site package
+  (`extensions/chatgpt-native/`, display name "Yoetz Native Transport") with
+  adapters under `src/sites/`. `job_start.payload.recipe` selects `chatgpt` or
+  `claude` (missing means ChatGPT; unknown fails before side effects).
+  Extension `hello` advertises `recipes`; derive `claude_ready` from that
+  capability, never from version comparison.
+- Extension lifecycle: `setup --chatgpt` or `setup --claude` materializes the
+  same packaged source into `$YOETZ_DIR/chatgpt-native-extension`. Load that
+  exact directory unpacked in the Chrome profile that hosts the AI sessions;
+  `chrome://extensions` load state is profile-specific. Never load a repo
+  checkout. `update` re-syncs the managed copy with a stamped identity, reloads
+  it, and verifies the loaded version. `status` and `doctor` fail on wrong-path
+  or unstamped loads. Never hand-patch the managed directory.
+- The native host and managed extension directory are machine-global,
+  single-writer state shared by every agent lane. Serialize setup/update/reload
+  operations; concurrent lanes may run recipes only against one frozen loaded
+  artifact.
+- ChatGPT and Claude conversation resume use
+  `--var conversation=<site-specific-id|url>` or `--followup`
   (native-extension only, no automatic context management); callers own the
   resume-vs-fresh decision.
+- Claude attachments may be inline or retrieval-backed. Warn, do not fail,
+  above the `inline_warn_tokens` estimate, and do not raise Yoetz's byte caps:
+  the quality cliff is tokens in context, not file bytes. Claude's upload input
+  is hidden/zero-size, so resolve the exact selector rather than accessibility
+  snapshots; use the native `input.files` setter so page-world handlers observe
+  files assigned from the extension's isolated world.
+- Claude jobs must open active because its SPA may not mount in a never-focused
+  tab. Keep the tab active through upload and accepted send, then restore the
+  previous tab before waiting for the response; ChatGPT jobs remain background.
+  Base UI picker choreography needs settle pacing, attributed pointer-event
+  hover fallback, visibility-gated Thinking reads, and diagnostics for every
+  verification leg. Early-exit and full-selection results must have the same
+  acceptable shape.
+- Claude finality requires the last assistant turn to be non-streaming and no
+  `Stop response` control, with bounded no-progress failure. The copy control
+  is hover-dependent and is not a primary finality anchor. Exclude cloned
+  `group/status` thinking rows from response text without mutating the live DOM.
 - Multiple loaded extension profiles route by `profile_email` when Chrome
   exposes it, else by the stable `extension_instance_id` from
-  `status --chatgpt`.
+  `status --chatgpt` or `status --claude`.
 - Default mode is connect-first: attach to the user's already running Chrome
   before considering cookie sync or managed-profile fallbacks.
 - The daemon is trusted by default. Do not silently recycle live-attach

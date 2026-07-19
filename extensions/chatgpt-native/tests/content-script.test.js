@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { uint8ArrayToBase64 } from "../src/chunks.js";
 
-const helperModule = `const hooks = globalThis.__contentScriptTestHooks;
+const chatgptBackendModuleUrl = new URL("../src/sites/chatgpt-backend.js", import.meta.url).href;
+const helperModule = `import { fetchConversationAnswer } from ${JSON.stringify(chatgptBackendModuleUrl)};
+export { fetchConversationAnswer };
+const hooks = globalThis.__contentScriptTestHooks;
 
 export function ownedWindowName(job) {
   return \`yoetz-chatgpt-native:\${job.run_id}:\${job.job_id}\`;
@@ -106,7 +109,44 @@ export function modelSelectionDiagnostics() {
 function conversationIdFromLocation() {
   const match = String(globalThis.location.pathname ?? "").match(/^\\/c\\/([^/?#]+)$/);
   return match ? decodeURIComponent(match[1]) : null;
-}`;
+}
+
+const dom = {
+  ownedWindowName,
+  parseOwnedWindowName,
+  getPageText,
+  classifyManualHandoff,
+  classifyWaitManualHandoff,
+  ensureFreshChat,
+  ensureConversationLoaded,
+  markOwnership,
+  uploadFile,
+  configureModelState,
+  sendAcceptanceBaseline,
+  insertPrompt,
+  clickSend,
+  waitForSendAccepted,
+  extractResponse,
+  modelSelectionDiagnostics
+};
+
+export const siteAdapter = {
+  recipe: "chatgpt",
+  displayName: "ChatGPT",
+  dom,
+  fetchConversationAnswer,
+  conversationIdFromUrl(value) {
+    try {
+      const match = new URL(value).pathname.match(/^\\/c\\/([^/?#]+)$/);
+      return match ? decodeURIComponent(match[1]) : null;
+    } catch {
+      return null;
+    }
+  },
+  isConversationUrl(value) {
+    return Boolean(this.conversationIdFromUrl(value));
+  }
+};`;
 
 test("content script resume path skips fresh enforcement and completes on requested conversation", async () => {
   const { send, hooks, restore } = await loadContentScript("resume_happy", "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
@@ -144,6 +184,26 @@ test("content script resume path skips fresh enforcement and completes on reques
     const extracted = await send({ type: "yoetz_extract_response", job });
     assert.equal(extracted.ok, true);
     assert.equal(extracted.payload.conversation_id, "conv-123");
+  } finally {
+    restore();
+  }
+});
+
+test("content script rejects an unavailable site adapter before DOM side effects", async () => {
+  const { send, hooks, restore } = await loadContentScript("unsupported_recipe", "https://chatgpt.com/");
+  try {
+    const response = await send({
+      type: "yoetz_prepare_job",
+      job: { ...resumeJob(), recipe: "unknown" }
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "unsupported_recipe");
+    assert.equal(response.phase, "profile");
+    assert.equal(response.side_effect_started, false);
+    assert.deepEqual(hooks.ensureFreshChatCalls, []);
+    assert.deepEqual(hooks.ensureConversationLoadedCalls, []);
+    assert.deepEqual(hooks.markOwnershipCalls, []);
   } finally {
     restore();
   }

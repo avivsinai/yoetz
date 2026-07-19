@@ -87,6 +87,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     assert.equal(port.messages[0].payload.profile_email, "work@example.com");
     assert.equal(port.messages[0].payload.profile_id, "gaia-work");
     assert.match(port.messages[0].payload.extension_instance_id, /^ext_/);
+    assert.deepEqual(port.messages[0].payload.recipes, ["chatgpt", "claude"]);
 
     port.emit(envelope("reconnect", "job_reconnect"));
     await eventually(() => port.messages.some((message) => message.type === "reconnect" && message.job_id === "job_reconnect"));
@@ -142,6 +143,268 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     globalThis.chrome = originalChrome;
     globalThis.setInterval = originalSetInterval;
     globalThis.clearInterval = originalClearInterval;
+  }
+});
+
+test("service worker runs a Claude job through its adapter and probes the selected recipe", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  const updatedTabs = [];
+  let sent = false;
+  const conversationId = "123e4567-e89b-12d3-a456-426614174000";
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      query: async (query) => {
+        assert.deepEqual(query, { active: true, currentWindow: true });
+        return [{ id: 17, active: true }];
+      },
+      create: async ({ url, active }) => {
+        assert.equal(url, "https://claude.ai/new?_yoetz=run_job_claude");
+        assert.equal(active, true);
+        return { id: 71 };
+      },
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new?_yoetz=run_job_claude" }),
+      update: async (id, options) => {
+        updatedTabs.push({ id, options });
+        return { id, ...options };
+      },
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude", url: "https://claude.ai/new" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "selected",
+                requested_model: "fable-5-max",
+                modelVerified: true,
+                maxVerified: true,
+                thinkingChecked: true,
+                model_used: "Fable 5 Max"
+              }
+            };
+          case "yoetz_upload_file":
+            assert.deepEqual(updatedTabs, []);
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            assert.deepEqual(updatedTabs, []);
+            sent = true;
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: conversationId,
+                submitted_user_count: 1,
+                submitted_assistant_count: 0
+              }
+            };
+          case "yoetz_extract_response":
+            assert.deepEqual(
+              updatedTabs,
+              sent ? [{ id: 17, options: { active: true } }] : []
+            );
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "assistant_dom",
+                    text: "Claude answer",
+                    is_generating: false,
+                    assistant_count: 1,
+                    copy_button_count: 0,
+                    has_copy_button: false,
+                    turn_index: 0,
+                    conversation_id: conversationId
+                  }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      },
+      group: async () => 1
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_job=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    assert.deepEqual(
+      port.messages.find((message) => message.type === "hello")?.payload.recipes,
+      ["chatgpt", "claude"]
+    );
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_claude", {
+      recipe: "claude",
+      prompt: "review",
+      wait_interval_ms: 500,
+      wait_timeout_ms: 2500
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.job_id === "job_claude"
+      && (message.type === "job_error" || message.payload?.phase === "ready_for_file")
+    ));
+    const startError = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_claude"
+    );
+    assert.equal(startError, undefined, JSON.stringify(startError?.payload));
+    assert.equal(
+      sentToTabs.find((item) => item.message.type === "yoetz_probe")?.message.recipe,
+      "claude"
+    );
+    assert.deepEqual(updatedTabs, []);
+
+    port.emit(envelope("job_file_chunk", "job_claude", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_complete" && message.job_id === "job_claude"
+    ));
+    const complete = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_claude"
+    );
+    assert.equal(complete.payload.response, "Claude answer");
+    assert.equal(complete.payload.model_used, "Fable 5 Max");
+    assert.equal(complete.payload.completion_reason, "stable_idle");
+    assert.equal(complete.payload.conversation_id, conversationId);
+    assert.equal(complete.payload.conversation_url, `https://claude.ai/chat/${conversationId}`);
+    assert.deepEqual(updatedTabs, [{ id: 17, options: { active: true } }]);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker reports a generic Claude model timeout as model_selection", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      query: async () => [{ id: 17, active: true }],
+      create: async (options) => ({ id: 71, ...options }),
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new?_yoetz=run_job_claude_model_timeout" }),
+      update: async (id, options) => ({ id, ...options }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: false, error: "Claude page did not reach the requested state within 10000ms" };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_model_timeout_phase=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_claude_model_timeout", {
+      recipe: "claude",
+      prompt: "review"
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_model_timeout"
+    ));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_model_timeout"
+    );
+    assert.equal(error.payload.code, "extension_error");
+    assert.equal(error.payload.phase, "model_selection");
+    assert.equal(error.payload.side_effect_started, true);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker surfaces Claude model mismatch legs in the job error", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      query: async () => [{ id: 17, active: true }],
+      create: async (options) => ({ id: 71, ...options }),
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new?_yoetz=run_job_claude_mismatch" }),
+      update: async (id, options) => ({ id, ...options }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "mismatch",
+                requested_model: "fable-5-max",
+                model_used: "Fable 5 Max",
+                modelVerified: true,
+                maxVerified: true,
+                thinkingChecked: false,
+                modelChip: "Fable 5 Max",
+                thinkingAriaChecked: null,
+                options: ["Fable 5", "Max", "Thinking"]
+              }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_model_mismatch_detail=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_claude_mismatch", {
+      recipe: "claude",
+      prompt: "review"
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_mismatch"
+    ));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_mismatch"
+    );
+    assert.match(error.payload.message, /modelVerified=true/);
+    assert.match(error.payload.message, /maxVerified=true/);
+    assert.match(error.payload.message, /thinkingChecked=false/);
+    assert.deepEqual(error.payload.model_selection_diagnostics, {
+      modelVerified: true,
+      maxVerified: true,
+      thinkingChecked: false,
+      modelChip: "Fable 5 Max",
+      thinkingAriaChecked: null,
+      options: ["Fable 5", "Max", "Thinking"]
+    });
+  } finally {
+    globalThis.chrome = originalChrome;
   }
 });
 
@@ -386,6 +649,41 @@ test("service worker rejects invalid conversation ids before opening a tab", asy
       const error = port.messages.find((message) => message.type === "job_error");
       assert.equal(error.payload.code, "invalid_conversation");
       assert.equal(error.payload.phase, "upload");
+      assert.equal(error.payload.side_effect_started, false);
+      assert.deepEqual(createdTabs, []);
+    } finally {
+      globalThis.chrome = originalChrome;
+    }
+  }
+});
+
+test("service worker rejects unavailable recipes before opening a tab", async () => {
+  for (const recipe of ["unknown"]) {
+    const originalChrome = globalThis.chrome;
+    const port = makePort();
+    const createdTabs = [];
+    globalThis.chrome = chromeStub({
+      port,
+      tabs: {
+        create: async (opts) => {
+          createdTabs.push(opts);
+          return { id: createdTabs.length, ...opts };
+        },
+        get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+        sendMessage: async () => {
+          throw new Error("unsupported recipes must fail before tab messaging");
+        }
+      }
+    });
+
+    try {
+      await import(`../src/service-worker.js?unsupported_recipe=${recipe}_${Date.now()}`);
+      port.emit(envelope("job_start", `job_${recipe}`, { recipe, prompt: "review" }));
+
+      await eventually(() => port.messages.some((message) => message.type === "job_error"));
+      const error = port.messages.find((message) => message.type === "job_error");
+      assert.equal(error.payload.code, "unsupported_recipe");
+      assert.equal(error.payload.phase, "profile");
       assert.equal(error.payload.side_effect_started, false);
       assert.deepEqual(createdTabs, []);
     } finally {
@@ -1521,6 +1819,7 @@ test("service worker hello falls back with instance id when profile identity fai
     assert.match(hello.payload.extension_instance_id, /^ext_/);
     assert.equal(hello.payload.profile_email, null);
     assert.equal(hello.payload.profile_id, null);
+    assert.deepEqual(hello.payload.recipes, ["chatgpt", "claude"]);
   } finally {
     globalThis.chrome = originalChrome;
   }

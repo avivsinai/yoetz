@@ -18,6 +18,8 @@ use thiserror::Error;
 use crate::chatgpt_recipe::{
     ChatgptModelSelectionStatus, ChatgptRecipeSpec, ChatgptTransportPhase,
 };
+use crate::claude_recipe::ClaudeRecipeSpec;
+use crate::web_recipe::BuiltinWebRecipe;
 use yoetz_core::output::{write_jsonl, OutputFormat};
 use yoetz_core::paths::home_dir;
 
@@ -45,6 +47,10 @@ const EXTENSION_RELOAD_VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
 const EXTENSION_RELOAD_VERIFY_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(unix)]
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 100;
+
+fn default_extension_recipes() -> Vec<String> {
+    vec!["chatgpt".to_string()]
+}
 
 #[derive(Debug, Error)]
 #[error("frame is too large: {len} bytes, max {max} bytes")]
@@ -90,6 +96,8 @@ pub struct ExtensionStatus {
     pub status_file_present: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub connected_instances: Vec<ExtensionInstanceStatus>,
+    pub recipes: Vec<String>,
+    pub claude_ready: bool,
     pub protocol_version: u32,
     pub detail: String,
 }
@@ -107,6 +115,8 @@ pub struct ExtensionInstanceStatus {
     pub profile_email: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
+    #[serde(default = "default_extension_recipes")]
+    pub recipes: Vec<String>,
     pub protocol_version: u32,
     pub last_seen_ms: u128,
 }
@@ -138,8 +148,12 @@ pub struct ExtensionRecipeResult {
 pub struct ManagedExtensionUpdateResult {
     pub status: &'static str,
     pub source_dir: PathBuf,
+    pub source_version: String,
+    pub source_provenance: &'static str,
     pub extension_dir: PathBuf,
     pub loaded_extension_dirs: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_manifest_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_version: Option<String>,
     pub copied_files: usize,
@@ -304,7 +318,7 @@ pub fn prepare_managed_chatgpt_extension() -> Result<ManagedExtensionUpdateResul
     let mut result = sync_managed_chatgpt_extension_from(&source_dir, &extension_dir)?;
     let legacy_dir = legacy_loaded_chatgpt_extension_dir()?;
     if legacy_dir.exists() && !paths_refer_to_same_location(&legacy_dir, &extension_dir) {
-        sync_managed_chatgpt_extension_from(&source_dir, &legacy_dir).with_context(|| {
+        sync_extension_dir_exact(&extension_dir, &legacy_dir).with_context(|| {
             format!(
                 "sync legacy loaded ChatGPT native extension directory {}",
                 legacy_dir.display()
@@ -325,33 +339,92 @@ fn sync_managed_chatgpt_extension_from(
             source_dir.display()
         );
     }
+    let source_version = required_extension_manifest_version(source_dir)?;
+    let source_provenance = extension_source_provenance(source_dir);
+    ensure_extension_source_matches_cli(source_dir, &source_version, source_provenance)?;
+    let previous_manifest_version = extension_manifest_version(extension_dir);
     if paths_refer_to_same_location(source_dir, extension_dir) {
         return Ok(ManagedExtensionUpdateResult {
             status: "current",
             source_dir: source_dir.to_path_buf(),
+            source_version,
+            source_provenance,
             extension_dir: extension_dir.to_path_buf(),
             loaded_extension_dirs: vec![extension_dir.to_path_buf()],
-            manifest_version: extension_manifest_version(extension_dir),
+            previous_manifest_version: previous_manifest_version.clone(),
+            manifest_version: previous_manifest_version,
             copied_files: count_regular_files(extension_dir)?,
         });
     }
 
+    if !managed_chatgpt_extension_needs_sync(source_dir, extension_dir)? {
+        return Ok(ManagedExtensionUpdateResult {
+            status: "current",
+            source_dir: source_dir.to_path_buf(),
+            source_version,
+            source_provenance,
+            extension_dir: extension_dir.to_path_buf(),
+            loaded_extension_dirs: vec![extension_dir.to_path_buf()],
+            previous_manifest_version: previous_manifest_version.clone(),
+            manifest_version: previous_manifest_version,
+            copied_files: 0,
+        });
+    }
+
+    let stamped_version =
+        next_managed_extension_version(&source_version, previous_manifest_version.as_deref())?;
+    let status = if is_chatgpt_extension_source_dir(extension_dir)
+        && previous_manifest_version.as_deref() == Some(source_version.as_str())
+    {
+        "restamped"
+    } else {
+        "updated"
+    };
+    let copied_files =
+        copy_extension_dir_atomically(source_dir, extension_dir, Some(stamped_version.as_str()))?;
+
+    Ok(ManagedExtensionUpdateResult {
+        status,
+        source_dir: source_dir.to_path_buf(),
+        source_version,
+        source_provenance,
+        extension_dir: extension_dir.to_path_buf(),
+        loaded_extension_dirs: vec![extension_dir.to_path_buf()],
+        previous_manifest_version,
+        manifest_version: Some(stamped_version),
+        copied_files,
+    })
+}
+
+fn sync_extension_dir_exact(source_dir: &Path, extension_dir: &Path) -> Result<usize> {
+    if !is_chatgpt_extension_source_dir(source_dir) {
+        bail!(
+            "ChatGPT native extension source is incomplete: {}",
+            source_dir.display()
+        );
+    }
+    if paths_refer_to_same_location(source_dir, extension_dir) {
+        return Ok(0);
+    }
+    if is_chatgpt_extension_source_dir(extension_dir)
+        && extension_dir_fingerprint(source_dir, None)?
+            == extension_dir_fingerprint(extension_dir, None)?
+    {
+        return Ok(0);
+    }
+    copy_extension_dir_atomically(source_dir, extension_dir, None)
+}
+
+fn copy_extension_dir_atomically(
+    source_dir: &Path,
+    extension_dir: &Path,
+    stamped_version: Option<&str>,
+) -> Result<usize> {
     let parent = extension_dir
         .parent()
         .context("managed extension directory must have a parent")?;
     fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     ensure_replaceable_extension_dir(extension_dir)?;
-    if !managed_chatgpt_extension_needs_sync(source_dir, extension_dir)? {
-        return Ok(ManagedExtensionUpdateResult {
-            status: "current",
-            source_dir: source_dir.to_path_buf(),
-            extension_dir: extension_dir.to_path_buf(),
-            loaded_extension_dirs: vec![extension_dir.to_path_buf()],
-            manifest_version: extension_manifest_version(extension_dir),
-            copied_files: 0,
-        });
-    }
-
     let name = extension_dir
         .file_name()
         .and_then(|value| value.to_str())
@@ -369,6 +442,9 @@ fn sync_managed_chatgpt_extension_from(
 
     let copied_files = copy_extension_dir_contents(source_dir, &temp_dir)
         .with_context(|| format!("copy extension source from {}", source_dir.display()))?;
+    if let Some(version) = stamped_version {
+        write_extension_manifest_version(&temp_dir, version)?;
+    }
     if !is_chatgpt_extension_source_dir(&temp_dir) {
         let _ = fs::remove_dir_all(&temp_dir);
         bail!(
@@ -401,22 +477,26 @@ fn sync_managed_chatgpt_extension_from(
         fs::remove_dir_all(&backup_dir)
             .with_context(|| format!("remove old managed extension {}", backup_dir.display()))?;
     }
-
-    Ok(ManagedExtensionUpdateResult {
-        status: "updated",
-        source_dir: source_dir.to_path_buf(),
-        extension_dir: extension_dir.to_path_buf(),
-        loaded_extension_dirs: vec![extension_dir.to_path_buf()],
-        manifest_version: extension_manifest_version(extension_dir),
-        copied_files,
-    })
+    Ok(copied_files)
 }
 
 fn managed_chatgpt_extension_needs_sync(source_dir: &Path, extension_dir: &Path) -> Result<bool> {
     if !is_chatgpt_extension_source_dir(extension_dir) {
         return Ok(true);
     }
-    Ok(extension_dir_fingerprint(source_dir)? != extension_dir_fingerprint(extension_dir)?)
+    let source_version = required_extension_manifest_version(source_dir)?;
+    if managed_extension_counter(
+        &source_version,
+        extension_manifest_version(extension_dir).as_deref(),
+    )
+    .is_none()
+    {
+        return Ok(true);
+    }
+    Ok(
+        extension_dir_fingerprint(source_dir, Some(&source_version))?
+            != extension_dir_fingerprint(extension_dir, Some(&source_version))?,
+    )
 }
 
 fn paths_refer_to_same_location(left: &Path, right: &Path) -> bool {
@@ -490,11 +570,24 @@ fn count_regular_files(root: &Path) -> Result<usize> {
     Ok(extension_file_paths(root)?.len())
 }
 
-fn extension_dir_fingerprint(root: &Path) -> Result<Vec<(PathBuf, String)>> {
+fn extension_dir_fingerprint(
+    root: &Path,
+    manifest_version_override: Option<&str>,
+) -> Result<Vec<(PathBuf, String)>> {
     let mut files = Vec::new();
     for relative in extension_file_paths(root)? {
-        let bytes = fs::read(root.join(&relative))
+        let path = root.join(&relative);
+        let mut bytes = fs::read(&path)
             .with_context(|| format!("read extension file {}", root.join(&relative).display()))?;
+        if relative == Path::new("manifest.json") {
+            let mut manifest = serde_json::from_slice::<Value>(&bytes)
+                .with_context(|| format!("parse extension manifest {}", path.display()))?;
+            if let Some(version) = manifest_version_override {
+                manifest["version"] = Value::String(version.to_string());
+            }
+            bytes = serde_json::to_vec(&manifest)
+                .with_context(|| format!("normalize extension manifest {}", path.display()))?;
+        }
         let mut hash = Sha256::new();
         hash.update(&bytes);
         files.push((relative, hex::encode(hash.finalize())));
@@ -545,13 +638,219 @@ fn extension_manifest_version(extension_dir: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-fn extension_version_skew_message(extension_version: Option<&str>) -> Option<String> {
-    let extension_version = extension_version?.trim();
-    if extension_version.is_empty() || extension_version == YOETZ_CLI_VERSION {
+fn required_extension_manifest_version(extension_dir: &Path) -> Result<String> {
+    extension_manifest_version(extension_dir).with_context(|| {
+        format!(
+            "extension manifest has no version: {}",
+            extension_dir.join("manifest.json").display()
+        )
+    })
+}
+
+fn extension_source_provenance(source_dir: &Path) -> &'static str {
+    if env::var(CHATGPT_EXTENSION_DIR_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .is_some_and(|value| paths_refer_to_same_location(source_dir, Path::new(value.trim())))
+    {
+        return "environment_override";
+    }
+    if env::current_dir()
+        .ok()
+        .map(|cwd| cwd.join("extensions").join("chatgpt-native"))
+        .is_some_and(|candidate| paths_refer_to_same_location(source_dir, &candidate))
+    {
+        return "working_directory";
+    }
+    let crate_source = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("extensions")
+        .join("chatgpt-native");
+    if paths_refer_to_same_location(source_dir, &crate_source) {
+        return "source_checkout";
+    }
+    if let Ok(exe) = env::current_exe() {
+        if let Some(prefix) = exe.parent().and_then(Path::parent) {
+            for candidate in [
+                prefix
+                    .join("share")
+                    .join("yoetz")
+                    .join("extensions")
+                    .join("chatgpt-native"),
+                prefix.join("share").join("yoetz").join("chatgpt-native"),
+            ] {
+                if paths_refer_to_same_location(source_dir, &candidate) {
+                    return "installed_share";
+                }
+            }
+        }
+    }
+    "explicit_path"
+}
+
+fn ensure_extension_source_matches_cli(
+    source_dir: &Path,
+    source_version: &str,
+    source_provenance: &str,
+) -> Result<()> {
+    let source_parts = chrome_extension_version_parts(source_version).with_context(|| {
+        format!("extension source version `{source_version}` is not a valid Chrome version")
+    })?;
+    let cli_parts = chrome_extension_version_parts(YOETZ_CLI_VERSION).with_context(|| {
+        format!("yoetz CLI version `{YOETZ_CLI_VERSION}` is not a valid Chrome version")
+    })?;
+    if source_parts.len() != 3 {
+        bail!(
+            "refusing to sync extension source version `{source_version}` from {} ({source_provenance}); source versions must have exactly three components for yoetz CLI {YOETZ_CLI_VERSION}",
+            source_dir.display()
+        );
+    }
+    if cli_parts.len() < 3 {
+        bail!("yoetz CLI version `{YOETZ_CLI_VERSION}` must have at least three components");
+    }
+    if source_parts[..3] == cli_parts[..3] {
+        return Ok(());
+    }
+    let relationship = if source_parts[..3] < cli_parts[..3] {
+        "older than"
+    } else {
+        "newer than"
+    };
+    bail!(
+        "refusing to sync extension source version {source_version} from {} ({source_provenance}); it is {relationship} yoetz CLI {YOETZ_CLI_VERSION}",
+        source_dir.display()
+    )
+}
+
+fn chrome_extension_version_parts(version: &str) -> Option<Vec<u16>> {
+    let parts = version
+        .trim()
+        .split('.')
+        .map(str::parse::<u16>)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    (1..=4).contains(&parts.len()).then_some(parts)
+}
+
+fn cli_version_prefix() -> Option<[u16; 3]> {
+    let parts = chrome_extension_version_parts(YOETZ_CLI_VERSION)?;
+    (parts.len() >= 3).then(|| [parts[0], parts[1], parts[2]])
+}
+
+fn extension_version_is_cli_compatible(version: &str) -> bool {
+    let Some(expected) = cli_version_prefix() else {
+        return version.trim() == YOETZ_CLI_VERSION;
+    };
+    let Some(parts) = chrome_extension_version_parts(version) else {
+        return false;
+    };
+    parts.len() >= 3 && parts[..3] == expected
+}
+
+fn managed_extension_counter(source_version: &str, managed_version: Option<&str>) -> Option<u16> {
+    let source_parts = chrome_extension_version_parts(source_version)?;
+    if source_parts.len() != 3 {
         return None;
     }
+    let managed_parts = chrome_extension_version_parts(managed_version?)?;
+    (managed_parts.len() == 4 && managed_parts[..3] == source_parts[..3]).then(|| managed_parts[3])
+}
+
+fn next_managed_extension_version(
+    source_version: &str,
+    current_managed_version: Option<&str>,
+) -> Result<String> {
+    let source_parts = chrome_extension_version_parts(source_version).with_context(|| {
+        format!("extension version `{source_version}` is not a valid Chrome extension version")
+    })?;
+    if source_parts.len() != 3 {
+        bail!(
+            "managed extension source version must have exactly three components, got `{source_version}`"
+        );
+    }
+    let counter = managed_extension_counter(source_version, current_managed_version)
+        .unwrap_or(0)
+        .checked_add(1)
+        .context("managed extension version counter exhausted at 65535")?;
+    Ok(format!("{source_version}.{counter}"))
+}
+
+fn write_extension_manifest_version(extension_dir: &Path, version: &str) -> Result<()> {
+    let manifest_path = extension_dir.join("manifest.json");
+    let text = fs::read_to_string(&manifest_path)
+        .with_context(|| format!("read extension manifest {}", manifest_path.display()))?;
+    let mut manifest = serde_json::from_str::<Value>(&text)
+        .with_context(|| format!("parse extension manifest {}", manifest_path.display()))?;
+    manifest["version"] = Value::String(version.to_string());
+    let mut rendered = serde_json::to_string_pretty(&manifest)
+        .with_context(|| format!("render extension manifest {}", manifest_path.display()))?;
+    rendered.push('\n');
+    fs::write(&manifest_path, rendered)
+        .with_context(|| format!("write extension manifest {}", manifest_path.display()))
+}
+
+fn extension_version_skew_message(
+    extension_version: Option<&str>,
+    site_flag: Option<&str>,
+) -> Option<String> {
+    let extension_version = extension_version?.trim();
+    if extension_version.is_empty() || extension_version_is_cli_compatible(extension_version) {
+        return None;
+    }
+    let update_hint = match site_flag {
+        Some(site_flag) => format!("`yoetz browser extension update {site_flag}`"),
+        None => "`yoetz browser extension update --chatgpt` or `yoetz browser extension update --claude`".to_string(),
+    };
     Some(format!(
-        "loaded chrome-extension-native extension version {extension_version} does not match yoetz CLI {YOETZ_CLI_VERSION}; run `yoetz browser extension update --chatgpt`"
+        "loaded chrome-extension-native extension version {extension_version} does not match yoetz CLI {YOETZ_CLI_VERSION}; run {update_hint}"
+    ))
+}
+
+fn managed_extension_identity_message(
+    observed_version: Option<&str>,
+    expected_version: Option<&str>,
+    managed_dir: &Path,
+) -> Option<String> {
+    let observed = observed_version?.trim();
+    let expected = expected_version?.trim();
+    if observed.is_empty() || expected.is_empty() {
+        return None;
+    }
+    let observed_parts = chrome_extension_version_parts(observed);
+    let expected_parts = chrome_extension_version_parts(expected);
+    if expected_parts.as_ref().is_none_or(|parts| parts.len() != 4) {
+        return Some(format!(
+            "managed extension copy at {} has no stamped sync identity; run `yoetz browser extension update --chatgpt` or `yoetz browser extension update --claude` to initialize it",
+            managed_dir.display()
+        ));
+    }
+    if observed == expected {
+        return None;
+    }
+    if observed_parts
+        .as_ref()
+        .is_some_and(|parts| parts.len() == 3)
+        && expected_parts
+            .as_ref()
+            .is_some_and(|parts| parts.len() == 4)
+    {
+        return Some(format!(
+            "Chrome is running a non-managed copy of the Yoetz extension; one-time migration: remove the Yoetz card in chrome://extensions, then Load unpacked {}",
+            managed_dir.display()
+        ));
+    }
+    if extension_version_is_cli_compatible(observed)
+        && extension_version_is_cli_compatible(expected)
+    {
+        return Some(format!(
+            "Chrome is running a stale managed copy of the Yoetz extension (loaded {observed}, expected {expected}); run `yoetz browser extension update --chatgpt` or `yoetz browser extension update --claude`, or reload {} in chrome://extensions",
+            managed_dir.display()
+        ));
+    }
+    Some(format!(
+        "loaded Yoetz extension version {observed} does not match managed copy {expected} at {}; run `yoetz browser extension update --chatgpt` or `yoetz browser extension update --claude`",
+        managed_dir.display()
     ))
 }
 
@@ -600,15 +899,32 @@ pub fn status() -> Result<ExtensionStatus> {
         .or_else(|| {
             legacy_extension_status_string(legacy_hello_seen, extension_value, "profile_id")
         });
+    let recipes = latest_instance_with_hello
+        .map(|instance| instance.recipes.clone())
+        .unwrap_or_else(|| legacy_extension_recipes(extension_value));
+    let claude_ready =
+        socket_reachable && hello_seen && recipes.iter().any(|recipe| recipe == "claude");
     let protocol_version_mismatch = status_value
         .as_ref()
         .and_then(|value| value.get("version_mismatch"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let extension_version_mismatch = extension_version_skew_message(extension_version.as_deref());
+    let extension_version_mismatch =
+        extension_version_skew_message(extension_version.as_deref(), None);
     let version_mismatch = protocol_version_mismatch
         .clone()
         .or_else(|| extension_version_mismatch.clone());
+    let managed_extension_dir = managed_chatgpt_extension_dir()?;
+    let managed_extension_version = extension_manifest_version(&managed_extension_dir);
+    let managed_copy_mismatch = hello_seen
+        .then(|| {
+            managed_extension_identity_message(
+                extension_version.as_deref(),
+                managed_extension_version.as_deref(),
+                &managed_extension_dir,
+            )
+        })
+        .flatten();
     let manual_handoff = status_value
         .as_ref()
         .and_then(|value| value.get("last_manual_handoff"))
@@ -616,6 +932,8 @@ pub fn status() -> Result<ExtensionStatus> {
         .is_some();
     let status = if version_mismatch.is_some() {
         "version_mismatch"
+    } else if managed_copy_mismatch.is_some() {
+        "managed_copy_mismatch"
     } else if manual_handoff {
         "manual_handoff"
     } else if socket_reachable && hello_seen {
@@ -647,6 +965,9 @@ pub fn status() -> Result<ExtensionStatus> {
             .map(str::to_string)
             .or_else(|| version_mismatch.clone())
             .unwrap_or_else(|| "extension/native protocol version mismatch".to_string()),
+        "managed_copy_mismatch" => managed_copy_mismatch
+            .clone()
+            .unwrap_or_else(|| "loaded extension does not match the managed copy".to_string()),
         "manual_handoff" => status_value
             .as_ref()
             .and_then(|value| value.get("last_manual_handoff"))
@@ -677,6 +998,8 @@ pub fn status() -> Result<ExtensionStatus> {
         status_path: paths.status_path,
         status_file_present,
         connected_instances,
+        recipes,
+        claude_ready,
         protocol_version: PROTOCOL_VERSION,
         detail,
     })
@@ -756,7 +1079,7 @@ pub fn doctor() -> Result<DoctorReport> {
             legacy_extension_status_string(legacy_hello_seen, extension_value, "extension_version")
         });
     let extension_version_mismatch =
-        extension_version_skew_message(observed_extension_version.as_deref());
+        extension_version_skew_message(observed_extension_version.as_deref(), None);
     let extension_instance_id = latest_instance_with_hello
         .and_then(|instance| instance.extension_instance_id.clone())
         .or_else(|| {
@@ -766,6 +1089,50 @@ pub fn doctor() -> Result<DoctorReport> {
                 "extension_instance_id",
             )
         });
+    let managed_extension_dir = managed_chatgpt_extension_dir()?;
+    let managed_extension_version = extension_manifest_version(&managed_extension_dir);
+    let managed_copy_mismatch = managed_extension_identity_message(
+        observed_extension_version.as_deref(),
+        managed_extension_version.as_deref(),
+        &managed_extension_dir,
+    );
+    let managed_copy_check = match (
+        observed_extension_version.as_deref(),
+        managed_extension_version.as_deref(),
+        managed_copy_mismatch.as_deref(),
+    ) {
+        (_, _, Some(message)) => DoctorCheck {
+            name: "managed_extension_copy",
+            ok: false,
+            detail: message.to_string(),
+        },
+        (Some(observed), Some(expected), None) if observed == expected => DoctorCheck {
+            name: "managed_extension_copy",
+            ok: true,
+            detail: format!(
+                "loaded managed extension version {expected} from {}",
+                managed_extension_dir.display()
+            ),
+        },
+        (None, _, None) => DoctorCheck {
+            name: "managed_extension_copy",
+            ok: false,
+            detail: "no extension version observed".to_string(),
+        },
+        (_, None, None) => DoctorCheck {
+            name: "managed_extension_copy",
+            ok: true,
+            detail: format!(
+                "managed extension copy has not been prepared at {}",
+                managed_extension_dir.display()
+            ),
+        },
+        _ => DoctorCheck {
+            name: "managed_extension_copy",
+            ok: false,
+            detail: "loaded extension identity could not be verified".to_string(),
+        },
+    };
     let version_detail = status_value
         .as_ref()
         .and_then(|value| value.get("version_mismatch"))
@@ -774,6 +1141,7 @@ pub fn doctor() -> Result<DoctorReport> {
         .or_else(|| extension_version_mismatch.clone())
         .unwrap_or_else(|| {
             observed_extension_version
+                .as_deref()
                 .map(|version| {
                     format!(
                         "protocol_version={PROTOCOL_VERSION}, cli_version={YOETZ_CLI_VERSION}, extension_version={version}"
@@ -814,6 +1182,7 @@ pub fn doctor() -> Result<DoctorReport> {
                 && extension_version_mismatch.is_none(),
             detail: version_detail,
         },
+        managed_copy_check,
         DoctorCheck {
             name: "extension_instance_id",
             ok: extension_instance_id.is_some(),
@@ -832,25 +1201,39 @@ pub fn doctor() -> Result<DoctorReport> {
     Ok(DoctorReport { ok, checks })
 }
 
-pub fn doctor_with_auth_probe(selector: ExtensionInstanceSelector<'_>) -> Result<DoctorReport> {
+pub fn doctor_with_auth_probe(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<DoctorReport> {
     let mut report = doctor()?;
-    report.checks.push(chatgpt_auth_doctor_check(selector));
+    report.checks.push(site_auth_doctor_check(selector, recipe));
     report.ok = report.checks.iter().all(|check| check.ok);
     Ok(report)
 }
 
-fn chatgpt_auth_doctor_check(selector: ExtensionInstanceSelector<'_>) -> DoctorCheck {
-    match chatgpt_auth_probe(selector) {
-        Ok(payload) => chatgpt_auth_doctor_check_from_payload(&payload),
+fn site_auth_doctor_check(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> DoctorCheck {
+    match site_auth_probe(selector, recipe) {
+        Ok(payload) => auth_doctor_check_from_payload(&payload, recipe),
         Err(error) => DoctorCheck {
-            name: "chatgpt_auth",
-            ok: true,
+            name: match recipe {
+                BuiltinWebRecipe::Chatgpt => "chatgpt_auth",
+                BuiltinWebRecipe::Claude => "claude_auth",
+            },
+            ok: recipe == BuiltinWebRecipe::Chatgpt,
             detail: format!("status=probe_unavailable, auth probe unavailable: {error}"),
         },
     }
 }
 
+#[cfg(test)]
 fn chatgpt_auth_doctor_check_from_payload(payload: &Value) -> DoctorCheck {
+    auth_doctor_check_from_payload(payload, BuiltinWebRecipe::Chatgpt)
+}
+
+fn auth_doctor_check_from_payload(payload: &Value, recipe: BuiltinWebRecipe) -> DoctorCheck {
     let status = payload
         .get("status")
         .and_then(Value::as_str)
@@ -877,7 +1260,10 @@ fn chatgpt_auth_doctor_check_from_payload(payload: &Value) -> DoctorCheck {
         detail.push(format!("url={url}"));
     }
     DoctorCheck {
-        name: "chatgpt_auth",
+        name: match recipe {
+            BuiltinWebRecipe::Chatgpt => "chatgpt_auth",
+            BuiltinWebRecipe::Claude => "claude_auth",
+        },
         ok: authenticated || !is_confirmed_unusable_chatgpt_auth_status(status),
         detail: detail.join(", "),
     }
@@ -891,11 +1277,15 @@ fn is_confirmed_unusable_chatgpt_auth_status(status: &str) -> bool {
     )
 }
 
-pub fn chatgpt_auth_probe(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
-    let response = send_control_job(
+pub fn site_auth_probe(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    let response = send_site_control_job(
         "reconnect",
-        json!({ "intent": "doctor_auth_probe" }),
+        json!({ "intent": "doctor_auth_probe", "recipe": recipe.as_str() }),
         selector,
+        recipe,
     )?;
     Ok(response.payload)
 }
@@ -929,18 +1319,41 @@ pub fn reload_extension(selector: ExtensionInstanceSelector<'_>) -> Result<Value
     }))
 }
 
-pub fn update_extension(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
-    let update = prepare_managed_chatgpt_extension()?;
-    let reload = reload_extension(selector)?;
+pub fn update_extension(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
     let paths = extension_paths()?;
-    let instance = wait_for_extension_version(&paths, selector, YOETZ_CLI_VERSION)
-        .context("wait for reloaded extension to report the current CLI version")?;
+    let previous_instance = select_extension_instance(&paths, selector)?;
+    let update = prepare_managed_chatgpt_extension()?;
+    let expected_version = update
+        .manifest_version
+        .as_deref()
+        .context("managed extension copy has no stamped manifest version")?;
+    ensure_reload_can_reach_managed_copy(&previous_instance, &update)?;
+    let reload = reload_extension(selector)?;
+    let instance = wait_for_extension_update(
+        &paths,
+        selector,
+        expected_version,
+        recipe.as_str(),
+        &previous_instance.native_instance_id,
+    )
+    .with_context(|| {
+        format!(
+            "managed extension source {} was copied, but the loaded extension did not activate the requested site capability",
+            update.source_dir.display()
+        )
+    })?;
     Ok(json!({
         "status": "updated",
         "transport": TRANSPORT_NAME,
         "extension_dir": update.extension_dir,
         "source_dir": update.source_dir,
+        "source_version": update.source_version,
+        "source_provenance": update.source_provenance,
         "loaded_extension_dirs": update.loaded_extension_dirs,
+        "previous_manifest_version": update.previous_manifest_version,
         "manifest_version": update.manifest_version,
         "copy_status": update.status,
         "copied_files": update.copied_files,
@@ -949,44 +1362,101 @@ pub fn update_extension(selector: ExtensionInstanceSelector<'_>) -> Result<Value
     }))
 }
 
-pub fn bridge_check(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
-    let response = send_control_job("reconnect", json!({ "intent": "bridge_check" }), selector)?;
+pub fn bridge_check_for_recipe(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    let response = send_site_control_job(
+        "reconnect",
+        json!({ "intent": "bridge_check", "recipe": recipe.as_str() }),
+        selector,
+        recipe,
+    )?;
     Ok(json!({
         "status": "ok",
         "transport": TRANSPORT_NAME,
+        "recipe": recipe.as_str(),
         "live": false,
         "response": response.payload,
     }))
 }
 
-pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
+fn instance_advertises_recipe(
+    instance: &ExtensionInstanceStatus,
+    recipe: BuiltinWebRecipe,
+) -> bool {
+    instance
+        .recipes
+        .iter()
+        .any(|value| value == recipe.as_str())
+}
+
+pub fn recipe_ready(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<bool> {
+    let paths = extension_paths()?;
+    let instance = select_extension_instance(&paths, selector)?;
+    Ok(instance_advertises_recipe(&instance, recipe))
+}
+
+pub fn canary(
+    live: bool,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
     if !live {
-        return bridge_check(selector);
+        return bridge_check_for_recipe(selector, recipe);
     }
     let dir = tempfile::tempdir()?;
-    let bundle_path = dir.path().join("yoetz-chatgpt-native-canary.md");
+    let bundle_path = dir
+        .path()
+        .join(format!("yoetz-{}-native-canary.md", recipe.as_str()));
     fs::write(&bundle_path, "Reply with exactly OK.\n")?;
-    let spec = ChatgptRecipeSpec {
-        bundle_path: Some(bundle_path),
-        model: crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
-        model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
-        prompt: "Reply with exactly OK.".to_string(),
-        browser_context_id: None,
-        profile_email: selector.profile_email.map(str::to_string),
-        extension_instance_id: selector.extension_instance_id.map(str::to_string),
-        extension_profile_id: selector.extension_profile_id.map(str::to_string),
-        conversation_id: None,
-        run_id: new_id("canary"),
-        wait_timeout_ms: 180_000,
-        wait_interval_ms: 1_000,
-        upload_timeout_ms: 30_000,
-        send_timeout_ms: 120_000,
+    let response = match recipe {
+        BuiltinWebRecipe::Chatgpt => run_chatgpt_recipe(
+            &ChatgptRecipeSpec {
+                bundle_path: Some(bundle_path),
+                model: crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL.to_string(),
+                model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
+                prompt: "Reply with exactly OK.".to_string(),
+                browser_context_id: None,
+                profile_email: selector.profile_email.map(str::to_string),
+                extension_instance_id: selector.extension_instance_id.map(str::to_string),
+                extension_profile_id: selector.extension_profile_id.map(str::to_string),
+                conversation_id: None,
+                run_id: new_id("canary"),
+                wait_timeout_ms: 180_000,
+                wait_interval_ms: 1_000,
+                upload_timeout_ms: 30_000,
+                send_timeout_ms: 120_000,
+            },
+            OutputFormat::Json,
+        )?,
+        BuiltinWebRecipe::Claude => run_claude_recipe(
+            &ClaudeRecipeSpec {
+                bundle_path: Some(bundle_path),
+                prompt: "Reply with exactly OK.".to_string(),
+                browser_context_id: None,
+                profile_email: selector.profile_email.map(str::to_string),
+                extension_instance_id: selector.extension_instance_id.map(str::to_string),
+                extension_profile_id: selector.extension_profile_id.map(str::to_string),
+                conversation_id: None,
+                run_id: new_id("canary"),
+                wait_timeout_ms: 180_000,
+                wait_interval_ms: 1_000,
+                upload_timeout_ms: 30_000,
+                send_timeout_ms: 120_000,
+                warnings: Vec::new(),
+            },
+            OutputFormat::Json,
+        )?,
     };
-    let response = run_chatgpt_recipe(&spec, OutputFormat::Json)?;
     validate_canary_response(&response.response)?;
     Ok(json!({
         "status": "ok",
         "transport": TRANSPORT_NAME,
+        "recipe": recipe.as_str(),
         "live": true,
         "expected_response": "OK",
         "response": response.response,
@@ -996,15 +1466,25 @@ pub fn canary(live: bool, selector: ExtensionInstanceSelector<'_>) -> Result<Val
     }))
 }
 
-pub fn inspect_run(run_id: &str, selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
+pub fn inspect_run(
+    run_id: &str,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
     let trimmed = run_id.trim();
     if trimmed.is_empty() {
         bail!("--run-id is required");
     }
-    let response = send_control_job("inspect_run", json!({ "run_id": trimmed }), selector)?;
+    let response = send_site_control_job(
+        "inspect_run",
+        json!({ "run_id": trimmed, "recipe": recipe.as_str() }),
+        selector,
+        recipe,
+    )?;
     Ok(json!({
         "status": "ok",
         "transport": TRANSPORT_NAME,
+        "recipe": recipe.as_str(),
         "response": response.payload,
     }))
 }
@@ -1036,7 +1516,9 @@ pub fn run_chatgpt_recipe(
             extension_profile_id: spec.extension_profile_id.as_deref(),
         },
     )?;
-    if let Some(message) = extension_version_skew_message(instance.extension_version.as_deref()) {
+    if let Some(message) =
+        extension_version_skew_message(instance.extension_version.as_deref(), Some("--chatgpt"))
+    {
         eprintln!("warning: {message}");
         let selector = ExtensionInstanceSelector {
             profile_email: spec.profile_email.as_deref(),
@@ -1054,6 +1536,7 @@ pub fn run_chatgpt_recipe(
             Err(err) => eprintln!("warning: automatic extension update failed: {err:#}"),
         }
     }
+    ensure_instance_matches_managed_copy(&instance)?;
     let token = read_capability_token(&paths.token_path)?;
     let mut stream = connect_socket(&instance.socket_path).with_context(|| {
         format!(
@@ -1091,6 +1574,78 @@ pub fn run_chatgpt_recipe(
     }
 }
 
+pub fn run_claude_recipe(
+    spec: &ClaudeRecipeSpec,
+    format: OutputFormat,
+) -> Result<ExtensionRecipeResult> {
+    let bundle_path = spec
+        .bundle_path
+        .as_deref()
+        .context("chrome-extension-native transport requires `--bundle`")?;
+    let bundle = validate_bundle_path(bundle_path)?;
+    let paths = extension_paths()?;
+    let selector = ExtensionInstanceSelector {
+        profile_email: spec.profile_email.as_deref(),
+        extension_instance_id: spec.extension_instance_id.as_deref(),
+        extension_profile_id: spec.extension_profile_id.as_deref(),
+    };
+    let mut instance = select_extension_instance(&paths, selector)?;
+    if let Some(message) =
+        extension_version_skew_message(instance.extension_version.as_deref(), Some("--claude"))
+    {
+        eprintln!("warning: {message}");
+        match auto_heal_extension_version_skew(&paths, selector) {
+            Ok(Some(healed_instance)) => {
+                eprintln!(
+                    "info: refreshed and reloaded chrome-extension-native extension from packaged source"
+                );
+                instance = healed_instance;
+            }
+            Ok(None) => {}
+            Err(err) => eprintln!("warning: automatic extension update failed: {err:#}"),
+        }
+    }
+    ensure_instance_matches_managed_copy(&instance)?;
+    // Capability is checked on the exact routed extension instance after any
+    // best-effort heal and before opening the socket or emitting job_start.
+    ensure_instance_supports_recipe(&instance, "claude")?;
+    let token = read_capability_token(&paths.token_path)?;
+    let mut stream = connect_socket(&instance.socket_path).with_context(|| {
+        format!(
+            "chrome-extension-native bridge is not connected at {}. Run `yoetz browser extension doctor --claude`, then open Chrome with the Yoetz extension enabled.",
+            instance.socket_path.display()
+        )
+    })?;
+    stream.set_read_timeout(Some(
+        Duration::from_millis(spec.wait_timeout_ms).saturating_add(RECIPE_READ_GRACE),
+    ))?;
+
+    let job_id = new_id("job");
+    let start = ProtocolEnvelope::new(
+        "job_start",
+        Some(job_id),
+        Some(spec.run_id.clone()),
+        claude_job_start_payload(spec, &bundle),
+    )
+    .with_token(token);
+    write_json_frame(&mut stream, &start)?;
+
+    loop {
+        let envelope = read_json_frame(&mut stream)?;
+        validate_inbound_envelope(&envelope)?;
+        match envelope.kind.as_str() {
+            "job_progress" => emit_progress(format, &envelope)?,
+            "job_complete" => return parse_recipe_result(envelope),
+            "job_error" => return Err(job_error_for_recipe(envelope, BuiltinWebRecipe::Claude)),
+            other => {
+                if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+                    eprintln!("info: ignored chrome-extension-native event `{other}`");
+                }
+            }
+        }
+    }
+}
+
 pub fn serve_native_host_chatgpt() -> Result<()> {
     #[cfg(unix)]
     {
@@ -1112,6 +1667,28 @@ fn chatgpt_job_start_payload(spec: &ChatgptRecipeSpec, bundle: &BundleInfo) -> V
         "prompt": spec.prompt,
         "model": spec.model,
         "model_strategy": spec.model_strategy,
+        "browser_context_id": spec.browser_context_id,
+        "profile_email": spec.profile_email,
+        "extension_instance_id": spec.extension_instance_id,
+        "extension_profile_id": spec.extension_profile_id,
+        "conversation_id": spec.conversation_id,
+        "wait_timeout_ms": spec.wait_timeout_ms,
+        "wait_interval_ms": spec.wait_interval_ms,
+        "upload_timeout_ms": spec.upload_timeout_ms,
+        "send_timeout_ms": spec.send_timeout_ms,
+    })
+}
+
+fn claude_job_start_payload(spec: &ClaudeRecipeSpec, bundle: &BundleInfo) -> Value {
+    json!({
+        "recipe": "claude",
+        "bundle_path": bundle.path,
+        "file_name": bundle.file_name,
+        "bundle_size": bundle.size,
+        "mime": bundle.mime,
+        "prompt": spec.prompt,
+        "model": crate::claude_recipe::CLAUDE_FABLE_MAX_MODEL,
+        "model_strategy": "select",
         "browser_context_id": spec.browser_context_id,
         "profile_email": spec.profile_email,
         "extension_instance_id": spec.extension_instance_id,
@@ -1231,6 +1808,22 @@ fn legacy_extension_status_string(
     } else {
         None
     }
+}
+
+fn legacy_extension_recipes(
+    extension_value: Option<&serde_json::Map<String, Value>>,
+) -> Vec<String> {
+    let Some(value) = extension_value.and_then(|value| value.get("recipes")) else {
+        return default_extension_recipes();
+    };
+    let Some(values) = value.as_array() else {
+        return Vec::new();
+    };
+    values
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
 }
 
 fn status_file_has_extension_hello(
@@ -1429,6 +2022,19 @@ fn select_extension_instance(
     }
 }
 
+fn ensure_instance_supports_recipe(instance: &ExtensionInstanceStatus, recipe: &str) -> Result<()> {
+    if instance.recipes.iter().any(|value| value == recipe) {
+        return Ok(());
+    }
+    bail!(
+        "selected chrome-extension-native instance {} does not advertise recipe `{recipe}`; refusing before job_start. Run `yoetz browser extension update --{recipe}` and reload the selected Chrome profile",
+        instance
+            .extension_instance_id
+            .as_deref()
+            .unwrap_or(instance.native_instance_id.as_str())
+    )
+}
+
 fn auto_heal_extension_version_skew(
     paths: &ExtensionPaths,
     selector: ExtensionInstanceSelector<'_>,
@@ -1436,9 +2042,67 @@ fn auto_heal_extension_version_skew(
     if chatgpt_extension_source_dir().is_none() {
         return Ok(None);
     }
-    prepare_managed_chatgpt_extension()?;
+    let previous_instance = select_extension_instance(paths, selector)?;
+    let update = prepare_managed_chatgpt_extension()?;
+    let expected_version = update
+        .manifest_version
+        .as_deref()
+        .context("managed extension copy has no stamped manifest version")?;
+    ensure_reload_can_reach_managed_copy(&previous_instance, &update)?;
     reload_extension(selector)?;
-    wait_for_extension_version(paths, selector, YOETZ_CLI_VERSION).map(Some)
+    wait_for_extension_version(paths, selector, expected_version).map(Some)
+}
+
+fn ensure_reload_can_reach_managed_copy(
+    instance: &ExtensionInstanceStatus,
+    update: &ManagedExtensionUpdateResult,
+) -> Result<()> {
+    let expected_version = update
+        .manifest_version
+        .as_deref()
+        .context("managed extension copy has no stamped manifest version")?;
+    let observed_parts = instance
+        .extension_version
+        .as_deref()
+        .and_then(chrome_extension_version_parts);
+    let expected_parts = chrome_extension_version_parts(expected_version);
+    if observed_parts
+        .as_ref()
+        .is_some_and(|parts| parts.len() == 3)
+        && expected_parts
+            .as_ref()
+            .is_some_and(|parts| parts.len() == 4)
+    {
+        // A 3-part live version that exactly matches the managed path before
+        // this restamp is the clobbered-managed case: reload still reaches the
+        // same path, so do not misclassify it as a separately loaded source copy.
+        let restamped_loaded_managed_copy = update.status == "restamped"
+            && instance.extension_version.as_deref() == update.previous_manifest_version.as_deref();
+        if restamped_loaded_managed_copy {
+            return Ok(());
+        }
+        if let Some(message) = managed_extension_identity_message(
+            instance.extension_version.as_deref(),
+            Some(expected_version),
+            &update.extension_dir,
+        ) {
+            bail!(message);
+        }
+    }
+    Ok(())
+}
+
+fn ensure_instance_matches_managed_copy(instance: &ExtensionInstanceStatus) -> Result<()> {
+    let managed_dir = managed_chatgpt_extension_dir()?;
+    let expected_version = extension_manifest_version(&managed_dir);
+    if let Some(message) = managed_extension_identity_message(
+        instance.extension_version.as_deref(),
+        expected_version.as_deref(),
+        &managed_dir,
+    ) {
+        bail!(message);
+    }
+    Ok(())
 }
 
 fn wait_for_extension_version(
@@ -1468,6 +2132,58 @@ fn wait_for_extension_version(
         }
         thread::sleep(EXTENSION_RELOAD_VERIFY_INTERVAL);
     }
+}
+
+fn wait_for_extension_update(
+    paths: &ExtensionPaths,
+    selector: ExtensionInstanceSelector<'_>,
+    expected_version: &str,
+    expected_recipe: &str,
+    previous_native_instance_id: &str,
+) -> Result<ExtensionInstanceStatus> {
+    let deadline = Instant::now() + EXTENSION_RELOAD_VERIFY_TIMEOUT;
+    loop {
+        let current_state = match select_extension_instance(paths, selector) {
+            Ok(instance)
+                if extension_update_is_active(
+                    &instance,
+                    expected_version,
+                    expected_recipe,
+                    previous_native_instance_id,
+                ) =>
+            {
+                return Ok(instance)
+            }
+            Ok(instance) => format!(
+                "native_instance_id={}, extension_version={}, recipes={:?}",
+                instance.native_instance_id,
+                instance.extension_version.as_deref().unwrap_or("<unknown>"),
+                instance.recipes
+            ),
+            Err(err) => err.to_string(),
+        };
+        if Instant::now() >= deadline {
+            bail!(
+                "timed out waiting for a new chrome-extension-native instance to advertise recipe `{expected_recipe}` at extension version {expected_version}; last state: {current_state}. Chrome may retain a same-version unpacked module cache: open chrome://extensions, click Reload for `Yoetz Native Transport`, then run `yoetz browser extension status --{expected_recipe}`"
+            );
+        }
+        thread::sleep(EXTENSION_RELOAD_VERIFY_INTERVAL);
+    }
+}
+
+fn extension_update_is_active(
+    instance: &ExtensionInstanceStatus,
+    expected_version: &str,
+    expected_recipe: &str,
+    previous_native_instance_id: &str,
+) -> bool {
+    instance.native_instance_id != previous_native_instance_id
+        && instance.extension_version.as_deref() == Some(expected_version)
+        && instance_has_extension_hello(instance)
+        && instance
+            .recipes
+            .iter()
+            .any(|recipe| recipe == expected_recipe)
 }
 
 fn non_empty_selector(value: Option<&str>) -> Option<&str> {
@@ -1531,6 +2247,7 @@ fn connect_legacy_socket_instance(paths: &ExtensionPaths) -> Result<ExtensionIns
         extension_version: None,
         profile_email: None,
         profile_id: None,
+        recipes: default_extension_recipes(),
         protocol_version: PROTOCOL_VERSION,
         last_seen_ms: 0,
     })
@@ -1895,8 +2612,29 @@ fn send_control_job(
     payload: Value,
     selector: ExtensionInstanceSelector<'_>,
 ) -> Result<ProtocolEnvelope> {
+    send_control_job_with_recipe(kind, payload, selector, None)
+}
+
+fn send_site_control_job(
+    kind: &str,
+    payload: Value,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<ProtocolEnvelope> {
+    send_control_job_with_recipe(kind, payload, selector, Some(recipe.as_str()))
+}
+
+fn send_control_job_with_recipe(
+    kind: &str,
+    payload: Value,
+    selector: ExtensionInstanceSelector<'_>,
+    required_recipe: Option<&str>,
+) -> Result<ProtocolEnvelope> {
     let paths = extension_paths()?;
     let instance = select_extension_instance(&paths, selector)?;
+    if let Some(recipe) = required_recipe {
+        ensure_instance_supports_recipe(&instance, recipe)?;
+    }
     let token = read_capability_token(&paths.token_path)?;
     let job_id = new_id(kind);
     let mut stream = connect_socket(&instance.socket_path).with_context(|| {
@@ -2049,6 +2787,10 @@ fn parse_model_selection_status(value: Option<&str>) -> ChatgptModelSelectionSta
 }
 
 fn job_error(envelope: ProtocolEnvelope) -> anyhow::Error {
+    job_error_for_recipe(envelope, BuiltinWebRecipe::Chatgpt)
+}
+
+fn job_error_for_recipe(envelope: ProtocolEnvelope, recipe: BuiltinWebRecipe) -> anyhow::Error {
     let message = job_error_message(&envelope.payload);
     let phase = envelope.payload.get("phase").and_then(Value::as_str);
     let side_effect_started = envelope
@@ -2060,21 +2802,12 @@ fn job_error(envelope: ProtocolEnvelope) -> anyhow::Error {
     if !side_effect_started {
         return err;
     }
-    match phase {
-        Some("upload") => {
-            crate::chatgpt_recipe::mark_terminal_fallback_phase(err, ChatgptTransportPhase::Upload)
-        }
-        Some("send") => {
-            crate::chatgpt_recipe::mark_terminal_fallback_phase(err, ChatgptTransportPhase::Send)
-        }
-        Some("wait_response") => crate::chatgpt_recipe::mark_terminal_fallback_phase(
-            err,
-            ChatgptTransportPhase::WaitResponse,
-        ),
-        _ => {
-            crate::chatgpt_recipe::mark_terminal_fallback_phase(err, ChatgptTransportPhase::Upload)
-        }
-    }
+    let phase = match phase {
+        Some("send") => ChatgptTransportPhase::Send,
+        Some("wait_response") => ChatgptTransportPhase::WaitResponse,
+        _ => ChatgptTransportPhase::Upload,
+    };
+    crate::web_recipe::mark_terminal_fallback_phase(err, recipe, phase)
 }
 
 fn job_error_message(payload: &Value) -> String {
@@ -2937,12 +3670,13 @@ mod native_host_unix {
             return;
         }
         match envelope.payload.get("phase").and_then(Value::as_str) {
-            Some(
-                "tab_opened" | "model_selection" | "tab_grouped" | "ready_for_file"
-                | "file_uploaded",
-            ) => {
+            Some("tab_opened" | "tab_grouped" | "ready_for_file" | "file_uploaded") => {
                 client.side_effect_started = true;
                 client.fallback_phase = Some("upload");
+            }
+            Some("model_selection") => {
+                client.side_effect_started = true;
+                client.fallback_phase = Some("model_selection");
             }
             Some("prompt_sent") => {
                 client.side_effect_started = true;
@@ -3035,6 +3769,7 @@ mod native_host_unix {
                         "extension_instance_id": envelope.payload.get("extension_instance_id").cloned().unwrap_or(Value::Null),
                         "profile_email": envelope.payload.get("profile_email").cloned().unwrap_or(Value::Null),
                         "profile_id": envelope.payload.get("profile_id").cloned().unwrap_or(Value::Null),
+                        "recipes": envelope.payload.get("recipes").cloned().unwrap_or_else(|| json!(default_extension_recipes())),
                         "seen_at_ms": now_millis(),
                     },
                     "version_mismatch": Value::Null,
@@ -3063,6 +3798,7 @@ mod native_host_unix {
                     "extension_version": envelope.payload.get("extension_version").cloned().unwrap_or(Value::Null),
                     "profile_email": envelope.payload.get("profile_email").cloned().unwrap_or(Value::Null),
                     "profile_id": envelope.payload.get("profile_id").cloned().unwrap_or(Value::Null),
+                    "recipes": envelope.payload.get("recipes").cloned().unwrap_or_else(|| json!(default_extension_recipes())),
                     "protocol_version": envelope.payload.get("protocol_version").cloned().unwrap_or(json!(PROTOCOL_VERSION)),
                 }),
             ),
@@ -3085,6 +3821,7 @@ mod native_host_unix {
             "extension_version": Value::Null,
             "profile_email": Value::Null,
             "profile_id": Value::Null,
+            "recipes": default_extension_recipes(),
             "protocol_version": PROTOCOL_VERSION,
             "last_seen_ms": now_millis(),
         });
@@ -3182,6 +3919,37 @@ mod native_host_unix {
             .unwrap_or_default()
             .as_millis()
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn model_selection_progress_preserves_the_diagnostic_phase() {
+            let (stream, _peer) = UnixStream::pair().unwrap();
+            let mut client = ClientJob {
+                stream,
+                job_id: "job_model".to_string(),
+                run_id: Some("run_model".to_string()),
+                chunks: Vec::new(),
+                next_chunk: 0,
+                side_effect_started: false,
+                fallback_phase: None,
+                cancel_on_disconnect: true,
+            };
+            let envelope = ProtocolEnvelope::new(
+                "job_progress",
+                Some("job_model".to_string()),
+                Some("run_model".to_string()),
+                json!({ "phase": "model_selection" }),
+            );
+
+            update_client_effect_state(&mut client, &envelope);
+
+            assert!(client.side_effect_started);
+            assert_eq!(client.fallback_phase, Some("model_selection"));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3257,6 +4025,118 @@ mod tests {
         let payload = chatgpt_job_start_payload(&spec, &bundle);
 
         assert_eq!(payload["conversation_id"], "conv-123");
+    }
+
+    #[test]
+    fn claude_job_start_payload_carries_recipe_model_and_conversation() {
+        let bundle = BundleInfo {
+            path: PathBuf::from("/tmp/yoetz-bundle.md"),
+            file_name: "yoetz-bundle.md".to_string(),
+            size: 42,
+            mime: "text/markdown".to_string(),
+        };
+        let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
+        let spec = crate::claude_recipe::ClaudeRecipeSpec {
+            bundle_path: Some(bundle.path.clone()),
+            prompt: "continue".to_string(),
+            browser_context_id: None,
+            profile_email: None,
+            extension_instance_id: Some("ext_claude".to_string()),
+            extension_profile_id: None,
+            conversation_id: Some(conversation_id.to_string()),
+            run_id: "run-claude".to_string(),
+            wait_timeout_ms: 10_000,
+            wait_interval_ms: 1_000,
+            upload_timeout_ms: 2_000,
+            send_timeout_ms: 3_000,
+            warnings: vec!["size warning".to_string()],
+        };
+
+        let payload = claude_job_start_payload(&spec, &bundle);
+
+        assert_eq!(payload["recipe"], "claude");
+        assert_eq!(
+            payload["model"],
+            crate::claude_recipe::CLAUDE_FABLE_MAX_MODEL
+        );
+        assert_eq!(payload["model_strategy"], "select");
+        assert_eq!(payload["conversation_id"], conversation_id);
+        assert_eq!(payload["extension_instance_id"], "ext_claude");
+    }
+
+    #[test]
+    fn selected_instance_capability_gate_is_recipe_specific_and_legacy_safe() {
+        let mut instance = ExtensionInstanceStatus {
+            native_instance_id: "native_claude".to_string(),
+            socket_path: PathBuf::from("/tmp/claude.sock"),
+            pid: 1,
+            extension_instance_id: Some("ext_claude".to_string()),
+            extension_version: Some("0.5.33".to_string()),
+            profile_email: None,
+            profile_id: None,
+            recipes: vec!["chatgpt".to_string()],
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1,
+        };
+
+        ensure_instance_supports_recipe(&instance, "chatgpt").unwrap();
+        let error = ensure_instance_supports_recipe(&instance, "claude").unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not advertise recipe `claude`"));
+        assert!(error.to_string().contains("before job_start"));
+
+        instance.recipes.push("claude".to_string());
+        ensure_instance_supports_recipe(&instance, "claude").unwrap();
+    }
+
+    #[test]
+    fn extension_update_readiness_requires_new_instance_version_and_recipe() {
+        let expected_version = format!("{YOETZ_CLI_VERSION}.7");
+        let mut instance = ExtensionInstanceStatus {
+            native_instance_id: "native_before".to_string(),
+            socket_path: PathBuf::from("/tmp/claude.sock"),
+            pid: 1,
+            extension_instance_id: Some("ext_claude".to_string()),
+            extension_version: Some(expected_version.clone()),
+            profile_email: None,
+            profile_id: None,
+            recipes: vec!["chatgpt".to_string(), "claude".to_string()],
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1,
+        };
+
+        assert!(!extension_update_is_active(
+            &instance,
+            &expected_version,
+            "claude",
+            "native_before"
+        ));
+
+        instance.native_instance_id = "native_after".to_string();
+        instance.recipes = vec!["chatgpt".to_string()];
+        assert!(!extension_update_is_active(
+            &instance,
+            &expected_version,
+            "claude",
+            "native_before"
+        ));
+
+        instance.recipes.push("claude".to_string());
+        assert!(extension_update_is_active(
+            &instance,
+            &expected_version,
+            "claude",
+            "native_before"
+        ));
+
+        instance.extension_version = Some("0.0.0".to_string());
+        assert!(!extension_update_is_active(
+            &instance,
+            YOETZ_CLI_VERSION,
+            "claude",
+            "native_before"
+        ));
     }
 
     #[test]
@@ -3640,6 +4520,8 @@ mod tests {
         assert!(!payload.hello_seen);
         assert_eq!(payload.extension_version, None);
         assert_eq!(payload.extension_instance_id, None);
+        assert_eq!(payload.recipes, vec!["chatgpt"]);
+        assert!(!payload.claude_ready);
 
         let extension_hello = doctor()
             .unwrap()
@@ -3677,6 +4559,7 @@ mod tests {
                 extension_version: Some("0.2.0".to_string()),
                 profile_email: Some("work@example.com".to_string()),
                 profile_id: Some("gaia_123".to_string()),
+                recipes: vec!["chatgpt".to_string(), "claude".to_string()],
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1234,
             },
@@ -3692,6 +4575,8 @@ mod tests {
             Some("work@example.com")
         );
         assert_eq!(payload.extension_profile_id.as_deref(), Some("gaia_123"));
+        assert_eq!(payload.recipes, vec!["chatgpt", "claude"]);
+        assert!(payload.claude_ready);
 
         let extension_hello = doctor()
             .unwrap()
@@ -3704,6 +4589,30 @@ mod tests {
             extension_hello.detail,
             "extension_version=0.2.0, extension_instance_id=ext_123, chrome_profile_email=work@example.com"
         );
+    }
+
+    #[test]
+    fn selected_instance_capability_is_recipe_exact() {
+        let instance = ExtensionInstanceStatus {
+            native_instance_id: "native_1".to_string(),
+            socket_path: PathBuf::from("/tmp/native_1.sock"),
+            pid: process::id(),
+            extension_instance_id: Some("ext_1".to_string()),
+            extension_version: Some("0.5.33".to_string()),
+            profile_email: None,
+            profile_id: None,
+            recipes: vec!["chatgpt".to_string()],
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1,
+        };
+        assert!(instance_advertises_recipe(
+            &instance,
+            BuiltinWebRecipe::Chatgpt
+        ));
+        assert!(!instance_advertises_recipe(
+            &instance,
+            BuiltinWebRecipe::Claude
+        ));
     }
 
     #[test]
@@ -3732,6 +4641,7 @@ mod tests {
                 extension_version: Some("0.5.13".to_string()),
                 profile_email: Some("work@example.com".to_string()),
                 profile_id: Some("gaia_123".to_string()),
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1234,
             },
@@ -3762,6 +4672,69 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn status_and_doctor_reject_non_managed_loaded_copy() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let state = dir.path().join("state");
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &state);
+        write_extension_source_fixture(
+            &state.join("chatgpt-native-extension"),
+            &format!("{YOETZ_CLI_VERSION}.9"),
+        );
+        let paths = extension_paths().unwrap();
+        fs::create_dir_all(&paths.instances_dir).unwrap();
+        let socket = dir.path().join("work.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        write_instance_fixture(
+            &paths,
+            ExtensionInstanceStatus {
+                native_instance_id: "native_work".to_string(),
+                socket_path: socket,
+                pid: process::id(),
+                extension_instance_id: Some("ext_123".to_string()),
+                extension_version: Some(YOETZ_CLI_VERSION.to_string()),
+                profile_email: Some("work@example.com".to_string()),
+                profile_id: Some("gaia_123".to_string()),
+                recipes: vec!["chatgpt".to_string(), "claude".to_string()],
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 1234,
+            },
+        );
+
+        let payload = status().unwrap();
+        assert_eq!(payload.status, "managed_copy_mismatch");
+        assert!(payload.detail.contains("non-managed copy"));
+        assert!(payload.detail.contains("remove the Yoetz card"));
+        assert!(payload.detail.contains(&format!(
+            "Load unpacked {}",
+            managed_chatgpt_extension_dir().unwrap().display()
+        )));
+
+        let report = doctor().unwrap();
+        let version_compatible = report
+            .checks
+            .iter()
+            .find(|check| check.name == "version_compatible")
+            .unwrap();
+        assert!(version_compatible.ok);
+        let managed_copy = report
+            .checks
+            .iter()
+            .find(|check| check.name == "managed_extension_copy")
+            .unwrap();
+        assert!(!managed_copy.ok);
+        assert!(managed_copy.detail.contains("non-managed copy"));
+        assert!(!report.ok);
+    }
+
+    #[test]
     #[serial]
     fn managed_extension_dir_uses_stable_yoetz_state_dir() {
         let dir = TempDir::new().unwrap();
@@ -3780,10 +4753,10 @@ mod tests {
     fn sync_managed_extension_replaces_stale_copy_atomically() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
-        write_extension_source_fixture(&source, "fresh");
+        write_extension_source_fixture(&source, YOETZ_CLI_VERSION);
         let target = dir.path().join("managed");
         fs::create_dir_all(target.join("src")).unwrap();
-        fs::write(target.join("manifest.json"), r#"{"version":"stale"}"#).unwrap();
+        fs::write(target.join("manifest.json"), r#"{"version":"0.5.32"}"#).unwrap();
         fs::write(target.join("src").join("stale.js"), "stale").unwrap();
 
         let result = sync_managed_chatgpt_extension_from(&source, &target).unwrap();
@@ -3792,14 +4765,125 @@ mod tests {
         assert_eq!(result.source_dir, source);
         assert_eq!(result.extension_dir, target);
         assert_eq!(
-            fs::read_to_string(result.extension_dir.join("manifest.json")).unwrap(),
-            r#"{"version":"fresh"}"#
+            extension_manifest_version(&result.extension_dir).as_deref(),
+            Some(format!("{YOETZ_CLI_VERSION}.1").as_str())
+        );
+        assert_eq!(
+            fs::read_to_string(source.join("manifest.json")).unwrap(),
+            format!(r#"{{"version":"{YOETZ_CLI_VERSION}"}}"#)
+        );
+        assert_eq!(
+            result.manifest_version.as_deref(),
+            Some(format!("{YOETZ_CLI_VERSION}.1").as_str())
         );
         assert_eq!(
             fs::read_to_string(result.extension_dir.join("src").join("service-worker.js")).unwrap(),
-            "service-worker:fresh"
+            format!("service-worker:{YOETZ_CLI_VERSION}")
         );
         assert!(!result.extension_dir.join("src").join("stale.js").exists());
+    }
+
+    #[test]
+    #[serial]
+    fn sync_managed_extension_rejects_an_older_source_before_mutation() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        write_extension_source_fixture(&source, "0.5.32");
+        let target = dir.path().join("managed");
+        write_extension_source_fixture(&target, YOETZ_CLI_VERSION);
+        fs::write(
+            target.join("src").join("sentinel.js"),
+            "keep-newer-managed-copy",
+        )
+        .unwrap();
+
+        let err = sync_managed_chatgpt_extension_from(&source, &target).unwrap_err();
+
+        let message = format!("{err:#}");
+        assert!(message.contains("refusing to sync"));
+        assert!(message.contains("0.5.32"));
+        assert!(message.contains(YOETZ_CLI_VERSION));
+        assert!(message.contains(source.to_string_lossy().as_ref()));
+        assert_eq!(
+            fs::read_to_string(target.join("src").join("sentinel.js")).unwrap(),
+            "keep-newer-managed-copy"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn sync_managed_extension_classifies_an_unstamped_managed_target_as_restamped() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        write_extension_source_fixture(&source, YOETZ_CLI_VERSION);
+        fs::write(
+            source.join("src").join("service-worker.js"),
+            "service-worker:new-source",
+        )
+        .unwrap();
+        let target = dir.path().join("managed");
+        write_extension_source_fixture(&target, YOETZ_CLI_VERSION);
+
+        let result = sync_managed_chatgpt_extension_from(&source, &target).unwrap();
+
+        assert_eq!(result.status, "restamped");
+        assert_eq!(
+            result.manifest_version.as_deref(),
+            Some(format!("{YOETZ_CLI_VERSION}.1").as_str())
+        );
+        assert_eq!(
+            result.previous_manifest_version.as_deref(),
+            Some(YOETZ_CLI_VERSION)
+        );
+        let loaded_before_restamp = ExtensionInstanceStatus {
+            native_instance_id: "native_restamped".to_string(),
+            socket_path: dir.path().join("native.sock"),
+            pid: process::id(),
+            extension_instance_id: Some("ext_restamped".to_string()),
+            extension_version: result.previous_manifest_version.clone(),
+            profile_email: None,
+            profile_id: None,
+            recipes: default_extension_recipes(),
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1,
+        };
+        assert!(ensure_reload_can_reach_managed_copy(&loaded_before_restamp, &result).is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn managed_extension_stamp_increments_only_when_source_changes() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        write_extension_source_fixture(&source, YOETZ_CLI_VERSION);
+        let target = dir.path().join("managed");
+        let first_version = format!("{YOETZ_CLI_VERSION}.1");
+        let second_version = format!("{YOETZ_CLI_VERSION}.2");
+
+        let first = sync_managed_chatgpt_extension_from(&source, &target).unwrap();
+        assert_eq!(
+            first.manifest_version.as_deref(),
+            Some(first_version.as_str())
+        );
+
+        fs::write(
+            source.join("src").join("service-worker.js"),
+            "service-worker:changed",
+        )
+        .unwrap();
+        let second = sync_managed_chatgpt_extension_from(&source, &target).unwrap();
+        assert_eq!(second.status, "updated");
+        assert_eq!(
+            second.manifest_version.as_deref(),
+            Some(second_version.as_str())
+        );
+
+        let current = sync_managed_chatgpt_extension_from(&source, &target).unwrap();
+        assert_eq!(current.status, "current");
+        assert_eq!(
+            current.manifest_version.as_deref(),
+            Some(second_version.as_str())
+        );
     }
 
     #[test]
@@ -3807,7 +4891,7 @@ mod tests {
     fn prepare_managed_extension_materializes_from_discovered_source() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
-        write_extension_source_fixture(&source, "prepared");
+        write_extension_source_fixture(&source, YOETZ_CLI_VERSION);
         let state = dir.path().join("state");
         let _source_guard = EnvGuard::set(CHATGPT_EXTENSION_DIR_ENV, &source);
         let _state_guard = EnvGuard::set("YOETZ_DIR", &state);
@@ -3817,6 +4901,9 @@ mod tests {
         assert_eq!(result.source_dir, source.canonicalize().unwrap());
         assert_eq!(result.extension_dir, state.join("chatgpt-native-extension"));
         assert!(is_chatgpt_extension_source_dir(&result.extension_dir));
+        let payload = serde_json::to_value(&result).unwrap();
+        assert_eq!(payload["source_version"], YOETZ_CLI_VERSION);
+        assert_eq!(payload["source_provenance"], "environment_override");
     }
 
     #[test]
@@ -3824,10 +4911,10 @@ mod tests {
     fn prepare_managed_extension_refreshes_legacy_loaded_unpacked_dir_when_present() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
-        write_extension_source_fixture(&source, "fresh");
+        write_extension_source_fixture(&source, YOETZ_CLI_VERSION);
         let state = dir.path().join("state");
         let legacy_loaded = state.join("chrome-extension-native").join("unpacked");
-        write_extension_source_fixture(&legacy_loaded, "stale");
+        write_extension_source_fixture(&legacy_loaded, "0.5.32");
         let _source_guard = EnvGuard::set(CHATGPT_EXTENSION_DIR_ENV, &source);
         let _state_guard = EnvGuard::set("YOETZ_DIR", &state);
 
@@ -3838,12 +4925,53 @@ mod tests {
         assert!(result.loaded_extension_dirs.contains(&legacy_loaded));
         assert_eq!(
             fs::read_to_string(legacy_loaded.join("manifest.json")).unwrap(),
-            r#"{"version":"fresh"}"#
+            fs::read_to_string(result.extension_dir.join("manifest.json")).unwrap()
         );
         assert_eq!(
             fs::read_to_string(legacy_loaded.join("src").join("service-worker.js")).unwrap(),
-            "service-worker:fresh"
+            format!("service-worker:{YOETZ_CLI_VERSION}")
         );
+    }
+
+    #[test]
+    fn managed_extension_versions_are_cli_compatible_but_identity_exact() {
+        let managed_version = format!("{YOETZ_CLI_VERSION}.42");
+        let stale_managed_version = format!("{YOETZ_CLI_VERSION}.41");
+        assert!(extension_version_skew_message(Some(&managed_version), None).is_none());
+        assert!(extension_version_skew_message(Some("not-a-version"), None).is_some());
+
+        let unstamped = managed_extension_identity_message(
+            Some(YOETZ_CLI_VERSION),
+            Some(YOETZ_CLI_VERSION),
+            Path::new("/managed/extension"),
+        )
+        .unwrap();
+        assert!(unstamped.contains("no stamped sync identity"));
+        assert!(unstamped.contains("extension update"));
+
+        assert!(managed_extension_identity_message(
+            Some(&managed_version),
+            Some(&managed_version),
+            Path::new("/managed/extension")
+        )
+        .is_none());
+        let source_copy = managed_extension_identity_message(
+            Some(YOETZ_CLI_VERSION),
+            Some(&managed_version),
+            Path::new("/managed/extension"),
+        )
+        .unwrap();
+        assert!(source_copy.contains("non-managed copy"));
+        assert!(source_copy.contains("remove the Yoetz card"));
+        assert!(source_copy.contains("Load unpacked /managed/extension"));
+
+        let stale_copy = managed_extension_identity_message(
+            Some(&stale_managed_version),
+            Some(&managed_version),
+            Path::new("/managed/extension"),
+        )
+        .unwrap();
+        assert!(stale_copy.contains("stale managed copy"));
     }
 
     #[test]
@@ -3872,6 +5000,7 @@ mod tests {
                 extension_version: Some(YOETZ_CLI_VERSION.to_string()),
                 profile_email: None,
                 profile_id: None,
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
             },
@@ -3915,6 +5044,7 @@ mod tests {
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: Some("stale@example.com".to_string()),
                 profile_id: Some("stale_profile".to_string()),
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1234,
             },
@@ -3959,6 +5089,7 @@ mod tests {
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: Some("work@example.com".to_string()),
                 profile_id: Some("work_profile".to_string()),
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 2,
             },
@@ -3973,6 +5104,7 @@ mod tests {
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: Some("personal@example.com".to_string()),
                 profile_id: Some("personal_profile".to_string()),
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
             },
@@ -4023,6 +5155,7 @@ mod tests {
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: None,
                 profile_id: None,
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 2,
             },
@@ -4037,6 +5170,7 @@ mod tests {
                 extension_version: Some("0.4.0".to_string()),
                 profile_email: None,
                 profile_id: None,
+                recipes: default_extension_recipes(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
             },

@@ -4,6 +4,8 @@ name: chatgpt
 # `crates/yoetz-cli/src/chatgpt_recipe.rs`. This YAML still defines the
 # generic agent-browser action sequence, but MCP/dev-browser consume the same
 # typed Rust contract even when they do not execute these steps literally.
+# The native extension is the same pinned multi-site "Yoetz Native Transport"
+# package used by the Claude recipe; this recipe selects its ChatGPT adapter.
 # Transport order when the native extension is missing or unhealthy:
 #   1. chrome-devtools-mcp — direct CDP client against running Chrome 147+
 #      (uses vendored `headless_chrome`; NOT a bridge to the chrome-devtools-mcp

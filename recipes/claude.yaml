@@ -1,16 +1,74 @@
 name: claude
+# Authoritative typed contract: crates/yoetz-cli/src/claude_recipe.rs.
+#
+# Default extension-free transport order:
+#   chrome-devtools-mcp -> dev-browser -> agent-browser -> manual.
+# The typed CDP/dev-browser paths and the literal claude_* agent-browser actions
+# below implement the same fail-closed contract. dev-browser uses a macOS
+# clipboard fallback because its QuickJS runner cannot drive file inputs;
+# non-macOS dev-browser delivery degrades to inline text with a warning. Result
+# metadata always reports the actual delivery_mode and auto_paste_fallback.
+# When extension status --claude is connected, the built-in recipe promotes the
+# shared multi-site "Yoetz Native Transport" as its native-only default.
+#
+# Exact model policy: Fable 5, Effort=Max, Thinking=on. Selection is
+# fail-closed. `--model-strategy current` and vars model/effort/thinking are
+# rejected. Picker opens are state-verified and paced; Max and Thinking are
+# re-read as visible aria-checked controls. Diagnostics expose every failed leg.
+# Claude tabs stay active through upload and accepted send because the SPA may
+# not mount or commit uploads in a never-focused tab; prior focus is restored
+# before the response wait.
+#
+# Conversation/followup: `conversation=<uuid|https://claude.ai/chat/<uuid>>`
+# and `--followup` are native-extension-only. Fallback transports reject them
+# before browser side effects; omitting them creates a fresh marked `/new` tab.
+#
+# Native uploads resolve the exact hidden input[data-testid='file-upload'] and
+# assign through the native input.files setter so page-world handlers see files
+# from the extension isolated world. Finality requires a non-streaming last
+# assistant turn and no Stop response control; cloned group/status thinking rows
+# are excluded from answer text without mutating the live DOM.
+#
+# inline_warn_tokens is a heuristic quality guard, not a documented Claude
+# cutoff. Above it, claude.ai may use retrieval-backed file access. Set 0 to
+# disable. Existing bundle byte caps are unchanged.
+
+defaults:
+  prompt: Review the attached file and provide your analysis.
+  thread: "fresh"
+  upload_timeout_ms: "120000"
+  upload_interval_ms: "2000"
+  send_timeout_ms: "120000"
+  wait_timeout_ms: "5400000"
+  wait_interval_ms: "30000"
+  inline_warn_tokens: "150000"
+
 steps:
   - action: open
-    args: ["https://claude.ai/new"]
-  - action: wait
-    args: ["--load", "domcontentloaded"]
+    args: ["https://claude.ai/new?_yoetz={{run_id}}"]
+  - sleep_ms: 4000
+
+  - action: eval
+    args:
+      - |
+        (() => {
+          window.name = "yoetz:{{run_id}}";
+          return "marked yoetz-owned claude tab";
+        })()
+  - sleep_ms: 500
+
+  - action: claude_select_model
+  - action: claude_open_attachment_ui
+  - action: claude_upload_bundle
+  - action: claude_wait_upload
+    args: ["--interval-ms", "{{upload_interval_ms}}", "--timeout-ms", "{{upload_timeout_ms}}"]
+
+  - action: type
+    args: ["[data-testid='chat-input']", "{{prompt}}"]
+  - action: claude_send
+  - action: claude_wait_response
+    args: ["--interval-ms", "{{wait_interval_ms}}", "--timeout-ms", "{{wait_timeout_ms}}"]
+    timeout_ms: 10000
+
   - action: snapshot
-    args: ["-i", "-c", "--json"]
-  - action: find
-    args: ["placeholder", "Message", "fill", "{{bundle_text}}"]
-  - action: find
-    args: ["role", "button", "click", "--name", "Send"]
-  - action: wait
-    args: ["--load", "networkidle"]
-  - action: snapshot
-    args: ["-i", "-c", "--json"]
+    args: ["-c", "--json"]
