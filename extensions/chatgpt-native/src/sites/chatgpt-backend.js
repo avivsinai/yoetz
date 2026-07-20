@@ -69,7 +69,10 @@ async function fetchChatgptAccessToken() {
 }
 
 function resolveBackendAnswer(job, conversationId, data) {
-  const baseline = nonNegativeInt(job?.submitted_assistant_count ?? job?.response_baseline?.assistant_count ?? 0);
+  // Freshness is relative to the assistant turns that existed before this send.
+  // The post-send DOM count can already include the newly-created in-progress
+  // turn, and is not comparable to completed answer nodes in the backend mapping.
+  const baseline = nonNegativeInt(job?.response_baseline?.assistant_count ?? 0);
   const notReady = (detail) => ({
     method: "backend_api",
     text: "",

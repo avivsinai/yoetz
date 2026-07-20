@@ -70,6 +70,7 @@ const BACKEND_API_FETCH_COOLDOWN_MS = Math.max(
     ? Number(globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS)
     : 60000
 );
+const MAX_BACKEND_API_CONSECUTIVE_FAILURES = 3;
 const CHATGPT_DOM_ONLY_FINALITY_WARNING = "ChatGPT finality_anchor=dom_only: backend API positive-finality proof was unavailable; response relied on DOM-only completion";
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
@@ -1928,11 +1929,10 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
   if (!domExtraction || domExtraction.manual_handoff || !conversationId) {
     return null;
   }
-  if (domExtraction.is_generating) {
-    return job.backend_api_pending
-      ? backendApiPendingExtraction(domExtraction, null)
-      : null;
-  }
+  // DOM generation state is a useful rendering hint, not an authority boundary.
+  // A settled reasoning-recap widget can be misclassified as still generating
+  // after a render refresh. Keep polling the active-lineage backend anchor so it
+  // can prove completion (or keep us pending) in either DOM state.
   const lastFetchAt = Number(job.backend_api_last_fetch_at ?? 0);
   if (Date.now() - lastFetchAt < BACKEND_API_FETCH_COOLDOWN_MS) {
     return job.backend_api_pending
@@ -1950,6 +1950,7 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
     });
     const normalized = normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId);
     const fresh = completion.isFreshBackendApiExtraction(normalized);
+    job.backend_api_consecutive_failures = 0;
     job.backend_api_pending = !fresh;
     job.updated_at = Date.now();
     await persistJob(job);
@@ -1960,12 +1961,20 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
     }
     if (job.backend_api_pending) {
       // Do not silently downgrade to DOM finality after the backend has already
-      // proved that the active lineage is unfinished. Losing that positive
-      // anchor mid-run is an explicit failure; otherwise the same transient
-      // caption that armed the backend check can win on the next DOM poll.
+      // proved that the active lineage is unfinished. Transient fetch failures
+      // keep the DOM barred and retry on the normal cooldown; only a sustained
+      // loss of the positive anchor terminates the job.
+      job.backend_api_consecutive_failures = Math.max(
+        0,
+        Number(job.backend_api_consecutive_failures ?? 0) || 0
+      ) + 1;
+      job.updated_at = Date.now();
+      if (job.backend_api_consecutive_failures < MAX_BACKEND_API_CONSECUTIVE_FAILURES) {
+        await persistJob(job);
+        return backendApiPendingExtraction(domExtraction, null);
+      }
       job.backend_api_disabled = true;
       job.backend_api_disabled_reason = error?.code ?? String(error?.message ?? error);
-      job.updated_at = Date.now();
       await persistJob(job);
       throw error;
     }

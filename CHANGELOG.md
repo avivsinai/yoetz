@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- Prevented short ChatGPT answers from timing out when refreshed reasoning
+  chrome leaves the DOM generation signal stuck. Active-lineage backend
+  finality now polls independently, uses the pre-send answer baseline, and
+  tolerates two consecutive transient backend failures while remaining
+  fail-closed.
 
 ## [0.5.37] - 2026-07-20
 ### Fixed
