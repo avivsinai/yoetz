@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.38] - 2026-07-20
 ### Fixed
 
 - Prevented short ChatGPT answers from timing out when refreshed reasoning
@@ -13,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   finality now polls independently, uses the pre-send answer baseline, and
   tolerates two consecutive transient backend failures while remaining
   fail-closed.
+
 
 ## [0.5.37] - 2026-07-20
 ### Fixed
