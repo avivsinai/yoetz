@@ -3706,6 +3706,110 @@ test("service worker completes with backend-api text when the DOM answer turn ne
   }
 });
 
+test("service worker accepts fresh backend finality when the DOM generating heuristic stays stuck", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let backendFetchCount = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/conv-stuck-generating?_yoetz=run_job_stuck_generating" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, conversation_id: "conv-stuck-generating", submitted_assistant_count: 1 } };
+          case "yoetz_fetch_conversation":
+            backendFetchCount += 1;
+            return {
+              ok: true,
+              payload: {
+                method: "backend_api",
+                text: "7",
+                is_generating: false,
+                node_fresh: true,
+                conversation_id: "conv-stuck-generating",
+                assistant_count: 1,
+                turn_index: 0,
+                copy_button_count: 0,
+                has_copy_button: false
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "copy_scope_dom_fallback",
+                    text: "7",
+                    is_generating: true,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 2,
+                    has_copy_button: true,
+                    turn_index: 0,
+                    conversation_id: "conv-stuck-generating",
+                    diagnostics: { counts: { stop_controls: 0, copy_buttons: 2 } }
+                  }
+                : {
+                    method: "none",
+                    text: "",
+                    is_generating: false,
+                    assistant_count: 0,
+                    user_count: 0,
+                    copy_button_count: 0,
+                    has_copy_button: false,
+                    turn_index: -1
+                  }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?backend_api_stuck_generating=${Date.now()}`);
+    port.emit(envelope("job_start", "job_stuck_generating", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_stuck_generating", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_stuck_generating.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"), 3000);
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.ok(backendFetchCount >= 1, "backend API must be consulted even while the DOM says generating");
+    assert.equal(complete.payload.response, "7");
+    assert.equal(complete.payload.extraction_method, "backend_api");
+    assert.equal(complete.payload.finality_anchor, "backend_api");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker treats a stale backend-api node as still generating until a fresh node appears", async () => {
   const originalChrome = globalThis.chrome;
   const previousCooldown = globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS;
@@ -3735,6 +3839,11 @@ test("service worker treats a stale backend-api node as still generating until a
             return { ok: true, payload: { sent: true, conversation_id: "conv-stale", submitted_assistant_count: 1 } };
           case "yoetz_fetch_conversation":
             fetchCount += 1;
+            if (fetchCount === 2 || fetchCount === 3) {
+              throw Object.assign(new Error("transient backend-api conversation fetch failed"), {
+                code: "backend_api_unavailable"
+              });
+            }
             return {
               ok: true,
               payload: fetchCount === 1
@@ -3814,7 +3923,7 @@ test("service worker treats a stale backend-api node as still generating until a
 
     await eventually(() => port.messages.some((message) => message.type === "job_complete"), 6000);
     const complete = port.messages.find((message) => message.type === "job_complete");
-    assert.ok(fetchCount >= 2, "backend API should be retried after a stale current_node result");
+    assert.ok(fetchCount >= 4, "pending backend finality should survive two transient errors and retry to fresh");
     assert.equal(complete.payload.response, FINAL);
     assert.equal(complete.payload.extraction_method, "backend_api");
     assert.equal(complete.payload.completion_reason, "backend_api");
@@ -4057,7 +4166,7 @@ test("service worker fails closed if the backend positive-finality anchor disapp
 
     await eventually(() => port.messages.some((message) => message.type === "job_complete" || message.type === "job_error"), 6000);
     const error = port.messages.find((message) => message.type === "job_error");
-    assert.ok(fetchCount >= 2, "backend API should be retried before the anchor is declared lost");
+    assert.ok(fetchCount >= 4, "the anchor should be declared lost only after three consecutive errors");
     assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
     assert.equal(error?.payload.code, "backend_api_unavailable");
   } finally {

@@ -486,13 +486,14 @@ function resumeJob() {
 
 // ---- T1 backend-api read (yoetz_fetch_conversation) ----
 
-function fetchJob(submittedAssistantCount = 0) {
+function fetchJob(preSendAssistantCount = 0) {
   return {
     job_id: "job_fetch",
     run_id: "run_fetch",
     conversation_id: "conv-123",
     expected_conversation_id: "conv-123",
-    submitted_assistant_count: submittedAssistantCount,
+    response_baseline: { assistant_count: preSendAssistantCount },
+    submitted_assistant_count: preSendAssistantCount,
     upload_timeout_ms: 1000,
     send_timeout_ms: 1000
   };
@@ -564,6 +565,35 @@ test("backend-api read returns the fresh final answer from the conversation mapp
     assert.equal(res.payload.conversation_id, "conv-123");
     assert.equal(res.payload.assistant_count, 2);
     assert.equal(res.payload.node_id, "a_final");
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
+
+test("backend-api freshness uses the pre-send answer baseline, not the post-send DOM turn count", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_post_send_dom_turn", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const restoreFetch = installBackendFetch({ conv: {
+    current_node: "a_final",
+    mapping: {
+      u1: { id: "u1", parent: null, children: ["a_final"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["Return only 7"] }, end_turn: null } },
+      a_final: asstTextNode("a_final", "u1", "7")
+    }
+  }});
+  try {
+    const job = {
+      ...fetchJob(),
+      response_baseline: { assistant_count: 0 },
+      // Send acceptance can observe the newly-created in-progress DOM turn.
+      // That count is not comparable to completed backend answer nodes.
+      submitted_assistant_count: 1
+    };
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.payload.node_fresh, true);
+    assert.equal(res.payload.text, "7");
+    assert.equal(res.payload.assistant_count, 1);
   } finally {
     restoreFetch();
     restore();
