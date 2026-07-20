@@ -1332,7 +1332,10 @@ test("service worker keeps the current-model warning to one final payload entry"
     await eventually(() => port.messages.some((message) => message.type === "job_complete" && message.job_id === "job_current_warning"));
     const complete = port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_current_warning");
     assert.equal(complete.payload.model_selection_status, "current");
-    assert.deepEqual(complete.payload.warnings, ["model pinning bypassed — answer may come from any model"]);
+    assert.deepEqual(complete.payload.warnings, [
+      "model pinning bypassed — answer may come from any model",
+      "ChatGPT finality_anchor=dom_only: backend API positive-finality proof was unavailable; response relied on DOM-only completion"
+    ]);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -2789,6 +2792,8 @@ test("service worker completion is structural and does not classify response tex
     const complete = port.messages.find((message) => message.type === "job_complete");
     assert.equal(complete.payload.response, "Thought for 9m 55s\nThought for 9m 55s");
     assert.equal(complete.payload.completion_reason, "copy_button");
+    assert.equal(complete.payload.finality_anchor, "dom_only");
+    assert.match(complete.payload.warnings.at(-1), /finality_anchor=dom_only/);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -3813,6 +3818,8 @@ test("service worker treats a stale backend-api node as still generating until a
     assert.equal(complete.payload.response, FINAL);
     assert.equal(complete.payload.extraction_method, "backend_api");
     assert.equal(complete.payload.completion_reason, "backend_api");
+    assert.equal(complete.payload.finality_anchor, "backend_api");
+    assert.deepEqual(complete.payload.warnings, []);
     assert.equal(port.messages.some((message) => message.type === "job_error"), false);
   } finally {
     globalThis.chrome = originalChrome;
@@ -3824,7 +3831,246 @@ test("service worker treats a stale backend-api node as still generating until a
   }
 });
 
-test("service worker still refreshes a frozen render while backend-api reads are stale", async () => {
+test("service worker does not return a longer transient caption before a shorter backend final answer", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousCooldown = globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS;
+  globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS = 2000;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let fetchCount = 0;
+  const CAPTION = "The checksum and nine-file scope match. I am checking edge-state coexistence, canonicalization, resend enforcement, and delivery claim/rollback invariants.";
+  const FINAL = "PASS - no release-blocking findings in this exact patch.";
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/conv-caption?_yoetz=run_job_backend_caption_then_final" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, conversation_id: "conv-caption", submitted_assistant_count: 1 } };
+          case "yoetz_fetch_conversation":
+            fetchCount += 1;
+            return {
+              ok: true,
+              payload: fetchCount === 1
+                ? {
+                    method: "backend_api",
+                    text: "",
+                    is_generating: true,
+                    node_fresh: false,
+                    conversation_id: "conv-caption",
+                    assistant_count: 1,
+                    turn_index: 0
+                  }
+                : {
+                    method: "backend_api",
+                    text: FINAL,
+                    is_generating: false,
+                    node_fresh: true,
+                    conversation_id: "conv-caption",
+                    assistant_count: 2,
+                    turn_index: 1,
+                    copy_button_count: 0,
+                    has_copy_button: false
+                  }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "copy_scope_dom_fallback",
+                    text: CAPTION,
+                    is_generating: false,
+                    assistant_count: 2,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 2,
+                    has_copy_button: true,
+                    turn_index: 1,
+                    conversation_id: "conv-caption",
+                    diagnostics: { counts: { stop_controls: 0, copy_buttons: 2 } }
+                  }
+                : {
+                    method: "copy_scope_dom_fallback",
+                    text: "previous answer",
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 0,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: 0,
+                    conversation_id: "conv-caption"
+                  }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?backend_caption_then_final=${Date.now()}`);
+    port.emit(envelope("job_start", "job_backend_caption_then_final", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 6000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_backend_caption_then_final", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_backend_caption_then_final.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"), 8000);
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    assert.ok(fetchCount >= 2, "backend API should prove the active-lineage answer is final");
+    assert.ok(CAPTION.length > FINAL.length, "regression must not be catchable by a length heuristic");
+    assert.equal(complete.payload.response, FINAL);
+    assert.equal(complete.payload.extraction_method, "backend_api");
+    assert.equal(complete.payload.completion_reason, "backend_api");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousCooldown === undefined) {
+      delete globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS;
+    } else {
+      globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS = previousCooldown;
+    }
+  }
+});
+
+test("service worker fails closed if the backend positive-finality anchor disappears after pending", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousCooldown = globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS;
+  globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS = 100;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let fetchCount = 0;
+  const CAPTION = "I am still checking rollback invariants before returning the verdict.";
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/conv-anchor-lost?_yoetz=run_job_backend_anchor_lost" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, conversation_id: "conv-anchor-lost", submitted_assistant_count: 1 } };
+          case "yoetz_fetch_conversation":
+            fetchCount += 1;
+            if (fetchCount > 1) {
+              throw Object.assign(new Error("backend-api conversation fetch failed"), {
+                code: "backend_api_unavailable"
+              });
+            }
+            return {
+              ok: true,
+              payload: {
+                method: "backend_api",
+                text: "",
+                is_generating: true,
+                node_fresh: false,
+                conversation_id: "conv-anchor-lost",
+                assistant_count: 1,
+                turn_index: 0
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "copy_scope_dom_fallback",
+                    text: CAPTION,
+                    is_generating: false,
+                    assistant_count: 2,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 2,
+                    has_copy_button: true,
+                    turn_index: 1,
+                    conversation_id: "conv-anchor-lost",
+                    diagnostics: { counts: { stop_controls: 0, copy_buttons: 2 } }
+                  }
+                : {
+                    method: "copy_scope_dom_fallback",
+                    text: "previous answer",
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 0,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: 0,
+                    conversation_id: "conv-anchor-lost"
+                  }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?backend_anchor_lost=${Date.now()}`);
+    port.emit(envelope("job_start", "job_backend_anchor_lost", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 4000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_backend_anchor_lost", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_backend_anchor_lost.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete" || message.type === "job_error"), 6000);
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.ok(fetchCount >= 2, "backend API should be retried before the anchor is declared lost");
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    assert.equal(error?.payload.code, "backend_api_unavailable");
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousCooldown === undefined) {
+      delete globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS;
+    } else {
+      globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS = previousCooldown;
+    }
+  }
+});
+
+test("service worker refreshes a frozen render while backend finality is pending", async () => {
   const originalChrome = globalThis.chrome;
   const previousCooldown = globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS;
   globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS = 30;
@@ -3872,15 +4118,27 @@ test("service worker still refreshes a frozen render while backend-api reads are
             fetchCount += 1;
             return {
               ok: true,
-              payload: {
-                method: "backend_api",
-                text: "",
-                is_generating: true,
-                node_fresh: false,
-                conversation_id: "conv-stale-refresh",
-                assistant_count: 1,
-                turn_index: 0
-              }
+              payload: reloaded
+                ? {
+                    method: "backend_api",
+                    text: FINAL,
+                    is_generating: false,
+                    node_fresh: true,
+                    conversation_id: "conv-stale-refresh",
+                    assistant_count: 1,
+                    turn_index: 0,
+                    copy_button_count: 0,
+                    has_copy_button: false
+                  }
+                : {
+                    method: "backend_api",
+                    text: "",
+                    is_generating: true,
+                    node_fresh: false,
+                    conversation_id: "conv-stale-refresh",
+                    assistant_count: 1,
+                    turn_index: 0
+                  }
             };
           case "yoetz_bind_job":
             bindCount += 1;
@@ -3950,7 +4208,8 @@ test("service worker still refreshes a frozen render while backend-api reads are
     assert.deepEqual(updates[0], { id: 1, opts: { url: conversationUrl, active: false } });
     assert.equal(bindCount, 1);
     assert.equal(complete.payload.response, FINAL);
-    assert.equal(complete.payload.completion_reason, "copy_button");
+    assert.equal(complete.payload.extraction_method, "backend_api");
+    assert.equal(complete.payload.completion_reason, "backend_api");
     assert.equal(port.messages.some((message) => message.type === "job_error"), false);
   } finally {
     globalThis.chrome = originalChrome;
