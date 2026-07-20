@@ -600,18 +600,17 @@ test("backend-api freshness uses the pre-send answer baseline, not the post-send
   }
 });
 
-test("backend-api read walks past reasoning_recap and tool nodes to the real assistant answer", async () => {
-  const { send, hooks, restore } = await loadContentScript("backend_walk", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
-  const FINAL = "I reviewed the bundle end to end; the consumer guard is correct and the producer invariants hold.";
+test("backend-api read does not accept an answer buried below a later current node", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_buried_answer", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const CAPTION = "I'll review the bundle end to end, then report whether the producer and consumer invariants hold.";
   const restoreFetch = installBackendFetch({ conv: {
-    // current_node is a reasoning_recap with end_turn:true (the live trap) whose parent chain leads to the text answer
+    // A backend caption can itself look like a completed answer. Once later
+    // work exists above it, the caption must not be treated as turn-final.
     current_node: "recap",
     mapping: {
-      u1: { id: "u1", parent: null, children: ["a_final"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["review"] }, end_turn: null } },
-      a_final: asstTextNode("a_final", "u1", FINAL),
-      // a tool turn (recipient not 'all') must NOT count or be selected
-      tool1: { id: "tool1", parent: "a_final", children: ["recap"], message: { author: { role: "assistant" }, content: { content_type: "text", parts: ["{search}"] }, end_turn: true, recipient: "file_search.msearch" } },
-      // reasoning_recap with end_turn:true must NOT be selected
+      u1: { id: "u1", parent: null, children: ["a_caption"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["review"] }, end_turn: null } },
+      a_caption: asstTextNode("a_caption", "u1", CAPTION),
+      tool1: { id: "tool1", parent: "a_caption", children: ["recap"], message: { author: { role: "assistant" }, content: { content_type: "text", parts: ["{search}"] }, end_turn: true, recipient: "file_search.msearch", status: "finished_successfully" } },
       recap: { id: "recap", parent: "tool1", children: [], message: { author: { role: "assistant" }, content: { content_type: "reasoning_recap", parts: ["recapped"] }, end_turn: true, recipient: "all" } }
     }
   }});
@@ -620,10 +619,45 @@ test("backend-api read walks past reasoning_recap and tool nodes to the real ass
     await prepareFetchJob(send, hooks, job);
     const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
     assert.equal(res.ok, true, JSON.stringify(res));
-    assert.equal(res.payload.node_fresh, true);
-    assert.equal(res.payload.text, FINAL);
-    assert.equal(res.payload.node_id, "a_final");
-    assert.equal(res.payload.assistant_count, 1, "recap + tool nodes must not count as answer turns");
+    assert.equal(res.payload.node_fresh, false);
+    assert.equal(res.payload.is_generating, true);
+    assert.equal(res.payload.text, "");
+    assert.match(res.payload.backend_api_detail, /current_node/i);
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
+
+test("backend-api read rejects an end_turn caption while any mapping message is in progress", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_in_progress_caption", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const CAPTION = "I'll compare both mechanisms across failure recovery, takeover safety, and implementation guardrails.";
+  const restoreFetch = installBackendFetch({ conv: {
+    current_node: "a_caption",
+    mapping: {
+      u1: { id: "u1", parent: null, children: ["a_caption"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["compare"] }, end_turn: null } },
+      a_caption: asstTextNode("a_caption", "u1", CAPTION),
+      tool_in_flight: {
+        id: "tool_in_flight",
+        parent: "a_caption",
+        children: [],
+        message: {
+          author: { role: "tool" },
+          content: { content_type: "text", parts: [""] },
+          status: "in_progress"
+        }
+      }
+    }
+  }});
+  try {
+    const job = fetchJob(0);
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.payload.node_fresh, false);
+    assert.equal(res.payload.is_generating, true);
+    assert.equal(res.payload.text, "");
+    assert.match(res.payload.backend_api_detail, /in.progress/i);
   } finally {
     restoreFetch();
     restore();
