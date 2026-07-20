@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- Kept native ChatGPT runs in progress when the backend active lineage is not
+  yet final, preventing transient reasoning captions from winning the DOM
+  finality race. DOM-only fallback completions now emit explicit finality
+  provenance and a warning.
 
 ## [0.5.36] - 2026-07-19
 ### Fixed

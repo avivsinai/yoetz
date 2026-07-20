@@ -70,6 +70,7 @@ const BACKEND_API_FETCH_COOLDOWN_MS = Math.max(
     ? Number(globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS)
     : 60000
 );
+const CHATGPT_DOM_ONLY_FINALITY_WARNING = "ChatGPT finality_anchor=dom_only: backend API positive-finality proof was unavailable; response relied on DOM-only completion";
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
 // Cap for the tail of last_response_progress_text persisted to chrome.storage.session.
@@ -506,6 +507,10 @@ async function runJobWithFile(job, file) {
 
 async function completeJobWithExtraction(job, extraction) {
   const conversationId = conversationIdForJob(job, extraction);
+  const adapter = adapterForJob(job);
+  const finalityAnchor = adapter.recipe === "chatgpt"
+    ? (extraction.method === "backend_api" ? "backend_api" : "dom_only")
+    : null;
   const completeEnvelope = makeEnvelope("job_complete", {
     job_id: job.job_id,
     run_id: job.run_id,
@@ -520,6 +525,7 @@ async function completeJobWithExtraction(job, extraction) {
       response: extraction.text,
       extraction_method: extraction.method,
       completion_reason: extraction.completion_reason,
+      finality_anchor: finalityAnchor,
       stable_for_ms: extraction.stable_for_ms,
       assistant_turn_count: extraction.assistant_turn_count ?? extraction.assistant_count ?? 0,
       copy_button_count: extraction.copy_button_count ?? 0,
@@ -530,8 +536,9 @@ async function completeJobWithExtraction(job, extraction) {
       model_selection_status: job.model_selection_status ?? "unavailable",
       warnings: [
         ...(job.warnings ?? []),
-        ...(extraction.text ? [] : [adapterForJob(job).completion.emptyResponseWarning]),
-        ...(extraction.warning ? [extraction.warning] : [])
+        ...(extraction.text ? [] : [adapter.completion.emptyResponseWarning]),
+        ...(extraction.warning ? [extraction.warning] : []),
+        ...(finalityAnchor === "dom_only" ? [CHATGPT_DOM_ONLY_FINALITY_WARNING] : [])
       ]
     }
   });
@@ -1524,11 +1531,19 @@ async function waitForResponse(job) {
       assertJobConnectionCurrent(job);
     }
     const extractionIdle = !extraction?.is_generating;
-    const scopedExtractionCandidate = Boolean(
+    const backendApiPending = Boolean(extraction?.backend_api_pending);
+    const scopedDomExtractionCandidate = Boolean(
       postSend
       && extractionIdle
       && extraction?.method !== "page_text_fallback"
     );
+    // Once the ChatGPT conversation API has answered but says the active
+    // lineage has no completed end_turn yet, DOM affordances are not proof of
+    // finality. Reasoning captions can temporarily render as copyable assistant
+    // content while stop/Answer-now controls disappear. Keep the DOM sample for
+    // render-refresh diagnostics, but require the backend positive anchor before
+    // allowing it to complete the job.
+    const scopedExtractionCandidate = scopedDomExtractionCandidate && !backendApiPending;
     const backendApiFinal = Boolean(scopedExtractionCandidate && completion.isFreshBackendApiExtraction(extraction));
     const finalAffordance = Boolean(scopedExtractionCandidate && completion.hasFinalAssistantAffordance(extraction));
     const finalStructuralResponse = finalAffordance || backendApiFinal;
@@ -1538,6 +1553,7 @@ async function waitForResponse(job) {
       postSendAssistantActivity
       && extraction?.method === "page_text_fallback"
       && !extraction?.is_generating
+      && !backendApiPending
       && completion.hasFinalAssistantAffordance(extraction)
     );
     const stableIdleUnscopedCopy = Boolean(
@@ -1552,7 +1568,7 @@ async function waitForResponse(job) {
     const renderRefreshCandidateEligible = completion.isRenderFreezeRefreshCandidate(
       job,
       extraction,
-      scopedExtractionCandidate,
+      scopedDomExtractionCandidate,
       finalStructuralResponse,
       {
         conversationId: conversationIdForJob(job, extraction),
@@ -1600,7 +1616,7 @@ async function waitForResponse(job) {
       unscopedCopyCandidate = null;
       bestUnscopedCopyCandidate = null;
       unscopedCopyCandidateSinceMs = 0;
-    } else if (extraction?.is_generating) {
+    } else if (extraction?.is_generating || backendApiPending) {
       finalAffordanceCandidate = null;
       finalAffordanceCandidateSinceMs = 0;
       unscopedCopyCandidate = null;
@@ -1668,7 +1684,7 @@ async function waitForResponse(job) {
       renderRefreshCandidate = null;
       renderRefreshCandidateSinceMs = 0;
     }
-    const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalStructuralResponse);
+    const awaitingFinalAffordance = Boolean(scopedDomExtractionCandidate && !finalStructuralResponse);
     if (finalAffordanceWithoutScopedText) {
       if (!extractionFailureSinceMs) {
         extractionFailureSinceMs = Date.now();
@@ -1721,7 +1737,8 @@ async function waitForResponse(job) {
         backend_api_final: backendApiFinal,
         stable_idle_unscoped_copy_candidate: stableIdleUnscopedCopy,
         extraction_failure_candidate: finalAffordanceWithoutScopedText,
-        render_refresh_candidate: renderRefreshCandidateEligible
+        render_refresh_candidate: renderRefreshCandidateEligible,
+        backend_api_pending: backendApiPending
       };
       if (awaitingFinalAffordance) {
         waitingDetail.awaiting_final_affordance = true;
@@ -1777,7 +1794,7 @@ function assistantTurnsSinceSend(job, extraction) {
 // A second-or-later assistant turn appearing while generation is still active proves the earlier
 // turn(s) were interim status posts ("I'll review...", "I've narrowed..."), not the final answer.
 function interimTurnState(job, extraction) {
-  const generating = Boolean(extraction?.is_generating);
+  const generating = Boolean(extraction?.is_generating || extraction?.backend_api_pending);
   const turnsSinceSend = assistantTurnsSinceSend(job, extraction);
   return { generating, turnsSinceSend, interimAssistantTurn: generating && turnsSinceSend > 1 };
 }
@@ -1803,6 +1820,7 @@ function postResponseProgress(job, extraction) {
     response_tail: text.slice(-500),
     extraction_method: extraction.method,
     is_generating: generating,
+    backend_api_pending: Boolean(extraction.backend_api_pending),
     assistant_count: extraction.assistant_count ?? 0,
     turn_index: extraction.turn_index ?? -1,
     copy_button_count: extraction.copy_button_count ?? 0,
@@ -1827,6 +1845,7 @@ function postWaitingResponseProgress(job, extraction, detail = {}) {
     interim_assistant_turn: interimAssistantTurn,
     assistant_turns_since_send: turnsSinceSend,
     is_generating: generating,
+    backend_api_pending: Boolean(extraction?.backend_api_pending),
     assistant_count: extraction?.assistant_count ?? 0,
     turn_index: extraction?.turn_index ?? -1,
     copy_button_count: extraction?.copy_button_count ?? 0,
@@ -1902,10 +1921,24 @@ async function extractDomResponseForJob(job) {
 
 async function maybeBackendApiExtractionForJob(job, domExtraction) {
   const completion = adapterForJob(job).completion;
-  if (!shouldFetchBackendApi(job, domExtraction)) {
+  if (!completion.supportsBackendApiFallback || job?.backend_api_disabled) {
     return null;
   }
   const conversationId = conversationIdForJob(job, domExtraction);
+  if (!domExtraction || domExtraction.manual_handoff || !conversationId) {
+    return null;
+  }
+  if (domExtraction.is_generating) {
+    return job.backend_api_pending
+      ? backendApiPendingExtraction(domExtraction, null)
+      : null;
+  }
+  const lastFetchAt = Number(job.backend_api_last_fetch_at ?? 0);
+  if (Date.now() - lastFetchAt < BACKEND_API_FETCH_COOLDOWN_MS) {
+    return job.backend_api_pending
+      ? backendApiPendingExtraction(domExtraction, null)
+      : null;
+  }
   job.backend_api_last_fetch_at = Date.now();
   job.updated_at = Date.now();
   await persistJob(job);
@@ -1916,31 +1949,41 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
       conversation_id: conversationId
     });
     const normalized = normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId);
-    return completion.isFreshBackendApiExtraction(normalized) ? normalized : null;
+    const fresh = completion.isFreshBackendApiExtraction(normalized);
+    job.backend_api_pending = !fresh;
+    job.updated_at = Date.now();
+    await persistJob(job);
+    return fresh ? normalized : backendApiPendingExtraction(domExtraction, normalized);
   } catch (error) {
     if (!completion.isBackendApiFallbackError(error)) {
       throw error;
     }
+    if (job.backend_api_pending) {
+      // Do not silently downgrade to DOM finality after the backend has already
+      // proved that the active lineage is unfinished. Losing that positive
+      // anchor mid-run is an explicit failure; otherwise the same transient
+      // caption that armed the backend check can win on the next DOM poll.
+      job.backend_api_disabled = true;
+      job.backend_api_disabled_reason = error?.code ?? String(error?.message ?? error);
+      job.updated_at = Date.now();
+      await persistJob(job);
+      throw error;
+    }
     job.backend_api_disabled = true;
     job.backend_api_disabled_reason = error?.code ?? String(error?.message ?? error);
+    job.backend_api_pending = false;
     job.updated_at = Date.now();
     await persistJob(job);
     return null;
   }
 }
 
-function shouldFetchBackendApi(job, domExtraction) {
-  if (!adapterForJob(job).completion.supportsBackendApiFallback || job?.backend_api_disabled) {
-    return false;
-  }
-  if (!domExtraction || domExtraction.manual_handoff || domExtraction.is_generating) {
-    return false;
-  }
-  if (!conversationIdForJob(job, domExtraction)) {
-    return false;
-  }
-  const lastFetchAt = Number(job.backend_api_last_fetch_at ?? 0);
-  return Date.now() - lastFetchAt >= BACKEND_API_FETCH_COOLDOWN_MS;
+function backendApiPendingExtraction(domExtraction, backendExtraction) {
+  return {
+    ...domExtraction,
+    backend_api_pending: true,
+    backend_api_detail: backendExtraction?.backend_api_detail ?? null
+  };
 }
 
 function normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId) {
