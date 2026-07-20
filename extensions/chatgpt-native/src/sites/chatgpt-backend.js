@@ -95,6 +95,13 @@ function resolveBackendAnswer(job, conversationId, data) {
   if (!answerNode) {
     return notReady("no completed assistant answer node on the active lineage yet (still generating / tool-only)");
   }
+  const currentNode = mapping[data.current_node];
+  if (currentNode !== answerNode) {
+    return notReady("latest assistant answer is not the conversation current_node (later reasoning / tool work is still active)");
+  }
+  if (hasInProgressMessage(mapping)) {
+    return notReady("conversation mapping still contains a status=in_progress message");
+  }
   if (lineageAnswerCount <= baseline) {
     return notReady(`assistant answer not fresh past baseline (active-lineage ${lineageAnswerCount} <= ${baseline})`);
   }
@@ -153,6 +160,12 @@ function collectLineageAnswerNodes(mapping, currentNodeId) {
     id = node.parent;
   }
   return { answerNode, count };
+}
+
+function hasInProgressMessage(mapping) {
+  return Object.values(mapping).some((node) =>
+    String(node?.message?.status ?? "").toLowerCase() === "in_progress"
+  );
 }
 
 function nonNegativeInt(value) {

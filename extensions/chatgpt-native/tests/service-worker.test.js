@@ -4,6 +4,7 @@ import { uint8ArrayToBase64 } from "../src/chunks.js";
 
 globalThis.__YOETZ_MIN_STABLE_IDLE_MS = 100;
 globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER = 0;
+globalThis.__YOETZ_BACKEND_API_CONFIRMATION_MS = 50;
 
 test("service worker routes reconnect and multiplexes two native jobs", async () => {
   const originalChrome = globalThis.chrome;
@@ -3605,6 +3606,7 @@ test("service worker completes with backend-api text when the DOM answer turn ne
   let tabId = 0;
   let sent = false;
   let backendFetch = null;
+  let backendFetchCount = 0;
   const FINAL = "Backend API captured the full Pro review even though the DOM stayed frozen.";
   globalThis.chrome = chromeStub({
     port,
@@ -3626,6 +3628,7 @@ test("service worker completes with backend-api text when the DOM answer turn ne
             return { ok: true, payload: { sent: true, conversation_id: "conv-api", submitted_assistant_count: 1 } };
           case "yoetz_fetch_conversation":
             backendFetch = message;
+            backendFetchCount += 1;
             return {
               ok: true,
               payload: {
@@ -3633,6 +3636,7 @@ test("service worker completes with backend-api text when the DOM answer turn ne
                 text: FINAL,
                 is_generating: false,
                 node_fresh: true,
+                node_id: "answer-api",
                 conversation_id: "conv-api",
                 assistant_count: 1,
                 turn_index: 0,
@@ -3696,6 +3700,7 @@ test("service worker completes with backend-api text when the DOM answer turn ne
     await eventually(() => port.messages.some((message) => message.type === "job_complete"), 5000);
     const complete = port.messages.find((message) => message.type === "job_complete");
     assert.equal(backendFetch?.conversation_id, "conv-api");
+    assert.ok(backendFetchCount >= 2, "backend finality must survive a second fetch of the same current answer node");
     assert.equal(complete.payload.response, FINAL);
     assert.equal(complete.payload.extraction_method, "backend_api");
     assert.equal(complete.payload.completion_reason, "backend_api");
@@ -3739,6 +3744,7 @@ test("service worker accepts fresh backend finality when the DOM generating heur
                 text: "7",
                 is_generating: false,
                 node_fresh: true,
+                node_id: "answer-stuck-generating",
                 conversation_id: "conv-stuck-generating",
                 assistant_count: 1,
                 turn_index: 0,
@@ -3800,7 +3806,7 @@ test("service worker accepts fresh backend finality when the DOM generating heur
 
     await eventually(() => port.messages.some((message) => message.type === "job_complete"), 3000);
     const complete = port.messages.find((message) => message.type === "job_complete");
-    assert.ok(backendFetchCount >= 1, "backend API must be consulted even while the DOM says generating");
+    assert.ok(backendFetchCount >= 2, "backend API must confirm finality even while the DOM says generating");
     assert.equal(complete.payload.response, "7");
     assert.equal(complete.payload.extraction_method, "backend_api");
     assert.equal(complete.payload.finality_anchor, "backend_api");
@@ -3861,6 +3867,7 @@ test("service worker treats a stale backend-api node as still generating until a
                     text: FINAL,
                     is_generating: false,
                     node_fresh: true,
+                    node_id: "answer-stale-final",
                     conversation_id: "conv-stale",
                     assistant_count: 1,
                     turn_index: 0,
@@ -3975,6 +3982,19 @@ test("service worker does not return a longer transient caption before a shorter
               payload: fetchCount === 1
                 ? {
                     method: "backend_api",
+                    text: CAPTION,
+                    is_generating: false,
+                    node_fresh: true,
+                    node_id: "answer-caption-interim",
+                    conversation_id: "conv-caption",
+                    assistant_count: 2,
+                    turn_index: 1,
+                    copy_button_count: 0,
+                    has_copy_button: false
+                  }
+                : fetchCount === 2
+                ? {
+                    method: "backend_api",
                     text: "",
                     is_generating: true,
                     node_fresh: false,
@@ -3987,6 +4007,7 @@ test("service worker does not return a longer transient caption before a shorter
                     text: FINAL,
                     is_generating: false,
                     node_fresh: true,
+                    node_id: "answer-caption-final",
                     conversation_id: "conv-caption",
                     assistant_count: 2,
                     turn_index: 1,
@@ -4049,7 +4070,7 @@ test("service worker does not return a longer transient caption before a shorter
 
     await eventually(() => port.messages.some((message) => message.type === "job_complete"), 8000);
     const complete = port.messages.find((message) => message.type === "job_complete");
-    assert.ok(fetchCount >= 2, "backend API should prove the active-lineage answer is final");
+    assert.ok(fetchCount >= 4, "a transient fresh caption must fail confirmation before the final node is confirmed");
     assert.ok(CAPTION.length > FINAL.length, "regression must not be catchable by a length heuristic");
     assert.equal(complete.payload.response, FINAL);
     assert.equal(complete.payload.extraction_method, "backend_api");
@@ -4233,6 +4254,7 @@ test("service worker refreshes a frozen render while backend finality is pending
                     text: FINAL,
                     is_generating: false,
                     node_fresh: true,
+                    node_id: "answer-refresh-final",
                     conversation_id: "conv-stale-refresh",
                     assistant_count: 1,
                     turn_index: 0,

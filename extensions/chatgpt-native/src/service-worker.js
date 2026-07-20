@@ -70,6 +70,12 @@ const BACKEND_API_FETCH_COOLDOWN_MS = Math.max(
     ? Number(globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS)
     : 60000
 );
+const BACKEND_API_CONFIRMATION_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_CONFIRMATION_MS))
+    ? Number(globalThis.__YOETZ_BACKEND_API_CONFIRMATION_MS)
+    : 5000
+);
 const MAX_BACKEND_API_CONSECUTIVE_FAILURES = 3;
 const CHATGPT_DOM_ONLY_FINALITY_WARNING = "ChatGPT finality_anchor=dom_only: backend API positive-finality proof was unavailable; response relied on DOM-only completion";
 const JOBS_KEY_PREFIX = "jobs.";
@@ -1719,7 +1725,9 @@ async function waitForResponse(job) {
     } else {
       extractionFailureSinceMs = 0;
     }
-    const nextDelay = finalAffordance
+    const nextDelay = job.backend_api_confirmation
+      ? Math.min(interval, Math.max(50, BACKEND_API_CONFIRMATION_MS))
+      : finalAffordance
       // Poll fast while confirming a latched final affordance so the short confirm
       // window is sampled across several ticks rather than overshot by a coarse poll.
       ? Math.min(interval, AFFORDANCE_CONFIRM_POLL_MS)
@@ -1933,14 +1941,21 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
   // A settled reasoning-recap widget can be misclassified as still generating
   // after a render refresh. Keep polling the active-lineage backend anchor so it
   // can prove completion (or keep us pending) in either DOM state.
+  const now = Date.now();
   const lastFetchAt = Number(job.backend_api_last_fetch_at ?? 0);
-  if (Date.now() - lastFetchAt < BACKEND_API_FETCH_COOLDOWN_MS) {
+  const confirmation = job.backend_api_confirmation;
+  const confirmationDue = Boolean(
+    confirmation
+    && now - Number(confirmation.observed_at ?? 0) >= BACKEND_API_CONFIRMATION_MS
+  );
+  if ((confirmation && !confirmationDue)
+      || (!confirmation && now - lastFetchAt < BACKEND_API_FETCH_COOLDOWN_MS)) {
     return job.backend_api_pending
       ? backendApiPendingExtraction(domExtraction, null)
       : null;
   }
-  job.backend_api_last_fetch_at = Date.now();
-  job.updated_at = Date.now();
+  job.backend_api_last_fetch_at = now;
+  job.updated_at = now;
   await persistJob(job);
   try {
     const backendExtraction = await sendToTab(job.tab_id, {
@@ -1951,10 +1966,39 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
     const normalized = normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId);
     const fresh = completion.isFreshBackendApiExtraction(normalized);
     job.backend_api_consecutive_failures = 0;
-    job.backend_api_pending = !fresh;
+    if (!fresh) {
+      job.backend_api_confirmation = null;
+      job.backend_api_pending = true;
+      job.updated_at = Date.now();
+      await persistJob(job);
+      return backendApiPendingExtraction(domExtraction, normalized);
+    }
+    const nodeId = String(normalized.node_id ?? "").trim();
+    if (!nodeId) {
+      job.backend_api_confirmation = null;
+      job.backend_api_pending = true;
+      job.updated_at = Date.now();
+      await persistJob(job);
+      return backendApiPendingExtraction(domExtraction, {
+        ...normalized,
+        backend_api_detail: "fresh backend answer omitted node_id required for confirmation"
+      });
+    }
+    if (!confirmation || String(confirmation.node_id ?? "") !== nodeId) {
+      job.backend_api_confirmation = { node_id: nodeId, observed_at: Date.now() };
+      job.backend_api_pending = true;
+      job.updated_at = Date.now();
+      await persistJob(job);
+      return backendApiPendingExtraction(domExtraction, {
+        ...normalized,
+        backend_api_detail: `awaiting confirmation of backend answer node ${nodeId}`
+      });
+    }
+    job.backend_api_confirmation = null;
+    job.backend_api_pending = false;
     job.updated_at = Date.now();
     await persistJob(job);
-    return fresh ? normalized : backendApiPendingExtraction(domExtraction, normalized);
+    return normalized;
   } catch (error) {
     if (!completion.isBackendApiFallbackError(error)) {
       throw error;
@@ -1968,6 +2012,7 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
         0,
         Number(job.backend_api_consecutive_failures ?? 0) || 0
       ) + 1;
+      job.backend_api_confirmation = null;
       job.updated_at = Date.now();
       if (job.backend_api_consecutive_failures < MAX_BACKEND_API_CONSECUTIVE_FAILURES) {
         await persistJob(job);
@@ -1981,6 +2026,7 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
     job.backend_api_disabled = true;
     job.backend_api_disabled_reason = error?.code ?? String(error?.message ?? error);
     job.backend_api_pending = false;
+    job.backend_api_confirmation = null;
     job.updated_at = Date.now();
     await persistJob(job);
     return null;
