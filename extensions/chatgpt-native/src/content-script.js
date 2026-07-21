@@ -184,7 +184,9 @@ async function extractJobResponse(job) {
   assertJobOwnership(job, parseOwnedWindowName, { adapter });
   const conversationId = adapter.conversationIdFromUrl(location.href);
   const expectedConversationId = expectedConversationIdForJob(job);
-  if (expectedConversationId && conversationId !== expectedConversationId) {
+  if (expectedConversationId
+      && conversationId !== expectedConversationId
+      && !isExpectedConversationIdAssignment(job, adapter, expectedConversationId, conversationId)) {
     throw commandError(
       "conversation_changed",
       `tab moved from ${adapter.displayName} conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
@@ -326,7 +328,9 @@ async function bindJob(job) {
   }
   const conversationId = adapter.conversationIdFromUrl(location.href);
   const expectedConversationId = expectedConversationIdForJob(job);
-  if (expectedConversationId && conversationId !== expectedConversationId) {
+  if (expectedConversationId
+      && conversationId !== expectedConversationId
+      && !isExpectedConversationIdAssignment(job, adapter, expectedConversationId, conversationId)) {
     throw commandError(
       "conversation_changed",
       `tab moved from ${adapter.displayName} conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
@@ -405,6 +409,14 @@ function conversationIdForJob(job) {
 
 function expectedConversationIdForJob(job) {
   return String(job?.expected_conversation_id ?? job?.submitted_conversation_id ?? job?.conversation_id ?? "").trim() || null;
+}
+
+function isExpectedConversationIdAssignment(job, adapter, expectedConversationId, currentConversationId) {
+  return Boolean(adapter.isExpectedConversationIdAssignment?.(
+    job,
+    expectedConversationId,
+    currentConversationId
+  ));
 }
 
 function conversationLoadOptionsForJob(job) {

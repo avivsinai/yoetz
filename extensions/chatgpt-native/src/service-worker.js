@@ -1515,7 +1515,9 @@ async function waitForResponse(job) {
     }
     const extraction = await extractResponseForJob(job);
     assertJobConnectionCurrent(job);
-    assertJobConversationCurrent(job, extraction);
+    if (reconcileJobConversationCurrent(job, extraction)) {
+      await persistJob(job);
+    }
     if (extraction?.manual_handoff) {
       postNative(progress(job, "manual_handoff", extraction.manual_handoff));
       await failJob(job, "manual_handoff", extraction.manual_handoff.message, {
@@ -2220,14 +2222,25 @@ function assertSubmittedConversationCurrent(job, sendResult) {
   );
 }
 
-function assertJobConversationCurrent(job, extraction) {
+function reconcileJobConversationCurrent(job, extraction) {
   const expectedConversationId = job.expected_conversation_id ?? job.submitted_conversation_id ?? job.conversation_id;
   if (!expectedConversationId) {
-    return;
+    return false;
   }
   const currentConversationId = extraction?.conversation_id ?? null;
   if (expectedConversationId === currentConversationId) {
-    return;
+    return false;
+  }
+  const currentUrl = extraction?.url ?? null;
+  if (adapterForJob(job).isExpectedConversationIdAssignment?.(
+    job,
+    expectedConversationId,
+    currentConversationId
+  )) {
+    job.submitted_conversation_id = currentConversationId;
+    job.submitted_url = currentUrl;
+    job.updated_at = Date.now();
+    return true;
   }
   throw commandError(
     "conversation_changed",

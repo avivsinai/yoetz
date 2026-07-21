@@ -41,6 +41,17 @@ function normalizeConversationId(value) {
   return { ok: true, id };
 }
 
+function isExpectedConversationIdAssignment(job, expectedConversationId, currentConversationId) {
+  const requestedConversationId = String(job?.conversation_id ?? "").trim();
+  const submittedConversationId = String(job?.submitted_conversation_id ?? "").trim();
+  const expected = String(expectedConversationId ?? "").trim();
+  const current = String(currentConversationId ?? "").trim();
+  return !requestedConversationId
+    && submittedConversationId === expected
+    && expected.startsWith("WEB:")
+    && normalizeConversationId(current).ok;
+}
+
 function modelUsedLooksLikeSolPro(value) {
   const folded = String(value ?? "").toLowerCase();
   return /\bsol\b/.test(folded) && /\bpro\b/.test(folded);
@@ -193,6 +204,7 @@ export const chatgptSiteAdapter = Object.freeze({
   conversationJobUrl: dom.chatgptConversationJobUrl,
   conversationUrl,
   conversationIdFromUrl,
+  isExpectedConversationIdAssignment,
   isConversationUrl: (url) => Boolean(conversationIdFromUrl(url)),
   normalizeConversationId,
   isAllowedTabUrl: (url) => String(url ?? "").startsWith(`${CHATGPT_ORIGIN}/`),
