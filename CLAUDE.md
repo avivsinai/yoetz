@@ -117,11 +117,15 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   it, and verifies the loaded version. `status` and `doctor` fail on wrong-path
   or unstamped loads. Never hand-patch the managed directory.
 - The native host and managed extension directory are machine-global,
-  single-writer state shared by every agent lane. Serialize setup/update/reload
-  operations; recipe lanes may run only against one frozen loaded artifact.
+  single-writer state shared by every agent lane. Recipe runs hold the shared
+  side of the lifecycle lock; setup/update/reload/auto-heal require the
+  exclusive side and fail closed if a recipe is active. Recipe lanes may run
+  only against one frozen loaded artifact.
 - Independent ChatGPT recipes may run concurrently through one connected
   extension profile: each job owns a separate background tab. Profile selectors
   route among loaded profiles; they are not required for ChatGPT parallelism.
+  Every parallel recipe must use a distinct Yoetz bundle session directory;
+  reusing one managed `bundle.md` fails with `session_busy` before browser work.
   Claude is asymmetric because its tab must stay active through upload and
   accepted send. Until per-profile activation coordination is implemented,
   serialize Claude recipes within one loaded Chrome profile.

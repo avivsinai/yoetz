@@ -1,10 +1,11 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
@@ -34,6 +35,7 @@ pub const TOKEN_FILENAME: &str = "chatgpt-native.token";
 pub const STATUS_FILENAME: &str = "chatgpt-native-status.json";
 pub const WRAPPER_FILENAME: &str = "yoetz-chrome-native-host";
 pub const INSTANCES_DIRNAME: &str = "instances";
+const EXTENSION_LIFECYCLE_LOCK_FILENAME: &str = "extension-lifecycle.lock";
 pub const CHROME_EXTENSIONS_URL: &str = "chrome://extensions/";
 pub const CHATGPT_EXTENSION_DIR_ENV: &str = "YOETZ_CHATGPT_NATIVE_EXTENSION_DIR";
 pub const MAX_CHROME_NATIVE_EXTENSION_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
@@ -159,6 +161,17 @@ pub struct ManagedExtensionUpdateResult {
     pub copied_files: usize,
 }
 
+#[derive(Debug)]
+struct ExtensionLifecycleLock {
+    _file: File,
+}
+
+impl Drop for ExtensionLifecycleLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self._file);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProtocolEnvelope {
     pub protocol_version: u32,
@@ -204,7 +217,68 @@ impl ProtocolEnvelope {
     }
 }
 
+fn extension_lifecycle_lock_path() -> Result<PathBuf> {
+    Ok(extension_paths()?
+        .state_dir
+        .join(EXTENSION_LIFECYCLE_LOCK_FILENAME))
+}
+
+fn open_extension_lifecycle_lock() -> Result<(File, PathBuf)> {
+    let path = extension_lifecycle_lock_path()?;
+    let parent = path
+        .parent()
+        .context("extension lifecycle lock must have a parent directory")?;
+    #[cfg(unix)]
+    ensure_private_dir(parent)?;
+    #[cfg(not(unix))]
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "create extension lifecycle lock directory {}",
+            parent.display()
+        )
+    })?;
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("open extension lifecycle lock {}", path.display()))?;
+    Ok((file, path))
+}
+
+fn acquire_extension_lifecycle_shared(action: &str) -> Result<ExtensionLifecycleLock> {
+    let (file, path) = open_extension_lifecycle_lock()?;
+    match FileExt::try_lock_shared(&file) {
+        Ok(()) => Ok(ExtensionLifecycleLock { _file: file }),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => bail!(
+            "extension_lifecycle_busy: cannot start {action} while extension setup, update, reload, or auto-heal is in progress ({})",
+            path.display()
+        ),
+        Err(err) => Err(err)
+            .with_context(|| format!("lock extension lifecycle shared {}", path.display())),
+    }
+}
+
+fn acquire_extension_lifecycle_exclusive(action: &str) -> Result<ExtensionLifecycleLock> {
+    let (file, path) = open_extension_lifecycle_lock()?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(ExtensionLifecycleLock { _file: file }),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => bail!(
+            "extension_lifecycle_busy: cannot {action} while native extension recipes or another lifecycle mutation are active ({})",
+            path.display()
+        ),
+        Err(err) => Err(err)
+            .with_context(|| format!("lock extension lifecycle exclusive {}", path.display())),
+    }
+}
+
 pub fn install_host() -> Result<InstallHostResult> {
+    let _lifecycle_lock = acquire_extension_lifecycle_exclusive("install native host")?;
+    install_host_unlocked()
+}
+
+fn install_host_unlocked() -> Result<InstallHostResult> {
     #[cfg(unix)]
     {
         let paths = extension_paths()?;
@@ -244,6 +318,14 @@ pub fn install_host() -> Result<InstallHostResult> {
     {
         bail!("chrome-extension-native install-host is currently supported on macOS/Linux only")
     }
+}
+
+pub fn setup_extension() -> Result<(InstallHostResult, ManagedExtensionUpdateResult)> {
+    let _lifecycle_lock = acquire_extension_lifecycle_exclusive("set up native extension")?;
+    Ok((
+        install_host_unlocked()?,
+        prepare_managed_chatgpt_extension_unlocked()?,
+    ))
 }
 
 pub fn chatgpt_extension_source_dir() -> Option<PathBuf> {
@@ -310,7 +392,7 @@ fn legacy_loaded_chatgpt_extension_dir() -> Result<PathBuf> {
         .join("unpacked"))
 }
 
-pub fn prepare_managed_chatgpt_extension() -> Result<ManagedExtensionUpdateResult> {
+fn prepare_managed_chatgpt_extension_unlocked() -> Result<ManagedExtensionUpdateResult> {
     let source_dir = chatgpt_extension_source_dir().with_context(|| {
         format!("could not find ChatGPT native extension source; set {CHATGPT_EXTENSION_DIR_ENV}")
     })?;
@@ -1300,6 +1382,11 @@ pub fn reconnect(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
 }
 
 pub fn reload_extension(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
+    let _lifecycle_lock = acquire_extension_lifecycle_exclusive("reload native extension")?;
+    reload_extension_unlocked(selector)
+}
+
+fn reload_extension_unlocked(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
     let response = send_control_job(
         "reconnect",
         json!({ "intent": "reload_extension" }),
@@ -1323,15 +1410,16 @@ pub fn update_extension(
     selector: ExtensionInstanceSelector<'_>,
     recipe: BuiltinWebRecipe,
 ) -> Result<Value> {
+    let _lifecycle_lock = acquire_extension_lifecycle_exclusive("update native extension")?;
     let paths = extension_paths()?;
     let previous_instance = select_extension_instance(&paths, selector)?;
-    let update = prepare_managed_chatgpt_extension()?;
+    let update = prepare_managed_chatgpt_extension_unlocked()?;
     let expected_version = update
         .manifest_version
         .as_deref()
         .context("managed extension copy has no stamped manifest version")?;
     ensure_reload_can_reach_managed_copy(&previous_instance, &update)?;
-    let reload = reload_extension(selector)?;
+    let reload = reload_extension_unlocked(selector)?;
     let instance = wait_for_extension_update(
         &paths,
         selector,
@@ -1498,6 +1586,32 @@ pub fn grant_identity_permission(selector: ExtensionInstanceSelector<'_>) -> Res
     }))
 }
 
+fn select_recipe_instance_with_lifecycle_lock(
+    paths: &ExtensionPaths,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe_flag: &str,
+    action: &str,
+) -> Result<(ExtensionLifecycleLock, ExtensionInstanceStatus)> {
+    let mut lifecycle_lock = acquire_extension_lifecycle_shared(action)?;
+    let mut instance = select_extension_instance(paths, selector)?;
+    if let Some(message) =
+        extension_version_skew_message(instance.extension_version.as_deref(), Some(recipe_flag))
+    {
+        eprintln!("warning: {message}");
+        drop(lifecycle_lock);
+        match auto_heal_extension_version_skew(paths, selector) {
+            Ok(Some(_)) => eprintln!(
+                "info: refreshed and reloaded chrome-extension-native extension from packaged source"
+            ),
+            Ok(None) => {}
+            Err(err) => eprintln!("warning: automatic extension update failed: {err:#}"),
+        }
+        lifecycle_lock = acquire_extension_lifecycle_shared(action)?;
+        instance = select_extension_instance(paths, selector)?;
+    }
+    Ok((lifecycle_lock, instance))
+}
+
 pub fn run_chatgpt_recipe(
     spec: &ChatgptRecipeSpec,
     format: OutputFormat,
@@ -1508,34 +1622,17 @@ pub fn run_chatgpt_recipe(
         .context("chrome-extension-native transport requires `--bundle`")?;
     let bundle = validate_bundle_path(bundle_path)?;
     let paths = extension_paths()?;
-    let mut instance = select_extension_instance(
+    let selector = ExtensionInstanceSelector {
+        profile_email: spec.profile_email.as_deref(),
+        extension_instance_id: spec.extension_instance_id.as_deref(),
+        extension_profile_id: spec.extension_profile_id.as_deref(),
+    };
+    let (_lifecycle_lock, instance) = select_recipe_instance_with_lifecycle_lock(
         &paths,
-        ExtensionInstanceSelector {
-            profile_email: spec.profile_email.as_deref(),
-            extension_instance_id: spec.extension_instance_id.as_deref(),
-            extension_profile_id: spec.extension_profile_id.as_deref(),
-        },
+        selector,
+        "--chatgpt",
+        "ChatGPT native extension recipe",
     )?;
-    if let Some(message) =
-        extension_version_skew_message(instance.extension_version.as_deref(), Some("--chatgpt"))
-    {
-        eprintln!("warning: {message}");
-        let selector = ExtensionInstanceSelector {
-            profile_email: spec.profile_email.as_deref(),
-            extension_instance_id: spec.extension_instance_id.as_deref(),
-            extension_profile_id: spec.extension_profile_id.as_deref(),
-        };
-        match auto_heal_extension_version_skew(&paths, selector) {
-            Ok(Some(healed_instance)) => {
-                eprintln!(
-                    "info: refreshed and reloaded chrome-extension-native extension from packaged source"
-                );
-                instance = healed_instance;
-            }
-            Ok(None) => {}
-            Err(err) => eprintln!("warning: automatic extension update failed: {err:#}"),
-        }
-    }
     ensure_instance_matches_managed_copy(&instance)?;
     let token = read_capability_token(&paths.token_path)?;
     let mut stream = connect_socket(&instance.socket_path).with_context(|| {
@@ -1589,22 +1686,12 @@ pub fn run_claude_recipe(
         extension_instance_id: spec.extension_instance_id.as_deref(),
         extension_profile_id: spec.extension_profile_id.as_deref(),
     };
-    let mut instance = select_extension_instance(&paths, selector)?;
-    if let Some(message) =
-        extension_version_skew_message(instance.extension_version.as_deref(), Some("--claude"))
-    {
-        eprintln!("warning: {message}");
-        match auto_heal_extension_version_skew(&paths, selector) {
-            Ok(Some(healed_instance)) => {
-                eprintln!(
-                    "info: refreshed and reloaded chrome-extension-native extension from packaged source"
-                );
-                instance = healed_instance;
-            }
-            Ok(None) => {}
-            Err(err) => eprintln!("warning: automatic extension update failed: {err:#}"),
-        }
-    }
+    let (_lifecycle_lock, instance) = select_recipe_instance_with_lifecycle_lock(
+        &paths,
+        selector,
+        "--claude",
+        "Claude native extension recipe",
+    )?;
     ensure_instance_matches_managed_copy(&instance)?;
     // Capability is checked on the exact routed extension instance after any
     // best-effort heal and before opening the socket or emitting job_start.
@@ -2042,14 +2129,20 @@ fn auto_heal_extension_version_skew(
     if chatgpt_extension_source_dir().is_none() {
         return Ok(None);
     }
+    let _lifecycle_lock = acquire_extension_lifecycle_exclusive("auto-heal native extension")?;
     let previous_instance = select_extension_instance(paths, selector)?;
-    let update = prepare_managed_chatgpt_extension()?;
+    if extension_version_skew_message(previous_instance.extension_version.as_deref(), None)
+        .is_none()
+    {
+        return Ok(None);
+    }
+    let update = prepare_managed_chatgpt_extension_unlocked()?;
     let expected_version = update
         .manifest_version
         .as_deref()
         .context("managed extension copy has no stamped manifest version")?;
     ensure_reload_can_reach_managed_copy(&previous_instance, &update)?;
-    reload_extension(selector)?;
+    reload_extension_unlocked(selector)?;
     wait_for_extension_version(paths, selector, expected_version).map(Some)
 }
 
@@ -4812,6 +4905,53 @@ mod tests {
 
     #[test]
     #[serial]
+    fn lifecycle_lock_allows_parallel_recipes_and_rejects_mutation() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        write_extension_source_fixture(&source, YOETZ_CLI_VERSION);
+        let state = dir.path().join("state");
+        let manifest_dir = dir.path().join("native-hosts");
+        let _source_guard = EnvGuard::set(CHATGPT_EXTENSION_DIR_ENV, &source);
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &state);
+        let _manifest_guard = EnvGuard::set("YOETZ_CHROME_NATIVE_MESSAGING_DIR", &manifest_dir);
+
+        let recipe_a = acquire_extension_lifecycle_shared("recipe A").unwrap();
+        let recipe_b = acquire_extension_lifecycle_shared("recipe B").unwrap();
+
+        let started_at = Instant::now();
+        let error = setup_extension().unwrap_err();
+        assert!(started_at.elapsed() < Duration::from_secs(1));
+        assert!(error.to_string().contains("extension_lifecycle_busy"));
+        assert!(!state.join("chatgpt-native-extension").exists());
+        assert!(!manifest_dir
+            .join(format!("{NATIVE_HOST_NAME}.json"))
+            .exists());
+
+        drop(recipe_b);
+        drop(recipe_a);
+        setup_extension().unwrap();
+        assert!(state.join("chatgpt-native-extension").exists());
+        assert!(manifest_dir
+            .join(format!("{NATIVE_HOST_NAME}.json"))
+            .exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn lifecycle_lock_guard_releases_a_fork_inherited_descriptor() {
+        let dir = TempDir::new().unwrap();
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+        let recipe = acquire_extension_lifecycle_shared("fork inheritance test").unwrap();
+        let _child = crate::test_support::ForkChild::sleep_for(Duration::from_secs(5));
+
+        drop(recipe);
+
+        acquire_extension_lifecycle_exclusive("verify guard release").unwrap();
+    }
+
+    #[test]
+    #[serial]
     fn sync_managed_extension_replaces_stale_copy_atomically() {
         let dir = TempDir::new().unwrap();
         let source = dir.path().join("source");
@@ -4958,7 +5098,7 @@ mod tests {
         let _source_guard = EnvGuard::set(CHATGPT_EXTENSION_DIR_ENV, &source);
         let _state_guard = EnvGuard::set("YOETZ_DIR", &state);
 
-        let result = prepare_managed_chatgpt_extension().unwrap();
+        let result = prepare_managed_chatgpt_extension_unlocked().unwrap();
 
         assert_eq!(result.source_dir, source.canonicalize().unwrap());
         assert_eq!(result.extension_dir, state.join("chatgpt-native-extension"));
@@ -4980,7 +5120,7 @@ mod tests {
         let _source_guard = EnvGuard::set(CHATGPT_EXTENSION_DIR_ENV, &source);
         let _state_guard = EnvGuard::set("YOETZ_DIR", &state);
 
-        let result = prepare_managed_chatgpt_extension().unwrap();
+        let result = prepare_managed_chatgpt_extension_unlocked().unwrap();
 
         assert_eq!(result.extension_dir, state.join("chatgpt-native-extension"));
         assert!(result.loaded_extension_dirs.contains(&result.extension_dir));
