@@ -228,7 +228,15 @@ fn open_extension_lifecycle_lock() -> Result<(File, PathBuf)> {
     let parent = path
         .parent()
         .context("extension lifecycle lock must have a parent directory")?;
+    #[cfg(unix)]
     ensure_private_dir(parent)?;
+    #[cfg(not(unix))]
+    fs::create_dir_all(parent).with_context(|| {
+        format!(
+            "create extension lifecycle lock directory {}",
+            parent.display()
+        )
+    })?;
     let file = OpenOptions::new()
         .create(true)
         .read(true)
