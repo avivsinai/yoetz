@@ -182,6 +182,107 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
   }
 });
 
+test("service worker reconciles ChatGPT conversation assignment after the URL marker is dropped", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const submittedConversationId = "WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d";
+  const assignedConversationId = "6a5f60dc-8174-8329-949a-1f282d1dccbd";
+  const sentJobs = new Set();
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async () => ({ id: 71 }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_web_assignment" }),
+      sendMessage: async (id, message) => {
+        assert.equal(id, 71);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT", text: "" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sentJobs.add(message.job.job_id);
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: submittedConversationId,
+                submitted_user_count: 1,
+                submitted_assistant_count: 0
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sentJobs.has(message.job.job_id) ? {
+                method: "assistant_dom_fallback",
+                text: "answer",
+                is_generating: false,
+                assistant_count: 1,
+                copy_button_count: 1,
+                has_copy_button: true,
+                turn_index: 0,
+                conversation_id: assignedConversationId,
+                url: `https://chatgpt.com/c/${assignedConversationId}`
+              } : {
+                method: "none",
+                text: "",
+                is_generating: false,
+                assistant_count: 0,
+                turn_index: -1
+              }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      },
+      group: async () => 1
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?web_assignment=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    const runAssignmentJob = async (jobId) => {
+      port.messages.length = 0;
+      port.emit(envelope("job_start", jobId, {
+        prompt: "review",
+        wait_interval_ms: 10,
+        wait_timeout_ms: 1000
+      }));
+      await eventually(() => port.messages.some((message) =>
+        message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+      ));
+      port.emit(envelope("job_file_chunk", jobId, {
+        sequence: 0,
+        total_chunks: 1,
+        total_bytes: 4,
+        filename: "bundle.md",
+        mime_type: "text/markdown",
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+      }));
+      await eventually(() => port.messages.some((message) =>
+        message.type === "job_complete" || message.type === "job_error"
+      ));
+      return port.messages.find((message) =>
+        message.type === "job_complete" || message.type === "job_error"
+      );
+    };
+
+    const terminal = await runAssignmentJob("job_web_assignment");
+    assert.equal(terminal.type, "job_complete", JSON.stringify(terminal));
+    assert.equal(terminal.payload.conversation_id, assignedConversationId);
+    assert.equal(terminal.payload.conversation_url, `https://chatgpt.com/c/${assignedConversationId}`);
+
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker runs a Claude job through its adapter and probes the selected recipe", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

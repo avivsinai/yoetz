@@ -95,6 +95,7 @@ export async function clickSend(_document, options) {
 }
 
 export async function waitForSendAccepted() {
+  hooks.afterWaitForSendAccepted?.();
   return hooks.sendAccepted ?? { accepted: true };
 }
 
@@ -142,6 +143,9 @@ export const siteAdapter = {
     } catch {
       return null;
     }
+  },
+  isExpectedConversationIdAssignment() {
+    return Boolean(hooks.allowConversationAssignment);
   },
   isConversationUrl(value) {
     return Boolean(this.conversationIdFromUrl(value));
@@ -409,6 +413,76 @@ test("content script fresh path still requires a fresh page after prepare", asyn
 
     assert.equal(response.ok, false);
     assert.equal(response.code, "fresh_chat_lost");
+  } finally {
+    restore();
+  }
+});
+
+test("content script accepts ChatGPT replacing a submitted WEB conversation id on the owned tab", async () => {
+  const { send, hooks, restore, location } = await loadContentScript("fresh_web_assignment", "https://chatgpt.com/?_yoetz=run_fresh_assignment");
+  try {
+    hooks.allowConversationAssignment = true;
+    const job = {
+      job_id: "job_fresh_assignment",
+      run_id: "run_fresh_assignment",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+
+    globalThis.__contentScriptTestHooks.afterWaitForSendAccepted = () => {
+      location.href = "https://chatgpt.com/c/WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d?_yoetz=run_fresh_assignment";
+      location.pathname = "/c/WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d";
+    };
+    const sent = await send({ type: "yoetz_send_prompt", job, prompt: "review" });
+    assert.equal(sent.ok, true);
+    assert.equal(sent.payload.conversation_id, "WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d");
+
+    const waitingJob = {
+      ...job,
+      submitted_conversation_id: sent.payload.conversation_id
+    };
+    location.href = "https://chatgpt.com/c/6a5f60dc-8174-8329-949a-1f282d1dccbd";
+    location.pathname = "/c/6a5f60dc-8174-8329-949a-1f282d1dccbd";
+    const rebound = await send({ type: "yoetz_bind_job", job: waitingJob });
+    assert.equal(rebound.ok, true, JSON.stringify(rebound));
+    const extracted = await send({ type: "yoetz_extract_response", job: waitingJob });
+
+    assert.equal(extracted.ok, true, JSON.stringify(extracted));
+    assert.equal(extracted.payload.conversation_id, "6a5f60dc-8174-8329-949a-1f282d1dccbd");
+  } finally {
+    restore();
+  }
+});
+
+test("content script requires the surviving window.name marker for conversation assignment", async () => {
+  const { send, hooks, restore, location } = await loadContentScript(
+    "fresh_web_assignment_wrong_owner",
+    "https://chatgpt.com/?_yoetz=run_fresh_assignment"
+  );
+  try {
+    hooks.allowConversationAssignment = true;
+    const job = {
+      job_id: "job_fresh_assignment",
+      run_id: "run_fresh_assignment",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+
+    const waitingJob = {
+      ...job,
+      submitted_conversation_id: "WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d"
+    };
+    location.href = "https://chatgpt.com/c/6a5f60dc-8174-8329-949a-1f282d1dccbd";
+    location.pathname = "/c/6a5f60dc-8174-8329-949a-1f282d1dccbd";
+    globalThis.window.name = "yoetz-chatgpt-native:other_run:other_job";
+    const extracted = await send({ type: "yoetz_extract_response", job: waitingJob });
+
+    assert.equal(extracted.ok, false);
+    assert.match(extracted.error, /ownership marker mismatch/);
   } finally {
     restore();
   }
