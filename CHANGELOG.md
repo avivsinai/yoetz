@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- Reconciled ChatGPT's provisional `WEB:<uuid>` conversation id with the
+  canonical id it is replaced by, so fresh native-extension ChatGPT runs no
+  longer fail `conversation_changed` ("tab moved") at `wait_response`. The
+  canonical-assignment navigation drops the URL query string, so post-assignment
+  tab ownership now relies on the durable `window.name` marker and the owning
+  tab id rather than the `_yoetz` URL marker. The reconciliation is fail-closed:
+  it applies only to fresh jobs whose submitted id matches the expected `WEB:`
+  id and whose replacement is a canonical conversation id; resume jobs stay
+  strict. Verified end to end against a live ChatGPT business/workspace account.
+
+### Added
+
+- Process-level regression proving the native host multiplexes concurrent jobs:
+  two local clients interleave chunk acknowledgements, complete out of order,
+  and a client disconnect cancels only its own job. Service-worker coverage now
+  asserts two concurrent ChatGPT jobs keep distinct tabs and that cancelling one
+  leaves the other running.
+
+### Changed
+
+- Documented that independent ChatGPT recipes may run concurrently through one
+  connected extension profile, each owning a separate background tab, and that
+  profile selectors route among loaded profiles rather than enabling
+  parallelism. Claude remains asymmetric because its tab must stay active
+  through upload and accepted send, so Claude recipes must still be serialized
+  within one loaded Chrome profile until activation coordination lands.
 
 ## [0.5.39] - 2026-07-20
 ### Fixed
