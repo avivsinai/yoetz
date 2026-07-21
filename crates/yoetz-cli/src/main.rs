@@ -18,6 +18,40 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
+#[cfg(all(test, unix))]
+mod test_support {
+    use std::time::Duration;
+
+    pub(crate) struct ForkChild(libc::pid_t);
+
+    impl ForkChild {
+        #[allow(unsafe_code)]
+        pub(crate) fn sleep_for(duration: Duration) -> Self {
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork test child");
+            if pid == 0 {
+                let micros =
+                    duration.as_micros().min(libc::useconds_t::MAX.into()) as libc::useconds_t;
+                unsafe {
+                    libc::usleep(micros);
+                    libc::_exit(0);
+                }
+            }
+            Self(pid)
+        }
+    }
+
+    impl Drop for ForkChild {
+        #[allow(unsafe_code)]
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0, libc::SIGTERM);
+                libc::waitpid(self.0, std::ptr::null_mut(), 0);
+            }
+        }
+    }
+}
+
 mod browser;
 mod browser_extension_native;
 mod budget;
@@ -2720,6 +2754,12 @@ struct BrowserRecipeSessionLease {
     _file: File,
 }
 
+impl Drop for BrowserRecipeSessionLease {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self._file);
+    }
+}
+
 fn acquire_browser_recipe_session_lease(
     bundle_path: Option<&Path>,
 ) -> Result<Option<BrowserRecipeSessionLease>> {
@@ -5240,6 +5280,25 @@ mod tests {
             .contains(dir.path().to_string_lossy().as_ref()));
 
         drop(first);
+        assert!(acquire_browser_recipe_session_lease(Some(&bundle_md))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn browser_recipe_session_lease_releases_a_fork_inherited_descriptor() {
+        let dir = TempDir::new().unwrap();
+        let bundle_md = dir.path().join("bundle.md");
+        fs::write(&bundle_md, "# bundle").unwrap();
+        fs::write(dir.path().join("bundle.json"), "{}").unwrap();
+        let lease = acquire_browser_recipe_session_lease(Some(&bundle_md))
+            .unwrap()
+            .expect("managed bundle session should be locked");
+        let _child = crate::test_support::ForkChild::sleep_for(Duration::from_secs(5));
+
+        drop(lease);
+
         assert!(acquire_browser_recipe_session_lease(Some(&bundle_md))
             .unwrap()
             .is_some());

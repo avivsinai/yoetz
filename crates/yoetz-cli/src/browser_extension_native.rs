@@ -166,6 +166,12 @@ struct ExtensionLifecycleLock {
     _file: File,
 }
 
+impl Drop for ExtensionLifecycleLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self._file);
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProtocolEnvelope {
     pub protocol_version: u32,
@@ -4920,6 +4926,20 @@ mod tests {
         assert!(manifest_dir
             .join(format!("{NATIVE_HOST_NAME}.json"))
             .exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn lifecycle_lock_guard_releases_a_fork_inherited_descriptor() {
+        let dir = TempDir::new().unwrap();
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+        let recipe = acquire_extension_lifecycle_shared("fork inheritance test").unwrap();
+        let _child = crate::test_support::ForkChild::sleep_for(Duration::from_secs(5));
+
+        drop(recipe);
+
+        acquire_extension_lifecycle_exclusive("verify guard release").unwrap();
     }
 
     #[test]
