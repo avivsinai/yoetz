@@ -118,8 +118,13 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   or unstamped loads. Never hand-patch the managed directory.
 - The native host and managed extension directory are machine-global,
   single-writer state shared by every agent lane. Serialize setup/update/reload
-  operations; concurrent lanes may run recipes only against one frozen loaded
-  artifact.
+  operations; recipe lanes may run only against one frozen loaded artifact.
+- Independent ChatGPT recipes may run concurrently through one connected
+  extension profile: each job owns a separate background tab. Profile selectors
+  route among loaded profiles; they are not required for ChatGPT parallelism.
+  Claude is asymmetric because its tab must stay active through upload and
+  accepted send. Until per-profile activation coordination is implemented,
+  serialize Claude recipes within one loaded Chrome profile.
 - ChatGPT and Claude conversation resume use
   `--var conversation=<site-specific-id|url>` or `--followup`
   (native-extension only, no automatic context management); callers own the

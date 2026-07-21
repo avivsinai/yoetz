@@ -359,9 +359,10 @@ yoetz browser extension inspect --chatgpt --run-id <run-id>
 yoetz browser extension grant-identity --chatgpt
 ```
 
-The extension transport is ChatGPT-only, native-host backed, and currently
-macOS/Linux-only. Do not use it as a general browser interpreter, and do not
-silently fall back to CDP after browser-side side effects have started.
+The extension transport supports ChatGPT and Claude, is native-host backed, and
+is currently macOS/Linux-only. Do not use it as a general browser interpreter,
+and do not silently fall back to CDP after browser-side side effects have
+started.
 For extension-native workflows, plain `yoetz browser check --format json`
 auto-selects `chrome-extension-native` when the extension reports connected,
 returns `auto_selected: true`, and avoids Chrome's remote-debugging approval
@@ -432,6 +433,14 @@ confirmation for local extensions.
 When multiple Chrome profiles have the extension loaded, pass
 `--var profile_email=<email>` if Chrome exposes one, or the stable
 `--var extension_instance_id=<id>` shown by `status --chatgpt`.
+
+Independent ChatGPT recipes may run concurrently through one connected profile:
+each job owns a separate background tab. Profile selectors only choose among
+loaded profiles and are not required for ChatGPT parallelism. Claude is
+asymmetric because each job must keep its tab active through upload and accepted
+send; serialize Claude recipes within one loaded profile until per-profile
+activation coordination is available. Setup, update, and reload remain
+machine-global single-writer operations for both sites.
 
 ### Cookie sync (legacy fallback)
 
