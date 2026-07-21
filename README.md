@@ -301,8 +301,14 @@ yoetz browser recipe --recipe claude --transport chrome-extension-native --bundl
 Load the managed `$YOETZ_DIR/chatgpt-native-extension` directory unpacked in
 the Chrome profile that hosts the target AI sessions; do not load a repo
 checkout. Setup, update, and reload share machine-global native-host and managed
-extension state, so serialize those operations across agent lanes. Recipe runs
-may proceed concurrently only against one frozen loaded artifact.
+extension state, so serialize those operations across agent lanes.
+
+Independent ChatGPT recipe runs may share one connected extension profile: each
+job owns a separate background tab, and profile selectors are routing controls,
+not a prerequisite for parallelism. Claude is asymmetric because each job must
+keep its tab active through upload and accepted send. Until per-profile Claude
+activation coordination lands, serialize Claude recipe runs within one loaded
+Chrome profile. Both sites may run only against one frozen loaded artifact.
 
 Upgrade the installed CLI before another lane runs extension auto-heal after a
 release. An older CLI can overwrite the newer stamped managed copy.

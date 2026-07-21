@@ -12,7 +12,11 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
   const originalClearInterval = globalThis.clearInterval;
   const port = makePort();
   const sentToTabs = [];
+  const createdTabs = [];
+  const jobTabs = new Map();
   const sentJobs = new Set();
+  const extractedJobs = new Set();
+  const releasableJobs = new Set();
   let tabId = 0;
 
   globalThis.setInterval = () => 1;
@@ -42,7 +46,11 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
       clear: () => {}
     },
     tabs: {
-      create: async () => ({ id: ++tabId }),
+      create: async (options) => {
+        const tab = { id: ++tabId, ...options };
+        createdTabs.push(tab);
+        return tab;
+      },
       get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
       sendMessage: async (id, message) => {
         sentToTabs.push({ id, message });
@@ -50,6 +58,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
           case "yoetz_probe":
             return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT", text: "" } };
           case "yoetz_prepare_job":
+            jobTabs.set(message.job.job_id, id);
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
             return { ok: true, payload: verifiedSolProSelection() };
@@ -65,11 +74,14 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
               }
             };
           case "yoetz_extract_response":
+            extractedJobs.add(message.job.job_id);
             return {
               ok: true,
-              payload: sentJobs.has(message.job.job_id)
+              payload: sentJobs.has(message.job.job_id) && releasableJobs.has(message.job.job_id)
                 ? { method: "assistant_dom_fallback", text: `answer ${message.job.job_id}`, is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0, conversation_id: `conv-${message.job.job_id}` }
-                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+                : sentJobs.has(message.job.job_id)
+                  ? { method: "assistant_dom_fallback", text: `partial ${message.job.job_id}`, is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0, conversation_id: `conv-${message.job.job_id}` }
+                  : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
             };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
@@ -98,8 +110,8 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     for (const jobId of jobs) {
       port.emit(envelope("job_start", jobId, {
         prompt: `prompt ${jobId}`,
-        wait_interval_ms: 500,
-        wait_timeout_ms: 2500
+        wait_interval_ms: 50,
+        wait_timeout_ms: 5000
       }));
     }
     await eventually(() => port.messages.filter((message) => message.type === "job_progress" && message.payload.phase === "ready_for_file").length === 2);
@@ -114,6 +126,21 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
         bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
       }));
     }
+    await eventually(() => sentJobs.size === 2 && extractedJobs.size === 2);
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    assert.notEqual(jobTabs.get("job_a"), jobTabs.get("job_b"));
+    assert.deepEqual(createdTabs.map((tab) => tab.active), [false, false]);
+
+    releasableJobs.add("job_b");
+    await eventually(() => port.messages.some((message) =>
+      message.job_id === "job_b" && ["job_complete", "job_error"].includes(message.type)
+    ));
+    assert.equal(
+      port.messages.find((message) => message.type === "job_error" && message.job_id === "job_b"),
+      undefined
+    );
+    assert.equal(port.messages.some((message) => message.type === "job_complete" && message.job_id === "job_a"), false);
+    releasableJobs.add("job_a");
     await eventually(() => port.messages.filter((message) => message.type === "job_complete").length === 2);
     assert.deepEqual(
       port.messages.filter((message) => message.type === "job_file_chunk_ack").map((message) => message.job_id).sort(),
@@ -136,6 +163,14 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
       "https://chatgpt.com/c/conv-job_a"
     );
     assert.equal(sentToTabs.filter((item) => item.message.type === "yoetz_upload_file").length, 2);
+    for (const jobId of jobs) {
+      const ownedTabIds = new Set(
+        sentToTabs
+          .filter((item) => item.message.job?.job_id === jobId)
+          .map((item) => item.id)
+      );
+      assert.deepEqual([...ownedTabIds], [jobTabs.get(jobId)], `${jobId} must remain on its own tab`);
+    }
     assert.equal(
       sentToTabs.find((item) => item.message.type === "yoetz_configure_model" && item.message.job.job_id === "job_b")?.message.job.model,
       "gpt-5-6-sol-pro"
@@ -5594,13 +5629,15 @@ test("service worker preserves terminal_delivery_lost jobs on restore", async ()
   }
 });
 
-test("service worker cancelJob clicks stop, removes tab, and evicts the in-memory job", async () => {
+test("service worker cancelJob isolates one of two active ChatGPT jobs", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
   const removedTabs = [];
+  const jobTabs = new Map();
+  const sentJobs = new Set();
   let createdTabId = 0;
-  let sent = false;
+  let survivorCanComplete = false;
   globalThis.chrome = chromeStub({
     port,
     tabs: {
@@ -5615,21 +5652,22 @@ test("service worker cancelJob clicks stop, removes tab, and evicts the in-memor
           case "yoetz_probe":
             return { ok: true, payload: {} };
           case "yoetz_prepare_job":
+            jobTabs.set(message.job.job_id, id);
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
             return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
-            sent = true;
+            sentJobs.add(message.job.job_id);
             return { ok: true, payload: { sent: true } };
           case "yoetz_extract_response":
-            // Keep the response perpetually "still generating" so the worker
-            // remains in waitForResponse until cancel arrives.
             return {
               ok: true,
-              payload: sent
-                ? { method: "assistant_dom_fallback", text: "partial...", is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0 }
+              payload: sentJobs.has(message.job.job_id)
+                ? survivorCanComplete && message.job.job_id === "job_survivor_b"
+                  ? { method: "assistant_dom_fallback", text: "survivor complete", is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0 }
+                  : { method: "assistant_dom_fallback", text: `partial ${message.job.job_id}`, is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0 }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
             };
           case "yoetz_cancel_send":
@@ -5645,26 +5683,28 @@ test("service worker cancelJob clicks stop, removes tab, and evicts the in-memor
     await import(`../src/service-worker.js?cancel_kills_tab=${Date.now()}`);
     await eventually(() => port.messages.some((m) => m.type === "hello"));
 
-    port.emit(envelope("job_start", "job_cancel_a", {
-      prompt: "prompt",
-      wait_interval_ms: 50,
-      wait_timeout_ms: 60000
-    }));
-    await eventually(() => port.messages.some((m) => m.payload?.phase === "ready_for_file"));
+    const jobs = ["job_cancel_a", "job_survivor_b"];
+    for (const jobId of jobs) {
+      port.emit(envelope("job_start", jobId, {
+        prompt: `prompt ${jobId}`,
+        wait_interval_ms: 50,
+        wait_timeout_ms: 60000
+      }));
+    }
+    await eventually(() => port.messages.filter((m) => m.payload?.phase === "ready_for_file").length === 2);
 
-    port.emit(envelope("job_file_chunk", "job_cancel_a", {
-      sequence: 0,
-      total_chunks: 1,
-      total_bytes: 4,
-      filename: "job_cancel_a.md",
-      mime_type: "text/markdown",
-      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
-    }));
-    // Wait for the prompt to be sent so the job is mid-response when we cancel.
-    await eventually(() => sent);
-    // Wait for at least one extract_response cycle so the job is firmly inside
-    // waitForResponse before cancel arrives.
-    await eventually(() => sentToTabs.some((m) => m.type === "yoetz_extract_response"));
+    for (const jobId of jobs) {
+      port.emit(envelope("job_file_chunk", jobId, {
+        sequence: 0,
+        total_chunks: 1,
+        total_bytes: 4,
+        filename: `${jobId}.md`,
+        mime_type: "text/markdown",
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+      }));
+    }
+    await eventually(() => sentJobs.size === 2);
+    await eventually(() => jobs.every((jobId) => sentToTabs.some((m) => m.type === "yoetz_extract_response" && m.jobId === jobId)));
 
     port.emit(envelope("job_cancel", "job_cancel_a"));
 
@@ -5675,11 +5715,19 @@ test("service worker cancelJob clicks stop, removes tab, and evicts the in-memor
       sentToTabs.some((m) => m.type === "yoetz_cancel_send" && m.jobId === "job_cancel_a"),
       "expected service worker to forward yoetz_cancel_send to the content script"
     );
-    assert.deepEqual(removedTabs, [createdTabId],
-      "expected service worker to remove the ChatGPT tab on cancel");
+    assert.deepEqual(removedTabs, [jobTabs.get("job_cancel_a")],
+      "expected service worker to remove only the cancelled ChatGPT tab");
+    assert.equal(sentToTabs.some((m) => m.type === "yoetz_cancel_send" && m.jobId === "job_survivor_b"), false);
+    assert.equal(port.messages.some((m) => m.type === "job_cancel" && m.job_id === "job_survivor_b"), false);
     const cancelEnvelope = port.messages.find((m) => m.type === "job_cancel" && m.job_id === "job_cancel_a");
     assert.equal(cancelEnvelope.payload.cancelled, true);
     assert.equal(cancelEnvelope.payload.stop_clicked, true);
+
+    survivorCanComplete = true;
+    await eventually(() => port.messages.some((m) => m.type === "job_complete" && m.job_id === "job_survivor_b"));
+    const survivor = port.messages.find((m) => m.type === "job_complete" && m.job_id === "job_survivor_b");
+    assert.equal(survivor.payload.response, "survivor complete");
+    assert.notEqual(jobTabs.get("job_cancel_a"), jobTabs.get("job_survivor_b"));
 
     // Subsequent extract_response for the cancelled job_id must surface
     // "unknown job" — the in-memory map can no longer carry a cancelled entry.
