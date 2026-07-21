@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use fs2::FileExt;
 use jsonschema::Validator;
 use litellm_rust::{
     ChatContentPart, ChatContentPartFile, ChatContentPartImageUrl, ChatContentPartText, ChatFile,
@@ -11,7 +12,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -51,6 +52,7 @@ use http::send_json;
 /// simple queries when no explicit --max-output-tokens is provided.
 const REGISTRY_OUTPUT_TOKENS_CAP: usize = 16384;
 const DEFAULT_CHATGPT_RECIPE_PROMPT: &str = "Review the attached file and provide your analysis.";
+const BROWSER_RECIPE_SESSION_LOCK_FILENAME: &str = ".browser-recipe.lock";
 
 #[derive(Parser)]
 #[command(
@@ -2713,6 +2715,37 @@ fn browser_recipe_artifact_paths(bundle_path: Option<&Path>) -> Option<ArtifactP
     })
 }
 
+#[derive(Debug)]
+struct BrowserRecipeSessionLease {
+    _file: File,
+}
+
+fn acquire_browser_recipe_session_lease(
+    bundle_path: Option<&Path>,
+) -> Result<Option<BrowserRecipeSessionLease>> {
+    let Some(artifacts) = browser_recipe_artifact_paths(bundle_path) else {
+        return Ok(None);
+    };
+    let session_dir = PathBuf::from(artifacts.session_dir);
+    let lock_path = session_dir.join(BROWSER_RECIPE_SESSION_LOCK_FILENAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("open browser recipe session lock {}", lock_path.display()))?;
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(BrowserRecipeSessionLease { _file: file })),
+        Err(err) if err.kind() == io::ErrorKind::WouldBlock => bail!(
+            "session_busy: browser recipe session {} already has an active writer; use one session directory per parallel run",
+            session_dir.display()
+        ),
+        Err(err) => Err(err)
+            .with_context(|| format!("lock browser recipe session {}", lock_path.display())),
+    }
+}
+
 fn maybe_write_followup_session_metadata(
     recipe_args: &BrowserRecipeArgs,
     current_prompt_hash: Option<&str>,
@@ -3173,8 +3206,7 @@ fn handle_browser_extension(
     let (kind, payload) = match args.command {
         BrowserExtensionCommand::Setup(args) => {
             let recipe = extension_site_scope(args.chatgpt, args.claude)?;
-            let install = browser_extension_native::install_host()?;
-            let extension_update = browser_extension_native::prepare_managed_chatgpt_extension()?;
+            let (install, extension_update) = browser_extension_native::setup_extension()?;
             let extension_dir = extension_update.extension_dir.clone();
             let source_dir = extension_update.source_dir.clone();
             let source_version = extension_update.source_version.clone();
@@ -4165,6 +4197,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             }
         }
         BrowserCommand::Recipe(recipe_args) => {
+            let _session_lease =
+                acquire_browser_recipe_session_lease(recipe_args.bundle.as_deref())?;
             let recipe_path = browser::resolve_recipe(&recipe_args.recipe)
                 .with_context(|| format!("resolve recipe {:?}", recipe_args.recipe))?;
             let content = fs::read_to_string(&recipe_path)
@@ -5187,6 +5221,39 @@ mod tests {
             artifacts.response_json.as_deref(),
             Some(expected_response_json.as_str())
         );
+    }
+
+    #[test]
+    fn browser_recipe_session_lease_rejects_concurrent_writers() {
+        let dir = TempDir::new().unwrap();
+        let bundle_md = dir.path().join("bundle.md");
+        fs::write(&bundle_md, "# bundle").unwrap();
+        fs::write(dir.path().join("bundle.json"), "{}").unwrap();
+
+        let first = acquire_browser_recipe_session_lease(Some(&bundle_md))
+            .unwrap()
+            .expect("managed bundle session should be locked");
+        let error = acquire_browser_recipe_session_lease(Some(&bundle_md)).unwrap_err();
+        assert!(error.to_string().contains("session_busy"));
+        assert!(error
+            .to_string()
+            .contains(dir.path().to_string_lossy().as_ref()));
+
+        drop(first);
+        assert!(acquire_browser_recipe_session_lease(Some(&bundle_md))
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn browser_recipe_session_lease_ignores_standalone_bundles() {
+        let dir = TempDir::new().unwrap();
+        let bundle = dir.path().join("review.md");
+        fs::write(&bundle, "# review").unwrap();
+
+        assert!(acquire_browser_recipe_session_lease(Some(&bundle))
+            .unwrap()
+            .is_none());
     }
 
     #[test]

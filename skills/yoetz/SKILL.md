@@ -439,8 +439,11 @@ each job owns a separate background tab. Profile selectors only choose among
 loaded profiles and are not required for ChatGPT parallelism. Claude is
 asymmetric because each job must keep its tab active through upload and accepted
 send; serialize Claude recipes within one loaded profile until per-profile
-activation coordination is available. Setup, update, and reload remain
-machine-global single-writer operations for both sites.
+activation coordination is available. Give every parallel recipe a distinct
+Yoetz bundle session directory; reusing one managed `bundle.md` fails with
+`session_busy` before browser work. Recipe runs share the lifecycle lock, while
+setup, update, reload, and auto-heal require its exclusive side and fail closed
+instead of changing the loaded artifact mid-run.
 
 ### Cookie sync (legacy fallback)
 
