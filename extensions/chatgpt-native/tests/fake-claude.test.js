@@ -119,7 +119,7 @@ test("fake Claude upload waits for the committed chip and re-enabled send", asyn
   }
 });
 
-test("fake Claude model picker drives hover-only Max and Thinking then closes", async () => {
+test("fake Claude model picker drives hover-only Max then closes", async () => {
   const fixture = makeClaudeModelFixture();
   const previousPointerEvent = globalThis.PointerEvent;
   const previousMouseEvent = globalThis.MouseEvent;
@@ -132,11 +132,33 @@ test("fake Claude model picker drives hover-only Max and Thinking then closes", 
 
     assert.equal(result.status, "selected");
     assert.equal(result.model_used, "Fable 5 Max");
-    assert.equal(result.thinkingChecked, true);
-    assert.equal(fixture.thinking.getAttribute("aria-checked"), "true");
-    assert.ok(fixture.hoverEvents >= 3, "effort submenu must be re-hovered for Max, Thinking, and verification");
+    assert.equal(result.modelVerified, true);
+    assert.equal(result.maxVerified, true);
+    assert.ok(fixture.hoverEvents >= 3, "effort submenu must be re-hovered for Max and verification");
     assert.equal(fixture.sawMousePointer, true);
     assert.equal(fixture.modelButton.getAttribute("aria-expanded"), "false");
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
+test("fake Claude model picker accepts Fable 5 Max without a Thinking control", async () => {
+  const fixture = makeClaudeModelFixture();
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    const result = await configureModelState(fixture.root, { model_selection_timeout_ms: 25 });
+
+    assert.equal(result.status, "selected");
+    assert.equal(result.modelVerified, true);
+    assert.equal(result.maxVerified, true);
+    assert.equal(result.model_used, "Fable 5 Max");
   } finally {
     globalThis.PointerEvent = previousPointerEvent;
     globalThis.MouseEvent = previousMouseEvent;
@@ -165,28 +187,8 @@ test("fake Claude model picker waits for a delayed menu close before reopening",
   }
 });
 
-test("fake Claude model picker waits for Thinking to render before verification", async () => {
-  const fixture = makeClaudeModelFixture({ delayedThinkingRender: true });
-  const previousPointerEvent = globalThis.PointerEvent;
-  const previousMouseEvent = globalThis.MouseEvent;
-  const previousKeyboardEvent = globalThis.KeyboardEvent;
-  globalThis.PointerEvent = FakePointerEvent;
-  globalThis.MouseEvent = FakeMouseEvent;
-  globalThis.KeyboardEvent = FakeKeyboardEvent;
-  try {
-    const result = await configureModelState(fixture.root, { model_selection_timeout_ms: 250 });
-
-    assert.equal(result.status, "selected");
-    assert.equal(result.thinkingChecked, true);
-  } finally {
-    globalThis.PointerEvent = previousPointerEvent;
-    globalThis.MouseEvent = previousMouseEvent;
-    globalThis.KeyboardEvent = previousKeyboardEvent;
-  }
-});
-
 test("fake Claude model picker preserves an already exact selection without clicking options", async () => {
-  const fixture = makeClaudeModelFixture({ initiallyConfigured: true, delayedThinkingRender: true });
+  const fixture = makeClaudeModelFixture({ initiallyConfigured: true });
   const previousPointerEvent = globalThis.PointerEvent;
   const previousMouseEvent = globalThis.MouseEvent;
   const previousKeyboardEvent = globalThis.KeyboardEvent;
@@ -200,7 +202,6 @@ test("fake Claude model picker preserves an already exact selection without clic
     assert.equal(result.model_used, "Fable 5 Max");
     assert.equal(fixture.fableClicks, 0);
     assert.equal(fixture.maxClicks, 0);
-    assert.equal(fixture.thinkingClicks, 0);
     assert.equal(fixture.modelButton.getAttribute("aria-expanded"), "false");
   } finally {
     globalThis.PointerEvent = previousPointerEvent;
@@ -247,6 +248,26 @@ test("fake Claude missing Fable returns unavailable with live options", async ()
     assert.ok(result.options.includes("Sonnet 5"));
     assert.match(result.warning, /live options: Sonnet 5/);
     assert.equal(fixture.modelButton.getAttribute("aria-expanded"), "false");
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
+test("fake Claude model picker refuses to proceed without a verifiable Max option", async () => {
+  const fixture = makeClaudeModelFixture({ includeMax: false });
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    await assert.rejects(
+      configureModelState(fixture.root, { model_selection_timeout_ms: 1 }),
+      /did not reach the requested state/
+    );
   } finally {
     globalThis.PointerEvent = previousPointerEvent;
     globalThis.MouseEvent = previousMouseEvent;
@@ -398,17 +419,16 @@ test("fake Claude conversation loader preserves changed and unavailable taxonomy
   }
 });
 
-test("fake Claude model acceptance requires Fable 5, Max, and Thinking together", () => {
+test("fake Claude model acceptance requires Fable 5 and Max together", () => {
   const selected = {
     status: "selected",
     requested_model: "fable-5-max",
     model_used: "Fable 5 Max",
     modelVerified: true,
-    maxVerified: true,
-    thinkingChecked: true
+    maxVerified: true
   };
   assert.equal(claudeSiteAdapter.isAcceptableModelSelection(selected), true);
-  for (const field of ["modelVerified", "maxVerified", "thinkingChecked"]) {
+  for (const field of ["modelVerified", "maxVerified"]) {
     assert.equal(
       claudeSiteAdapter.isAcceptableModelSelection({ ...selected, [field]: false }),
       false,
@@ -504,19 +524,17 @@ class FakeKeyboardEvent extends Event {
 
 function makeClaudeModelFixture({
   includeFable = true,
+  includeMax = true,
   delayedSelectionClose = false,
-  delayedThinkingRender = false,
   ignoreEscape = false,
   initiallyConfigured = false
 } = {}) {
   let menuOpen = false;
   let effortHovered = false;
-  let thinkingVisible = false;
   let hoverEvents = 0;
   let sawMousePointer = false;
   let fableClicks = 0;
   let maxClicks = 0;
-  let thinkingClicks = 0;
 
   const control = (attrs, text, onClick = () => {}) => ({
     attrs: { ...attrs },
@@ -547,11 +565,6 @@ function makeClaudeModelFixture({
         if (event.pointerType === "mouse" && event.pointerId === 1 && event.clientX > 0 && event.clientY > 0) {
           sawMousePointer = true;
           effortHovered = true;
-          if (delayedThinkingRender) {
-            setTimeout(() => { thinkingVisible = true; }, 10);
-          } else {
-            thinkingVisible = true;
-          }
         }
       }
       if (event.type === "keydown" && event.key === "Escape" && !ignoreEscape) {
@@ -569,13 +582,11 @@ function makeClaudeModelFixture({
       if (modelButton.getAttribute("aria-expanded") === "true") {
         menuOpen = false;
         effortHovered = false;
-        thinkingVisible = false;
         modelButton.setAttribute("aria-expanded", "false");
         return;
       }
       menuOpen = true;
       effortHovered = false;
-      thinkingVisible = false;
       modelButton.setAttribute("aria-expanded", "true");
     }
   );
@@ -603,12 +614,7 @@ function makeClaudeModelFixture({
     modelButton.innerText = "Fable 5 Max";
     modelButton.textContent = modelButton.innerText;
     effortHovered = false;
-    thinkingVisible = false;
     closeAfterSelection();
-  });
-  const thinking = control({ role: "switch", "aria-label": "Thinking", "aria-checked": initiallyConfigured ? "true" : "false" }, "Thinking", (element) => {
-    thinkingClicks += 1;
-    element.setAttribute("aria-checked", "true");
   });
   const root = {
     activeElement: modelButton,
@@ -617,7 +623,7 @@ function makeClaudeModelFixture({
       if (selector === "[data-testid='model-selector-dropdown']") return modelButton;
       if (selector === "[data-testid='effort-menu-trigger']") return menuOpen ? effort : null;
       if (selector === "[role='menuitemradio'][data-testid='effort-option-max']") {
-        return menuOpen && effortHovered ? max : null;
+        return includeMax && menuOpen && effortHovered ? max : null;
       }
       return null;
     },
@@ -627,18 +633,15 @@ function makeClaudeModelFixture({
         return includeFable ? [fable, sonnet] : [sonnet];
       }
       if (selector === "[role='menuitemradio'][aria-checked='true']") {
-        return [fable, sonnet, max].filter((element) => element.getAttribute("aria-checked") === "true");
-      }
-      if (selector === "span[role='switch'][aria-checked]") {
-        return effortHovered && thinkingVisible ? [thinking] : [];
+        return [fable, sonnet, includeMax ? max : null]
+          .filter((element) => element?.getAttribute("aria-checked") === "true");
       }
       if (selector === "[role='menuitem'], [role='menuitemradio'], button, [role='switch']") {
         return [
           includeFable ? fable : null,
           sonnet,
           effort,
-          effortHovered ? max : null,
-          effortHovered && thinkingVisible ? thinking : null
+          includeMax && effortHovered ? max : null
         ].filter(Boolean);
       }
       return [];
@@ -652,10 +655,8 @@ function makeClaudeModelFixture({
   return {
     root,
     modelButton,
-    thinking,
     get fableClicks() { return fableClicks; },
     get maxClicks() { return maxClicks; },
-    get thinkingClicks() { return thinkingClicks; },
     get hoverEvents() { return hoverEvents; },
     get sawMousePointer() { return sawMousePointer; }
   };

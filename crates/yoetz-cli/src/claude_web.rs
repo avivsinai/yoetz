@@ -245,23 +245,12 @@ pub fn build_select_max_function() -> String {
 }"##.to_string()
 }
 
-pub fn build_ensure_thinking_on_function() -> String {
-    r##"() => {
-  const visible = (el) => !!el && el.getClientRects().length > 0;
-  const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-  const switches = Array.from(document.querySelectorAll("span[role='switch'][aria-checked]"))
-    .filter(visible);
-  const thinking = switches.find((el) => /Thinking/i.test(normalize(
-    el.getAttribute("aria-label") || el.closest("[role='menuitem']")?.innerText || el.parentElement?.innerText
-  )));
-  if (!thinking) return { status: "unavailable", switches: switches.map((el) => normalize(el.getAttribute("aria-label") || el.parentElement?.innerText)).slice(0, 20) };
-  const before = thinking.getAttribute("aria-checked");
-  if (before !== "true") thinking.click();
-  return { status: before === "true" ? "already_on" : "clicked", before };
-}"##.to_string()
-}
-
-pub fn build_verify_fable_max_thinking_function() -> String {
+/// Re-read both exact Claude model postconditions after selection.
+///
+/// Live picker DOM captured 2026-07-21 exposes Fable 5 as a checked
+/// `menuitemradio` and Max as checked `effort-option-max`; it has no independent
+/// Thinking control. A successful click is never proof for either remaining leg.
+pub fn build_verify_fable_max_function() -> String {
     format!(
         r##"() => {{
   const visible = (el) => !!el && el.getClientRects().length > 0;
@@ -275,19 +264,12 @@ pub fn build_verify_fable_max_thinking_function() -> String {
   const modelSelected = Array.from(document.querySelectorAll("[role='menuitemradio'][aria-checked='true']"))
     .some((el) => normalize(el.innerText || el.textContent).toLowerCase().startsWith("fable 5"));
   const maxOption = document.querySelector("[role='menuitemradio'][data-testid='effort-option-max']");
-  const switches = Array.from(document.querySelectorAll("span[role='switch'][aria-checked]"))
-    .filter(visible);
-  const thinking = switches.find((el) => /Thinking/i.test(normalize(
-    el.getAttribute("aria-label") || el.closest("[role='menuitem']")?.innerText || el.parentElement?.innerText
-  )));
-  const thinkingChecked = thinking?.getAttribute("aria-checked") === "true";
   const modelVerified = modelSelected && /\bFable 5\b/i.test(modelChip);
   const maxVerified = maxOption?.getAttribute("aria-checked") === "true" && /\bMax\b/i.test(modelChip);
   return {{
-    status: modelVerified && maxVerified && thinkingChecked ? "selected" : "mismatch",
-    modelVerified, maxVerified, thinkingChecked, modelChip, effortChip,
+    status: modelVerified && maxVerified ? "selected" : "mismatch",
+    modelVerified, maxVerified, modelChip, effortChip,
     options: visibleText.slice(0, 50),
-    thinkingAriaChecked: thinking?.getAttribute("aria-checked") || null,
   }};
 }}"##,
         model_selector = serde_json::to_string(MODEL_SELECTOR).expect("selector JSON")
@@ -298,8 +280,7 @@ pub fn model_selection_status(value: &Value) -> WebModelSelectionStatus {
     match value.get("status").and_then(Value::as_str) {
         Some("selected")
             if value.get("modelVerified").and_then(Value::as_bool) == Some(true)
-                && value.get("maxVerified").and_then(Value::as_bool) == Some(true)
-                && value.get("thinkingChecked").and_then(Value::as_bool) == Some(true) =>
+                && value.get("maxVerified").and_then(Value::as_bool) == Some(true) =>
         {
             WebModelSelectionStatus::Selected
         }
@@ -439,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn model_scripts_bind_fable_max_hover_fallback_and_thinking_postcondition() {
+    fn model_scripts_bind_fable_max_hover_fallback_and_exact_postconditions() {
         assert!(build_open_model_menu_function().contains("model-selector-dropdown"));
         assert!(build_select_fable_function().contains("fable 5"));
         assert!(build_mark_effort_parent_function().contains(EFFORT_HOVER_MARKER));
@@ -457,21 +438,19 @@ mod tests {
         assert!(hover.contains("already_open"));
         assert!(hover.contains("effort-option-"));
         assert!(build_select_max_function().contains("Max"));
-        let thinking = build_ensure_thinking_on_function();
-        assert!(thinking.contains("Thinking"));
-        assert!(thinking.contains("aria-checked"));
-        let verify = build_verify_fable_max_thinking_function();
-        assert!(verify.contains("modelVerified && maxVerified && thinkingChecked"));
+        let verify = build_verify_fable_max_function();
+        assert!(verify.contains("modelVerified && maxVerified"));
+        assert!(!verify.contains("thinkingChecked"));
     }
 
     #[test]
-    fn selected_status_requires_all_three_verified_postconditions() {
-        let selected = json!({"status":"selected","modelVerified":true,"maxVerified":true,"thinkingChecked":true});
+    fn selected_status_requires_fable_and_max_verified_postconditions() {
+        let selected = json!({"status":"selected","modelVerified":true,"maxVerified":true});
         assert_eq!(
             model_selection_status(&selected),
             WebModelSelectionStatus::Selected
         );
-        for key in ["modelVerified", "maxVerified", "thinkingChecked"] {
+        for key in ["modelVerified", "maxVerified"] {
             let mut mismatch = selected.clone();
             mismatch[key] = Value::Bool(false);
             assert_eq!(

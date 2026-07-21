@@ -264,7 +264,7 @@ Browser recipes let Yoetz use web-only model surfaces from the terminal. The
 built-in ChatGPT recipe targets GPT-5.6 Sol with Pro intelligence and is
 fail-closed: if Yoetz cannot prove the requested surface is available, it stops
 instead of silently downgrading. The built-in Claude recipe applies the same
-contract to claude.ai with exactly Fable 5, Effort Max, and Thinking enabled.
+contract to claude.ai with exactly Fable 5 and Effort Max.
 
 ```bash
 yoetz browser check --format json

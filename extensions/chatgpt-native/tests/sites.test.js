@@ -50,7 +50,6 @@ test("Claude adapter owns UUID conversations, exact model policy, and DOM-only f
     requested_model: "fable-5-max",
     modelVerified: true,
     maxVerified: true,
-    thinkingChecked: true,
     model_used: "Fable 5 Max"
   }), true);
   assert.equal(adapter.isAcceptableModelSelection({
@@ -58,7 +57,6 @@ test("Claude adapter owns UUID conversations, exact model policy, and DOM-only f
     requested_model: "fable-5-max",
     modelVerified: true,
     maxVerified: false,
-    thinkingChecked: true,
     model_used: "Fable 5 High"
   }), false);
   assert.equal(adapter.completion.supportsBackendApiFallback, false);

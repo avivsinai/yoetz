@@ -235,33 +235,26 @@ export async function configureModelState(root, job = {}) {
   await settleAfterMenuSelection(modelButton, timeoutMs);
 
   await openModelMenu(modelButton, timeoutMs);
-  let effortTrigger = await waitFor(() => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
+  const effortTrigger = await waitFor(() => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
   dispatchHover(effortTrigger);
   const max = await waitFor(() => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"), timeoutMs);
   max.click();
   await settleAfterMenuSelection(modelButton, timeoutMs);
-
-  await openModelMenu(modelButton, timeoutMs);
-  effortTrigger = await waitFor(() => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
-  dispatchHover(effortTrigger);
-  const thinking = await waitFor(() => findThinkingSwitch(root), timeoutMs);
-  if (thinking.getAttribute("aria-checked") !== "true") {
-    thinking.click();
-  }
-  await sleep(MODEL_MENU_SETTLE_MS);
 
   await closeModelMenu(root, modelButton);
   await sleep(MODEL_MENU_SETTLE_MS);
   await openModelMenu(modelButton, timeoutMs);
   const verificationEffort = await waitFor(() => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
   dispatchHover(verificationEffort);
+  // Live picker DOM captured 2026-07-21 exposes Fable 5 as a checked
+  // menuitemradio and Max as effort-option-max; it has no independent Thinking
+  // control. Keep both remaining legs as positive, post-click re-reads.
   await waitFor(() => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"), timeoutMs);
-  await waitFor(() => findThinkingSwitch(root), timeoutMs);
   const diagnostics = modelSelectionDiagnostics(root);
   const menuClosed = await closeModelMenu(root, modelButton);
   await sleep(MODEL_MENU_SETTLE_MS);
   return {
-    status: diagnostics.modelVerified && diagnostics.maxVerified && diagnostics.thinkingChecked && menuClosed
+    status: diagnostics.modelVerified && diagnostics.maxVerified && menuClosed
       ? "selected"
       : "mismatch",
     requested_model: "fable-5-max",
@@ -388,8 +381,6 @@ export function modelSelectionDiagnostics(root = document) {
     && selectedModels.some((element) => normalizeText(element.innerText || element.textContent).toLowerCase().startsWith("fable 5"));
   const maxOption = root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']");
   const maxVerified = maxOption?.getAttribute("aria-checked") === "true" && /\bMax\b/i.test(modelChip);
-  const thinking = findThinkingSwitch(root);
-  const thinkingChecked = thinking?.getAttribute("aria-checked") === "true";
   const options = visibleElements(root, "[role='menuitem'], [role='menuitemradio'], button, [role='switch']")
     .map((element) => normalizeText(element.innerText || element.textContent))
     .filter(Boolean)
@@ -397,10 +388,8 @@ export function modelSelectionDiagnostics(root = document) {
   return {
     modelVerified,
     maxVerified,
-    thinkingChecked,
     modelChip,
-    options,
-    thinkingAriaChecked: thinking?.getAttribute("aria-checked") ?? null
+    options
   };
 }
 
@@ -509,13 +498,8 @@ async function verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs) {
   if (!max) {
     return null;
   }
-  const thinking = await waitForOptional(() => findThinkingSwitch(root), timeoutMs);
-  if (!thinking) {
-    return null;
-  }
-
   const diagnostics = modelSelectionDiagnostics(root);
-  if (!diagnostics.modelVerified || !diagnostics.maxVerified || !diagnostics.thinkingChecked) {
+  if (!diagnostics.modelVerified || !diagnostics.maxVerified) {
     return null;
   }
   const menuClosed = await closeModelMenu(root, modelButton);
@@ -528,15 +512,6 @@ async function verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs) {
     ...(menuClosed ? {} : { warning: "Claude model menu remained open after Escape; refusing to send" }),
     ...diagnostics
   };
-}
-
-function findThinkingSwitch(root) {
-  return visibleElements(root, "span[role='switch'][aria-checked]")
-    .find((element) => /Thinking/i.test(normalizeText(
-      element.getAttribute("aria-label")
-      || element.closest("[role='menuitem']")?.innerText
-      || element.parentElement?.innerText
-    )));
 }
 
 function dispatchHover(element) {
