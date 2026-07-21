@@ -7,12 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.41] - 2026-07-21
 ### Fixed
 
 - Restored built-in Claude runs after claude.ai removed the independent
   Thinking picker control. Native-extension, CDP, dev-browser, and manual
   transports now fail closed on the live exact contract: Fable 5 plus Effort
   Max, each positively re-read after selection.
+
 
 ## [0.5.40] - 2026-07-21
 ### Fixed
