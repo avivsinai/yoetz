@@ -122,14 +122,12 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   side of the lifecycle lock; setup/update/reload/auto-heal require the
   exclusive side and fail closed if a recipe is active. Recipe lanes may run
   only against one frozen loaded artifact.
-- Independent ChatGPT recipes may run concurrently through one connected
-  extension profile: each job owns a separate background tab. Profile selectors
-  route among loaded profiles; they are not required for ChatGPT parallelism.
+- Independent ChatGPT and Claude recipes may run concurrently through one
+  connected extension profile: each job owns a separate background tab. Profile
+  selectors route among loaded profiles; they are not required for recipe
+  parallelism.
   Every parallel recipe must use a distinct Yoetz bundle session directory;
   reusing one managed `bundle.md` fails with `session_busy` before browser work.
-  Claude is asymmetric because its tab must stay active through upload and
-  accepted send. Until per-profile activation coordination is implemented,
-  serialize Claude recipes within one loaded Chrome profile.
 - ChatGPT and Claude conversation resume use
   `--var conversation=<site-specific-id|url>` or `--followup`
   (native-extension only, no automatic context management); callers own the
@@ -140,11 +138,12 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   is hidden/zero-size, so resolve the exact selector rather than accessibility
   snapshots; use the native `input.files` setter so page-world handlers observe
   files assigned from the extension's isolated world.
-- Claude jobs currently open active through upload and accepted send, then
-  restore the previous tab before waiting for the response; ChatGPT jobs remain
-  background. A July 2026 live probe proved Claude's SPA, Fable 5, and Effort
-  Max all mount and verify in a never-focused tab. Background upload, send, and
-  response waiting remain unverified.
+- Claude jobs open in background tabs. A July 2026 live probe completed an
+  entire Claude job in a never-focused tab: SPA mount, Fable 5 and Effort Max
+  verification, file upload, accepted send, response observation, and final
+  extraction all succeeded. Service-worker coverage proves two Claude jobs use
+  distinct background tabs through overlapping phases and that cancelling one
+  does not affect the other.
   Base UI picker choreography needs settle pacing, attributed pointer-event
   hover fallback, and diagnostics for every verification leg. Early-exit and
   full-selection results must have the same acceptable shape.

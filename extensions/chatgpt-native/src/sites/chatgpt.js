@@ -212,6 +212,7 @@ export const chatgptSiteAdapter = Object.freeze({
   fetchConversationAnswer,
   tabActivation: Object.freeze({
     activateOnCreate: false,
+    // Explicit policy marker: background jobs never capture or restore focus.
     restorePreviousAfter: null
   }),
   auth: Object.freeze({

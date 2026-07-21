@@ -16,10 +16,9 @@ name: claude
 # thinking override stays rejected because the live picker has no independent
 # Thinking control. Picker opens are state-verified and paced; the model and Max
 # are re-read as visible aria-checked controls. Diagnostics expose every failed
-# leg. Claude tabs currently stay active through upload and accepted send, then
-# restore prior focus before the response wait. A July 2026 live probe proved
-# the SPA, Fable 5, and Max mount and verify in a never-focused tab; background
-# upload, send, and response waiting remain unverified.
+# leg. Claude tabs remain in the background for the full run. A July 2026 live
+# probe completed SPA mount, Fable 5 and Max verification, file upload, accepted
+# send, response observation, and final extraction in a never-focused tab.
 #
 # Conversation/followup: `conversation=<uuid|https://claude.ai/chat/<uuid>>`
 # and `--followup` are native-extension-only. Fallback transports reject them

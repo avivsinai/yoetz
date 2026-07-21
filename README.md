@@ -305,12 +305,12 @@ extension state. Recipe runs hold a shared lifecycle lock; setup, update,
 reload, and auto-heal require its exclusive side and fail with
 `extension_lifecycle_busy` instead of changing the loaded artifact mid-run.
 
-Independent ChatGPT recipe runs may share one connected extension profile: each
-job owns a separate background tab, and profile selectors are routing controls,
-not a prerequisite for parallelism. Claude is asymmetric because each job must
-keep its tab active through upload and accepted send. Until per-profile Claude
-activation coordination lands, serialize Claude recipe runs within one loaded
-Chrome profile. Both sites may run only against one frozen loaded artifact.
+Independent ChatGPT and Claude recipe runs may share one connected extension
+profile: each job owns a separate background tab, and profile selectors are
+routing controls, not a prerequisite for parallelism. A July 2026 live probe
+completed Claude model selection, file upload, accepted send, response
+observation, and final extraction without ever activating the run tab. Both
+sites may run only against one frozen loaded artifact.
 Give each parallel recipe its own Yoetz bundle session directory; reusing one
 managed `bundle.md` fails with `session_busy` rather than overwriting that
 session's `response.json` or `followup.json`.

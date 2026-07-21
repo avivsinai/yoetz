@@ -275,11 +275,8 @@ async function startJob(message) {
   const url = job.expected_conversation_id
     ? adapter.conversationJobUrl(job.expected_conversation_id, job.run_id)
     : adapter.jobUrl(job.run_id);
-  const tabActivation = await createJobTab(url, adapter);
-  const tab = tabActivation.tab;
+  const tab = await createJobTab(url, adapter);
   job.tab_id = tab.id;
-  job.previous_active_tab_id = tabActivation.previousTabId;
-  job.restore_previous_after = tabActivation.restorePreviousAfter;
   job.updated_at = Date.now();
   await persistJob(job);
   const inspectCommand = inspectCommandForJob(job);
@@ -475,7 +472,6 @@ async function runJobWithFile(job, file) {
     assertSubmittedConversationCurrent(job, sendResult);
     assertJobConnectionCurrent(job);
     if (job.cancelled) return;
-    await restorePreviousTabForJob(job, "send");
     const inspectCommand = inspectCommandForJob(job);
     if (!postNative(progress(job, "prompt_sent", {
       timeout_ms: responseWaitTimeoutMs(job),
@@ -1378,45 +1374,7 @@ async function waitForSiteTab(tabId, adapter) {
 async function createJobTab(url, adapter) {
   const policy = adapter.tabActivation ?? {};
   const activateOnCreate = policy.activateOnCreate === true;
-  const restorePreviousAfter = typeof policy.restorePreviousAfter === "string"
-    ? policy.restorePreviousAfter
-    : null;
-  let previousTabId = null;
-  if (activateOnCreate && restorePreviousAfter) {
-    try {
-      const [previousTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      previousTabId = previousTab?.id ?? null;
-    } catch {
-      // Capturing focus is best effort; mounting the site is the correctness gate.
-    }
-  }
-  const tab = await chrome.tabs.create({ url, active: activateOnCreate });
-  return { tab, previousTabId, restorePreviousAfter };
-}
-
-async function restorePreviousTabForJob(job, phase) {
-  if (job.restore_previous_after !== phase) {
-    return;
-  }
-  await restorePreviousTab({
-    tab: { id: job.tab_id },
-    previousTabId: job.previous_active_tab_id
-  });
-  job.previous_active_tab_id = null;
-  job.restore_previous_after = null;
-  job.updated_at = Date.now();
-  await persistJob(job);
-}
-
-async function restorePreviousTab({ tab, previousTabId }) {
-  if (previousTabId == null || previousTabId === tab?.id) {
-    return;
-  }
-  try {
-    await chrome.tabs.update(previousTabId, { active: true });
-  } catch {
-    // The user may have closed or moved the prior tab while the site mounted.
-  }
+  return chrome.tabs.create({ url, active: activateOnCreate });
 }
 
 async function waitForContentScript(tabId, adapter) {
