@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.40] - 2026-07-21
 ### Fixed
 
 - Reconciled ChatGPT's provisional `WEB:<uuid>` conversation id with the
@@ -34,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   parallelism. Claude remains asymmetric because its tab must stay active
   through upload and accepted send, so Claude recipes must still be serialized
   within one loaded Chrome profile until activation coordination lands.
+
 
 ## [0.5.39] - 2026-07-20
 ### Fixed
