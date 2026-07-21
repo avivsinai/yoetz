@@ -2490,7 +2490,9 @@ fn ensure_claude_fable_max_only(
     recipe_vars: &BTreeMap<String, String>,
 ) -> Result<()> {
     if recipe_args.model_strategy == chatgpt_recipe::ChatgptModelStrategy::Current {
-        bail!("Claude supports only Fable 5 with Max effort and Thinking on; --model-strategy current is not allowed");
+        bail!(
+            "Claude supports only Fable 5 with Max effort; --model-strategy current is not allowed"
+        );
     }
     let unsupported = ["model", "effort", "thinking"]
         .into_iter()
@@ -2498,7 +2500,7 @@ fn ensure_claude_fable_max_only(
         .collect::<Vec<_>>();
     if !unsupported.is_empty() {
         bail!(
-            "Claude supports only Fable 5 with Max effort and Thinking on; remove unsupported var(s): {}",
+            "Claude supports only Fable 5 with Max effort; remove unsupported var(s): {}",
             unsupported.join(", ")
         );
     }

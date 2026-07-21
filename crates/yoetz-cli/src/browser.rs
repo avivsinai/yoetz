@@ -2438,17 +2438,6 @@ fn run_claude_select_model(
     require_claude_status(&max, &["selected"], "Max effort selection")?;
     thread::sleep(Duration::from_millis(300));
 
-    open_claude_model_menu(connection, use_stealth, headed)?;
-    hover_claude_effort(connection, use_stealth, headed)?;
-    let thinking = run_claude_dom_function(
-        &claude_web::build_ensure_thinking_on_function(),
-        connection,
-        use_stealth,
-        headed,
-    )?;
-    require_claude_status(&thinking, &["already_on", "clicked"], "Thinking enable")?;
-    thread::sleep(Duration::from_millis(300));
-
     let _ = run_claude_dom_function(
         &claude_web::build_close_model_menu_function(),
         connection,
@@ -2459,7 +2448,7 @@ fn run_claude_select_model(
     open_claude_model_menu(connection, use_stealth, headed)?;
     hover_claude_effort(connection, use_stealth, headed)?;
     let verification = run_claude_dom_function(
-        &claude_web::build_verify_fable_max_thinking_function(),
+        &claude_web::build_verify_fable_max_function(),
         connection,
         use_stealth,
         headed,
@@ -2473,7 +2462,7 @@ fn run_claude_select_model(
     );
     if status != WebModelSelectionStatus::Selected {
         bail!(
-            "Claude exact model contract is unavailable or mismatched; required Fable 5 + Max + Thinking on; diagnostics={verification}"
+            "Claude exact model contract is unavailable or mismatched; required Fable 5 + Max; diagnostics={verification}"
         );
     }
     Ok(json!({

@@ -90,9 +90,10 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   `chrome-devtools-mcp`, then `dev-browser`, then `agent-browser`.
 - The `claude` recipe mirrors `chatgpt` end to end through the typed contract in
   `crates/yoetz-cli/src/claude_recipe.rs` and DOM builders in `claude_web.rs`.
-  Its only model target is Fable 5 + Effort Max + Thinking on. Selection is
-  fail-closed: re-read the model radio, `effort-option-max`, and Thinking
-  switch state; a successful click is never proof.
+  Its only model target is Fable 5 + Effort Max. Selection is fail-closed:
+  re-read the model radio and `effort-option-max`; a successful click is never
+  proof. Claude's July 2026 picker has no independent Thinking control; the
+  effort scale now expresses reasoning depth and Max is the strongest option.
 - Built-in web-recipe exception: when extension status for the selected site
   reports `connected`, `chrome-extension-native` is auto-selected as the only
   default transport and fails closed instead of falling through to CDP
@@ -139,13 +140,14 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   is hidden/zero-size, so resolve the exact selector rather than accessibility
   snapshots; use the native `input.files` setter so page-world handlers observe
   files assigned from the extension's isolated world.
-- Claude jobs must open active because its SPA may not mount in a never-focused
-  tab. Keep the tab active through upload and accepted send, then restore the
-  previous tab before waiting for the response; ChatGPT jobs remain background.
+- Claude jobs currently open active through upload and accepted send, then
+  restore the previous tab before waiting for the response; ChatGPT jobs remain
+  background. A July 2026 live probe proved Claude's SPA, Fable 5, and Effort
+  Max all mount and verify in a never-focused tab. Background upload, send, and
+  response waiting remain unverified.
   Base UI picker choreography needs settle pacing, attributed pointer-event
-  hover fallback, visibility-gated Thinking reads, and diagnostics for every
-  verification leg. Early-exit and full-selection results must have the same
-  acceptable shape.
+  hover fallback, and diagnostics for every verification leg. Early-exit and
+  full-selection results must have the same acceptable shape.
 - Claude finality requires the last assistant turn to be non-streaming and no
   `Stop response` control; the CDP path adds a bounded no-progress failure,
   while the native path fails at the response deadline. The copy control

@@ -323,7 +323,6 @@ test("service worker runs a Claude job through its adapter and probes the select
                 requested_model: "fable-5-max",
                 modelVerified: true,
                 maxVerified: true,
-                thinkingChecked: true,
                 model_used: "Fable 5 Max"
               }
             };
@@ -497,13 +496,11 @@ test("service worker surfaces Claude model mismatch legs in the job error", asyn
               payload: {
                 status: "mismatch",
                 requested_model: "fable-5-max",
-                model_used: "Fable 5 Max",
+                model_used: "Fable 5 High",
                 modelVerified: true,
-                maxVerified: true,
-                thinkingChecked: false,
-                modelChip: "Fable 5 Max",
-                thinkingAriaChecked: null,
-                options: ["Fable 5", "Max", "Thinking"]
+                maxVerified: false,
+                modelChip: "Fable 5 High",
+                options: ["Fable 5", "High", "Max"]
               }
             };
           default:
@@ -530,15 +527,12 @@ test("service worker surfaces Claude model mismatch legs in the job error", asyn
       message.type === "job_error" && message.job_id === "job_claude_mismatch"
     );
     assert.match(error.payload.message, /modelVerified=true/);
-    assert.match(error.payload.message, /maxVerified=true/);
-    assert.match(error.payload.message, /thinkingChecked=false/);
+    assert.match(error.payload.message, /maxVerified=false/);
     assert.deepEqual(error.payload.model_selection_diagnostics, {
       modelVerified: true,
-      maxVerified: true,
-      thinkingChecked: false,
-      modelChip: "Fable 5 Max",
-      thinkingAriaChecked: null,
-      options: ["Fable 5", "Max", "Thinking"]
+      maxVerified: false,
+      modelChip: "Fable 5 High",
+      options: ["Fable 5", "High", "Max"]
     });
   } finally {
     globalThis.chrome = originalChrome;

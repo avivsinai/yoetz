@@ -1520,11 +1520,8 @@ fn build_claude_model_script(page_name: &str) -> String {
         .expect("open effort function JSON");
     let max_json =
         serde_json::to_string(&claude_web::build_select_max_function()).expect("Max function JSON");
-    let thinking_json = serde_json::to_string(&claude_web::build_ensure_thinking_on_function())
-        .expect("Thinking function JSON");
-    let verify_json =
-        serde_json::to_string(&claude_web::build_verify_fable_max_thinking_function())
-            .expect("verification function JSON");
+    let verify_json = serde_json::to_string(&claude_web::build_verify_fable_max_function())
+        .expect("verification function JSON");
     format!(
         r#"
 const PAGE_NAME = {page_name_json};
@@ -1534,7 +1531,6 @@ const SELECT_FABLE = {fable_json};
 const MARK_EFFORT = {mark_effort_json};
 const OPEN_EFFORT = {open_effort_json};
 const SELECT_MAX = {max_json};
-const ENABLE_THINKING = {thinking_json};
 const VERIFY = {verify_json};
 const page = await browser.getPage(PAGE_NAME);
 let state = await page.evaluate((source) => eval("(" + source + ")")(), OPEN);
@@ -1564,20 +1560,6 @@ await page.waitForTimeout(400);
 state = await page.evaluate((source) => eval("(" + source + ")")(), SELECT_MAX);
 if (state?.status !== 'selected') {{
   console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Max effort unavailable', diagnostics: state }}));
-  return;
-}}
-await page.waitForTimeout(300);
-await page.evaluate((source) => eval("(" + source + ")")(), OPEN);
-await page.evaluate((source) => eval("(" + source + ")")(), MARK_EFFORT);
-state = await page.evaluate((source) => eval("(" + source + ")")(), OPEN_EFFORT);
-if (!['already_open', 'dispatched'].includes(state?.status)) {{
-  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Effort menu hover target unavailable', diagnostics: state }}));
-  return;
-}}
-await page.waitForTimeout(400);
-state = await page.evaluate((source) => eval("(" + source + ")")(), ENABLE_THINKING);
-if (!['already_on', 'clicked'].includes(state?.status)) {{
-  console.log(JSON.stringify({{ status: 'unavailable', error: 'Claude Thinking switch unavailable', diagnostics: state }}));
   return;
 }}
 await page.waitForTimeout(300);
@@ -2226,7 +2208,7 @@ pub fn run_claude_recipe(ctx: &ClaudeDevBrowserRecipeContext) -> Result<ClaudeRe
     let model_selection_status = claude_web::model_selection_status(&model);
     if model_selection_status != WebModelSelectionStatus::Selected {
         bail!(
-            "Claude exact model contract is unavailable or mismatched; required Fable 5 + Max + Thinking on; diagnostics={model}"
+            "Claude exact model contract is unavailable or mismatched; required Fable 5 + Max; diagnostics={model}"
         );
     }
 

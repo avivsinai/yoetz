@@ -353,9 +353,7 @@ function modelSelectionFailureDiagnostics(selection) {
   for (const key of [
     "modelVerified",
     "maxVerified",
-    "thinkingChecked",
-    "modelChip",
-    "thinkingAriaChecked"
+    "modelChip"
   ]) {
     if (Object.prototype.hasOwnProperty.call(selection ?? {}, key)) {
       diagnostics[key] = selection[key];

@@ -36,7 +36,6 @@ function isAcceptableModelSelection(selection) {
     && selection?.requested_model === CLAUDE_MODEL
     && selection?.modelVerified === true
     && selection?.maxVerified === true
-    && selection?.thinkingChecked === true
     && selection?.model_used === "Fable 5 Max";
 }
 
