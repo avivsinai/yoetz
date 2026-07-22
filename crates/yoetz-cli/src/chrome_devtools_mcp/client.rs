@@ -367,11 +367,21 @@ struct BrowserContextPage {
 
 impl ChromeCdpClient {
     pub async fn connect_to_running_chrome(cdp_endpoint: Option<&str>) -> Result<Self> {
+        Self::connect_to_running_chrome_with_handshake_timeout(cdp_endpoint, None).await
+    }
+
+    async fn connect_to_running_chrome_with_handshake_timeout(
+        cdp_endpoint: Option<&str>,
+        handshake_timeout: Option<Duration>,
+    ) -> Result<Self> {
         let ws_endpoint = resolve_canonical_ws_endpoint(cdp_endpoint)?;
-        let browser = Browser::connect_with_timeout(
-            ws_endpoint.clone(),
-            Duration::from_secs(CDP_SESSION_IDLE_TIMEOUT_SECS),
-        )
+        let idle_timeout = Duration::from_secs(CDP_SESSION_IDLE_TIMEOUT_SECS);
+        let browser = match handshake_timeout {
+            Some(timeout) => {
+                Browser::connect_with_timeouts(ws_endpoint.clone(), idle_timeout, timeout)
+            }
+            None => Browser::connect_with_timeout(ws_endpoint.clone(), idle_timeout),
+        }
         .with_context(|| format!("connecting to Chrome websocket `{ws_endpoint}` failed"))?;
 
         Ok(Self {
@@ -2975,33 +2985,6 @@ mod tests {
     };
     use tempfile::tempdir;
 
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn set<K>(key: &'static str, value: K) -> Self
-        where
-            K: AsRef<std::ffi::OsStr>,
-        {
-            let original = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
-
     fn devtools_active_port_test_paths(home: &Path) -> (PathBuf, PathBuf) {
         match std::env::consts::OS {
             "macos" => (
@@ -3926,7 +3909,6 @@ mod tests {
 
     #[test]
     fn connect_to_running_chrome_times_out_when_websocket_handshake_stalls() {
-        let _timeout_guard = EnvVarGuard::set("YOETZ_CDP_WS_HANDSHAKE_TIMEOUT_MS", "200");
         let (port, shutdown, handle) = spawn_stalled_websocket_server();
         let ws_endpoint = format!("ws://127.0.0.1:{port}/devtools/browser/stalled");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3934,9 +3916,12 @@ mod tests {
             .build()
             .expect("tokio runtime");
         let started = Instant::now();
-        let err = match runtime.block_on(ChromeCdpClient::connect_to_running_chrome(Some(
-            &ws_endpoint,
-        ))) {
+        let err = match runtime.block_on(
+            ChromeCdpClient::connect_to_running_chrome_with_handshake_timeout(
+                Some(&ws_endpoint),
+                Some(Duration::from_millis(200)),
+            ),
+        ) {
             Ok(_) => panic!("stalled websocket handshake should time out"),
             Err(err) => err,
         };

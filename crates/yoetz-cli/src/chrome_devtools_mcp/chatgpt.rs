@@ -908,7 +908,11 @@ fn emit_stable_idle_warning(message: &str) {
 }
 
 fn approval_wait_message() -> String {
-    let timeout_secs = configured_ws_handshake_timeout_ms() / 1_000;
+    approval_wait_message_for_timeout_ms(configured_ws_handshake_timeout_ms())
+}
+
+fn approval_wait_message_for_timeout_ms(timeout_ms: u64) -> String {
+    let timeout_secs = timeout_ms / 1_000;
     format!(
         "live browser attach timed out ({timeout_secs}s). Chrome may be showing an \"Allow remote debugging?\" dialog — click Allow, then retry."
     )
@@ -1808,8 +1812,6 @@ async fn read_latest_assistant_text(client: &ChromeCdpClient) -> Result<String> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serial_test::serial;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     #[tokio::test]
     async fn run_errors_without_bundle() {
@@ -1845,41 +1847,6 @@ mod tests {
         );
     }
 
-    fn lock_env() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
-
-    struct EnvVarGuard {
-        key: &'static str,
-        previous: Option<String>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn set(key: &'static str, value: &str) -> Self {
-            let previous = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, previous }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn drop(&mut self) {
-            match self.previous.as_deref() {
-                Some(value) => unsafe {
-                    std::env::set_var(self.key, value);
-                },
-                None => unsafe {
-                    std::env::remove_var(self.key);
-                },
-            }
-        }
-    }
-
     #[test]
     fn cdp_attach_hint_preserves_approval_dialog_errors() {
         // Approval-wait errors must pass through so the outer transport funnel
@@ -1895,11 +1862,8 @@ mod tests {
     }
 
     #[test]
-    #[serial]
-    fn approval_wait_message_uses_configured_handshake_timeout() {
-        let _guard = lock_env();
-        let _timeout = EnvVarGuard::set("YOETZ_CDP_WS_HANDSHAKE_TIMEOUT_MS", "120000");
-        assert!(approval_wait_message().contains("120s"));
+    fn approval_wait_message_formats_handshake_timeout() {
+        assert!(approval_wait_message_for_timeout_ms(120_000).contains("120s"));
     }
 
     #[tokio::test]
