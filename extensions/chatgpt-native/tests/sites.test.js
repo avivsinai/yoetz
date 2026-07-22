@@ -42,8 +42,8 @@ test("Claude adapter owns UUID conversations, exact model policy, and DOM-only f
   assert.equal(adapter.isAllowedTabUrl(`https://claude.ai/chat/${conversationId}`), true);
   assert.equal(adapter.isAllowedTabUrl("https://chatgpt.com/"), false);
   assert.deepEqual(adapter.tabActivation, {
-    activateOnCreate: true,
-    restorePreviousAfter: "send"
+    activateOnCreate: false,
+    restorePreviousAfter: null
   });
   assert.equal(adapter.isAcceptableModelSelection({
     status: "selected",

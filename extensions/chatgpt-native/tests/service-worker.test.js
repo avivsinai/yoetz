@@ -182,6 +182,166 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
   }
 });
 
+test("service worker runs two concurrent Claude jobs in background and isolates cancellation", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const createdTabs = [];
+  const updatedTabs = [];
+  const removedTabs = [];
+  const sentToTabs = [];
+  const jobTabs = new Map();
+  const sentJobs = new Set();
+  const extractedJobs = new Set();
+  const releasableJobs = new Set();
+  const conversationIds = new Map([
+    ["job_claude_cancel", "11111111-1111-4111-8111-111111111111"],
+    ["job_claude_survivor", "22222222-2222-4222-8222-222222222222"]
+  ]);
+  let tabId = 100;
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      query: async () => [{ id: 17, active: true }],
+      create: async (options) => {
+        const tab = { id: ++tabId, status: "complete", ...options };
+        createdTabs.push(tab);
+        return tab;
+      },
+      get: async (id) => createdTabs.find((tab) => tab.id === id),
+      update: async (id, options) => {
+        updatedTabs.push({ id, options });
+        return { id, ...options };
+      },
+      remove: async (id) => {
+        removedTabs.push(id);
+      },
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude" } };
+          case "yoetz_prepare_job":
+            jobTabs.set(message.job.job_id, id);
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedFableMaxSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt": {
+            const jobId = message.job.job_id;
+            sentJobs.add(jobId);
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: conversationIds.get(jobId),
+                submitted_user_count: 1,
+                submitted_assistant_count: 0
+              }
+            };
+          }
+          case "yoetz_extract_response": {
+            const jobId = message.job.job_id;
+            extractedJobs.add(jobId);
+            if (!sentJobs.has(jobId)) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 } };
+            }
+            const complete = releasableJobs.has(jobId);
+            return {
+              ok: true,
+              payload: {
+                method: "assistant_dom",
+                text: complete ? `answer ${jobId}` : `partial ${jobId}`,
+                is_generating: !complete,
+                assistant_count: 1,
+                copy_button_count: 0,
+                has_copy_button: false,
+                turn_index: 0,
+                conversation_id: conversationIds.get(jobId)
+              }
+            };
+          }
+          case "yoetz_cancel_send":
+            return { ok: true, payload: { stopped: true } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      },
+      group: async () => 1
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?two_claude_background=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+
+    const jobs = ["job_claude_cancel", "job_claude_survivor"];
+    for (const jobId of jobs) {
+      port.emit(envelope("job_start", jobId, {
+        recipe: "claude",
+        prompt: `prompt ${jobId}`,
+        wait_interval_ms: 50,
+        wait_timeout_ms: 5000
+      }));
+    }
+    await eventually(() => port.messages.filter((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ).length === 2);
+
+    assert.notEqual(jobTabs.get(jobs[0]), jobTabs.get(jobs[1]));
+    assert.deepEqual(createdTabs.map((tab) => tab.active), [false, false]);
+
+    for (const jobId of jobs) {
+      port.emit(envelope("job_file_chunk", jobId, {
+        sequence: 0,
+        total_chunks: 1,
+        total_bytes: 4,
+        filename: `${jobId}.md`,
+        mime_type: "text/markdown",
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+      }));
+    }
+    await eventually(() => sentJobs.size === 2 && extractedJobs.size === 2);
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+
+    port.emit(envelope("job_cancel", "job_claude_cancel"));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_cancel" && message.job_id === "job_claude_cancel"
+    ));
+    assert.deepEqual(removedTabs, [jobTabs.get("job_claude_cancel")]);
+    assert.ok(sentToTabs.some((item) =>
+      item.message.type === "yoetz_cancel_send" && item.message.job.job_id === "job_claude_cancel"
+    ));
+    assert.equal(sentToTabs.some((item) =>
+      item.message.type === "yoetz_cancel_send" && item.message.job.job_id === "job_claude_survivor"
+    ), false);
+    assert.equal(port.messages.some((message) =>
+      message.type === "job_complete" && message.job_id === "job_claude_cancel"
+    ), false);
+
+    releasableJobs.add("job_claude_survivor");
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_complete" && message.job_id === "job_claude_survivor"
+    ));
+    const survivor = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_claude_survivor"
+    );
+    assert.equal(survivor.payload.response, "answer job_claude_survivor");
+    assert.equal(survivor.payload.model_used, "Fable 5 Max");
+    assert.deepEqual(updatedTabs, []);
+
+    for (const jobId of jobs) {
+      const ownedTabIds = new Set(sentToTabs
+        .filter((item) => item.message.job?.job_id === jobId)
+        .map((item) => item.id));
+      assert.deepEqual([...ownedTabIds], [jobTabs.get(jobId)], `${jobId} must remain on its own tab`);
+    }
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker reconciles ChatGPT conversation assignment after the URL marker is dropped", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -287,27 +447,18 @@ test("service worker runs a Claude job through its adapter and probes the select
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
-  const updatedTabs = [];
   let sent = false;
   const conversationId = "123e4567-e89b-12d3-a456-426614174000";
 
   globalThis.chrome = chromeStub({
     port,
     tabs: {
-      query: async (query) => {
-        assert.deepEqual(query, { active: true, currentWindow: true });
-        return [{ id: 17, active: true }];
-      },
       create: async ({ url, active }) => {
         assert.equal(url, "https://claude.ai/new?_yoetz=run_job_claude");
-        assert.equal(active, true);
+        assert.equal(active, false);
         return { id: 71 };
       },
       get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new?_yoetz=run_job_claude" }),
-      update: async (id, options) => {
-        updatedTabs.push({ id, options });
-        return { id, ...options };
-      },
       sendMessage: async (id, message) => {
         sentToTabs.push({ id, message });
         switch (message.type) {
@@ -327,10 +478,8 @@ test("service worker runs a Claude job through its adapter and probes the select
               }
             };
           case "yoetz_upload_file":
-            assert.deepEqual(updatedTabs, []);
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
-            assert.deepEqual(updatedTabs, []);
             sent = true;
             return {
               ok: true,
@@ -342,10 +491,6 @@ test("service worker runs a Claude job through its adapter and probes the select
               }
             };
           case "yoetz_extract_response":
-            assert.deepEqual(
-              updatedTabs,
-              sent ? [{ id: 17, options: { active: true } }] : []
-            );
             return {
               ok: true,
               payload: sent
@@ -396,7 +541,6 @@ test("service worker runs a Claude job through its adapter and probes the select
       sentToTabs.find((item) => item.message.type === "yoetz_probe")?.message.recipe,
       "claude"
     );
-    assert.deepEqual(updatedTabs, []);
 
     port.emit(envelope("job_file_chunk", "job_claude", {
       sequence: 0,
@@ -417,7 +561,6 @@ test("service worker runs a Claude job through its adapter and probes the select
     assert.equal(complete.payload.completion_reason, "stable_idle");
     assert.equal(complete.payload.conversation_id, conversationId);
     assert.equal(complete.payload.conversation_url, `https://claude.ai/chat/${conversationId}`);
-    assert.deepEqual(updatedTabs, [{ id: 17, options: { active: true } }]);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -6431,6 +6574,16 @@ function verifiedSolProSelection() {
     requested_model: "gpt-5-6-sol-pro",
     family_status: "verified",
     effort_status: "verified"
+  };
+}
+
+function verifiedFableMaxSelection() {
+  return {
+    status: "selected",
+    requested_model: "fable-5-max",
+    modelVerified: true,
+    maxVerified: true,
+    model_used: "Fable 5 Max"
   };
 }
 

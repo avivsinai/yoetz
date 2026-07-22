@@ -94,8 +94,9 @@ export const claudeSiteAdapter = Object.freeze({
   isAllowedTabUrl: (url) => String(url ?? "").startsWith(`${CLAUDE_ORIGIN}/`),
   isAcceptableModelSelection,
   tabActivation: Object.freeze({
-    activateOnCreate: true,
-    restorePreviousAfter: "send"
+    activateOnCreate: false,
+    // Explicit policy marker: background jobs never capture or restore focus.
+    restorePreviousAfter: null
   }),
   auth: Object.freeze({
     noTabStatus: "no_claude_tab",

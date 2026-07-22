@@ -434,16 +434,16 @@ When multiple Chrome profiles have the extension loaded, pass
 `--var profile_email=<email>` if Chrome exposes one, or the stable
 `--var extension_instance_id=<id>` shown by `status --chatgpt`.
 
-Independent ChatGPT recipes may run concurrently through one connected profile:
-each job owns a separate background tab. Profile selectors only choose among
-loaded profiles and are not required for ChatGPT parallelism. Claude is
-asymmetric because each job must keep its tab active through upload and accepted
-send; serialize Claude recipes within one loaded profile until per-profile
-activation coordination is available. Give every parallel recipe a distinct
-Yoetz bundle session directory; reusing one managed `bundle.md` fails with
-`session_busy` before browser work. Recipe runs share the lifecycle lock, while
-setup, update, reload, and auto-heal require its exclusive side and fail closed
-instead of changing the loaded artifact mid-run.
+Independent ChatGPT and Claude recipes may run concurrently through one
+connected profile: each job owns a separate background tab. Profile selectors
+only choose among loaded profiles and are not required for recipe parallelism.
+A July 2026 live probe completed Claude model selection, file upload, accepted
+send, response observation, and final extraction without ever activating the
+run tab. Give every parallel recipe a distinct Yoetz bundle session directory;
+reusing one managed `bundle.md` fails with `session_busy` before browser work.
+Recipe runs share the lifecycle lock, while setup, update, reload, and auto-heal
+require its exclusive side and fail closed instead of changing the loaded
+artifact mid-run.
 
 ### Cookie sync (legacy fallback)
 
