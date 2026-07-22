@@ -138,12 +138,17 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   is hidden/zero-size, so resolve the exact selector rather than accessibility
   snapshots; use the native `input.files` setter so page-world handlers observe
   files assigned from the extension's isolated world.
-- Claude jobs open in background tabs. A July 2026 live probe completed an
-  entire Claude job in a never-focused tab: SPA mount, Fable 5 and Effort Max
-  verification, file upload, accepted send, response observation, and final
-  extraction all succeeded. Service-worker coverage proves two Claude jobs use
-  distinct background tabs through overlapping phases and that cancelling one
-  does not affect the other.
+- Claude jobs open in background tabs. On released `v0.5.42`, a live run proved
+  exactly two concurrent Claude recipes in one connected profile on an
+  Enterprise workspace account. The jobs overlapped for 125s and used distinct
+  conversations. Both verified Fable 5 and Effort Max. Tab non-activation has
+  separate evidence: the released adapter sets `activateOnCreate:false`, a
+  single-job live probe measured `tab_active=false` at every phase, and
+  service-worker coverage asserts that no tab activation call occurs. The
+  concurrency evidence covers two jobs, not higher fanout or other account
+  types. Service-worker coverage separately proves two Claude jobs use distinct
+  background tabs through overlapping phases and that cancelling one does not
+  affect the other.
   Base UI picker choreography needs settle pacing, attributed pointer-event
   hover fallback, and diagnostics for every verification leg. Early-exit and
   full-selection results must have the same acceptable shape.

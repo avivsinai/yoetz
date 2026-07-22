@@ -437,13 +437,20 @@ When multiple Chrome profiles have the extension loaded, pass
 Independent ChatGPT and Claude recipes may run concurrently through one
 connected profile: each job owns a separate background tab. Profile selectors
 only choose among loaded profiles and are not required for recipe parallelism.
-A July 2026 live probe completed Claude model selection, file upload, accepted
-send, response observation, and final extraction without ever activating the
-run tab. Give every parallel recipe a distinct Yoetz bundle session directory;
-reusing one managed `bundle.md` fails with `session_busy` before browser work.
-Recipe runs share the lifecycle lock, while setup, update, reload, and auto-heal
-require its exclusive side and fail closed instead of changing the loaded
-artifact mid-run.
+On released `v0.5.42`, a live run proved exactly two concurrent Claude recipes
+in one connected profile on an Enterprise workspace account. The jobs overlapped
+for 125s and used distinct conversations. Both verified Fable 5 and Effort Max.
+Tab non-activation has separate evidence: the released adapter sets
+`activateOnCreate:false`, a single-job live probe measured `tab_active=false` at
+every phase, and service-worker coverage asserts that no tab activation call
+occurs. The concurrency evidence covers two jobs, not higher fanout or other
+account types. Service-worker coverage separately proves two Claude jobs use
+distinct background tabs through overlapping phases and that cancelling one
+does not affect the other. Give every parallel recipe a distinct Yoetz bundle
+session directory; reusing one managed `bundle.md` fails with `session_busy`
+before browser work. Recipe runs share the lifecycle lock, while setup, update,
+reload, and auto-heal require its exclusive side and fail closed instead of
+changing the loaded artifact mid-run.
 
 ### Cookie sync (legacy fallback)
 
