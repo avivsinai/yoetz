@@ -98,6 +98,19 @@ jobs:
           ./scripts/ci-classify-changes.sh \
             "$GITHUB_EVENT_NAME" "$head_ref" "$subject" "${files[@]}" >> "$GITHUB_OUTPUT"
 
+  workflow-policy:
+    name: Workflow Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check immutable action pins
+        run: ./scripts/check-workflow-action-pins.sh
+      - name: Lint GitHub Actions workflows
+        uses: docker://rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # actionlint 1.7.12
+        with:
+          args: -color
+
   release-commit-fast-path:
     name: Release Commit Fast Path
     needs: changes
