@@ -48,6 +48,8 @@ jobs:
       browser_changed: ${{ steps.detect.outputs.browser_changed }}
       build_os_matrix: ${{ steps.detect.outputs.build_os_matrix }}
       release_push: ${{ steps.detect.outputs.release_push }}
+      dependency_changed: ${{ steps.detect.outputs.dependency_changed }}
+      workflow_changed: ${{ steps.detect.outputs.workflow_changed }}
     env:
       PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
       PR_HEAD_REF: ${{ github.event.pull_request.head.ref }}
@@ -59,125 +61,55 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+      - name: Test change classifier
+        run: ./scripts/test-ci-classify-changes.sh
       - id: detect
         shell: bash
         run: |
           set -euo pipefail
 
-          full_build_matrix='["ubuntu-latest","macos-latest","windows-latest"]'
-          linux_build_matrix='["ubuntu-latest"]'
-          build_os_matrix="$linux_build_matrix"
-
-          emit_outputs() {
-            {
-              echo "light_only=$1"
-              echo "browser_changed=$2"
-              echo "build_os_matrix=$3"
-              echo "release_push=$4"
-            } >> "$GITHUB_OUTPUT"
-          }
-
           case "${GITHUB_EVENT_NAME}" in
             pull_request)
               base="$PR_BASE_SHA"
               head="$PR_HEAD_SHA"
-              if [[ "${PR_HEAD_REF:-}" == release/* ]]; then
-                # Release PRs only bump version metadata (CHANGELOG, Cargo.*,
-                # plugin/skill/extension manifests). release.yml is the real
-                # cross-platform build+publish gate and release.sh already ran
-                # local gates, so the heavy PR build/test/browser jobs here are
-                # pure redundancy. Treat the PR as light to skip them.
-                emit_outputs true false "$linux_build_matrix" false
-                exit 0
-              fi
+              head_ref="$PR_HEAD_REF"
+              subject="$PR_TITLE"
               ;;
             push)
-              commit_subject="${PUSH_COMMIT_MESSAGE%%$'\n'*}"
-              if [[ "$commit_subject" == chore\(release\):\ v* ]]; then
-                emit_outputs true false "$linux_build_matrix" true
-                exit 0
-              fi
               base="$PUSH_BEFORE_SHA"
               head="$GITHUB_SHA"
-              ;;
-            workflow_dispatch)
-              emit_outputs false true "$full_build_matrix" false
-              exit 0
+              head_ref=""
+              subject="${PUSH_COMMIT_MESSAGE%%$'\n'*}"
               ;;
             *)
-              emit_outputs false true "$linux_build_matrix" false
+              ./scripts/ci-classify-changes.sh \
+                "$GITHUB_EVENT_NAME" "" "" | tee -a "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
 
-          if [[ -z "${base:-}" || "$base" == "0000000000000000000000000000000000000000" ]]; then
-            emit_outputs false true "$build_os_matrix" false
+          if [[ -z "${base:-}" || -z "${head:-}" || "$base" == "0000000000000000000000000000000000000000" ]]; then
+            ./scripts/ci-classify-changes.sh \
+              "$GITHUB_EVENT_NAME" "$head_ref" "$subject" | tee -a "$GITHUB_OUTPUT"
             exit 0
           fi
 
           mapfile -t files < <(git diff --name-only "$base" "$head")
-          if ((${#files[@]} == 0)); then
-            emit_outputs false true "$build_os_matrix" false
-            exit 0
-          fi
+          ./scripts/ci-classify-changes.sh \
+            "$GITHUB_EVENT_NAME" "$head_ref" "$subject" "${files[@]}" | tee -a "$GITHUB_OUTPUT"
 
-          # A PR is "light-only" when every changed file matches one of these
-          # categories:
-          #   - release bookkeeping: Cargo.toml/lock, CHANGELOG.md, plugin /
-          #     skill manifests.
-          #   - documentation: any *.md, anything under docs/, README*.
-          #   - repo infrastructure: anything under .github/, .gitignore,
-          #     .gitleaks.toml, LICENSE*.
-          #
-          # Light-only PRs skip the heavy build / test / browser jobs. The
-          # required checks (Format, Clippy, Test) still RUN to keep the
-          # GitHub "required status checks" list satisfied without needing
-          # admin-bypass, but they short-circuit after checkout to keep the
-          # whole PR under a minute. See clippy / test jobs below.
-          #
-          # Ordinary PRs and main pushes intentionally use the Ubuntu build
-          # only. Cross-platform release builds run in release.yml at tag time
-          # (and on demand via workflow_dispatch); release/* PRs are treated as
-          # light here because they only bump version metadata.
-          # Bash case-pattern `*` matches any characters including `/`, so
-          # `docs/*` covers any depth under `docs/`.
-          light_only=true
-          browser_changed=false
-          for file in "${files[@]}"; do
-            matched=false
-            case "$file" in
-              Cargo.toml|Cargo.lock) matched=true ;;
-              CHANGELOG.md) matched=true ;;
-              .claude-plugin/plugin.json|.codex-plugin/plugin.json) matched=true ;;
-              skills/*/SKILL.md) matched=true ;;
-              *.md) matched=true ;;
-              docs/*) matched=true ;;
-              README*) matched=true ;;
-              .github/*) matched=true ;;
-              .gitignore|.gitleaks.toml) matched=true ;;
-              LICENSE*) matched=true ;;
-            esac
-
-            case "$file" in
-              extensions/*) browser_changed=true ;;
-              recipes/*) browser_changed=true ;;
-              scripts/build-chatgpt-native-extension.sh) browser_changed=true ;;
-              scripts/build-live-cdp-daemon.sh) browser_changed=true ;;
-              scripts/ci-real-browser-smoke.sh) browser_changed=true ;;
-              crates/yoetz-cli/src/*browser*) browser_changed=true ;;
-              crates/yoetz-cli/src/*chatgpt*) browser_changed=true ;;
-              crates/yoetz-cli/src/live_*) browser_changed=true ;;
-              crates/yoetz-cli/src/chrome_*) browser_changed=true ;;
-              crates/yoetz-cli/tests/*browser*) browser_changed=true ;;
-              crates/yoetz-cli/tests/*chatgpt*) browser_changed=true ;;
-            esac
-
-            if [[ "$matched" != "true" ]]; then
-              light_only=false
-            fi
-          done
-
-          emit_outputs "$light_only" "$browser_changed" "$build_os_matrix" false
+  workflow-policy:
+    name: Workflow Policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Check immutable action pins
+        run: ./scripts/check-workflow-action-pins.sh
+      - name: Lint GitHub Actions workflows
+        uses: docker://rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # actionlint 1.7.12
+        with:
+          args: -color
 
   release-commit-fast-path:
     name: Release Commit Fast Path
@@ -245,7 +177,7 @@ jobs:
       - name: Light-only short-circuit
         if: needs.changes.outputs.light_only == 'true'
         run: |
-          echo "Skipping Clippy because this PR only touches docs / changelog / workflow files."
+          echo "Skipping Clippy because this PR only touches docs / changelog / release metadata."
           echo "See the 'Detect Light-Only Changes' job for the file set that triggered the fast path."
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         if: needs.changes.outputs.light_only != 'true'
@@ -270,7 +202,7 @@ jobs:
       - name: Light-only short-circuit
         if: needs.changes.outputs.light_only == 'true'
         run: |
-          echo "Skipping Test because this PR only touches docs / changelog / workflow files."
+          echo "Skipping Test because this PR only touches docs / changelog / release metadata."
           echo "See the 'Detect Light-Only Changes' job for the file set that triggered the fast path."
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         if: needs.changes.outputs.light_only != 'true'
