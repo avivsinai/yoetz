@@ -41,6 +41,26 @@ impl WebSocketConnection {
     ) -> Result<Self> {
         let (connection, _) = Self::websocket_connection(ws_url)?;
 
+        Ok(Self::from_connection(connection, process_id, messages_tx))
+    }
+
+    pub(crate) fn new_with_handshake_timeout(
+        ws_url: &Url,
+        process_id: Option<u32>,
+        messages_tx: mpsc::Sender<RoutedMessage>,
+        handshake_timeout: Duration,
+    ) -> Result<Self> {
+        let (connection, _) =
+            Self::websocket_connection_with_handshake_timeout(ws_url, handshake_timeout)?;
+
+        Ok(Self::from_connection(connection, process_id, messages_tx))
+    }
+
+    fn from_connection(
+        connection: TungsteniteWebsocketConnection,
+        process_id: Option<u32>,
+        messages_tx: mpsc::Sender<RoutedMessage>,
+    ) -> Self {
         let connection = Arc::new(Mutex::new(connection));
 
         let thread = {
@@ -52,11 +72,11 @@ impl WebSocketConnection {
             })
         };
 
-        Ok(Self {
+        Self {
             connection,
             thread,
             process_id,
-        })
+        }
     }
 
     pub fn shutdown(&self) {
@@ -166,9 +186,19 @@ impl WebSocketConnection {
         tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
         Response<Option<Vec<u8>>>,
     )> {
+        Self::websocket_connection_with_handshake_timeout(ws_url, handshake_timeout_duration())
+    }
+
+    fn websocket_connection_with_handshake_timeout(
+        ws_url: &Url,
+        handshake_timeout: Duration,
+    ) -> Result<(
+        tungstenite::WebSocket<MaybeTlsStream<TcpStream>>,
+        Response<Option<Vec<u8>>>,
+    )> {
         let mut client = websocket_connection_with_timeout(
             ws_url,
-            handshake_timeout_duration(),
+            handshake_timeout,
             Some(
                 WebSocketConfig::default()
                     .accept_unmasked_frames(true)

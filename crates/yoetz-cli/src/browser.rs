@@ -7476,7 +7476,7 @@ steps:
     #[cfg(unix)]
     #[test]
     fn force_kill_stale_daemon_preserves_recent_live_process() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::symlink;
         use std::os::unix::net::UnixListener;
 
         let dir = unique_unix_socket_dir("daemon_grace");
@@ -7487,13 +7487,12 @@ steps:
         }
 
         let script_path = dir.join("agent-browser");
-        fs::write(&script_path, "#!/bin/sh\nsleep 30\n").unwrap();
-        let mut perms = fs::metadata(&script_path).unwrap().permissions();
-        perms.set_mode(0o700);
-        fs::set_permissions(&script_path, perms).unwrap();
+        symlink("/bin/sleep", &script_path).unwrap();
 
-        let mut child = Command::new("/bin/sh").arg(&script_path).spawn().unwrap();
+        let mut child = Command::new(&script_path).arg("30").spawn().unwrap();
         fs::write(&pid_path, child.id().to_string()).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        assert!(process_looks_like_agent_browser(child.id()));
 
         let action =
             force_kill_stale_daemon_with_paths(&pid_path, &sock_path, Duration::from_secs(30));

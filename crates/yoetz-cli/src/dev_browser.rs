@@ -27,9 +27,6 @@ use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use yoetz_core::paths::home_dir;
-
 use crate::chatgpt_recipe::AnyhowResultExt;
 use crate::claude_recipe::AnyhowResultExt as ClaudeAnyhowResultExt;
 use crate::web_recipe::{WebModelSelectionStatus, WebRecipeTransportPhase};
@@ -94,16 +91,6 @@ impl Default for ChatgptPollSettings {
             interval_ms: CHATGPT_POLL_INTERVAL_MS_DEFAULT,
         }
     }
-}
-
-/// dev-browser tmp directory for file staging.
-#[cfg(test)]
-#[allow(dead_code)]
-fn dev_browser_tmp_dir() -> PathBuf {
-    home_dir()
-        .unwrap_or_else(|| PathBuf::from("/tmp"))
-        .join(".dev-browser")
-        .join("tmp")
 }
 
 fn command_is_available(bin: &str) -> bool {
@@ -531,13 +518,10 @@ pub fn run_script_connect_with_endpoint(
     run_script_connect_with_browser_and_endpoint(script, timeout_secs, None, cdp_endpoint)
 }
 
-/// Stage a file into dev-browser's tmp directory so scripts can read it
-/// via `readFile(name)`.
+/// Stage a file in a caller-owned test directory.
 #[cfg(test)]
-#[allow(dead_code)]
-pub fn stage_file(name: &str, content: &str) -> Result<PathBuf> {
-    let tmp_dir = dev_browser_tmp_dir();
-    fs::create_dir_all(&tmp_dir)
+fn stage_file(tmp_dir: &Path, name: &str, content: &str) -> Result<PathBuf> {
+    fs::create_dir_all(tmp_dir)
         .with_context(|| format!("create dev-browser tmp dir: {}", tmp_dir.display()))?;
     let path = tmp_dir.join(name);
     fs::write(&path, content).with_context(|| format!("write staged file: {}", path.display()))?;
@@ -2306,19 +2290,45 @@ mod tests {
     use std::ffi::{OsStr, OsString};
 
     #[test]
-    fn test_dev_browser_tmp_dir() {
-        let dir = dev_browser_tmp_dir();
-        assert!(dir.to_string_lossy().contains(".dev-browser"));
-        assert!(dir.to_string_lossy().ends_with("tmp"));
-    }
-
-    #[test]
     fn test_stage_file() {
-        let path = stage_file("test_stage.txt", "hello world").unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = stage_file(tmp_dir.path(), "test_stage.txt", "hello world").unwrap();
         assert!(path.exists());
         let content = fs::read_to_string(&path).unwrap();
         assert_eq!(content, "hello world");
-        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn parallel_stage_file_callers_do_not_overwrite_each_other() {
+        use std::sync::{Arc, Barrier};
+
+        let first_tmp = tempfile::tempdir().unwrap();
+        let second_tmp = tempfile::tempdir().unwrap();
+        let first_root = first_tmp.path().to_path_buf();
+        let second_root = second_tmp.path().to_path_buf();
+        let both_written = Arc::new(Barrier::new(2));
+        let first = std::thread::spawn({
+            let both_written = Arc::clone(&both_written);
+            move || {
+                let path = stage_file(&first_root, "parallel-stage.txt", "first").unwrap();
+                both_written.wait();
+                let content = fs::read_to_string(&path).unwrap();
+                (path, content)
+            }
+        });
+        let second = std::thread::spawn(move || {
+            let path = stage_file(&second_root, "parallel-stage.txt", "second").unwrap();
+            both_written.wait();
+            let content = fs::read_to_string(&path).unwrap();
+            (path, content)
+        });
+
+        let (first_path, first_content) = first.join().unwrap();
+        let (second_path, second_content) = second.join().unwrap();
+
+        assert_eq!(first_content, "first");
+        assert_eq!(second_content, "second");
+        assert_ne!(first_path, second_path);
     }
 
     #[cfg(unix)]
@@ -2326,10 +2336,10 @@ mod tests {
     fn stage_file_sets_owner_only_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
-        let path = stage_file("test_permissions.txt", "secret").unwrap();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let path = stage_file(tmp_dir.path(), "test_permissions.txt", "secret").unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        let _ = fs::remove_file(&path);
     }
 
     #[test]

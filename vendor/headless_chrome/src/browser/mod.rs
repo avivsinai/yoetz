@@ -128,9 +128,36 @@ impl Browser {
         debug_ws_url: String,
         idle_browser_timeout: Duration,
     ) -> Result<Self> {
+        Self::connect_with_optional_handshake_timeout(debug_ws_url, idle_browser_timeout, None)
+    }
+
+    /// Connect to an externally-launched Chrome process with separate idle and
+    /// initial websocket handshake timeouts.
+    pub fn connect_with_timeouts(
+        debug_ws_url: String,
+        idle_browser_timeout: Duration,
+        handshake_timeout: Duration,
+    ) -> Result<Self> {
+        Self::connect_with_optional_handshake_timeout(
+            debug_ws_url,
+            idle_browser_timeout,
+            Some(handshake_timeout),
+        )
+    }
+
+    fn connect_with_optional_handshake_timeout(
+        debug_ws_url: String,
+        idle_browser_timeout: Duration,
+        handshake_timeout: Option<Duration>,
+    ) -> Result<Self> {
         let url = Url::parse(&debug_ws_url)?;
 
-        let transport = Arc::new(Transport::new(url, None, idle_browser_timeout)?);
+        let transport = Arc::new(match handshake_timeout {
+            Some(timeout) => {
+                Transport::new_with_handshake_timeout(url, None, idle_browser_timeout, timeout)?
+            }
+            None => Transport::new(url, None, idle_browser_timeout)?,
+        });
         trace!("created transport");
 
         Self::create_browser(None, transport, idle_browser_timeout, false)

@@ -367,11 +367,21 @@ struct BrowserContextPage {
 
 impl ChromeCdpClient {
     pub async fn connect_to_running_chrome(cdp_endpoint: Option<&str>) -> Result<Self> {
+        Self::connect_to_running_chrome_with_handshake_timeout(cdp_endpoint, None).await
+    }
+
+    async fn connect_to_running_chrome_with_handshake_timeout(
+        cdp_endpoint: Option<&str>,
+        handshake_timeout: Option<Duration>,
+    ) -> Result<Self> {
         let ws_endpoint = resolve_canonical_ws_endpoint(cdp_endpoint)?;
-        let browser = Browser::connect_with_timeout(
-            ws_endpoint.clone(),
-            Duration::from_secs(CDP_SESSION_IDLE_TIMEOUT_SECS),
-        )
+        let idle_timeout = Duration::from_secs(CDP_SESSION_IDLE_TIMEOUT_SECS);
+        let browser = match handshake_timeout {
+            Some(timeout) => {
+                Browser::connect_with_timeouts(ws_endpoint.clone(), idle_timeout, timeout)
+            }
+            None => Browser::connect_with_timeout(ws_endpoint.clone(), idle_timeout),
+        }
         .with_context(|| format!("connecting to Chrome websocket `{ws_endpoint}` failed"))?;
 
         Ok(Self {
@@ -1509,10 +1519,16 @@ pub fn fingerprint_for_ws_endpoint(ws_endpoint: &str) -> BrowserFingerprint {
 }
 
 pub fn discover_running_chrome_targets() -> Vec<RunningChromeTarget> {
+    discover_running_chrome_targets_from_candidates(devtools_active_port_candidates())
+}
+
+fn discover_running_chrome_targets_from_candidates(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Vec<RunningChromeTarget> {
     let mut seen = BTreeSet::new();
     let mut targets = Vec::new();
 
-    for source_path in devtools_active_port_candidates() {
+    for source_path in candidates {
         let Ok(contents) = std::fs::read_to_string(&source_path) else {
             continue;
         };
@@ -2416,12 +2432,17 @@ fn is_localhost_host(endpoint: &Url) -> bool {
 }
 
 fn devtools_active_port_candidates() -> Vec<PathBuf> {
-    let home = home_dir_candidates();
+    devtools_active_port_candidates_from_homes(home_dir_candidates())
+}
+
+fn devtools_active_port_candidates_from_homes(
+    homes: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = BTreeSet::new();
     match std::env::consts::OS {
         "macos" => {
-            for home in home {
+            for home in homes {
                 for path in [
                     home.join("Library/Application Support/Google/Chrome/DevToolsActivePort"),
                     home.join("Library/Application Support/Google/Chrome Canary/DevToolsActivePort"),
@@ -2446,7 +2467,7 @@ fn devtools_active_port_candidates() -> Vec<PathBuf> {
             }
         }
         "windows" => {
-            for home in home {
+            for home in homes {
                 for path in [
                     home.join("AppData/Local/Google/Chrome/User Data/DevToolsActivePort"),
                     home.join("AppData/Local/Google/Chrome Beta/User Data/DevToolsActivePort"),
@@ -2473,7 +2494,7 @@ fn devtools_active_port_candidates() -> Vec<PathBuf> {
             }
         }
         _ => {
-            for home in home {
+            for home in homes {
                 for path in [
                     home.join(".config/google-chrome/DevToolsActivePort"),
                     home.join(".config/chromium/DevToolsActivePort"),
@@ -2963,33 +2984,6 @@ mod tests {
         time::Duration,
     };
     use tempfile::tempdir;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<std::ffi::OsString>,
-    }
-
-    impl EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn set<K>(key: &'static str, value: K) -> Self
-        where
-            K: AsRef<std::ffi::OsStr>,
-        {
-            let original = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            Self { key, original }
-        }
-    }
-
-    impl Drop for EnvVarGuard {
-        #[allow(unsafe_code)]
-        fn drop(&mut self) {
-            match &self.original {
-                Some(value) => unsafe { std::env::set_var(self.key, value) },
-                None => unsafe { std::env::remove_var(self.key) },
-            }
-        }
-    }
 
     fn devtools_active_port_test_paths(home: &Path) -> (PathBuf, PathBuf) {
         match std::env::consts::OS {
@@ -3915,7 +3909,6 @@ mod tests {
 
     #[test]
     fn connect_to_running_chrome_times_out_when_websocket_handshake_stalls() {
-        let _timeout_guard = EnvVarGuard::set("YOETZ_CDP_WS_HANDSHAKE_TIMEOUT_MS", "200");
         let (port, shutdown, handle) = spawn_stalled_websocket_server();
         let ws_endpoint = format!("ws://127.0.0.1:{port}/devtools/browser/stalled");
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -3923,9 +3916,12 @@ mod tests {
             .build()
             .expect("tokio runtime");
         let started = Instant::now();
-        let err = match runtime.block_on(ChromeCdpClient::connect_to_running_chrome(Some(
-            &ws_endpoint,
-        ))) {
+        let err = match runtime.block_on(
+            ChromeCdpClient::connect_to_running_chrome_with_handshake_timeout(
+                Some(&ws_endpoint),
+                Some(Duration::from_millis(200)),
+            ),
+        ) {
             Ok(_) => panic!("stalled websocket handshake should time out"),
             Err(err) => err,
         };
@@ -4018,7 +4014,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn discover_running_chrome_targets_skips_unhealthy_active_port_files() {
         let home = tempdir().unwrap();
         let (stale_path, healthy_path) = devtools_active_port_test_paths(home.path());
@@ -4026,10 +4021,8 @@ mod tests {
         write_devtools_active_port(&stale_path, port + 1, "stale");
         write_devtools_active_port(&healthy_path, port, "healthy");
 
-        let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
-        let _profile = EnvVarGuard::set("USERPROFILE", home.path().as_os_str());
-
-        let targets = discover_running_chrome_targets();
+        let candidates = devtools_active_port_candidates_from_homes([home.path().to_path_buf()]);
+        let targets = discover_running_chrome_targets_from_candidates(candidates);
 
         shutdown.store(true, Ordering::Relaxed);
         let _ = handle.join();
