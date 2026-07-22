@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.42] - 2026-07-22
 ### Changed
 
 - Claude native-extension recipes now use independent background tabs, matching
@@ -14,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   selection, file upload, accepted send, response observation, and final
   extraction in a never-focused tab; service-worker coverage proves two Claude
   jobs keep distinct tabs and cancellation remains isolated.
+
 
 ## [0.5.41] - 2026-07-21
 ### Fixed
