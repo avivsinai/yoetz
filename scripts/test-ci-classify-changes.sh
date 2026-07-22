@@ -126,5 +126,7 @@ grep -Fq "dependency_changed: \${{ steps.detect.outputs.dependency_changed }}" "
 grep -Fq "workflow_changed: \${{ steps.detect.outputs.workflow_changed }}" "$WORKFLOW" || fail "workflow does not publish workflow_changed"
 grep -Fq './scripts/test-ci-classify-changes.sh' "$WORKFLOW" || fail "workflow does not run the classifier table tests"
 grep -Fq "./scripts/ci-classify-changes.sh \\" "$WORKFLOW" || fail "workflow does not invoke the classifier"
+tee_count="$(grep -Fc "| tee -a \"\$GITHUB_OUTPUT\"" "$WORKFLOW" || true)"
+[[ "$tee_count" == "3" ]] || fail "workflow must log and publish all three classifier paths; found ${tee_count} tee invocations"
 
 echo "All CI classifier tests passed."

@@ -83,20 +83,20 @@ jobs:
               ;;
             *)
               ./scripts/ci-classify-changes.sh \
-                "$GITHUB_EVENT_NAME" "" "" >> "$GITHUB_OUTPUT"
+                "$GITHUB_EVENT_NAME" "" "" | tee -a "$GITHUB_OUTPUT"
               exit 0
               ;;
           esac
 
           if [[ -z "${base:-}" || -z "${head:-}" || "$base" == "0000000000000000000000000000000000000000" ]]; then
             ./scripts/ci-classify-changes.sh \
-              "$GITHUB_EVENT_NAME" "$head_ref" "$subject" >> "$GITHUB_OUTPUT"
+              "$GITHUB_EVENT_NAME" "$head_ref" "$subject" | tee -a "$GITHUB_OUTPUT"
             exit 0
           fi
 
           mapfile -t files < <(git diff --name-only "$base" "$head")
           ./scripts/ci-classify-changes.sh \
-            "$GITHUB_EVENT_NAME" "$head_ref" "$subject" "${files[@]}" >> "$GITHUB_OUTPUT"
+            "$GITHUB_EVENT_NAME" "$head_ref" "$subject" "${files[@]}" | tee -a "$GITHUB_OUTPUT"
 
   workflow-policy:
     name: Workflow Policy
