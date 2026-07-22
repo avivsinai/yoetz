@@ -1509,10 +1509,16 @@ pub fn fingerprint_for_ws_endpoint(ws_endpoint: &str) -> BrowserFingerprint {
 }
 
 pub fn discover_running_chrome_targets() -> Vec<RunningChromeTarget> {
+    discover_running_chrome_targets_from_candidates(devtools_active_port_candidates())
+}
+
+fn discover_running_chrome_targets_from_candidates(
+    candidates: impl IntoIterator<Item = PathBuf>,
+) -> Vec<RunningChromeTarget> {
     let mut seen = BTreeSet::new();
     let mut targets = Vec::new();
 
-    for source_path in devtools_active_port_candidates() {
+    for source_path in candidates {
         let Ok(contents) = std::fs::read_to_string(&source_path) else {
             continue;
         };
@@ -2416,12 +2422,17 @@ fn is_localhost_host(endpoint: &Url) -> bool {
 }
 
 fn devtools_active_port_candidates() -> Vec<PathBuf> {
-    let home = home_dir_candidates();
+    devtools_active_port_candidates_from_homes(home_dir_candidates())
+}
+
+fn devtools_active_port_candidates_from_homes(
+    homes: impl IntoIterator<Item = PathBuf>,
+) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = BTreeSet::new();
     match std::env::consts::OS {
         "macos" => {
-            for home in home {
+            for home in homes {
                 for path in [
                     home.join("Library/Application Support/Google/Chrome/DevToolsActivePort"),
                     home.join("Library/Application Support/Google/Chrome Canary/DevToolsActivePort"),
@@ -2446,7 +2457,7 @@ fn devtools_active_port_candidates() -> Vec<PathBuf> {
             }
         }
         "windows" => {
-            for home in home {
+            for home in homes {
                 for path in [
                     home.join("AppData/Local/Google/Chrome/User Data/DevToolsActivePort"),
                     home.join("AppData/Local/Google/Chrome Beta/User Data/DevToolsActivePort"),
@@ -2473,7 +2484,7 @@ fn devtools_active_port_candidates() -> Vec<PathBuf> {
             }
         }
         _ => {
-            for home in home {
+            for home in homes {
                 for path in [
                     home.join(".config/google-chrome/DevToolsActivePort"),
                     home.join(".config/chromium/DevToolsActivePort"),
@@ -4018,7 +4029,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(unsafe_code)]
     fn discover_running_chrome_targets_skips_unhealthy_active_port_files() {
         let home = tempdir().unwrap();
         let (stale_path, healthy_path) = devtools_active_port_test_paths(home.path());
@@ -4026,10 +4036,8 @@ mod tests {
         write_devtools_active_port(&stale_path, port + 1, "stale");
         write_devtools_active_port(&healthy_path, port, "healthy");
 
-        let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
-        let _profile = EnvVarGuard::set("USERPROFILE", home.path().as_os_str());
-
-        let targets = discover_running_chrome_targets();
+        let candidates = devtools_active_port_candidates_from_homes([home.path().to_path_buf()]);
+        let targets = discover_running_chrome_targets_from_candidates(candidates);
 
         shutdown.store(true, Ordering::Relaxed);
         let _ = handle.join();
