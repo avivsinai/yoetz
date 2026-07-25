@@ -196,6 +196,13 @@ impl Drop for ExtensionLifecycleLock {
     }
 }
 
+pub(crate) struct ExtensionRecipeLease {
+    _lifecycle_lock: ExtensionLifecycleLock,
+    paths: ExtensionPaths,
+    instance: ExtensionInstanceStatus,
+    recipe: BuiltinWebRecipe,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ProtocolEnvelope {
     pub protocol_version: u32,
@@ -1649,33 +1656,91 @@ fn select_recipe_instance_with_lifecycle_lock(
     Ok((lifecycle_lock, instance))
 }
 
+pub(crate) fn acquire_chatgpt_recipe_lease(
+    spec: &ChatgptRecipeSpec,
+) -> Result<ExtensionRecipeLease> {
+    let bundle_path = spec
+        .bundle_path
+        .as_deref()
+        .context("chrome-extension-native transport requires `--bundle`")?;
+    validate_bundle_path(bundle_path)?;
+    acquire_extension_recipe_lease(
+        ExtensionInstanceSelector {
+            profile_email: spec.profile_email.as_deref(),
+            extension_instance_id: spec.extension_instance_id.as_deref(),
+            extension_profile_id: spec.extension_profile_id.as_deref(),
+        },
+        BuiltinWebRecipe::Chatgpt,
+        "--chatgpt",
+        "ChatGPT native extension recipe",
+    )
+}
+
+pub(crate) fn acquire_claude_recipe_lease(spec: &ClaudeRecipeSpec) -> Result<ExtensionRecipeLease> {
+    let bundle_path = spec
+        .bundle_path
+        .as_deref()
+        .context("chrome-extension-native transport requires `--bundle`")?;
+    validate_bundle_path(bundle_path)?;
+    acquire_extension_recipe_lease(
+        ExtensionInstanceSelector {
+            profile_email: spec.profile_email.as_deref(),
+            extension_instance_id: spec.extension_instance_id.as_deref(),
+            extension_profile_id: spec.extension_profile_id.as_deref(),
+        },
+        BuiltinWebRecipe::Claude,
+        "--claude",
+        "Claude native extension recipe",
+    )
+}
+
+fn acquire_extension_recipe_lease(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+    recipe_flag: &str,
+    action: &str,
+) -> Result<ExtensionRecipeLease> {
+    let paths = extension_paths()?;
+    let (lifecycle_lock, instance) =
+        select_recipe_instance_with_lifecycle_lock(&paths, selector, recipe_flag, action)?;
+    ensure_instance_matches_managed_copy(&instance)?;
+    if recipe == BuiltinWebRecipe::Claude {
+        ensure_instance_supports_recipe(&instance, "claude")?;
+    }
+    Ok(ExtensionRecipeLease {
+        _lifecycle_lock: lifecycle_lock,
+        paths,
+        instance,
+        recipe,
+    })
+}
+
 pub fn run_chatgpt_recipe(
     spec: &ChatgptRecipeSpec,
     format: OutputFormat,
 ) -> Result<ExtensionRecipeResult> {
+    let lease = acquire_chatgpt_recipe_lease(spec)?;
+    run_chatgpt_recipe_with_lease(spec, format, &lease)
+}
+
+pub(crate) fn run_chatgpt_recipe_with_lease(
+    spec: &ChatgptRecipeSpec,
+    format: OutputFormat,
+    lease: &ExtensionRecipeLease,
+) -> Result<ExtensionRecipeResult> {
+    if lease.recipe != BuiltinWebRecipe::Chatgpt {
+        bail!("native extension recipe lease does not belong to ChatGPT");
+    }
     let bundle_path = spec
         .bundle_path
         .as_deref()
         .context("chrome-extension-native transport requires `--bundle`")?;
     let bundle = validate_bundle_path(bundle_path)?;
-    let paths = extension_paths()?;
-    let selector = ExtensionInstanceSelector {
-        profile_email: spec.profile_email.as_deref(),
-        extension_instance_id: spec.extension_instance_id.as_deref(),
-        extension_profile_id: spec.extension_profile_id.as_deref(),
-    };
-    let (_lifecycle_lock, instance) = select_recipe_instance_with_lifecycle_lock(
-        &paths,
-        selector,
-        "--chatgpt",
-        "ChatGPT native extension recipe",
-    )?;
-    ensure_instance_matches_managed_copy(&instance)?;
-    let token = read_capability_token(&paths.token_path)?;
-    let mut stream = connect_socket(&instance.socket_path).with_context(|| {
+    let token = read_capability_token(&lease.paths.token_path)?;
+    let mut stream = connect_socket(&lease.instance.socket_path).with_context(|| {
         format!(
             "chrome-extension-native bridge is not connected at {}. Run `yoetz browser extension doctor --chatgpt`, then open Chrome with the Yoetz extension enabled.",
-            instance.socket_path.display()
+            lease.instance.socket_path.display()
         )
     })?;
     stream.set_read_timeout(Some(
@@ -1712,32 +1777,28 @@ pub fn run_claude_recipe(
     spec: &ClaudeRecipeSpec,
     format: OutputFormat,
 ) -> Result<ExtensionRecipeResult> {
+    let lease = acquire_claude_recipe_lease(spec)?;
+    run_claude_recipe_with_lease(spec, format, &lease)
+}
+
+pub(crate) fn run_claude_recipe_with_lease(
+    spec: &ClaudeRecipeSpec,
+    format: OutputFormat,
+    lease: &ExtensionRecipeLease,
+) -> Result<ExtensionRecipeResult> {
+    if lease.recipe != BuiltinWebRecipe::Claude {
+        bail!("native extension recipe lease does not belong to Claude");
+    }
     let bundle_path = spec
         .bundle_path
         .as_deref()
         .context("chrome-extension-native transport requires `--bundle`")?;
     let bundle = validate_bundle_path(bundle_path)?;
-    let paths = extension_paths()?;
-    let selector = ExtensionInstanceSelector {
-        profile_email: spec.profile_email.as_deref(),
-        extension_instance_id: spec.extension_instance_id.as_deref(),
-        extension_profile_id: spec.extension_profile_id.as_deref(),
-    };
-    let (_lifecycle_lock, instance) = select_recipe_instance_with_lifecycle_lock(
-        &paths,
-        selector,
-        "--claude",
-        "Claude native extension recipe",
-    )?;
-    ensure_instance_matches_managed_copy(&instance)?;
-    // Capability is checked on the exact routed extension instance after any
-    // best-effort heal and before opening the socket or emitting job_start.
-    ensure_instance_supports_recipe(&instance, "claude")?;
-    let token = read_capability_token(&paths.token_path)?;
-    let mut stream = connect_socket(&instance.socket_path).with_context(|| {
+    let token = read_capability_token(&lease.paths.token_path)?;
+    let mut stream = connect_socket(&lease.instance.socket_path).with_context(|| {
         format!(
             "chrome-extension-native bridge is not connected at {}. Run `yoetz browser extension doctor --claude`, then open Chrome with the Yoetz extension enabled.",
-            instance.socket_path.display()
+            lease.instance.socket_path.display()
         )
     })?;
     stream.set_read_timeout(Some(

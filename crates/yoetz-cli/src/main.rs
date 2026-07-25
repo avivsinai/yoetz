@@ -355,6 +355,10 @@ struct BrowserRecipeArgs {
     #[arg(long, requires = "thread")]
     fresh: bool,
 
+    /// Same-label collision behavior: fail (default), `wait[:<duration>]`, or fork.
+    #[arg(long, value_name = "MODE", requires = "thread")]
+    on_thread_conflict: Option<followup::ThreadConflictPolicy>,
+
     /// Allow the same prompt hash to be submitted to the same conversation.
     #[arg(long)]
     allow_duplicate_prompt: bool,
@@ -2680,6 +2684,65 @@ fn bundle_prompt_for_recipe(bundle_path: Option<&Path>) -> Result<Option<String>
     Ok(Some(bundle.prompt))
 }
 
+fn prepare_native_thread_run_in(
+    recipe_args: &BrowserRecipeArgs,
+    current_prompt_hash: Option<&str>,
+    recipe: web_recipe::BuiltinWebRecipe,
+    run_id: &str,
+    conversation_id: &mut Option<String>,
+    sessions_base: &Path,
+) -> Result<Option<followup::PreparedThreadRun>> {
+    let Some(thread_label) = recipe_args.thread.as_deref() else {
+        return Ok(None);
+    };
+    let default_policy = followup::ThreadConflictPolicy::default();
+    let conflict_policy = recipe_args
+        .on_thread_conflict
+        .as_ref()
+        .unwrap_or(&default_policy);
+    let prepared = followup::prepare_thread_run_in(
+        thread_label,
+        sessions_base,
+        recipe,
+        run_id,
+        recipe_args.fresh,
+        conflict_policy,
+    )?;
+
+    match prepared.disposition() {
+        followup::PreparedThreadDisposition::Labeled {
+            resolved: Some(resolved),
+            ..
+        } => {
+            let current_prompt_hash = current_prompt_hash
+                .ok_or_else(|| anyhow!("thread `{thread_label}` requires a current prompt hash"))?;
+            followup::guard_duplicate_prompt(
+                current_prompt_hash,
+                resolved.prior_prompt_hash.as_deref(),
+                recipe_args.allow_duplicate_prompt,
+                &resolved.conversation.id,
+                resolved.source_session_id.as_deref(),
+            )?;
+            *conversation_id = Some(resolved.conversation.id.clone());
+        }
+        followup::PreparedThreadDisposition::Labeled { resolved: None, .. } => {
+            *conversation_id = None;
+        }
+        followup::PreparedThreadDisposition::Forked {
+            from_label,
+            from_conversation_id,
+        } => {
+            *conversation_id = None;
+            eprintln!(
+                "warning: thread `{from_label}` is busy; starting an opt-in forked conversation that will not re-point the original label (forked_from_conversation_id={})",
+                from_conversation_id.as_deref().unwrap_or("unknown")
+            );
+        }
+    }
+
+    Ok(Some(prepared))
+}
+
 fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
     ctx: &AppContext,
     recipe_args: &BrowserRecipeArgs,
@@ -2723,16 +2786,30 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
     }
     let started_at = Instant::now();
 
-    let (payload, jsonl_event, notification_target) = match builtin_recipe {
+    let (payload, jsonl_event, notification_target, prepared_thread) = match builtin_recipe {
         web_recipe::BuiltinWebRecipe::Chatgpt => {
-            let recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
-            let response = browser_extension_native::run_chatgpt_recipe(&recipe_spec, format)
-                .map_err(|err| {
-                    browser_extension_native::with_thread_conversation_recovery_hint(
-                        err,
-                        recipe_args.thread.as_deref(),
-                    )
-                })?;
+            let mut recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
+            let native_lease =
+                browser_extension_native::acquire_chatgpt_recipe_lease(&recipe_spec)?;
+            let prepared_thread = prepare_native_thread_run_in(
+                recipe_args,
+                current_prompt_hash,
+                builtin_recipe,
+                &recipe_spec.run_id,
+                &mut recipe_spec.conversation_id,
+                &yoetz_core::session::session_base_dir(),
+            )?;
+            let response = browser_extension_native::run_chatgpt_recipe_with_lease(
+                &recipe_spec,
+                format,
+                &native_lease,
+            )
+            .map_err(|err| {
+                browser_extension_native::with_thread_conversation_recovery_hint(
+                    err,
+                    recipe_args.thread.as_deref(),
+                )
+            })?;
             let output = chatgpt_recipe::ChatgptRecipeOutput {
                 transport: browser_extension_native::TRANSPORT_NAME.to_string(),
                 backend: browser_extension_native::TRANSPORT_NAME.to_string(),
@@ -2752,18 +2829,32 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
                 output.to_value(),
                 output.to_recipe_complete_event(),
                 recipe_spec.model,
+                prepared_thread,
             )
         }
         web_recipe::BuiltinWebRecipe::Claude => {
-            let recipe_spec =
+            let mut recipe_spec =
                 build_claude_recipe_spec(recipe_args, recipe_vars, preflight_warnings)?;
-            let response = browser_extension_native::run_claude_recipe(&recipe_spec, format)
-                .map_err(|err| {
-                    browser_extension_native::with_thread_conversation_recovery_hint(
-                        err,
-                        recipe_args.thread.as_deref(),
-                    )
-                })?;
+            let native_lease = browser_extension_native::acquire_claude_recipe_lease(&recipe_spec)?;
+            let prepared_thread = prepare_native_thread_run_in(
+                recipe_args,
+                current_prompt_hash,
+                builtin_recipe,
+                &recipe_spec.run_id,
+                &mut recipe_spec.conversation_id,
+                &yoetz_core::session::session_base_dir(),
+            )?;
+            let response = browser_extension_native::run_claude_recipe_with_lease(
+                &recipe_spec,
+                format,
+                &native_lease,
+            )
+            .map_err(|err| {
+                browser_extension_native::with_thread_conversation_recovery_hint(
+                    err,
+                    recipe_args.thread.as_deref(),
+                )
+            })?;
             let mut warnings = recipe_spec.warnings.clone();
             warnings.extend(response.warnings);
             warnings.sort();
@@ -2785,6 +2876,7 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
                 output.to_value(),
                 output.to_recipe_complete_event(),
                 claude_recipe::CLAUDE_REPORTED_MODEL.to_string(),
+                prepared_thread,
             )
         }
     };
@@ -2794,10 +2886,11 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
         current_prompt_hash,
         builtin_recipe,
         payload,
-        &jsonl_event,
+        jsonl_event,
         &notification_target,
         started_at,
         format,
+        prepared_thread.as_ref(),
     )
 }
 
@@ -2808,22 +2901,41 @@ fn complete_chrome_extension_native_recipe(
     current_prompt_hash: Option<&str>,
     builtin_recipe: web_recipe::BuiltinWebRecipe,
     mut payload: Value,
-    jsonl_event: &Value,
+    mut jsonl_event: Value,
     notification_target: &str,
     started_at: Instant,
     format: OutputFormat,
+    prepared_thread: Option<&followup::PreparedThreadRun>,
 ) -> Result<Value> {
     let completion = || -> Result<Value> {
         if let Some(thread_label) = recipe_args.thread.as_deref() {
             let current_prompt_hash = current_prompt_hash.ok_or_else(|| {
                 anyhow!("persist thread `{thread_label}` metadata: missing current prompt hash")
             })?;
-            write_followup_session_metadata_required(
+            let prepared_thread = prepared_thread.ok_or_else(|| {
+                anyhow!("persist thread `{thread_label}` metadata: missing thread lease")
+            })?;
+            write_prepared_thread_metadata_required(
                 recipe_args,
                 current_prompt_hash,
                 &payload,
                 builtin_recipe,
+                prepared_thread,
             )?;
+            if let followup::PreparedThreadDisposition::Forked {
+                from_label,
+                from_conversation_id,
+            } = prepared_thread.disposition()
+            {
+                let thread = json!({
+                    "label": Value::Null,
+                    "resolved": "forked",
+                    "forked_from_label": from_label,
+                    "forked_from_conversation_id": from_conversation_id,
+                });
+                payload["thread"] = thread.clone();
+                jsonl_event["thread"] = thread;
+            }
         }
         attach_browser_recipe_artifacts(&mut payload, recipe_args.bundle.as_deref())?;
         maybe_write_output(ctx, &payload)?;
@@ -3026,6 +3138,27 @@ fn write_followup_session_metadata(
     payload: &Value,
     recipe: web_recipe::BuiltinWebRecipe,
 ) -> Result<()> {
+    write_followup_session_metadata_with_lineage(
+        recipe_args,
+        current_prompt_hash,
+        payload,
+        recipe,
+        recipe_args.thread.as_deref(),
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_followup_session_metadata_with_lineage(
+    recipe_args: &BrowserRecipeArgs,
+    current_prompt_hash: &str,
+    payload: &Value,
+    recipe: web_recipe::BuiltinWebRecipe,
+    thread_label: Option<&str>,
+    forked_from_label: Option<&str>,
+    forked_from_conversation_id: Option<&str>,
+) -> Result<()> {
     let session_artifacts = browser_recipe_artifact_paths(recipe_args.bundle.as_deref())
         .ok_or_else(|| {
             anyhow!(
@@ -3060,16 +3193,19 @@ fn write_followup_session_metadata(
             session_dir.join("followup.json").display()
         )
     })?;
-    followup::write_followup_metadata_for_recipe(
+    followup::write_followup_metadata_for_recipe_with_lineage(
         &session_dir,
         &session_id,
         recipe,
         &conversation,
         current_prompt_hash,
-        recipe_args.thread.as_deref(),
+        thread_label,
+        forked_from_label,
+        forked_from_conversation_id,
     )
 }
 
+#[cfg(test)]
 fn write_followup_session_metadata_required(
     recipe_args: &BrowserRecipeArgs,
     current_prompt_hash: &str,
@@ -3082,6 +3218,29 @@ fn write_followup_session_metadata_required(
         .ok_or_else(|| anyhow!("required thread metadata needs --thread"))?;
     write_followup_session_metadata(recipe_args, current_prompt_hash, payload, recipe)
         .with_context(|| format!("persist thread `{thread_label}` metadata"))
+}
+
+fn write_prepared_thread_metadata_required(
+    recipe_args: &BrowserRecipeArgs,
+    current_prompt_hash: &str,
+    payload: &Value,
+    recipe: web_recipe::BuiltinWebRecipe,
+    prepared_thread: &followup::PreparedThreadRun,
+) -> Result<()> {
+    let requested_label = recipe_args
+        .thread
+        .as_deref()
+        .ok_or_else(|| anyhow!("required thread metadata needs --thread"))?;
+    write_followup_session_metadata_with_lineage(
+        recipe_args,
+        current_prompt_hash,
+        payload,
+        recipe,
+        prepared_thread.thread_label_for_metadata(),
+        prepared_thread.forked_from_label(),
+        prepared_thread.forked_from_conversation_id(),
+    )
+    .with_context(|| format!("persist thread `{requested_label}` metadata"))
 }
 
 fn maybe_write_followup_session_metadata(
@@ -4567,26 +4726,6 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         "conversation".to_string(),
                         resolved_followup.conversation.url.clone(),
                     );
-                } else if let Some(thread_label) = recipe_args.thread.as_deref() {
-                    if !recipe_args.fresh {
-                        if let Some(resolved_thread) = followup::resolve_thread_target(
-                            thread_label,
-                            &yoetz_core::session::session_base_dir(),
-                            recipe_kind,
-                        )? {
-                            followup::guard_duplicate_prompt(
-                                &current_prompt_hash,
-                                resolved_thread.prior_prompt_hash.as_deref(),
-                                recipe_args.allow_duplicate_prompt,
-                                &resolved_thread.conversation.id,
-                                resolved_thread.source_session_id.as_deref(),
-                            )?;
-                            recipe_vars.insert(
-                                "conversation".to_string(),
-                                resolved_thread.conversation.url,
-                            );
-                        }
-                    }
                 }
                 Some(current_prompt_hash)
             } else {
@@ -5474,6 +5613,7 @@ mod tests {
             followup: None,
             thread: Some("review-pr-341".to_string()),
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         }
@@ -5674,6 +5814,7 @@ mod tests {
                 followup: None,
                 thread: Some("review-pr-341".to_string()),
                 fresh: true,
+                on_thread_conflict: None,
                 allow_duplicate_prompt: false,
                 no_notify: false,
             };
@@ -5785,6 +5926,17 @@ mod tests {
         fs::write(dir.path().join("bundle.json"), "{}").unwrap();
         fs::create_dir(dir.path().join("response.json")).unwrap();
         let recipe_args = thread_recipe_args(bundle);
+        let sessions_dir = dir.path().join("sessions");
+        fs::create_dir_all(&sessions_dir).unwrap();
+        let prepared_thread = followup::prepare_thread_run_in(
+            "review-pr-341",
+            &sessions_dir,
+            web_recipe::BuiltinWebRecipe::Chatgpt,
+            "run-test",
+            false,
+            &followup::ThreadConflictPolicy::Fail,
+        )
+        .unwrap();
 
         let err = complete_chrome_extension_native_recipe(
             &test_app_context(),
@@ -5796,10 +5948,11 @@ mod tests {
                 "response": "done",
                 "conversation_id": "final-conversation"
             }),
-            &json!({"status": "ok"}),
+            json!({"status": "ok"}),
             "GPT-5.6 Sol Pro",
             Instant::now(),
             OutputFormat::Text,
+            Some(&prepared_thread),
         )
         .unwrap_err();
 
@@ -7281,6 +7434,8 @@ mod tests {
             "--thread",
             "review-pr-341",
             "--fresh",
+            "--on-thread-conflict",
+            "wait:30s",
         ])
         .expect("thread args should parse");
 
@@ -7290,9 +7445,34 @@ mod tests {
             }) => {
                 assert_eq!(args.thread.as_deref(), Some("review-pr-341"));
                 assert!(args.fresh);
+                assert_eq!(
+                    args.on_thread_conflict,
+                    Some(followup::ThreadConflictPolicy::Wait(Some(
+                        Duration::from_secs(30)
+                    )))
+                );
             }
             _ => panic!("unexpected command parsed"),
         }
+    }
+
+    #[test]
+    fn browser_recipe_cli_rejects_thread_conflict_mode_without_thread() {
+        let result = Cli::try_parse_from([
+            "yoetz",
+            "browser",
+            "recipe",
+            "--recipe",
+            "chatgpt",
+            "--on-thread-conflict",
+            "fork",
+        ]);
+        let err = match result {
+            Ok(_) => panic!("thread conflict mode should require --thread"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("--thread"));
     }
 
     #[tokio::test]
@@ -7311,6 +7491,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7351,6 +7532,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7387,6 +7569,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7424,6 +7607,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7461,6 +7645,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7498,6 +7683,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7537,6 +7723,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7569,6 +7756,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7599,6 +7787,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7651,6 +7840,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7722,6 +7912,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7785,6 +7976,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7833,6 +8025,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7882,6 +8075,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7911,6 +8105,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7949,6 +8144,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7987,6 +8183,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -8053,6 +8250,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -8089,6 +8287,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -8136,6 +8335,7 @@ mod tests {
             followup: None,
             thread: None,
             fresh: false,
+            on_thread_conflict: None,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
