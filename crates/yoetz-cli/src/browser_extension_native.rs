@@ -165,9 +165,21 @@ pub struct ExtensionRecipeResult {
     pub model_used: Option<String>,
     pub model_selection_status: ChatgptModelSelectionStatus,
     pub warnings: Vec<String>,
+    pub warning_details: Vec<Value>,
     pub conversation_id: Option<String>,
     pub conversation_url: Option<String>,
     pub diagnostics: ChatgptRecipeDiagnostics,
+}
+
+impl ExtensionRecipeResult {
+    fn warning_values(&self) -> Vec<Value> {
+        self.warnings
+            .iter()
+            .cloned()
+            .map(Value::String)
+            .chain(self.warning_details.iter().cloned())
+            .collect()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -1594,7 +1606,7 @@ pub fn canary(
         "response": response.response,
         "model_used": response.model_used,
         "model_selection_status": response.model_selection_status,
-        "warnings": response.warnings,
+        "warnings": response.warning_values(),
     }))
 }
 
@@ -2941,6 +2953,18 @@ fn parse_recipe_result(envelope: ProtocolEnvelope) -> Result<ExtensionRecipeResu
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
+    let warning_details = envelope
+        .payload
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter(|item| item.is_object())
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let conversation_id = envelope
         .payload
         .get("conversation_id")
@@ -2985,6 +3009,7 @@ fn parse_recipe_result(envelope: ProtocolEnvelope) -> Result<ExtensionRecipeResu
         model_used,
         model_selection_status,
         warnings,
+        warning_details,
         conversation_id,
         conversation_url,
         diagnostics,
@@ -4447,7 +4472,14 @@ mod tests {
                 "response": "done",
                 "model_used": "GPT-5.6 Sol Pro",
                 "model_selection_status": "selected",
-                "warnings": ["kept current"],
+                "warnings": [
+                    "kept current",
+                    {
+                        "code": "artifact_unextracted",
+                        "count": 1,
+                        "titles": ["Release plan"]
+                    }
+                ],
                 "conversation_id": "conv-123",
                 "conversation_url": "https://chatgpt.com/c/conv-123",
                 "extraction_method": "copy_scope_dom_fallback",
@@ -4468,6 +4500,14 @@ mod tests {
             ChatgptModelSelectionStatus::Selected
         );
         assert_eq!(result.warnings, vec!["kept current"]);
+        assert_eq!(
+            result.warning_details,
+            vec![json!({
+                "code": "artifact_unextracted",
+                "count": 1,
+                "titles": ["Release plan"]
+            })]
+        );
         assert_eq!(result.conversation_id.as_deref(), Some("conv-123"));
         assert_eq!(
             result.conversation_url.as_deref(),

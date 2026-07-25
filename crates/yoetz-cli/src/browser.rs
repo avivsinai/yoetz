@@ -112,6 +112,9 @@ pub struct RecipeStep {
 pub struct RecipeContext {
     pub bundle_path: Option<String>,
     pub bundle_text: Option<String>,
+    /// A built-in-owned prompt inserted after all other recipe interpolation so
+    /// caller bytes such as `{{run_id}}` remain opaque.
+    pub opaque_prompt: Option<String>,
     pub profile_dir: Option<PathBuf>,
     pub profile_mode: BrowserProfileMode,
     pub fallback_used: bool,
@@ -1289,6 +1292,7 @@ fn claude_recipe_payload_from_steps(
         model_used,
         model_selection_status,
         warnings,
+        warning_details: Vec::new(),
         fallback_used,
         conversation_id,
         conversation_url,
@@ -5662,7 +5666,11 @@ fn json_string_literal(s: &str) -> String {
     serde_json::to_string(s).unwrap()
 }
 
-fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> Result<String> {
+pub(crate) fn interpolate(
+    value: &str,
+    ctx: &RecipeContext,
+    bundle_text: Option<&str>,
+) -> Result<String> {
     if (value.contains("{{bundle_path}}") || value.contains("{{bundle_path|json}}"))
         && ctx.bundle_path.is_none()
     {
@@ -5678,6 +5686,9 @@ fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> R
     // so that {{...}} patterns inside bundle_text don't trigger false errors.
     let mut known_vars: std::collections::HashSet<&str> =
         ctx.vars.keys().map(|s| s.as_str()).collect();
+    if ctx.opaque_prompt.is_some() {
+        known_vars.insert("prompt");
+    }
     known_vars.insert("bundle_path");
     known_vars.insert("bundle_text");
     let mut scan = value;
@@ -5698,8 +5709,55 @@ fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> R
         }
     }
 
-    // Perform substitutions — process |json filtered variants first so they
-    // aren't consumed by the plain replacement pass.
+    if let Some(prompt) = ctx.opaque_prompt.as_deref() {
+        return interpolate_with_opaque_prompt(value, ctx, bundle_text, prompt);
+    }
+
+    Ok(interpolate_replacements(value, ctx, bundle_text))
+}
+
+fn interpolate_with_opaque_prompt(
+    value: &str,
+    ctx: &RecipeContext,
+    bundle_text: Option<&str>,
+    prompt: &str,
+) -> Result<String> {
+    const PLAIN: &str = "{{prompt}}";
+    const JSON: &str = "{{prompt|json}}";
+    let mut remaining = value;
+    let mut out = String::with_capacity(value.len() + prompt.len());
+
+    loop {
+        let plain_at = remaining.find(PLAIN);
+        let json_at = remaining.find(JSON);
+        let next = match (plain_at, json_at) {
+            (Some(plain), Some(json)) if plain <= json => Some((plain, PLAIN, false)),
+            (Some(_), Some(json)) => Some((json, JSON, true)),
+            (Some(plain), None) => Some((plain, PLAIN, false)),
+            (None, Some(json)) => Some((json, JSON, true)),
+            (None, None) => None,
+        };
+        let Some((index, needle, as_json)) = next else {
+            out.push_str(&interpolate_replacements(remaining, ctx, bundle_text));
+            return Ok(out);
+        };
+        out.push_str(&interpolate_replacements(
+            &remaining[..index],
+            ctx,
+            bundle_text,
+        ));
+        if as_json {
+            out.push_str(&json_string_literal(prompt));
+        } else {
+            out.push_str(prompt);
+        }
+        remaining = &remaining[index + needle.len()..];
+    }
+}
+
+fn interpolate_replacements(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> String {
+    // Process |json filtered variants first so they aren't consumed by the
+    // plain replacement pass.
     let mut out = value.to_string();
     if let Some(path) = &ctx.bundle_path {
         out = out.replace("{{bundle_path|json}}", &json_string_literal(path));
@@ -5715,7 +5773,7 @@ fn interpolate(value: &str, ctx: &RecipeContext, bundle_text: Option<&str>) -> R
         out = out.replace("{{bundle_text|json}}", &json_string_literal(text));
         out = out.replace("{{bundle_text}}", text);
     }
-    Ok(out)
+    out
 }
 
 fn parse_recipe_var(entry: &str) -> Result<(String, String)> {
@@ -5877,6 +5935,7 @@ mod tests {
         RecipeContext {
             bundle_path: Some("/tmp/bundle.md".to_string()),
             bundle_text: Some("hello world".to_string()),
+            opaque_prompt: None,
             profile_dir: None,
             profile_mode: BrowserProfileMode::ProfileOnly,
             fallback_used: false,
@@ -6993,6 +7052,41 @@ browser_cdp = "http://evil.example.com:9222"
         let ctx = recipe_context();
         let result = interpolate("{{bundle_text}}", &ctx, Some("literal {{model}}")).unwrap();
         assert_eq!(result, "literal {{model}}");
+    }
+
+    #[test]
+    fn interpolate_inserts_opaque_prompt_after_other_recipe_vars() {
+        let mut ctx = recipe_context();
+        ctx.vars
+            .insert("run_id".to_string(), "run-actual".to_string());
+        ctx.opaque_prompt = Some("caller\r\nbytes {{run_id}}  \n".to_string());
+
+        let result = interpolate("before {{prompt}} after {{run_id}}", &ctx, None).unwrap();
+
+        assert_eq!(
+            result,
+            "before caller\r\nbytes {{run_id}}  \n after run-actual"
+        );
+    }
+
+    #[test]
+    fn interpolate_json_inserts_opaque_prompt_without_rewriting_its_bytes() {
+        let mut ctx = recipe_context();
+        ctx.vars
+            .insert("run_id".to_string(), "run-actual".to_string());
+        ctx.opaque_prompt = Some("caller\r\nbytes {{run_id}}  \n".to_string());
+
+        let result = interpolate(
+            "const prompt = {{prompt|json}}; const run = {{run_id|json}};",
+            &ctx,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            result,
+            r#"const prompt = "caller\r\nbytes {{run_id}}  \n"; const run = "run-actual";"#
+        );
     }
 
     #[test]

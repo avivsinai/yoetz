@@ -304,6 +304,15 @@ export function extractResponse(root = document) {
   const turn = last?.closest?.("[data-testid*='turn'], article") ?? last;
   const body = last?.querySelector?.(".font-claude-response") ?? null;
   const text = responseBodyText(body);
+  const artifactCards = Array.from(
+    last?.querySelectorAll?.("[class*='group/artifact-block']") ?? []
+  );
+  const artifactBlocks = {
+    count: artifactCards.length,
+    titles: artifactCards
+      .map((element) => normalizeText(element.innerText || element.textContent))
+      .filter(Boolean)
+  };
   const globalCopyButtons = root.querySelectorAll(COPY_ACTION_SELECTOR).length;
   const scopedCopyButtons = turn?.querySelectorAll?.(COPY_ACTION_SELECTOR)?.length ?? 0;
   const isGenerating = isResponseGenerating(root);
@@ -313,7 +322,8 @@ export function extractResponse(root = document) {
       assistant_turns: assistants.length,
       copy_buttons: globalCopyButtons,
       stop_controls: root.querySelectorAll("button[aria-label='Stop response']").length,
-      thinking_rows: root.querySelectorAll("button[class*='group/status']").length
+      thinking_rows: root.querySelectorAll("button[class*='group/status']").length,
+      artifact_blocks: artifactBlocks.count
     },
     assistant_turn_snippets: assistants.slice(-3).map((element) => elementSummary(element)),
     page_text_chars: String(root.body?.innerText ?? "").length,
@@ -329,6 +339,7 @@ export function extractResponse(root = document) {
       preceding_user_count: precedingUserCount,
       copy_button_count: globalCopyButtons,
       has_copy_button: scopedCopyButtons > 0,
+      artifact_blocks: artifactBlocks,
       diagnostics
     };
   }
@@ -341,6 +352,7 @@ export function extractResponse(root = document) {
     preceding_user_count: precedingUserCount,
     copy_button_count: globalCopyButtons,
     has_copy_button: scopedCopyButtons > 0,
+    artifact_blocks: artifactBlocks,
     diagnostics
   };
 }

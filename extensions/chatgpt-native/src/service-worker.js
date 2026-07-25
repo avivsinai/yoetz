@@ -1,4 +1,5 @@
 import { ChunkAssembler, uint8ArrayToBase64 } from "./chunks.js";
+import { completionWarnings } from "./completion-warnings.js";
 import {
   EXTENSION_ID,
   NATIVE_HOST,
@@ -535,12 +536,14 @@ async function completeJobWithExtraction(job, extraction) {
       model_strategy: job.model_strategy ?? "select",
       model_used: job.model_used ?? null,
       model_selection_status: job.model_selection_status ?? "unavailable",
-      warnings: [
-        ...(job.warnings ?? []),
-        ...(extraction.text ? [] : [adapter.completion.emptyResponseWarning]),
-        ...(extraction.warning ? [extraction.warning] : []),
-        ...(finalityAnchor === "dom_only" ? [CHATGPT_DOM_ONLY_FINALITY_WARNING] : [])
-      ]
+      warnings: completionWarnings({
+        jobWarnings: job.warnings,
+        extraction,
+        emptyResponseWarning: adapter.completion.emptyResponseWarning,
+        extractionWarnings: adapter.completion.extractionWarnings?.(extraction),
+        finalityAnchor,
+        domOnlyFinalityWarning: CHATGPT_DOM_ONLY_FINALITY_WARNING
+      })
     }
   });
   const completeBytes = nativeEnvelopeByteLength(completeEnvelope);

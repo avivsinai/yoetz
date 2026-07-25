@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Claude native recipes now detect file/artifact cards in the final assistant
+  turn and return a structured `artifact_unextracted` warning instead of
+  silently reporting a complete response while dropping the deliverable.
+- Built-in Claude prompts now require the deliverable to remain in the chat
+  message as plain Markdown, reducing artifact loss while preserving the
+  caller's task bytes exactly. Custom recipes remain unchanged.
+
 ## [0.5.44] - 2026-07-25
 
 ### Fixed
