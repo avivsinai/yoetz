@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.44] - 2026-07-25
+
 ### Fixed
 
 - Browser recipe threads now hold a recipe-scoped per-label lock for the full
