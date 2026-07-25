@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Added recipe-scoped `--thread <label>` aliases for ChatGPT and Claude, with
+  `--fresh` for an intentional new conversation, strict label validation, and
+  fail-closed persistence of the final native conversation identity.
+- Yoetz-owned tabs created by the native browser extension now close
+  automatically after successful terminal delivery for ChatGPT or Claude
+  recipes. Pass `--keep-tab` to retain one for debugging; failure,
+  manual-handoff, and terminal-delivery-loss tabs remain open for recovery.
+- Browser extension doctor output now reports open Yoetz-owned tabs and
+  completed close-eligible leaks. Tabs retained deliberately with `--keep-tab`
+  are not counted as leaks.
+
+### Fixed
+
+- Excluded ChatGPT citation and source controls from DOM response extraction,
+  so a Sources-only affordance cannot satisfy finality while legitimate answer
+  text and extraction diagnostics remain intact.
+
 ## [0.5.42] - 2026-07-22
 ### Changed
 
