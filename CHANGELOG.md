@@ -14,6 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   interleaving prompts in one conversation. Collisions fail with actionable
   holder details by default; `--on-thread-conflict wait[:<duration>]` and
   `fork` provide explicit alternatives without ambiguously re-pointing labels.
+- Claude response extraction now removes the complete thinking/status row
+  structurally, preventing hidden caption copies from contaminating short
+  answers such as `ACK`.
+- ChatGPT response extraction no longer promotes a sibling response-action row
+  such as the `Sources` control over the model-authored answer.
 
 ## [0.5.43] - 2026-07-25
 ### Added
