@@ -1077,6 +1077,32 @@ test("extractResponse preserves a legitimate answer button labeled Sources", () 
   assert.equal(extraction.text, "Choose Sources to continue.");
 });
 
+test("extractResponse preserves a button-only answer in an explicit nested assistant node", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Choose an action");
+  const answerButton = withChildNodes(
+    new FakeElement("button", { "aria-label": "Sources" }),
+    new FakeTextNode("Sources")
+  );
+  const explicitAssistant = new FakeElement(
+    "div",
+    { "data-message-author-role": "assistant" },
+    "Sources"
+  ).append(answerButton);
+  const copy = new FakeElement("button", { "aria-label": "Copy response" }, "Copy response");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "Sources Copy response")
+    .append(explicitAssistant, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Choose an action Sources Copy response")
+    .append(user, assistantTurn);
+  const body = new FakeElement("body", {}, "Choose an action Sources Copy response").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Sources");
+  assert.equal(extraction.has_copy_button, true);
+});
+
 test("extractResponse preserves legitimate answer markup titled Open source repository", () => {
   const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Where is the code?");
   const repositoryLink = withChildNodes(
