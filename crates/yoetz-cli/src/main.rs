@@ -347,6 +347,14 @@ struct BrowserRecipeArgs {
     #[arg(long)]
     followup: Option<String>,
 
+    /// Address a reusable conversation by a stable semantic label.
+    #[arg(long, value_name = "LABEL")]
+    thread: Option<String>,
+
+    /// Start a new conversation and re-point --thread at its final conversation.
+    #[arg(long, requires = "thread")]
+    fresh: bool,
+
     /// Allow the same prompt hash to be submitted to the same conversation.
     #[arg(long)]
     allow_duplicate_prompt: bool,
@@ -2807,10 +2815,13 @@ fn maybe_write_followup_session_metadata(
     else {
         return;
     };
+    // The final job_complete conversation_id is authoritative: ChatGPT may begin under a
+    // WEB: scaffold reassigned by isExpectedConversationIdAssignment in
+    // extensions/chatgpt-native/src/sites/chatgpt.js. Keep the URL as a legacy fallback.
     let Some(conversation_raw) = payload
-        .get("conversation_url")
+        .get("conversation_id")
         .and_then(Value::as_str)
-        .or_else(|| payload.get("conversation_id").and_then(Value::as_str))
+        .or_else(|| payload.get("conversation_url").and_then(Value::as_str))
     else {
         return;
     };
@@ -2847,6 +2858,7 @@ fn maybe_write_followup_session_metadata(
         recipe,
         &conversation,
         current_prompt_hash,
+        recipe_args.thread.as_deref(),
     ) {
         eprintln!(
             "warning: could not write followup metadata {}: {err}",
@@ -4259,6 +4271,9 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             let builtin_recipe = builtin_web_recipe(&recipe, &recipe_path);
             let is_chatgpt = builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Chatgpt);
             let is_claude = builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Claude);
+            if builtin_recipe.is_none() && (recipe_args.thread.is_some() || recipe_args.fresh) {
+                bail!("--thread and --fresh require a built-in ChatGPT or Claude recipe");
+            }
             let current_prompt_hash = if let Some(recipe_kind) = builtin_recipe {
                 apply_chatgpt_prompt_default(&recipe_args, &mut recipe_vars)?;
                 let current_prompt_hash = followup::compute_prompt_hash(
@@ -4268,11 +4283,13 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         .unwrap_or_default(),
                     recipe_args.bundle.as_deref(),
                 )?;
+                followup::validate_followup_args(
+                    recipe_args.followup.as_deref(),
+                    recipe_vars.get("conversation").map(String::as_str),
+                    recipe_args.thread.as_deref(),
+                    recipe_args.fresh,
+                )?;
                 if let Some(followup_raw) = recipe_args.followup.as_deref() {
-                    followup::validate_followup_args(
-                        Some(followup_raw),
-                        recipe_vars.get("conversation").map(String::as_str),
-                    )?;
                     let resolved_followup = followup::resolve_followup_target_for_recipe(
                         followup_raw,
                         &yoetz_core::session::session_base_dir(),
@@ -4301,6 +4318,26 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         "conversation".to_string(),
                         resolved_followup.conversation.url.clone(),
                     );
+                } else if let Some(thread_label) = recipe_args.thread.as_deref() {
+                    if !recipe_args.fresh {
+                        if let Some(resolved_thread) = followup::resolve_thread_target(
+                            thread_label,
+                            &yoetz_core::session::session_base_dir(),
+                            recipe_kind,
+                        )? {
+                            followup::guard_duplicate_prompt(
+                                &current_prompt_hash,
+                                resolved_thread.prior_prompt_hash.as_deref(),
+                                recipe_args.allow_duplicate_prompt,
+                                &resolved_thread.conversation.id,
+                                resolved_thread.source_session_id.as_deref(),
+                            )?;
+                            recipe_vars.insert(
+                                "conversation".to_string(),
+                                resolved_thread.conversation.url,
+                            );
+                        }
+                    }
                 }
                 Some(current_prompt_hash)
             } else {
@@ -5321,6 +5358,66 @@ mod tests {
         assert!(acquire_browser_recipe_session_lease(Some(&bundle))
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn thread_writeback_uses_final_completion_conversation_for_both_sites() {
+        for (recipe, final_id, final_url) in [
+            (
+                web_recipe::BuiltinWebRecipe::Chatgpt,
+                "final-chatgpt-conversation",
+                "https://chatgpt.com/c/final-chatgpt-conversation",
+            ),
+            (
+                web_recipe::BuiltinWebRecipe::Claude,
+                "123e4567-e89b-12d3-a456-426614174000",
+                "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174000",
+            ),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let bundle = dir.path().join("bundle.md");
+            fs::write(&bundle, "# bundle").unwrap();
+            fs::write(dir.path().join("bundle.json"), "{}").unwrap();
+            let recipe_args = BrowserRecipeArgs {
+                recipe: PathBuf::from(format!("recipes/{}.yaml", recipe.as_str())),
+                model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
+                transport: None,
+                allow_cdp_fallback: false,
+                bundle: Some(bundle),
+                profile: None,
+                cdp: None,
+                browser_id: None,
+                vars: vec![],
+                followup: None,
+                thread: Some("review-pr-341".to_string()),
+                fresh: true,
+                allow_duplicate_prompt: false,
+                no_notify: false,
+            };
+            let completion_payload = json!({
+                "requested_conversation_id": "WEB:scaffold-that-must-not-be-persisted",
+                "conversation_id": final_id,
+                "conversation_url": "https://chatgpt.com/c/WEB:scaffold-that-must-not-be-persisted",
+            });
+
+            maybe_write_followup_session_metadata(
+                &recipe_args,
+                Some("prompt-hash"),
+                &completion_payload,
+                recipe,
+            );
+
+            let metadata = followup::read_followup_metadata(dir.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(metadata.thread_label.as_deref(), Some("review-pr-341"));
+            assert_eq!(metadata.conversation_id, final_id);
+            assert_eq!(metadata.conversation_url, final_url);
+            assert_ne!(
+                metadata.conversation_id,
+                "WEB:scaffold-that-must-not-be-persisted"
+            );
+        }
     }
 
     #[test]
@@ -6623,6 +6720,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn browser_recipe_cli_accepts_thread_and_fresh() {
+        let cli = Cli::try_parse_from([
+            "yoetz",
+            "browser",
+            "recipe",
+            "--recipe",
+            "chatgpt",
+            "--thread",
+            "review-pr-341",
+            "--fresh",
+        ])
+        .expect("thread args should parse");
+
+        match cli.command {
+            Commands::Browser(BrowserArgs {
+                command: BrowserCommand::Recipe(args),
+            }) => {
+                assert_eq!(args.thread.as_deref(), Some("review-pr-341"));
+                assert!(args.fresh);
+            }
+            _ => panic!("unexpected command parsed"),
+        }
+    }
+
     #[tokio::test]
     async fn run_recipe_via_chrome_devtools_mcp_rejects_non_builtin_recipes() {
         let recipe_args = BrowserRecipeArgs {
@@ -6637,6 +6759,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -6675,6 +6799,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -6709,6 +6835,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -6744,6 +6872,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -6779,6 +6909,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -6814,6 +6946,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -6851,6 +6985,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -6881,6 +7017,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -6909,6 +7047,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -6959,6 +7099,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7028,6 +7170,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Current,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7089,6 +7233,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7135,6 +7281,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7182,6 +7330,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec!["prompt=Explicit prompt".to_string()],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7209,6 +7359,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7244,6 +7396,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7279,6 +7433,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7341,6 +7497,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7375,6 +7533,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };
@@ -7420,6 +7580,8 @@ mod tests {
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             vars: vec![],
             followup: None,
+            thread: None,
+            fresh: false,
             allow_duplicate_prompt: false,
             no_notify: false,
         };

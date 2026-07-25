@@ -14,6 +14,8 @@ pub(crate) struct FollowupMetadata {
     pub session_id: String,
     #[serde(default)]
     pub recipe: BuiltinWebRecipe,
+    #[serde(default)]
+    pub thread_label: Option<String>,
     pub conversation_id: String,
     pub conversation_url: String,
     pub prompt_hash: String,
@@ -85,6 +87,46 @@ where
     })
 }
 
+pub(crate) fn validate_thread_label(label: &str) -> Result<()> {
+    let mut chars = label.chars();
+    let Some(first) = chars.next() else {
+        bail!("thread label must match ^[A-Za-z0-9][A-Za-z0-9_.-]{{0,63}}$");
+    };
+    if !first.is_ascii_alphanumeric()
+        || label.len() > 64
+        || !chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '.' | '-'))
+    {
+        bail!("invalid thread label `{label}`; expected ^[A-Za-z0-9][A-Za-z0-9_.-]{{0,63}}$");
+    }
+    Ok(())
+}
+
+pub(crate) fn resolve_thread_target(
+    label: &str,
+    sessions_base: &Path,
+    recipe: BuiltinWebRecipe,
+) -> Result<Option<ResolvedFollowup>> {
+    validate_thread_label(label)?;
+    for session in list_sessions_in(sessions_base)? {
+        let Some(metadata) = read_followup_metadata(&session.path)? else {
+            continue;
+        };
+        if metadata.recipe != recipe || metadata.thread_label.as_deref() != Some(label) {
+            continue;
+        }
+        return Ok(Some(ResolvedFollowup {
+            recipe,
+            conversation: WebConversation {
+                id: metadata.conversation_id,
+                url: metadata.conversation_url,
+            },
+            source_session_id: Some(metadata.session_id),
+            prior_prompt_hash: Some(metadata.prompt_hash),
+        }));
+    }
+    Ok(None)
+}
+
 pub(crate) fn compute_prompt_hash(prompt: &str, bundle_path: Option<&Path>) -> Result<String> {
     let bundle_hash = if let Some(bundle_path) = bundle_path {
         let bundle_bytes = fs::read(bundle_path)
@@ -131,9 +173,20 @@ pub(crate) fn guard_duplicate_prompt(
 pub(crate) fn validate_followup_args(
     followup: Option<&str>,
     conversation_var: Option<&str>,
+    thread: Option<&str>,
+    fresh: bool,
 ) -> Result<()> {
-    if followup.is_some() && conversation_var.is_some() {
-        bail!("--followup is mutually exclusive with --var conversation=");
+    let selector_count = usize::from(followup.is_some())
+        + usize::from(conversation_var.is_some())
+        + usize::from(thread.is_some());
+    if selector_count > 1 {
+        bail!("--thread, --followup, and --var conversation= are mutually exclusive");
+    }
+    if fresh && thread.is_none() {
+        bail!("--fresh requires --thread");
+    }
+    if let Some(label) = thread {
+        validate_thread_label(label)?;
     }
     Ok(())
 }
@@ -154,6 +207,7 @@ pub(crate) fn write_followup_metadata(
             url: conversation.url.clone(),
         },
         prompt_hash,
+        None,
     )
 }
 
@@ -163,11 +217,13 @@ pub(crate) fn write_followup_metadata_for_recipe(
     recipe: BuiltinWebRecipe,
     conversation: &WebConversation,
     prompt_hash: &str,
+    thread_label: Option<&str>,
 ) -> Result<()> {
     let path = followup_metadata_path(session_dir);
     let metadata = FollowupMetadata {
         session_id: session_id.to_string(),
         recipe,
+        thread_label: thread_label.map(str::to_string),
         conversation_id: conversation.id.clone(),
         conversation_url: conversation.url.clone(),
         prompt_hash: prompt_hash.to_string(),
@@ -239,12 +295,37 @@ mod tests {
     }
 
     #[test]
-    fn followup_args_are_mutually_exclusive_with_conversation_var() {
-        assert!(validate_followup_args(Some("session-1"), None).is_ok());
-        assert!(validate_followup_args(None, Some("https://chatgpt.com/c/conv-1")).is_ok());
-        let err = validate_followup_args(Some("session-1"), Some("https://chatgpt.com/c/conv-1"))
-            .unwrap_err();
-        assert!(err.to_string().contains("mutually exclusive"));
+    fn conversation_selectors_are_pairwise_mutually_exclusive() {
+        let selectors = [
+            (
+                Some("session-1"),
+                Some("https://chatgpt.com/c/conv-1"),
+                None,
+            ),
+            (Some("session-1"), None, Some("review-pr-341")),
+            (
+                None,
+                Some("https://chatgpt.com/c/conv-1"),
+                Some("review-pr-341"),
+            ),
+        ];
+        for (followup, conversation, thread) in selectors {
+            let err = validate_followup_args(followup, conversation, thread, false).unwrap_err();
+            assert!(err.to_string().contains("mutually exclusive"));
+        }
+    }
+
+    #[test]
+    fn fresh_requires_a_valid_thread_label() {
+        assert!(validate_followup_args(None, None, Some("review-pr_341.v2"), true).is_ok());
+        assert!(validate_followup_args(None, None, None, true)
+            .unwrap_err()
+            .to_string()
+            .contains("requires --thread"));
+        for invalid in ["", "../escape", "-leading", "space label", "é"] {
+            assert!(validate_followup_args(None, None, Some(invalid), false).is_err());
+        }
+        assert!(validate_followup_args(None, None, Some(&"a".repeat(65)), false).is_err());
     }
 
     #[test]
@@ -338,6 +419,7 @@ mod tests {
 
         let metadata = read_followup_metadata(root.path()).unwrap().unwrap();
         assert_eq!(metadata.recipe, BuiltinWebRecipe::Chatgpt);
+        assert_eq!(metadata.thread_label, None);
     }
 
     #[test]
@@ -357,6 +439,7 @@ mod tests {
                 url: "https://chatgpt.com/c/shared-id".to_string(),
             },
             "chatgpt-hash",
+            None,
         )
         .unwrap();
         write_followup_metadata_for_recipe(
@@ -368,6 +451,7 @@ mod tests {
                 url: "https://claude.ai/chat/shared-id".to_string(),
             },
             "claude-hash",
+            None,
         )
         .unwrap();
 
@@ -389,6 +473,88 @@ mod tests {
         assert_eq!(
             resolved.source_session_id.as_deref(),
             Some("20260711_010000_claude")
+        );
+    }
+
+    #[test]
+    fn thread_resolution_uses_newest_matching_recipe_and_skips_legacy_files() {
+        let root = tempdir().unwrap();
+        let sessions_dir = root.path().join("sessions");
+        let legacy = sessions_dir.join("20260711_020000_legacy");
+        let old_chatgpt = sessions_dir.join("20260711_000000_chatgpt");
+        let new_chatgpt = sessions_dir.join("20260711_030000_chatgpt");
+        let claude = sessions_dir.join("20260711_040000_claude");
+        for path in [&legacy, &old_chatgpt, &new_chatgpt, &claude] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(
+            legacy.join("followup.json"),
+            r#"{
+              "session_id": "20260711_020000_legacy",
+              "conversation_id": "legacy",
+              "conversation_url": "https://chatgpt.com/c/legacy",
+              "prompt_hash": "legacy-hash"
+            }"#,
+        )
+        .unwrap();
+        for (path, session_id, recipe, conversation_id, hash) in [
+            (
+                &old_chatgpt,
+                "20260711_000000_chatgpt",
+                BuiltinWebRecipe::Chatgpt,
+                "old-chatgpt",
+                "old-hash",
+            ),
+            (
+                &new_chatgpt,
+                "20260711_030000_chatgpt",
+                BuiltinWebRecipe::Chatgpt,
+                "new-chatgpt",
+                "new-hash",
+            ),
+            (
+                &claude,
+                "20260711_040000_claude",
+                BuiltinWebRecipe::Claude,
+                "claude-conversation",
+                "claude-hash",
+            ),
+        ] {
+            let host = match recipe {
+                BuiltinWebRecipe::Chatgpt => "https://chatgpt.com/c/",
+                BuiltinWebRecipe::Claude => "https://claude.ai/chat/",
+            };
+            write_followup_metadata_for_recipe(
+                path,
+                session_id,
+                recipe,
+                &WebConversation {
+                    id: conversation_id.to_string(),
+                    url: format!("{host}{conversation_id}"),
+                },
+                hash,
+                Some("review-pr-341"),
+            )
+            .unwrap();
+        }
+
+        let chatgpt =
+            resolve_thread_target("review-pr-341", &sessions_dir, BuiltinWebRecipe::Chatgpt)
+                .unwrap()
+                .unwrap();
+        assert_eq!(chatgpt.conversation.id, "new-chatgpt");
+        assert_eq!(chatgpt.prior_prompt_hash.as_deref(), Some("new-hash"));
+
+        let claude =
+            resolve_thread_target("review-pr-341", &sessions_dir, BuiltinWebRecipe::Claude)
+                .unwrap()
+                .unwrap();
+        assert_eq!(claude.conversation.id, "claude-conversation");
+
+        assert!(
+            resolve_thread_target("unknown-thread", &sessions_dir, BuiltinWebRecipe::Chatgpt)
+                .unwrap()
+                .is_none()
         );
     }
 }
