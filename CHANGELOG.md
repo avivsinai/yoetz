@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.43] - 2026-07-25
 ### Added
 
 - Added recipe-scoped `--thread <label>` aliases for ChatGPT and Claude, with
@@ -25,6 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Excluded ChatGPT citation and source controls from DOM response extraction,
   so a Sources-only affordance cannot satisfy finality while legitimate answer
   text and extraction diagnostics remain intact.
+
 
 ## [0.5.42] - 2026-07-22
 ### Changed
