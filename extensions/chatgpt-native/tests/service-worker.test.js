@@ -767,7 +767,7 @@ test("service worker doctor auth probe prefers active non-owned ChatGPT tab and 
     assert.equal(complete.payload.manual_handoff.state, "login_required");
     assert.equal(complete.payload.tab_id, 2);
     assert.equal(complete.payload.selection, "active_non_yoetz_chatgpt_tab");
-    assert.equal(complete.payload.yoetz_owned_tabs_open, 4);
+    assert.equal(complete.payload.yoetz_owned_tabs_open, 3);
     assert.equal(complete.payload.yoetz_owned_complete_tabs_open, 1);
     assert.deepEqual(sentToTabs.map((item) => item.id), [2]);
   } finally {
@@ -6296,10 +6296,10 @@ test("service worker cancelJob removes the tab but warns may_still_be_running wh
   }
 });
 
-test("service worker cancelJob on an already-idle response removes the tab and reports confirmed_idle", async () => {
+test("service worker cancelJob reports close_failed when tab removal throws after confirmed idle", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
-  const removedTabs = [];
+  const removeAttempts = [];
   let createdTabId = 0;
   let sent = false;
   globalThis.chrome = chromeStub({
@@ -6308,7 +6308,8 @@ test("service worker cancelJob on an already-idle response removes the tab and r
       create: async (opts) => ({ id: ++createdTabId, ...opts }),
       get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
       remove: async (id) => {
-        removedTabs.push(id);
+        removeAttempts.push(id);
+        throw new Error("tabs.remove failed");
       },
       sendMessage: async (_id, message) => {
         switch (message.type) {
@@ -6365,13 +6366,20 @@ test("service worker cancelJob on an already-idle response removes the tab and r
     port.emit(envelope("job_cancel", "job_cancel_idle"));
     await eventually(() => port.messages.some((m) => m.type === "job_cancel" && m.job_id === "job_cancel_idle"));
 
-    assert.deepEqual(removedTabs, [createdTabId], "already-idle cancel must still remove the tab");
+    assert.deepEqual(removeAttempts, [createdTabId]);
     const cancelEnvelope = port.messages.find((m) => m.type === "job_cancel" && m.job_id === "job_cancel_idle");
     assert.equal(cancelEnvelope.payload.cancelled, true);
+    assert.equal(cancelEnvelope.payload.tab_disposition, "close_failed");
     assert.equal(cancelEnvelope.payload.stop_clicked, false);
     assert.equal(cancelEnvelope.payload.stop_confirmed, true);
     assert.equal(cancelEnvelope.payload.generation_idle, true);
     assert.equal(cancelEnvelope.payload.may_still_be_running, false);
+    const cancelledProgress = port.messages.find((m) =>
+      m.type === "job_progress"
+      && m.job_id === "job_cancel_idle"
+      && m.payload?.phase === "cancelled"
+    );
+    assert.equal(cancelledProgress.payload.tab_disposition, "close_failed");
   } finally {
     globalThis.chrome = originalChrome;
   }

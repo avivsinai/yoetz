@@ -684,9 +684,11 @@ async function cancelJob(message) {
   // here through the tabGroups API instead of chrome.tabs.remove. This runs only
   // after the awaited cancelSend above resolves, so we never destroy the page
   // mid-abort.
+  let tabDisposition = job.tab_id ? "close_failed" : "closed";
   if (job.tab_id && chrome.tabs?.remove) {
     try {
       await chrome.tabs.remove(job.tab_id);
+      tabDisposition = "closed";
     } catch {
       // Tab already closed by the user, or removal racing with navigation.
     }
@@ -694,7 +696,7 @@ async function cancelJob(message) {
 
   postNative(progress(job, "cancelled", {
     tab_id: job.tab_id,
-    tab_disposition: "closed",
+    tab_disposition: tabDisposition,
     stop_clicked: stopClicked,
     stop_confirmed: stopConfirmed,
     generation_idle: stopConfirmed,
@@ -708,7 +710,7 @@ async function cancelJob(message) {
     capability_token: job.capability_token,
     payload: {
       cancelled: true,
-      tab_disposition: "closed",
+      tab_disposition: tabDisposition,
       stop_clicked: stopClicked,
       stop_confirmed: stopConfirmed,
       generation_idle: stopConfirmed,
@@ -830,7 +832,11 @@ async function countOwnedTabs(tabs, adapter) {
       && Number.isFinite(job?.tab_id)
     )
     .map(([, job]) => job);
-  const shardedTabIds = new Set(storedJobs.map((job) => job.tab_id));
+  const shardedTabIds = new Set(
+    storedJobs
+      .filter((job) => job.tab_disposition !== "closed")
+      .map((job) => job.tab_id)
+  );
   const ownedTabIds = new Set(
     (tabs ?? [])
       .filter((tab) =>
