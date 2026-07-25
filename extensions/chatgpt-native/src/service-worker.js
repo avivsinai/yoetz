@@ -572,9 +572,34 @@ async function completeJobWithExtraction(job, extraction) {
     await recordTerminalDeliveryLost(job, "wait_response");
     return;
   }
+  await closeOwnedTabOnComplete(job);
   rememberTerminalJob(job.job_id);
   jobs.delete(job.job_id);
   chunks.discard(job.job_id);
+}
+
+async function closeOwnedTabOnComplete(job) {
+  if (!job.close_tab_on_complete || !job.tab_id) {
+    return;
+  }
+  let phase = "tab_closed";
+  let detail = { tab_id: job.tab_id };
+  try {
+    await chrome.tabs.remove(job.tab_id);
+    job.tab_disposition = "closed";
+  } catch (error) {
+    job.tab_disposition = "close_failed";
+    phase = "tab_close_failed";
+    detail = {
+      tab_id: job.tab_id,
+      error: String(error?.message ?? error)
+    };
+  }
+  await persistJob(job);
+  // The native host currently releases the per-job client after job_complete,
+  // so this progress event is intentionally unrouted until host routing grows
+  // an explicit post-terminal channel. The persisted shard is authoritative.
+  postNative(progress(job, phase, detail));
 }
 
 function conversationIdForJob(job, extraction = null) {
@@ -669,6 +694,7 @@ async function cancelJob(message) {
 
   postNative(progress(job, "cancelled", {
     tab_id: job.tab_id,
+    tab_disposition: "closed",
     stop_clicked: stopClicked,
     stop_confirmed: stopConfirmed,
     generation_idle: stopConfirmed,
@@ -682,6 +708,7 @@ async function cancelJob(message) {
     capability_token: job.capability_token,
     payload: {
       cancelled: true,
+      tab_disposition: "closed",
       stop_clicked: stopClicked,
       stop_confirmed: stopConfirmed,
       generation_idle: stopConfirmed,
@@ -758,13 +785,15 @@ async function handleDoctorAuthProbe(message) {
 
 async function probeSiteAuthentication(adapter) {
   const tabs = await chrome.tabs.query({ url: adapter.tabQueryPattern });
+  const ownedTabCounts = await countOwnedTabs(tabs, adapter);
   const selected = selectSiteAuthProbeTab(tabs, adapter);
   if (!selected) {
     return {
       status: adapter.auth.noTabStatus,
       authenticated: false,
       message: `No ${adapter.displayName} tab is open in this Chrome profile; open ${adapter.homeUrl} and rerun doctor`,
-      inspected_tabs: 0
+      inspected_tabs: 0,
+      ...ownedTabCounts
     };
   }
   try {
@@ -775,7 +804,8 @@ async function probeSiteAuthentication(adapter) {
       tab_url: selected.tab.url ?? null,
       tab_title: selected.tab.title ?? null,
       selection: selected.selection,
-      inspected_tabs: selected.total
+      inspected_tabs: selected.total,
+      ...ownedTabCounts
     };
   } catch (error) {
     return {
@@ -786,9 +816,50 @@ async function probeSiteAuthentication(adapter) {
       tab_url: selected.tab.url ?? null,
       tab_title: selected.tab.title ?? null,
       selection: selected.selection,
-      inspected_tabs: selected.total
+      inspected_tabs: selected.total,
+      ...ownedTabCounts
     };
   }
+}
+
+async function countOwnedTabs(tabs, adapter) {
+  const stored = await chrome.storage.session.get(null);
+  const storedJobs = Object.entries(stored)
+    .filter(([key, job]) =>
+      key.startsWith(JOBS_KEY_PREFIX)
+      && Number.isFinite(job?.tab_id)
+    )
+    .map(([, job]) => job);
+  const shardedTabIds = new Set(storedJobs.map((job) => job.tab_id));
+  const ownedTabIds = new Set(
+    (tabs ?? [])
+      .filter((tab) =>
+        isYoetzOwnedTab(tab, adapter)
+        || shardedTabIds.has(tab?.id)
+      )
+      .map((tab) => tab.id)
+  );
+  const completeTabIds = new Set(
+    storedJobs
+      .filter((job) =>
+        job.status === "complete"
+        && job.close_tab_on_complete === true
+        && job.tab_disposition !== "closed"
+      )
+      .map((job) => job.tab_id)
+  );
+  return {
+    yoetz_owned_tabs_open: ownedTabIds.size,
+    yoetz_owned_complete_tabs_open: [...ownedTabIds]
+      .filter((tabId) => completeTabIds.has(tabId))
+      .length
+  };
+}
+
+function isYoetzOwnedTab(tab, adapter) {
+  return Boolean(tab?.id)
+    && adapter.isAllowedTabUrl(tab.url)
+    && new URL(tab.url).searchParams.has("_yoetz");
 }
 
 function selectSiteAuthProbeTab(tabs, adapter) {
@@ -796,7 +867,7 @@ function selectSiteAuthProbeTab(tabs, adapter) {
     .filter((tab) => tab?.id && adapter.isAllowedTabUrl(tab.url))
     .map((tab) => ({
       tab,
-      yoetzOwned: new URL(tab.url).searchParams.has("_yoetz")
+      yoetzOwned: isYoetzOwnedTab(tab, adapter)
     }));
   if (candidates.length === 0) {
     return null;
@@ -1101,6 +1172,7 @@ function normalizeJob(message, adapter) {
     wait_interval_ms: payload.wait_interval_ms ?? 30000,
     upload_timeout_ms: payload.upload_timeout_ms ?? 120000,
     send_timeout_ms: payload.send_timeout_ms ?? 120000,
+    close_tab_on_complete: payload.close_tab_on_complete === true,
     browser_context_id: payload.browser_context_id ?? null,
     profile_email: payload.profile_email ?? null,
     extension_instance_id: payload.extension_instance_id ?? null,
@@ -2246,6 +2318,11 @@ function cleanupTerminalJobIds() {
 
 async function failJob(job, code, message, detail = {}) {
   const { terminal_status: terminalStatus, ...payloadDetail } = detail;
+  if (job?.tab_id) {
+    // "kept" means Yoetz did not close the tab on this failure path. It does
+    // not assert that the user has not already closed the tab independently.
+    payloadDetail.tab_disposition = "kept";
+  }
   if (job) {
     job.status = terminalStatus ?? "failed";
     job.updated_at = Date.now();

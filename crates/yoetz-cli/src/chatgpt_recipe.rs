@@ -124,6 +124,7 @@ pub struct ChatgptRecipeSpec {
     pub wait_interval_ms: u64,
     pub upload_timeout_ms: u64,
     pub send_timeout_ms: u64,
+    pub close_tab_on_complete: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

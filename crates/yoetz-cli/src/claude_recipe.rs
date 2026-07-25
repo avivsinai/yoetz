@@ -46,6 +46,7 @@ pub struct ClaudeRecipeSpec {
     pub wait_interval_ms: u64,
     pub upload_timeout_ms: u64,
     pub send_timeout_ms: u64,
+    pub close_tab_on_complete: bool,
     pub warnings: Vec<String>,
 }
 
@@ -126,6 +127,32 @@ pub fn inline_size_warnings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_recipe_output_keeps_conversation_url_at_top_level() {
+        let output = ClaudeRecipeOutput {
+            transport: "chrome-extension-native".to_string(),
+            backend: "chrome-extension-native".to_string(),
+            response: "done".to_string(),
+            model_used: Some(CLAUDE_REPORTED_MODEL.to_string()),
+            model_selection_status: WebModelSelectionStatus::Selected,
+            warnings: Vec::new(),
+            fallback_used: false,
+            conversation_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
+            conversation_url: Some(
+                "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174000".to_string(),
+            ),
+            run_id: "run-claude".to_string(),
+            elapsed_ms: 42,
+        };
+
+        let payload = output.to_value();
+
+        assert_eq!(
+            payload["conversation_url"],
+            "https://claude.ai/chat/123e4567-e89b-12d3-a456-426614174000"
+        );
+    }
 
     #[test]
     fn exact_model_aliases_canonicalize_and_other_models_fail_closed() {
