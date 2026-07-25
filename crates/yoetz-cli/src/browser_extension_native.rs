@@ -1334,6 +1334,15 @@ fn auth_doctor_check_from_payload(payload: &Value, recipe: BuiltinWebRecipe) -> 
     if let Some(selection) = payload.get("selection").and_then(Value::as_str) {
         detail.push(format!("selection={selection}"));
     }
+    if let Some(count) = payload.get("yoetz_owned_tabs_open").and_then(Value::as_u64) {
+        detail.push(format!("yoetz_owned_tabs_open={count}"));
+    }
+    if let Some(count) = payload
+        .get("yoetz_owned_complete_tabs_open")
+        .and_then(Value::as_u64)
+    {
+        detail.push(format!("yoetz_owned_complete_tabs_open={count}"));
+    }
     if let Some(url) = payload
         .get("url")
         .or_else(|| payload.get("tab_url"))
@@ -1501,6 +1510,8 @@ pub fn canary(
         .path()
         .join(format!("yoetz-{}-native-canary.md", recipe.as_str()));
     fs::write(&bundle_path, "Reply with exactly OK.\n")?;
+    // A successful automated canary should not leave a diagnostic tab behind.
+    let close_tab_on_complete = true;
     let response = match recipe {
         BuiltinWebRecipe::Chatgpt => run_chatgpt_recipe(
             &ChatgptRecipeSpec {
@@ -1518,6 +1529,7 @@ pub fn canary(
                 wait_interval_ms: 1_000,
                 upload_timeout_ms: 30_000,
                 send_timeout_ms: 120_000,
+                close_tab_on_complete,
             },
             OutputFormat::Json,
         )?,
@@ -1535,6 +1547,7 @@ pub fn canary(
                 wait_interval_ms: 1_000,
                 upload_timeout_ms: 30_000,
                 send_timeout_ms: 120_000,
+                close_tab_on_complete,
                 warnings: Vec::new(),
             },
             OutputFormat::Json,
@@ -1763,6 +1776,7 @@ fn chatgpt_job_start_payload(spec: &ChatgptRecipeSpec, bundle: &BundleInfo) -> V
         "wait_interval_ms": spec.wait_interval_ms,
         "upload_timeout_ms": spec.upload_timeout_ms,
         "send_timeout_ms": spec.send_timeout_ms,
+        "close_tab_on_complete": spec.close_tab_on_complete,
     })
 }
 
@@ -1785,6 +1799,7 @@ fn claude_job_start_payload(spec: &ClaudeRecipeSpec, bundle: &BundleInfo) -> Val
         "wait_interval_ms": spec.wait_interval_ms,
         "upload_timeout_ms": spec.upload_timeout_ms,
         "send_timeout_ms": spec.send_timeout_ms,
+        "close_tab_on_complete": spec.close_tab_on_complete,
     })
 }
 
@@ -4175,11 +4190,13 @@ mod tests {
             wait_interval_ms: 1_000,
             upload_timeout_ms: 2_000,
             send_timeout_ms: 3_000,
+            close_tab_on_complete: true,
         };
 
         let payload = chatgpt_job_start_payload(&spec, &bundle);
 
         assert_eq!(payload["conversation_id"], "conv-123");
+        assert_eq!(payload["close_tab_on_complete"], true);
     }
 
     #[test]
@@ -4204,6 +4221,7 @@ mod tests {
             wait_interval_ms: 1_000,
             upload_timeout_ms: 2_000,
             send_timeout_ms: 3_000,
+            close_tab_on_complete: false,
             warnings: vec!["size warning".to_string()],
         };
 
@@ -4217,6 +4235,7 @@ mod tests {
         assert_eq!(payload["model_strategy"], "select");
         assert_eq!(payload["conversation_id"], conversation_id);
         assert_eq!(payload["extension_instance_id"], "ext_claude");
+        assert_eq!(payload["close_tab_on_complete"], false);
     }
 
     #[test]
@@ -4323,6 +4342,28 @@ mod tests {
         assert_eq!(
             result.conversation_url.as_deref(),
             Some("https://chatgpt.com/c/conv-123")
+        );
+    }
+
+    #[test]
+    fn job_complete_parsing_tolerates_absent_tab_reporting_fields() {
+        let envelope = ProtocolEnvelope::new(
+            "job_complete",
+            Some("job_old_extension".to_string()),
+            Some("run_old_extension".to_string()),
+            json!({
+                "response": "done",
+                "conversation_id": "conv-old-extension",
+                "conversation_url": "https://chatgpt.com/c/conv-old-extension"
+            }),
+        );
+
+        let result = parse_recipe_result(envelope).unwrap();
+
+        assert_eq!(result.response, "done");
+        assert_eq!(
+            result.conversation_url.as_deref(),
+            Some("https://chatgpt.com/c/conv-old-extension")
         );
     }
 
@@ -4602,7 +4643,9 @@ mod tests {
             "message": "ChatGPT login required in this Chrome profile",
             "tab_id": 7,
             "selection": "active_non_yoetz_chatgpt_tab",
-            "url": "https://chatgpt.com/auth/login"
+            "url": "https://chatgpt.com/auth/login",
+            "yoetz_owned_tabs_open": 3,
+            "yoetz_owned_complete_tabs_open": 1
         }));
 
         assert_eq!(check.name, "chatgpt_auth");
@@ -4610,6 +4653,8 @@ mod tests {
         assert!(check.detail.contains("login_required"));
         assert!(check.detail.contains("tab_id=7"));
         assert!(check.detail.contains("active_non_yoetz_chatgpt_tab"));
+        assert!(check.detail.contains("yoetz_owned_tabs_open=3"));
+        assert!(check.detail.contains("yoetz_owned_complete_tabs_open=1"));
     }
 
     #[test]

@@ -321,6 +321,10 @@ struct BrowserRecipeArgs {
     #[arg(long)]
     allow_cdp_fallback: bool,
 
+    /// Keep the yoetz-owned browser tab open after successful completion.
+    #[arg(long)]
+    keep_tab: bool,
+
     #[arg(long)]
     bundle: Option<PathBuf>,
 
@@ -2431,6 +2435,7 @@ fn build_chatgpt_recipe_spec(
         wait_interval_ms: poll_settings.interval_ms,
         upload_timeout_ms,
         send_timeout_ms,
+        close_tab_on_complete: !recipe_args.keep_tab,
     })
 }
 
@@ -2481,6 +2486,7 @@ fn build_claude_recipe_spec(
         wait_interval_ms: poll_settings.interval_ms,
         upload_timeout_ms,
         send_timeout_ms,
+        close_tab_on_complete: !recipe_args.keep_tab,
         warnings: warnings.to_vec(),
     })
 }
@@ -6543,6 +6549,30 @@ mod tests {
     }
 
     #[test]
+    fn browser_recipe_keep_tab_flag_defaults_off_and_can_be_enabled() {
+        for (extra_args, expected_keep_tab) in
+            [(Vec::<&str>::new(), false), (vec!["--keep-tab"], true)]
+        {
+            let mut argv = vec![
+                "yoetz",
+                "browser",
+                "recipe",
+                "--recipe",
+                "recipes/chatgpt.yaml",
+            ];
+            argv.extend(extra_args);
+            let cli = Cli::try_parse_from(argv).expect("browser recipe args should parse");
+
+            match cli.command {
+                Commands::Browser(BrowserArgs {
+                    command: BrowserCommand::Recipe(args),
+                }) => assert_eq!(args.keep_tab, expected_keep_tab),
+                _ => panic!("unexpected command parsed"),
+            }
+        }
+    }
+
+    #[test]
     fn browser_sync_cookies_cli_accepts_profile_path() {
         let cli = Cli::try_parse_from([
             "yoetz",
@@ -6599,6 +6629,7 @@ mod tests {
             recipe: PathBuf::from("recipes/claude.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: None,
             profile: None,
             cdp: None,
@@ -6636,6 +6667,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: None,
             profile: Some(PathBuf::from("/tmp/ignored")),
             cdp: None,
@@ -6669,6 +6701,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
@@ -6703,6 +6736,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: None,
             profile: None,
             cdp: None,
@@ -6737,6 +6771,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
@@ -6771,6 +6806,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
@@ -6807,6 +6843,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(bundle_path.clone()),
             profile: None,
             cdp: None,
@@ -6836,6 +6873,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(bundle_path.clone()),
             profile: None,
             cdp: None,
@@ -6863,6 +6901,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
@@ -6912,6 +6951,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
@@ -6980,6 +7020,7 @@ mod tests {
             recipe: PathBuf::from("recipes/claude.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
@@ -7040,6 +7081,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
@@ -7085,6 +7127,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(bundle_md),
             profile: None,
             cdp: None,
@@ -7131,6 +7174,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(bundle_md),
             profile: None,
             cdp: None,
@@ -7157,6 +7201,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: Some(browser::RecipeTransport::ChromeExtensionNative),
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/missing-bundle.md")),
             profile: None,
             cdp: None,
@@ -7191,6 +7236,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: Some(browser::RecipeTransport::ChromeExtensionNative),
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/missing-bundle.md")),
             profile: None,
             cdp: None,
@@ -7225,6 +7271,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: Some(browser::RecipeTransport::ChromeExtensionNative),
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
@@ -7286,6 +7333,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,
@@ -7319,6 +7367,7 @@ mod tests {
             recipe: PathBuf::from("recipes/claude.yaml"),
             transport: Some(browser::RecipeTransport::DevBrowser),
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/claude-bundle.md")),
             profile: None,
             cdp: None,
@@ -7363,6 +7412,7 @@ mod tests {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
             allow_cdp_fallback: false,
+            keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
             profile: None,
             cdp: None,

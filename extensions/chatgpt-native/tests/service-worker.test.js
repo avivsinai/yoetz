@@ -685,15 +685,46 @@ test("service worker surfaces Claude model mismatch legs in the job error", asyn
 test("service worker doctor auth probe prefers active non-owned ChatGPT tab and surfaces login", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
+  const storage = makeStorage();
   const sentToTabs = [];
+  await storage.set({
+    "jobs.job_complete_leak": {
+      job_id: "job_complete_leak",
+      tab_id: 1,
+      status: "complete",
+      close_tab_on_complete: true
+    },
+    "jobs.job_active_owned": {
+      job_id: "job_active_owned",
+      tab_id: 4,
+      status: "waiting_response"
+    },
+    "jobs.job_kept_complete": {
+      job_id: "job_kept_complete",
+      tab_id: 5,
+      status: "complete",
+      close_tab_on_complete: false
+    },
+    "jobs.job_closed_complete": {
+      job_id: "job_closed_complete",
+      tab_id: 6,
+      status: "complete",
+      close_tab_on_complete: true,
+      tab_disposition: "closed"
+    }
+  });
   globalThis.chrome = chromeStub({
     port,
+    storage,
     profileEmail: "work@example.com",
     tabs: {
       query: async () => [
-        { id: 1, url: "https://chatgpt.com/?_yoetz=run_job", title: "Yoetz job", active: true },
+        { id: 1, url: "https://chatgpt.com/c/completed", title: "Yoetz job", active: false },
         { id: 2, url: "https://chatgpt.com/", title: "ChatGPT", active: true },
-        { id: 3, url: "https://chatgpt.com/c/older", title: "Older ChatGPT", active: false }
+        { id: 3, url: "https://chatgpt.com/c/older", title: "Older ChatGPT", active: false },
+        { id: 4, url: "https://chatgpt.com/c/active?_yoetz=run_active", title: "Active Yoetz job", active: false },
+        { id: 5, url: "https://chatgpt.com/c/kept", title: "Kept Yoetz job", active: false },
+        { id: 6, url: "https://chatgpt.com/c/closed", title: "Stale closed shard", active: false }
       ],
       create: async () => {
         throw new Error("doctor auth probe must not open a tab");
@@ -736,6 +767,8 @@ test("service worker doctor auth probe prefers active non-owned ChatGPT tab and 
     assert.equal(complete.payload.manual_handoff.state, "login_required");
     assert.equal(complete.payload.tab_id, 2);
     assert.equal(complete.payload.selection, "active_non_yoetz_chatgpt_tab");
+    assert.equal(complete.payload.yoetz_owned_tabs_open, 3);
+    assert.equal(complete.payload.yoetz_owned_complete_tabs_open, 1);
     assert.deepEqual(sentToTabs.map((item) => item.id), [2]);
   } finally {
     globalThis.chrome = originalChrome;
@@ -924,6 +957,7 @@ test("service worker rejects invalid conversation ids before opening a tab", asy
       assert.equal(error.payload.code, "invalid_conversation");
       assert.equal(error.payload.phase, "upload");
       assert.equal(error.payload.side_effect_started, false);
+      assert.equal(error.payload.tab_disposition, undefined);
       assert.deepEqual(createdTabs, []);
     } finally {
       globalThis.chrome = originalChrome;
@@ -1206,6 +1240,7 @@ test("service worker fails unavailable conversations with inspectable terminal e
     assert.equal(error.payload.requested_conversation_id, "conv-404");
     assert.equal(error.payload.current_url, currentUrl);
     assert.equal(error.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_unavailable");
+    assert.equal(error.payload.tab_disposition, "kept");
     assert.match(error.payload.message, /requested conversation conv-404/);
     assert.match(error.payload.message, /current URL https:\/\/chatgpt\.com\/c\/conv-404\?_yoetz=run_job_unavailable/);
     assert.match(error.payload.message, /phase upload/);
@@ -1248,6 +1283,7 @@ test("service worker marks manual handoff as terminal after tab side effects", a
     assert.equal(error.payload.code, "manual_handoff");
     assert.equal(error.payload.phase, "upload");
     assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.tab_disposition, "kept");
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -3220,6 +3256,7 @@ test("service worker reports oversized completed responses before native deliver
     assert.equal(error.payload.side_effect_started, true);
     assert.equal(error.payload.response_length, 2048);
     assert.equal(error.payload.max_native_message_bytes, 1024);
+    assert.equal(error.payload.tab_disposition, "kept");
     assert.equal(error.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_oversized_completed_response");
     assert.ok(error.payload.native_message_bytes > error.payload.max_native_message_bytes);
     assert.match(error.payload.message, /too large to deliver/);
@@ -5960,6 +5997,13 @@ test("service worker cancelJob isolates one of two active ChatGPT jobs", async (
     const cancelEnvelope = port.messages.find((m) => m.type === "job_cancel" && m.job_id === "job_cancel_a");
     assert.equal(cancelEnvelope.payload.cancelled, true);
     assert.equal(cancelEnvelope.payload.stop_clicked, true);
+    assert.equal(cancelEnvelope.payload.tab_disposition, "closed");
+    const cancelledProgress = port.messages.find((m) =>
+      m.type === "job_progress"
+      && m.job_id === "job_cancel_a"
+      && m.payload?.phase === "cancelled"
+    );
+    assert.equal(cancelledProgress.payload.tab_disposition, "closed");
 
     survivorCanComplete = true;
     await eventually(() => port.messages.some((m) => m.type === "job_complete" && m.job_id === "job_survivor_b"));
@@ -6252,10 +6296,10 @@ test("service worker cancelJob removes the tab but warns may_still_be_running wh
   }
 });
 
-test("service worker cancelJob on an already-idle response removes the tab and reports confirmed_idle", async () => {
+test("service worker cancelJob reports close_failed when tab removal throws after confirmed idle", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
-  const removedTabs = [];
+  const removeAttempts = [];
   let createdTabId = 0;
   let sent = false;
   globalThis.chrome = chromeStub({
@@ -6264,7 +6308,8 @@ test("service worker cancelJob on an already-idle response removes the tab and r
       create: async (opts) => ({ id: ++createdTabId, ...opts }),
       get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
       remove: async (id) => {
-        removedTabs.push(id);
+        removeAttempts.push(id);
+        throw new Error("tabs.remove failed");
       },
       sendMessage: async (_id, message) => {
         switch (message.type) {
@@ -6321,16 +6366,92 @@ test("service worker cancelJob on an already-idle response removes the tab and r
     port.emit(envelope("job_cancel", "job_cancel_idle"));
     await eventually(() => port.messages.some((m) => m.type === "job_cancel" && m.job_id === "job_cancel_idle"));
 
-    assert.deepEqual(removedTabs, [createdTabId], "already-idle cancel must still remove the tab");
+    assert.deepEqual(removeAttempts, [createdTabId]);
     const cancelEnvelope = port.messages.find((m) => m.type === "job_cancel" && m.job_id === "job_cancel_idle");
     assert.equal(cancelEnvelope.payload.cancelled, true);
+    assert.equal(cancelEnvelope.payload.tab_disposition, "close_failed");
     assert.equal(cancelEnvelope.payload.stop_clicked, false);
     assert.equal(cancelEnvelope.payload.stop_confirmed, true);
     assert.equal(cancelEnvelope.payload.generation_idle, true);
     assert.equal(cancelEnvelope.payload.may_still_be_running, false);
+    const cancelledProgress = port.messages.find((m) =>
+      m.type === "job_progress"
+      && m.job_id === "job_cancel_idle"
+      && m.payload?.phase === "cancelled"
+    );
+    assert.equal(cancelledProgress.payload.tab_disposition, "close_failed");
   } finally {
     globalThis.chrome = originalChrome;
   }
+});
+
+test("service worker closes an owned tab only after delivering a gated successful completion", async () => {
+  const result = await runSuccessfulCompletionCase({
+    jobId: "job_close_success",
+    closeTabOnComplete: true
+  });
+
+  assert.deepEqual(result.removedTabs, [result.tabId]);
+  assert.ok(
+    result.events.indexOf("post:job_complete") < result.events.indexOf(`remove:${result.tabId}`),
+    `expected job_complete delivery before tab removal, got ${result.events.join(", ")}`
+  );
+  const closed = result.messages.find((message) =>
+    message.type === "job_progress" && message.payload?.phase === "tab_closed"
+  );
+  assert.equal(closed.payload.tab_id, result.tabId);
+  assert.equal(result.shard.status, "complete");
+  assert.equal(result.shard.tab_disposition, "closed");
+});
+
+test("service worker preserves legacy success behavior when the close gate is absent", async () => {
+  const result = await runSuccessfulCompletionCase({
+    jobId: "job_close_legacy"
+  });
+
+  assert.deepEqual(result.removedTabs, []);
+  assert.equal(
+    result.messages.some((message) =>
+      message.type === "job_progress"
+      && ["tab_closed", "tab_close_failed"].includes(message.payload?.phase)
+    ),
+    false
+  );
+  assert.equal(result.shard.status, "complete");
+  assert.equal(result.shard.tab_disposition, undefined);
+});
+
+test("service worker keeps the tab when successful completion delivery is lost", async () => {
+  const result = await runSuccessfulCompletionCase({
+    jobId: "job_close_delivery_lost",
+    closeTabOnComplete: true,
+    failCompleteDelivery: true
+  });
+
+  assert.deepEqual(result.removedTabs, []);
+  assert.equal(result.shard.status, "terminal_delivery_lost");
+  assert.equal(result.shard.tab_disposition, undefined);
+});
+
+test("service worker reports close failure without changing successful terminal status", async () => {
+  const result = await runSuccessfulCompletionCase({
+    jobId: "job_close_failure",
+    closeTabOnComplete: true,
+    removeError: new Error("tabs.remove failed")
+  });
+
+  assert.deepEqual(result.removedTabs, []);
+  const failed = result.messages.find((message) =>
+    message.type === "job_progress" && message.payload?.phase === "tab_close_failed"
+  );
+  assert.equal(failed.payload.tab_id, result.tabId);
+  assert.equal(failed.payload.error, "tabs.remove failed");
+  assert.equal(result.shard.status, "complete");
+  assert.equal(result.shard.tab_disposition, "close_failed");
+  assert.equal(
+    result.messages.some((message) => message.type === "job_error"),
+    false
+  );
 });
 
 test("service worker resumes waiting_for_file jobs after service-worker restart", async () => {
@@ -6566,6 +6687,156 @@ test("service worker still fails receiving_file jobs after service-worker restar
     globalThis.chrome = originalChrome;
   }
 });
+
+async function runSuccessfulCompletionCase({
+  jobId,
+  closeTabOnComplete,
+  failCompleteDelivery = false,
+  removeError = null
+}) {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const removedTabs = [];
+  const events = [];
+  let tabId = 0;
+  let sent = false;
+
+  const originalPostMessage = port.postMessage.bind(port);
+  port.postMessage = (message) => {
+    events.push(`post:${message.type}`);
+    return originalPostMessage(message);
+  };
+  port.throwOnPostMessage = (message) =>
+    failCompleteDelivery && message.type === "job_complete";
+
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      create: async (options) => ({ id: ++tabId, ...options }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      remove: async (id) => {
+        events.push(`remove:${id}`);
+        if (removeError) {
+          throw removeError;
+        }
+        removedTabs.push(id);
+      },
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: `conv-${jobId}`,
+                submitted_assistant_count: 0
+              }
+            };
+          case "yoetz_fetch_conversation":
+            return {
+              ok: true,
+              payload: {
+                method: "backend_api",
+                text: "done",
+                is_generating: false,
+                node_fresh: true,
+                node_id: `answer-${jobId}`,
+                conversation_id: `conv-${jobId}`,
+                assistant_count: 1,
+                turn_index: 0,
+                copy_button_count: 0,
+                has_copy_button: false
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "assistant_dom_fallback",
+                    text: "done",
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: 0,
+                    conversation_id: `conv-${jobId}`
+                  }
+                : {
+                    method: "none",
+                    text: "",
+                    is_generating: false,
+                    assistant_count: 0,
+                    user_count: 0,
+                    copy_button_count: 0,
+                    has_copy_button: false,
+                    turn_index: -1
+                  }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?close_success_case=${jobId}_${Date.now()}`);
+    const payload = {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 2000
+    };
+    if (closeTabOnComplete !== undefined) {
+      payload.close_tab_on_complete = closeTabOnComplete;
+    }
+    port.emit(envelope("job_start", jobId, payload));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", jobId, {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: `${jobId}.md`,
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    const terminalStatus = failCompleteDelivery ? "terminal_delivery_lost" : "complete";
+    await eventually(async () =>
+      (await storage.get(`jobs.${jobId}`))[`jobs.${jobId}`]?.status === terminalStatus
+    );
+    if (closeTabOnComplete && !failCompleteDelivery) {
+      await eventually(async () => {
+        const shard = (await storage.get(`jobs.${jobId}`))[`jobs.${jobId}`];
+        return ["closed", "close_failed"].includes(shard?.tab_disposition);
+      });
+    }
+    return {
+      events,
+      messages: [...port.messages],
+      removedTabs,
+      tabId,
+      shard: (await storage.get(`jobs.${jobId}`))[`jobs.${jobId}`]
+    };
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+}
 
 function verifiedSolProSelection() {
   return {
