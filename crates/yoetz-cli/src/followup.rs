@@ -95,10 +95,9 @@ fn parse_thread_wait_duration(raw: &str) -> Option<Duration> {
         (number, "s")
     } else if let Some(number) = raw.strip_suffix('m') {
         (number, "m")
-    } else if let Some(number) = raw.strip_suffix('h') {
-        (number, "h")
     } else {
-        return None;
+        let number = raw.strip_suffix('h')?;
+        (number, "h")
     };
     let value = number.parse::<u64>().ok()?;
     if value == 0 {

@@ -355,7 +355,7 @@ struct BrowserRecipeArgs {
     #[arg(long, requires = "thread")]
     fresh: bool,
 
-    /// Same-label collision behavior: fail (default), wait[:<duration>], or fork.
+    /// Same-label collision behavior: fail (default), `wait[:<duration>]`, or fork.
     #[arg(long, value_name = "MODE", requires = "thread")]
     on_thread_conflict: Option<followup::ThreadConflictPolicy>,
 
