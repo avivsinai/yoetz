@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Browser recipe threads now hold a recipe-scoped per-label lock for the full
+  native run and metadata write, preventing concurrent agents from silently
+  interleaving prompts in one conversation. Collisions fail with actionable
+  holder details by default; `--on-thread-conflict wait[:<duration>]` and
+  `fork` provide explicit alternatives without ambiguously re-pointing labels.
+
 ## [0.5.43] - 2026-07-25
 ### Added
 
