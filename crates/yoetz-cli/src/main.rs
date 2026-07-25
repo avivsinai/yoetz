@@ -1317,6 +1317,10 @@ fn recipe_should_auto_discover_cdp_target(
         && (!extension_native_will_route || (requested_extension_native && allow_cdp_fallback))
 }
 
+fn recipe_should_probe_live_browser_routes(thread_label: Option<&str>) -> bool {
+    thread_label.is_none()
+}
+
 fn recipe_should_auto_select_extension_native<R: IntoBuiltinWebRecipe>(
     requested_transport: Option<browser::RecipeTransport>,
     builtin_recipe: R,
@@ -1370,13 +1374,19 @@ fn recipe_transport_error_detail_for_recipe(
     builtin_recipe: Option<web_recipe::BuiltinWebRecipe>,
 ) -> String {
     let mut detail = recipe_transport_error_detail(err);
-    if let Some((recipe, _phase)) = web_recipe::terminal_fallback_marker(err)
+    if let Some((recipe, phase)) = web_recipe::terminal_fallback_marker(err)
         .or_else(|| {
             chatgpt_recipe::terminal_fallback_phase(err)
                 .map(|phase| (web_recipe::BuiltinWebRecipe::Chatgpt, phase))
         })
         .filter(|(recipe, _)| builtin_recipe.is_none_or(|expected| expected == *recipe))
     {
+        if phase == web_recipe::WebRecipeTransportPhase::PostCompletion {
+            detail.push_str(
+                "\nPost-completion status: browser/model run completed, but local finalization failed; do not rerun because the completed request may produce a duplicate submission.",
+            );
+            return detail;
+        }
         if let Some(run_id) = recipe_vars
             .get("run_id")
             .map(String::as_str)
@@ -1469,6 +1479,12 @@ fn recipe_should_stop_live_transport_fallback(
     // targets and auto-selected targets remain advisory.
     selected_cdp_target.is_some_and(browser::ResolvedCdpTarget::is_authoritative)
         && !matches!(transport, browser::RecipeTransport::Manual)
+}
+
+fn should_print_native_cdp_fallback_hint(thread_label: Option<&str>, err: &anyhow::Error) -> bool {
+    thread_label.is_none()
+        && web_recipe::terminal_fallback_marker(err).is_none()
+        && chatgpt_recipe::terminal_fallback_phase(err).is_none()
 }
 
 /// A transport is "pure live-CDP" if its only way to drive the browser is
@@ -1601,6 +1617,24 @@ fn constrain_chatgpt_transports_for_conversation<R: IntoBuiltinWebRecipe>(
         .collect()
 }
 
+fn constrain_builtin_transports_for_conversation_or_thread<R: IntoBuiltinWebRecipe>(
+    transports: Vec<browser::RecipeTransport>,
+    recipe_vars: &std::collections::BTreeMap<String, String>,
+    thread_label: Option<&str>,
+    builtin_recipe: R,
+) -> Vec<browser::RecipeTransport> {
+    let builtin_recipe = builtin_recipe.into_builtin_web_recipe();
+    if builtin_recipe.is_some() && thread_label.is_some() {
+        return transports
+            .into_iter()
+            .filter(|transport| {
+                matches!(transport, browser::RecipeTransport::ChromeExtensionNative)
+            })
+            .collect();
+    }
+    constrain_chatgpt_transports_for_conversation(transports, recipe_vars, builtin_recipe)
+}
+
 fn ensure_chatgpt_transport_constraints_allow_any<R: IntoBuiltinWebRecipe>(
     transports: &[browser::RecipeTransport],
     requested: Option<browser::RecipeTransport>,
@@ -1643,6 +1677,42 @@ fn ensure_chatgpt_transport_constraints_allow_any<R: IntoBuiltinWebRecipe>(
     }
 
     Ok(())
+}
+
+fn ensure_builtin_transport_constraints_allow_any<R: IntoBuiltinWebRecipe>(
+    transports: &[browser::RecipeTransport],
+    requested: Option<browser::RecipeTransport>,
+    recipe_vars: &std::collections::BTreeMap<String, String>,
+    thread_label: Option<&str>,
+    builtin_recipe: R,
+) -> Result<()> {
+    let builtin_recipe = builtin_recipe.into_builtin_web_recipe();
+    if transports.is_empty() {
+        if let (Some(label), Some(recipe)) = (thread_label, builtin_recipe) {
+            let requested = requested
+                .map(recipe_transport_name)
+                .map(|name| format!("requested transport `{name}`"))
+                .unwrap_or_else(|| "configured transports".to_string());
+            let setup = match recipe {
+                web_recipe::BuiltinWebRecipe::Chatgpt => {
+                    "Install the Yoetz Chrome extension (`yoetz browser extension setup --chatgpt`) or pass --transport chrome-extension-native."
+                }
+                web_recipe::BuiltinWebRecipe::Claude => {
+                    "Install or update the Yoetz Chrome extension (`yoetz browser extension setup --claude`) so the selected instance advertises Claude support."
+                }
+            };
+            bail!(
+                "{} thread `{label}` requires chrome-extension-native; {requested} is not compatible. {setup}",
+                recipe.display_name()
+            );
+        }
+    }
+    ensure_chatgpt_transport_constraints_allow_any(
+        transports,
+        requested,
+        recipe_vars,
+        builtin_recipe,
+    )
 }
 
 fn live_attach_owner_present(summary: &live_attach::DaemonSummary) -> bool {
@@ -2612,6 +2682,7 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
     ctx: &AppContext,
     recipe_args: &BrowserRecipeArgs,
     recipe_vars: &BTreeMap<String, String>,
+    current_prompt_hash: Option<&str>,
     format: OutputFormat,
     builtin_recipe: R,
     preflight_warnings: &[String],
@@ -2650,10 +2721,16 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
     }
     let started_at = Instant::now();
 
-    let (mut payload, jsonl_event, notification_target) = match builtin_recipe {
+    let (payload, jsonl_event, notification_target) = match builtin_recipe {
         web_recipe::BuiltinWebRecipe::Chatgpt => {
             let recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
-            let response = browser_extension_native::run_chatgpt_recipe(&recipe_spec, format)?;
+            let response = browser_extension_native::run_chatgpt_recipe(&recipe_spec, format)
+                .map_err(|err| {
+                    browser_extension_native::with_thread_conversation_recovery_hint(
+                        err,
+                        recipe_args.thread.as_deref(),
+                    )
+                })?;
             let output = chatgpt_recipe::ChatgptRecipeOutput {
                 transport: browser_extension_native::TRANSPORT_NAME.to_string(),
                 backend: browser_extension_native::TRANSPORT_NAME.to_string(),
@@ -2677,7 +2754,13 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
         web_recipe::BuiltinWebRecipe::Claude => {
             let recipe_spec =
                 build_claude_recipe_spec(recipe_args, recipe_vars, preflight_warnings)?;
-            let response = browser_extension_native::run_claude_recipe(&recipe_spec, format)?;
+            let response = browser_extension_native::run_claude_recipe(&recipe_spec, format)
+                .map_err(|err| {
+                    browser_extension_native::with_thread_conversation_recovery_hint(
+                        err,
+                        recipe_args.thread.as_deref(),
+                    )
+                })?;
             let mut warnings = recipe_spec.warnings.clone();
             warnings.extend(response.warnings);
             warnings.sort();
@@ -2702,28 +2785,73 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
             )
         }
     };
-    attach_browser_recipe_artifacts(&mut payload, recipe_args.bundle.as_deref())?;
-    maybe_write_output(ctx, &payload)?;
-    match format {
-        OutputFormat::Json => {
-            write_json(&payload)?;
-        }
-        OutputFormat::Jsonl => {
-            write_jsonl("browser.recipe", &jsonl_event)?;
-        }
-        OutputFormat::Text | OutputFormat::Markdown => {
-            println!("{}", payload["response"].as_str().unwrap_or_default());
-        }
-    }
-    maybe_notify_browser_recipe_completion(
+    complete_chrome_extension_native_recipe(
         ctx,
-        recipe_args.no_notify,
-        notification_target.as_str(),
-        &payload,
-        started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
-        None,
-    );
-    Ok(payload)
+        recipe_args,
+        current_prompt_hash,
+        builtin_recipe,
+        payload,
+        &jsonl_event,
+        &notification_target,
+        started_at,
+        format,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn complete_chrome_extension_native_recipe(
+    ctx: &AppContext,
+    recipe_args: &BrowserRecipeArgs,
+    current_prompt_hash: Option<&str>,
+    builtin_recipe: web_recipe::BuiltinWebRecipe,
+    mut payload: Value,
+    jsonl_event: &Value,
+    notification_target: &str,
+    started_at: Instant,
+    format: OutputFormat,
+) -> Result<Value> {
+    let completion = || -> Result<Value> {
+        if let Some(thread_label) = recipe_args.thread.as_deref() {
+            let current_prompt_hash = current_prompt_hash.ok_or_else(|| {
+                anyhow!("persist thread `{thread_label}` metadata: missing current prompt hash")
+            })?;
+            write_followup_session_metadata_required(
+                recipe_args,
+                current_prompt_hash,
+                &payload,
+                builtin_recipe,
+            )?;
+        }
+        attach_browser_recipe_artifacts(&mut payload, recipe_args.bundle.as_deref())?;
+        maybe_write_output(ctx, &payload)?;
+        match format {
+            OutputFormat::Json => {
+                write_json(&payload)?;
+            }
+            OutputFormat::Jsonl => {
+                write_jsonl("browser.recipe", &jsonl_event)?;
+            }
+            OutputFormat::Text | OutputFormat::Markdown => {
+                println!("{}", payload["response"].as_str().unwrap_or_default());
+            }
+        }
+        maybe_notify_browser_recipe_completion(
+            ctx,
+            recipe_args.no_notify,
+            notification_target,
+            &payload,
+            started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            None,
+        );
+        Ok(payload)
+    };
+    completion().map_err(|err| {
+        web_recipe::mark_terminal_fallback_phase(
+            err,
+            builtin_recipe,
+            web_recipe::WebRecipeTransportPhase::PostCompletion,
+        )
+    })
 }
 
 fn attach_browser_recipe_artifacts(payload: &mut Value, bundle_path: Option<&Path>) -> Result<()> {
@@ -2765,6 +2893,75 @@ fn browser_recipe_artifact_paths(bundle_path: Option<&Path>) -> Option<ArtifactP
     })
 }
 
+fn validate_thread_persistence_preflight_in(
+    recipe_args: &BrowserRecipeArgs,
+    sessions_base: &Path,
+) -> Result<()> {
+    let Some(thread_label) = recipe_args.thread.as_deref() else {
+        return Ok(());
+    };
+    let bundle_path = recipe_args.bundle.as_deref().ok_or_else(|| {
+        anyhow!(
+            "thread `{thread_label}` requires a managed bundle session with bundle.md and bundle.json"
+        )
+    })?;
+    if bundle_path.file_name().and_then(|name| name.to_str()) != Some("bundle.md") {
+        bail!("thread `{thread_label}` bundle must be named bundle.md");
+    }
+    let session_dir = bundle_path
+        .parent()
+        .ok_or_else(|| anyhow!("thread `{thread_label}` bundle has no session directory"))?;
+    let bundle_json = session_dir.join("bundle.json");
+
+    ensure_regular_file(bundle_path, "bundle.md", thread_label)?;
+    ensure_regular_file(&bundle_json, "bundle.json", thread_label)?;
+    let canonical_base = fs::canonicalize(sessions_base).with_context(|| {
+        format!(
+            "thread `{thread_label}` canonicalize managed sessions directory {}",
+            sessions_base.display()
+        )
+    })?;
+    let canonical_session = fs::canonicalize(session_dir).with_context(|| {
+        format!(
+            "thread `{thread_label}` canonicalize session directory {}",
+            session_dir.display()
+        )
+    })?;
+    if canonical_session.parent() != Some(canonical_base.as_path()) {
+        bail!(
+            "thread `{thread_label}` session must be a direct child of the managed sessions directory {}",
+            canonical_base.display()
+        );
+    }
+
+    let followup_path = session_dir.join("followup.json");
+    match fs::symlink_metadata(&followup_path) {
+        Ok(metadata) if metadata.file_type().is_file() => {}
+        Ok(_) => bail!(
+            "thread `{thread_label}` followup.json must be a regular file when it already exists"
+        ),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "thread `{thread_label}` inspect existing {}",
+                    followup_path.display()
+                )
+            });
+        }
+    }
+    Ok(())
+}
+
+fn ensure_regular_file(path: &Path, name: &str, thread_label: &str) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("thread `{thread_label}` inspect {}", path.display()))?;
+    if !metadata.file_type().is_file() {
+        bail!("thread `{thread_label}` {name} must be a regular file");
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct BrowserRecipeSessionLease {
     _file: File,
@@ -2802,29 +2999,38 @@ fn acquire_browser_recipe_session_lease(
     }
 }
 
-fn maybe_write_followup_session_metadata(
+fn acquire_browser_recipe_session_lease_in(
     recipe_args: &BrowserRecipeArgs,
-    current_prompt_hash: Option<&str>,
-    payload: &Value,
-    recipe: web_recipe::BuiltinWebRecipe,
-) {
-    let Some(current_prompt_hash) = current_prompt_hash else {
-        return;
-    };
-    let Some(session_artifacts) = browser_recipe_artifact_paths(recipe_args.bundle.as_deref())
-    else {
-        return;
-    };
+    sessions_base: &Path,
+) -> Result<Option<BrowserRecipeSessionLease>> {
+    validate_thread_persistence_preflight_in(recipe_args, sessions_base)?;
+    acquire_browser_recipe_session_lease(recipe_args.bundle.as_deref())
+}
+
+fn final_conversation_identity(payload: &Value) -> Option<&str> {
     // The final job_complete conversation_id is authoritative: ChatGPT may begin under a
     // WEB: scaffold reassigned by isExpectedConversationIdAssignment in
     // extensions/chatgpt-native/src/sites/chatgpt.js. Keep the URL as a legacy fallback.
-    let Some(conversation_raw) = payload
+    payload
         .get("conversation_id")
         .and_then(Value::as_str)
         .or_else(|| payload.get("conversation_url").and_then(Value::as_str))
-    else {
-        return;
-    };
+}
+
+fn write_followup_session_metadata(
+    recipe_args: &BrowserRecipeArgs,
+    current_prompt_hash: &str,
+    payload: &Value,
+    recipe: web_recipe::BuiltinWebRecipe,
+) -> Result<()> {
+    let session_artifacts = browser_recipe_artifact_paths(recipe_args.bundle.as_deref())
+        .ok_or_else(|| {
+            anyhow!(
+                "followup metadata requires a managed bundle session with bundle.md and bundle.json"
+            )
+        })?;
+    let conversation_raw = final_conversation_identity(payload)
+        .ok_or_else(|| anyhow!("missing authoritative final conversation identity"))?;
 
     let session_dir = PathBuf::from(session_artifacts.session_dir);
     let session_id = session_dir
@@ -2844,22 +3050,59 @@ fn maybe_write_followup_session_metadata(
         web_recipe::BuiltinWebRecipe::Claude => {
             claude_web::normalize_conversation(conversation_raw)
         }
-    };
-    let Ok(conversation) = conversation else {
-        eprintln!(
-            "warning: could not normalize followup conversation for metadata {}",
+    }
+    .with_context(|| {
+        format!(
+            "normalize final conversation identity for metadata {}",
             session_dir.join("followup.json").display()
-        );
-        return;
-    };
-    if let Err(err) = followup::write_followup_metadata_for_recipe(
+        )
+    })?;
+    followup::write_followup_metadata_for_recipe(
         &session_dir,
         &session_id,
         recipe,
         &conversation,
         current_prompt_hash,
         recipe_args.thread.as_deref(),
-    ) {
+    )
+}
+
+fn write_followup_session_metadata_required(
+    recipe_args: &BrowserRecipeArgs,
+    current_prompt_hash: &str,
+    payload: &Value,
+    recipe: web_recipe::BuiltinWebRecipe,
+) -> Result<()> {
+    let thread_label = recipe_args
+        .thread
+        .as_deref()
+        .ok_or_else(|| anyhow!("required thread metadata needs --thread"))?;
+    write_followup_session_metadata(recipe_args, current_prompt_hash, payload, recipe)
+        .with_context(|| format!("persist thread `{thread_label}` metadata"))
+}
+
+fn maybe_write_followup_session_metadata(
+    recipe_args: &BrowserRecipeArgs,
+    current_prompt_hash: Option<&str>,
+    payload: &Value,
+    recipe: web_recipe::BuiltinWebRecipe,
+) {
+    let Some(current_prompt_hash) = current_prompt_hash else {
+        return;
+    };
+    if browser_recipe_artifact_paths(recipe_args.bundle.as_deref()).is_none()
+        || final_conversation_identity(payload).is_none()
+    {
+        return;
+    }
+    if let Err(err) =
+        write_followup_session_metadata(recipe_args, current_prompt_hash, payload, recipe)
+    {
+        let session_dir = recipe_args
+            .bundle
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or_else(|| Path::new("."));
         eprintln!(
             "warning: could not write followup metadata {}: {err}",
             session_dir.join("followup.json").display()
@@ -4257,8 +4500,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             }
         }
         BrowserCommand::Recipe(recipe_args) => {
-            let _session_lease =
-                acquire_browser_recipe_session_lease(recipe_args.bundle.as_deref())?;
+            let _session_lease = acquire_browser_recipe_session_lease_in(
+                &recipe_args,
+                &yoetz_core::session::session_base_dir(),
+            )?;
             let recipe_path = browser::resolve_recipe(&recipe_args.recipe)
                 .with_context(|| format!("resolve recipe {:?}", recipe_args.recipe))?;
             let content = fs::read_to_string(&recipe_path)
@@ -4403,17 +4648,23 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             } else {
                 Vec::new()
             };
-            let mut resolved_cdp_target = browser::resolve_cdp_target_with_selector(
-                recipe_args.cdp.as_deref(),
-                recipe_args.browser_id.as_deref(),
-                &ctx.browser_defaults,
-                recipe_should_auto_discover_cdp_target(
-                    managed_profile_only,
-                    requested_extension_native,
-                    extension_native_will_route,
-                    effective_allow_cdp_fallback,
-                ),
-            )?;
+            let probe_live_browser_routes =
+                recipe_should_probe_live_browser_routes(recipe_args.thread.as_deref());
+            let mut resolved_cdp_target = if probe_live_browser_routes {
+                browser::resolve_cdp_target_with_selector(
+                    recipe_args.cdp.as_deref(),
+                    recipe_args.browser_id.as_deref(),
+                    &ctx.browser_defaults,
+                    recipe_should_auto_discover_cdp_target(
+                        managed_profile_only,
+                        requested_extension_native,
+                        extension_native_will_route,
+                        effective_allow_cdp_fallback,
+                    ),
+                )?
+            } else {
+                None
+            };
             maybe_print_auto_selected_cdp_target(resolved_cdp_target.as_ref(), format);
             let base_transports = browser::maybe_select_extension_native_for_builtin(
                 browser::recipe_transports(&recipe, builtin_recipe),
@@ -4430,8 +4681,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 effective_allow_cdp_fallback,
                 builtin_recipe,
             )?;
-            let live_attach_owner_is_present =
-                live_attach_owner_present(&live_attach::inspect_daemon_sync());
+            let live_attach_owner_is_present = probe_live_browser_routes
+                && live_attach_owner_present(&live_attach::inspect_daemon_sync());
             let prefer_auto_connect = builtin_recipe.is_some()
                 && !managed_profile_only
                 && !recipe_uses_exact_browser_context_selector(&recipe_vars)
@@ -4449,15 +4700,17 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 &recipe_vars,
                 builtin_recipe,
             );
-            let transports = constrain_chatgpt_transports_for_conversation(
+            let transports = constrain_builtin_transports_for_conversation_or_thread(
                 transports,
                 &recipe_vars,
+                recipe_args.thread.as_deref(),
                 builtin_recipe,
             );
-            ensure_chatgpt_transport_constraints_allow_any(
+            ensure_builtin_transport_constraints_allow_any(
                 &transports,
                 recipe_args.transport,
                 &recipe_vars,
+                recipe_args.thread.as_deref(),
                 builtin_recipe,
             )?;
             maybe_print_auto_selected_extension_native_transport(
@@ -4534,6 +4787,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                             ctx,
                             &recipe_args,
                             &recipe_vars,
+                            current_prompt_hash.as_deref(),
                             format,
                             builtin_recipe,
                             &preflight_warnings,
@@ -4553,13 +4807,15 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         ) {
                             maybe_remember_cdp_target(resolved_cdp_target.as_ref(), format);
                         }
-                        if let Some(recipe_kind) = builtin_recipe {
-                            maybe_write_followup_session_metadata(
-                                &recipe_args,
-                                current_prompt_hash.as_deref(),
-                                &_payload,
-                                recipe_kind,
-                            );
+                        if recipe_args.thread.is_none() {
+                            if let Some(recipe_kind) = builtin_recipe {
+                                maybe_write_followup_session_metadata(
+                                    &recipe_args,
+                                    current_prompt_hash.as_deref(),
+                                    &_payload,
+                                    recipe_kind,
+                                );
+                            }
                         }
                         return Ok(());
                     }
@@ -4601,8 +4857,10 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         }
                         if matches!(transport, browser::RecipeTransport::ChromeExtensionNative)
                             && !effective_allow_cdp_fallback
-                            && web_recipe::terminal_fallback_marker(&err).is_none()
-                            && chatgpt_recipe::terminal_fallback_phase(&err).is_none()
+                            && should_print_native_cdp_fallback_hint(
+                                recipe_args.thread.as_deref(),
+                                &err,
+                            )
                             && matches!(format, OutputFormat::Text | OutputFormat::Markdown)
                         {
                             eprintln!(
@@ -5197,6 +5455,26 @@ mod tests {
         }
     }
 
+    fn thread_recipe_args(bundle: PathBuf) -> BrowserRecipeArgs {
+        BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/chatgpt.yaml"),
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
+            transport: None,
+            allow_cdp_fallback: false,
+            keep_tab: false,
+            bundle: Some(bundle),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            vars: vec![],
+            followup: None,
+            thread: Some("review-pr-341".to_string()),
+            fresh: false,
+            allow_duplicate_prompt: false,
+            no_notify: false,
+        }
+    }
+
     fn temp_schema_path() -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5383,6 +5661,7 @@ mod tests {
                 model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
                 transport: None,
                 allow_cdp_fallback: false,
+                keep_tab: false,
                 bundle: Some(bundle),
                 profile: None,
                 cdp: None,
@@ -5418,6 +5697,127 @@ mod tests {
                 "WEB:scaffold-that-must-not-be-persisted"
             );
         }
+    }
+
+    #[test]
+    fn required_thread_writeback_rejects_missing_final_conversation_identity() {
+        let dir = TempDir::new().unwrap();
+        let bundle = dir.path().join("bundle.md");
+        fs::write(&bundle, "# bundle").unwrap();
+        fs::write(dir.path().join("bundle.json"), "{}").unwrap();
+        let recipe_args = thread_recipe_args(bundle);
+
+        let err = write_followup_session_metadata_required(
+            &recipe_args,
+            "prompt-hash",
+            &json!({"status": "ok", "response": "done"}),
+            web_recipe::BuiltinWebRecipe::Chatgpt,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("missing authoritative final conversation identity"));
+        assert!(!dir.path().join("followup.json").exists());
+    }
+
+    #[test]
+    fn required_thread_writeback_propagates_persistence_failure() {
+        let dir = TempDir::new().unwrap();
+        let bundle = dir.path().join("bundle.md");
+        fs::write(&bundle, "# bundle").unwrap();
+        fs::write(dir.path().join("bundle.json"), "{}").unwrap();
+        fs::create_dir(dir.path().join("followup.json")).unwrap();
+        let recipe_args = thread_recipe_args(bundle);
+
+        let err = write_followup_session_metadata_required(
+            &recipe_args,
+            "prompt-hash",
+            &json!({
+                "status": "ok",
+                "response": "done",
+                "conversation_id": "final-conversation"
+            }),
+            web_recipe::BuiltinWebRecipe::Chatgpt,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("persist thread `review-pr-341`"));
+    }
+
+    #[test]
+    fn non_thread_followup_writeback_remains_best_effort() {
+        let dir = TempDir::new().unwrap();
+        let bundle = dir.path().join("bundle.md");
+        fs::write(&bundle, "# bundle").unwrap();
+        fs::write(dir.path().join("bundle.json"), "{}").unwrap();
+        fs::create_dir(dir.path().join("followup.json")).unwrap();
+        let mut recipe_args = thread_recipe_args(bundle);
+        recipe_args.thread = None;
+
+        maybe_write_followup_session_metadata(
+            &recipe_args,
+            Some("prompt-hash"),
+            &json!({"status": "ok", "response": "missing identity"}),
+            web_recipe::BuiltinWebRecipe::Chatgpt,
+        );
+        maybe_write_followup_session_metadata(
+            &recipe_args,
+            Some("prompt-hash"),
+            &json!({
+                "status": "ok",
+                "response": "persistence fails",
+                "conversation_id": "final-conversation"
+            }),
+            web_recipe::BuiltinWebRecipe::Chatgpt,
+        );
+
+        assert!(dir.path().join("followup.json").is_dir());
+    }
+
+    #[test]
+    fn thread_metadata_is_persisted_before_artifact_completion() {
+        let dir = TempDir::new().unwrap();
+        let bundle = dir.path().join("bundle.md");
+        fs::write(&bundle, "# bundle").unwrap();
+        fs::write(dir.path().join("bundle.json"), "{}").unwrap();
+        fs::create_dir(dir.path().join("response.json")).unwrap();
+        let recipe_args = thread_recipe_args(bundle);
+
+        let err = complete_chrome_extension_native_recipe(
+            &test_app_context(),
+            &recipe_args,
+            Some("prompt-hash"),
+            web_recipe::BuiltinWebRecipe::Chatgpt,
+            json!({
+                "status": "ok",
+                "response": "done",
+                "conversation_id": "final-conversation"
+            }),
+            &json!({"status": "ok"}),
+            "GPT-5.6 Sol Pro",
+            Instant::now(),
+            OutputFormat::Text,
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("response.json"));
+        assert_eq!(
+            web_recipe::terminal_fallback_marker(&err),
+            Some((
+                web_recipe::BuiltinWebRecipe::Chatgpt,
+                web_recipe::WebRecipeTransportPhase::PostCompletion,
+            ))
+        );
+        assert!(recipe_should_stop_live_transport_fallback(
+            &err,
+            None,
+            browser::RecipeTransport::ChromeExtensionNative,
+            &BTreeMap::new(),
+        ));
+        let metadata = followup::read_followup_metadata(dir.path())
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.thread_label.as_deref(), Some("review-pr-341"));
+        assert_eq!(metadata.conversation_id, "final-conversation");
     }
 
     #[test]
@@ -6157,6 +6557,152 @@ mod tests {
         assert!(message.contains("conversation requires chrome-extension-native"));
         assert!(message.contains("configured transports"));
         assert!(message.contains("yoetz browser extension setup --chatgpt"));
+    }
+
+    #[test]
+    fn thread_rejects_explicit_non_native_transport_for_both_sites() {
+        let vars = BTreeMap::new();
+        for recipe in [
+            web_recipe::BuiltinWebRecipe::Chatgpt,
+            web_recipe::BuiltinWebRecipe::Claude,
+        ] {
+            let transports = constrain_builtin_transports_for_conversation_or_thread(
+                vec![browser::RecipeTransport::ChromeDevtoolsMcp],
+                &vars,
+                Some("review-pr-341"),
+                Some(recipe),
+            );
+            let err = ensure_builtin_transport_constraints_allow_any(
+                &transports,
+                Some(browser::RecipeTransport::ChromeDevtoolsMcp),
+                &vars,
+                Some("review-pr-341"),
+                Some(recipe),
+            )
+            .unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("thread `review-pr-341` requires chrome-extension-native"));
+            assert!(message.contains("requested transport `chrome-devtools-mcp`"));
+        }
+    }
+
+    #[test]
+    fn thread_rejects_auto_selected_routes_when_native_is_unavailable() {
+        let vars = BTreeMap::new();
+        let transports = constrain_builtin_transports_for_conversation_or_thread(
+            vec![
+                browser::RecipeTransport::ChromeDevtoolsMcp,
+                browser::RecipeTransport::DevBrowser,
+                browser::RecipeTransport::AgentBrowser,
+                browser::RecipeTransport::Manual,
+            ],
+            &vars,
+            Some("review-pr-341"),
+            Some(web_recipe::BuiltinWebRecipe::Chatgpt),
+        );
+        assert!(transports.is_empty());
+        let err = ensure_builtin_transport_constraints_allow_any(
+            &transports,
+            None,
+            &vars,
+            Some("review-pr-341"),
+            Some(web_recipe::BuiltinWebRecipe::Chatgpt),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("thread `review-pr-341` requires chrome-extension-native"));
+        assert!(message.contains("configured transports"));
+    }
+
+    #[test]
+    fn thread_rejects_external_managed_bundle_lookalike_before_locking() {
+        let root = TempDir::new().unwrap();
+        let sessions_base = root.path().join("sessions");
+        let external_session = root.path().join("external").join("session-lookalike");
+        fs::create_dir_all(&sessions_base).unwrap();
+        fs::create_dir_all(&external_session).unwrap();
+        fs::write(external_session.join("bundle.md"), "# bundle").unwrap();
+        fs::write(external_session.join("bundle.json"), "{}").unwrap();
+        let recipe_args = thread_recipe_args(external_session.join("bundle.md"));
+
+        let err =
+            acquire_browser_recipe_session_lease_in(&recipe_args, &sessions_base).unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("direct child of the managed sessions directory"));
+        assert!(!external_session
+            .join(BROWSER_RECIPE_SESSION_LOCK_FILENAME)
+            .exists());
+    }
+
+    #[test]
+    fn thread_accepts_canonical_managed_session_with_regular_artifacts() {
+        let root = TempDir::new().unwrap();
+        let sessions_base = root.path().join("sessions");
+        let session = sessions_base.join("20260725_120000_abcdef");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("bundle.md"), "# bundle").unwrap();
+        fs::write(session.join("bundle.json"), "{}").unwrap();
+        let recipe_args = thread_recipe_args(session.join("bundle.md"));
+
+        assert!(validate_thread_persistence_preflight_in(&recipe_args, &sessions_base).is_ok());
+    }
+
+    #[test]
+    fn thread_rejects_non_regular_bundle_artifacts_and_followup_target() {
+        let root = TempDir::new().unwrap();
+        let sessions_base = root.path().join("sessions");
+
+        let bundle_dir_session = sessions_base.join("bundle-dir");
+        fs::create_dir_all(bundle_dir_session.join("bundle.md")).unwrap();
+        fs::write(bundle_dir_session.join("bundle.json"), "{}").unwrap();
+        let err = validate_thread_persistence_preflight_in(
+            &thread_recipe_args(bundle_dir_session.join("bundle.md")),
+            &sessions_base,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bundle.md must be a regular file"));
+
+        let json_dir_session = sessions_base.join("json-dir");
+        fs::create_dir_all(json_dir_session.join("bundle.json")).unwrap();
+        fs::write(json_dir_session.join("bundle.md"), "# bundle").unwrap();
+        let err = validate_thread_persistence_preflight_in(
+            &thread_recipe_args(json_dir_session.join("bundle.md")),
+            &sessions_base,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("bundle.json must be a regular file"));
+
+        let followup_dir_session = sessions_base.join("followup-dir");
+        fs::create_dir_all(followup_dir_session.join("followup.json")).unwrap();
+        fs::write(followup_dir_session.join("bundle.md"), "# bundle").unwrap();
+        fs::write(followup_dir_session.join("bundle.json"), "{}").unwrap();
+        let err = validate_thread_persistence_preflight_in(
+            &thread_recipe_args(followup_dir_session.join("bundle.md")),
+            &sessions_base,
+        )
+        .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("followup.json must be a regular file"));
+    }
+
+    #[test]
+    fn thread_never_probes_live_browser_routes_or_prints_cdp_fallback_hint() {
+        let err = anyhow!("native extension unavailable");
+
+        assert!(!recipe_should_probe_live_browser_routes(Some(
+            "review-pr-341"
+        )));
+        assert!(!should_print_native_cdp_fallback_hint(
+            Some("review-pr-341"),
+            &err,
+        ));
+        assert!(recipe_should_probe_live_browser_routes(None));
+        assert!(should_print_native_cdp_fallback_hint(None, &err));
     }
 
     #[test]
@@ -7371,6 +7917,7 @@ mod tests {
             &ctx,
             &recipe_args,
             &recipe_vars,
+            None,
             OutputFormat::Json,
             true,
             &[],
@@ -7408,6 +7955,7 @@ mod tests {
             &ctx,
             &recipe_args,
             &recipe_vars,
+            None,
             OutputFormat::Json,
             true,
             &[],
@@ -7445,6 +7993,7 @@ mod tests {
             &ctx,
             &recipe_args,
             &recipe_vars,
+            None,
             OutputFormat::Json,
             true,
             &[],
@@ -7631,6 +8180,31 @@ mod tests {
         assert!(detail.contains("window.name `yoetz:run-123`"));
         assert!(detail.contains("extension marker prefix `yoetz-chatgpt-native:run-123:`"));
         assert!(detail.contains("duplicate submission"));
+    }
+
+    #[test]
+    fn recipe_transport_error_detail_for_post_completion_forbids_rerun_and_tab_recovery() {
+        let err = web_recipe::mark_terminal_fallback_phase(
+            anyhow::anyhow!("persist thread metadata failed"),
+            web_recipe::BuiltinWebRecipe::Chatgpt,
+            web_recipe::WebRecipeTransportPhase::PostCompletion,
+        );
+        let vars = BTreeMap::from([("run_id".to_string(), "run-complete".to_string())]);
+
+        let detail = recipe_transport_error_detail_for_recipe(
+            &err,
+            &vars,
+            Some(web_recipe::BuiltinWebRecipe::Chatgpt),
+        );
+
+        assert!(detail.contains("browser/model run completed"));
+        assert!(detail.contains("local finalization failed"));
+        assert!(detail.contains("do not rerun"));
+        assert!(detail.contains("duplicate"));
+        assert!(!detail.contains("Manual recovery"));
+        assert!(!detail.contains("continue in"));
+        assert!(!detail.contains("inspect"));
+        assert!(!detail.contains("chatgpt.com"));
     }
 
     #[test]

@@ -2,12 +2,14 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use tempfile::NamedTempFile;
 
 #[cfg(test)]
 use crate::chatgpt_web::{self, ChatgptConversation};
 use crate::web_recipe::{BuiltinWebRecipe, WebConversation};
-use yoetz_core::session::{list_sessions_in, write_json};
+use yoetz_core::session::list_sessions_in;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct FollowupMetadata {
@@ -16,6 +18,8 @@ pub(crate) struct FollowupMetadata {
     pub recipe: BuiltinWebRecipe,
     #[serde(default)]
     pub thread_label: Option<String>,
+    #[serde(default)]
+    pub thread_revision: u64,
     pub conversation_id: String,
     pub conversation_url: String,
     pub prompt_hash: String,
@@ -107,24 +111,39 @@ pub(crate) fn resolve_thread_target(
     recipe: BuiltinWebRecipe,
 ) -> Result<Option<ResolvedFollowup>> {
     validate_thread_label(label)?;
+    let mut latest: Option<FollowupMetadata> = None;
     for session in list_sessions_in(sessions_base)? {
-        let Some(metadata) = read_followup_metadata(&session.path)? else {
-            continue;
+        let metadata = match read_followup_metadata(&session.path) {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!(
+                    "warning: skipping unreadable followup metadata in session `{}`: {err:#}",
+                    session.id
+                );
+                continue;
+            }
         };
         if metadata.recipe != recipe || metadata.thread_label.as_deref() != Some(label) {
             continue;
         }
-        return Ok(Some(ResolvedFollowup {
-            recipe,
-            conversation: WebConversation {
-                id: metadata.conversation_id,
-                url: metadata.conversation_url,
-            },
-            source_session_id: Some(metadata.session_id),
-            prior_prompt_hash: Some(metadata.prompt_hash),
-        }));
+        if latest
+            .as_ref()
+            .is_some_and(|current| current.thread_revision >= metadata.thread_revision)
+        {
+            continue;
+        }
+        latest = Some(metadata);
     }
-    Ok(None)
+    Ok(latest.map(|metadata| ResolvedFollowup {
+        recipe,
+        conversation: WebConversation {
+            id: metadata.conversation_id,
+            url: metadata.conversation_url,
+        },
+        source_session_id: Some(metadata.session_id),
+        prior_prompt_hash: Some(metadata.prompt_hash),
+    }))
 }
 
 pub(crate) fn compute_prompt_hash(prompt: &str, bundle_path: Option<&Path>) -> Result<String> {
@@ -220,15 +239,70 @@ pub(crate) fn write_followup_metadata_for_recipe(
     thread_label: Option<&str>,
 ) -> Result<()> {
     let path = followup_metadata_path(session_dir);
+    let thread_revision = match thread_label {
+        Some(label) => next_thread_revision(session_dir, recipe, label)?,
+        None => 0,
+    };
     let metadata = FollowupMetadata {
         session_id: session_id.to_string(),
         recipe,
         thread_label: thread_label.map(str::to_string),
+        thread_revision,
         conversation_id: conversation.id.clone(),
         conversation_url: conversation.url.clone(),
         prompt_hash: prompt_hash.to_string(),
     };
-    write_json(&path, &metadata)?;
+    write_followup_metadata_atomically(&path, &metadata)?;
+    Ok(())
+}
+
+fn next_thread_revision(
+    session_dir: &Path,
+    recipe: BuiltinWebRecipe,
+    thread_label: &str,
+) -> Result<u64> {
+    let sessions_base = session_dir
+        .parent()
+        .ok_or_else(|| anyhow!("thread metadata session has no sessions directory parent"))?;
+    let mut max_revision = 0;
+    for session in list_sessions_in(sessions_base)? {
+        let metadata = match read_followup_metadata(&session.path) {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => continue,
+            Err(err) => {
+                eprintln!(
+                    "warning: skipping unreadable followup metadata in session `{}` while assigning thread revision: {err:#}",
+                    session.id
+                );
+                continue;
+            }
+        };
+        if metadata.recipe == recipe && metadata.thread_label.as_deref() == Some(thread_label) {
+            max_revision = max_revision.max(metadata.thread_revision);
+        }
+    }
+    max_revision
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("thread `{thread_label}` revision overflow"))
+}
+
+fn write_followup_metadata_atomically(path: &Path, metadata: &FollowupMetadata) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("followup metadata path has no parent"))?;
+    let mut temp = NamedTempFile::new_in(parent)
+        .with_context(|| format!("create temporary followup metadata in {}", parent.display()))?;
+    serde_json::to_writer_pretty(temp.as_file_mut(), metadata)
+        .with_context(|| format!("serialize followup metadata {}", path.display()))?;
+    temp.as_file_mut()
+        .write_all(b"\n")
+        .with_context(|| format!("write temporary followup metadata for {}", path.display()))?;
+    temp.as_file()
+        .sync_all()
+        .with_context(|| format!("sync temporary followup metadata for {}", path.display()))?;
+    temp.persist(path)
+        .map_err(|err| err.error)
+        .with_context(|| format!("atomically replace followup metadata {}", path.display()))?;
     Ok(())
 }
 
@@ -555,6 +629,106 @@ mod tests {
             resolve_thread_target("unknown-thread", &sessions_dir, BuiltinWebRecipe::Chatgpt)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn thread_resolution_skips_corrupt_unrelated_session_metadata() {
+        let root = tempdir().unwrap();
+        let sessions_dir = root.path().join("sessions");
+        let corrupt = sessions_dir.join("20260711_040000_corrupt");
+        let matching = sessions_dir.join("20260711_030000_matching");
+        fs::create_dir_all(&corrupt).unwrap();
+        fs::create_dir_all(&matching).unwrap();
+        fs::write(corrupt.join("followup.json"), "{not-json").unwrap();
+        write_followup_metadata_for_recipe(
+            &matching,
+            "20260711_030000_matching",
+            BuiltinWebRecipe::Chatgpt,
+            &WebConversation {
+                id: "conv-match".to_string(),
+                url: "https://chatgpt.com/c/conv-match".to_string(),
+            },
+            "matching-hash",
+            Some("review-pr-341"),
+        )
+        .unwrap();
+
+        let resolved =
+            resolve_thread_target("review-pr-341", &sessions_dir, BuiltinWebRecipe::Chatgpt)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(resolved.conversation.id, "conv-match");
+    }
+
+    #[test]
+    fn followup_metadata_write_replaces_existing_file_atomically() {
+        let root = tempdir().unwrap();
+        let session = root.path().join("sessions").join("session-atomic");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("followup.json"), "{partial").unwrap();
+
+        write_followup_metadata_for_recipe(
+            &session,
+            "session-atomic",
+            BuiltinWebRecipe::Chatgpt,
+            &WebConversation {
+                id: "conv-atomic".to_string(),
+                url: "https://chatgpt.com/c/conv-atomic".to_string(),
+            },
+            "atomic-hash",
+            Some("review-pr-341"),
+        )
+        .unwrap();
+
+        let metadata = read_followup_metadata(&session).unwrap().unwrap();
+        assert_eq!(metadata.session_id, "session-atomic");
+        assert_eq!(metadata.conversation_id, "conv-atomic");
+        assert!(fs::read_dir(&session).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp")));
+    }
+
+    #[test]
+    fn rewriting_older_session_repoints_thread_label() {
+        let root = tempdir().unwrap();
+        let sessions_dir = root.path().join("sessions");
+        let older = sessions_dir.join("20260711_010000_older");
+        let newer = sessions_dir.join("20260711_020000_newer");
+        fs::create_dir_all(&older).unwrap();
+        fs::create_dir_all(&newer).unwrap();
+
+        for (session, id, conversation) in [
+            (&older, "20260711_010000_older", "conv-old"),
+            (&newer, "20260711_020000_newer", "conv-newer"),
+            (&older, "20260711_010000_older", "conv-fresh"),
+        ] {
+            write_followup_metadata_for_recipe(
+                session,
+                id,
+                BuiltinWebRecipe::Chatgpt,
+                &WebConversation {
+                    id: conversation.to_string(),
+                    url: format!("https://chatgpt.com/c/{conversation}"),
+                },
+                &format!("{conversation}-hash"),
+                Some("review-pr-341"),
+            )
+            .unwrap();
+        }
+
+        let resolved =
+            resolve_thread_target("review-pr-341", &sessions_dir, BuiltinWebRecipe::Chatgpt)
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(resolved.conversation.id, "conv-fresh");
+        assert_eq!(
+            resolved.prior_prompt_hash.as_deref(),
+            Some("conv-fresh-hash")
         );
     }
 }

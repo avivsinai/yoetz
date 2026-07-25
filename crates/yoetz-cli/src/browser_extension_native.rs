@@ -61,6 +61,29 @@ struct FrameTooLargeError {
     max: usize,
 }
 
+#[derive(Debug, Error)]
+#[error("{message}")]
+struct ConversationJobError {
+    message: String,
+}
+
+pub(crate) fn is_conversation_job_error(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.downcast_ref::<ConversationJobError>().is_some())
+}
+
+pub(crate) fn with_thread_conversation_recovery_hint(
+    err: anyhow::Error,
+    thread_label: Option<&str>,
+) -> anyhow::Error {
+    match (thread_label, is_conversation_job_error(&err)) {
+        (Some(label), true) => err.context(format!(
+            "thread `{label}` could not resume its saved conversation; start a new conversation with `--thread {label} --fresh`"
+        )),
+        _ => err,
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct InstallHostResult {
     pub status: &'static str,
@@ -2903,13 +2926,22 @@ fn job_error(envelope: ProtocolEnvelope) -> anyhow::Error {
 
 fn job_error_for_recipe(envelope: ProtocolEnvelope, recipe: BuiltinWebRecipe) -> anyhow::Error {
     let message = job_error_message(&envelope.payload);
+    let is_conversation_error = envelope
+        .payload
+        .get("code")
+        .and_then(Value::as_str)
+        .is_some_and(|code| code.starts_with("conversation_"));
     let phase = envelope.payload.get("phase").and_then(Value::as_str);
     let side_effect_started = envelope
         .payload
         .get("side_effect_started")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let err = anyhow!("{message}");
+    let err = if is_conversation_error {
+        anyhow::Error::new(ConversationJobError { message })
+    } else {
+        anyhow!("{message}")
+    };
     if !side_effect_started {
         return err;
     }
@@ -5590,6 +5622,12 @@ mod tests {
         assert!(text.contains("current URL https://chatgpt.com/c/conv-404?_yoetz=run_conv"));
         assert!(text.contains("phase upload"));
         assert!(text.contains("yoetz browser extension inspect --chatgpt --run-id run_conv"));
+        assert!(is_conversation_job_error(&err));
+        assert!(format!(
+            "{:#}",
+            with_thread_conversation_recovery_hint(err, Some("review-pr-341"))
+        )
+        .contains("--thread review-pr-341 --fresh"));
     }
 
     #[test]
@@ -5613,9 +5651,15 @@ mod tests {
         assert!(text.contains("tab 920272522"));
         assert!(text.contains("phase upload"));
         assert!(text.contains("yoetz browser extension inspect --chatgpt --run-id run_ready"));
+        assert!(!is_conversation_job_error(&err));
         assert_eq!(
             crate::chatgpt_recipe::terminal_fallback_phase(&err),
             Some(ChatgptTransportPhase::Upload)
         );
+        assert!(!format!(
+            "{:#}",
+            with_thread_conversation_recovery_hint(err, Some("review-pr-341"))
+        )
+        .contains("--fresh"));
     }
 }
