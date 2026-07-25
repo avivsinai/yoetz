@@ -1223,6 +1223,7 @@ function assistantMessageTextEntry(turn) {
     addContentNode(turn);
   }
   for (const selector of [
+    '[data-message-author-role="assistant"]',
     '[data-testid*="assistant-message"]',
     '[data-testid*="assistant-response"]',
     '[data-message-author-role="assistant"] [class*="markdown"]',
