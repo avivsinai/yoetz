@@ -1284,27 +1284,12 @@ function leafNodes(nodes) {
 
 function isCitationSourceAffordance(node, turn = null) {
   for (let current = node; current; current = current.parentElement) {
-    const tag = String(current.tagName ?? "").toLowerCase();
-    const role = String(current.getAttribute?.("role") ?? "");
-    const testId = String(current.getAttribute?.("data-testid") ?? "");
-    const ariaLabel = String(current.getAttribute?.("aria-label") ?? "");
-    const title = String(current.getAttribute?.("title") ?? "");
-    const className = String(current.getAttribute?.("class") ?? "");
-    const semanticMarker = `${role} ${testId} ${ariaLabel} ${title}`;
-    const interactive = tag === "button"
-      || tag === "summary"
-      || role === "button"
-      || current.getAttribute?.("aria-expanded") !== null;
-    const explicitCitationMarker = /\b(citations?|sources?)\b/i.test(semanticMarker)
-      || /\b(citations?|sources?)(?:[-_]|$)/i.test(testId)
-      || (interactive && /\b(citations?|sources?)\b/i.test(className));
-    const exactInteractiveLabel = interactive
-      && /^sources?$/i.test(normalizeText(textOf(current)));
-    if (explicitCitationMarker || exactInteractiveLabel) {
-      return true;
-    }
     if (current === turn) {
       return false;
+    }
+    const testId = String(current.getAttribute?.("data-testid") ?? "");
+    if (testId === "citations-button" || classTokens(current).includes("group/footnote")) {
+      return true;
     }
   }
   return false;
@@ -1329,15 +1314,13 @@ function textContentWithoutCitationAffordances(node, turn) {
       .map((child) => child?.nodeType === 3
         ? String(child.textContent ?? "")
         : textContentWithoutCitationAffordances(child, turn))
-      .filter(Boolean)
-      .join("\n");
+      .join("");
   }
   const children = Array.from(node?.children ?? []);
   if (children.length > 0) {
     return children
       .map((child) => textContentWithoutCitationAffordances(child, turn))
-      .filter(Boolean)
-      .join("\n");
+      .join("");
   }
   return String(node?.textContent ?? "");
 }
