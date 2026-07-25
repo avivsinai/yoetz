@@ -17,7 +17,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 use crate::chatgpt_recipe::{
-    ChatgptModelSelectionStatus, ChatgptRecipeSpec, ChatgptTransportPhase,
+    ChatgptModelSelectionStatus, ChatgptRecipeDiagnostics, ChatgptRecipeSpec, ChatgptTransportPhase,
 };
 use crate::claude_recipe::ClaudeRecipeSpec;
 use crate::web_recipe::BuiltinWebRecipe;
@@ -167,6 +167,7 @@ pub struct ExtensionRecipeResult {
     pub warnings: Vec<String>,
     pub conversation_id: Option<String>,
     pub conversation_url: Option<String>,
+    pub diagnostics: ChatgptRecipeDiagnostics,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2889,6 +2890,35 @@ fn parse_recipe_result(envelope: ProtocolEnvelope) -> Result<ExtensionRecipeResu
         .get("conversation_url")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let diagnostics = ChatgptRecipeDiagnostics {
+        extraction_method: envelope
+            .payload
+            .get("extraction_method")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        completion_reason: envelope
+            .payload
+            .get("completion_reason")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        finality_anchor: envelope
+            .payload
+            .get("finality_anchor")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        stable_for_ms: envelope
+            .payload
+            .get("stable_for_ms")
+            .and_then(Value::as_u64),
+        assistant_turn_count: envelope
+            .payload
+            .get("assistant_turn_count")
+            .and_then(Value::as_u64),
+        copy_button_count: envelope
+            .payload
+            .get("copy_button_count")
+            .and_then(Value::as_u64),
+    };
     Ok(ExtensionRecipeResult {
         response,
         model_used,
@@ -2896,6 +2926,7 @@ fn parse_recipe_result(envelope: ProtocolEnvelope) -> Result<ExtensionRecipeResu
         warnings,
         conversation_id,
         conversation_url,
+        diagnostics,
     })
 }
 
@@ -4358,6 +4389,12 @@ mod tests {
                 "warnings": ["kept current"],
                 "conversation_id": "conv-123",
                 "conversation_url": "https://chatgpt.com/c/conv-123",
+                "extraction_method": "copy_scope_dom_fallback",
+                "completion_reason": "copy_button",
+                "finality_anchor": "dom_only",
+                "stable_for_ms": 5000,
+                "assistant_turn_count": 2,
+                "copy_button_count": 1,
             }),
         );
 
@@ -4375,6 +4412,21 @@ mod tests {
             result.conversation_url.as_deref(),
             Some("https://chatgpt.com/c/conv-123")
         );
+        assert_eq!(
+            result.diagnostics.extraction_method.as_deref(),
+            Some("copy_scope_dom_fallback")
+        );
+        assert_eq!(
+            result.diagnostics.completion_reason.as_deref(),
+            Some("copy_button")
+        );
+        assert_eq!(
+            result.diagnostics.finality_anchor.as_deref(),
+            Some("dom_only")
+        );
+        assert_eq!(result.diagnostics.stable_for_ms, Some(5000));
+        assert_eq!(result.diagnostics.assistant_turn_count, Some(2));
+        assert_eq!(result.diagnostics.copy_button_count, Some(1));
     }
 
     #[test]

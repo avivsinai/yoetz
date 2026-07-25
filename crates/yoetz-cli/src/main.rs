@@ -2348,6 +2348,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
         auto_paste_fallback: false,
         conversation_id: None,
         conversation_url: None,
+        diagnostics: chatgpt_recipe::ChatgptRecipeDiagnostics::default(),
     }
     .to_value();
     maybe_write_output(ctx, &payload)?;
@@ -2379,6 +2380,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
                 auto_paste_fallback: false,
                 conversation_id: payload["conversation_id"].as_str().map(str::to_owned),
                 conversation_url: payload["conversation_url"].as_str().map(str::to_owned),
+                diagnostics: chatgpt_recipe::ChatgptRecipeDiagnostics::default(),
             }
             .to_recipe_complete_event();
             write_jsonl("browser.recipe", &event)?;
@@ -2744,6 +2746,7 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
                 auto_paste_fallback: false,
                 conversation_id: response.conversation_id,
                 conversation_url: response.conversation_url,
+                diagnostics: response.diagnostics,
             };
             (
                 output.to_value(),
@@ -3218,6 +3221,7 @@ fn run_recipe_via_dev_browser<R: IntoBuiltinWebRecipe>(
         auto_paste_fallback,
         conversation_id: None,
         conversation_url: None,
+        diagnostics: chatgpt_recipe::ChatgptRecipeDiagnostics::default(),
     };
     let payload = output.to_value();
     maybe_write_output(ctx, &payload)?;
@@ -8019,6 +8023,7 @@ mod tests {
             auto_paste_fallback: true,
             conversation_id: Some("conv-123".to_string()),
             conversation_url: Some("https://chatgpt.com/c/conv-123".to_string()),
+            diagnostics: crate::chatgpt_recipe::ChatgptRecipeDiagnostics::default(),
         };
 
         let event = output.to_recipe_complete_event();

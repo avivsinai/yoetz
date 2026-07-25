@@ -1590,8 +1590,8 @@ async function waitForResponse(job) {
     const backendApiFinal = Boolean(scopedExtractionCandidate && completion.isFreshBackendApiExtraction(extraction));
     const finalAffordance = Boolean(scopedExtractionCandidate && completion.hasFinalAssistantAffordance(extraction));
     const finalStructuralResponse = finalAffordance || backendApiFinal;
-    // Broad page text is diagnostic only; final controls without scoped text
-    // means extraction failed, not that page chrome is safe to return.
+    // Broad page text is diagnostic only; final controls without scoped answer
+    // text means extraction failed, not that page chrome is safe to return.
     const finalAffordanceWithoutScopedText = Boolean(
       postSendAssistantActivity
       && extraction?.method === "page_text_fallback"
