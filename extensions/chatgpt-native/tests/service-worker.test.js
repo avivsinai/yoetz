@@ -3109,6 +3109,104 @@ test("service worker completion is structural and does not classify response tex
   }
 });
 
+test("service worker fails closed on Sources-only DOM chrome when backend finality is unavailable", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/conv-sources" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: "conv-sources",
+                submitted_user_count: 1,
+                submitted_assistant_count: 0
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "page_text_fallback",
+                    text: "Review bundle Sources Copy",
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: 0,
+                    conversation_id: "conv-sources"
+                  }
+                : {
+                    method: "none",
+                    text: "",
+                    is_generating: false,
+                    assistant_count: 0,
+                    user_count: 0,
+                    copy_button_count: 0,
+                    has_copy_button: false,
+                    turn_index: -1
+                  }
+            };
+          case "yoetz_fetch_conversation":
+            throw new Error("backend API unavailable");
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?sources_only_dom=${Date.now()}`);
+    port.emit(envelope("job_start", "job_sources_only_dom", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 2000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_sources_only_dom", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_sources_only_dom.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.payload.code === "response_extraction_failed"
+    ));
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.payload.code === "response_extraction_failed"
+    );
+    assert.equal(error.payload.extraction_method, "page_text_fallback");
+    assert.equal(error.payload.response_length, 26);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker accepts a scoped single-letter assistant markdown response", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

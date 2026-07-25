@@ -1035,6 +1035,7 @@ function standaloneAssistantSegment(root, conversation, ordered, marker, latestU
         && nodePrecedes(root, latestUser, node)
         && isVisible(node, { allowDisabled: true })
         && !isInsideUserTurn(node)
+        && !isCitationSourceAffordance(node)
         && !isNonConversationChrome(node);
     });
   const textEntries = markdownNodes
@@ -1228,7 +1229,9 @@ function assistantMessageTextEntry(turn) {
     '[class*="markdown"]'
   ]) {
     for (const node of Array.from(turn.querySelectorAll?.(selector) ?? [])) {
-      if (!looksLikeUserTurn(node) && isAssistantContentNode(node, turn)) {
+      if (!looksLikeUserTurn(node)
+          && !isCitationSourceAffordance(node, turn)
+          && isAssistantContentNode(node, turn)) {
         addContentNode(node);
       }
     }
@@ -1236,7 +1239,10 @@ function assistantMessageTextEntry(turn) {
   const leafContentNodes = leafNodes(contentNodes);
   const textEntries = [];
   for (const node of leafContentNodes) {
-    const text = cleanAssistantText(node, { preserveContentStatusText: node !== turn });
+    const text = cleanAssistantText(node, {
+      preserveContentStatusText: node !== turn,
+      assistantTurn: turn
+    });
     if (text) {
       textEntries.push({ node, text });
     }
@@ -1247,7 +1253,7 @@ function assistantMessageTextEntry(turn) {
       text: normalizeText(textEntries.map((entry) => entry.text).join("\n\n"))
     };
   }
-  const fallback = cleanAssistantText(turn);
+  const fallback = cleanAssistantText(turn, { assistantTurn: turn });
   return { node: turn, text: isModelStatusText(fallback) ? "" : fallback };
 }
 
@@ -1276,13 +1282,73 @@ function leafNodes(nodes) {
   return nodes.filter((node) => !nodes.some((other) => other !== node && containsNode(node, other)));
 }
 
+function isCitationSourceAffordance(node, turn = null) {
+  for (let current = node; current; current = current.parentElement) {
+    const tag = String(current.tagName ?? "").toLowerCase();
+    const role = String(current.getAttribute?.("role") ?? "");
+    const testId = String(current.getAttribute?.("data-testid") ?? "");
+    const ariaLabel = String(current.getAttribute?.("aria-label") ?? "");
+    const title = String(current.getAttribute?.("title") ?? "");
+    const className = String(current.getAttribute?.("class") ?? "");
+    const semanticMarker = `${role} ${testId} ${ariaLabel} ${title}`;
+    const interactive = tag === "button"
+      || tag === "summary"
+      || role === "button"
+      || current.getAttribute?.("aria-expanded") !== null;
+    const explicitCitationMarker = /\b(citations?|sources?)\b/i.test(semanticMarker)
+      || /\b(citations?|sources?)(?:[-_]|$)/i.test(testId)
+      || (interactive && /\b(citations?|sources?)\b/i.test(className));
+    const exactInteractiveLabel = interactive
+      && /^sources?$/i.test(normalizeText(textOf(current)));
+    if (explicitCitationMarker || exactInteractiveLabel) {
+      return true;
+    }
+    if (current === turn) {
+      return false;
+    }
+  }
+  return false;
+}
+
+function assistantBodyTextOf(node, turn = node) {
+  const hasCitationAffordance = flattenTree(node)
+    .some((candidate) => candidate !== node && isCitationSourceAffordance(candidate, turn));
+  if (!hasCitationAffordance) {
+    return bodyTextOf(node);
+  }
+  return normalizeText(textContentWithoutCitationAffordances(node, turn));
+}
+
+function textContentWithoutCitationAffordances(node, turn) {
+  if (node !== turn && isCitationSourceAffordance(node, turn)) {
+    return "";
+  }
+  const childNodes = Array.from(node?.childNodes ?? []);
+  if (childNodes.length > 0) {
+    return childNodes
+      .map((child) => child?.nodeType === 3
+        ? String(child.textContent ?? "")
+        : textContentWithoutCitationAffordances(child, turn))
+      .filter(Boolean)
+      .join("\n");
+  }
+  const children = Array.from(node?.children ?? []);
+  if (children.length > 0) {
+    return children
+      .map((child) => textContentWithoutCitationAffordances(child, turn))
+      .filter(Boolean)
+      .join("\n");
+  }
+  return String(node?.textContent ?? "");
+}
+
 function cleanAssistantText(node, options = {}) {
   // Body text MUST come from textContent, not innerText: a virtualized/clipped long answer node
   // returns only its rendered head via innerText (observed live as a single "I"). textContent
   // returns the full DOM text regardless of layout. Per-line control/status stripping below then
   // removes any code-block "Copy code", sr-only, thought/status, and control lines that
   // textContent may surface. Fall back to innerText only if textContent is empty (defensive).
-  const source = bodyTextOf(node) || textOf(node);
+  const source = assistantBodyTextOf(node, options.assistantTurn ?? node) || textOf(node);
   const lines = source
     .split(/\n+/)
     .map((line) => normalizeText(line))

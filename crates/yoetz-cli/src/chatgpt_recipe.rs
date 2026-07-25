@@ -127,6 +127,16 @@ pub struct ChatgptRecipeSpec {
     pub close_tab_on_complete: bool,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ChatgptRecipeDiagnostics {
+    pub extraction_method: Option<String>,
+    pub completion_reason: Option<String>,
+    pub finality_anchor: Option<String>,
+    pub stable_for_ms: Option<u64>,
+    pub assistant_turn_count: Option<u64>,
+    pub copy_button_count: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatgptRecipeOutput {
     pub transport: String,
@@ -141,6 +151,7 @@ pub struct ChatgptRecipeOutput {
     pub auto_paste_fallback: bool,
     pub conversation_id: Option<String>,
     pub conversation_url: Option<String>,
+    pub diagnostics: ChatgptRecipeDiagnostics,
 }
 
 impl ChatgptRecipeOutput {
@@ -159,6 +170,12 @@ impl ChatgptRecipeOutput {
             "auto_paste_fallback": self.auto_paste_fallback,
             "conversation_id": self.conversation_id,
             "conversation_url": self.conversation_url,
+            "extraction_method": self.diagnostics.extraction_method,
+            "completion_reason": self.diagnostics.completion_reason,
+            "finality_anchor": self.diagnostics.finality_anchor,
+            "stable_for_ms": self.diagnostics.stable_for_ms,
+            "assistant_turn_count": self.diagnostics.assistant_turn_count,
+            "copy_button_count": self.diagnostics.copy_button_count,
         })
     }
 
@@ -177,6 +194,12 @@ impl ChatgptRecipeOutput {
             "auto_paste_fallback": self.auto_paste_fallback,
             "conversation_id": self.conversation_id,
             "conversation_url": self.conversation_url,
+            "extraction_method": self.diagnostics.extraction_method,
+            "completion_reason": self.diagnostics.completion_reason,
+            "finality_anchor": self.diagnostics.finality_anchor,
+            "stable_for_ms": self.diagnostics.stable_for_ms,
+            "assistant_turn_count": self.diagnostics.assistant_turn_count,
+            "copy_button_count": self.diagnostics.copy_button_count,
         })
     }
 }
@@ -201,6 +224,14 @@ mod tests {
             auto_paste_fallback: true,
             conversation_id: Some("conv-123".to_string()),
             conversation_url: Some("https://chatgpt.com/c/conv-123".to_string()),
+            diagnostics: ChatgptRecipeDiagnostics {
+                extraction_method: Some("copy_scope_dom_fallback".to_string()),
+                completion_reason: Some("copy_button".to_string()),
+                finality_anchor: Some("dom_only".to_string()),
+                stable_for_ms: Some(5000),
+                assistant_turn_count: Some(2),
+                copy_button_count: Some(1),
+            },
         };
 
         let payload = output.to_value();
@@ -220,10 +251,22 @@ mod tests {
             payload["conversation_url"],
             "https://chatgpt.com/c/conv-123"
         );
+        assert_eq!(payload["extraction_method"], "copy_scope_dom_fallback");
+        assert_eq!(payload["completion_reason"], "copy_button");
+        assert_eq!(payload["finality_anchor"], "dom_only");
+        assert_eq!(payload["stable_for_ms"], 5000);
+        assert_eq!(payload["assistant_turn_count"], 2);
+        assert_eq!(payload["copy_button_count"], 1);
 
         let event = output.to_recipe_complete_event();
         assert_eq!(event["conversation_id"], "conv-123");
         assert_eq!(event["conversation_url"], "https://chatgpt.com/c/conv-123");
+        assert_eq!(event["extraction_method"], "copy_scope_dom_fallback");
+        assert_eq!(event["completion_reason"], "copy_button");
+        assert_eq!(event["finality_anchor"], "dom_only");
+        assert_eq!(event["stable_for_ms"], 5000);
+        assert_eq!(event["assistant_turn_count"], 2);
+        assert_eq!(event["copy_button_count"], 1);
     }
 
     #[test]

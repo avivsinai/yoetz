@@ -1216,6 +1216,7 @@ fn chatgpt_recipe_payload_from_steps(steps: &[Value], fallback_used: bool) -> Va
         auto_paste_fallback: false,
         conversation_id: None,
         conversation_url: None,
+        diagnostics: chatgpt_recipe::ChatgptRecipeDiagnostics::default(),
     };
     let mut payload = output.to_value();
     if let Some(object) = payload.as_object_mut() {

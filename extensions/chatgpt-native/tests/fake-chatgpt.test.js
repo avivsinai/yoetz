@@ -1003,6 +1003,77 @@ test("extractResponse returns all rendered markdown blocks from one assistant tu
   assert.equal(extraction.has_copy_button, true);
 });
 
+test("extractResponse excludes a nested Sources citation affordance from the assistant answer", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const answer = new FakeElement("div", { class: "prose" }, "PASS\nReview evidence only.");
+  const sources = new FakeElement("button", {
+    "aria-label": "Sources",
+    "aria-expanded": "false",
+    "data-testid": "citations-button"
+  }, "Sources").append(new FakeElement("div", { class: "markdown" }, "Sources"));
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement(
+    "article",
+    { "data-message-author-role": "assistant" },
+    "PASS\nReview evidence only.\nSources\nCopy"
+  ).append(answer, sources, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle PASS Review evidence only. Sources Copy")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "Review bundle PASS Review evidence only. Sources Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "PASS\nReview evidence only.");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse does not promote a Sources-only citation affordance to assistant text", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const sources = new FakeElement("button", {
+    "aria-label": "Sources",
+    "aria-expanded": "false",
+    "data-testid": "citations-button"
+  }, "Sources").append(new FakeElement("div", { class: "markdown" }, "Sources"));
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Sources\nCopy")
+    .append(sources, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Sources Copy")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "Review bundle Sources Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
+  assert.equal(extraction.turn_index, -1);
+});
+
+test("extractResponse preserves a legitimate Sources heading and answer content", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "List sources");
+  const answer = new FakeElement(
+    "div",
+    { class: "markdown prose" },
+    "Sources\n- Architecture.md\n- PLAN.md"
+  );
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement(
+    "article",
+    { "data-message-author-role": "assistant" },
+    "Sources\n- Architecture.md\n- PLAN.md\nCopy"
+  ).append(answer, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "List sources Sources Architecture PLAN Copy")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "List sources Sources Architecture PLAN Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Sources\n- Architecture.md\n- PLAN.md");
+});
+
 test("extractResponse uses the latest user transcript scope for split action rows", () => {
   const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
   const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
