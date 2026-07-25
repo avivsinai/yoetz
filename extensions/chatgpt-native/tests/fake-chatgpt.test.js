@@ -1234,6 +1234,48 @@ test("extractResponse uses the latest user transcript scope for split action row
   assert.equal(extraction.has_copy_button, true);
 });
 
+test("extractResponse does not promote a sibling response-action Sources button over assistant text", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "PASS\nReview evidence only.");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "PASS\nReview evidence only.")
+    .append(marker, markdown);
+  const copy = new FakeElement("button", { "aria-label": "Copy response" }, "Copy response");
+  const sources = new FakeElement("button", { "aria-label": "Sources" }, "Sources");
+  const actionRow = withChildNodes(
+    new FakeElement("div", { class: "agent-turn", "aria-label": "Response actions" }),
+    copy,
+    sources
+  );
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle PASS Review evidence only. Copy response Sources")
+    .append(user, assistantTurn, actionRow);
+  const body = new FakeElement("body", {}, "Review bundle PASS Review evidence only. Copy response Sources").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "PASS\nReview evidence only.");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse preserves unmarked copy-scoped div text outside action controls", () => {
+  const copy = new FakeElement("button", { "aria-label": "Copy response" }, "Copy response");
+  const assistant = withChildNodes(
+    new FakeElement("div", { class: "agent-turn" }),
+    new FakeTextNode("Plain assistant answer"),
+    copy
+  );
+  const body = new FakeElement("body", {}, "Plain assistant answer Copy response").append(assistant);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Plain assistant answer");
+  assert.equal(extraction.has_copy_button, true);
+});
+
 test("extractResponse walks past plain thread wrappers to the transcript scope", () => {
   const userMarkdown = new FakeElement("div", { class: "markdown prose" }, "Review bundle");
   const user = new FakeElement("div", { class: "thread" }, "Review bundle")

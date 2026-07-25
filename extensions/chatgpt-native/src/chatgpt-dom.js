@@ -1253,7 +1253,19 @@ function assistantMessageTextEntry(turn) {
       text: normalizeText(textEntries.map((entry) => entry.text).join("\n\n"))
     };
   }
-  const fallback = cleanAssistantText(turn, { assistantTurn: turn });
+  // A copy control can infer a split action <div> as an assistant "turn" even when
+  // that row contains no model-authored content. For inferred non-article turns,
+  // accept only text structurally outside interactive controls; this rejects a
+  // response-action Sources row without dropping legitimate unwrapped div text.
+  const inferredText = !isAssistantMarkerNode(turn) && turn.tagName !== "ARTICLE"
+    ? textContentOutsideActionControls(turn)
+    : null;
+  if (inferredText !== null && !normalizeText(inferredText)) {
+    return { node: null, text: "" };
+  }
+  const fallback = inferredText === null
+    ? cleanAssistantText(turn, { assistantTurn: turn })
+    : cleanAssistantSourceText(inferredText, { assistantTurn: turn });
   return { node: turn, text: isModelStatusText(fallback) ? "" : fallback };
 }
 
@@ -1332,11 +1344,38 @@ function cleanAssistantText(node, options = {}) {
   // removes any code-block "Copy code", sr-only, thought/status, and control lines that
   // textContent may surface. Fall back to innerText only if textContent is empty (defensive).
   const source = assistantBodyTextOf(node, options.assistantTurn ?? node) || textOf(node);
+  return cleanAssistantSourceText(source, options);
+}
+
+function cleanAssistantSourceText(source, options = {}) {
   const lines = source
     .split(/\n+/)
     .map((line) => normalizeText(line))
     .filter((line) => line && !isAssistantControlLine(line, options));
   return normalizeText(lines.join("\n"));
+}
+
+function textContentOutsideActionControls(node) {
+  if (!node || node.tagName === "BUTTON" || node.getAttribute?.("role") === "button") {
+    return "";
+  }
+  const childNodes = Array.from(node.childNodes ?? []);
+  if (childNodes.length > 0) {
+    return childNodes
+      .map((child) => child?.nodeType === 3
+        ? String(child.textContent ?? "")
+        : textContentOutsideActionControls(child))
+      .join("");
+  }
+  const children = Array.from(node.children ?? []);
+  if (children.length > 0) {
+    const aggregate = normalizeText(node.textContent ?? "");
+    const childAggregate = normalizeText(children.map((child) => child.textContent ?? "").join(" "));
+    if (aggregate === childAggregate) {
+      return children.map((child) => textContentOutsideActionControls(child)).join("");
+    }
+  }
+  return String(node.textContent ?? "");
 }
 
 function isAssistantControlLine(line, options = {}) {
