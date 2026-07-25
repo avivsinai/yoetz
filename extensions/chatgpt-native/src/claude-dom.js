@@ -411,21 +411,29 @@ function responseBodyText(body) {
   if (!sanitized) {
     return normalizeResponseText(body.innerText || body.textContent || "");
   }
-  const statusCaptions = [];
   for (const statusRow of sanitized.querySelectorAll?.("button[class*='group/status']") ?? []) {
-    const caption = normalizeResponseText(statusRow.innerText || statusRow.textContent || "");
-    if (caption) statusCaptions.push(caption);
-    statusRow.remove();
-  }
-  let text = normalizeResponseText(sanitized.innerText || sanitized.textContent || "");
-  for (const caption of statusCaptions) {
-    // Completed thinking can leave a hidden copy of the collapsed caption before the answer.
-    // Strip only an exact leading copy anchored to a status row observed in this response body.
-    if (text.startsWith(caption)) {
-      text = normalizeResponseText(text.slice(caption.length));
+    // Claude renders the visible status button and its hidden thinking caption as
+    // siblings in the first row of a two-row status/answer grid. Remove that
+    // structural row instead of trying to match its flattened text, which drifts
+    // with punctuation and duration badges.
+    const statusSubtree = thinkingStatusSubtree(statusRow, sanitized);
+    if (statusSubtree && statusSubtree !== sanitized) {
+      statusSubtree.remove();
+    } else {
+      statusRow.remove();
     }
   }
-  return text;
+  return normalizeResponseText(sanitized.innerText || sanitized.textContent || "");
+}
+
+function thinkingStatusSubtree(statusRow, body) {
+  for (let node = statusRow; node && node !== body; node = node.parentElement) {
+    const classTokens = String(node.getAttribute?.("class") ?? "").split(/\s+/);
+    if (classTokens.includes("row-start-1") && classTokens.includes("col-start-1")) {
+      return node;
+    }
+  }
+  return statusRow;
 }
 
 function assistantRoots(root) {

@@ -328,13 +328,79 @@ test("fake Claude extraction excludes collapsed thinking status text from the an
   assert.equal(extraction.text, answer);
 });
 
-test("fake Claude extraction strips a duplicated collapsed thinking caption prefix", () => {
+test("fake Claude extraction excludes a duplicated collapsed thinking subtree", () => {
   const caption = "Scrutinizing verification request authenticity and token protocol";
   const answer = "YOETZ-EXT-VERIFY-20260719-QOPHET";
   const contaminated = `${caption}${answer}`;
   const page = fakeClaudePage({ text: contaminated, streaming: false, copy: true });
+  page.body.cloneNode = () => fakeClaudeThinkingClone({
+    statusCaption: caption,
+    hiddenCaption: caption,
+    answer
+  });
+
+  const extraction = extractResponse(page.root);
+
+  assert.equal(extraction.text, answer);
+});
+
+test("fake Claude extraction excludes a thinking subtree when its hidden caption differs by punctuation", () => {
+  const statusCaption = "Thinking about acknowledging a direct instruction request.";
+  const hiddenCaption = "Thinking about acknowledging a direct instruction request";
+  const answer = "ACK";
+  const contaminated = `${hiddenCaption}${answer}`;
+  const page = fakeClaudePage({ text: contaminated, streaming: false, copy: true });
+  page.body.cloneNode = () => fakeClaudeThinkingClone({
+    statusCaption,
+    hiddenCaption,
+    answer
+  });
+
+  const extraction = extractResponse(page.root);
+
+  assert.equal(extraction.text, answer);
+});
+
+test("fake Claude extraction excludes a thinking subtree with a duration badge", () => {
+  const statusCaption = "Thinking about acknowledging a direct instruction request 12s";
+  const hiddenCaption = "Thinking about acknowledging a direct instruction request";
+  const answer = "ACK";
+  const contaminated = `${hiddenCaption}${answer}`;
+  const page = fakeClaudePage({ text: contaminated, streaming: false, copy: true });
+  page.body.cloneNode = () => fakeClaudeThinkingClone({
+    statusCaption,
+    hiddenCaption,
+    answer
+  });
+
+  const extraction = extractResponse(page.root);
+
+  assert.equal(extraction.text, answer);
+});
+
+test("fake Claude unmatched thinking layout removes only the status button and preserves answer text", () => {
+  const caption = "Thinking layout changed";
+  const answer = "ACK";
+  const page = fakeClaudePage({ text: `${caption}${answer}`, streaming: false, copy: true });
   page.body.cloneNode = () => {
-    let text = `${caption}\n${caption}\n${answer}`;
+    let text = `${caption}\n${answer}`;
+    const unsafeParent = {
+      getAttribute() {
+        return "";
+      },
+      remove() {
+        text = "";
+      }
+    };
+    const statusRow = {
+      parentElement: unsafeParent,
+      getAttribute() {
+        return "group/status";
+      },
+      remove() {
+        text = answer;
+      }
+    };
     return {
       get innerText() {
         return text;
@@ -343,13 +409,7 @@ test("fake Claude extraction strips a duplicated collapsed thinking caption pref
         return text;
       },
       querySelectorAll(selector) {
-        return selector === "button[class*='group/status']"
-          ? [{
-              innerText: caption,
-              textContent: caption,
-              remove: () => { text = contaminated; }
-            }]
-          : [];
+        return selector === "button[class*='group/status']" ? [statusRow] : [];
       }
     };
   };
@@ -487,6 +547,50 @@ function fakeClaudePage({ text, streaming, copy, thinking = false }) {
   page.assistant = assistant;
   page.body = body;
   return page;
+}
+
+function fakeClaudeThinkingClone({ statusCaption, hiddenCaption, answer }) {
+  let text = `${statusCaption}\n${hiddenCaption}\n${answer}`;
+  const contaminated = `${hiddenCaption}${answer}`;
+  const statusSubtree = {
+    getAttribute(name) {
+      return name === "class" ? "row-start-1 col-start-1 min-w-0" : null;
+    },
+    remove() {
+      text = answer;
+    }
+  };
+  const statusControl = {
+    parentElement: statusSubtree,
+    getAttribute() {
+      return "";
+    },
+    remove() {
+      text = contaminated;
+    }
+  };
+  const statusRow = {
+    parentElement: statusControl,
+    innerText: statusCaption,
+    textContent: statusCaption,
+    getAttribute() {
+      return "group/status";
+    },
+    remove() {
+      text = contaminated;
+    }
+  };
+  return {
+    get innerText() {
+      return text;
+    },
+    get textContent() {
+      return text;
+    },
+    querySelectorAll(selector) {
+      return selector === "button[class*='group/status']" ? [statusRow] : [];
+    }
+  };
 }
 
 class FakeDataTransfer {
