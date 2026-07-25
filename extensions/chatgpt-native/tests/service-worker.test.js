@@ -448,6 +448,7 @@ test("service worker runs a Claude job through its adapter and probes the select
   const port = makePort();
   const sentToTabs = [];
   let sent = false;
+  let postSendExtractCount = 0;
   const conversationId = "123e4567-e89b-12d3-a456-426614174000";
 
   globalThis.chrome = chromeStub({
@@ -491,6 +492,7 @@ test("service worker runs a Claude job through its adapter and probes the select
               }
             };
           case "yoetz_extract_response":
+            if (sent) postSendExtractCount += 1;
             return {
               ok: true,
               payload: sent
@@ -504,8 +506,8 @@ test("service worker runs a Claude job through its adapter and probes the select
                     turn_index: 0,
                     conversation_id: conversationId,
                     artifact_blocks: {
-                      count: 1,
-                      titles: ["Release plan"]
+                      count: postSendExtractCount >= 2 ? 1 : 0,
+                      titles: postSendExtractCount >= 2 ? ["Release plan"] : []
                     }
                   }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
@@ -570,6 +572,146 @@ test("service worker runs a Claude job through its adapter and probes the select
       count: 1,
       titles: ["Release plan"]
     }]);
+    assert.equal(postSendExtractCount, 2);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker completes an artifact-only Claude response with both warnings", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let sent = false;
+  const conversationId = "223e4567-e89b-12d3-a456-426614174000";
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async ({ url, active }) => {
+        assert.equal(url, "https://claude.ai/new?_yoetz=run_job_claude_artifact_only");
+        assert.equal(active, false);
+        return { id: 72 };
+      },
+      get: async (id) => ({
+        id,
+        status: "complete",
+        url: "https://claude.ai/new?_yoetz=run_job_claude_artifact_only"
+      }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude", url: "https://claude.ai/new" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "selected",
+                requested_model: "fable-5-max",
+                modelVerified: true,
+                maxVerified: true,
+                model_used: "Fable 5 Max"
+              }
+            };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: conversationId,
+                submitted_user_count: 1,
+                submitted_assistant_count: 0
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "none",
+                    text: "",
+                    is_generating: false,
+                    assistant_count: 1,
+                    copy_button_count: 0,
+                    has_copy_button: false,
+                    turn_index: 0,
+                    conversation_id: conversationId,
+                    artifact_blocks: {
+                      count: 1,
+                      titles: ["Release plan"]
+                    }
+                  }
+                : {
+                    method: "none",
+                    text: "",
+                    is_generating: false,
+                    assistant_count: 0,
+                    turn_index: -1
+                  }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      },
+      group: async () => 1
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_artifact_only=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_claude_artifact_only", {
+      recipe: "claude",
+      prompt: "review",
+      wait_interval_ms: 500,
+      wait_timeout_ms: 2500
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.job_id === "job_claude_artifact_only"
+      && (message.type === "job_error" || message.payload?.phase === "ready_for_file")
+    ));
+    const startError = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_artifact_only"
+    );
+    assert.equal(startError, undefined, JSON.stringify(startError?.payload));
+
+    port.emit(envelope("job_file_chunk", "job_claude_artifact_only", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.job_id === "job_claude_artifact_only"
+      && (message.type === "job_complete" || message.type === "job_error")
+    ));
+    const complete = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_claude_artifact_only"
+    );
+    assert.ok(complete, JSON.stringify(port.messages));
+    assert.equal(complete.payload.response, "");
+    assert.deepEqual(complete.payload.warnings, [
+      "empty Claude response extracted",
+      {
+        code: "artifact_unextracted",
+        count: 1,
+        titles: ["Release plan"]
+      }
+    ]);
+    assert.equal(
+      port.messages.some((message) =>
+        message.type === "job_error" && message.job_id === "job_claude_artifact_only"
+      ),
+      false
+    );
   } finally {
     globalThis.chrome = originalChrome;
   }

@@ -3513,6 +3513,7 @@ fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
     let builtin_recipe = builtin_recipe.into_builtin_web_recipe();
     let is_chatgpt = builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Chatgpt);
     let is_claude = builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Claude);
+    let (recipe_vars, opaque_prompt) = prepare_agent_browser_prompt(is_claude, recipe_vars);
     let needs_auth = is_chatgpt || is_claude;
     let target_url = if is_claude {
         claude_web::CLAUDE_URL
@@ -3579,6 +3580,7 @@ fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
         bundle_text,
+        opaque_prompt,
         profile_dir: Some(profile_dir),
         profile_mode,
         fallback_used,
@@ -3615,6 +3617,20 @@ fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
         );
         Ok(payload)
     }
+}
+
+fn prepare_agent_browser_prompt(
+    is_builtin_claude: bool,
+    mut recipe_vars: BTreeMap<String, String>,
+) -> (BTreeMap<String, String>, Option<String>) {
+    if !is_builtin_claude {
+        return (recipe_vars, None);
+    }
+    let caller_prompt = recipe_vars
+        .remove("prompt")
+        .unwrap_or_else(|| DEFAULT_CHATGPT_RECIPE_PROMPT.to_string());
+    let prompt = claude_recipe::render_builtin_prompt(&caller_prompt);
+    (recipe_vars, Some(prompt))
 }
 
 fn maybe_notify_browser_recipe_completion(
@@ -7874,6 +7890,75 @@ mod tests {
         assert!(claude_recipe::inline_size_warnings(Some(&bundle), 0)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn builtin_claude_agent_browser_prompt_crosses_the_transport_boundary_opaquely() {
+        let caller = "review\r\nliteral {{run_id}}  \n\n";
+        let vars = BTreeMap::from([
+            ("prompt".to_string(), caller.to_string()),
+            ("run_id".to_string(), "run-actual".to_string()),
+        ]);
+
+        let (vars, opaque_prompt) = prepare_agent_browser_prompt(true, vars);
+        assert!(!vars.contains_key("prompt"));
+        assert_eq!(vars["run_id"], "run-actual");
+        let context = browser::RecipeContext {
+            bundle_path: None,
+            bundle_text: None,
+            opaque_prompt,
+            profile_dir: None,
+            profile_mode: browser::BrowserProfileMode::ProfileOnly,
+            fallback_used: false,
+            use_stealth: false,
+            headed: false,
+            vars,
+            warnings: Vec::new(),
+            target_url: claude_web::CLAUDE_URL.to_string(),
+        };
+        let expanded = browser::interpolate("{{prompt}}", &context, None).unwrap();
+        let expected = format!("{}\n\n{}", claude_recipe::OUTPUT_CHANNEL_CONTRACT, caller);
+
+        assert_eq!(expanded.as_bytes(), expected.as_bytes());
+        assert_eq!(
+            expanded
+                .matches(claude_recipe::OUTPUT_CHANNEL_CONTRACT)
+                .count(),
+            1
+        );
+        assert!(expanded.contains("literal {{run_id}}  \n\n"));
+    }
+
+    #[test]
+    fn custom_agent_browser_recipe_keeps_ordinary_prompt_interpolation() {
+        let caller = "review\r\nliteral {{run_id}}  \n\n";
+        let vars = BTreeMap::from([
+            ("prompt".to_string(), caller.to_string()),
+            ("run_id".to_string(), "run-actual".to_string()),
+        ]);
+
+        let (prepared_vars, opaque_prompt) = prepare_agent_browser_prompt(false, vars.clone());
+
+        assert_eq!(prepared_vars, vars);
+        assert_eq!(opaque_prompt, None);
+        let context = browser::RecipeContext {
+            bundle_path: None,
+            bundle_text: None,
+            opaque_prompt,
+            profile_dir: None,
+            profile_mode: browser::BrowserProfileMode::ProfileOnly,
+            fallback_used: false,
+            use_stealth: false,
+            headed: false,
+            vars: prepared_vars,
+            warnings: Vec::new(),
+            target_url: "https://example.test/".to_string(),
+        };
+
+        assert_eq!(
+            browser::interpolate("{{prompt}}", &context, None).unwrap(),
+            "review\r\nliteral run-actual  \n\n"
+        );
     }
 
     #[test]
