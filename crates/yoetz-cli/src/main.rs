@@ -2439,6 +2439,7 @@ async fn run_claude_recipe_via_chrome_devtools_mcp(
         model_used: response.model_used,
         model_selection_status: response.model_selection_status,
         warnings: recipe_spec.warnings,
+        warning_details: Vec::new(),
         fallback_used,
         conversation_id: response.conversation_id,
         conversation_url: response.conversation_url,
@@ -2540,10 +2541,12 @@ fn build_claude_recipe_spec(
         .transpose()?;
     Ok(claude_recipe::ClaudeRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
-        prompt: recipe_vars
-            .get("prompt")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_CHATGPT_RECIPE_PROMPT.to_string()),
+        prompt: claude_recipe::render_builtin_prompt(
+            recipe_vars
+                .get("prompt")
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_CHATGPT_RECIPE_PROMPT),
+        ),
         browser_context_id: recipe_vars
             .get("browser_context_id")
             .map(|value| value.trim().to_string())
@@ -2866,6 +2869,7 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
                 model_used: response.model_used,
                 model_selection_status: response.model_selection_status,
                 warnings,
+                warning_details: response.warning_details,
                 fallback_used,
                 conversation_id: response.conversation_id,
                 conversation_url: response.conversation_url,
@@ -3450,6 +3454,7 @@ fn run_claude_recipe_via_dev_browser(
         model_used: response.model_used,
         model_selection_status: response.model_selection_status,
         warnings: response.warnings,
+        warning_details: Vec::new(),
         fallback_used,
         conversation_id: response.conversation_id,
         conversation_url: response.conversation_url,
@@ -7880,6 +7885,11 @@ mod tests {
             model_used: Some("Fable 5 Max".to_string()),
             model_selection_status: web_recipe::WebModelSelectionStatus::Selected,
             warnings: vec!["size warning".to_string()],
+            warning_details: vec![json!({
+                "code": "artifact_unextracted",
+                "count": 1,
+                "titles": ["Release plan"]
+            })],
             fallback_used: false,
             conversation_id: None,
             conversation_url: None,
@@ -7893,7 +7903,17 @@ mod tests {
         assert_eq!(payload["delivery_mode"], "file_upload");
         assert_eq!(payload["run_id"], "run-claude");
         assert_eq!(payload["elapsed_ms"], 1234);
-        assert_eq!(payload["warnings"], json!(["size warning"]));
+        assert_eq!(
+            payload["warnings"],
+            json!([
+                "size warning",
+                {
+                    "code": "artifact_unextracted",
+                    "count": 1,
+                    "titles": ["Release plan"]
+                }
+            ])
+        );
     }
 
     #[test]

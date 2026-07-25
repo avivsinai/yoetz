@@ -77,6 +77,19 @@ function completedExtraction(extraction, completionReason, stableForMs) {
   };
 }
 
+export function artifactUnextractedWarnings(extraction) {
+  const count = Number(extraction?.artifact_blocks?.count ?? 0);
+  if (!Number.isInteger(count) || count <= 0) return [];
+  const titles = Array.isArray(extraction?.artifact_blocks?.titles)
+    ? extraction.artifact_blocks.titles.filter((title) => typeof title === "string" && title)
+    : [];
+  return [{
+    code: "artifact_unextracted",
+    count,
+    titles
+  }];
+}
+
 export const claudeSiteAdapter = Object.freeze({
   recipe: "claude",
   displayName: "Claude",
@@ -112,6 +125,7 @@ export const claudeSiteAdapter = Object.freeze({
     renderRefreshMode: "none",
     finalAffordanceRequiresStableIdle: true,
     emptyResponseWarning: "empty Claude response extracted",
+    extractionWarnings: artifactUnextractedWarnings,
     isFreshBackendApiExtraction: () => false,
     hasFinalAssistantAffordance,
     hasStableIdleUnscopedCopyAffordance: () => false,

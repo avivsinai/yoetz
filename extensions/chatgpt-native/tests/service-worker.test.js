@@ -494,7 +494,7 @@ test("service worker runs a Claude job through its adapter and probes the select
             return {
               ok: true,
               payload: sent
-                ? {
+                  ? {
                     method: "assistant_dom",
                     text: "Claude answer",
                     is_generating: false,
@@ -502,7 +502,11 @@ test("service worker runs a Claude job through its adapter and probes the select
                     copy_button_count: 0,
                     has_copy_button: false,
                     turn_index: 0,
-                    conversation_id: conversationId
+                    conversation_id: conversationId,
+                    artifact_blocks: {
+                      count: 1,
+                      titles: ["Release plan"]
+                    }
                   }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
             };
@@ -561,6 +565,11 @@ test("service worker runs a Claude job through its adapter and probes the select
     assert.equal(complete.payload.completion_reason, "stable_idle");
     assert.equal(complete.payload.conversation_id, conversationId);
     assert.equal(complete.payload.conversation_url, `https://claude.ai/chat/${conversationId}`);
+    assert.deepEqual(complete.payload.warnings, [{
+      code: "artifact_unextracted",
+      count: 1,
+      titles: ["Release plan"]
+    }]);
   } finally {
     globalThis.chrome = originalChrome;
   }

@@ -1289,6 +1289,7 @@ fn claude_recipe_payload_from_steps(
         model_used,
         model_selection_status,
         warnings,
+        warning_details: Vec::new(),
         fallback_used,
         conversation_id,
         conversation_url,

@@ -445,6 +445,71 @@ test("fake Claude completed scoped answer does not require a hover-only copy but
   assert.equal(claudeSiteAdapter.completion.finalAffordanceRequiresStableIdle, true);
 });
 
+test("fake Claude extraction reports artifact cards from only the final assistant root", () => {
+  const finalArtifact = fakeArtifactCard("Release plan / Document · MD / Download");
+  const finalPage = fakeClaudePage({
+    text: "Chat summary",
+    streaming: false,
+    copy: true,
+    artifacts: [finalArtifact]
+  });
+
+  assert.deepEqual(extractResponse(finalPage.root).artifact_blocks, {
+    count: 1,
+    titles: ["Release plan / Document · MD / Download"]
+  });
+
+  const resumedPage = fakeClaudePage({
+    text: "Current answer",
+    streaming: false,
+    copy: true
+  });
+  resumedPage.root.querySelectorAll = (selector) => {
+    if (selector === "[data-is-streaming]") {
+      return [
+        fakeClaudeAssistant({ text: "Earlier answer", artifacts: [finalArtifact] }),
+        resumedPage.assistant
+      ];
+    }
+    if (selector === "[data-testid='action-bar-copy']") return resumedPage.globalCopy;
+    if (selector === "button[aria-label='Stop response']") return [];
+    if (selector === "button[class*='group/status']") return [];
+    if (selector === "[data-testid='user-message']") return [];
+    return [];
+  };
+
+  assert.deepEqual(extractResponse(resumedPage.root).artifact_blocks, {
+    count: 0,
+    titles: []
+  });
+});
+
+test("fake Claude artifact detection survives an open side panel and stays silent without a card", () => {
+  const page = fakeClaudePage({
+    text: "Chat summary",
+    streaming: false,
+    copy: true,
+    artifacts: [fakeArtifactCard("Open deliverable")]
+  });
+  page.root.body.innerText = "Chat summary\nOpen side panel body";
+  page.root.body.textContent = page.root.body.innerText;
+
+  assert.deepEqual(extractResponse(page.root).artifact_blocks, {
+    count: 1,
+    titles: ["Open deliverable"]
+  });
+
+  const noArtifact = fakeClaudePage({
+    text: "Plain answer",
+    streaming: false,
+    copy: true
+  });
+  assert.deepEqual(extractResponse(noArtifact.root).artifact_blocks, {
+    count: 0,
+    titles: []
+  });
+});
+
 test("fake Claude conversation loader preserves changed and unavailable taxonomy", async () => {
   const originalLocation = globalThis.location;
   const requested = "123e4567-e89b-12d3-a456-426614174000";
@@ -497,32 +562,18 @@ test("fake Claude model acceptance requires Fable 5 and Max together", () => {
   }
 });
 
-function fakeClaudePage({ text, streaming, copy, thinking = false }) {
+function fakeClaudePage({ text, streaming, copy, thinking = false, artifacts = [] }) {
   const body = { innerText: text, textContent: text };
   const copyButton = {};
   const page = {
     globalCopy: copy ? [copyButton] : []
-  };
-  const assistant = {
-    streaming,
-    thinking,
-    getAttribute(name) {
-      return name === "data-is-streaming" ? String(this.streaming) : null;
-    },
-    querySelector(selector) {
-      if (selector === ".font-claude-response") return body;
-      if (selector === "button[class*='group/status']") return this.thinking ? {} : null;
-      return null;
-    },
-    closest() {
-      return turn;
-    }
   };
   const turn = {
     querySelectorAll(selector) {
       return selector === "[data-testid='action-bar-copy']" && copy ? [copyButton] : [];
     }
   };
+  const assistant = fakeClaudeAssistant({ text, streaming, thinking, artifacts, body, turn });
   const user = {
     compareDocumentPosition() {
       return 4;
@@ -591,6 +642,38 @@ function fakeClaudeThinkingClone({ statusCaption, hiddenCaption, answer }) {
       return selector === "button[class*='group/status']" ? [statusRow] : [];
     }
   };
+}
+
+function fakeClaudeAssistant({
+  text,
+  streaming = false,
+  thinking = false,
+  artifacts = [],
+  body = { innerText: text, textContent: text },
+  turn = { querySelectorAll: () => [] }
+}) {
+  return {
+    streaming,
+    thinking,
+    getAttribute(name) {
+      return name === "data-is-streaming" ? String(this.streaming) : null;
+    },
+    querySelector(selector) {
+      if (selector === ".font-claude-response") return body;
+      if (selector === "button[class*='group/status']") return this.thinking ? {} : null;
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector === "[class*='group/artifact-block']" ? artifacts : [];
+    },
+    closest() {
+      return turn;
+    }
+  };
+}
+
+function fakeArtifactCard(title) {
+  return { innerText: title, textContent: title };
 }
 
 class FakeDataTransfer {
