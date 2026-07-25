@@ -73,6 +73,7 @@ pub enum WebRecipeTransportPhase {
     Upload,
     Send,
     WaitResponse,
+    PostCompletion,
 }
 
 impl fmt::Display for WebRecipeTransportPhase {
@@ -81,6 +82,7 @@ impl fmt::Display for WebRecipeTransportPhase {
             Self::Upload => "upload",
             Self::Send => "send",
             Self::WaitResponse => "wait_response",
+            Self::PostCompletion => "post_completion",
         })
     }
 }
