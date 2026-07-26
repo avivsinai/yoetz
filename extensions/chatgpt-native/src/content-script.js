@@ -252,7 +252,7 @@ async function inspectPage(runId, options = {}) {
     ownership: parsed,
     active_job_ids: Array.from(activeJobs.keys()),
     extraction,
-    model_selection: modelSelectionDiagnostics(document),
+    current_model_chip_state: modelSelectionDiagnostics(document),
     // Runtime build marker for the CONTENT SCRIPT specifically. Content scripts already injected
     // into open tabs do NOT refresh when the extension is reloaded (only the service worker
     // does), so a stale content script can emit old diagnostics (e.g. snippets without

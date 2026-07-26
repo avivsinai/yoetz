@@ -119,6 +119,139 @@ test("fake Claude upload waits for the committed chip and re-enabled send", asyn
   }
 });
 
+test("fake Claude upload timeout reports each attachment readiness leg", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    const input = {
+      files: null,
+      dispatchEvent() {
+        return true;
+      }
+    };
+    const attachment = {
+      textContent: "fixture.md Processing",
+      getAttribute(name) {
+        if (name === "aria-busy") return "true";
+        return null;
+      },
+      querySelector(selector) {
+        if (selector === "h3") return { textContent: "fixture.md" };
+        if (selector === "[role='progressbar']") return {};
+        return null;
+      },
+      querySelectorAll() {
+        return [];
+      }
+    };
+    const root = {
+      querySelector(selector) {
+        if (selector === "input[data-testid='file-upload']") return input;
+        if (selector === "button[aria-label='Send message']") {
+          return { disabled: true, getAttribute: () => "true" };
+        }
+        return null;
+      },
+      querySelectorAll(selector) {
+        if (selector === "input[data-testid='file-upload']") return [input];
+        if (selector === "[data-testid='file-thumbnail']") return [attachment];
+        return [];
+      }
+    };
+
+    await assert.rejects(
+      () => uploadFile(root, new File(["bundle"], "fixture.md", { type: "text/markdown" }), {
+        timeoutMs: 1
+      }),
+      (error) => {
+        assert.match(error.message, /file_input_count=1/);
+        assert.match(error.message, /thumbnail_count=1/);
+        assert.match(error.message, /thumbnail_labels=\["fixture\.md"\]/);
+        assert.match(error.message, /filename_match=true/);
+        assert.match(error.message, /remove_present=false/);
+        assert.match(error.message, /attachment_busy=\["fixture\.md"\]/);
+        assert.match(error.message, /attachment_failures=\[\]/);
+        assert.match(error.message, /send_present=true/);
+        assert.match(error.message, /send_disabled=true/);
+        assert.match(error.message, /send_aria_disabled="true"/);
+        assert.match(error.message, /timeout_stage="attachment_readiness"/);
+        return true;
+      }
+    );
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
+test("fake Claude upload timeout reports an absent send control", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    const input = {
+      files: null,
+      dispatchEvent() {
+        return true;
+      }
+    };
+    const attachment = {
+      textContent: "fixture.md",
+      getAttribute: () => null,
+      querySelector(selector) {
+        if (selector === "h3") return { textContent: "fixture.md" };
+        if (selector === "button[aria-label='Remove']") return {};
+        return null;
+      }
+    };
+    const root = {
+      querySelector(selector) {
+        return selector === "input[data-testid='file-upload']" ? input : null;
+      },
+      querySelectorAll(selector) {
+        if (selector === "input[data-testid='file-upload']") return [input];
+        if (selector === "[data-testid='file-thumbnail']") return [attachment];
+        return [];
+      }
+    };
+
+    await assert.rejects(
+      () => uploadFile(root, new File(["bundle"], "fixture.md", { type: "text/markdown" }), {
+        timeoutMs: 1
+      }),
+      (error) => {
+        assert.match(error.message, /filename_match=true/);
+        assert.match(error.message, /remove_present=true/);
+        assert.match(error.message, /attachment_busy=\[\]/);
+        assert.match(error.message, /attachment_failures=\[\]/);
+        assert.match(error.message, /send_present=false/);
+        assert.match(error.message, /send_disabled=null/);
+        assert.match(error.message, /send_aria_disabled=null/);
+        assert.match(error.message, /timeout_stage="attachment_readiness"/);
+        return true;
+      }
+    );
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
+test("fake Claude upload timeout identifies the file-input wait", async () => {
+  const root = {
+    querySelector: () => null,
+    querySelectorAll: () => []
+  };
+
+  await assert.rejects(
+    () => uploadFile(root, new File(["bundle"], "fixture.md", { type: "text/markdown" }), {
+      timeoutMs: 1
+    }),
+    (error) => {
+      assert.match(error.message, /file_input_count=0/);
+      assert.match(error.message, /timeout_stage="file_input"/);
+      return true;
+    }
+  );
+});
+
 test("fake Claude model picker drives hover-only Max then closes", async () => {
   const fixture = makeClaudeModelFixture();
   const previousPointerEvent = globalThis.PointerEvent;
