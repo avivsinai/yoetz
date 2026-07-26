@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.45] - 2026-07-26
 ### Fixed
 
 - Claude native recipes now detect file/artifact cards in the final assistant
@@ -15,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Built-in Claude prompts now require the deliverable to remain in the chat
   message as plain Markdown, reducing artifact loss while preserving the
   caller's task bytes exactly. Custom recipes remain unchanged.
+
 
 ## [0.5.44] - 2026-07-25
 
