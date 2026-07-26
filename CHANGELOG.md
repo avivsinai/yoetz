@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Documentation
+
+- Document the `upload_timeout_ms` and `send_timeout_ms` recipe vars alongside
+  `wait_timeout_ms` in the yoetz skill, including the upload default of 120000
+  plus 5000 per MiB of bundle. Both overrides already existed for the `chatgpt`
+  and `claude` recipes but appeared in no guidance, so callers hitting the
+  125000 bound on a small bundle had no documented lever.
+
 ## [0.5.45] - 2026-07-26
 ### Fixed
 
