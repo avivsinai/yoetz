@@ -104,7 +104,7 @@ export function extractResponse() {
 }
 
 export function modelSelectionDiagnostics() {
-  return {};
+  return hooks.modelSelectionDiagnostics ?? {};
 }
 
 function conversationIdFromLocation() {
@@ -232,6 +232,32 @@ test("content script auth probe reports manual handoff without job side effects"
     assert.deepEqual(hooks.ensureFreshChatCalls, []);
     assert.deepEqual(hooks.ensureConversationLoadedCalls, []);
     assert.deepEqual(hooks.markOwnershipCalls, []);
+  } finally {
+    restore();
+  }
+});
+
+test("content script inspect labels model diagnostics as current chip state", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "inspect_current_model_chip",
+    "https://chatgpt.com/c/conv-123?_yoetz=run-inspect"
+  );
+  try {
+    globalThis.window.name = "yoetz-chatgpt-native:run-inspect:job-inspect";
+    hooks.modelSelectionDiagnostics = {
+      modelChip: "GPT-5.6 Sol Pro",
+      modelVerified: true
+    };
+
+    const response = await send({
+      type: "yoetz_inspect_page",
+      run_id: "run-inspect",
+      recipe: "chatgpt"
+    });
+
+    assert.equal(response.ok, true);
+    assert.deepEqual(response.payload.current_model_chip_state, hooks.modelSelectionDiagnostics);
+    assert.equal(response.payload.model_selection, undefined);
   } finally {
     restore();
   }

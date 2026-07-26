@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Browser-extension inspect output now labels the current chip state at inspect
+  time as `current_model_chip_state` instead of the misleading
+  `model_selection` for both ChatGPT and Claude recipes.
+
+### Added
+
+- Claude upload timeouts now report per-leg readiness evidence for the file
+  input, attachment, and send control, including which wait stage expired.
+
 ### Documentation
 
 - Document the `upload_timeout_ms` and `send_timeout_ms` recipe vars alongside

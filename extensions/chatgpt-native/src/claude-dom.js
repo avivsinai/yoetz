@@ -116,20 +116,29 @@ export async function insertPrompt(root, prompt, options = {}) {
 
 export async function uploadFile(root, file, options = {}) {
   const timeoutMs = options.timeoutMs ?? 120000;
-  const input = await waitFor(() => findFileInput(root), Math.min(timeoutMs, 20000));
-  const transfer = new DataTransfer();
-  transfer.items.add(file);
-  input.files = transfer.files;
-  input.dispatchEvent(new Event("change", { bubbles: true }));
-  await waitFor(() => {
-    const attachment = Array.from(root.querySelectorAll(ATTACHMENT_SELECTOR)).find((node) =>
-      normalizeText(node.querySelector("h3")?.textContent) === file.name
-      && Boolean(node.querySelector("button[aria-label='Remove']"))
-    );
-    const send = findSendButton(root);
-    return attachment && send && !send.disabled && send.getAttribute("aria-disabled") !== "true";
-  }, timeoutMs);
-  return true;
+  let timeoutStage = "file_input";
+  try {
+    const input = await waitFor(() => findFileInput(root), Math.min(timeoutMs, 20000));
+    const transfer = new DataTransfer();
+    transfer.items.add(file);
+    input.files = transfer.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    timeoutStage = "attachment_readiness";
+    await waitFor(() => {
+      const attachment = Array.from(root.querySelectorAll(ATTACHMENT_SELECTOR)).find((node) =>
+        normalizeText(node.querySelector("h3")?.textContent) === file.name
+        && Boolean(node.querySelector("button[aria-label='Remove']"))
+      );
+      const send = findSendButton(root);
+      return attachment && send && !send.disabled && send.getAttribute("aria-disabled") !== "true";
+    }, timeoutMs);
+    return true;
+  } catch (error) {
+    if (error?.isClaudeWaitTimeout) {
+      error.message = `${error.message}; upload diagnostics: ${claudeUploadDiagnosticSummary(root, file.name, timeoutStage)}`;
+    }
+    throw error;
+  }
 }
 
 export async function ensureFreshChat(root = document, job = {}, options = {}) {
@@ -594,6 +603,55 @@ function elementSummary(element) {
   };
 }
 
+function claudeUploadDiagnosticSummary(root, filename, timeoutStage) {
+  const inputs = Array.from(root.querySelectorAll?.(FILE_INPUT_SELECTOR) ?? []);
+  const thumbnails = Array.from(root.querySelectorAll?.(ATTACHMENT_SELECTOR) ?? []);
+  const send = findSendButton(root);
+  const observations = thumbnails.map((thumbnail) => {
+    const label = normalizeText(
+      thumbnail.querySelector?.("h3")?.textContent
+      || thumbnail.getAttribute?.("aria-label")
+      || thumbnail.getAttribute?.("title")
+    );
+    const text = normalizeText(thumbnail.innerText || thumbnail.textContent);
+    const busy = thumbnail.getAttribute?.("aria-busy") === "true"
+      || Boolean(thumbnail.querySelector?.([
+        "[role='progressbar']",
+        "[aria-busy='true']",
+        "[data-state*='loading']"
+      ].join(", ")))
+      || /\b(uploading|attaching|processing|scanning)\b/i.test(text);
+    const failureNode = thumbnail.querySelector?.(
+      "[role='alert'], [data-testid*='error'], [aria-live='assertive']"
+    );
+    const failureText = normalizeText(failureNode?.innerText || failureNode?.textContent);
+    const failure = failureText || (
+      /\b(upload|attach|file)\b.*\b(failed|error)\b/i.test(text) ? text.slice(0, 200) : ""
+    );
+    return {
+      label,
+      matchesFilename: label === filename,
+      removePresent: Boolean(thumbnail.querySelector?.("button[aria-label='Remove']")),
+      busy,
+      failure
+    };
+  });
+  const filenameMatch = observations.find((item) => item.matchesFilename);
+  return [
+    `file_input_count=${inputs.length}`,
+    `thumbnail_count=${thumbnails.length}`,
+    `thumbnail_labels=${JSON.stringify(observations.map((item) => item.label))}`,
+    `filename_match=${Boolean(filenameMatch)}`,
+    `remove_present=${Boolean(filenameMatch?.removePresent)}`,
+    `attachment_busy=${JSON.stringify(observations.filter((item) => item.busy).map((item) => item.label))}`,
+    `attachment_failures=${JSON.stringify(observations.filter((item) => item.failure).map((item) => item.failure))}`,
+    `send_present=${Boolean(send)}`,
+    `send_disabled=${send ? Boolean(send.disabled) : null}`,
+    `send_aria_disabled=${JSON.stringify(send?.getAttribute?.("aria-disabled") ?? null)}`,
+    `timeout_stage=${JSON.stringify(timeoutStage)}`
+  ].join(", ");
+}
+
 async function waitForReadyComposer(root, timeoutMs) {
   try {
     return await waitFor(() => findComposer(root), timeoutMs);
@@ -621,7 +679,9 @@ async function waitFor(read, timeoutMs) {
     value = read();
   }
   if (!value) {
-    throw new Error(`Claude page did not reach the requested state within ${timeoutMs}ms`);
+    const error = new Error(`Claude page did not reach the requested state within ${timeoutMs}ms`);
+    error.isClaudeWaitTimeout = true;
+    throw error;
   }
   return value;
 }
