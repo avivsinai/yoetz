@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.47] - 2026-07-27
 ### Fixed
 
 - Claude browser jobs now fail with `response_finality_stalled` after five
@@ -18,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Claude browser recipes now detect the visible organization usage-credit
   exhaustion banner, stop before clicking Send, and return structured provider
   diagnostics without switching models.
+
 
 ## [0.5.46] - 2026-07-27
 ### Changed
