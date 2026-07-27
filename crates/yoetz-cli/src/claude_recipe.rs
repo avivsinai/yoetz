@@ -51,6 +51,7 @@ pub struct ClaudeRecipeSpec {
     pub wait_timeout_ms: u64,
     pub wait_interval_ms: u64,
     pub upload_timeout_ms: u64,
+    pub attachment_stall_timeout_ms: u64,
     pub send_timeout_ms: u64,
     pub close_tab_on_complete: bool,
     pub warnings: Vec<String>,

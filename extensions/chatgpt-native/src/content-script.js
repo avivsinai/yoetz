@@ -118,7 +118,16 @@ async function uploadJobFile(job, filePayload) {
   const file = new File([bytes], filePayload.filename || "yoetz-bundle.md", {
     type: filePayload.mime_type || "text/markdown"
   });
-  await uploadFile(document, file, { timeoutMs: Number(job.upload_timeout_ms) || 120000 });
+  const timeoutMs = Number(job.upload_timeout_ms) || 120000;
+  const uploadOptions = { timeoutMs };
+  if (adapter.recipe === "claude") {
+    const stallTimeoutMs = Number(job.attachment_stall_timeout_ms);
+    if (Number.isFinite(stallTimeoutMs) && stallTimeoutMs > timeoutMs) {
+      uploadOptions.stallTimeoutMs = stallTimeoutMs;
+    }
+    uploadOptions.initialAttachmentTrace = job.attachment_trace;
+  }
+  await uploadFile(document, file, uploadOptions);
   return { filename: file.name, size: file.size };
 }
 
@@ -527,6 +536,9 @@ function errorResponse(error) {
   }
   if (typeof error?.side_effect_started === "boolean") {
     response.side_effect_started = error.side_effect_started;
+  }
+  if (error?.attachment_trace !== undefined) {
+    response.attachment_trace = error.attachment_trace;
   }
   for (const key of [
     "requested_conversation_id",

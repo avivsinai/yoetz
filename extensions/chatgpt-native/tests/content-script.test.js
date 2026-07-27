@@ -72,6 +72,9 @@ export function markOwnership(_document, job) {
 
 export async function uploadFile(_document, file, options) {
   hooks.uploadFileCalls.push({ file_name: file.name, size: file.size, options });
+  if (hooks.uploadFileError) {
+    throw hooks.uploadFileError;
+  }
   return true;
 }
 
@@ -132,7 +135,7 @@ const dom = {
 };
 
 export const siteAdapter = {
-  recipe: "chatgpt",
+  recipe: hooks.recipe ?? "chatgpt",
   displayName: "ChatGPT",
   dom,
   fetchConversationAnswer,
@@ -188,6 +191,81 @@ test("content script resume path skips fresh enforcement and completes on reques
     const extracted = await send({ type: "yoetz_extract_response", job });
     assert.equal(extracted.ok, true);
     assert.equal(extracted.payload.conversation_id, "conv-123");
+  } finally {
+    restore();
+  }
+});
+
+test("content script preserves an attachment-stalled trace from the upload adapter", async () => {
+  const { send, hooks, restore } = await loadContentScript("attachment_trace", "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+  try {
+    const job = resumeJob();
+    const error = new Error("Claude attachment stalled");
+    error.code = "attachment_stalled";
+    error.phase = "upload";
+    error.side_effect_started = true;
+    error.attachment_trace = {
+      final_chunk_ack_at_ms: 100,
+      input_resolved_at_ms: 101,
+      files_assigned_at_ms: 102,
+      change_dispatched_at_ms: 103,
+      hard_timeout_at_ms: 420000,
+      hard_timeout_pending_legs: ["matching_thumbnail"]
+    };
+    hooks.uploadFileError = error;
+
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+
+    const response = await send({
+      type: "yoetz_upload_file",
+      job,
+      file: {
+        filename: "bundle.md",
+        mime_type: "text/markdown",
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+      }
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "attachment_stalled");
+    assert.deepEqual(response.attachment_trace, error.attachment_trace);
+  } finally {
+    restore();
+  }
+});
+
+test("content script extends Claude attachment observation only when the stall window is opt in", async () => {
+  const { send, hooks, restore } = await loadContentScript("claude_opt_in_stall", "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+  try {
+    hooks.recipe = "claude";
+    const job = { ...resumeJob(), recipe: "claude" };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+
+    const defaultUpload = await send({
+      type: "yoetz_upload_file",
+      job,
+      file: {
+        filename: "bundle.md",
+        mime_type: "text/markdown",
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+      }
+    });
+    assert.equal(defaultUpload.ok, true);
+    assert.equal(hooks.uploadFileCalls[0].options.stallTimeoutMs, undefined);
+
+    const optedInUpload = await send({
+      type: "yoetz_upload_file",
+      job: { ...job, attachment_stall_timeout_ms: 1500 },
+      file: {
+        filename: "bundle.md",
+        mime_type: "text/markdown",
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+      }
+    });
+    assert.equal(optedInUpload.ok, true);
+    assert.equal(hooks.uploadFileCalls[1].options.stallTimeoutMs, 1500);
   } finally {
     restore();
   }

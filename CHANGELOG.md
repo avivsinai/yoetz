@@ -17,6 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Claude upload timeouts now report per-leg readiness evidence for the file
   input, attachment, and send control, including which wait stage expired.
+- Added the opt-in `attachment_stall_timeout_ms` Claude recipe var. When set
+  above `upload_timeout_ms`, it observes the already-dispatched attachment to
+  that deadline and returns `attachment_stalled` with a timestamped readiness
+  trace. Its default of `0` preserves the existing upload-timeout behavior.
 
 ### Documentation
 

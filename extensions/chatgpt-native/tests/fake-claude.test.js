@@ -119,6 +119,157 @@ test("fake Claude upload waits for the committed chip and re-enabled send", asyn
   }
 });
 
+test("fake Claude upload accepts a later duplicate thumbnail that has the remove control", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    const input = {
+      files: null,
+      dispatchEvent() {
+        return true;
+      }
+    };
+    const thumbnail = (hasRemoveControl) => ({
+      querySelector(selector) {
+        if (selector === "h3") return { textContent: "fixture.md" };
+        if (selector === "button[aria-label='Remove']") return hasRemoveControl ? {} : null;
+        return null;
+      }
+    });
+    const root = {
+      querySelector(selector) {
+        if (selector === "input[data-testid='file-upload']") return input;
+        if (selector === "button[aria-label='Send message']") {
+          return { disabled: false, getAttribute: () => null };
+        }
+        return null;
+      },
+      querySelectorAll(selector) {
+        return selector === "[data-testid='file-thumbnail']"
+          ? [thumbnail(false), thumbnail(true)]
+          : [];
+      }
+    };
+
+    await uploadFile(root, new File(["bundle"], "fixture.md", { type: "text/markdown" }), {
+      timeoutMs: 50
+    });
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
+test("fake Claude upload keeps observing after its soft deadline without redispatching", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    let attachment = null;
+    let dispatches = 0;
+    const send = {
+      disabled: true,
+      getAttribute: () => null
+    };
+    const input = {
+      files: null,
+      dispatchEvent(event) {
+        assert.equal(event.type, "change");
+        dispatches += 1;
+        const name = this.files[0].name;
+        setTimeout(() => {
+          attachment = {
+            querySelector(selector) {
+              if (selector === "h3") return { textContent: name };
+              if (selector === "button[aria-label='Remove']") return {};
+              return null;
+            }
+          };
+          send.disabled = false;
+        }, 150);
+        return true;
+      }
+    };
+    const root = {
+      querySelector(selector) {
+        if (selector === "input[data-testid='file-upload']") return input;
+        if (selector === "button[aria-label='Send message']") return send;
+        return null;
+      },
+      querySelectorAll(selector) {
+        return selector === "[data-testid='file-thumbnail']" && attachment ? [attachment] : [];
+      }
+    };
+
+    await uploadFile(root, new File(["bundle"], "fixture.md", { type: "text/markdown" }), {
+      timeoutMs: 50,
+      stallTimeoutMs: 300
+    });
+
+    assert.equal(dispatches, 1);
+    assert.equal(send.disabled, false);
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
+test("fake Claude upload reports a bounded attachment trace when it stalls", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    let dispatches = 0;
+    const input = {
+      files: null,
+      dispatchEvent() {
+        dispatches += 1;
+        return true;
+      }
+    };
+    const root = {
+      querySelector(selector) {
+        if (selector === "input[data-testid='file-upload']") return input;
+        if (selector === "button[aria-label='Send message']") {
+          return { disabled: true, getAttribute: () => "true" };
+        }
+        return null;
+      },
+      querySelectorAll(selector) {
+        return selector === "input[data-testid='file-upload']" ? [input] : [];
+      }
+    };
+    const finalChunkAckAtMs = Date.now();
+
+    await assert.rejects(
+      () => uploadFile(root, new File(["bundle"], "fixture.md", { type: "text/markdown" }), {
+        timeoutMs: 50,
+        stallTimeoutMs: 150,
+        initialAttachmentTrace: { final_chunk_ack_at_ms: finalChunkAckAtMs }
+      }),
+      (error) => {
+        assert.equal(error.code, "attachment_stalled");
+        assert.equal(error.phase, "upload");
+        assert.equal(error.side_effect_started, true);
+        assert.match(error.message, /attachment stalled/);
+        assert.equal(error.attachment_trace.final_chunk_ack_at_ms, finalChunkAckAtMs);
+        assert.ok(Number.isFinite(error.attachment_trace.input_resolved_at_ms));
+        assert.ok(Number.isFinite(error.attachment_trace.files_assigned_at_ms));
+        assert.ok(Number.isFinite(error.attachment_trace.change_dispatched_at_ms));
+        assert.ok(Number.isFinite(error.attachment_trace.soft_timeout_at_ms));
+        assert.ok(Number.isFinite(error.attachment_trace.hard_timeout_at_ms));
+        assert.deepEqual(error.attachment_trace.hard_timeout_pending_legs, [
+          "matching_thumbnail",
+          "remove_control",
+          "send_enabled"
+        ]);
+        assert.equal(JSON.stringify(error.attachment_trace).includes("fixture.md"), false);
+        return true;
+      }
+    );
+
+    assert.equal(dispatches, 1);
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
 test("fake Claude upload timeout reports each attachment readiness leg", async () => {
   const previousDataTransfer = globalThis.DataTransfer;
   globalThis.DataTransfer = FakeDataTransfer;
