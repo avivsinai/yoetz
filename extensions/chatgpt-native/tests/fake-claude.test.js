@@ -34,6 +34,8 @@ function fakeCreditBanner({
   nestedMessage = false,
   renderedText = text,
   messageHidden = false,
+  messageRect = rect,
+  messageStyle = {},
   displayContentsAncestor = false,
   shellStyle = {}
 } = {}) {
@@ -71,7 +73,7 @@ function fakeCreditBanner({
       return visible ? [{}] : [];
     },
     getBoundingClientRect() {
-      return rect;
+      return messageRect;
     },
     closest() {
       return excluded ? {} : null;
@@ -155,6 +157,7 @@ function fakeCreditBanner({
         visibility: messageHidden && element === message ? "hidden" : (visible ? "visible" : "hidden"),
         opacity: hiddenAncestor && element === shell ? "0" : (visible ? "1" : "0"),
         ...(element === banner ? style : {}),
+        ...(element === message ? messageStyle : {}),
         ...(element === shell ? shellStyle : {})
       })
     },
@@ -236,18 +239,42 @@ test("classifyBlockingState matches rendered notice text and painted visibility"
   const zeroArea = fakeCreditBanner({
     rect: { left: 10, top: 10, right: 10, bottom: 10, width: 0, height: 0 }
   });
-  const fullyClipped = fakeCreditBanner({ style: { clipPath: "inset(50%)" } });
-  const overflowClipped = fakeCreditBanner({
+  const transparentMatchingChild = fakeCreditBanner({
+    nestedMessage: true,
+    messageStyle: { opacity: "0" },
+    switchControlQueryable: false
+  });
+  const offscreenMatchingChild = fakeCreditBanner({
+    nestedMessage: true,
+    messageRect: { left: 0, top: 900, right: 500, bottom: 1000, width: 500, height: 100 },
+    switchControlQueryable: false
+  });
+  const zeroAreaMatchingChild = fakeCreditBanner({
+    nestedMessage: true,
+    messageRect: { left: 10, top: 10, right: 10, bottom: 10, width: 0, height: 0 },
+    switchControlQueryable: false
+  });
+  const visibleClipPath = fakeCreditBanner({ style: { clipPath: "inset(0)" } });
+  const overflowAutoClipped = fakeCreditBanner({
     rect: { left: 200, top: 200, right: 300, bottom: 300, width: 100, height: 100 },
     ancestorRect: { left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 },
-    shellStyle: { overflow: "hidden" }
+    shellStyle: { overflow: "auto" }
+  });
+  const overflowScrollClipped = fakeCreditBanner({
+    rect: { left: 200, top: 200, right: 300, bottom: 300, width: 100, height: 100 },
+    ancestorRect: { left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 },
+    shellStyle: { overflow: "scroll" }
   });
   const displayContentsAncestor = fakeCreditBanner({ displayContentsAncestor: true });
 
   assert.equal(classifyBlockingState(hiddenMatchingChild.root), null);
   assert.equal(classifyBlockingState(zeroArea.root), null);
-  assert.equal(classifyBlockingState(fullyClipped.root), null);
-  assert.equal(classifyBlockingState(overflowClipped.root), null);
+  assert.equal(classifyBlockingState(transparentMatchingChild.root), null);
+  assert.equal(classifyBlockingState(offscreenMatchingChild.root), null);
+  assert.equal(classifyBlockingState(zeroAreaMatchingChild.root), null);
+  assert.equal(classifyBlockingState(visibleClipPath.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(overflowAutoClipped.root), null);
+  assert.equal(classifyBlockingState(overflowScrollClipped.root), null);
   assert.equal(classifyBlockingState(displayContentsAncestor.root)?.code, "usage_credits_exhausted");
 });
 
@@ -289,6 +316,40 @@ test("classifyBlockingState accepts wording drift but rejects structural false p
   assert.equal(classifyBlockingState(unrelated.root), null);
 });
 
+test("classifyBlockingState distinguishes terminal semantic notices from warnings", () => {
+  const terminal = fakeCreditBanner({
+    text: "You're out of usage credits.",
+    switchControlQueryable: false
+  });
+  const terminalAfterUnrelatedNegation = fakeCreditBanner({
+    text: "We could not verify your billing. Your org is out of usage credits.",
+    switchControlQueryable: false
+  });
+  const warnings = [
+    "You're almost out of usage credits.",
+    "You're nearly out of usage credits.",
+    "Your org is not out of usage credits.",
+    "You are no longer out of usage credits.",
+    "Your org isn't out of usage credits.",
+    "You aren't out of usage credits.",
+    "You're about to be out of usage credits.",
+    "You're running low, not out of usage credits."
+  ].map((text) => fakeCreditBanner({ text, switchControlQueryable: false }));
+  const controlCorroborated = fakeCreditBanner({
+    role: null,
+    nestedMessage: true,
+    depth: 1,
+    text: "You're almost out of usage credits. Switch models."
+  });
+
+  assert.equal(classifyBlockingState(terminal.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(terminalAfterUnrelatedNegation.root)?.code, "usage_credits_exhausted");
+  for (const warning of warnings) {
+    assert.equal(classifyBlockingState(warning.root), null);
+  }
+  assert.equal(classifyBlockingState(controlCorroborated.root)?.code, "usage_credits_exhausted");
+});
+
 test("classifyBlockingState throttles repeated full-DOM scans for quoted credit text", () => {
   const quoted = fakeCreditBanner({ excluded: true });
   const querySelectorAll = quoted.root.querySelectorAll.bind(quoted.root);
@@ -303,6 +364,44 @@ test("classifyBlockingState throttles repeated full-DOM scans for quoted credit 
   assert.equal(bodyScans, 1);
   assert.equal(classifyBlockingState(quoted.root, { forceScan: true }), null);
   assert.equal(bodyScans, 2);
+});
+
+test("clickSend force-scans after a cached negative before clicking", async () => {
+  const banner = fakeCreditBanner();
+  const querySelectorAll = banner.root.querySelectorAll.bind(banner.root);
+  let mounted = false;
+  banner.root.querySelectorAll = (selector) => {
+    if (selector === "body *") {
+      return mounted ? [banner.banner, banner.switchModels] : [];
+    }
+    if (selector.includes("button")) {
+      return mounted ? [banner.switchModels] : [];
+    }
+    return querySelectorAll(selector);
+  };
+  const send = {
+    disabled: false,
+    clickCount: 0,
+    getAttribute() {
+      return null;
+    },
+    click() {
+      this.clickCount += 1;
+    }
+  };
+  banner.root.querySelector = (selector) => (
+    selector === "button[aria-label='Send message']" ? send : null
+  );
+
+  assert.equal(classifyBlockingState(banner.root), null);
+  mounted = true;
+  await assert.rejects(
+    clickSend(banner.root, { timeoutMs: 1 }),
+    (error) => error?.code === "usage_credits_exhausted"
+      && error?.phase === "send"
+      && error?.send_committed === false
+  );
+  assert.equal(send.clickCount, 0);
 });
 
 test("Claude waits reclassify a persistent credit banner instead of timing out", async () => {

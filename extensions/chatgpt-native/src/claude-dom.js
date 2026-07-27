@@ -97,15 +97,27 @@ export function classifyBlockingState(root = document, { forceScan = false } = {
   const surfaces = candidates
     .filter((element) => USAGE_CREDITS_TEXT_PATTERN.test(normalizeText(element.textContent)))
     .filter((element) => !element.closest?.(CONVERSATION_CONTENT_SELECTOR))
-    .map((element) => notificationSurfaceFor(element, root)
-      ?? controlBackedSurfaceFor(element, switchControls, root))
-    .filter(Boolean)
-    .filter((surface, index, all) => all.indexOf(surface) === index)
-    .filter((surface) => !surface.closest?.(CONVERSATION_CONTENT_SELECTOR))
-    .filter((surface) => !surface.querySelector?.(CONVERSATION_CONTENT_SELECTOR))
-    .filter((surface) => isStrictlyVisibleBannerElement(root, surface))
-    .map((surface) => ({ surface, text: normalizeText(surface.innerText) }))
-    .filter(({ text }) => isUsageCreditsMessage(text))
+    .map((element) => ({
+      surface: notificationSurfaceFor(element, root)
+        ?? controlBackedSurfaceFor(element, switchControls, root)
+    }))
+    .filter(({ surface }) => Boolean(surface))
+    .filter(({ surface }, index, all) => all.findIndex((entry) => entry.surface === surface) === index)
+    .map(({ surface }) => ({
+      surface,
+      controlCorroborated: switchControls.some((control) => isDescendantOrSelf(control, surface)),
+      contributors: deepestUsageCreditsContributors(surface, candidates)
+    }))
+    .filter(({ surface }) => !surface.closest?.(CONVERSATION_CONTENT_SELECTOR))
+    .filter(({ surface }) => !surface.querySelector?.(CONVERSATION_CONTENT_SELECTOR))
+    .filter(({ surface }) => isStrictlyVisibleBannerElement(root, surface))
+    .filter(({ contributors }) => contributors.some((element) => isStrictlyVisibleBannerElement(root, element)))
+    .map(({ surface, controlCorroborated }) => ({
+      surface,
+      controlCorroborated,
+      text: normalizeText(surface.innerText)
+    }))
+    .filter(({ text, controlCorroborated }) => isUsageCreditsMessage(text, { controlCorroborated }))
     .sort((left, right) => left.text.length - right.text.length);
   const match = surfaces.at(0);
   if (!match) {
@@ -454,6 +466,11 @@ export async function clickSend(root, options = {}) {
     side_effect_started: true,
     send_committed: false
   });
+  throwIfBlockingState(root, {
+    phase: "send",
+    side_effect_started: true,
+    send_committed: false
+  }, { forceScan: true });
   send.click();
   return true;
 }
@@ -781,8 +798,30 @@ function visibleElements(root, selector) {
     .filter((element) => element.getClientRects().length > 0);
 }
 
-function isUsageCreditsMessage(text) {
+function hasUsageCreditsCore(text) {
   return USAGE_CREDITS_TEXT_PATTERN.test(text);
+}
+
+function isUsageCreditsMessage(text, { controlCorroborated = false } = {}) {
+  if (!hasUsageCreditsCore(text)) {
+    return false;
+  }
+  if (controlCorroborated) {
+    return true;
+  }
+  const matchIndex = text.toLowerCase().indexOf("out of usage credits");
+  const precedingWindow = text.slice(Math.max(0, matchIndex - 80), matchIndex);
+  const sentenceBoundary = Math.max(
+    precedingWindow.lastIndexOf("."),
+    precedingWindow.lastIndexOf("!"),
+    precedingWindow.lastIndexOf("?")
+  );
+  const precedingText = precedingWindow.slice(sentenceBoundary + 1);
+  if (/\b(?:almost|nearly|not|no longer|isn't|aren't|about to|running low)\b/i.test(precedingText)) {
+    return false;
+  }
+  return /\b(?:your|this)\s+org(?:anization)?\s+is\s+out of usage credits\b/i.test(text)
+    || /\byou(?:'re| are)\s+out of usage credits\b/i.test(text);
 }
 
 function notificationSurfaceFor(element, root) {
@@ -815,13 +854,26 @@ function controlBackedSurfaceFor(element, controls, root) {
         continue;
       }
       const text = normalizeText(node.innerText);
-      if (text.length <= MAX_CONTROL_SURFACE_TEXT_CHARS && isUsageCreditsMessage(text)) {
+      if (text.length <= MAX_CONTROL_SURFACE_TEXT_CHARS && hasUsageCreditsCore(text)) {
         return node;
       }
       break;
     }
   }
   return null;
+}
+
+function deepestUsageCreditsContributors(surface, candidates) {
+  const matching = candidates.filter((element) => (
+    isDescendantOrSelf(element, surface)
+    && hasUsageCreditsCore(normalizeText(element.textContent))
+  ));
+  // A phrase split across sibling inline elements can leave the surface itself
+  // as the deepest contributor. We knowingly accept that paint edge until a
+  // real provider DOM capture justifies text-node range machinery.
+  return matching.filter((element) => !matching.some((other) => (
+    other !== element && isDescendantOrSelf(other, element)
+  )));
 }
 
 function isDescendantOrSelf(element, ancestor) {
@@ -861,8 +913,6 @@ function isStrictlyVisibleBannerElement(root, element) {
       || style.visibility === "collapse"
       || (style.opacity !== "" && Number(style.opacity) === 0)
       || style.contentVisibility === "hidden"
-      || (style.clipPath && style.clipPath !== "none")
-      || (style.clip && style.clip !== "auto" && style.clip !== "none")
     )) {
       return false;
     }
@@ -891,7 +941,7 @@ function isStrictlyVisibleBannerElement(root, element) {
         style.overflow,
         style.overflowX,
         style.overflowY
-      ].some((value) => value === "hidden" || value === "clip");
+      ].some((value) => ["auto", "scroll", "hidden", "clip"].includes(value));
       if (node === element || clipsOverflow) {
         paintedIntersection = {
           left: Math.max(paintedIntersection.left, left),
