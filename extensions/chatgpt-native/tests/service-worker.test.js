@@ -5969,6 +5969,14 @@ test("service worker preserves content-script committed-send error metadata", as
             return {
               ok: false,
               code: "send_acceptance_unknown",
+              state: "usage_credits_exhausted",
+              provider_message: "Your org is out of usage credits for the month.",
+              provider_dom: {
+                container: { found: true, tag: "div", role: "alert" },
+                switch_models_control: { found: false }
+              },
+              requested_model: "fable-5-max",
+              send_committed: true,
               phase: "send",
               side_effect_started: true,
               error: "send click committed; acceptance unknown"
@@ -5999,6 +6007,99 @@ test("service worker preserves content-script committed-send error metadata", as
     const error = port.messages.find((message) => message.type === "job_error" && message.payload.code === "send_acceptance_unknown");
     assert.equal(error.payload.phase, "send");
     assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.state, "usage_credits_exhausted");
+    assert.equal(error.payload.provider_message, "Your org is out of usage credits for the month.");
+    assert.deepEqual(error.payload.provider_dom, {
+      container: { found: true, tag: "div", role: "alert" },
+      switch_models_control: { found: false }
+    });
+    assert.equal(error.payload.requested_model, "fable-5-max");
+    assert.equal(error.payload.send_committed, true);
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker reports Claude credits at baseline extraction as pre-send", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let sendPromptCalls = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "selected",
+                requested_model: "fable-5-max",
+                model_used: "Fable 5 Max",
+                modelVerified: true,
+                maxVerified: true
+              }
+            };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_extract_response":
+            assert.equal(message.blocking_context, "pre_send_baseline");
+            return {
+              ok: false,
+              code: "usage_credits_exhausted",
+              state: "usage_credits_exhausted",
+              provider_message: "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.",
+              requested_model: "fable-5-max",
+              phase: "send",
+              side_effect_started: true,
+              send_committed: false,
+              error: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
+            };
+          case "yoetz_send_prompt":
+            sendPromptCalls += 1;
+            throw new Error("prompt must not be sent after credit exhaustion");
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_credits_baseline=${Date.now()}`);
+    port.emit(envelope("job_start", "job_claude_credits_baseline", {
+      recipe: "claude",
+      prompt: "prompt"
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_claude_credits_baseline", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_claude_credits_baseline.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => (
+      message.type === "job_error" && message.payload.code === "usage_credits_exhausted"
+    )));
+    const error = port.messages.find((message) => (
+      message.type === "job_error" && message.payload.code === "usage_credits_exhausted"
+    ));
+    assert.equal(error.payload.phase, "send");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.send_committed, false);
+    assert.equal(error.payload.requested_model, "fable-5-max");
+    assert.equal(sendPromptCalls, 0);
     assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
   } finally {
     globalThis.chrome = originalChrome;

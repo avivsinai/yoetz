@@ -2,16 +2,454 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  classifyBlockingState,
+  clickSend,
   configureModelState,
   ensureConversationLoaded,
+  ensureFreshChat,
   extractResponse,
   insertPrompt,
   isResponseGenerating,
-  uploadFile
+  uploadFile,
+  waitForSendAccepted
 } from "../src/claude-dom.js";
 import { claudeSiteAdapter } from "../src/sites/claude.js";
 
 const claudeDomSource = await readFile(new URL("../src/claude-dom.js", import.meta.url), "utf8");
+
+function fakeCreditBanner({
+  excluded = false,
+  visible = true,
+  text = "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.",
+  depth = 8,
+  style = {},
+  rect = null,
+  ancestorRect = null,
+  conversationDescendant = false,
+  hiddenAncestor = false,
+  switchControlQueryable = true,
+  role = "alert",
+  ariaLive = null,
+  tagName = null,
+  nestedMessage = false,
+  renderedText = text,
+  messageHidden = false,
+  messageRect = rect,
+  messageStyle = {},
+  displayContentsAncestor = false,
+  shellStyle = {}
+} = {}) {
+  const shell = {
+    innerText: renderedText,
+    textContent: text,
+    tagName: "BODY",
+    parentElement: null,
+    getAttribute() {
+      return null;
+    },
+    closest() {
+      return excluded ? {} : null;
+    },
+    querySelector() {
+      return conversationDescendant ? {} : null;
+    },
+    getClientRects() {
+      return displayContentsAncestor ? [] : [{}];
+    },
+    getBoundingClientRect() {
+      return ancestorRect;
+    }
+  };
+  const banner = {
+    attrs: { role, "aria-live": ariaLive },
+    innerText: renderedText,
+    textContent: text,
+    tagName,
+    parentElement: shell,
+    getAttribute(name) {
+      return this.attrs[name] ?? null;
+    },
+    getClientRects() {
+      return visible ? [{}] : [];
+    },
+    getBoundingClientRect() {
+      return messageRect;
+    },
+    closest() {
+      return excluded ? {} : null;
+    },
+    querySelector() {
+      return conversationDescendant ? {} : null;
+    }
+  };
+  const message = nestedMessage || messageHidden ? {
+    attrs: {},
+    innerText: text,
+    textContent: text,
+    tagName: "P",
+    parentElement: banner,
+    getAttribute(name) {
+      return this.attrs[name] ?? null;
+    },
+    getClientRects() {
+      return messageHidden ? [] : [{}];
+    },
+    getBoundingClientRect() {
+      return rect;
+    },
+    closest() {
+      return excluded ? {} : null;
+    },
+    querySelector() {
+      return null;
+    }
+  } : null;
+  const switchModels = {
+    attrs: { role: "button" },
+    innerText: "Switch models",
+    textContent: "Switch models",
+    parentElement: null,
+    clickCount: 0,
+    click() {
+      this.clickCount += 1;
+    },
+    closest() {
+      return excluded ? {} : null;
+    },
+    getAttribute(name) {
+      return this.attrs[name] ?? null;
+    },
+    getClientRects() {
+      return visible ? [{}] : [];
+    },
+    getBoundingClientRect() {
+      return rect;
+    }
+  };
+  let parent = banner;
+  for (let index = 0; index < depth; index += 1) {
+    parent = {
+      innerText: "Switch models",
+      textContent: "Switch models",
+      parentElement: parent,
+      getAttribute() {
+        return null;
+      },
+      getClientRects() {
+        return visible ? [{}] : [];
+      },
+      getBoundingClientRect() {
+        return rect;
+      }
+    };
+  }
+  switchModels.parentElement = parent;
+  const root = {
+    body: shell,
+    documentElement: shell,
+    defaultView: {
+      innerWidth: 1200,
+      innerHeight: 800,
+      getComputedStyle: (element) => ({
+        display: messageHidden && element === message
+          ? "none"
+          : (displayContentsAncestor && element === shell ? "contents" : (visible ? "block" : "none")),
+        visibility: messageHidden && element === message ? "hidden" : (visible ? "visible" : "hidden"),
+        opacity: hiddenAncestor && element === shell ? "0" : (visible ? "1" : "0"),
+        ...(element === banner ? style : {}),
+        ...(element === message ? messageStyle : {}),
+        ...(element === shell ? shellStyle : {})
+      })
+    },
+    querySelectorAll(selector) {
+      if (selector === "body *") return [message, banner, switchModels].filter(Boolean);
+      return switchControlQueryable && selector.includes("button") ? [switchModels] : [];
+    }
+  };
+  return { root, shell, banner, message, switchModels };
+}
+
+test("classifyBlockingState detects the visible organization credit banner", () => {
+  const banner = fakeCreditBanner();
+
+  assert.deepEqual(classifyBlockingState(banner.root), {
+    state: "usage_credits_exhausted",
+    code: "usage_credits_exhausted",
+    requested_model: "fable-5-max",
+    provider_message: "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.",
+    provider_dom: {
+      container: {
+        found: true,
+        tag: null,
+        role: "alert",
+        testid: null,
+        class_fragment: null
+      },
+      switch_models_control: {
+        found: true,
+        tag: null,
+        role: "button",
+        testid: null,
+        class_fragment: null
+      }
+    },
+    message: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
+  });
+  assert.equal(banner.switchModels.clickCount, 0);
+});
+
+test("classifyBlockingState survives unknown Switch models markup and records diagnostics", () => {
+  const banner = fakeCreditBanner({ switchControlQueryable: false });
+
+  const blockingState = classifyBlockingState(banner.root);
+
+  assert.equal(blockingState?.code, "usage_credits_exhausted");
+  assert.deepEqual(blockingState?.provider_dom.switch_models_control, { found: false });
+  assert.equal(banner.switchModels.clickCount, 0);
+});
+
+test("classifyBlockingState bounds credit text to a provider notice surface", () => {
+  const sidebarTitle = fakeCreditBanner({
+    role: null,
+    tagName: "ASIDE",
+    switchControlQueryable: false
+  });
+  const ordinaryPageText = fakeCreditBanner({
+    role: null,
+    text: "Your org is out of usage credits for the month.",
+    switchControlQueryable: false
+  });
+  const alertWithoutControl = fakeCreditBanner({ switchControlQueryable: false });
+  const nestedAlert = fakeCreditBanner({ nestedMessage: true, depth: 1 });
+  const controlBackedNotice = fakeCreditBanner({ role: null, nestedMessage: true, depth: 1 });
+
+  assert.equal(classifyBlockingState(sidebarTitle.root), null);
+  assert.equal(classifyBlockingState(ordinaryPageText.root), null);
+  assert.equal(classifyBlockingState(alertWithoutControl.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(nestedAlert.root)?.provider_dom.switch_models_control.found, true);
+  assert.equal(classifyBlockingState(controlBackedNotice.root)?.code, "usage_credits_exhausted");
+});
+
+test("classifyBlockingState matches rendered notice text and painted visibility", () => {
+  const hiddenMatchingChild = fakeCreditBanner({
+    renderedText: "A different visible notification.",
+    messageHidden: true,
+    switchControlQueryable: false
+  });
+  const zeroArea = fakeCreditBanner({
+    rect: { left: 10, top: 10, right: 10, bottom: 10, width: 0, height: 0 }
+  });
+  const transparentMatchingChild = fakeCreditBanner({
+    nestedMessage: true,
+    messageStyle: { opacity: "0" },
+    switchControlQueryable: false
+  });
+  const offscreenMatchingChild = fakeCreditBanner({
+    nestedMessage: true,
+    messageRect: { left: 0, top: 900, right: 500, bottom: 1000, width: 500, height: 100 },
+    switchControlQueryable: false
+  });
+  const zeroAreaMatchingChild = fakeCreditBanner({
+    nestedMessage: true,
+    messageRect: { left: 10, top: 10, right: 10, bottom: 10, width: 0, height: 0 },
+    switchControlQueryable: false
+  });
+  const visibleClipPath = fakeCreditBanner({ style: { clipPath: "inset(0)" } });
+  const overflowAutoClipped = fakeCreditBanner({
+    rect: { left: 200, top: 200, right: 300, bottom: 300, width: 100, height: 100 },
+    ancestorRect: { left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 },
+    shellStyle: { overflow: "auto" }
+  });
+  const overflowScrollClipped = fakeCreditBanner({
+    rect: { left: 200, top: 200, right: 300, bottom: 300, width: 100, height: 100 },
+    ancestorRect: { left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 },
+    shellStyle: { overflow: "scroll" }
+  });
+  const displayContentsAncestor = fakeCreditBanner({ displayContentsAncestor: true });
+
+  assert.equal(classifyBlockingState(hiddenMatchingChild.root), null);
+  assert.equal(classifyBlockingState(zeroArea.root), null);
+  assert.equal(classifyBlockingState(transparentMatchingChild.root), null);
+  assert.equal(classifyBlockingState(offscreenMatchingChild.root), null);
+  assert.equal(classifyBlockingState(zeroAreaMatchingChild.root), null);
+  assert.equal(classifyBlockingState(visibleClipPath.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(overflowAutoClipped.root), null);
+  assert.equal(classifyBlockingState(overflowScrollClipped.root), null);
+  assert.equal(classifyBlockingState(displayContentsAncestor.root)?.code, "usage_credits_exhausted");
+});
+
+test("classifyBlockingState accepts wording drift but rejects structural false positives", () => {
+  const quoted = fakeCreditBanner({ excluded: true });
+  const hidden = fakeCreditBanner({ visible: false });
+  const transparent = fakeCreditBanner({ style: { opacity: "0" } });
+  const offscreen = fakeCreditBanner({
+    rect: { left: 0, top: 900, right: 500, bottom: 1000, width: 500, height: 100 }
+  });
+  const shortened = fakeCreditBanner({
+    text: "Your org is out of usage credits for the month. Switch models to continue chatting."
+  });
+  const reordered = fakeCreditBanner({
+    text: "Switch models to continue chatting. We let your admin know. Your org is out of usage credits for the month."
+  });
+  const extra = fakeCreditBanner({
+    text: "Your org is out of usage credits for the month. We let your admin know. Prompt quoted this notice. Switch models to continue chatting."
+  });
+  const drifted = fakeCreditBanner({
+    text: "You're out of usage credits. Switch models to continue."
+  });
+  const conversationCompleted = fakeCreditBanner({ conversationDescendant: true });
+  const ancestorHidden = fakeCreditBanner({ hiddenAncestor: true });
+  const unrelated = fakeCreditBanner({
+    text: "Your organization has a billing notice. Switch models to continue chatting."
+  });
+
+  assert.equal(classifyBlockingState(quoted.root), null);
+  assert.equal(classifyBlockingState(hidden.root), null);
+  assert.equal(classifyBlockingState(transparent.root), null);
+  assert.equal(classifyBlockingState(offscreen.root), null);
+  assert.equal(classifyBlockingState(shortened.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(reordered.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(extra.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(drifted.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(conversationCompleted.root), null);
+  assert.equal(classifyBlockingState(ancestorHidden.root), null);
+  assert.equal(classifyBlockingState(unrelated.root), null);
+});
+
+test("classifyBlockingState distinguishes terminal semantic notices from warnings", () => {
+  const terminal = fakeCreditBanner({
+    text: "You're out of usage credits.",
+    switchControlQueryable: false
+  });
+  const terminalAfterUnrelatedNegation = fakeCreditBanner({
+    text: "We could not verify your billing. Your org is out of usage credits.",
+    switchControlQueryable: false
+  });
+  const warnings = [
+    "You're almost out of usage credits.",
+    "You're nearly out of usage credits.",
+    "Your org is not out of usage credits.",
+    "You are no longer out of usage credits.",
+    "Your org isn't out of usage credits.",
+    "You aren't out of usage credits.",
+    "You're about to be out of usage credits.",
+    "You're running low, not out of usage credits."
+  ].map((text) => fakeCreditBanner({ text, switchControlQueryable: false }));
+  const controlCorroborated = fakeCreditBanner({
+    role: null,
+    nestedMessage: true,
+    depth: 1,
+    text: "You're almost out of usage credits. Switch models."
+  });
+
+  assert.equal(classifyBlockingState(terminal.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(terminalAfterUnrelatedNegation.root)?.code, "usage_credits_exhausted");
+  for (const warning of warnings) {
+    assert.equal(classifyBlockingState(warning.root), null);
+  }
+  assert.equal(classifyBlockingState(controlCorroborated.root)?.code, "usage_credits_exhausted");
+});
+
+test("classifyBlockingState throttles repeated full-DOM scans for quoted credit text", () => {
+  const quoted = fakeCreditBanner({ excluded: true });
+  const querySelectorAll = quoted.root.querySelectorAll.bind(quoted.root);
+  let bodyScans = 0;
+  quoted.root.querySelectorAll = (selector) => {
+    if (selector === "body *") bodyScans += 1;
+    return querySelectorAll(selector);
+  };
+
+  assert.equal(classifyBlockingState(quoted.root), null);
+  assert.equal(classifyBlockingState(quoted.root), null);
+  assert.equal(bodyScans, 1);
+  assert.equal(classifyBlockingState(quoted.root, { forceScan: true }), null);
+  assert.equal(bodyScans, 2);
+});
+
+test("clickSend force-scans after a cached negative before clicking", async () => {
+  const banner = fakeCreditBanner();
+  const querySelectorAll = banner.root.querySelectorAll.bind(banner.root);
+  let mounted = false;
+  banner.root.querySelectorAll = (selector) => {
+    if (selector === "body *") {
+      return mounted ? [banner.banner, banner.switchModels] : [];
+    }
+    if (selector.includes("button")) {
+      return mounted ? [banner.switchModels] : [];
+    }
+    return querySelectorAll(selector);
+  };
+  const send = {
+    disabled: false,
+    clickCount: 0,
+    getAttribute() {
+      return null;
+    },
+    click() {
+      this.clickCount += 1;
+    }
+  };
+  banner.root.querySelector = (selector) => (
+    selector === "button[aria-label='Send message']" ? send : null
+  );
+
+  assert.equal(classifyBlockingState(banner.root), null);
+  mounted = true;
+  await assert.rejects(
+    clickSend(banner.root, { timeoutMs: 1 }),
+    (error) => error?.code === "usage_credits_exhausted"
+      && error?.phase === "send"
+      && error?.send_committed === false
+  );
+  assert.equal(send.clickCount, 0);
+});
+
+test("Claude waits reclassify a persistent credit banner instead of timing out", async () => {
+  const composerWait = fakeCreditBanner();
+  composerWait.root.querySelector = () => null;
+  await assert.rejects(
+    ensureFreshChat(composerWait.root, {}, { timeoutMs: 1 }),
+    (error) => error?.code === "usage_credits_exhausted"
+      && error?.phase === "upload"
+      && error?.send_committed === false
+  );
+
+  const sendWait = fakeCreditBanner();
+  sendWait.root.querySelector = () => null;
+  await assert.rejects(
+    clickSend(sendWait.root, { timeoutMs: 1 }),
+    (error) => error?.code === "usage_credits_exhausted"
+      && error?.phase === "send"
+      && error?.send_committed === false
+  );
+  assert.equal(sendWait.switchModels.clickCount, 0);
+});
+
+test("waitForSendAccepted fails with typed credit state without switching models", async () => {
+  const banner = fakeCreditBanner();
+  banner.root.querySelectorAll = (selector) => {
+    if (selector === "body *") return [banner.banner, banner.switchModels];
+    if (selector.includes("button") || selector.includes("[role=")) return [banner.switchModels];
+    if (selector === "[data-testid='user-message']") return [];
+    if (selector === "[data-is-streaming]") return [];
+    return [];
+  };
+
+  await assert.rejects(
+    waitForSendAccepted(banner.root, { user_count: 0, assistant_count: 0 }, {
+      timeoutMs: 20,
+      intervalMs: 1
+    }),
+    (error) => {
+      assert.equal(error.code, "usage_credits_exhausted");
+      assert.equal(error.state, "usage_credits_exhausted");
+      assert.equal(error.requested_model, "fable-5-max");
+      assert.equal(error.send_committed, true);
+      return true;
+    }
+  );
+  assert.equal(banner.switchModels.clickCount, 0);
+});
 
 test("Claude upload uses the native files setter for page-world visibility", () => {
   assert.doesNotMatch(
@@ -421,6 +859,63 @@ test("fake Claude model picker drives hover-only Max then closes", async () => {
     assert.ok(fixture.hoverEvents >= 3, "effort submenu must be re-hovered for Max and verification");
     assert.equal(fixture.sawMousePointer, true);
     assert.equal(fixture.modelButton.getAttribute("aria-expanded"), "false");
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
+test("fake Claude model picker keeps shared menu visibility semantics for offscreen Fable", async () => {
+  const fixture = makeClaudeModelFixture({ offscreenFable: true });
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    const result = await configureModelState(fixture.root, { model_selection_timeout_ms: 250 });
+    assert.equal(result.status, "selected");
+    assert.equal(fixture.fableClicks, 1);
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
+test("fake Claude model picker reclassifies credits immediately after Fable selection", async () => {
+  const fixture = makeClaudeModelFixture();
+  const credits = fakeCreditBanner();
+  const originalQuerySelectorAll = fixture.root.querySelectorAll.bind(fixture.root);
+  fixture.root.defaultView = {
+    ...fixture.root.defaultView,
+    ...credits.root.defaultView
+  };
+  fixture.root.querySelectorAll = (selector) => (
+    fixture.modelButton.innerText === "Fable 5 High" && selector === "body *"
+      ? [credits.banner, credits.switchModels]
+      : fixture.modelButton.innerText === "Fable 5 High" && selector.includes("button")
+        ? [credits.switchModels]
+        : originalQuerySelectorAll(selector)
+  );
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    await assert.rejects(
+      configureModelState(fixture.root, { model_selection_timeout_ms: 250 }),
+      (error) => error?.code === "usage_credits_exhausted"
+        && error?.phase === "model_selection"
+        && error?.send_committed === false
+    );
+    assert.equal(fixture.fableClicks, 1);
+    assert.equal(fixture.maxClicks, 0);
+    assert.equal(credits.switchModels.clickCount, 0);
   } finally {
     globalThis.PointerEvent = previousPointerEvent;
     globalThis.MouseEvent = previousMouseEvent;
@@ -998,7 +1493,8 @@ function makeClaudeModelFixture({
   includeMax = true,
   delayedSelectionClose = false,
   ignoreEscape = false,
-  initiallyConfigured = false
+  initiallyConfigured = false,
+  offscreenFable = false
 } = {}) {
   let menuOpen = false;
   let effortHovered = false;
@@ -1077,6 +1573,16 @@ function makeClaudeModelFixture({
     modelButton.textContent = modelButton.innerText;
     closeAfterSelection();
   });
+  if (offscreenFable) {
+    fable.getBoundingClientRect = () => ({
+      left: 10,
+      top: 900,
+      right: 50,
+      bottom: 920,
+      width: 40,
+      height: 20
+    });
+  }
   const sonnet = control({ role: "menuitemradio", "aria-checked": includeFable ? "false" : "true" }, "Sonnet 5");
   const effort = control({ "data-testid": "effort-menu-trigger" }, "Effort");
   const max = control({ role: "menuitemradio", "data-testid": "effort-option-max", "aria-checked": initiallyConfigured ? "true" : "false" }, "Max", (element) => {
