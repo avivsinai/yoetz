@@ -484,7 +484,11 @@ async function runJobWithFile(job, file) {
 
   const prompt = job.prompt ?? "";
   if (prompt) {
-    job.response_baseline = await sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
+    job.response_baseline = await sendToTab(job.tab_id, {
+      type: "yoetz_extract_response",
+      job,
+      blocking_context: "pre_send_baseline"
+    });
     assertJobConnectionCurrent(job);
     job.status = "sending_prompt";
     job.updated_at = Date.now();
@@ -1249,6 +1253,16 @@ function errorContextForJob(job, error = null) {
       ? error.side_effect_started
       : Boolean(job.tab_id)
   };
+  for (const key of [
+    "state",
+    "provider_message",
+    "requested_model",
+    "send_committed"
+  ]) {
+    if (error?.[key] !== undefined) {
+      detail[key] = error[key];
+    }
+  }
   if (job.tab_id != null) {
     detail.tab_id = job.tab_id;
   }
@@ -1545,6 +1559,10 @@ function tabCommandError(response) {
     error.attachment_trace = response.attachment_trace;
   }
   for (const key of [
+    "state",
+    "provider_message",
+    "requested_model",
+    "send_committed",
     "requested_conversation_id",
     "current_conversation_id",
     "current_url",

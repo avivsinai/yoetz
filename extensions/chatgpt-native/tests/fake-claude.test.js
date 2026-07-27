@@ -2,16 +2,209 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import {
+  classifyBlockingState,
+  clickSend,
   configureModelState,
   ensureConversationLoaded,
+  ensureFreshChat,
   extractResponse,
   insertPrompt,
   isResponseGenerating,
-  uploadFile
+  uploadFile,
+  waitForSendAccepted
 } from "../src/claude-dom.js";
 import { claudeSiteAdapter } from "../src/sites/claude.js";
 
 const claudeDomSource = await readFile(new URL("../src/claude-dom.js", import.meta.url), "utf8");
+
+function fakeCreditBanner({
+  excluded = false,
+  visible = true,
+  text = "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.",
+  depth = 8,
+  style = {},
+  rect = null,
+  conversationDescendant = false,
+  hiddenAncestor = false
+} = {}) {
+  const shell = {
+    innerText: text,
+    textContent: text,
+    parentElement: null,
+    getAttribute() {
+      return null;
+    },
+    querySelector() {
+      return conversationDescendant ? {} : null;
+    },
+    getClientRects() {
+      return [{}];
+    }
+  };
+  const banner = {
+    attrs: { role: "alert" },
+    innerText: text,
+    textContent: text,
+    parentElement: shell,
+    getAttribute(name) {
+      return this.attrs[name] ?? null;
+    },
+    getClientRects() {
+      return visible ? [{}] : [];
+    },
+    getBoundingClientRect() {
+      return rect;
+    },
+    querySelector() {
+      return conversationDescendant ? {} : null;
+    }
+  };
+  const switchModels = {
+    attrs: { role: "button" },
+    innerText: "Switch models",
+    textContent: "Switch models",
+    parentElement: null,
+    clickCount: 0,
+    click() {
+      this.clickCount += 1;
+    },
+    closest() {
+      return excluded ? {} : null;
+    },
+    getAttribute(name) {
+      return this.attrs[name] ?? null;
+    },
+    getClientRects() {
+      return visible ? [{}] : [];
+    },
+    getBoundingClientRect() {
+      return rect;
+    }
+  };
+  let parent = banner;
+  for (let index = 0; index < depth; index += 1) {
+    parent = {
+      innerText: "Switch models",
+      textContent: "Switch models",
+      parentElement: parent,
+      getAttribute() {
+        return null;
+      },
+      getClientRects() {
+        return visible ? [{}] : [];
+      },
+      getBoundingClientRect() {
+        return rect;
+      }
+    };
+  }
+  switchModels.parentElement = parent;
+  const root = {
+    body: shell,
+    documentElement: shell,
+    defaultView: {
+      innerWidth: 1200,
+      innerHeight: 800,
+      getComputedStyle: (element) => ({
+        display: visible ? "block" : "none",
+        visibility: visible ? "visible" : "hidden",
+        opacity: hiddenAncestor && element === shell ? "0" : (visible ? "1" : "0"),
+        ...style
+      })
+    },
+    querySelectorAll: (selector) => selector.includes("button") ? [switchModels] : []
+  };
+  return { root, shell, banner, switchModels };
+}
+
+test("classifyBlockingState detects the visible organization credit banner", () => {
+  const banner = fakeCreditBanner();
+
+  assert.deepEqual(classifyBlockingState(banner.root), {
+    state: "usage_credits_exhausted",
+    code: "usage_credits_exhausted",
+    requested_model: "fable-5-max",
+    provider_message: "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.",
+    message: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
+  });
+  assert.equal(banner.switchModels.clickCount, 0);
+});
+
+test("classifyBlockingState ignores quoted, hidden, and incomplete credit text", () => {
+  const quoted = fakeCreditBanner({ excluded: true });
+  const hidden = fakeCreditBanner({ visible: false });
+  const transparent = fakeCreditBanner({ style: { opacity: "0" } });
+  const offscreen = fakeCreditBanner({
+    rect: { left: 0, top: 900, right: 500, bottom: 1000, width: 500, height: 100 }
+  });
+  const incomplete = fakeCreditBanner({
+    text: "Your org is out of usage credits for the month. Switch models to continue chatting."
+  });
+  const reordered = fakeCreditBanner({
+    text: "Switch models to continue chatting. We let your admin know. Your org is out of usage credits for the month."
+  });
+  const extra = fakeCreditBanner({
+    text: "Your org is out of usage credits for the month. We let your admin know. Prompt quoted this notice. Switch models to continue chatting."
+  });
+  const conversationCompleted = fakeCreditBanner({ conversationDescendant: true });
+  const ancestorHidden = fakeCreditBanner({ hiddenAncestor: true });
+
+  assert.equal(classifyBlockingState(quoted.root), null);
+  assert.equal(classifyBlockingState(hidden.root), null);
+  assert.equal(classifyBlockingState(transparent.root), null);
+  assert.equal(classifyBlockingState(offscreen.root), null);
+  assert.equal(classifyBlockingState(incomplete.root), null);
+  assert.equal(classifyBlockingState(reordered.root), null);
+  assert.equal(classifyBlockingState(extra.root), null);
+  assert.equal(classifyBlockingState(conversationCompleted.root), null);
+  assert.equal(classifyBlockingState(ancestorHidden.root), null);
+});
+
+test("Claude waits reclassify a persistent credit banner instead of timing out", async () => {
+  const composerWait = fakeCreditBanner();
+  composerWait.root.querySelector = () => null;
+  await assert.rejects(
+    ensureFreshChat(composerWait.root, {}, { timeoutMs: 1 }),
+    (error) => error?.code === "usage_credits_exhausted"
+      && error?.phase === "upload"
+      && error?.send_committed === false
+  );
+
+  const sendWait = fakeCreditBanner();
+  sendWait.root.querySelector = () => null;
+  await assert.rejects(
+    clickSend(sendWait.root, { timeoutMs: 1 }),
+    (error) => error?.code === "usage_credits_exhausted"
+      && error?.phase === "send"
+      && error?.send_committed === false
+  );
+  assert.equal(sendWait.switchModels.clickCount, 0);
+});
+
+test("waitForSendAccepted fails with typed credit state without switching models", async () => {
+  const banner = fakeCreditBanner();
+  banner.root.querySelectorAll = (selector) => {
+    if (selector.includes("button") || selector.includes("[role=")) return [banner.switchModels];
+    if (selector === "[data-testid='user-message']") return [];
+    if (selector === "[data-is-streaming]") return [];
+    return [];
+  };
+
+  await assert.rejects(
+    waitForSendAccepted(banner.root, { user_count: 0, assistant_count: 0 }, {
+      timeoutMs: 20,
+      intervalMs: 1
+    }),
+    (error) => {
+      assert.equal(error.code, "usage_credits_exhausted");
+      assert.equal(error.state, "usage_credits_exhausted");
+      assert.equal(error.requested_model, "fable-5-max");
+      assert.equal(error.send_committed, true);
+      return true;
+    }
+  );
+  assert.equal(banner.switchModels.clickCount, 0);
+});
 
 test("Claude upload uses the native files setter for page-world visibility", () => {
   assert.doesNotMatch(
@@ -421,6 +614,42 @@ test("fake Claude model picker drives hover-only Max then closes", async () => {
     assert.ok(fixture.hoverEvents >= 3, "effort submenu must be re-hovered for Max and verification");
     assert.equal(fixture.sawMousePointer, true);
     assert.equal(fixture.modelButton.getAttribute("aria-expanded"), "false");
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
+test("fake Claude model picker reclassifies credits immediately after Fable selection", async () => {
+  const fixture = makeClaudeModelFixture();
+  const credits = fakeCreditBanner();
+  const originalQuerySelectorAll = fixture.root.querySelectorAll.bind(fixture.root);
+  fixture.root.defaultView = {
+    ...fixture.root.defaultView,
+    ...credits.root.defaultView
+  };
+  fixture.root.querySelectorAll = (selector) => (
+    fixture.modelButton.innerText === "Fable 5 High" && selector.includes("button")
+      ? [credits.switchModels]
+      : originalQuerySelectorAll(selector)
+  );
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    await assert.rejects(
+      configureModelState(fixture.root, { model_selection_timeout_ms: 250 }),
+      (error) => error?.code === "usage_credits_exhausted"
+        && error?.phase === "model_selection"
+        && error?.send_committed === false
+    );
+    assert.equal(fixture.fableClicks, 1);
+    assert.equal(fixture.maxClicks, 0);
+    assert.equal(credits.switchModels.clickCount, 0);
   } finally {
     globalThis.PointerEvent = previousPointerEvent;
     globalThis.MouseEvent = previousMouseEvent;

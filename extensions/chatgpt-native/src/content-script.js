@@ -25,7 +25,7 @@ async function handleMessage(message) {
     case "yoetz_send_prompt":
       return sendPrompt(message.job, message.prompt);
     case "yoetz_extract_response":
-      return extractJobResponse(message.job);
+      return extractJobResponse(message.job, message.blocking_context);
     case "yoetz_fetch_conversation":
       return fetchSiteConversationAnswer(message.job, message.conversation_id);
     case "yoetz_cancel_send":
@@ -69,6 +69,7 @@ async function cancelSend(job) {
 
 async function prepareJob(job) {
   const {
+    classifyBlockingState,
     classifyManualHandoff,
     ensureConversationLoaded,
     ensureFreshChat,
@@ -93,6 +94,11 @@ async function prepareJob(job) {
     ? await ensureFreshChat(document, job)
     : null;
   if (!handoff) {
+    assertNoBlockingState(classifyBlockingState, {
+      phase: "upload",
+      side_effect_started: false,
+      send_committed: false
+    });
     if (conversationId) {
       assertUrlRunMarker(job);
     }
@@ -132,15 +138,27 @@ async function uploadJobFile(job, filePayload) {
 }
 
 async function configureModel(job) {
-  const { configureModelState, parseOwnedWindowName } = await domHelpers(job);
+  const { classifyBlockingState, configureModelState, parseOwnedWindowName } = await domHelpers(job);
   const adapter = await siteAdapter(job);
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "model_selection", adapter));
-  return configureModelState(document, job);
+  assertNoBlockingState(classifyBlockingState, {
+    phase: "model_selection",
+    side_effect_started: false,
+    send_committed: false
+  });
+  const selection = await configureModelState(document, job);
+  assertNoBlockingState(classifyBlockingState, {
+    phase: "model_selection",
+    side_effect_started: false,
+    send_committed: false
+  });
+  return selection;
 }
 
 async function sendPrompt(job, prompt) {
   const adapter = await siteAdapter(job);
   const {
+    classifyBlockingState,
     clickSend,
     insertPrompt,
     parseOwnedWindowName,
@@ -148,9 +166,19 @@ async function sendPrompt(job, prompt) {
     waitForSendAccepted
   } = await domHelpers(job);
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send", adapter));
+  assertNoBlockingState(classifyBlockingState, {
+    phase: "send",
+    side_effect_started: true,
+    send_committed: false
+  });
   const baseline = sendAcceptanceBaseline(document);
   await insertPrompt(document, prompt, { timeoutMs: 20000 });
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send", adapter));
+  assertNoBlockingState(classifyBlockingState, {
+    phase: "send",
+    side_effect_started: true,
+    send_committed: false
+  });
   const clickOptions = { timeoutMs: Number(job.send_timeout_ms) || 120000 };
   const expectedConversationId = expectedConversationIdForJob(job);
   if (expectedConversationId) {
@@ -163,6 +191,9 @@ async function sendPrompt(job, prompt) {
       timeoutMs: Number(job.send_timeout_ms) || 120000
     });
   } catch (error) {
+    if (error?.code === "usage_credits_exhausted") {
+      throw error;
+    }
     throw commandError(
       "send_acceptance_unknown",
       `${adapter.displayName} send click was committed, but Yoetz could not confirm ${adapter.displayName} accepted the prompt before timeout. If a response eventually appears, do not rerun automatically: ${String(error?.message ?? error)}`,
@@ -183,14 +214,19 @@ async function sendPrompt(job, prompt) {
   };
 }
 
-async function extractJobResponse(job) {
+async function extractJobResponse(job, blockingContext = null) {
   const adapter = await siteAdapter(job);
   const {
+    classifyBlockingState,
     classifyWaitManualHandoff,
     extractResponse,
     parseOwnedWindowName
   } = await domHelpers(job);
   assertJobOwnership(job, parseOwnedWindowName, { adapter });
+  const blockingDetail = blockingContext === "pre_send_baseline"
+    ? { phase: "send", side_effect_started: true, send_committed: false }
+    : { phase: "wait_response", side_effect_started: true, send_committed: true };
+  assertNoBlockingState(classifyBlockingState, blockingDetail);
   const conversationId = adapter.conversationIdFromUrl(location.href);
   const expectedConversationId = expectedConversationIdForJob(job);
   if (expectedConversationId
@@ -208,6 +244,7 @@ async function extractJobResponse(job) {
     );
   }
   const extraction = extractResponse(document);
+  assertNoBlockingState(classifyBlockingState, blockingDetail);
   // During response wait, page text includes the user prompt and model output.
   // Handoff classification here must stay on transport/page metadata only.
   const handoff = classifyWaitManualHandoff({
@@ -497,6 +534,17 @@ function commandError(code, message, detail = {}) {
   return error;
 }
 
+function assertNoBlockingState(classifyBlockingState, detail) {
+  const blockingState = classifyBlockingState?.(document);
+  if (!blockingState) {
+    return;
+  }
+  throw commandError(blockingState.code, blockingState.message, {
+    ...blockingState,
+    ...detail
+  });
+}
+
 function conversationLocationDetail(code) {
   if (!String(code ?? "").startsWith("conversation_")) {
     return {};
@@ -541,6 +589,10 @@ function errorResponse(error) {
     response.attachment_trace = error.attachment_trace;
   }
   for (const key of [
+    "state",
+    "provider_message",
+    "requested_model",
+    "send_committed",
     "requested_conversation_id",
     "current_conversation_id",
     "current_url",

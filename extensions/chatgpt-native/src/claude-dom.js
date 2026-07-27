@@ -9,6 +9,15 @@ const ATTACHMENT_SELECTOR = "[data-testid='file-thumbnail']";
 const COPY_ACTION_SELECTOR = "[data-testid='action-bar-copy']";
 const ASSISTANT_SELECTOR = "[data-is-streaming]";
 const MODEL_MENU_SETTLE_MS = 300;
+const SWITCH_MODELS_CONTROL_SELECTOR = "button, a, [role='button'], [role='link']";
+const CONVERSATION_CONTENT_SELECTOR = [
+  COMPOSER_SELECTOR,
+  "[data-testid='user-message']",
+  "[data-testid*='turn']",
+  "[data-is-streaming]",
+  "article"
+].join(", ");
+const USAGE_CREDITS_PROVIDER_MESSAGE = "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.";
 
 export function ownedWindowName(job) {
   return `${YOETZ_WINDOW_PREFIX}${job.run_id}:${job.job_id}`;
@@ -58,6 +67,31 @@ export function classifyWaitManualHandoff({ url = "", title = "" } = {}) {
   return classifyManualHandoff({ url, title, text: "" });
 }
 
+export function classifyBlockingState(root = document) {
+  const switchModels = visibleElements(root, SWITCH_MODELS_CONTROL_SELECTOR)
+    .filter((element) => normalizeText(element.innerText || element.textContent).toLowerCase() === "switch models")
+    .filter((element) => !element.closest?.(CONVERSATION_CONTENT_SELECTOR));
+  for (const control of switchModels) {
+    let container = control;
+    while (container) {
+      const text = normalizeText(container.innerText || container.textContent).toLowerCase();
+      if (text === USAGE_CREDITS_PROVIDER_MESSAGE.toLowerCase()
+          && isActuallyVisible(root, container)
+          && !container.querySelector?.(CONVERSATION_CONTENT_SELECTOR)) {
+        return {
+          state: "usage_credits_exhausted",
+          code: "usage_credits_exhausted",
+          requested_model: "fable-5-max",
+          provider_message: USAGE_CREDITS_PROVIDER_MESSAGE,
+          message: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
+        };
+      }
+      container = container.parentElement;
+    }
+  }
+  return null;
+}
+
 export function findComposer(root = document) {
   return root.querySelector(COMPOSER_SELECTOR);
 }
@@ -86,7 +120,12 @@ export function assertOwnedPage(win, job) {
 }
 
 export async function insertPrompt(root, prompt, options = {}) {
-  const composer = await waitFor(() => findComposer(root), options.timeoutMs ?? 20000);
+  const composer = await waitForClaudeState(
+    root,
+    () => findComposer(root),
+    options.timeoutMs ?? 20000,
+    { phase: "send", side_effect_started: true, send_committed: false }
+  );
   composer.focus();
   const text = String(prompt ?? "");
   if (composer.isContentEditable || composer.getAttribute("contenteditable") === "true") {
@@ -242,6 +281,11 @@ export async function ensureConversationLoaded(root = document, conversationId, 
   const timeoutMs = options.timeoutMs ?? 120000;
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
+    throwIfBlockingState(root, {
+      phase: "upload",
+      side_effect_started: false,
+      send_committed: false
+    });
     const currentId = conversationIdFromLocation();
     if (currentId && currentId !== conversationId) {
       throw commandError(
@@ -302,9 +346,9 @@ export async function ensureConversationLoaded(root = document, conversationId, 
 
 export async function configureModelState(root, job = {}) {
   const timeoutMs = Number(job.model_selection_timeout_ms) || 10000;
-  const modelButton = await waitFor(() => root.querySelector(MODEL_SELECTOR), 20000);
-  await openModelMenu(modelButton, timeoutMs);
-  const fable = await waitForOptional(() => visibleElements(root, "[role='menuitemradio']")
+  const modelButton = await waitForModelState(root, () => root.querySelector(MODEL_SELECTOR), 20000);
+  await openModelMenu(root, modelButton, timeoutMs);
+  const fable = await waitForModelOptional(root, () => visibleElements(root, "[role='menuitemradio']")
     .find((element) => normalizeText(element.innerText || element.textContent).toLowerCase().startsWith("fable 5")), timeoutMs);
   if (!fable) {
     const diagnostics = modelSelectionDiagnostics(root);
@@ -324,25 +368,27 @@ export async function configureModelState(root, job = {}) {
     return alreadySelected;
   }
 
+  throwIfModelBlocked(root);
   fable.click();
-  await settleAfterMenuSelection(modelButton, timeoutMs);
+  await settleAfterMenuSelection(root, modelButton, timeoutMs);
 
-  await openModelMenu(modelButton, timeoutMs);
-  const effortTrigger = await waitFor(() => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
+  await openModelMenu(root, modelButton, timeoutMs);
+  const effortTrigger = await waitForModelState(root, () => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
   dispatchHover(effortTrigger);
-  const max = await waitFor(() => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"), timeoutMs);
+  const max = await waitForModelState(root, () => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"), timeoutMs);
+  throwIfModelBlocked(root);
   max.click();
-  await settleAfterMenuSelection(modelButton, timeoutMs);
+  await settleAfterMenuSelection(root, modelButton, timeoutMs);
 
   await closeModelMenu(root, modelButton);
   await sleep(MODEL_MENU_SETTLE_MS);
-  await openModelMenu(modelButton, timeoutMs);
-  const verificationEffort = await waitFor(() => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
+  await openModelMenu(root, modelButton, timeoutMs);
+  const verificationEffort = await waitForModelState(root, () => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
   dispatchHover(verificationEffort);
   // Live picker DOM captured 2026-07-21 exposes Fable 5 as a checked
   // menuitemradio and Max as effort-option-max; it has no independent Thinking
   // control. Keep both remaining legs as positive, post-click re-reads.
-  await waitFor(() => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"), timeoutMs);
+  await waitForModelState(root, () => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"), timeoutMs);
   const diagnostics = modelSelectionDiagnostics(root);
   const menuClosed = await closeModelMenu(root, modelButton);
   await sleep(MODEL_MENU_SETTLE_MS);
@@ -359,12 +405,16 @@ export async function configureModelState(root, job = {}) {
 }
 
 export async function clickSend(root, options = {}) {
-  const send = await waitFor(() => {
+  const send = await waitForClaudeState(root, () => {
     const candidate = findSendButton(root);
     return candidate && !candidate.disabled && candidate.getAttribute("aria-disabled") !== "true"
       ? candidate
       : null;
-  }, options.timeoutMs ?? 120000);
+  }, options.timeoutMs ?? 120000, {
+    phase: "send",
+    side_effect_started: true,
+    send_committed: false
+  });
   send.click();
   return true;
 }
@@ -379,6 +429,14 @@ export function sendAcceptanceBaseline(root = document) {
 export async function waitForSendAccepted(root, baseline = {}, options = {}) {
   const timeoutMs = options.timeoutMs ?? 120000;
   return waitFor(() => {
+    const blockingState = classifyBlockingState(root);
+    if (blockingState) {
+      throw blockingStateError(blockingState, {
+        phase: "send",
+        side_effect_started: true,
+        send_committed: true
+      });
+    }
     const userCount = userTurnCount(root);
     const assistantCount = assistantRoots(root).length;
     const generating = isResponseGenerating(root);
@@ -563,7 +621,7 @@ function conversationIdFromLocation() {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-async function openModelMenu(button, timeoutMs) {
+async function openModelMenu(root, button, timeoutMs) {
   if (button.getAttribute("aria-expanded") === "true") {
     await sleep(MODEL_MENU_SETTLE_MS);
     if (button.getAttribute("aria-expanded") === "true") {
@@ -573,8 +631,10 @@ async function openModelMenu(button, timeoutMs) {
 
   const attemptTimeoutMs = Math.max(100, Math.min(timeoutMs, 1000));
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    throwIfModelBlocked(root);
     button.click();
-    const opened = await waitForOptional(
+    const opened = await waitForModelOptional(
+      root,
       () => button.getAttribute("aria-expanded") === "true",
       attemptTimeoutMs
     );
@@ -588,12 +648,13 @@ async function openModelMenu(button, timeoutMs) {
   throw new Error(`Claude model menu did not open within ${timeoutMs}ms`);
 }
 
-async function settleAfterMenuSelection(modelButton, timeoutMs) {
-  await waitFor(() => modelButton.getAttribute("aria-expanded") !== "true", timeoutMs);
+async function settleAfterMenuSelection(root, modelButton, timeoutMs) {
+  await waitForModelState(root, () => modelButton.getAttribute("aria-expanded") !== "true", timeoutMs);
   await sleep(MODEL_MENU_SETTLE_MS);
 }
 
 async function verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs) {
+  throwIfModelBlocked(root);
   const modelChip = normalizeText(modelButton.innerText || modelButton.textContent);
   if (fable.getAttribute("aria-checked") !== "true" || !/\bFable 5\b.*\bMax\b/i.test(modelChip)) {
     return null;
@@ -604,7 +665,8 @@ async function verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs) {
     return null;
   }
   dispatchHover(effortTrigger);
-  const max = await waitForOptional(
+  const max = await waitForModelOptional(
+    root,
     () => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"),
     timeoutMs
   );
@@ -658,22 +720,61 @@ async function closeModelMenu(root, modelButton) {
     bubbles: true,
     cancelable: true
   }));
-  const escaped = await waitForOptional(
+  const escaped = await waitForModelOptional(
+    root,
     () => modelButton.getAttribute("aria-expanded") !== "true",
     1000
   );
   if (escaped) {
     return true;
   }
+  throwIfModelBlocked(root);
   modelButton.click();
-  return Boolean(await waitForOptional(
+  return Boolean(await waitForModelOptional(
+    root,
     () => modelButton.getAttribute("aria-expanded") !== "true",
     2000
   ));
 }
 
 function visibleElements(root, selector) {
-  return Array.from(root.querySelectorAll(selector)).filter((element) => element.getClientRects().length > 0);
+  return Array.from(root.querySelectorAll?.(selector) ?? []).filter((element) => isActuallyVisible(root, element));
+}
+
+function isActuallyVisible(root, element) {
+  const viewWidth = Number(root.defaultView?.innerWidth);
+  const viewHeight = Number(root.defaultView?.innerHeight);
+  for (let node = element; node; node = node.parentElement) {
+    if (node.hidden || node.getAttribute?.("aria-hidden") === "true") {
+      return false;
+    }
+    if (node.getClientRects?.().length === 0) {
+      return false;
+    }
+    const style = root.defaultView?.getComputedStyle?.(node);
+    if (style && (
+      style.display === "none"
+      || style.visibility === "hidden"
+      || style.visibility === "collapse"
+      || (style.opacity !== "" && Number(style.opacity) === 0)
+    )) {
+      return false;
+    }
+    const rect = node.getBoundingClientRect?.();
+    if (rect && Number.isFinite(viewWidth) && viewWidth > 0 && Number.isFinite(viewHeight) && viewHeight > 0) {
+      const left = Number(rect.left ?? 0);
+      const top = Number(rect.top ?? 0);
+      const right = Number(rect.right ?? (left + Number(rect.width ?? 0)));
+      const bottom = Number(rect.bottom ?? (top + Number(rect.height ?? 0)));
+      if (!(bottom > 0 && right > 0 && top < viewHeight && left < viewWidth)) {
+        return false;
+      }
+    }
+    if (node === root.documentElement) {
+      break;
+    }
+  }
+  return true;
 }
 
 function elementSummary(element) {
@@ -738,7 +839,11 @@ function claudeUploadDiagnosticSummary(root, filename, timeoutStage) {
 
 async function waitForReadyComposer(root, timeoutMs) {
   try {
-    return await waitFor(() => findComposer(root), timeoutMs);
+    return await waitForClaudeState(root, () => findComposer(root), timeoutMs, {
+      phase: "upload",
+      side_effect_started: false,
+      send_committed: false
+    });
   } catch (error) {
     const handoff = classifyManualHandoff({
       url: globalThis.location?.href,
@@ -770,10 +875,36 @@ async function waitFor(read, timeoutMs) {
   return value;
 }
 
-async function waitForOptional(read, timeoutMs) {
+async function waitForClaudeState(root, read, timeoutMs, detail) {
+  return waitFor(() => {
+    throwIfBlockingState(root, detail);
+    return read();
+  }, timeoutMs);
+}
+
+function waitForModelState(root, read, timeoutMs) {
+  return waitForClaudeState(root, read, timeoutMs, {
+    phase: "model_selection",
+    side_effect_started: false,
+    send_committed: false
+  });
+}
+
+function throwIfModelBlocked(root) {
+  throwIfBlockingState(root, {
+    phase: "model_selection",
+    side_effect_started: false,
+    send_committed: false
+  });
+}
+
+async function waitForModelOptional(root, read, timeoutMs) {
   try {
-    return await waitFor(read, timeoutMs);
-  } catch {
+    return await waitForModelState(root, read, timeoutMs);
+  } catch (error) {
+    if (error?.code === "usage_credits_exhausted") {
+      throw error;
+    }
     return null;
   }
 }
@@ -783,6 +914,20 @@ function commandError(code, message, detail = {}) {
   error.code = code;
   Object.assign(error, detail);
   return error;
+}
+
+function blockingStateError(blockingState, detail = {}) {
+  return commandError(blockingState.code, blockingState.message, {
+    ...blockingState,
+    ...detail
+  });
+}
+
+function throwIfBlockingState(root, detail) {
+  const blockingState = classifyBlockingState(root);
+  if (blockingState) {
+    throw blockingStateError(blockingState, detail);
+  }
 }
 
 function sleep(ms) {

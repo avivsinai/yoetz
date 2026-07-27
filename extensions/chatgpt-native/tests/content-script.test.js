@@ -35,6 +35,10 @@ export function classifyWaitManualHandoff() {
   return hooks.waitManualHandoff ?? null;
 }
 
+export function classifyBlockingState() {
+  return hooks.blockingState ?? null;
+}
+
 export async function ensureFreshChat(_document, job) {
   hooks.ensureFreshChatCalls.push(job);
   if (hooks.failFreshChat) {
@@ -121,6 +125,7 @@ const dom = {
   getPageText,
   classifyManualHandoff,
   classifyWaitManualHandoff,
+  classifyBlockingState,
   ensureFreshChat,
   ensureConversationLoaded,
   markOwnership,
@@ -490,6 +495,79 @@ test("content script resume send rechecks conversation drift after prompt insert
   }
 });
 
+test("content script fails closed on Claude credits before marking prepare complete", async () => {
+  const { send, hooks, restore } = await loadContentScript("claude_credits_prepare", "https://claude.ai/new?_yoetz=run_credits");
+  try {
+    hooks.recipe = "claude";
+    hooks.blockingState = usageCreditsState();
+    const response = await send({
+      type: "yoetz_prepare_job",
+      job: { job_id: "job_credits", run_id: "run_credits", recipe: "claude" }
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "usage_credits_exhausted");
+    assert.equal(response.state, "usage_credits_exhausted");
+    assert.equal(response.requested_model, "fable-5-max");
+    assert.equal(response.phase, "upload");
+    assert.equal(response.side_effect_started, false);
+    assert.equal(response.send_committed, false);
+    assert.deepEqual(hooks.markOwnershipCalls, []);
+  } finally {
+    restore();
+  }
+});
+
+test("content script rechecks Claude credits after prompt insertion without clicking send", async () => {
+  const { send, hooks, restore } = await loadContentScript("claude_credits_presend", "https://claude.ai/new?_yoetz=run_credits");
+  try {
+    hooks.recipe = "claude";
+    const job = { job_id: "job_credits", run_id: "run_credits", recipe: "claude" };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+    hooks.afterInsertPrompt = () => {
+      hooks.blockingState = usageCreditsState();
+    };
+
+    const response = await send({ type: "yoetz_send_prompt", job, prompt: "review" });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "usage_credits_exhausted");
+    assert.equal(response.phase, "send");
+    assert.equal(response.side_effect_started, true);
+    assert.equal(response.send_committed, false);
+    assert.equal(response.provider_message, usageCreditsState().provider_message);
+    assert.equal(hooks.clickSendCalls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("content script classifies a credit banner during baseline extraction as pre-send", async () => {
+  const { send, hooks, restore } = await loadContentScript("claude_credits_baseline", "https://claude.ai/new?_yoetz=run_credits");
+  try {
+    hooks.recipe = "claude";
+    const job = { job_id: "job_credits", run_id: "run_credits", recipe: "claude" };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+    hooks.blockingState = usageCreditsState();
+
+    const response = await send({
+      type: "yoetz_extract_response",
+      job,
+      blocking_context: "pre_send_baseline"
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "usage_credits_exhausted");
+    assert.equal(response.phase, "send");
+    assert.equal(response.side_effect_started, true);
+    assert.equal(response.send_committed, false);
+  } finally {
+    restore();
+  }
+});
+
 test("content script fresh path still requires a fresh page after prepare", async () => {
   const { send, hooks, restore, location } = await loadContentScript("fresh_guard", "https://chatgpt.com/?_yoetz=run_fresh");
   try {
@@ -659,6 +737,16 @@ function resumeJob() {
     expected_conversation_id: "conv-123",
     upload_timeout_ms: 1000,
     send_timeout_ms: 1000
+  };
+}
+
+function usageCreditsState() {
+  return {
+    state: "usage_credits_exhausted",
+    code: "usage_credits_exhausted",
+    requested_model: "fable-5-max",
+    provider_message: "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.",
+    message: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
   };
 }
 
