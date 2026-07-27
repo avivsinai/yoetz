@@ -5708,10 +5708,9 @@ mod tests {
     }
 
     // These tests intentionally pin jsonschema's user-visible error strings and edge-case
-    // acceptance. A failure after a dependency bump is behavior to assess and record, not a
-    // literal to update mechanically. The u64::MAX multipleOf case detects the 0.48.0 exact
-    // integer fix; the disabled Validation vocabulary case detects the 0.47.0 vocabulary fix.
-    // A meta-schema resolution error instead means this test's file-URI harness needs porting.
+    // behavior. The u64::MAX multipleOf case protects exact large-integer validation, and the
+    // disabled Validation vocabulary case protects the declared meta-schema semantics. A
+    // meta-schema resolution error instead means this test's file-URI harness needs porting.
     #[test]
     fn output_schema_accepts_matching_value() {
         let dir = TempDir::new().unwrap();
@@ -5764,16 +5763,24 @@ mod tests {
     }
 
     #[test]
-    fn output_schema_baseline_accepts_rounded_large_integer_multiple() {
+    fn output_schema_rejects_large_integer_non_multiple() {
         let dir = TempDir::new().unwrap();
         let schema_path = dir.path().join("schema.json");
         fs::write(&schema_path, r#"{"type":"integer","multipleOf":4}"#).unwrap();
 
-        validate_output_schema(&schema_path, &json!(u64::MAX)).unwrap();
+        let error = validate_output_schema(&schema_path, &json!(u64::MAX)).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "output does not match schema {}: 18446744073709551615 is not a multiple of 4",
+                schema_path.display()
+            )
+        );
     }
 
     #[test]
-    fn output_schema_baseline_surfaces_disabled_vocabulary_type_error() {
+    fn output_schema_accepts_disabled_validation_vocabulary() {
         let dir = TempDir::new().unwrap();
         let meta_schema_path = dir.path().join("meta-no-validation.json");
         fs::write(
@@ -5809,15 +5816,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = validate_output_schema(&schema_path, &json!([1, "x"])).unwrap_err();
-
-        assert_eq!(
-            error.to_string(),
-            format!(
-                "output does not match schema {}: \"x\" is not of type \"integer\"",
-                schema_path.display()
-            )
-        );
+        validate_output_schema(&schema_path, &json!([1, "x"])).unwrap();
     }
 
     #[test]
