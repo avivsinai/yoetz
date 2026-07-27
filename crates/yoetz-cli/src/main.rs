@@ -5707,6 +5707,119 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    // These tests intentionally pin jsonschema's user-visible error strings and edge-case
+    // acceptance. A failure after a dependency bump is behavior to assess and record, not a
+    // literal to update mechanically. The u64::MAX multipleOf case detects the 0.48.0 exact
+    // integer fix; the disabled Validation vocabulary case detects the 0.47.0 vocabulary fix.
+    // A meta-schema resolution error instead means this test's file-URI harness needs porting.
+    #[test]
+    fn output_schema_accepts_matching_value() {
+        let dir = TempDir::new().unwrap();
+        let schema_path = dir.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            r#"{"type":"object","required":["ok"],"properties":{"ok":{"type":"boolean"}}}"#,
+        )
+        .unwrap();
+
+        validate_output_schema(&schema_path, &json!({"ok": true})).unwrap();
+    }
+
+    #[test]
+    fn output_schema_surfaces_type_error_text() {
+        let dir = TempDir::new().unwrap();
+        let schema_path = dir.path().join("schema.json");
+        fs::write(&schema_path, r#"{"type":"integer"}"#).unwrap();
+
+        let error = validate_output_schema(&schema_path, &json!("not-an-integer")).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "output does not match schema {}: \"not-an-integer\" is not of type \"integer\"",
+                schema_path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn output_schema_surfaces_required_property_error_text() {
+        let dir = TempDir::new().unwrap();
+        let schema_path = dir.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            r#"{"type":"object","required":["name"],"properties":{"name":{"type":"string"}}}"#,
+        )
+        .unwrap();
+
+        let error = validate_output_schema(&schema_path, &json!({})).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "output does not match schema {}: \"name\" is a required property",
+                schema_path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn output_schema_baseline_accepts_rounded_large_integer_multiple() {
+        let dir = TempDir::new().unwrap();
+        let schema_path = dir.path().join("schema.json");
+        fs::write(&schema_path, r#"{"type":"integer","multipleOf":4}"#).unwrap();
+
+        validate_output_schema(&schema_path, &json!(u64::MAX)).unwrap();
+    }
+
+    #[test]
+    fn output_schema_baseline_surfaces_disabled_vocabulary_type_error() {
+        let dir = TempDir::new().unwrap();
+        let meta_schema_path = dir.path().join("meta-no-validation.json");
+        fs::write(
+            &meta_schema_path,
+            r#"{
+                "$id":"json-schema:///meta/no-validation",
+                "$schema":"https://json-schema.org/draft/2020-12/schema",
+                "$vocabulary":{
+                    "https://json-schema.org/draft/2020-12/vocab/core":true,
+                    "https://json-schema.org/draft/2020-12/vocab/applicator":true,
+                    "https://json-schema.org/draft/2020-12/vocab/validation":false
+                }
+            }"#,
+        )
+        .unwrap();
+        let meta_schema_uri = if cfg!(windows) {
+            format!(
+                "file:///{}",
+                meta_schema_path.display().to_string().replace('\\', "/")
+            )
+        } else {
+            format!("file://{}", meta_schema_path.display())
+        };
+        let schema_path = dir.path().join("schema.json");
+        fs::write(
+            &schema_path,
+            serde_json::to_vec(&json!({
+                "$schema": meta_schema_uri,
+                "type": "array",
+                "items": {"type": "integer"}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let error = validate_output_schema(&schema_path, &json!([1, "x"])).unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "output does not match schema {}: \"x\" is not of type \"integer\"",
+                schema_path.display()
+            )
+        );
+    }
+
     #[test]
     fn maybe_write_output_writes_output_final_json() {
         let output_path = temp_output_path("yoetz_browser_recipe_output");
