@@ -85,6 +85,24 @@ const LEGACY_JOBS_KEY = "jobs";
 // The full streaming text remains on the in-memory job for delta calculation; only the
 // tail is written to disk so a multi-MB Pro response cannot blow the 10MB session quota.
 const RESPONSE_TEXT_PERSIST_TAIL = 8 * 1024;
+const ATTACHMENT_TRACE_TIMESTAMP_KEYS = Object.freeze([
+  "final_chunk_ack_at_ms",
+  "input_resolved_at_ms",
+  "files_assigned_at_ms",
+  "change_dispatched_at_ms",
+  "matching_thumbnail_at_ms",
+  "remove_control_at_ms",
+  "send_present_at_ms",
+  "send_enabled_at_ms",
+  "soft_timeout_at_ms",
+  "hard_timeout_at_ms"
+]);
+const ATTACHMENT_TRACE_PENDING_LEGS = new Set([
+  "matching_thumbnail",
+  "remove_control",
+  "send_present",
+  "send_enabled"
+]);
 
 const jobs = new Map();
 const terminalJobIds = new Map();
@@ -421,6 +439,9 @@ async function acceptFileChunk(message) {
   }
 
   const file = chunks.takeFile(job.job_id);
+  if (job.recipe === "claude") {
+    job.attachment_trace = { final_chunk_ack_at_ms: Date.now() };
+  }
   job.status = "file_received";
   job.updated_at = Date.now();
   await persistJob(job);
@@ -1180,6 +1201,7 @@ function normalizeJob(message, adapter) {
     wait_timeout_ms: payload.wait_timeout_ms ?? DEFAULT_WAIT_TIMEOUT_MS,
     wait_interval_ms: payload.wait_interval_ms ?? 30000,
     upload_timeout_ms: payload.upload_timeout_ms ?? 120000,
+    attachment_stall_timeout_ms: payload.attachment_stall_timeout_ms ?? 0,
     send_timeout_ms: payload.send_timeout_ms ?? 120000,
     close_tab_on_complete: payload.close_tab_on_complete === true,
     browser_context_id: payload.browser_context_id ?? null,
@@ -1235,7 +1257,30 @@ function errorContextForJob(job, error = null) {
     detail.current_url = error?.current_url ?? job.submitted_url ?? null;
     detail.current_pathname = error?.current_pathname ?? null;
   }
+  const attachmentTrace = sanitizeAttachmentTrace(error?.attachment_trace);
+  if (attachmentTrace) {
+    detail.attachment_trace = attachmentTrace;
+  }
   return detail;
+}
+
+function sanitizeAttachmentTrace(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const trace = {};
+  for (const key of ATTACHMENT_TRACE_TIMESTAMP_KEYS) {
+    const timestamp = value[key];
+    if (Number.isSafeInteger(timestamp) && timestamp >= 0) {
+      trace[key] = timestamp;
+    }
+  }
+  for (const key of ["soft_timeout_pending_legs", "hard_timeout_pending_legs"]) {
+    if (Array.isArray(value[key])) {
+      trace[key] = value[key].filter((leg) => ATTACHMENT_TRACE_PENDING_LEGS.has(leg)).slice(0, 4);
+    }
+  }
+  return Object.keys(trace).length > 0 ? trace : null;
 }
 
 function jobErrorMessage(job, error, code, detail = {}) {
@@ -1488,6 +1533,9 @@ function tabCommandError(response) {
   }
   if (typeof response?.side_effect_started === "boolean") {
     error.side_effect_started = response.side_effect_started;
+  }
+  if (response?.attachment_trace !== undefined) {
+    error.attachment_trace = response.attachment_trace;
   }
   for (const key of [
     "requested_conversation_id",

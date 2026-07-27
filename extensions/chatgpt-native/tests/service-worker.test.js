@@ -767,6 +767,89 @@ test("service worker reports a generic Claude model timeout as model_selection",
   }
 });
 
+test("service worker surfaces a Claude attachment-stalled trace in the job error", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let uploadJob = null;
+  const attachmentTrace = {
+    final_chunk_ack_at_ms: 100,
+    input_resolved_at_ms: 101,
+    files_assigned_at_ms: 102,
+    change_dispatched_at_ms: 103,
+    soft_timeout_at_ms: 125000,
+    hard_timeout_at_ms: 420000,
+    hard_timeout_pending_legs: ["matching_thumbnail", "remove_control"]
+  };
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (options) => ({ id: 71, ...options }),
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new?_yoetz=run_job_claude_attachment_stalled" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedFableMaxSelection() };
+          case "yoetz_upload_file":
+            uploadJob = message.job;
+            return {
+              ok: false,
+              code: "attachment_stalled",
+              error: "Claude attachment stalled before readiness",
+              phase: "upload",
+              side_effect_started: true,
+              attachment_trace: attachmentTrace
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_attachment_trace=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_claude_attachment_stalled", {
+      recipe: "claude",
+      prompt: "review",
+      attachment_stall_timeout_ms: 420000
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.job_id === "job_claude_attachment_stalled"
+      && message.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_claude_attachment_stalled", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_attachment_stalled"
+    ));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_attachment_stalled"
+    );
+    assert.equal(error.payload.code, "attachment_stalled");
+    assert.equal(error.payload.phase, "upload");
+    assert.deepEqual(error.payload.attachment_trace, attachmentTrace);
+    assert.ok(Number.isSafeInteger(uploadJob?.attachment_trace?.final_chunk_ack_at_ms));
+    assert.equal(uploadJob?.attachment_stall_timeout_ms, 420000);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker surfaces Claude model mismatch legs in the job error", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

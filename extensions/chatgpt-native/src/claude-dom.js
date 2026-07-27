@@ -116,28 +116,112 @@ export async function insertPrompt(root, prompt, options = {}) {
 
 export async function uploadFile(root, file, options = {}) {
   const timeoutMs = options.timeoutMs ?? 120000;
+  const stallTimeoutMs = Math.max(timeoutMs, options.stallTimeoutMs ?? timeoutMs);
+  const attachmentTrace = initialAttachmentTrace(options.initialAttachmentTrace);
   let timeoutStage = "file_input";
   try {
     const input = await waitFor(() => findFileInput(root), Math.min(timeoutMs, 20000));
+    attachmentTrace.input_resolved_at_ms = Date.now();
     const transfer = new DataTransfer();
     transfer.items.add(file);
     input.files = transfer.files;
+    attachmentTrace.files_assigned_at_ms = Date.now();
     input.dispatchEvent(new Event("change", { bubbles: true }));
+    attachmentTrace.change_dispatched_at_ms = Date.now();
     timeoutStage = "attachment_readiness";
-    await waitFor(() => {
-      const attachment = Array.from(root.querySelectorAll(ATTACHMENT_SELECTOR)).find((node) =>
-        normalizeText(node.querySelector("h3")?.textContent) === file.name
-        && Boolean(node.querySelector("button[aria-label='Remove']"))
-      );
-      const send = findSendButton(root);
-      return attachment && send && !send.disabled && send.getAttribute("aria-disabled") !== "true";
-    }, timeoutMs);
+    await waitForAttachmentReadiness(root, file.name, attachmentTrace, timeoutMs, stallTimeoutMs);
     return true;
   } catch (error) {
     if (error?.isClaudeWaitTimeout) {
       error.message = `${error.message}; upload diagnostics: ${claudeUploadDiagnosticSummary(root, file.name, timeoutStage)}`;
     }
     throw error;
+  }
+}
+
+const ATTACHMENT_READINESS_LEGS = Object.freeze([
+  "matching_thumbnail",
+  "remove_control",
+  "send_present",
+  "send_enabled"
+]);
+
+function initialAttachmentTrace(value) {
+  const trace = {};
+  const finalChunkAckAtMs = Number(value?.final_chunk_ack_at_ms);
+  if (Number.isFinite(finalChunkAckAtMs) && finalChunkAckAtMs >= 0) {
+    trace.final_chunk_ack_at_ms = finalChunkAckAtMs;
+  }
+  return trace;
+}
+
+function attachmentReadiness(root, filename) {
+  const matchingThumbnails = Array.from(root.querySelectorAll(ATTACHMENT_SELECTOR)).filter((node) =>
+    normalizeText(node.querySelector("h3")?.textContent) === filename
+  );
+  const removeControl = matchingThumbnails.some((node) =>
+    Boolean(node.querySelector("button[aria-label='Remove']"))
+  );
+  const send = findSendButton(root);
+  const sendPresent = Boolean(send);
+  const sendEnabled = sendPresent
+    && !send.disabled
+    && send.getAttribute("aria-disabled") !== "true";
+  return {
+    matching_thumbnail: matchingThumbnails.length > 0,
+    remove_control: removeControl,
+    send_present: sendPresent,
+    send_enabled: sendEnabled
+  };
+}
+
+function recordAttachmentReadiness(trace, readiness, now) {
+  for (const leg of ATTACHMENT_READINESS_LEGS) {
+    const timestampKey = `${leg}_at_ms`;
+    if (readiness[leg] && trace[timestampKey] === undefined) {
+      trace[timestampKey] = now;
+    }
+  }
+}
+
+function pendingAttachmentLegs(readiness) {
+  return ATTACHMENT_READINESS_LEGS.filter((leg) => !readiness[leg]);
+}
+
+async function waitForAttachmentReadiness(root, filename, trace, softTimeoutMs, stallTimeoutMs) {
+  const dispatchedAtMs = trace.change_dispatched_at_ms ?? Date.now();
+  const softDeadline = dispatchedAtMs + softTimeoutMs;
+  const hardDeadline = dispatchedAtMs + stallTimeoutMs;
+  while (true) {
+    const now = Date.now();
+    const readiness = attachmentReadiness(root, filename);
+    recordAttachmentReadiness(trace, readiness, now);
+    if (ATTACHMENT_READINESS_LEGS.every((leg) => readiness[leg])) {
+      return true;
+    }
+    if (now >= softDeadline && trace.soft_timeout_at_ms === undefined) {
+      trace.soft_timeout_at_ms = now;
+      trace.soft_timeout_pending_legs = pendingAttachmentLegs(readiness);
+    }
+    if (now >= hardDeadline) {
+      if (hardDeadline === softDeadline) {
+        const error = new Error(`Claude page did not reach the requested state within ${softTimeoutMs}ms`);
+        error.isClaudeWaitTimeout = true;
+        throw error;
+      }
+      trace.hard_timeout_at_ms = now;
+      trace.hard_timeout_pending_legs = pendingAttachmentLegs(readiness);
+      throw commandError(
+        "attachment_stalled",
+        `Claude attachment stalled before readiness within ${stallTimeoutMs}ms`,
+        {
+          phase: "upload",
+          side_effect_started: true,
+          attachment_trace: trace
+        }
+      );
+    }
+    await sleep(Math.min(100, Math.max(1, hardDeadline - now)));
   }
 }
 

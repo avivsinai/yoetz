@@ -2533,6 +2533,15 @@ fn build_claude_recipe_spec(
     let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
     let upload_timeout_ms =
         dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, recipe_args.bundle.as_deref())?;
+    let attachment_stall_timeout_ms = recipe_vars
+        .get("attachment_stall_timeout_ms")
+        .map(|raw| {
+            raw.parse::<u64>().with_context(|| {
+                format!("invalid recipe var `attachment_stall_timeout_ms` value `{raw}`")
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
     let send_timeout_ms = dev_browser::resolve_chatgpt_send_timeout_ms(recipe_vars)?;
     claude_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
     let conversation = recipe_vars
@@ -2572,6 +2581,7 @@ fn build_claude_recipe_spec(
         wait_timeout_ms: poll_settings.timeout_ms,
         wait_interval_ms: poll_settings.interval_ms,
         upload_timeout_ms,
+        attachment_stall_timeout_ms,
         send_timeout_ms,
         close_tab_on_complete: !recipe_args.keep_tab,
         warnings: warnings.to_vec(),
@@ -8093,6 +8103,46 @@ mod tests {
         assert_eq!(spec.model, chatgpt_recipe::CHATGPT_SOL_PRO_MODEL);
         assert!(!recipe_vars.contains_key("model"));
         assert!(!recipe_vars.contains_key("extended"));
+    }
+
+    #[test]
+    fn builtin_claude_recipe_routes_attachment_stall_timeout_from_recipe_var_to_native_spec() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/claude.yaml");
+        let content = fs::read_to_string(&path).expect("read recipes/claude.yaml");
+        let recipe: browser::Recipe = serde_yaml_ng::from_str(&content).expect("parse claude.yaml");
+        let defaults = browser::build_recipe_vars(recipe.defaults.as_ref(), &[])
+            .expect("build default recipe vars");
+        assert_eq!(
+            defaults
+                .get("attachment_stall_timeout_ms")
+                .map(String::as_str),
+            Some("0")
+        );
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/claude.yaml"),
+            transport: None,
+            allow_cdp_fallback: false,
+            keep_tab: false,
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
+            vars: vec!["attachment_stall_timeout_ms=420000".to_string()],
+            followup: None,
+            thread: None,
+            fresh: false,
+            on_thread_conflict: None,
+            allow_duplicate_prompt: false,
+            no_notify: false,
+        };
+
+        let recipe_vars = browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)
+            .expect("build recipe vars");
+        let spec = build_claude_recipe_spec(&recipe_args, &recipe_vars, &[]).unwrap();
+
+        assert_eq!(recipe_vars["attachment_stall_timeout_ms"], "420000");
+        assert_eq!(spec.attachment_stall_timeout_ms, 420_000);
     }
 
     #[test]

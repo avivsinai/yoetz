@@ -1589,6 +1589,7 @@ pub fn canary(
                 wait_timeout_ms: 180_000,
                 wait_interval_ms: 1_000,
                 upload_timeout_ms: 30_000,
+                attachment_stall_timeout_ms: 0,
                 send_timeout_ms: 120_000,
                 close_tab_on_complete,
                 warnings: Vec::new(),
@@ -1895,6 +1896,7 @@ fn claude_job_start_payload(spec: &ClaudeRecipeSpec, bundle: &BundleInfo) -> Val
         "wait_timeout_ms": spec.wait_timeout_ms,
         "wait_interval_ms": spec.wait_interval_ms,
         "upload_timeout_ms": spec.upload_timeout_ms,
+        "attachment_stall_timeout_ms": spec.attachment_stall_timeout_ms,
         "send_timeout_ms": spec.send_timeout_ms,
         "close_tab_on_complete": spec.close_tab_on_complete,
     })
@@ -3154,6 +3156,15 @@ fn append_job_error_detail(payload: &Value, message: &str, detail: &mut Vec<Stri
             detail.push(format!("inspect with: {inspect_command}"));
         }
     }
+    if let Some(trace) = payload.get("attachment_trace").and_then(Value::as_object) {
+        if let Ok(trace) = serde_json::to_string(trace) {
+            if trace.len() <= 4096 {
+                detail.push(format!("attachment_trace={trace}"));
+            } else {
+                detail.push(format!("attachment_trace=<omitted: {} bytes>", trace.len()));
+            }
+        }
+    }
 }
 
 fn emit_progress(format: OutputFormat, envelope: &ProtocolEnvelope) -> Result<()> {
@@ -4301,6 +4312,33 @@ mod tests {
     }
 
     #[test]
+    fn job_error_message_surfaces_attachment_trace() {
+        let message = job_error_message(&json!({
+            "code": "attachment_stalled",
+            "message": "Claude attachment stalled before readiness",
+            "attachment_trace": {
+                "final_chunk_ack_at_ms": 100,
+                "hard_timeout_pending_legs": ["matching_thumbnail"]
+            }
+        }));
+
+        assert!(message.contains("attachment_trace="));
+        assert!(message.contains("final_chunk_ack_at_ms"));
+        assert!(message.contains("matching_thumbnail"));
+    }
+
+    #[test]
+    fn job_error_message_marks_an_oversized_attachment_trace() {
+        let message = job_error_message(&json!({
+            "code": "attachment_stalled",
+            "message": "Claude attachment stalled before readiness",
+            "attachment_trace": { "diagnostic": "x".repeat(4097) }
+        }));
+
+        assert!(message.contains("attachment_trace=<omitted:"));
+    }
+
+    #[test]
     fn frame_round_trips_json_envelope() {
         let envelope = ProtocolEnvelope::new(
             "job_progress",
@@ -4369,6 +4407,7 @@ mod tests {
             wait_timeout_ms: 10_000,
             wait_interval_ms: 1_000,
             upload_timeout_ms: 2_000,
+            attachment_stall_timeout_ms: 420_000,
             send_timeout_ms: 3_000,
             close_tab_on_complete: false,
             warnings: vec!["size warning".to_string()],
@@ -4384,6 +4423,7 @@ mod tests {
         assert_eq!(payload["model_strategy"], "select");
         assert_eq!(payload["conversation_id"], conversation_id);
         assert_eq!(payload["extension_instance_id"], "ext_claude");
+        assert_eq!(payload["attachment_stall_timeout_ms"], 420_000);
         assert_eq!(payload["close_tab_on_complete"], false);
     }
 
