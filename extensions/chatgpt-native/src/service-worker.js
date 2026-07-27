@@ -60,6 +60,13 @@ const AFFORDANCE_CONFIRM_POLL_MS = Math.max(
   250,
   Number(globalThis.__YOETZ_AFFORDANCE_CONFIRM_POLL_MS ?? 1500) || 1500
 );
+// Once assistant text is visible after send, shorten only the observation
+// cadence. The stable-idle threshold remains derived from the configured job
+// interval so adaptive polling cannot weaken finality.
+const POST_SEND_ASSISTANT_ACTIVITY_POLL_MS = Math.max(
+  250,
+  Number(globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS ?? 2000) || 2000
+);
 const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   1024,
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
@@ -1591,7 +1598,11 @@ async function waitForResponse(job) {
   let renderRefreshCandidate = null;
   let renderRefreshCandidateSinceMs = 0;
   let extractionFailureSinceMs = 0;
+  let lastResponseProgressAt = 0;
+  let lastResponseProgressGenerating = null;
+  let lastResponseProgressInterimTurn = false;
   let lastWaitingProgressAt = startedAt;
+  let reportedAwaitingFinalAffordance = false;
   const timeoutMs = responseWaitTimeoutMs(job);
   while (Date.now() - startedAt <= timeoutMs) {
     assertJobConnectionCurrent(job);
@@ -1621,8 +1632,21 @@ async function waitForResponse(job) {
       best = extraction;
     }
     if (postSend && extraction?.text) {
-      postResponseProgress(job, extraction);
-      assertJobConnectionCurrent(job);
+      const responseProgressState = interimTurnState(job, extraction);
+      const meaningfulProgressTransition = (
+        responseProgressState.interimAssistantTurn && !lastResponseProgressInterimTurn
+      ) || (
+        lastResponseProgressGenerating === true && !responseProgressState.generating
+      );
+      if (!lastResponseProgressAt
+          || meaningfulProgressTransition
+          || Date.now() - lastResponseProgressAt >= interval) {
+        postResponseProgress(job, extraction);
+        lastResponseProgressAt = Date.now();
+        assertJobConnectionCurrent(job);
+      }
+      lastResponseProgressGenerating = responseProgressState.generating;
+      lastResponseProgressInterimTurn = responseProgressState.interimAssistantTurn;
     }
     const extractionIdle = !extraction?.is_generating;
     const backendApiPending = Boolean(extraction?.backend_api_pending);
@@ -1818,12 +1842,17 @@ async function waitForResponse(job) {
       // Poll fast while confirming a latched final affordance so the short confirm
       // window is sampled across several ticks rather than overshot by a coarse poll.
       ? Math.min(interval, AFFORDANCE_CONFIRM_POLL_MS)
-      : (finalAffordanceWithoutScopedText
-          ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500))
-          : interval);
+      : finalAffordanceWithoutScopedText
+        ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500))
+      : postSendAssistantActivity
+        ? Math.min(interval, POST_SEND_ASSISTANT_ACTIVITY_POLL_MS)
+        : interval;
     const nowMs = Date.now();
     const elapsedMs = nowMs - startedAt;
-    if (nowMs - lastWaitingProgressAt >= WAITING_RESPONSE_PROGRESS_INTERVAL_MS) {
+    const enteredAwaitingFinalAffordance =
+      awaitingFinalAffordance && !reportedAwaitingFinalAffordance;
+    if (enteredAwaitingFinalAffordance
+        || nowMs - lastWaitingProgressAt >= WAITING_RESPONSE_PROGRESS_INTERVAL_MS) {
       const waitingDetail = {
         elapsed_ms: elapsedMs,
         timeout_ms: timeoutMs,
@@ -1841,6 +1870,7 @@ async function waitForResponse(job) {
         waitingDetail.inspect_command = inspectCommandForJob(job);
       }
       postWaitingResponseProgress(job, extraction, waitingDetail);
+      reportedAwaitingFinalAffordance ||= enteredAwaitingFinalAffordance;
       lastWaitingProgressAt = nowMs;
     }
     await sleep(nextDelay);
