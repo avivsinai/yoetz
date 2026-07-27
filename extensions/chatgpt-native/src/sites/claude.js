@@ -66,11 +66,9 @@ function selectFinalAffordanceCandidate(candidate, extraction) {
   const candidateText = normalizedResponseText(candidate?.text);
   const nextText = normalizedResponseText(extraction?.text);
   if (!candidate) return { candidate: extraction, resetTimer: true };
-  if (nextText === candidateText) {
+  if (extraction.assistant_identity === candidate.assistant_identity
+      && nextText === candidateText) {
     return { candidate: extraction, resetTimer: false };
-  }
-  if (nextText.length < candidateText.length) {
-    return { candidate, resetTimer: false };
   }
   return { candidate: extraction, resetTimer: true };
 }

@@ -1224,6 +1224,35 @@ test("fake Claude completed scoped answer does not require a hover-only copy but
   assert.equal(claudeSiteAdapter.completion.finalAffordanceRequiresStableIdle, true);
 });
 
+test("fake Claude reports a non-streaming last turn while a global stop keeps extraction fail-closed", () => {
+  const page = fakeClaudePage({
+    text: "complete-looking response with a persistent stop control",
+    streaming: false,
+    copy: false,
+    stop: true
+  });
+
+  const extraction = extractResponse(page.root);
+
+  assert.equal(extraction.has_copy_button, false);
+  assert.equal(extraction.is_generating, true);
+  assert.deepEqual(extraction.diagnostics.finality, {
+    last_turn_streaming: "false"
+  });
+  assert.equal(extraction.diagnostics.counts.scoped_copy_buttons, 0);
+  assert.equal(extraction.diagnostics.counts.stop_controls, 1);
+  assert.equal(claudeSiteAdapter.completion.hasFinalAssistantAffordance(extraction), false);
+});
+
+test("fake Claude rejects disconnected user nodes for assistant freshness", () => {
+  const page = fakeClaudePage({ text: "answer", streaming: false, copy: false });
+  page.user.compareDocumentPosition = () => 37;
+
+  const extraction = extractResponse(page.root);
+
+  assert.equal(extraction.preceding_user_count, 0);
+});
+
 test("fake Claude extraction reports artifact cards from only the final assistant root", () => {
   const finalArtifact = fakeArtifactCard("Release plan / Document · MD / Download");
   const finalPage = fakeClaudePage({
@@ -1341,7 +1370,14 @@ test("fake Claude model acceptance requires Fable 5 and Max together", () => {
   }
 });
 
-function fakeClaudePage({ text, streaming, copy, thinking = false, artifacts = [] }) {
+function fakeClaudePage({
+  text,
+  streaming,
+  copy,
+  thinking = false,
+  artifacts = [],
+  stop = false
+}) {
   const body = { innerText: text, textContent: text };
   const copyButton = {};
   const page = {
@@ -1354,20 +1390,22 @@ function fakeClaudePage({ text, streaming, copy, thinking = false, artifacts = [
   };
   const assistant = fakeClaudeAssistant({ text, streaming, thinking, artifacts, body, turn });
   const user = {
-    compareDocumentPosition() {
-      return 4;
+    compareDocumentPosition(target) {
+      return target === assistant ? 4 : 0;
     }
   };
   const root = {
     body: { innerText: text, textContent: text },
     querySelector(selector) {
-      if (selector === "button[aria-label='Stop response']") return null;
+      if (selector === "button[aria-label='Stop response']") return stop ? {} : null;
       return null;
     },
     querySelectorAll(selector) {
-      if (selector === "[data-is-streaming]") return [assistant];
+      if (selector === "[data-is-streaming]") {
+        return [assistant];
+      }
       if (selector === "[data-testid='action-bar-copy']") return page.globalCopy;
-      if (selector === "button[aria-label='Stop response']") return [];
+      if (selector === "button[aria-label='Stop response']") return stop ? [{}] : [];
       if (selector === "button[class*='group/status']") return thinking ? [{}] : [];
       if (selector === "[data-testid='user-message']") return [user];
       return [];
@@ -1375,6 +1413,7 @@ function fakeClaudePage({ text, streaming, copy, thinking = false, artifacts = [
   };
   page.root = root;
   page.assistant = assistant;
+  page.user = user;
   page.body = body;
   return page;
 }

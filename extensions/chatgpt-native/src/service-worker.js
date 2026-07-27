@@ -67,6 +67,12 @@ const POST_SEND_ASSISTANT_ACTIVITY_POLL_MS = Math.max(
   250,
   Number(globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS ?? 2000) || 2000
 );
+const RESPONSE_FINALITY_STALL_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS))
+    ? Number(globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS)
+    : 5 * 60 * 1000
+);
 const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   1024,
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
@@ -1618,6 +1624,8 @@ async function waitForResponse(job) {
   let renderRefreshCandidate = null;
   let renderRefreshCandidateSinceMs = 0;
   let extractionFailureSinceMs = 0;
+  let finalityStallSignature = null;
+  let finalityStallCandidateSinceMs = 0;
   let lastResponseProgressAt = 0;
   let lastResponseProgressGenerating = null;
   let lastResponseProgressInterimTurn = false;
@@ -1648,6 +1656,49 @@ async function waitForResponse(job) {
     last = extraction ?? last;
     const postSend = isPostSendExtraction(job, extraction);
     const postSendAssistantActivity = isPostSendAssistantActivity(job, extraction, true);
+    const currentFinalityStallSignature = isClaudeFinalityConflict(job, extraction)
+      ? responseFinalityStallSignature(extraction)
+      : null;
+    if (currentFinalityStallSignature === null) {
+      finalityStallSignature = null;
+      finalityStallCandidateSinceMs = 0;
+    } else if (currentFinalityStallSignature !== finalityStallSignature) {
+      finalityStallSignature = currentFinalityStallSignature;
+      finalityStallCandidateSinceMs = Date.now();
+    } else if (!finalityStallCandidateSinceMs) {
+      finalityStallCandidateSinceMs = Date.now();
+    }
+    const finalityStalledForMs = finalityStallCandidateSinceMs
+      ? Date.now() - finalityStallCandidateSinceMs
+      : 0;
+    if (currentFinalityStallSignature !== null
+        && finalityStalledForMs >= RESPONSE_FINALITY_STALL_MS) {
+      const inspectCommand = inspectCommandForJob(job);
+      const adapter = adapterForJob(job);
+      await failJob(
+        job,
+        "response_finality_stalled",
+        `${adapter.displayName} response content remained unchanged for ${formatDurationForMessage(finalityStalledForMs)} without positive finality proof. The owned ${adapter.displayName} tab is left open; inspect it before rerunning with: ${inspectCommand}. Do not rerun until inspection because the prompt was already submitted.`,
+        {
+          phase: "wait_response",
+          side_effect_started: true,
+          completion_reason: "non_streaming_turn_with_persistent_stop",
+          send_committed: true,
+          stable_for_ms: finalityStalledForMs,
+          stall_timeout_ms: RESPONSE_FINALITY_STALL_MS,
+          extraction_method: extraction.method,
+          response_length: extraction.text.length,
+          assistant_count: extraction.assistant_count ?? 0,
+          assistant_identity: extraction.assistant_identity,
+          turn_index: extraction.turn_index ?? -1,
+          copy_button_count: extraction.copy_button_count ?? 0,
+          has_copy_button: Boolean(extraction.has_copy_button),
+          inspect_command: inspectCommand,
+          diagnostics: diagnosticPayload(extraction.diagnostics)
+        }
+      );
+      return null;
+    }
     if (postSend && extraction?.text && extraction.text.length >= best.text.length) {
       best = extraction;
     }
@@ -2040,6 +2091,7 @@ function diagnosticPayload(diagnostics) {
     page_text_chars: diagnostics.page_text_chars ?? null,
     page_text_content_chars: diagnostics.page_text_content_chars ?? null,
     counts: diagnostics.counts ?? {},
+    finality: diagnostics.finality ?? {},
     assistant_turn_snippets: (diagnostics.assistant_turn_snippets ?? []).slice(-3),
     article_snippets: (diagnostics.article_snippets ?? []).slice(-3),
     markdown_snippets: (diagnostics.markdown_snippets ?? []).slice(-3),
@@ -2226,6 +2278,28 @@ function isPostSendExtraction(job, extraction) {
     return true;
   }
   return isPostSendAssistantActivity(job, extraction);
+}
+
+function responseFinalityStallSignature(extraction) {
+  return JSON.stringify([
+    extraction.text,
+    extraction.assistant_count,
+    extraction.turn_index,
+    extraction.method,
+    extraction.assistant_identity
+  ]);
+}
+
+function isClaudeFinalityConflict(job, extraction) {
+  return adapterForJob(job).recipe === "claude"
+    && isPostSendExtraction(job, extraction)
+    && extraction.method === "assistant_dom"
+    && Boolean(extraction.text)
+    && typeof extraction.assistant_identity === "string"
+    && Boolean(extraction.assistant_identity.trim())
+    && extraction.is_generating === true
+    && extraction.diagnostics?.finality?.last_turn_streaming === "false"
+    && Number(extraction.diagnostics?.counts?.stop_controls ?? 0) > 0;
 }
 
 function isPostSendAssistantActivity(job, extraction, allowUnknownTurnIndex = false) {
