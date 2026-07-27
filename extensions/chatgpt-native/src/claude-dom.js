@@ -11,6 +11,12 @@ const ASSISTANT_SELECTOR = "[data-is-streaming]";
 const MODEL_MENU_SETTLE_MS = 300;
 const BLOCKING_STATE_SCAN_INTERVAL_MS = 1000;
 const SWITCH_MODELS_CONTROL_SELECTOR = "button, a, [role='button'], [role='link']";
+// Keep control corroboration inside a local notice subtree rather than allowing
+// an unrelated page-level model control to validate matching text elsewhere.
+const MAX_CONTROL_SURFACE_DEPTH = 8;
+// A provider notice is short; this rejects broad page/sidebar wrappers when the
+// control-backed fallback is needed because no semantic live region exists.
+const MAX_CONTROL_SURFACE_TEXT_CHARS = 1000;
 const CONVERSATION_CONTENT_SELECTOR = [
   COMPOSER_SELECTOR,
   "[data-testid='user-message']",
@@ -85,28 +91,36 @@ export function classifyBlockingState(root = document, { forceScan = false } = {
     return cached.value;
   }
   const candidates = Array.from(root.querySelectorAll?.("body *") ?? []);
-  const container = candidates
+  const switchControls = Array.from(root.querySelectorAll?.(SWITCH_MODELS_CONTROL_SELECTOR) ?? [])
+    .filter((element) => /^switch models?$/i.test(normalizeText(element.innerText || element.textContent)))
+    .filter((element) => isStrictlyVisibleBannerElement(root, element));
+  const surfaces = candidates
     .filter((element) => USAGE_CREDITS_TEXT_PATTERN.test(normalizeText(element.textContent)))
     .filter((element) => !element.closest?.(CONVERSATION_CONTENT_SELECTOR))
-    .filter((element) => !element.querySelector?.(CONVERSATION_CONTENT_SELECTOR))
-    .filter((element) => isStrictlyVisibleBannerElement(root, element))
-    .sort((left, right) => normalizeText(left.textContent).length - normalizeText(right.textContent).length)
-    .at(0);
-  if (!container) {
+    .map((element) => notificationSurfaceFor(element, root)
+      ?? controlBackedSurfaceFor(element, switchControls, root))
+    .filter(Boolean)
+    .filter((surface, index, all) => all.indexOf(surface) === index)
+    .filter((surface) => !surface.closest?.(CONVERSATION_CONTENT_SELECTOR))
+    .filter((surface) => !surface.querySelector?.(CONVERSATION_CONTENT_SELECTOR))
+    .filter((surface) => isStrictlyVisibleBannerElement(root, surface))
+    .map((surface) => ({ surface, text: normalizeText(surface.innerText) }))
+    .filter(({ text }) => isUsageCreditsMessage(text))
+    .sort((left, right) => left.text.length - right.text.length);
+  const match = surfaces.at(0);
+  if (!match) {
     blockingStateScanCache.set(root, { scanned_at_ms: now, value: null });
     return null;
   }
-  const switchControl = Array.from(root.querySelectorAll?.(SWITCH_MODELS_CONTROL_SELECTOR) ?? [])
-    .filter((element) => normalizeText(element.textContent).toLowerCase() === "switch models")
+  const container = match.surface;
+  const switchControl = switchControls
     .filter((element) => isDescendantOrSelf(element, container))
-    .filter((element) => isStrictlyVisibleBannerElement(root, element))
     .at(0);
-  const text = normalizeText(container.innerText || container.textContent);
   const blockingState = {
     state: "usage_credits_exhausted",
     code: "usage_credits_exhausted",
     requested_model: "fable-5-max",
-    provider_message: text || USAGE_CREDITS_PROVIDER_MESSAGE,
+    provider_message: match.text || USAGE_CREDITS_PROVIDER_MESSAGE,
     provider_dom: {
       container: elementDiagnostic(container),
       switch_models_control: switchControl ? elementDiagnostic(switchControl) : { found: false }
@@ -767,6 +781,49 @@ function visibleElements(root, selector) {
     .filter((element) => element.getClientRects().length > 0);
 }
 
+function isUsageCreditsMessage(text) {
+  return USAGE_CREDITS_TEXT_PATTERN.test(text);
+}
+
+function notificationSurfaceFor(element, root) {
+  for (let node = element; node && node !== root.body && node !== root.documentElement; node = node.parentElement) {
+    const role = normalizeText(node.getAttribute?.("role")).toLowerCase();
+    const ariaLive = normalizeText(node.getAttribute?.("aria-live")).toLowerCase();
+    if (role === "alert" || role === "status" || (ariaLive && ariaLive !== "off")) {
+      return node;
+    }
+  }
+  return null;
+}
+
+function controlBackedSurfaceFor(element, controls, root) {
+  const ancestors = [];
+  for (
+    let node = element, depth = 0;
+    node && node !== root.body && node !== root.documentElement && depth < MAX_CONTROL_SURFACE_DEPTH;
+    node = node.parentElement, depth += 1
+  ) {
+    ancestors.push(node);
+  }
+  for (const control of controls) {
+    for (
+      let node = control, depth = 0;
+      node && node !== root.body && node !== root.documentElement && depth < MAX_CONTROL_SURFACE_DEPTH;
+      node = node.parentElement, depth += 1
+    ) {
+      if (!ancestors.includes(node)) {
+        continue;
+      }
+      const text = normalizeText(node.innerText);
+      if (text.length <= MAX_CONTROL_SURFACE_TEXT_CHARS && isUsageCreditsMessage(text)) {
+        return node;
+      }
+      break;
+    }
+  }
+  return null;
+}
+
 function isDescendantOrSelf(element, ancestor) {
   for (let node = element; node; node = node.parentElement) {
     if (node === ancestor) {
@@ -789,11 +846,12 @@ function elementDiagnostic(element) {
 function isStrictlyVisibleBannerElement(root, element) {
   const viewWidth = Number(root.defaultView?.innerWidth);
   const viewHeight = Number(root.defaultView?.innerHeight);
+  let paintedIntersection = Number.isFinite(viewWidth) && viewWidth > 0
+    && Number.isFinite(viewHeight) && viewHeight > 0
+    ? { left: 0, top: 0, right: viewWidth, bottom: viewHeight }
+    : null;
   for (let node = element; node; node = node.parentElement) {
     if (node.hidden || node.getAttribute?.("aria-hidden") === "true") {
-      return false;
-    }
-    if (node.getClientRects?.().length === 0) {
       return false;
     }
     const style = root.defaultView?.getComputedStyle?.(node);
@@ -802,17 +860,49 @@ function isStrictlyVisibleBannerElement(root, element) {
       || style.visibility === "hidden"
       || style.visibility === "collapse"
       || (style.opacity !== "" && Number(style.opacity) === 0)
+      || style.contentVisibility === "hidden"
+      || (style.clipPath && style.clipPath !== "none")
+      || (style.clip && style.clip !== "auto" && style.clip !== "none")
     )) {
       return false;
     }
-    const rect = node.getBoundingClientRect?.();
-    if (rect && Number.isFinite(viewWidth) && viewWidth > 0 && Number.isFinite(viewHeight) && viewHeight > 0) {
+    const displayContents = style?.display === "contents";
+    const clientRects = node.getClientRects?.();
+    if (node === element && !displayContents && clientRects?.length === 0) {
+      return false;
+    }
+    const boundingRect = node.getBoundingClientRect?.();
+    const rect = displayContents
+      ? null
+      : hasLayoutCoordinates(boundingRect)
+        ? boundingRect
+        : hasLayoutCoordinates(clientRects?.[0])
+          ? clientRects[0]
+          : null;
+    if (rect && paintedIntersection) {
       const left = Number(rect.left ?? 0);
       const top = Number(rect.top ?? 0);
       const right = Number(rect.right ?? (left + Number(rect.width ?? 0)));
       const bottom = Number(rect.bottom ?? (top + Number(rect.height ?? 0)));
-      if (!(bottom > 0 && right > 0 && top < viewHeight && left < viewWidth)) {
+      if (node === element && (!(right > left) || !(bottom > top))) {
         return false;
+      }
+      const clipsOverflow = node !== element && style && [
+        style.overflow,
+        style.overflowX,
+        style.overflowY
+      ].some((value) => value === "hidden" || value === "clip");
+      if (node === element || clipsOverflow) {
+        paintedIntersection = {
+          left: Math.max(paintedIntersection.left, left),
+          top: Math.max(paintedIntersection.top, top),
+          right: Math.min(paintedIntersection.right, right),
+          bottom: Math.min(paintedIntersection.bottom, bottom)
+        };
+        if (!(paintedIntersection.right > paintedIntersection.left)
+            || !(paintedIntersection.bottom > paintedIntersection.top)) {
+          return false;
+        }
       }
     }
     if (node === root.documentElement) {
@@ -820,6 +910,11 @@ function isStrictlyVisibleBannerElement(root, element) {
     }
   }
   return true;
+}
+
+function hasLayoutCoordinates(rect) {
+  return Boolean(rect) && ["left", "top", "right", "bottom", "width", "height"]
+    .some((key) => Number.isFinite(Number(rect[key])));
 }
 
 function elementSummary(element) {

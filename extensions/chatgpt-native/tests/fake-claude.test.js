@@ -24,13 +24,23 @@ function fakeCreditBanner({
   depth = 8,
   style = {},
   rect = null,
+  ancestorRect = null,
   conversationDescendant = false,
   hiddenAncestor = false,
-  switchControlQueryable = true
+  switchControlQueryable = true,
+  role = "alert",
+  ariaLive = null,
+  tagName = null,
+  nestedMessage = false,
+  renderedText = text,
+  messageHidden = false,
+  displayContentsAncestor = false,
+  shellStyle = {}
 } = {}) {
   const shell = {
-    innerText: text,
+    innerText: renderedText,
     textContent: text,
+    tagName: "BODY",
     parentElement: null,
     getAttribute() {
       return null;
@@ -42,13 +52,17 @@ function fakeCreditBanner({
       return conversationDescendant ? {} : null;
     },
     getClientRects() {
-      return [{}];
+      return displayContentsAncestor ? [] : [{}];
+    },
+    getBoundingClientRect() {
+      return ancestorRect;
     }
   };
   const banner = {
-    attrs: { role: "alert" },
-    innerText: text,
+    attrs: { role, "aria-live": ariaLive },
+    innerText: renderedText,
     textContent: text,
+    tagName,
     parentElement: shell,
     getAttribute(name) {
       return this.attrs[name] ?? null;
@@ -66,6 +80,28 @@ function fakeCreditBanner({
       return conversationDescendant ? {} : null;
     }
   };
+  const message = nestedMessage || messageHidden ? {
+    attrs: {},
+    innerText: text,
+    textContent: text,
+    tagName: "P",
+    parentElement: banner,
+    getAttribute(name) {
+      return this.attrs[name] ?? null;
+    },
+    getClientRects() {
+      return messageHidden ? [] : [{}];
+    },
+    getBoundingClientRect() {
+      return rect;
+    },
+    closest() {
+      return excluded ? {} : null;
+    },
+    querySelector() {
+      return null;
+    }
+  } : null;
   const switchModels = {
     attrs: { role: "button" },
     innerText: "Switch models",
@@ -113,18 +149,21 @@ function fakeCreditBanner({
       innerWidth: 1200,
       innerHeight: 800,
       getComputedStyle: (element) => ({
-        display: visible ? "block" : "none",
-        visibility: visible ? "visible" : "hidden",
+        display: messageHidden && element === message
+          ? "none"
+          : (displayContentsAncestor && element === shell ? "contents" : (visible ? "block" : "none")),
+        visibility: messageHidden && element === message ? "hidden" : (visible ? "visible" : "hidden"),
         opacity: hiddenAncestor && element === shell ? "0" : (visible ? "1" : "0"),
-        ...style
+        ...(element === banner ? style : {}),
+        ...(element === shell ? shellStyle : {})
       })
     },
     querySelectorAll(selector) {
-      if (selector === "body *") return [banner, switchModels];
+      if (selector === "body *") return [message, banner, switchModels].filter(Boolean);
       return switchControlQueryable && selector.includes("button") ? [switchModels] : [];
     }
   };
-  return { root, shell, banner, switchModels };
+  return { root, shell, banner, message, switchModels };
 }
 
 test("classifyBlockingState detects the visible organization credit banner", () => {
@@ -166,6 +205,52 @@ test("classifyBlockingState survives unknown Switch models markup and records di
   assert.equal(banner.switchModels.clickCount, 0);
 });
 
+test("classifyBlockingState bounds credit text to a provider notice surface", () => {
+  const sidebarTitle = fakeCreditBanner({
+    role: null,
+    tagName: "ASIDE",
+    switchControlQueryable: false
+  });
+  const ordinaryPageText = fakeCreditBanner({
+    role: null,
+    text: "Your org is out of usage credits for the month.",
+    switchControlQueryable: false
+  });
+  const alertWithoutControl = fakeCreditBanner({ switchControlQueryable: false });
+  const nestedAlert = fakeCreditBanner({ nestedMessage: true, depth: 1 });
+  const controlBackedNotice = fakeCreditBanner({ role: null, nestedMessage: true, depth: 1 });
+
+  assert.equal(classifyBlockingState(sidebarTitle.root), null);
+  assert.equal(classifyBlockingState(ordinaryPageText.root), null);
+  assert.equal(classifyBlockingState(alertWithoutControl.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(nestedAlert.root)?.provider_dom.switch_models_control.found, true);
+  assert.equal(classifyBlockingState(controlBackedNotice.root)?.code, "usage_credits_exhausted");
+});
+
+test("classifyBlockingState matches rendered notice text and painted visibility", () => {
+  const hiddenMatchingChild = fakeCreditBanner({
+    renderedText: "A different visible notification.",
+    messageHidden: true,
+    switchControlQueryable: false
+  });
+  const zeroArea = fakeCreditBanner({
+    rect: { left: 10, top: 10, right: 10, bottom: 10, width: 0, height: 0 }
+  });
+  const fullyClipped = fakeCreditBanner({ style: { clipPath: "inset(50%)" } });
+  const overflowClipped = fakeCreditBanner({
+    rect: { left: 200, top: 200, right: 300, bottom: 300, width: 100, height: 100 },
+    ancestorRect: { left: 0, top: 0, right: 100, bottom: 100, width: 100, height: 100 },
+    shellStyle: { overflow: "hidden" }
+  });
+  const displayContentsAncestor = fakeCreditBanner({ displayContentsAncestor: true });
+
+  assert.equal(classifyBlockingState(hiddenMatchingChild.root), null);
+  assert.equal(classifyBlockingState(zeroArea.root), null);
+  assert.equal(classifyBlockingState(fullyClipped.root), null);
+  assert.equal(classifyBlockingState(overflowClipped.root), null);
+  assert.equal(classifyBlockingState(displayContentsAncestor.root)?.code, "usage_credits_exhausted");
+});
+
 test("classifyBlockingState accepts wording drift but rejects structural false positives", () => {
   const quoted = fakeCreditBanner({ excluded: true });
   const hidden = fakeCreditBanner({ visible: false });
@@ -182,6 +267,9 @@ test("classifyBlockingState accepts wording drift but rejects structural false p
   const extra = fakeCreditBanner({
     text: "Your org is out of usage credits for the month. We let your admin know. Prompt quoted this notice. Switch models to continue chatting."
   });
+  const drifted = fakeCreditBanner({
+    text: "You're out of usage credits. Switch models to continue."
+  });
   const conversationCompleted = fakeCreditBanner({ conversationDescendant: true });
   const ancestorHidden = fakeCreditBanner({ hiddenAncestor: true });
   const unrelated = fakeCreditBanner({
@@ -195,6 +283,7 @@ test("classifyBlockingState accepts wording drift but rejects structural false p
   assert.equal(classifyBlockingState(shortened.root)?.code, "usage_credits_exhausted");
   assert.equal(classifyBlockingState(reordered.root)?.code, "usage_credits_exhausted");
   assert.equal(classifyBlockingState(extra.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(drifted.root)?.code, "usage_credits_exhausted");
   assert.equal(classifyBlockingState(conversationCompleted.root), null);
   assert.equal(classifyBlockingState(ancestorHidden.root), null);
   assert.equal(classifyBlockingState(unrelated.root), null);
