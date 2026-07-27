@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- Claude browser jobs now fail with `response_finality_stalled` after five
+  continuously unchanged minutes without positive finality proof, preserving
+  the owned tab for inspection instead of waiting until the general timeout.
 - Browser recipes now poll every two seconds after post-send assistant activity
   becomes visible and emit `awaiting_final_affordance` on transition, while
   preserving the configured cadence for outward response-progress events.

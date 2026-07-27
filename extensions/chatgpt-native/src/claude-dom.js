@@ -17,6 +17,10 @@ const MAX_CONTROL_SURFACE_DEPTH = 8;
 // A provider notice is short; this rejects broad page/sidebar wrappers when the
 // control-backed fallback is needed because no semantic live region exists.
 const MAX_CONTROL_SURFACE_TEXT_CHARS = 1000;
+const CONTENT_SCRIPT_INSTANCE_ID = globalThis.crypto?.randomUUID?.()
+  ?? `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+const assistantIdentityCache = new WeakMap();
+let nextAssistantIdentity = 0;
 const CONVERSATION_CONTENT_SELECTOR = [
   COMPOSER_SELECTOR,
   "[data-testid='user-message']",
@@ -522,15 +526,21 @@ export function extractResponse(root = document) {
   };
   const globalCopyButtons = root.querySelectorAll(COPY_ACTION_SELECTOR).length;
   const scopedCopyButtons = turn?.querySelectorAll?.(COPY_ACTION_SELECTOR)?.length ?? 0;
+  const lastTurnStreaming = last?.getAttribute?.("data-is-streaming") ?? null;
+  const assistantIdentity = last ? assistantIdentityFor(last) : null;
   const isGenerating = isResponseGenerating(root);
   const precedingUserCount = last ? precedingUserTurnCount(root, last) : 0;
   const diagnostics = {
     counts: {
       assistant_turns: assistants.length,
       copy_buttons: globalCopyButtons,
+      scoped_copy_buttons: scopedCopyButtons,
       stop_controls: root.querySelectorAll("button[aria-label='Stop response']").length,
       thinking_rows: root.querySelectorAll("button[class*='group/status']").length,
       artifact_blocks: artifactBlocks.count
+    },
+    finality: {
+      last_turn_streaming: lastTurnStreaming
     },
     assistant_turn_snippets: assistants.slice(-3).map((element) => elementSummary(element)),
     page_text_chars: String(root.body?.innerText ?? "").length,
@@ -542,6 +552,7 @@ export function extractResponse(root = document) {
       text: "",
       is_generating: isGenerating,
       assistant_count: assistants.length,
+      assistant_identity: assistantIdentity,
       turn_index: assistants.length - 1,
       preceding_user_count: precedingUserCount,
       copy_button_count: globalCopyButtons,
@@ -555,6 +566,7 @@ export function extractResponse(root = document) {
     text,
     is_generating: isGenerating,
     assistant_count: assistants.length,
+    assistant_identity: assistantIdentity,
     turn_index: assistants.length - 1,
     preceding_user_count: precedingUserCount,
     copy_button_count: globalCopyButtons,
@@ -665,11 +677,35 @@ function userTurnCount(root) {
 
 function precedingUserTurnCount(root, target) {
   const users = Array.from(root.querySelectorAll("[data-testid='user-message']"));
-  return users.filter((element) => {
-    const position = element.compareDocumentPosition?.(target) ?? 0;
-    const following = globalThis.Node?.DOCUMENT_POSITION_FOLLOWING ?? 4;
-    return Boolean(position & following);
-  }).length;
+  return users.filter((element) => isStrictlyFollowing(element, target)).length;
+}
+
+function isStrictlyFollowing(source, target) {
+  const position = source?.compareDocumentPosition?.(target) ?? 0;
+  const following = globalThis.Node?.DOCUMENT_POSITION_FOLLOWING ?? 4;
+  const disconnected = globalThis.Node?.DOCUMENT_POSITION_DISCONNECTED ?? 1;
+  const implementationSpecific = globalThis.Node?.DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC ?? 32;
+  return !(position & (disconnected | implementationSpecific))
+    && Boolean(position & following);
+}
+
+function assistantIdentityFor(element) {
+  const providerIdentity = [
+    element.getAttribute?.("data-message-id"),
+    element.getAttribute?.("data-turn-id"),
+    element.getAttribute?.("id"),
+    element.id
+  ].find((value) => typeof value === "string" && value.trim());
+  if (providerIdentity) {
+    return `provider:${providerIdentity.trim()}`;
+  }
+  let identity = assistantIdentityCache.get(element);
+  if (!identity) {
+    nextAssistantIdentity += 1;
+    identity = `dom:${CONTENT_SCRIPT_INSTANCE_ID}:${nextAssistantIdentity}`;
+    assistantIdentityCache.set(element, identity);
+  }
+  return identity;
 }
 
 function conversationIdFromLocation() {

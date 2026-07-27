@@ -493,21 +493,23 @@ test("service worker runs a Claude job through its adapter and probes the select
             };
           case "yoetz_extract_response":
             if (sent) postSendExtractCount += 1;
+            const latestAssistant = postSendExtractCount >= 2;
             return {
               ok: true,
               payload: sent
                   ? {
                     method: "assistant_dom",
-                    text: "Claude answer",
+                    text: latestAssistant ? "Short answer" : "Claude answer that is longer",
                     is_generating: false,
                     assistant_count: 1,
+                    assistant_identity: latestAssistant ? "assistant-a2" : "assistant-a1",
                     copy_button_count: 0,
                     has_copy_button: false,
                     turn_index: 0,
                     conversation_id: conversationId,
                     artifact_blocks: {
-                      count: postSendExtractCount >= 2 ? 1 : 0,
-                      titles: postSendExtractCount >= 2 ? ["Release plan"] : []
+                      count: postSendExtractCount >= 3 ? 1 : 0,
+                      titles: postSendExtractCount >= 3 ? ["Release plan"] : []
                     }
                   }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
@@ -562,7 +564,7 @@ test("service worker runs a Claude job through its adapter and probes the select
     const complete = port.messages.find((message) =>
       message.type === "job_complete" && message.job_id === "job_claude"
     );
-    assert.equal(complete.payload.response, "Claude answer");
+    assert.equal(complete.payload.response, "Short answer");
     assert.equal(complete.payload.model_used, "Fable 5 Max");
     assert.equal(complete.payload.completion_reason, "stable_idle");
     assert.equal(complete.payload.conversation_id, conversationId);
@@ -572,7 +574,7 @@ test("service worker runs a Claude job through its adapter and probes the select
       count: 1,
       titles: ["Release plan"]
     }]);
-    assert.equal(postSendExtractCount, 2);
+    assert.equal(postSendExtractCount, 3);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -3462,6 +3464,222 @@ test("service worker keeps stable-idle finality tied to the configured interval 
       delete globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER;
     } else {
       globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER = previousStableIdleMultiplier;
+    }
+  }
+});
+
+test("service worker fails a continuously unchanged post-send response as response_finality_stalled", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousFinalityStallMs = globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS;
+  globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS = 600;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let extractionCount = 0;
+  let removedTabs = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/" }),
+      remove: async () => {
+        removedTabs += 1;
+      },
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedFableMaxSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                submitted_assistant_count: 0,
+                submitted_user_count: 1
+              }
+            };
+          case "yoetz_extract_response":
+            if (!sent) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 } };
+            }
+            extractionCount += 1;
+            return {
+              ok: true,
+              payload: {
+                method: "assistant_dom",
+                text: "Complete-looking body blocked by an unowned global stop control.",
+                is_generating: true,
+                assistant_count: 1,
+                assistant_identity: "stalled-assistant",
+                preceding_user_count: 1,
+                turn_index: 0,
+                diagnostics: {
+                  finality: {
+                    last_turn_streaming: "false"
+                  },
+                  counts: { stop_controls: 1 }
+                }
+              }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?response_finality_stalled=${Date.now()}`);
+    port.emit(envelope("job_start", "job_response_finality_stalled", {
+      recipe: "claude",
+      prompt: "prompt",
+      wait_interval_ms: 500,
+      wait_timeout_ms: 4000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_response_finality_stalled", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_response_finality_stalled.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.payload.code === "response_finality_stalled"
+    ), 3000);
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.payload.code === "response_finality_stalled"
+    );
+    assert.ok(extractionCount >= 3);
+    assert.equal(error.payload.tab_disposition, "kept");
+    assert.equal(error.payload.extraction_method, "assistant_dom");
+    assert.equal(error.payload.assistant_count, 1);
+    assert.equal(error.payload.assistant_identity, "stalled-assistant");
+    assert.equal(error.payload.turn_index, 0);
+    assert.equal(error.payload.response_length, 64);
+    assert.equal(error.payload.completion_reason, "non_streaming_turn_with_persistent_stop");
+    assert.equal(error.payload.send_committed, true);
+    assert.equal(error.payload.copy_button_count, 0);
+    assert.equal(error.payload.has_copy_button, false);
+    assert.equal(error.payload.diagnostics.finality.last_turn_streaming, "false");
+    assert.equal(error.payload.diagnostics.counts.stop_controls, 1);
+    assert.match(error.payload.message, /inspect it before rerunning/i);
+    assert.match(error.payload.message, /Do not rerun until inspection/i);
+    assert.equal(removedTabs, 0, "terminal finality failures must preserve the owned tab");
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+
+    port.emit(envelope("job_start", "job_response_finality_stalled", {
+      recipe: "claude",
+      prompt: "must not resubmit"
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.payload.code === "duplicate_job"
+    ));
+    assert.equal(removedTabs, 0);
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousFinalityStallMs === undefined) {
+      delete globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS;
+    } else {
+      globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS = previousFinalityStallMs;
+    }
+  }
+});
+
+test("service worker resets the finality-stall timer on signature changes and disappearance", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousFinalityStallMs = globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS;
+  globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS = 600;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let extractionCount = 0;
+  const postSendExtractions = [
+    { method: "assistant_dom", text: "A", is_generating: true, assistant_count: 1, assistant_identity: "a1", preceding_user_count: 1, turn_index: 0, diagnostics: { finality: { last_turn_streaming: "false" }, counts: { stop_controls: 1 } } },
+    { method: "assistant_dom", text: "A", is_generating: true, assistant_count: 1, assistant_identity: "a2", preceding_user_count: 1, turn_index: 0, diagnostics: { finality: { last_turn_streaming: "false" }, counts: { stop_controls: 1 } } },
+    { method: "assistant_dom", text: "A", is_generating: true, assistant_count: 1, assistant_identity: "a2", preceding_user_count: 1, turn_index: 0, diagnostics: { finality: { last_turn_streaming: "false" }, counts: { stop_controls: 1 } } },
+    { method: "assistant_dom", text: "B", is_generating: true, assistant_count: 1, assistant_identity: "a2", preceding_user_count: 1, turn_index: 0, diagnostics: { finality: { last_turn_streaming: "false" }, counts: { stop_controls: 1 } } },
+    { method: "none", text: "", is_generating: true, assistant_count: 0, turn_index: -1 },
+    { method: "assistant_dom", text: "A", is_generating: true, assistant_count: 1, assistant_identity: "a3", preceding_user_count: 1, turn_index: 0, diagnostics: { finality: { last_turn_streaming: "true" }, counts: { stop_controls: 1 } } },
+    { method: "assistant_dom", text: "A", is_generating: true, assistant_count: 1, preceding_user_count: 1, turn_index: 0, diagnostics: { finality: { last_turn_streaming: "false" }, counts: { stop_controls: 1 } } },
+    { method: "assistant_dom", text: "A", is_generating: true, assistant_count: 1, preceding_user_count: 1, turn_index: 0, diagnostics: { finality: { last_turn_streaming: "false" }, counts: { stop_controls: 1 } } },
+    { method: "assistant_dom", text: "A", is_generating: true, assistant_count: 1, preceding_user_count: 1, turn_index: 0, diagnostics: { finality: { last_turn_streaming: "false" }, counts: { stop_controls: 1 } } },
+    { method: "assistant_dom", text: "A", is_generating: true, assistant_count: 1, assistant_identity: "a4", preceding_user_count: 1, turn_index: 0, diagnostics: { finality: { last_turn_streaming: "false" }, counts: { stop_controls: 1 } } }
+  ];
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedFableMaxSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, submitted_assistant_count: 0, submitted_user_count: 1 } };
+          case "yoetz_extract_response":
+            if (!sent) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 } };
+            }
+            extractionCount += 1;
+            return {
+              ok: true,
+              payload: postSendExtractions[Math.min(extractionCount - 1, postSendExtractions.length - 1)]
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?response_finality_stall_resets=${Date.now()}`);
+    port.emit(envelope("job_start", "job_response_finality_stall_resets", {
+      recipe: "claude",
+      prompt: "prompt",
+      wait_interval_ms: 500,
+      wait_timeout_ms: 7000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_response_finality_stall_resets", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_response_finality_stall_resets.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.payload.code === "response_finality_stalled"
+    ), 7000);
+    assert.ok(
+      extractionCount >= 12,
+      `timer must restart after signature changes and ignore missing identity; observed ${extractionCount} extractions`
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousFinalityStallMs === undefined) {
+      delete globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS;
+    } else {
+      globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS = previousFinalityStallMs;
     }
   }
 });
