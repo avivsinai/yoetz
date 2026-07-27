@@ -5971,6 +5971,10 @@ test("service worker preserves content-script committed-send error metadata", as
               code: "send_acceptance_unknown",
               state: "usage_credits_exhausted",
               provider_message: "Your org is out of usage credits for the month.",
+              provider_dom: {
+                container: { found: true, tag: "div", role: "alert" },
+                switch_models_control: { found: false }
+              },
               requested_model: "fable-5-max",
               send_committed: true,
               phase: "send",
@@ -6005,6 +6009,10 @@ test("service worker preserves content-script committed-send error metadata", as
     assert.equal(error.payload.side_effect_started, true);
     assert.equal(error.payload.state, "usage_credits_exhausted");
     assert.equal(error.payload.provider_message, "Your org is out of usage credits for the month.");
+    assert.deepEqual(error.payload.provider_dom, {
+      container: { found: true, tag: "div", role: "alert" },
+      switch_models_control: { found: false }
+    });
     assert.equal(error.payload.requested_model, "fable-5-max");
     assert.equal(error.payload.send_committed, true);
     assert.equal(port.messages.some((message) => message.type === "job_complete"), false);

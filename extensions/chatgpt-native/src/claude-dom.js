@@ -9,6 +9,7 @@ const ATTACHMENT_SELECTOR = "[data-testid='file-thumbnail']";
 const COPY_ACTION_SELECTOR = "[data-testid='action-bar-copy']";
 const ASSISTANT_SELECTOR = "[data-is-streaming]";
 const MODEL_MENU_SETTLE_MS = 300;
+const BLOCKING_STATE_SCAN_INTERVAL_MS = 1000;
 const SWITCH_MODELS_CONTROL_SELECTOR = "button, a, [role='button'], [role='link']";
 const CONVERSATION_CONTENT_SELECTOR = [
   COMPOSER_SELECTOR,
@@ -17,7 +18,13 @@ const CONVERSATION_CONTENT_SELECTOR = [
   "[data-is-streaming]",
   "article"
 ].join(", ");
+// Visible claude.ai web banner observed in an Aviv-provided screenshot on
+// 2026-07-27. This is screenshot provenance, not a captured DOM fixture; match
+// stable credit-exhaustion language while the structural control/container
+// guards carry false-positive resistance.
 const USAGE_CREDITS_PROVIDER_MESSAGE = "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.";
+const USAGE_CREDITS_TEXT_PATTERN = /\bout of usage credits\b/i;
+const blockingStateScanCache = new WeakMap();
 
 export function ownedWindowName(job) {
   return `${YOETZ_WINDOW_PREFIX}${job.run_id}:${job.job_id}`;
@@ -67,29 +74,47 @@ export function classifyWaitManualHandoff({ url = "", title = "" } = {}) {
   return classifyManualHandoff({ url, title, text: "" });
 }
 
-export function classifyBlockingState(root = document) {
-  const switchModels = visibleElements(root, SWITCH_MODELS_CONTROL_SELECTOR)
-    .filter((element) => normalizeText(element.innerText || element.textContent).toLowerCase() === "switch models")
-    .filter((element) => !element.closest?.(CONVERSATION_CONTENT_SELECTOR));
-  for (const control of switchModels) {
-    let container = control;
-    while (container) {
-      const text = normalizeText(container.innerText || container.textContent).toLowerCase();
-      if (text === USAGE_CREDITS_PROVIDER_MESSAGE.toLowerCase()
-          && isActuallyVisible(root, container)
-          && !container.querySelector?.(CONVERSATION_CONTENT_SELECTOR)) {
-        return {
-          state: "usage_credits_exhausted",
-          code: "usage_credits_exhausted",
-          requested_model: "fable-5-max",
-          provider_message: USAGE_CREDITS_PROVIDER_MESSAGE,
-          message: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
-        };
-      }
-      container = container.parentElement;
-    }
+export function classifyBlockingState(root = document, { forceScan = false } = {}) {
+  const pageText = normalizeText(root.body?.textContent || root.documentElement?.textContent);
+  if (pageText && !USAGE_CREDITS_TEXT_PATTERN.test(pageText)) {
+    return null;
   }
-  return null;
+  const now = Date.now();
+  const cached = blockingStateScanCache.get(root);
+  if (!forceScan && cached && now - cached.scanned_at_ms < BLOCKING_STATE_SCAN_INTERVAL_MS) {
+    return cached.value;
+  }
+  const candidates = Array.from(root.querySelectorAll?.("body *") ?? []);
+  const container = candidates
+    .filter((element) => USAGE_CREDITS_TEXT_PATTERN.test(normalizeText(element.textContent)))
+    .filter((element) => !element.closest?.(CONVERSATION_CONTENT_SELECTOR))
+    .filter((element) => !element.querySelector?.(CONVERSATION_CONTENT_SELECTOR))
+    .filter((element) => isStrictlyVisibleBannerElement(root, element))
+    .sort((left, right) => normalizeText(left.textContent).length - normalizeText(right.textContent).length)
+    .at(0);
+  if (!container) {
+    blockingStateScanCache.set(root, { scanned_at_ms: now, value: null });
+    return null;
+  }
+  const switchControl = Array.from(root.querySelectorAll?.(SWITCH_MODELS_CONTROL_SELECTOR) ?? [])
+    .filter((element) => normalizeText(element.textContent).toLowerCase() === "switch models")
+    .filter((element) => isDescendantOrSelf(element, container))
+    .filter((element) => isStrictlyVisibleBannerElement(root, element))
+    .at(0);
+  const text = normalizeText(container.innerText || container.textContent);
+  const blockingState = {
+    state: "usage_credits_exhausted",
+    code: "usage_credits_exhausted",
+    requested_model: "fable-5-max",
+    provider_message: text || USAGE_CREDITS_PROVIDER_MESSAGE,
+    provider_dom: {
+      container: elementDiagnostic(container),
+      switch_models_control: switchControl ? elementDiagnostic(switchControl) : { found: false }
+    },
+    message: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
+  };
+  blockingStateScanCache.set(root, { scanned_at_ms: now, value: blockingState });
+  return blockingState;
 }
 
 export function findComposer(root = document) {
@@ -738,10 +763,30 @@ async function closeModelMenu(root, modelButton) {
 }
 
 function visibleElements(root, selector) {
-  return Array.from(root.querySelectorAll?.(selector) ?? []).filter((element) => isActuallyVisible(root, element));
+  return Array.from(root.querySelectorAll?.(selector) ?? [])
+    .filter((element) => element.getClientRects().length > 0);
 }
 
-function isActuallyVisible(root, element) {
+function isDescendantOrSelf(element, ancestor) {
+  for (let node = element; node; node = node.parentElement) {
+    if (node === ancestor) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function elementDiagnostic(element) {
+  return {
+    found: true,
+    tag: String(element?.tagName ?? "").toLowerCase() || null,
+    role: element?.getAttribute?.("role") ?? null,
+    testid: element?.getAttribute?.("data-testid") ?? null,
+    class_fragment: normalizeText(element?.getAttribute?.("class")).slice(0, 160) || null
+  };
+}
+
+function isStrictlyVisibleBannerElement(root, element) {
   const viewWidth = Number(root.defaultView?.innerWidth);
   const viewHeight = Number(root.defaultView?.innerHeight);
   for (let node = element; node; node = node.parentElement) {
@@ -895,7 +940,7 @@ function throwIfModelBlocked(root) {
     phase: "model_selection",
     side_effect_started: false,
     send_committed: false
-  });
+  }, { forceScan: true });
 }
 
 async function waitForModelOptional(root, read, timeoutMs) {
@@ -923,8 +968,8 @@ function blockingStateError(blockingState, detail = {}) {
   });
 }
 
-function throwIfBlockingState(root, detail) {
-  const blockingState = classifyBlockingState(root);
+function throwIfBlockingState(root, detail, options) {
+  const blockingState = classifyBlockingState(root, options);
   if (blockingState) {
     throw blockingStateError(blockingState, detail);
   }

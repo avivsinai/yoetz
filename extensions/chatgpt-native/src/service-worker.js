@@ -1256,6 +1256,7 @@ function errorContextForJob(job, error = null) {
   for (const key of [
     "state",
     "provider_message",
+    "provider_dom",
     "requested_model",
     "send_committed"
   ]) {
@@ -1561,6 +1562,7 @@ function tabCommandError(response) {
   for (const key of [
     "state",
     "provider_message",
+    "provider_dom",
     "requested_model",
     "send_committed",
     "requested_conversation_id",

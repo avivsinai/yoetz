@@ -25,7 +25,8 @@ function fakeCreditBanner({
   style = {},
   rect = null,
   conversationDescendant = false,
-  hiddenAncestor = false
+  hiddenAncestor = false,
+  switchControlQueryable = true
 } = {}) {
   const shell = {
     innerText: text,
@@ -33,6 +34,9 @@ function fakeCreditBanner({
     parentElement: null,
     getAttribute() {
       return null;
+    },
+    closest() {
+      return excluded ? {} : null;
     },
     querySelector() {
       return conversationDescendant ? {} : null;
@@ -54,6 +58,9 @@ function fakeCreditBanner({
     },
     getBoundingClientRect() {
       return rect;
+    },
+    closest() {
+      return excluded ? {} : null;
     },
     querySelector() {
       return conversationDescendant ? {} : null;
@@ -112,7 +119,10 @@ function fakeCreditBanner({
         ...style
       })
     },
-    querySelectorAll: (selector) => selector.includes("button") ? [switchModels] : []
+    querySelectorAll(selector) {
+      if (selector === "body *") return [banner, switchModels];
+      return switchControlQueryable && selector.includes("button") ? [switchModels] : [];
+    }
   };
   return { root, shell, banner, switchModels };
 }
@@ -125,19 +135,45 @@ test("classifyBlockingState detects the visible organization credit banner", () 
     code: "usage_credits_exhausted",
     requested_model: "fable-5-max",
     provider_message: "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.",
+    provider_dom: {
+      container: {
+        found: true,
+        tag: null,
+        role: "alert",
+        testid: null,
+        class_fragment: null
+      },
+      switch_models_control: {
+        found: true,
+        tag: null,
+        role: "button",
+        testid: null,
+        class_fragment: null
+      }
+    },
     message: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
   });
   assert.equal(banner.switchModels.clickCount, 0);
 });
 
-test("classifyBlockingState ignores quoted, hidden, and incomplete credit text", () => {
+test("classifyBlockingState survives unknown Switch models markup and records diagnostics", () => {
+  const banner = fakeCreditBanner({ switchControlQueryable: false });
+
+  const blockingState = classifyBlockingState(banner.root);
+
+  assert.equal(blockingState?.code, "usage_credits_exhausted");
+  assert.deepEqual(blockingState?.provider_dom.switch_models_control, { found: false });
+  assert.equal(banner.switchModels.clickCount, 0);
+});
+
+test("classifyBlockingState accepts wording drift but rejects structural false positives", () => {
   const quoted = fakeCreditBanner({ excluded: true });
   const hidden = fakeCreditBanner({ visible: false });
   const transparent = fakeCreditBanner({ style: { opacity: "0" } });
   const offscreen = fakeCreditBanner({
     rect: { left: 0, top: 900, right: 500, bottom: 1000, width: 500, height: 100 }
   });
-  const incomplete = fakeCreditBanner({
+  const shortened = fakeCreditBanner({
     text: "Your org is out of usage credits for the month. Switch models to continue chatting."
   });
   const reordered = fakeCreditBanner({
@@ -148,16 +184,36 @@ test("classifyBlockingState ignores quoted, hidden, and incomplete credit text",
   });
   const conversationCompleted = fakeCreditBanner({ conversationDescendant: true });
   const ancestorHidden = fakeCreditBanner({ hiddenAncestor: true });
+  const unrelated = fakeCreditBanner({
+    text: "Your organization has a billing notice. Switch models to continue chatting."
+  });
 
   assert.equal(classifyBlockingState(quoted.root), null);
   assert.equal(classifyBlockingState(hidden.root), null);
   assert.equal(classifyBlockingState(transparent.root), null);
   assert.equal(classifyBlockingState(offscreen.root), null);
-  assert.equal(classifyBlockingState(incomplete.root), null);
-  assert.equal(classifyBlockingState(reordered.root), null);
-  assert.equal(classifyBlockingState(extra.root), null);
+  assert.equal(classifyBlockingState(shortened.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(reordered.root)?.code, "usage_credits_exhausted");
+  assert.equal(classifyBlockingState(extra.root)?.code, "usage_credits_exhausted");
   assert.equal(classifyBlockingState(conversationCompleted.root), null);
   assert.equal(classifyBlockingState(ancestorHidden.root), null);
+  assert.equal(classifyBlockingState(unrelated.root), null);
+});
+
+test("classifyBlockingState throttles repeated full-DOM scans for quoted credit text", () => {
+  const quoted = fakeCreditBanner({ excluded: true });
+  const querySelectorAll = quoted.root.querySelectorAll.bind(quoted.root);
+  let bodyScans = 0;
+  quoted.root.querySelectorAll = (selector) => {
+    if (selector === "body *") bodyScans += 1;
+    return querySelectorAll(selector);
+  };
+
+  assert.equal(classifyBlockingState(quoted.root), null);
+  assert.equal(classifyBlockingState(quoted.root), null);
+  assert.equal(bodyScans, 1);
+  assert.equal(classifyBlockingState(quoted.root, { forceScan: true }), null);
+  assert.equal(bodyScans, 2);
 });
 
 test("Claude waits reclassify a persistent credit banner instead of timing out", async () => {
@@ -184,6 +240,7 @@ test("Claude waits reclassify a persistent credit banner instead of timing out",
 test("waitForSendAccepted fails with typed credit state without switching models", async () => {
   const banner = fakeCreditBanner();
   banner.root.querySelectorAll = (selector) => {
+    if (selector === "body *") return [banner.banner, banner.switchModels];
     if (selector.includes("button") || selector.includes("[role=")) return [banner.switchModels];
     if (selector === "[data-testid='user-message']") return [];
     if (selector === "[data-is-streaming]") return [];
@@ -621,6 +678,25 @@ test("fake Claude model picker drives hover-only Max then closes", async () => {
   }
 });
 
+test("fake Claude model picker keeps shared menu visibility semantics for offscreen Fable", async () => {
+  const fixture = makeClaudeModelFixture({ offscreenFable: true });
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    const result = await configureModelState(fixture.root, { model_selection_timeout_ms: 250 });
+    assert.equal(result.status, "selected");
+    assert.equal(fixture.fableClicks, 1);
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
 test("fake Claude model picker reclassifies credits immediately after Fable selection", async () => {
   const fixture = makeClaudeModelFixture();
   const credits = fakeCreditBanner();
@@ -630,9 +706,11 @@ test("fake Claude model picker reclassifies credits immediately after Fable sele
     ...credits.root.defaultView
   };
   fixture.root.querySelectorAll = (selector) => (
-    fixture.modelButton.innerText === "Fable 5 High" && selector.includes("button")
-      ? [credits.switchModels]
-      : originalQuerySelectorAll(selector)
+    fixture.modelButton.innerText === "Fable 5 High" && selector === "body *"
+      ? [credits.banner, credits.switchModels]
+      : fixture.modelButton.innerText === "Fable 5 High" && selector.includes("button")
+        ? [credits.switchModels]
+        : originalQuerySelectorAll(selector)
   );
   const previousPointerEvent = globalThis.PointerEvent;
   const previousMouseEvent = globalThis.MouseEvent;
@@ -1227,7 +1305,8 @@ function makeClaudeModelFixture({
   includeMax = true,
   delayedSelectionClose = false,
   ignoreEscape = false,
-  initiallyConfigured = false
+  initiallyConfigured = false,
+  offscreenFable = false
 } = {}) {
   let menuOpen = false;
   let effortHovered = false;
@@ -1306,6 +1385,16 @@ function makeClaudeModelFixture({
     modelButton.textContent = modelButton.innerText;
     closeAfterSelection();
   });
+  if (offscreenFable) {
+    fable.getBoundingClientRect = () => ({
+      left: 10,
+      top: 900,
+      right: 50,
+      bottom: 920,
+      width: 40,
+      height: 20
+    });
+  }
   const sonnet = control({ role: "menuitemradio", "aria-checked": includeFable ? "false" : "true" }, "Sonnet 5");
   const effort = control({ "data-testid": "effort-menu-trigger" }, "Effort");
   const max = control({ role: "menuitemradio", "data-testid": "effort-option-max", "aria-checked": initiallyConfigured ? "true" : "false" }, "Max", (element) => {

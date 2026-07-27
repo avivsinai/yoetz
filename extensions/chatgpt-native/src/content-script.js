@@ -166,6 +166,10 @@ async function sendPrompt(job, prompt) {
     waitForSendAccepted
   } = await domHelpers(job);
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send", adapter));
+  // side_effect_started tracks provider-visible job effects, not whether prompt
+  // text was inserted. The worker reaches sendPrompt only after bundle upload
+  // committed, so every failure from this point is post-side-effect even when
+  // send_committed remains false.
   assertNoBlockingState(classifyBlockingState, {
     phase: "send",
     side_effect_started: true,
@@ -535,7 +539,7 @@ function commandError(code, message, detail = {}) {
 }
 
 function assertNoBlockingState(classifyBlockingState, detail) {
-  const blockingState = classifyBlockingState?.(document);
+  const blockingState = classifyBlockingState?.(document, { forceScan: true });
   if (!blockingState) {
     return;
   }
@@ -591,6 +595,7 @@ function errorResponse(error) {
   for (const key of [
     "state",
     "provider_message",
+    "provider_dom",
     "requested_model",
     "send_committed",
     "requested_conversation_id",

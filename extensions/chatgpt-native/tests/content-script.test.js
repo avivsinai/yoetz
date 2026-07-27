@@ -537,6 +537,7 @@ test("content script rechecks Claude credits after prompt insertion without clic
     assert.equal(response.side_effect_started, true);
     assert.equal(response.send_committed, false);
     assert.equal(response.provider_message, usageCreditsState().provider_message);
+    assert.deepEqual(response.provider_dom, usageCreditsState().provider_dom);
     assert.equal(hooks.clickSendCalls.length, 0);
   } finally {
     restore();
@@ -746,6 +747,10 @@ function usageCreditsState() {
     code: "usage_credits_exhausted",
     requested_model: "fable-5-max",
     provider_message: "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.",
+    provider_dom: {
+      container: { found: true, tag: "div", role: "alert" },
+      switch_models_control: { found: false }
+    },
     message: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
   };
 }
