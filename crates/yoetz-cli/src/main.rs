@@ -5711,6 +5711,7 @@ mod tests {
     // acceptance. A failure after a dependency bump is behavior to assess and record, not a
     // literal to update mechanically. The u64::MAX multipleOf case detects the 0.48.0 exact
     // integer fix; the disabled Validation vocabulary case detects the 0.47.0 vocabulary fix.
+    // A meta-schema resolution error instead means this test's file-URI harness needs porting.
     #[test]
     fn output_schema_accepts_matching_value() {
         let dir = TempDir::new().unwrap();
