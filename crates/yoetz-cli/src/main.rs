@@ -2439,6 +2439,7 @@ async fn run_claude_recipe_via_chrome_devtools_mcp(
         model_used: response.model_used,
         model_selection_status: response.model_selection_status,
         warnings: recipe_spec.warnings,
+        warning_details: Vec::new(),
         fallback_used,
         conversation_id: response.conversation_id,
         conversation_url: response.conversation_url,
@@ -2532,6 +2533,15 @@ fn build_claude_recipe_spec(
     let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
     let upload_timeout_ms =
         dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, recipe_args.bundle.as_deref())?;
+    let attachment_stall_timeout_ms = recipe_vars
+        .get("attachment_stall_timeout_ms")
+        .map(|raw| {
+            raw.parse::<u64>().with_context(|| {
+                format!("invalid recipe var `attachment_stall_timeout_ms` value `{raw}`")
+            })
+        })
+        .transpose()?
+        .unwrap_or(0);
     let send_timeout_ms = dev_browser::resolve_chatgpt_send_timeout_ms(recipe_vars)?;
     claude_web::validate_thread_mode(recipe_vars.get("thread").map(String::as_str))?;
     let conversation = recipe_vars
@@ -2540,10 +2550,12 @@ fn build_claude_recipe_spec(
         .transpose()?;
     Ok(claude_recipe::ClaudeRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
-        prompt: recipe_vars
-            .get("prompt")
-            .cloned()
-            .unwrap_or_else(|| DEFAULT_CHATGPT_RECIPE_PROMPT.to_string()),
+        prompt: claude_recipe::render_builtin_prompt(
+            recipe_vars
+                .get("prompt")
+                .map(String::as_str)
+                .unwrap_or(DEFAULT_CHATGPT_RECIPE_PROMPT),
+        ),
         browser_context_id: recipe_vars
             .get("browser_context_id")
             .map(|value| value.trim().to_string())
@@ -2569,6 +2581,7 @@ fn build_claude_recipe_spec(
         wait_timeout_ms: poll_settings.timeout_ms,
         wait_interval_ms: poll_settings.interval_ms,
         upload_timeout_ms,
+        attachment_stall_timeout_ms,
         send_timeout_ms,
         close_tab_on_complete: !recipe_args.keep_tab,
         warnings: warnings.to_vec(),
@@ -2866,6 +2879,7 @@ fn run_recipe_via_chrome_extension_native<R: IntoBuiltinWebRecipe>(
                 model_used: response.model_used,
                 model_selection_status: response.model_selection_status,
                 warnings,
+                warning_details: response.warning_details,
                 fallback_used,
                 conversation_id: response.conversation_id,
                 conversation_url: response.conversation_url,
@@ -3450,6 +3464,7 @@ fn run_claude_recipe_via_dev_browser(
         model_used: response.model_used,
         model_selection_status: response.model_selection_status,
         warnings: response.warnings,
+        warning_details: Vec::new(),
         fallback_used,
         conversation_id: response.conversation_id,
         conversation_url: response.conversation_url,
@@ -3508,6 +3523,7 @@ fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
     let builtin_recipe = builtin_recipe.into_builtin_web_recipe();
     let is_chatgpt = builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Chatgpt);
     let is_claude = builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Claude);
+    let (recipe_vars, opaque_prompt) = prepare_agent_browser_prompt(is_claude, recipe_vars);
     let needs_auth = is_chatgpt || is_claude;
     let target_url = if is_claude {
         claude_web::CLAUDE_URL
@@ -3574,6 +3590,7 @@ fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
         bundle_text,
+        opaque_prompt,
         profile_dir: Some(profile_dir),
         profile_mode,
         fallback_used,
@@ -3610,6 +3627,20 @@ fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
         );
         Ok(payload)
     }
+}
+
+fn prepare_agent_browser_prompt(
+    is_builtin_claude: bool,
+    mut recipe_vars: BTreeMap<String, String>,
+) -> (BTreeMap<String, String>, Option<String>) {
+    if !is_builtin_claude {
+        return (recipe_vars, None);
+    }
+    let caller_prompt = recipe_vars
+        .remove("prompt")
+        .unwrap_or_else(|| DEFAULT_CHATGPT_RECIPE_PROMPT.to_string());
+    let prompt = claude_recipe::render_builtin_prompt(&caller_prompt);
+    (recipe_vars, Some(prompt))
 }
 
 fn maybe_notify_browser_recipe_completion(
@@ -7872,6 +7903,75 @@ mod tests {
     }
 
     #[test]
+    fn builtin_claude_agent_browser_prompt_crosses_the_transport_boundary_opaquely() {
+        let caller = "review\r\nliteral {{run_id}}  \n\n";
+        let vars = BTreeMap::from([
+            ("prompt".to_string(), caller.to_string()),
+            ("run_id".to_string(), "run-actual".to_string()),
+        ]);
+
+        let (vars, opaque_prompt) = prepare_agent_browser_prompt(true, vars);
+        assert!(!vars.contains_key("prompt"));
+        assert_eq!(vars["run_id"], "run-actual");
+        let context = browser::RecipeContext {
+            bundle_path: None,
+            bundle_text: None,
+            opaque_prompt,
+            profile_dir: None,
+            profile_mode: browser::BrowserProfileMode::ProfileOnly,
+            fallback_used: false,
+            use_stealth: false,
+            headed: false,
+            vars,
+            warnings: Vec::new(),
+            target_url: claude_web::CLAUDE_URL.to_string(),
+        };
+        let expanded = browser::interpolate("{{prompt}}", &context, None).unwrap();
+        let expected = format!("{}\n\n{}", claude_recipe::OUTPUT_CHANNEL_CONTRACT, caller);
+
+        assert_eq!(expanded.as_bytes(), expected.as_bytes());
+        assert_eq!(
+            expanded
+                .matches(claude_recipe::OUTPUT_CHANNEL_CONTRACT)
+                .count(),
+            1
+        );
+        assert!(expanded.contains("literal {{run_id}}  \n\n"));
+    }
+
+    #[test]
+    fn custom_agent_browser_recipe_keeps_ordinary_prompt_interpolation() {
+        let caller = "review\r\nliteral {{run_id}}  \n\n";
+        let vars = BTreeMap::from([
+            ("prompt".to_string(), caller.to_string()),
+            ("run_id".to_string(), "run-actual".to_string()),
+        ]);
+
+        let (prepared_vars, opaque_prompt) = prepare_agent_browser_prompt(false, vars.clone());
+
+        assert_eq!(prepared_vars, vars);
+        assert_eq!(opaque_prompt, None);
+        let context = browser::RecipeContext {
+            bundle_path: None,
+            bundle_text: None,
+            opaque_prompt,
+            profile_dir: None,
+            profile_mode: browser::BrowserProfileMode::ProfileOnly,
+            fallback_used: false,
+            use_stealth: false,
+            headed: false,
+            vars: prepared_vars,
+            warnings: Vec::new(),
+            target_url: "https://example.test/".to_string(),
+        };
+
+        assert_eq!(
+            browser::interpolate("{{prompt}}", &context, None).unwrap(),
+            "review\r\nliteral run-actual  \n\n"
+        );
+    }
+
+    #[test]
     fn claude_recipe_output_serializes_standard_contract_with_run_metadata() {
         let output = claude_recipe::ClaudeRecipeOutput {
             transport: "chrome-devtools-mcp".to_string(),
@@ -7880,6 +7980,11 @@ mod tests {
             model_used: Some("Fable 5 Max".to_string()),
             model_selection_status: web_recipe::WebModelSelectionStatus::Selected,
             warnings: vec!["size warning".to_string()],
+            warning_details: vec![json!({
+                "code": "artifact_unextracted",
+                "count": 1,
+                "titles": ["Release plan"]
+            })],
             fallback_used: false,
             conversation_id: None,
             conversation_url: None,
@@ -7893,7 +7998,17 @@ mod tests {
         assert_eq!(payload["delivery_mode"], "file_upload");
         assert_eq!(payload["run_id"], "run-claude");
         assert_eq!(payload["elapsed_ms"], 1234);
-        assert_eq!(payload["warnings"], json!(["size warning"]));
+        assert_eq!(
+            payload["warnings"],
+            json!([
+                "size warning",
+                {
+                    "code": "artifact_unextracted",
+                    "count": 1,
+                    "titles": ["Release plan"]
+                }
+            ])
+        );
     }
 
     #[test]
@@ -7988,6 +8103,46 @@ mod tests {
         assert_eq!(spec.model, chatgpt_recipe::CHATGPT_SOL_PRO_MODEL);
         assert!(!recipe_vars.contains_key("model"));
         assert!(!recipe_vars.contains_key("extended"));
+    }
+
+    #[test]
+    fn builtin_claude_recipe_routes_attachment_stall_timeout_from_recipe_var_to_native_spec() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/claude.yaml");
+        let content = fs::read_to_string(&path).expect("read recipes/claude.yaml");
+        let recipe: browser::Recipe = serde_yaml_ng::from_str(&content).expect("parse claude.yaml");
+        let defaults = browser::build_recipe_vars(recipe.defaults.as_ref(), &[])
+            .expect("build default recipe vars");
+        assert_eq!(
+            defaults
+                .get("attachment_stall_timeout_ms")
+                .map(String::as_str),
+            Some("0")
+        );
+        let recipe_args = BrowserRecipeArgs {
+            recipe: PathBuf::from("recipes/claude.yaml"),
+            transport: None,
+            allow_cdp_fallback: false,
+            keep_tab: false,
+            bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            profile: None,
+            cdp: None,
+            browser_id: None,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
+            vars: vec!["attachment_stall_timeout_ms=420000".to_string()],
+            followup: None,
+            thread: None,
+            fresh: false,
+            on_thread_conflict: None,
+            allow_duplicate_prompt: false,
+            no_notify: false,
+        };
+
+        let recipe_vars = browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)
+            .expect("build recipe vars");
+        let spec = build_claude_recipe_spec(&recipe_args, &recipe_vars, &[]).unwrap();
+
+        assert_eq!(recipe_vars["attachment_stall_timeout_ms"], "420000");
+        assert_eq!(spec.attachment_stall_timeout_ms, 420_000);
     }
 
     #[test]

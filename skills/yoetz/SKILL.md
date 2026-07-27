@@ -1,6 +1,6 @@
 ---
 name: yoetz
-version: 0.5.44
+version: 0.5.46
 description: >
   Fast CLI-first LLM council, bundler, and multimodal gateway. Use ONLY when user
   explicitly mentions "yoetz", "yoetz ask", "yoetz council", "yoetz review",
@@ -256,6 +256,25 @@ run needs a deliberate override. If the extension returns a terminal
 upload/send/wait error, use
 `yoetz browser extension inspect --chatgpt --run-id <run-id>` before deciding
 whether an intentional rerun is safe.
+
+The two pre-response phases take the same kind of override, for both the
+`chatgpt` and `claude` recipes: `--var upload_timeout_ms=<milliseconds>` bounds
+the bundle attach and `--var send_timeout_ms=<milliseconds>` bounds the send.
+Send defaults to 120000. Upload defaults to 120000 plus 5000 per MiB of bundle,
+rounded up and capped at 3600000, so any non-empty sub-MiB bundle is bounded at
+125000; an empty bundle stays at 120000. Not every terminal upload error is a
+timeout — the phase also fails closed on invalid conversation, manual handoff,
+and rejected file chunks — but the specific `Claude page did not reach the
+requested state within <n>ms` error means the attachment thumbnail and an enabled
+send control never both appeared within that bound. Read that bound as processing
+latency, not transfer capacity: a small bundle can exhaust it when the site is
+slow to accept an attachment, and the attach can still land after the deadline,
+so raising `upload_timeout_ms` is the lever rather than an immediate rerun.
+Inspect the preserved tab before any rerun — use
+`yoetz browser extension inspect --claude --run-id <run-id>` for Claude runs, the
+`--chatgpt` form above for ChatGPT — because a late attach leaves a real
+attachment on that tab even though no conversation was created, so rerunning
+blind can duplicate the upload.
 
 If progress says `waiting for final assistant controls`, ChatGPT has exposed
 post-send assistant text but not a final scoped action affordance yet. Do not

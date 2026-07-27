@@ -29,6 +29,11 @@ name: claude
 # from the extension isolated world. Finality requires a non-streaming last
 # assistant turn and no Stop response control; cloned group/status thinking rows
 # are excluded from answer text without mutating the live DOM.
+# attachment_stall_timeout_ms is an opt-in post-upload observation deadline.
+# Zero preserves the upload_timeout_ms failure behavior; set it above that soft
+# timeout only for a deliberate instrumented attachment investigation.
+# The typed builtin path prepends an output-channel contract that keeps the
+# deliverable in the chat message; custom recipes remain caller-controlled.
 #
 # inline_warn_tokens is a heuristic quality guard, not a documented Claude
 # cutoff. Above it, claude.ai may use retrieval-backed file access. Set 0 to
@@ -38,6 +43,7 @@ defaults:
   prompt: Review the attached file and provide your analysis.
   thread: "fresh"
   upload_timeout_ms: "120000"
+  attachment_stall_timeout_ms: "0"
   upload_interval_ms: "2000"
   send_timeout_ms: "120000"
   wait_timeout_ms: "5400000"

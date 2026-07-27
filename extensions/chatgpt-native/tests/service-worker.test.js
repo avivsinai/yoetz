@@ -448,6 +448,7 @@ test("service worker runs a Claude job through its adapter and probes the select
   const port = makePort();
   const sentToTabs = [];
   let sent = false;
+  let postSendExtractCount = 0;
   const conversationId = "123e4567-e89b-12d3-a456-426614174000";
 
   globalThis.chrome = chromeStub({
@@ -491,10 +492,11 @@ test("service worker runs a Claude job through its adapter and probes the select
               }
             };
           case "yoetz_extract_response":
+            if (sent) postSendExtractCount += 1;
             return {
               ok: true,
               payload: sent
-                ? {
+                  ? {
                     method: "assistant_dom",
                     text: "Claude answer",
                     is_generating: false,
@@ -502,7 +504,11 @@ test("service worker runs a Claude job through its adapter and probes the select
                     copy_button_count: 0,
                     has_copy_button: false,
                     turn_index: 0,
-                    conversation_id: conversationId
+                    conversation_id: conversationId,
+                    artifact_blocks: {
+                      count: postSendExtractCount >= 2 ? 1 : 0,
+                      titles: postSendExtractCount >= 2 ? ["Release plan"] : []
+                    }
                   }
                 : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
             };
@@ -561,6 +567,151 @@ test("service worker runs a Claude job through its adapter and probes the select
     assert.equal(complete.payload.completion_reason, "stable_idle");
     assert.equal(complete.payload.conversation_id, conversationId);
     assert.equal(complete.payload.conversation_url, `https://claude.ai/chat/${conversationId}`);
+    assert.deepEqual(complete.payload.warnings, [{
+      code: "artifact_unextracted",
+      count: 1,
+      titles: ["Release plan"]
+    }]);
+    assert.equal(postSendExtractCount, 2);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker completes an artifact-only Claude response with both warnings", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let sent = false;
+  const conversationId = "223e4567-e89b-12d3-a456-426614174000";
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async ({ url, active }) => {
+        assert.equal(url, "https://claude.ai/new?_yoetz=run_job_claude_artifact_only");
+        assert.equal(active, false);
+        return { id: 72 };
+      },
+      get: async (id) => ({
+        id,
+        status: "complete",
+        url: "https://claude.ai/new?_yoetz=run_job_claude_artifact_only"
+      }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude", url: "https://claude.ai/new" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "selected",
+                requested_model: "fable-5-max",
+                modelVerified: true,
+                maxVerified: true,
+                model_used: "Fable 5 Max"
+              }
+            };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: conversationId,
+                submitted_user_count: 1,
+                submitted_assistant_count: 0
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "none",
+                    text: "",
+                    is_generating: false,
+                    assistant_count: 1,
+                    copy_button_count: 0,
+                    has_copy_button: false,
+                    turn_index: 0,
+                    conversation_id: conversationId,
+                    artifact_blocks: {
+                      count: 1,
+                      titles: ["Release plan"]
+                    }
+                  }
+                : {
+                    method: "none",
+                    text: "",
+                    is_generating: false,
+                    assistant_count: 0,
+                    turn_index: -1
+                  }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      },
+      group: async () => 1
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_artifact_only=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_claude_artifact_only", {
+      recipe: "claude",
+      prompt: "review",
+      wait_interval_ms: 500,
+      wait_timeout_ms: 2500
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.job_id === "job_claude_artifact_only"
+      && (message.type === "job_error" || message.payload?.phase === "ready_for_file")
+    ));
+    const startError = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_artifact_only"
+    );
+    assert.equal(startError, undefined, JSON.stringify(startError?.payload));
+
+    port.emit(envelope("job_file_chunk", "job_claude_artifact_only", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.job_id === "job_claude_artifact_only"
+      && (message.type === "job_complete" || message.type === "job_error")
+    ));
+    const complete = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_claude_artifact_only"
+    );
+    assert.ok(complete, JSON.stringify(port.messages));
+    assert.equal(complete.payload.response, "");
+    assert.deepEqual(complete.payload.warnings, [
+      "empty Claude response extracted",
+      {
+        code: "artifact_unextracted",
+        count: 1,
+        titles: ["Release plan"]
+      }
+    ]);
+    assert.equal(
+      port.messages.some((message) =>
+        message.type === "job_error" && message.job_id === "job_claude_artifact_only"
+      ),
+      false
+    );
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -611,6 +762,89 @@ test("service worker reports a generic Claude model timeout as model_selection",
     assert.equal(error.payload.code, "extension_error");
     assert.equal(error.payload.phase, "model_selection");
     assert.equal(error.payload.side_effect_started, true);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker surfaces a Claude attachment-stalled trace in the job error", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let uploadJob = null;
+  const attachmentTrace = {
+    final_chunk_ack_at_ms: 100,
+    input_resolved_at_ms: 101,
+    files_assigned_at_ms: 102,
+    change_dispatched_at_ms: 103,
+    soft_timeout_at_ms: 125000,
+    hard_timeout_at_ms: 420000,
+    hard_timeout_pending_legs: ["matching_thumbnail", "remove_control"]
+  };
+
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (options) => ({ id: 71, ...options }),
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new?_yoetz=run_job_claude_attachment_stalled" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "claude" } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedFableMaxSelection() };
+          case "yoetz_upload_file":
+            uploadJob = message.job;
+            return {
+              ok: false,
+              code: "attachment_stalled",
+              error: "Claude attachment stalled before readiness",
+              phase: "upload",
+              side_effect_started: true,
+              attachment_trace: attachmentTrace
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_attachment_trace=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("job_start", "job_claude_attachment_stalled", {
+      recipe: "claude",
+      prompt: "review",
+      attachment_stall_timeout_ms: 420000
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.job_id === "job_claude_attachment_stalled"
+      && message.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_claude_attachment_stalled", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_attachment_stalled"
+    ));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_claude_attachment_stalled"
+    );
+    assert.equal(error.payload.code, "attachment_stalled");
+    assert.equal(error.payload.phase, "upload");
+    assert.deepEqual(error.payload.attachment_trace, attachmentTrace);
+    assert.ok(Number.isSafeInteger(uploadJob?.attachment_trace?.final_chunk_ack_at_ms));
+    assert.equal(uploadJob?.attachment_stall_timeout_ms, 420000);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -3037,6 +3271,304 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
   }
 });
 
+test("service worker polls adaptively after post-send assistant text appears", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousActivityPoll = globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS;
+  globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS = 250;
+  const port = makePort();
+  const postSendExtractionTimes = [];
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response": {
+            if (!sent) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 } };
+            }
+            postSendExtractionTimes.push(Date.now());
+            const final = postSendExtractionTimes.length >= 5;
+            return {
+              ok: true,
+              payload: {
+                method: final ? "copy_scope_dom_fallback" : "assistant_dom_fallback",
+                text: final ? "Finished answer." : `Draft ${postSendExtractionTimes.length}`,
+                is_generating: !final,
+                assistant_count: 1,
+                user_count: 1,
+                preceding_user_count: 1,
+                copy_button_count: final ? 1 : 0,
+                has_copy_button: final,
+                turn_index: 0
+              }
+            };
+          }
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?adaptive_post_send_poll=${Date.now()}`);
+    port.emit(envelope("job_start", "job_adaptive_post_send_poll", {
+      prompt: "prompt",
+      wait_interval_ms: 1000,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_adaptive_post_send_poll", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_adaptive_post_send_poll.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"), 5000);
+    assert.ok(postSendExtractionTimes.length >= 2);
+    assert.ok(
+      postSendExtractionTimes[1] - postSendExtractionTimes[0] < 750,
+      `expected adaptive poll under 750ms, observed ${postSendExtractionTimes[1] - postSendExtractionTimes[0]}ms`
+    );
+    const responseObserved = port.messages.filter((message) =>
+      message.type === "job_progress" && message.payload?.phase === "response_observed"
+    );
+    assert.equal(
+      responseObserved.filter((message) => message.payload.response_in_progress).length,
+      1,
+      "adaptive polling must not multiply ordinary streaming progress output"
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousActivityPoll === undefined) {
+      delete globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS;
+    } else {
+      globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS = previousActivityPoll;
+    }
+  }
+});
+
+test("service worker keeps stable-idle finality tied to the configured interval while polling fast", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousActivityPoll = globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS;
+  const previousStableIdleMultiplier = globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER;
+  globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS = 250;
+  globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER = 3;
+  const port = makePort();
+  const postSendExtractionTimes = [];
+  const longAnswer = "Final Pro review paragraph with concrete evidence.\n".repeat(160).trim();
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, submitted_assistant_count: 0 } };
+          case "yoetz_extract_response":
+            if (!sent) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 } };
+            }
+            postSendExtractionTimes.push(Date.now());
+            return {
+              ok: true,
+              payload: {
+                // Long text plus an unscoped copy control selects the adaptive
+                // stable-idle path whose threshold must remain interval-derived.
+                method: "assistant_dom_fallback",
+                text: longAnswer,
+                is_generating: false,
+                assistant_count: 1,
+                user_count: 1,
+                preceding_user_count: 1,
+                copy_button_count: 1,
+                has_copy_button: false,
+                turn_index: 0,
+                diagnostics: {
+                  counts: { stop_controls: 0, copy_buttons: 1 }
+                }
+              }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?configured_interval_finality=${Date.now()}`);
+    port.emit(envelope("job_start", "job_configured_interval_finality", {
+      prompt: "prompt",
+      wait_interval_ms: 600,
+      wait_timeout_ms: 4000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_configured_interval_finality", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_configured_interval_finality.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"), 5000);
+    const stableForMs = port.messages.find((message) => message.type === "job_complete")?.payload?.stable_for_ms;
+    assert.ok(postSendExtractionTimes.length >= 6, "adaptive polling should sample repeatedly");
+    assert.ok(
+      postSendExtractionTimes[1] - postSendExtractionTimes[0] < 500,
+      `expected adaptive poll under 500ms, observed ${postSendExtractionTimes[1] - postSendExtractionTimes[0]}ms`
+    );
+    assert.ok(stableForMs >= 1800, `expected configured-interval threshold of 1800ms, observed ${stableForMs}ms`);
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousActivityPoll === undefined) {
+      delete globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS;
+    } else {
+      globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS = previousActivityPoll;
+    }
+    if (previousStableIdleMultiplier === undefined) {
+      delete globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER;
+    } else {
+      globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER = previousStableIdleMultiplier;
+    }
+  }
+});
+
+test("service worker emits final-affordance waiting progress once across state flaps", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousWaitingProgressInterval = globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
+  globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = 60000;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let postSendExtractCount = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response": {
+            if (sent) {
+              postSendExtractCount += 1;
+            }
+            const generating = postSendExtractCount === 2;
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "assistant_dom_fallback",
+                    text: "Settled text without final controls.",
+                    is_generating: generating,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 0,
+                    has_copy_button: false,
+                    turn_index: 0
+                  }
+                : {
+                    method: "none",
+                    text: "",
+                    is_generating: false,
+                    assistant_count: 0,
+                    copy_button_count: 0,
+                    has_copy_button: false,
+                    turn_index: -1
+                  }
+            };
+          }
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?final_affordance_transition=${Date.now()}`);
+    port.emit(envelope("job_start", "job_final_affordance_transition", {
+      prompt: "prompt",
+      wait_interval_ms: 500,
+      wait_timeout_ms: 2200
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_final_affordance_transition", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_final_affordance_transition.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error"), 4000);
+    const transitionEvents = port.messages.filter((message) =>
+      message.type === "job_progress"
+      && message.payload.phase === "waiting_response"
+      && message.payload.awaiting_final_affordance
+    );
+    assert.ok(postSendExtractCount >= 3, "test must exercise awaiting -> generating -> awaiting");
+    assert.equal(transitionEvents.length, 1);
+    assert.match(transitionEvents[0].payload.message, /waiting for final assistant controls/);
+    assert.equal(
+      transitionEvents[0].payload.inspect_command,
+      "yoetz browser extension inspect --chatgpt --run-id run_job_final_affordance_transition"
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousWaitingProgressInterval === undefined) {
+      delete globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
+    } else {
+      globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = previousWaitingProgressInterval;
+    }
+  }
+});
+
 test("service worker completion is structural and does not classify response text", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -5437,6 +5969,14 @@ test("service worker preserves content-script committed-send error metadata", as
             return {
               ok: false,
               code: "send_acceptance_unknown",
+              state: "usage_credits_exhausted",
+              provider_message: "Your org is out of usage credits for the month.",
+              provider_dom: {
+                container: { found: true, tag: "div", role: "alert" },
+                switch_models_control: { found: false }
+              },
+              requested_model: "fable-5-max",
+              send_committed: true,
               phase: "send",
               side_effect_started: true,
               error: "send click committed; acceptance unknown"
@@ -5467,6 +6007,99 @@ test("service worker preserves content-script committed-send error metadata", as
     const error = port.messages.find((message) => message.type === "job_error" && message.payload.code === "send_acceptance_unknown");
     assert.equal(error.payload.phase, "send");
     assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.state, "usage_credits_exhausted");
+    assert.equal(error.payload.provider_message, "Your org is out of usage credits for the month.");
+    assert.deepEqual(error.payload.provider_dom, {
+      container: { found: true, tag: "div", role: "alert" },
+      switch_models_control: { found: false }
+    });
+    assert.equal(error.payload.requested_model, "fable-5-max");
+    assert.equal(error.payload.send_committed, true);
+    assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker reports Claude credits at baseline extraction as pre-send", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let sendPromptCalls = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/new" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return {
+              ok: true,
+              payload: {
+                status: "selected",
+                requested_model: "fable-5-max",
+                model_used: "Fable 5 Max",
+                modelVerified: true,
+                maxVerified: true
+              }
+            };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_extract_response":
+            assert.equal(message.blocking_context, "pre_send_baseline");
+            return {
+              ok: false,
+              code: "usage_credits_exhausted",
+              state: "usage_credits_exhausted",
+              provider_message: "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.",
+              requested_model: "fable-5-max",
+              phase: "send",
+              side_effect_started: true,
+              send_committed: false,
+              error: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
+            };
+          case "yoetz_send_prompt":
+            sendPromptCalls += 1;
+            throw new Error("prompt must not be sent after credit exhaustion");
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?claude_credits_baseline=${Date.now()}`);
+    port.emit(envelope("job_start", "job_claude_credits_baseline", {
+      recipe: "claude",
+      prompt: "prompt"
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_claude_credits_baseline", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_claude_credits_baseline.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => (
+      message.type === "job_error" && message.payload.code === "usage_credits_exhausted"
+    )));
+    const error = port.messages.find((message) => (
+      message.type === "job_error" && message.payload.code === "usage_credits_exhausted"
+    ));
+    assert.equal(error.payload.phase, "send");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.send_committed, false);
+    assert.equal(error.payload.requested_model, "fable-5-max");
+    assert.equal(sendPromptCalls, 0);
     assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
   } finally {
     globalThis.chrome = originalChrome;

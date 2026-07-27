@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Browser recipes now poll every two seconds after post-send assistant activity
+  becomes visible and emit `awaiting_final_affordance` on transition, while
+  preserving the configured cadence for outward response-progress events.
+- Claude browser recipes now detect the visible organization usage-credit
+  exhaustion banner, stop before clicking Send, and return structured provider
+  diagnostics without switching models.
+
+## [0.5.46] - 2026-07-27
+### Changed
+
+- Browser-extension inspect output now labels the current chip state at inspect
+  time as `current_model_chip_state` instead of the misleading
+  `model_selection` for both ChatGPT and Claude recipes.
+
+### Added
+
+- Claude upload timeouts now report per-leg readiness evidence for the file
+  input, attachment, and send control, including which wait stage expired.
+- Added the opt-in `attachment_stall_timeout_ms` Claude recipe var. When set
+  above `upload_timeout_ms`, it observes the already-dispatched attachment to
+  that deadline and returns `attachment_stalled` with a timestamped readiness
+  trace. Its default of `0` preserves the existing upload-timeout behavior.
+
+### Documentation
+
+- Document the `upload_timeout_ms` and `send_timeout_ms` recipe vars alongside
+  `wait_timeout_ms` in the yoetz skill, including the upload default of 120000
+  plus 5000 per MiB of bundle. Both overrides already existed for the `chatgpt`
+  and `claude` recipes but appeared in no guidance, so callers hitting the
+  125000 bound on a small bundle had no documented lever.
+
+
+## [0.5.45] - 2026-07-26
+### Fixed
+
+- Claude native recipes now detect file/artifact cards in the final assistant
+  turn and return a structured `artifact_unextracted` warning instead of
+  silently reporting a complete response while dropping the deliverable.
+- Built-in Claude prompts now require the deliverable to remain in the chat
+  message as plain Markdown, reducing artifact loss while preserving the
+  caller's task bytes exactly. Custom recipes remain unchanged.
+
+
 ## [0.5.44] - 2026-07-25
 
 ### Fixed

@@ -1,4 +1,5 @@
 import { ChunkAssembler, uint8ArrayToBase64 } from "./chunks.js";
+import { completionWarnings } from "./completion-warnings.js";
 import {
   EXTENSION_ID,
   NATIVE_HOST,
@@ -59,6 +60,13 @@ const AFFORDANCE_CONFIRM_POLL_MS = Math.max(
   250,
   Number(globalThis.__YOETZ_AFFORDANCE_CONFIRM_POLL_MS ?? 1500) || 1500
 );
+// Once assistant text is visible after send, shorten only the observation
+// cadence. The stable-idle threshold remains derived from the configured job
+// interval so adaptive polling cannot weaken finality.
+const POST_SEND_ASSISTANT_ACTIVITY_POLL_MS = Math.max(
+  250,
+  Number(globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS ?? 2000) || 2000
+);
 const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   1024,
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
@@ -84,6 +92,24 @@ const LEGACY_JOBS_KEY = "jobs";
 // The full streaming text remains on the in-memory job for delta calculation; only the
 // tail is written to disk so a multi-MB Pro response cannot blow the 10MB session quota.
 const RESPONSE_TEXT_PERSIST_TAIL = 8 * 1024;
+const ATTACHMENT_TRACE_TIMESTAMP_KEYS = Object.freeze([
+  "final_chunk_ack_at_ms",
+  "input_resolved_at_ms",
+  "files_assigned_at_ms",
+  "change_dispatched_at_ms",
+  "matching_thumbnail_at_ms",
+  "remove_control_at_ms",
+  "send_present_at_ms",
+  "send_enabled_at_ms",
+  "soft_timeout_at_ms",
+  "hard_timeout_at_ms"
+]);
+const ATTACHMENT_TRACE_PENDING_LEGS = new Set([
+  "matching_thumbnail",
+  "remove_control",
+  "send_present",
+  "send_enabled"
+]);
 
 const jobs = new Map();
 const terminalJobIds = new Map();
@@ -420,6 +446,9 @@ async function acceptFileChunk(message) {
   }
 
   const file = chunks.takeFile(job.job_id);
+  if (job.recipe === "claude") {
+    job.attachment_trace = { final_chunk_ack_at_ms: Date.now() };
+  }
   job.status = "file_received";
   job.updated_at = Date.now();
   await persistJob(job);
@@ -455,7 +484,11 @@ async function runJobWithFile(job, file) {
 
   const prompt = job.prompt ?? "";
   if (prompt) {
-    job.response_baseline = await sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
+    job.response_baseline = await sendToTab(job.tab_id, {
+      type: "yoetz_extract_response",
+      job,
+      blocking_context: "pre_send_baseline"
+    });
     assertJobConnectionCurrent(job);
     job.status = "sending_prompt";
     job.updated_at = Date.now();
@@ -535,12 +568,14 @@ async function completeJobWithExtraction(job, extraction) {
       model_strategy: job.model_strategy ?? "select",
       model_used: job.model_used ?? null,
       model_selection_status: job.model_selection_status ?? "unavailable",
-      warnings: [
-        ...(job.warnings ?? []),
-        ...(extraction.text ? [] : [adapter.completion.emptyResponseWarning]),
-        ...(extraction.warning ? [extraction.warning] : []),
-        ...(finalityAnchor === "dom_only" ? [CHATGPT_DOM_ONLY_FINALITY_WARNING] : [])
-      ]
+      warnings: completionWarnings({
+        jobWarnings: job.warnings,
+        extraction,
+        emptyResponseWarning: adapter.completion.emptyResponseWarning,
+        extractionWarnings: adapter.completion.extractionWarnings?.(extraction),
+        finalityAnchor,
+        domOnlyFinalityWarning: CHATGPT_DOM_ONLY_FINALITY_WARNING
+      })
     }
   });
   const completeBytes = nativeEnvelopeByteLength(completeEnvelope);
@@ -1177,6 +1212,7 @@ function normalizeJob(message, adapter) {
     wait_timeout_ms: payload.wait_timeout_ms ?? DEFAULT_WAIT_TIMEOUT_MS,
     wait_interval_ms: payload.wait_interval_ms ?? 30000,
     upload_timeout_ms: payload.upload_timeout_ms ?? 120000,
+    attachment_stall_timeout_ms: payload.attachment_stall_timeout_ms ?? 0,
     send_timeout_ms: payload.send_timeout_ms ?? 120000,
     close_tab_on_complete: payload.close_tab_on_complete === true,
     browser_context_id: payload.browser_context_id ?? null,
@@ -1217,6 +1253,17 @@ function errorContextForJob(job, error = null) {
       ? error.side_effect_started
       : Boolean(job.tab_id)
   };
+  for (const key of [
+    "state",
+    "provider_message",
+    "provider_dom",
+    "requested_model",
+    "send_committed"
+  ]) {
+    if (error?.[key] !== undefined) {
+      detail[key] = error[key];
+    }
+  }
   if (job.tab_id != null) {
     detail.tab_id = job.tab_id;
   }
@@ -1232,7 +1279,30 @@ function errorContextForJob(job, error = null) {
     detail.current_url = error?.current_url ?? job.submitted_url ?? null;
     detail.current_pathname = error?.current_pathname ?? null;
   }
+  const attachmentTrace = sanitizeAttachmentTrace(error?.attachment_trace);
+  if (attachmentTrace) {
+    detail.attachment_trace = attachmentTrace;
+  }
   return detail;
+}
+
+function sanitizeAttachmentTrace(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const trace = {};
+  for (const key of ATTACHMENT_TRACE_TIMESTAMP_KEYS) {
+    const timestamp = value[key];
+    if (Number.isSafeInteger(timestamp) && timestamp >= 0) {
+      trace[key] = timestamp;
+    }
+  }
+  for (const key of ["soft_timeout_pending_legs", "hard_timeout_pending_legs"]) {
+    if (Array.isArray(value[key])) {
+      trace[key] = value[key].filter((leg) => ATTACHMENT_TRACE_PENDING_LEGS.has(leg)).slice(0, 4);
+    }
+  }
+  return Object.keys(trace).length > 0 ? trace : null;
 }
 
 function jobErrorMessage(job, error, code, detail = {}) {
@@ -1486,7 +1556,15 @@ function tabCommandError(response) {
   if (typeof response?.side_effect_started === "boolean") {
     error.side_effect_started = response.side_effect_started;
   }
+  if (response?.attachment_trace !== undefined) {
+    error.attachment_trace = response.attachment_trace;
+  }
   for (const key of [
+    "state",
+    "provider_message",
+    "provider_dom",
+    "requested_model",
+    "send_committed",
     "requested_conversation_id",
     "current_conversation_id",
     "current_url",
@@ -1540,7 +1618,11 @@ async function waitForResponse(job) {
   let renderRefreshCandidate = null;
   let renderRefreshCandidateSinceMs = 0;
   let extractionFailureSinceMs = 0;
+  let lastResponseProgressAt = 0;
+  let lastResponseProgressGenerating = null;
+  let lastResponseProgressInterimTurn = false;
   let lastWaitingProgressAt = startedAt;
+  let reportedAwaitingFinalAffordance = false;
   const timeoutMs = responseWaitTimeoutMs(job);
   while (Date.now() - startedAt <= timeoutMs) {
     assertJobConnectionCurrent(job);
@@ -1570,8 +1652,21 @@ async function waitForResponse(job) {
       best = extraction;
     }
     if (postSend && extraction?.text) {
-      postResponseProgress(job, extraction);
-      assertJobConnectionCurrent(job);
+      const responseProgressState = interimTurnState(job, extraction);
+      const meaningfulProgressTransition = (
+        responseProgressState.interimAssistantTurn && !lastResponseProgressInterimTurn
+      ) || (
+        lastResponseProgressGenerating === true && !responseProgressState.generating
+      );
+      if (!lastResponseProgressAt
+          || meaningfulProgressTransition
+          || Date.now() - lastResponseProgressAt >= interval) {
+        postResponseProgress(job, extraction);
+        lastResponseProgressAt = Date.now();
+        assertJobConnectionCurrent(job);
+      }
+      lastResponseProgressGenerating = responseProgressState.generating;
+      lastResponseProgressInterimTurn = responseProgressState.interimAssistantTurn;
     }
     const extractionIdle = !extraction?.is_generating;
     const backendApiPending = Boolean(extraction?.backend_api_pending);
@@ -1767,12 +1862,17 @@ async function waitForResponse(job) {
       // Poll fast while confirming a latched final affordance so the short confirm
       // window is sampled across several ticks rather than overshot by a coarse poll.
       ? Math.min(interval, AFFORDANCE_CONFIRM_POLL_MS)
-      : (finalAffordanceWithoutScopedText
-          ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500))
-          : interval);
+      : finalAffordanceWithoutScopedText
+        ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500))
+      : postSendAssistantActivity
+        ? Math.min(interval, POST_SEND_ASSISTANT_ACTIVITY_POLL_MS)
+        : interval;
     const nowMs = Date.now();
     const elapsedMs = nowMs - startedAt;
-    if (nowMs - lastWaitingProgressAt >= WAITING_RESPONSE_PROGRESS_INTERVAL_MS) {
+    const enteredAwaitingFinalAffordance =
+      awaitingFinalAffordance && !reportedAwaitingFinalAffordance;
+    if (enteredAwaitingFinalAffordance
+        || nowMs - lastWaitingProgressAt >= WAITING_RESPONSE_PROGRESS_INTERVAL_MS) {
       const waitingDetail = {
         elapsed_ms: elapsedMs,
         timeout_ms: timeoutMs,
@@ -1790,6 +1890,7 @@ async function waitForResponse(job) {
         waitingDetail.inspect_command = inspectCommandForJob(job);
       }
       postWaitingResponseProgress(job, extraction, waitingDetail);
+      reportedAwaitingFinalAffordance ||= enteredAwaitingFinalAffordance;
       lastWaitingProgressAt = nowMs;
     }
     await sleep(nextDelay);
