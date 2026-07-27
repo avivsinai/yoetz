@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Browser recipes now poll every two seconds after post-send assistant activity
+  becomes visible and emit `awaiting_final_affordance` on transition, while
+  preserving the configured cadence for outward response-progress events.
+- Claude browser recipes now detect the visible organization usage-credit
+  exhaustion banner, stop before clicking Send, and return structured provider
+  diagnostics without switching models.
+
 ## [0.5.46] - 2026-07-27
 ### Changed
 
