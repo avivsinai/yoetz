@@ -6,6 +6,18 @@ const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
 const CHATGPT_SOL_PRO_MODEL = "gpt-5-6-sol-pro";
 const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
 const CHATGPT_PRO_EFFORT_LABEL = "Pro";
+const MANUAL_HANDOFF_SHELL_SELECTORS = Object.freeze([
+  "nav",
+  "aside",
+  "header",
+  "footer",
+  '[role="navigation"]',
+  '[role="complementary"]',
+  '[data-testid*="sidebar"]',
+  '[aria-label*="sidebar"]',
+  '[class~="sidebar"]',
+  '[class~="side-panel"]'
+]);
 
 export function ownedWindowName(job) {
   return `${YOETZ_WINDOW_PREFIX}${job.run_id}:${job.job_id}`;
@@ -39,20 +51,32 @@ export function chatgptConversationJobUrl(conversationId, runId) {
 }
 
 export function classifyManualHandoff({ url = "", title = "", text = "" } = {}) {
-  const haystack = `${url}\n${title}\n${text}`.toLowerCase();
-  if (/\/auth\/login|log in|sign in/.test(haystack)) {
-    return {
-      state: "login_required",
-      message: "ChatGPT login required in this Chrome profile"
-    };
-  }
-  if (/captcha|cloudflare|verify you are human|security check/.test(haystack)) {
+  const pathname = manualHandoffPathname(url);
+  const conversationRoute = /^\/c\/[^/]+$/.test(pathname);
+  const normalizedTitle = conversationRoute ? "" : normalizeText(title).toLowerCase();
+  const normalizedText = normalizeText(text).toLowerCase();
+  const challengeRoute = /^\/cdn-cgi\/challenge-platform(?:\/|$)/.test(pathname);
+  const challengeTitle = /^(?:just a moment(?:\.\.\.)?|checking your browser(?:\.\.\.)?)(?:\s*(?:\||[-—])\s*(?:chatgpt|openai))?$/.test(normalizedTitle);
+  if (challengeRoute
+      || challengeTitle
+      || /captcha|cloudflare|checking your browser|attention required|security check|just a moment|verify you are human|cf-chl/.test(normalizedText)) {
     return {
       state: "challenge_required",
       message: "ChatGPT requires manual challenge completion"
     };
   }
-  if (/rate limit|too many requests|try again later/.test(haystack)) {
+  const loginRoute = /^\/(?:auth\/(?:login|oauth)|login|oauth)(?:\/|$)/.test(pathname);
+  const loginTitle = /^(?:log in|login|sign in)(?:\s*(?:\||[-—])\s*(?:chatgpt|openai))?$/.test(normalizedTitle);
+  if (loginRoute
+      || loginTitle
+      || /\blog in\b|\blogin\b|\bsign in\b|\bsign up\b|continue with google/.test(normalizedText)) {
+    return {
+      state: "login_required",
+      message: "ChatGPT login required in this Chrome profile"
+    };
+  }
+  const rateLimitTitle = /^(?:rate limited|too many requests|try again later)(?:\s*(?:\||[-—])\s*(?:chatgpt|openai))?$/.test(normalizedTitle);
+  if (rateLimitTitle || /\brate limits?\b|\btoo many requests\b|\btry again later\b/.test(normalizedText)) {
     return {
       state: "rate_limited",
       message: "ChatGPT is rate limited"
@@ -61,8 +85,8 @@ export function classifyManualHandoff({ url = "", title = "", text = "" } = {}) 
   return null;
 }
 
-export function classifyWaitManualHandoff({ url = "", title = "" } = {}) {
-  return classifyManualHandoff({ url, title });
+export function classifyWaitManualHandoff({ url = "", title = "", text = "" } = {}) {
+  return classifyManualHandoff({ url, title, text });
 }
 
 export function findComposer(root = document) {
@@ -74,6 +98,14 @@ export function findComposer(root = document) {
     'textarea',
     'div[contenteditable="true"][data-testid*="composer"]',
     'div[contenteditable="true"]'
+  ]);
+}
+
+export function findAuthenticatedComposer(root = document) {
+  return firstVisible(root, [
+    "#prompt-textarea",
+    'textarea[data-testid*="composer"]',
+    'div[contenteditable="true"][data-testid*="composer"]'
   ]);
 }
 
@@ -111,6 +143,36 @@ export function findModelButton(root = document) {
 
 export function getPageText(root = document) {
   return String(root.body?.innerText ?? root.documentElement?.innerText ?? "");
+}
+
+export function manualHandoffContext(root = document) {
+  if (findAuthenticatedComposer(root)) {
+    return {
+      authenticated: true,
+      title: "",
+      text: ""
+    };
+  }
+
+  const hasTranscript = hasConversationResidue(root);
+  const surfaces = manualHandoffSurfaces(root, { hasTranscript });
+  const chunks = [];
+  for (const surface of surfaces) {
+    collectManualHandoffSurfaceText(surface, chunks);
+  }
+  const hasShell = hasManualHandoffShell(root);
+  if (surfaces.length > 0 || hasShell || hasTranscript) {
+    return {
+      authenticated: false,
+      title: "",
+      text: normalizeText(chunks.join("\n"))
+    };
+  }
+  return {
+    authenticated: false,
+    title: String(root.title ?? ""),
+    text: getPageText(root)
+  };
 }
 
 export function markOwnership(root, job) {
@@ -2085,6 +2147,74 @@ function isConversationTurnSurface(node) {
     '[class*="agent-turn"]',
     '[class*="user-turn"]'
   ].join(",")));
+}
+
+function manualHandoffPathname(url) {
+  try {
+    return new URL(String(url ?? ""), "https://chatgpt.com").pathname.toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function manualHandoffSurfaces(root, { hasTranscript = false } = {}) {
+  const explicitInterstitialSelectors = [
+    '[role="alert"]',
+    '[role="dialog"]',
+    '[aria-live="assertive"]'
+  ];
+  const selectors = hasTranscript
+    ? explicitInterstitialSelectors
+    : ["main", '[role="main"]', ...explicitInterstitialSelectors];
+  const candidates = uniqueElements(
+    selectors.flatMap((selector) => Array.from(root.querySelectorAll?.(selector) ?? []))
+  )
+    .filter((node) => isVisible(node, { allowDisabled: true }));
+  return candidates.filter((candidate) => !candidates.some(
+    (other) => other !== candidate && containsNode(other, candidate)
+  ));
+}
+
+function hasManualHandoffShell(root) {
+  return MANUAL_HANDOFF_SHELL_SELECTORS.some(
+    (selector) => (root.querySelectorAll?.(selector)?.length ?? 0) > 0
+  );
+}
+
+function collectManualHandoffSurfaceText(node, chunks) {
+  if (!node
+      || isConversationTurnSurface(node)
+      || isManualHandoffShellNode(node)
+      || isManualHandoffEditableNode(node)) {
+    return;
+  }
+  const children = Array.from(node.children ?? []);
+  if (children.length === 0) {
+    if (isVisible(node, { allowDisabled: true })) {
+      const text = textOf(node);
+      if (text) {
+        chunks.push(text);
+      }
+    }
+    return;
+  }
+  for (const child of children) {
+    collectManualHandoffSurfaceText(child, chunks);
+  }
+}
+
+function isManualHandoffShellNode(node) {
+  return Boolean(node?.closest?.(MANUAL_HANDOFF_SHELL_SELECTORS.join(",")));
+}
+
+function isManualHandoffEditableNode(node) {
+  const tag = String(node?.tagName ?? "").toLowerCase();
+  if (tag === "input"
+      || tag === "textarea"
+      || node?.getAttribute?.("contenteditable") === "true") {
+    return true;
+  }
+  return Boolean(node?.closest?.('input, textarea, [contenteditable="true"]'));
 }
 
 function conversationResidue(root) {
