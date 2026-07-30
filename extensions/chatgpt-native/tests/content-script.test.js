@@ -3,7 +3,9 @@ import test from "node:test";
 import { uint8ArrayToBase64 } from "../src/chunks.js";
 
 const chatgptBackendModuleUrl = new URL("../src/sites/chatgpt-backend.js", import.meta.url).href;
+const chatgptDomModuleUrl = new URL("../src/chatgpt-dom.js", import.meta.url).href;
 const helperModule = `import { fetchConversationAnswer } from ${JSON.stringify(chatgptBackendModuleUrl)};
+import { classifyManualHandoff as classifyRealManualHandoff } from ${JSON.stringify(chatgptDomModuleUrl)};
 export { fetchConversationAnswer };
 const hooks = globalThis.__contentScriptTestHooks;
 
@@ -27,8 +29,15 @@ export function getPageText() {
   return hooks.pageText ?? "";
 }
 
-export function classifyManualHandoff() {
-  return hooks.manualHandoff ?? null;
+export function findComposer() {
+  return hooks.composer ?? null;
+}
+
+export function classifyManualHandoff(input) {
+  hooks.manualHandoffInputs.push(input);
+  return hooks.manualHandoff === undefined
+    ? classifyRealManualHandoff(input)
+    : hooks.manualHandoff;
 }
 
 export function classifyWaitManualHandoff() {
@@ -123,6 +132,7 @@ const dom = {
   ownedWindowName,
   parseOwnedWindowName,
   getPageText,
+  findComposer,
   classifyManualHandoff,
   classifyWaitManualHandoff,
   classifyBlockingState,
@@ -315,6 +325,41 @@ test("content script auth probe reports manual handoff without job side effects"
     assert.deepEqual(hooks.ensureFreshChatCalls, []);
     assert.deepEqual(hooks.ensureConversationLoadedCalls, []);
     assert.deepEqual(hooks.markOwnershipCalls, []);
+  } finally {
+    restore();
+  }
+});
+
+test("content script ignores a sidebar challenge title when the ChatGPT composer is visible", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "auth_probe_composer",
+    "https://chatgpt.com/?_yoetz=run_current"
+  );
+  try {
+    hooks.composer = {};
+    hooks.pageText = "New chat\nPre-execution security check\nAsk ChatGPT";
+    const job = {
+      job_id: "job_current",
+      run_id: "run_current",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    const auth = await send({ type: "yoetz_auth_probe" });
+
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.payload.manual_handoff, null);
+    assert.equal(prepared.payload.window_name, "yoetz-chatgpt-native:run_current:job_current");
+    assert.equal(auth.ok, true);
+    assert.equal(auth.payload.status, "authenticated");
+    assert.equal(auth.payload.manual_handoff, null);
+    assert.deepEqual(hooks.markOwnershipCalls, [job]);
+    assert.deepEqual(
+      hooks.manualHandoffInputs.map((input) => input.authenticated),
+      [true, true]
+    );
+
   } finally {
     restore();
   }
@@ -686,7 +731,8 @@ async function loadContentScript(label, href) {
     configureModelCalls: [],
     insertPromptCalls: [],
     clickSendCalls: [],
-    sendAcceptanceBaselineCalls: 0
+    sendAcceptanceBaselineCalls: 0,
+    manualHandoffInputs: []
   };
   globalThis.__contentScriptTestHooks = hooks;
   globalThis.window = { name: "", location };

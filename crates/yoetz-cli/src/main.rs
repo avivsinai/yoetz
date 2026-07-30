@@ -1749,8 +1749,9 @@ fn maybe_print_running_profile_auto_connect_preference(
 /// `connected`. Any other status (`disconnected`, `missing_extension`,
 /// `manual_handoff`, `version_mismatch`, `not_installed`) or I/O error is
 /// treated as not available for auto-selection. The probe is filesystem-local
-/// (status file + Unix socket reachability) and is cheap enough to run on
-/// every `yoetz browser recipe` invocation.
+/// (status file + Unix socket reachability) and is cheap enough to run on every
+/// `yoetz browser recipe` invocation. A live hello supersedes a historical
+/// manual-handoff record.
 fn extension_recipe_ready_for_auto_selection(recipe: Option<web_recipe::BuiltinWebRecipe>) -> bool {
     browser_extension_native::status()
         .map(|status| {

@@ -73,6 +73,7 @@ async function prepareJob(job) {
     classifyManualHandoff,
     ensureConversationLoaded,
     ensureFreshChat,
+    findComposer,
     getPageText,
     markOwnership,
     ownedWindowName
@@ -81,7 +82,8 @@ async function prepareJob(job) {
   const handoff = classifyManualHandoff({
     url: location.href,
     title: document.title,
-    text: getPageText(document)
+    text: getPageText(document),
+    authenticated: Boolean(findComposer(document))
   });
   const conversationId = conversationIdForJob(job);
   if (!handoff && conversationId) {
@@ -319,12 +321,13 @@ async function inspectPage(runId, options = {}) {
 
 async function authProbe(recipe) {
   const adapter = await siteAdapter(recipe);
-  const { classifyManualHandoff, getPageText } = await domHelpers(recipe);
+  const { classifyManualHandoff, findComposer, getPageText } = await domHelpers(recipe);
   const text = getPageText(document);
   const handoff = classifyManualHandoff({
     url: location.href,
     title: document.title,
-    text
+    text,
+    authenticated: Boolean(findComposer(document))
   });
   const authenticated = !handoff;
   return {

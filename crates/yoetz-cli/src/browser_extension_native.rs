@@ -1059,10 +1059,10 @@ pub fn status() -> Result<ExtensionStatus> {
         "version_mismatch"
     } else if managed_copy_mismatch.is_some() {
         "managed_copy_mismatch"
-    } else if manual_handoff {
-        "manual_handoff"
     } else if socket_reachable && hello_seen {
         "connected"
+    } else if manual_handoff {
+        "manual_handoff"
     } else if socket_reachable {
         "missing_extension"
     } else if manifest_installed && wrapper_installed && token_present {
@@ -5014,6 +5014,61 @@ mod tests {
             extension_hello.detail,
             "extension_version=0.2.0, extension_instance_id=ext_123, chrome_profile_email=work@example.com"
         );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn live_extension_connection_supersedes_historical_manual_handoff() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let state = dir.path().join("state");
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &state);
+        let extension_version = format!("{YOETZ_CLI_VERSION}.1");
+        write_extension_source_fixture(&state.join("chatgpt-native-extension"), &extension_version);
+        let paths = extension_paths().unwrap();
+        fs::create_dir_all(&paths.instances_dir).unwrap();
+        write_status_file(
+            &paths.status_path,
+            &json!({
+                "last_manual_handoff": {
+                    "job_id": "job_old",
+                    "run_id": "run_old",
+                    "state": "challenge_required",
+                    "message": "old ChatGPT job requires manual handoff",
+                    "seen_at_ms": 1234,
+                }
+            }),
+        )
+        .unwrap();
+        let socket = dir.path().join("work.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        write_instance_fixture(
+            &paths,
+            ExtensionInstanceStatus {
+                native_instance_id: "native_work".to_string(),
+                socket_path: socket,
+                pid: process::id(),
+                extension_instance_id: Some("ext_123".to_string()),
+                extension_version: Some(extension_version),
+                profile_email: Some("work@example.com".to_string()),
+                profile_id: Some("gaia_123".to_string()),
+                recipes: vec!["chatgpt".to_string()],
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 5678,
+            },
+        );
+
+        let payload = status().unwrap();
+
+        assert_eq!(payload.status, "connected");
+        assert!(payload.socket_reachable);
+        assert!(payload.hello_seen);
     }
 
     #[test]

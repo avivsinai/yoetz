@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- ChatGPT native-extension jobs now ignore challenge phrases in authenticated
+  page chrome, and live extension hellos supersede historical manual-handoff
+  records so reconnect restores transport auto-selection.
+
 ## [0.5.47] - 2026-07-27
 ### Fixed
 

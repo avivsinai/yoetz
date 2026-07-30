@@ -38,7 +38,7 @@ export function chatgptConversationJobUrl(conversationId, runId) {
   return url.toString();
 }
 
-export function classifyManualHandoff({ url = "", title = "", text = "" } = {}) {
+export function classifyManualHandoff({ url = "", title = "", text = "", authenticated = false } = {}) {
   const haystack = `${url}\n${title}\n${text}`.toLowerCase();
   if (/\/auth\/login|log in|sign in/.test(haystack)) {
     return {
@@ -46,7 +46,7 @@ export function classifyManualHandoff({ url = "", title = "", text = "" } = {}) 
       message: "ChatGPT login required in this Chrome profile"
     };
   }
-  if (/captcha|cloudflare|verify you are human|security check/.test(haystack)) {
+  if (!authenticated && /captcha|cloudflare|verify you are human|security check/.test(haystack)) {
     return {
       state: "challenge_required",
       message: "ChatGPT requires manual challenge completion"

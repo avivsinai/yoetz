@@ -34,8 +34,20 @@ test("classifyManualHandoff detects login, challenge, and rate limits", () => {
   assert.equal(classifyManualHandoff({ text: "Message ChatGPT" }), null);
 });
 
+test("classifyManualHandoff ignores challenge words in authenticated ChatGPT chrome", () => {
+  assert.equal(
+    classifyManualHandoff({
+      title: "ChatGPT",
+      text: "New chat\nPre-execution security check\nAsk ChatGPT",
+      authenticated: true
+    }),
+    null
+  );
+});
+
 test("classifyWaitManualHandoff avoids prompt and response text false positives", () => {
   assert.equal(classifyWaitManualHandoff({ url: "https://chatgpt.com/auth/login" }).state, "login_required");
+  assert.equal(classifyWaitManualHandoff({ title: "Security check | ChatGPT" }).state, "challenge_required");
   assert.equal(classifyWaitManualHandoff({ title: "Too many requests | ChatGPT" }).state, "rate_limited");
   assert.equal(
     classifyWaitManualHandoff({
