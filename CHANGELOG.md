@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.48] - 2026-07-30
 ### Fixed
 
 - ChatGPT native-extension jobs now scope login, challenge, and rate-limit
@@ -14,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   text cannot trigger a false manual handoff, recognize common Cloudflare
   interstitial metadata, and let live extension hellos supersede historical
   manual-handoff records so reconnect restores transport auto-selection.
+
 
 ## [0.5.47] - 2026-07-27
 ### Fixed
