@@ -73,17 +73,16 @@ async function prepareJob(job) {
     classifyManualHandoff,
     ensureConversationLoaded,
     ensureFreshChat,
-    findComposer,
-    getPageText,
+    manualHandoffContext,
     markOwnership,
     ownedWindowName
   } = await domHelpers(job);
   activeJobs.delete(job.job_id);
+  const handoffContext = manualHandoffContext(document);
   const handoff = classifyManualHandoff({
     url: location.href,
-    title: document.title,
-    text: getPageText(document),
-    authenticated: Boolean(findComposer(document))
+    title: handoffContext.title,
+    text: handoffContext.text
   });
   const conversationId = conversationIdForJob(job);
   if (!handoff && conversationId) {
@@ -226,6 +225,7 @@ async function extractJobResponse(job, blockingContext = null) {
     classifyBlockingState,
     classifyWaitManualHandoff,
     extractResponse,
+    manualHandoffContext,
     parseOwnedWindowName
   } = await domHelpers(job);
   assertJobOwnership(job, parseOwnedWindowName, { adapter });
@@ -251,11 +251,13 @@ async function extractJobResponse(job, blockingContext = null) {
   }
   const extraction = extractResponse(document);
   assertNoBlockingState(classifyBlockingState, blockingDetail);
-  // During response wait, page text includes the user prompt and model output.
-  // Handoff classification here must stay on transport/page metadata only.
+  // During response wait, extraction text includes the user prompt and model output.
+  // Handoff classification stays on route metadata and the adapter's transcript-free context.
+  const handoffContext = manualHandoffContext(document);
   const handoff = classifyWaitManualHandoff({
     url: location.href,
-    title: document.title,
+    title: handoffContext.title,
+    text: handoffContext.text,
     extraction
   });
   return {
@@ -321,22 +323,28 @@ async function inspectPage(runId, options = {}) {
 
 async function authProbe(recipe) {
   const adapter = await siteAdapter(recipe);
-  const { classifyManualHandoff, findComposer, getPageText } = await domHelpers(recipe);
+  const {
+    classifyManualHandoff,
+    getPageText,
+    manualHandoffContext
+  } = await domHelpers(recipe);
   const text = getPageText(document);
+  const handoffContext = manualHandoffContext(document);
   const handoff = classifyManualHandoff({
     url: location.href,
-    title: document.title,
-    text,
-    authenticated: Boolean(findComposer(document))
+    title: handoffContext.title,
+    text: handoffContext.text
   });
-  const authenticated = !handoff;
+  const authenticated = !handoff && handoffContext.authenticated;
+  const status = handoff?.state ?? (authenticated ? "authenticated" : "authentication_unknown");
   return {
-    status: authenticated ? "authenticated" : handoff.state,
+    status,
     authenticated,
     manual_handoff: handoff,
-    message: authenticated
-      ? `${adapter.displayName} authenticated in this Chrome profile`
-      : handoff.message,
+    message: handoff?.message
+      ?? (authenticated
+        ? `${adapter.displayName} authenticated in this Chrome profile`
+        : `${adapter.displayName} authentication could not be confirmed because its composer is not visible`),
     url: location.href,
     title: document.title,
     text_chars: text.length

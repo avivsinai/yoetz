@@ -5,7 +5,10 @@ import { uint8ArrayToBase64 } from "../src/chunks.js";
 const chatgptBackendModuleUrl = new URL("../src/sites/chatgpt-backend.js", import.meta.url).href;
 const chatgptDomModuleUrl = new URL("../src/chatgpt-dom.js", import.meta.url).href;
 const helperModule = `import { fetchConversationAnswer } from ${JSON.stringify(chatgptBackendModuleUrl)};
-import { classifyManualHandoff as classifyRealManualHandoff } from ${JSON.stringify(chatgptDomModuleUrl)};
+import {
+  classifyManualHandoff as classifyRealManualHandoff,
+  classifyWaitManualHandoff as classifyRealWaitManualHandoff
+} from ${JSON.stringify(chatgptDomModuleUrl)};
 export { fetchConversationAnswer };
 const hooks = globalThis.__contentScriptTestHooks;
 
@@ -33,6 +36,18 @@ export function findComposer() {
   return hooks.composer ?? null;
 }
 
+export function findAuthenticatedComposer() {
+  return hooks.authenticatedComposer ?? null;
+}
+
+export function manualHandoffContext() {
+  return hooks.manualHandoffContext ?? {
+    authenticated: Boolean(hooks.authenticatedComposer),
+    title: globalThis.document.title,
+    text: hooks.pageText ?? ""
+  };
+}
+
 export function classifyManualHandoff(input) {
   hooks.manualHandoffInputs.push(input);
   return hooks.manualHandoff === undefined
@@ -40,8 +55,11 @@ export function classifyManualHandoff(input) {
     : hooks.manualHandoff;
 }
 
-export function classifyWaitManualHandoff() {
-  return hooks.waitManualHandoff ?? null;
+export function classifyWaitManualHandoff(input) {
+  hooks.waitManualHandoffInputs.push(input);
+  return hooks.waitManualHandoff === undefined
+    ? classifyRealWaitManualHandoff(input)
+    : hooks.waitManualHandoff;
 }
 
 export function classifyBlockingState() {
@@ -133,6 +151,8 @@ const dom = {
   parseOwnedWindowName,
   getPageText,
   findComposer,
+  findAuthenticatedComposer,
+  manualHandoffContext,
   classifyManualHandoff,
   classifyWaitManualHandoff,
   classifyBlockingState,
@@ -330,14 +350,19 @@ test("content script auth probe reports manual handoff without job side effects"
   }
 });
 
-test("content script ignores a sidebar challenge title when the ChatGPT composer is visible", async () => {
+test("content script excludes sidebar challenge text even when authentication is unknown", async () => {
   const { send, hooks, restore } = await loadContentScript(
-    "auth_probe_composer",
+    "auth_probe_scoped_text",
     "https://chatgpt.com/?_yoetz=run_current"
   );
   try {
-    hooks.composer = {};
     hooks.pageText = "New chat\nPre-execution security check\nAsk ChatGPT";
+    hooks.manualHandoffContext = {
+      authenticated: false,
+      title: "",
+      text: "Ask ChatGPT"
+    };
+    globalThis.document.title = "Pre-execution security check";
     const job = {
       job_id: "job_current",
       run_id: "run_current",
@@ -347,19 +372,82 @@ test("content script ignores a sidebar challenge title when the ChatGPT composer
 
     const prepared = await send({ type: "yoetz_prepare_job", job });
     const auth = await send({ type: "yoetz_auth_probe" });
+    const extracted = await send({ type: "yoetz_extract_response", job });
 
     assert.equal(prepared.ok, true);
     assert.equal(prepared.payload.manual_handoff, null);
     assert.equal(prepared.payload.window_name, "yoetz-chatgpt-native:run_current:job_current");
     assert.equal(auth.ok, true);
-    assert.equal(auth.payload.status, "authenticated");
+    assert.equal(auth.payload.status, "authentication_unknown");
+    assert.equal(auth.payload.authenticated, false);
     assert.equal(auth.payload.manual_handoff, null);
+    assert.equal(extracted.ok, true);
+    assert.equal(extracted.payload.manual_handoff, null);
     assert.deepEqual(hooks.markOwnershipCalls, [job]);
-    assert.deepEqual(
-      hooks.manualHandoffInputs.map((input) => input.authenticated),
-      [true, true]
-    );
+    assert.deepEqual(hooks.manualHandoffInputs.map((input) => input.text), ["Ask ChatGPT", "Ask ChatGPT"]);
+    assert.equal(hooks.waitManualHandoffInputs[0].title, "");
+  } finally {
+    restore();
+  }
+});
 
+test("content script does not treat a generic visible editor as authenticated ChatGPT", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "auth_probe_generic_editor",
+    "https://chatgpt.com/?_yoetz=run_challenge"
+  );
+  try {
+    hooks.composer = {};
+    hooks.pageText = "Security check";
+    hooks.manualHandoffContext = {
+      authenticated: false,
+      title: "",
+      text: "Security check"
+    };
+    const job = {
+      job_id: "job_challenge",
+      run_id: "run_challenge",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    const auth = await send({ type: "yoetz_auth_probe" });
+
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.payload.manual_handoff.state, "challenge_required");
+    assert.equal(auth.ok, true);
+    assert.equal(auth.payload.status, "challenge_required");
+    assert.equal(auth.payload.authenticated, false);
+    assert.deepEqual(hooks.markOwnershipCalls, []);
+    assert.deepEqual(hooks.manualHandoffInputs.map((input) => input.text), ["Security check", "Security check"]);
+  } finally {
+    restore();
+  }
+});
+
+test("content script reports unknown authentication without a strict composer or handoff", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "auth_probe_unknown",
+    "https://chatgpt.com/"
+  );
+  try {
+    hooks.composer = {};
+    hooks.pageText = "Welcome";
+    hooks.manualHandoffContext = {
+      authenticated: false,
+      title: "",
+      text: "Welcome"
+    };
+
+    const auth = await send({ type: "yoetz_auth_probe" });
+
+    assert.equal(auth.ok, true);
+    assert.equal(auth.payload.status, "authentication_unknown");
+    assert.equal(auth.payload.authenticated, false);
+    assert.equal(auth.payload.manual_handoff, null);
+    assert.match(auth.payload.message, /composer is not visible/);
+    assert.equal(Object.hasOwn(hooks.manualHandoffInputs[0], "authenticated"), false);
   } finally {
     restore();
   }
@@ -732,7 +820,8 @@ async function loadContentScript(label, href) {
     insertPromptCalls: [],
     clickSendCalls: [],
     sendAcceptanceBaselineCalls: 0,
-    manualHandoffInputs: []
+    manualHandoffInputs: [],
+    waitManualHandoffInputs: []
   };
   globalThis.__contentScriptTestHooks = hooks;
   globalThis.window = { name: "", location };

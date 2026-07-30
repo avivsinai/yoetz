@@ -9,9 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- ChatGPT native-extension jobs now ignore challenge phrases in authenticated
-  page chrome, and live extension hellos supersede historical manual-handoff
-  records so reconnect restores transport auto-selection.
+- ChatGPT native-extension jobs now scope login, challenge, and rate-limit
+  detection to transcript-free site context so sidebar history and conversation
+  text cannot trigger a false manual handoff, recognize common Cloudflare
+  interstitial metadata, and let live extension hellos supersede historical
+  manual-handoff records so reconnect restores transport auto-selection.
 
 ## [0.5.47] - 2026-07-27
 ### Fixed

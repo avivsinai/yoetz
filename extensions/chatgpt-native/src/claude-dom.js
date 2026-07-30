@@ -84,6 +84,14 @@ export function classifyWaitManualHandoff({ url = "", title = "" } = {}) {
   return classifyManualHandoff({ url, title, text: "" });
 }
 
+export function manualHandoffContext(root = document) {
+  return {
+    authenticated: Boolean(findComposer(root)),
+    title: String(root.title ?? ""),
+    text: getPageText(root)
+  };
+}
+
 export function classifyBlockingState(root = document, { forceScan = false } = {}) {
   const pageText = normalizeText(root.body?.textContent || root.documentElement?.textContent);
   if (pageText && !USAGE_CREDITS_TEXT_PATTERN.test(pageText)) {
