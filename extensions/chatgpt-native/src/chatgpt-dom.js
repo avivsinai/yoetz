@@ -376,6 +376,10 @@ export async function configureModelState(root, job = {}) {
       available_families: [],
       family_status: "skipped",
       effort_status: "skipped",
+      failure_reason: null,
+      picker_shape: null,
+      effort_control: null,
+      effort_move_method: null,
       pill_text: pillText ?? "",
       family_label: null,
       effort_options: [],
@@ -394,6 +398,10 @@ export async function configureModelState(root, job = {}) {
     available_families: selection.available_families ?? [],
     family_status: selection.family_status ?? "unverified",
     effort_status: selection.effort_status ?? "unverified",
+    failure_reason: selection.failure_reason ?? null,
+    picker_shape: selection.picker_shape ?? null,
+    effort_control: selection.effort_control ?? null,
+    effort_move_method: selection.effort_move_method ?? null,
     pill_text: selection.pill_text ?? null,
     family_label: selection.family_label ?? null,
     effort_options: selection.effort_options ?? [],
@@ -485,8 +493,12 @@ async function selectSolProModel(root, options = {}) {
   const base = {
     status: "unavailable",
     model_used: null,
+    failure_reason: null,
     family_status: "unverified",
     effort_status: "unverified",
+    picker_shape: null,
+    effort_control: null,
+    effort_move_method: null,
     available_options: [],
     available_families: [],
     effort_options: []
@@ -495,6 +507,7 @@ async function selectSolProModel(root, options = {}) {
   if (legacyMarkers.length > 0) {
     return {
       ...base,
+      failure_reason: "legacy_picker_detected",
       warning: "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI",
       legacy_picker: legacyMarkers.slice(0, 10)
     };
@@ -506,11 +519,16 @@ async function selectSolProModel(root, options = {}) {
     if (lateLegacyMarkers.length > 0) {
       return {
         ...base,
+        failure_reason: "legacy_picker_detected",
         warning: "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI",
         legacy_picker: lateLegacyMarkers.slice(0, 10)
       };
     }
-    return { ...base, warning: "ChatGPT GPT-5.6 composer model pill not found" };
+    return {
+      ...base,
+      failure_reason: "model_control_not_found",
+      warning: "ChatGPT GPT-5.6 composer model pill not found"
+    };
   }
 
   let availableFamilies = [];
@@ -518,46 +536,61 @@ async function selectSolProModel(root, options = {}) {
   if (!state) {
     return {
       ...base,
+      failure_reason: "model_picker_open_failed",
       pill_text: modelControlLabel(modelButton),
       warning: "ChatGPT GPT-5.6 model picker did not open"
     };
   }
 
   if (!familyIsSol(state.family_label)) {
-    const familyMenu = await openFamilyPicker(root, state.menu, state.family_trigger, options);
+    const familyMenu = await openFamilyPicker(root, state.menu ?? state.surface, state.family_trigger, options);
     availableFamilies = familyMenu ? familyMenuRadios(familyMenu).map((item) => textOf(item)).filter(Boolean) : [];
     const solOption = familyMenuRadios(familyMenu).find((item) => foldedModelText(textOf(item)) === foldedModelText(CHATGPT_SOL_FAMILY_LABEL));
     if (!solOption) {
       await closeModelPicker(root, modelButton);
-      return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol was not visible in the family submenu");
+      return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol was not visible in the family submenu", "model_family_not_found");
     }
     realClick(solOption);
     await sleep(Number(options.actionSettleMs ?? 250));
     modelButton = await waitForModelButton(root, options);
     if (!modelButton) {
-      return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol");
+      return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol", "model_family_remount_failed");
     }
     state = await openAndReadModelPicker(root, modelButton, options);
     if (!state) {
-      return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting GPT-5.6 Sol");
+      return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting GPT-5.6 Sol", "model_picker_reopen_failed");
     }
   }
 
   if (!effortIsPro(state)) {
-    const proOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === foldedModelText(CHATGPT_PRO_EFFORT_LABEL));
-    if (!proOption) {
-      await closeModelPicker(root, modelButton);
-      return selectionFailure(base, modelButton, state, availableFamilies, "Pro intelligence was not visible for GPT-5.6 Sol");
-    }
-    realClick(proOption);
-    await sleep(Number(options.actionSettleMs ?? 250));
-    modelButton = await waitForModelButton(root, options);
-    if (!modelButton) {
-      return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting Pro intelligence");
-    }
-    state = await openAndReadModelPicker(root, modelButton, options);
-    if (!state) {
-      return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting Pro intelligence");
+    if (state.shape === "slider") {
+      if (!state.effort_slider) {
+        await closeModelPicker(root, modelButton);
+        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider was not found in the Advanced picker", "effort_control_not_found");
+      }
+      const moved = await moveEffortSliderToPro(root, state, options);
+      state = moved.state ?? state;
+      state.effort_move_method = moved.method;
+      if (!moved.ok) {
+        await closeModelPicker(root, modelButton);
+        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to Pro", "effort_slider_move_failed");
+      }
+    } else {
+      const proOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === foldedModelText(CHATGPT_PRO_EFFORT_LABEL));
+      if (!proOption) {
+        await closeModelPicker(root, modelButton);
+        return selectionFailure(base, modelButton, state, availableFamilies, "Pro intelligence was not visible for GPT-5.6 Sol", "effort_control_not_found");
+      }
+      realClick(proOption);
+      await sleep(Number(options.actionSettleMs ?? 250));
+      modelButton = await waitForModelButton(root, options);
+      if (!modelButton) {
+        return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting Pro intelligence", "effort_control_remount_failed");
+      }
+      state = await openAndReadModelPicker(root, modelButton, options);
+      if (!state) {
+        return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting Pro intelligence", "model_picker_reopen_failed");
+      }
     }
   }
 
@@ -565,18 +598,27 @@ async function selectSolProModel(root, options = {}) {
   const effortVerified = effortIsPro(state);
   if (!familyVerified || !effortVerified) {
     await closeModelPicker(root, modelButton);
-    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol + Pro could not be verified in one picker pass");
+    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol + Pro could not be verified in one picker pass", "model_selection_verification_failed");
   }
   if (!await closeModelPicker(root, modelButton)) {
-    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification");
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
+  }
+  modelButton = await waitForModelButton(root, options);
+  const pillText = modelControlLabel(modelButton);
+  if (state.shape === "slider" && !/\bpro\b/i.test(pillText)) {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm Pro after closing the slider picker", "effort_composer_pill_unverified");
   }
 
   return {
     status: "selected",
     model_used: `${CHATGPT_SOL_FAMILY_LABEL} ${CHATGPT_PRO_EFFORT_LABEL}`,
+    failure_reason: null,
     family_status: "verified",
     effort_status: "verified",
-    pill_text: modelControlLabel(modelButton),
+    picker_shape: state.shape,
+    effort_control: state.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider) : null,
+    effort_move_method: state.effort_move_method ?? null,
+    pill_text: pillText,
     family_label: state.family_label,
     available_options: state.effort_items.map((item) => textOf(item)).filter(Boolean),
     available_families: availableFamilies,
@@ -608,7 +650,7 @@ async function openAndReadModelPicker(root, modelButton, options = {}) {
 
 async function openModelPicker(root, modelButton, options = {}) {
   const settleMs = Number(options.settleMs ?? 150);
-  const opened = () => Boolean(findMainModelMenu(root));
+  const opened = () => Boolean(findPickerState(root));
   if (opened()) {
     return true;
   }
@@ -739,11 +781,11 @@ function pressActivationKey(element, key) {
 }
 
 async function closeModelPicker(root, modelButton) {
-  for (let attempt = 0; attempt < 3 && visibleMenus(root).length > 0; attempt += 1) {
+  for (let attempt = 0; attempt < 3 && findPickerState(root); attempt += 1) {
     pressActivationKey(modelButton, "Escape");
     await sleep(50);
   }
-  return visibleMenus(root).length === 0;
+  return !findPickerState(root);
 }
 
 async function waitForPickerState(root, options = {}) {
@@ -751,11 +793,16 @@ async function waitForPickerState(root, options = {}) {
   const intervalMs = Number(options.intervalMs ?? 100);
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    const menu = findMainModelMenu(root);
-    if (menu) return readPickerState(menu);
+    const state = findPickerState(root);
+    if (state) return state;
     await sleep(intervalMs);
   }
   return null;
+}
+
+function findPickerState(root) {
+  const menu = findMainModelMenu(root);
+  return menu ? readMenuPickerState(menu) : readSliderPickerState(root);
 }
 
 async function waitForFamilyMenu(root, mainMenu, options = {}) {
@@ -786,7 +833,7 @@ function visibleMenus(root) {
   return Array.from(root.querySelectorAll('[role="menu"]')).filter((menu) => isVisible(menu));
 }
 
-function readPickerState(menu) {
+function readMenuPickerState(menu) {
   const effortItems = menuRadioItems(menu);
   const familyTrigger = Array.from(menu.querySelectorAll('[role="menuitem"]'))
     .find((item) => {
@@ -795,11 +842,83 @@ function readPickerState(menu) {
         && /^(?:gpt|o\d)\b/i.test(label);
     });
   return {
+    shape: "menu",
     menu,
+    surface: menu,
     family_trigger: familyTrigger ?? null,
     family_label: textOf(familyTrigger),
-    effort_items: effortItems
+    effort_items: effortItems,
+    effort_slider: null,
+    effort_move_method: null
   };
+}
+
+function readSliderPickerState(root) {
+  const surface = findAdvancedPickerSurface(root);
+  if (!surface) return null;
+  const familyTrigger = Array.from(surface.querySelectorAll('[role="menuitem"], button'))
+    .find((item) => {
+      const label = normalizeText(textOf(item));
+      return /^(?:gpt|o\d)\b/i.test(label) && isVisible(item, { allowDisabled: true });
+    });
+  const effortSlider = Array.from(surface.querySelectorAll('[role="slider"]'))
+    .filter((slider) => isVisible(slider))
+    .find((slider) => sliderIsEffortControl(slider, surface) && Boolean(sliderEffortSnapshot(slider))) ?? null;
+  return {
+    shape: "slider",
+    menu: null,
+    surface,
+    family_trigger: familyTrigger ?? null,
+    family_label: textOf(familyTrigger),
+    effort_items: [],
+    effort_slider: effortSlider,
+    effort_move_method: null
+  };
+}
+
+function sliderIsEffortControl(slider, surface) {
+  const directLabel = normalizeText([
+    slider?.getAttribute?.("aria-label"),
+    slider?.getAttribute?.("title")
+  ].filter(Boolean).join(" "));
+  if (/\beffort\b/i.test(directLabel)) return true;
+
+  const labelledBy = normalizeText(slider?.getAttribute?.("aria-labelledby") ?? "")
+    .split(" ")
+    .map((id) => slider?.ownerDocument?.getElementById?.(id))
+    .filter(Boolean)
+    .map((node) => textOf(node))
+    .join(" ");
+  if (/\beffort\b/i.test(labelledBy)) return true;
+
+  let ancestor = slider?.parentElement;
+  while (ancestor && ancestor !== surface) {
+    const text = normalizeText(textOf(ancestor));
+    if (/\beffort\b/i.test(text) && !/\b(?:faster|smarter)\b/i.test(text)) return true;
+    ancestor = ancestor.parentElement;
+  }
+  return false;
+}
+
+function findAdvancedPickerSurface(root) {
+  const candidates = Array.from(root.querySelectorAll('div, [role="dialog"]'))
+    .filter((node) => {
+      if (!isVisible(node, { allowDisabled: true })) return false;
+      const text = normalizeText(textOf(node));
+      return /\bAdvanced\b/i.test(text)
+        && /\bFaster\b/i.test(text)
+        && /\bSmarter\b/i.test(text)
+        && /\bModel\b/i.test(text)
+        && /\bEffort\b/i.test(text)
+        && /\b(?:GPT|o\d)\b/i.test(text)
+        && Array.from(node.querySelectorAll?.('[role="slider"]') ?? [])
+          .some((slider) => isVisible(slider, { allowDisabled: true }));
+    });
+  return candidates.sort((left, right) => (
+    left.querySelectorAll?.("*")?.length ?? 0
+  ) - (
+    right.querySelectorAll?.("*")?.length ?? 0
+  ))[0] ?? null;
 }
 
 function menuRadioItems(menu) {
@@ -811,7 +930,89 @@ function familyMenuRadios(menu) {
 }
 
 function effortIsPro(state) {
+  if (state?.shape === "slider") {
+    const snapshot = sliderEffortSnapshot(state.effort_slider);
+    return Boolean(snapshot && snapshot.label === "pro" && snapshot.now === snapshot.max);
+  }
   return state?.effort_items?.some((item) => foldedModelText(textOf(item)) === "pro" && itemIsChecked(item)) ?? false;
+}
+
+function sliderEffortSnapshot(slider) {
+  if (!slider) return null;
+  const valueText = normalizeText(slider.getAttribute?.("aria-valuetext") ?? "");
+  const match = valueText.match(/^(Instant|Medium|High|Extra High|Pro)\s*,?\s*(\d+)\s+of\s+(\d+)\s*[.!?]?\s*$/i);
+  const now = Number(slider.getAttribute?.("aria-valuenow"));
+  const min = Number(slider.getAttribute?.("aria-valuemin"));
+  const max = Number(slider.getAttribute?.("aria-valuemax"));
+  if (!match || !Number.isFinite(now) || !Number.isFinite(min) || !Number.isFinite(max)
+    || max <= min || now < min || now > max || Number(match[2]) !== now || Number(match[3]) !== max) {
+    return null;
+  }
+  return { label: foldedModelText(match[1]), now, min, max, value_text: valueText };
+}
+
+function sliderEffortDiagnostics(slider) {
+  const snapshot = sliderEffortSnapshot(slider);
+  return snapshot ? {
+    role: "slider",
+    label: snapshot.label,
+    value_text: snapshot.value_text,
+    value_now: snapshot.now,
+    value_min: snapshot.min,
+    value_max: snapshot.max
+  } : null;
+}
+
+async function moveEffortSliderToPro(root, initialState, options = {}) {
+  const settleMs = Number(options.actionSettleMs ?? 250);
+  let state = initialState;
+  const attemptKey = async (key, method) => {
+    if (state?.shape !== "slider" || !state.effort_slider) return null;
+    pressActivationKey(state.effort_slider, key);
+    await sleep(settleMs);
+    state = findPickerState(root);
+    return effortIsPro(state) ? { ok: true, state, method } : null;
+  };
+
+  let result = await attemptKey("End", "keyboard_end");
+  if (result) return result;
+
+  const snapshot = sliderEffortSnapshot(state?.effort_slider);
+  const arrowAttempts = Math.min(10, Math.max(1, Math.ceil((snapshot?.max ?? 5) - (snapshot?.min ?? 1)) + 1));
+  for (let attempt = 0; attempt < arrowAttempts; attempt += 1) {
+    result = await attemptKey("ArrowRight", "keyboard_arrow_right");
+    if (result) return result;
+    if (state?.shape !== "slider" || !state.effort_slider) break;
+  }
+
+  if (state?.shape === "slider" && state.effort_slider) {
+    clickSliderTrackMax(state.effort_slider);
+    await sleep(settleMs);
+    state = findPickerState(root);
+    if (effortIsPro(state)) return { ok: true, state, method: "pointer_max" };
+  }
+  return { ok: false, state, method: null };
+}
+
+function clickSliderTrackMax(slider) {
+  const rect = slider?.getBoundingClientRect?.();
+  if (!rect || !Number.isFinite(rect.left) || !Number.isFinite(rect.top)
+    || !Number.isFinite(rect.width) || !Number.isFinite(rect.height)
+    || rect.width <= 0 || rect.height <= 0) {
+    return false;
+  }
+  const clientX = rect.left + rect.width - 1;
+  const clientY = rect.top + (rect.height / 2);
+  for (const [type, constructorName, init] of [
+    ["pointerdown", "PointerEvent", { button: 0, buttons: 1, pointerId: 1, pointerType: "mouse", isPrimary: true }],
+    ["mousedown", "MouseEvent", { button: 0, buttons: 1 }],
+    ["pointerup", "PointerEvent", { button: 0, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }],
+    ["mouseup", "MouseEvent", { button: 0, buttons: 0 }],
+    ["click", "MouseEvent", { button: 0, buttons: 0, detail: 1 }]
+  ]) {
+    dispatchSyntheticEvent(slider, type, constructorName, { ...init, clientX, clientY });
+  }
+  return true;
 }
 
 function familyIsSol(value) {
@@ -826,11 +1027,15 @@ function effortDiagnostics(items) {
   return items.map((item) => ({ label: textOf(item), checked: itemIsChecked(item) }));
 }
 
-function selectionFailure(base, modelButton, state, availableFamilies, warning) {
+function selectionFailure(base, modelButton, state, availableFamilies, warning, failureReason) {
   return {
     ...base,
+    failure_reason: failureReason,
     family_status: familyIsSol(state?.family_label) ? "verified" : "unverified",
     effort_status: effortIsPro(state) ? "verified" : "unverified",
+    picker_shape: state?.shape ?? null,
+    effort_control: state?.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider) : null,
+    effort_move_method: state?.effort_move_method ?? null,
     pill_text: modelControlLabel(modelButton),
     family_label: state?.family_label ?? null,
     available_options: state?.effort_items?.map((item) => textOf(item)).filter(Boolean) ?? [],
@@ -2392,9 +2597,8 @@ function uniqueElements(nodes) {
 
 export function modelSelectionDiagnostics(root = document) {
   const modelButton = findModelButton(root);
-  const mainMenu = findMainModelMenu(root);
-  const state = mainMenu ? readPickerState(mainMenu) : null;
-  const familyMenu = findFamilySubmenu(root, mainMenu);
+  const state = findPickerState(root);
+  const familyMenu = findFamilySubmenu(root, state?.menu ?? state?.surface);
   return {
     requested_model: CHATGPT_SOL_PRO_MODEL,
     current_model_label: modelControlLabel(modelButton),
@@ -2402,6 +2606,8 @@ export function modelSelectionDiagnostics(root = document) {
     family_status: familyIsSol(state?.family_label) ? "verified" : "unverified",
     effort_status: effortIsPro(state) ? "verified" : "unverified",
     family_label: state?.family_label ?? null,
+    picker_shape: state?.shape ?? null,
+    effort_control: state?.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider) : null,
     model_button: modelButton ? elementSummary(modelButton) : null,
     visible_options: state?.effort_items?.map((item) => textOf(item)).filter(Boolean).slice(0, 20) ?? [],
     visible_families: familyMenuRadios(familyMenu).map((item) => textOf(item)).filter(Boolean).slice(0, 20),

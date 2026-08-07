@@ -3127,6 +3127,16 @@ fn job_error_message(payload: &Value) -> String {
 }
 
 fn append_job_error_detail(payload: &Value, message: &str, detail: &mut Vec<String>) {
+    if let Some(reason) = payload
+        .get("failure_reason")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        let reason_text = format!("failure_reason={reason}");
+        if !message.contains(reason) {
+            detail.push(reason_text);
+        }
+    }
     if let Some(tab_id) = payload
         .get("tab_id")
         .and_then(Value::as_i64)
@@ -4336,6 +4346,19 @@ mod tests {
         }));
 
         assert!(message.contains("attachment_trace=<omitted:"));
+    }
+
+    #[test]
+    fn job_error_message_surfaces_model_selection_failure_reason() {
+        let message = job_error_message(&json!({
+            "code": "model_selection_failed",
+            "message": "Requested ChatGPT model was not selected",
+            "phase": "model_selection",
+            "failure_reason": "effort_slider_move_failed"
+        }));
+
+        assert!(message.contains("failure_reason=effort_slider_move_failed"));
+        assert!(message.contains("phase model_selection"));
     }
 
     #[test]
