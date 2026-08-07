@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.49] - 2026-08-07
 ### Fixed
 
 - ChatGPT native-extension model selection now detects the picker shape on
@@ -29,6 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   findings remain, and route scope expansion to the user. All canned review
   prompts now request blocking-in-scope vs out-of-scope/backlog
   classification with file/line evidence.
+
 
 ## [0.5.48] - 2026-07-30
 ### Fixed
