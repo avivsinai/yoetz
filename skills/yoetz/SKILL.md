@@ -220,7 +220,7 @@ cat "$BUNDLE"
 **For browser workflows**, pass the bundle.md path:
 ```bash
 PROMPT='Review the attached Rust code for correctness and regressions.
-Prioritize actionable findings with file and line evidence.
+Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence.
 Flag missing context instead of guessing, then list the checks you recommend.'
 BUNDLE=$(yoetz bundle -p "$PROMPT" -f "src/*.rs" --format json | jq -r .artifacts.bundle_md)
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --format json
@@ -312,7 +312,7 @@ If Chrome lands on `chrome://inspect/#devices` instead, that's fine. Keep "Disco
 **Step 2: Run a recipe**
 ```bash
 PROMPT='Review the attached Rust code for correctness and regressions.
-Prioritize actionable findings with file and line evidence.
+Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence.
 Flag missing context instead of guessing, then list the checks you recommend.'
 BUNDLE=$(yoetz bundle -p "$PROMPT" -f "src/*.rs" --format json | jq -r .artifacts.bundle_md)
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --format json
@@ -429,6 +429,25 @@ build a fresh bundle, and run a new native-extension recipe with a new
 nonsensical, report that the model response was unusable; rerun only when the
 current user task calls for another attempt.
 
+### Triage review findings without expanding scope
+
+Review findings are advisory input, not a work order. The consuming agent owns
+triage; the reviewer does not set or expand the current task's scope.
+
+1. Implement now only findings that are both in scope and urgent: correctness,
+   security, or data-loss blockers in the code being changed.
+2. Backlog every other finding, including non-urgent hardening, refactors,
+   adjacent bugs, and out-of-scope suggestions. Name and record each item using
+   the project's existing authorized convention; when an external write is not
+   authorized, report it explicitly as a pending backlog item. Never silently
+   drop it or implement it in the current change.
+3. After fixing in-scope blockers, re-review that bounded fix if the task calls
+   for iteration. Do not re-review while known in-scope blockers remain.
+4. End the review loop when all remaining findings are backlog-class. A review
+   does not need to return zero findings to converge.
+5. Treat any larger scope surfaced by the reviewer as a new task to propose to
+   the user, not as authorization for extra commits.
+
 If a run fails after upload/send/wait, inspect the marked tab with the run id
 from the error instead of rerunning blindly; reruns after browser side effects
 can duplicate the submission.
@@ -491,7 +510,7 @@ Enterprise accounts that still expose the legacy picker.
 ```bash
 # Create bundle and get bundle.md path
 PROMPT='Review the attached Rust code for correctness and regressions.
-Prioritize actionable findings with file and line evidence.
+Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence.
 Flag missing context instead of guessing, then list the checks you recommend.'
 BUNDLE=$(yoetz bundle -p "$PROMPT" -f "src/*.rs" --format json | jq -r .artifacts.bundle_md)
 
@@ -531,7 +550,7 @@ copy-control recovery above is satisfied.
 OPENAI_MODEL=$(yoetz models frontier --family openai --format json | jq -r '.[0].model.id')
 GEMINI_MODEL=$(yoetz models frontier --family gemini --format json | jq -r '.[0].model.id')
 PROMPT='Review the attached Rust code for correctness and regressions.
-Prioritize actionable findings with file and line evidence.
+Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence.
 Flag missing context instead of guessing, then list the checks you recommend.'
 yoetz council -p "$PROMPT" -f "src/*.rs" \
   --models "$OPENAI_MODEL,$GEMINI_MODEL" --format json > api.json
@@ -577,7 +596,7 @@ When `yoetz browser recipe` needs manual browser automation, use `dev-browser` d
 
 1. **Create bundle**:
    ```bash
-   PROMPT='Review the attached TypeScript code for correctness and regressions. Prioritize actionable findings with file and line evidence. Flag missing context instead of guessing, then list the checks you recommend.'
+   PROMPT='Review the attached TypeScript code for correctness and regressions. Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence. Flag missing context instead of guessing, then list the checks you recommend.'
    BUNDLE=$(yoetz bundle -p "$PROMPT" -f "src/**/*.ts" --format json | jq -r .artifacts.bundle_md)
    ```
 2. **Connect to Chrome**:
