@@ -6,6 +6,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- ChatGPT native-extension model selection now detects the picker shape on
+  every open and supports the Advanced effort slider that ChatGPT A/B-serves
+  alongside the Intelligence menu: Pro is set via keyboard (End, then bounded
+  ArrowRight) with a max-track pointer fallback, every attempt is verified
+  fail-closed against the slider's ARIA state and the composer pill, and the
+  effort slider is scoped away from the Faster/Smarter master control. The
+  existing menu path is unchanged. Selection failures now carry a
+  machine-readable `failure_reason` (for example `effort_slider_move_failed`
+  or `effort_control_not_found`) through the service worker and CLI error
+  text instead of the blanket `unavailable`. The slider path is
+  fixture-tested against the captured DOM evidence; live proof is pending
+  until the slider UI is served again.
+
+### Documentation
+
+- The yoetz skill now defines a scope-disciplined triage protocol for
+  consuming review findings: implement only in-scope urgent blockers,
+  explicitly backlog everything else, converge when only backlog-class
+  findings remain, and route scope expansion to the user. All canned review
+  prompts now request blocking-in-scope vs out-of-scope/backlog
+  classification with file/line evidence.
 
 ## [0.5.48] - 2026-07-30
 ### Fixed
