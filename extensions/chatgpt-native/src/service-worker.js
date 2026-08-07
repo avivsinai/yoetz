@@ -354,6 +354,7 @@ async function startJob(message) {
     const diagnosticSummary = formatModelSelectionFailureDiagnostics(diagnostics);
     await failJob(job, "model_selection_failed", [
       `Requested ${adapter.displayName} model was not selected: ${modelSelection.status ?? "unknown"}`,
+      modelSelection.failure_reason ? `reason: ${modelSelection.failure_reason}` : null,
       diagnosticSummary ? `diagnostics: ${diagnosticSummary}` : null
     ].filter(Boolean).join(". "), {
       phase: "model_selection",
@@ -362,6 +363,7 @@ async function startJob(message) {
       model_strategy: job.model_strategy,
       model_used: job.model_used,
       model_selection_status: job.model_selection_status,
+      failure_reason: modelSelection.failure_reason ?? null,
       model_selection: modelSelection,
       ...(Object.keys(diagnostics).length > 0 ? { model_selection_diagnostics: diagnostics } : {})
     });
@@ -380,6 +382,13 @@ async function startJob(message) {
 function modelSelectionFailureDiagnostics(selection) {
   const diagnostics = {};
   for (const key of [
+    "failure_reason",
+    "picker_shape",
+    "effort_control",
+    "effort_move_method",
+    "family_status",
+    "effort_status",
+    "family_label",
     "modelVerified",
     "maxVerified",
     "modelChip"

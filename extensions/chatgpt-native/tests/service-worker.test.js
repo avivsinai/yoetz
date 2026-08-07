@@ -1666,6 +1666,17 @@ test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async ()
                 model_used: "Default",
                 requested_model: "gpt-5-6-sol-pro",
                 available_options: ["Default"],
+                failure_reason: "effort_slider_move_failed",
+                picker_shape: "slider",
+                effort_control: {
+                  label: "high",
+                  value_text: "High, 3 of 5",
+                  value_now: 3,
+                  value_min: 1,
+                  value_max: 5
+                },
+                family_status: "verified",
+                effort_status: "unverified",
                 warning: "GPT-5.6 Sol was not visible in the family submenu"
               }
             };
@@ -1687,6 +1698,11 @@ test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async ()
     assert.equal(error.payload.phase, "model_selection");
     assert.equal(error.payload.side_effect_started, false);
     assert.equal(error.payload.model_selection_status, "unavailable");
+    assert.equal(error.payload.failure_reason, "effort_slider_move_failed");
+    assert.equal(error.payload.model_selection_diagnostics.failure_reason, "effort_slider_move_failed");
+    assert.equal(error.payload.model_selection_diagnostics.picker_shape, "slider");
+    assert.equal(error.payload.model_selection_diagnostics.effort_control.value_text, "High, 3 of 5");
+    assert.match(error.payload.message, /reason: effort_slider_move_failed/);
     assert.equal(sentToTabs.includes("yoetz_upload_file"), false);
     assert.equal(sentToTabs.includes("yoetz_send_prompt"), false);
   } finally {
