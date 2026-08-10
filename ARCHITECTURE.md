@@ -200,9 +200,9 @@ holds.
   the stable-idle window. If that condition is not reached before
   `responseWaitTimeoutMs`, the job fails with `response_timeout`. The
   hover-dependent copy control is never a primary anchor; cloned
-  `group/status` thinking rows are excluded from response text. Claude jobs
-  open the tab active, stay foreground through upload and accepted send, and
-  restore the previous tab before the response wait.
+  `group/status` thinking rows are excluded from response text. Claude jobs use
+  independent background tabs for model selection, upload, accepted send, and
+  response extraction; cancelling one job removes only its owned tab.
 - Send acceptance: when `clickSend` commits but `waitForSendAccepted`
   cannot confirm a post-click signal within budget, the run fails with
   `send_acceptance_unknown` carrying `side_effect_started: true`. The

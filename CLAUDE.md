@@ -90,9 +90,10 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   `chrome-devtools-mcp`, then `dev-browser`, then `agent-browser`.
 - The `claude` recipe mirrors `chatgpt` end to end through the typed contract in
   `crates/yoetz-cli/src/claude_recipe.rs` and DOM builders in `claude_web.rs`.
-  Its only model target is Fable 5 + Effort Max + Thinking on. Selection is
-  fail-closed: re-read the model radio, `effort-option-max`, and Thinking
-  switch state; a successful click is never proof.
+  Its only model target is Fable 5 + Effort Max. Selection is fail-closed:
+  re-read the model radio and `effort-option-max`; a successful click is never
+  proof. Claude's July 2026 picker has no independent Thinking control; the
+  effort scale now expresses reasoning depth and Max is the strongest option.
 - Built-in web-recipe exception: when extension status for the selected site
   reports `connected`, `chrome-extension-native` is auto-selected as the only
   default transport and fails closed instead of falling through to CDP
@@ -117,9 +118,16 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   it, and verifies the loaded version. `status` and `doctor` fail on wrong-path
   or unstamped loads. Never hand-patch the managed directory.
 - The native host and managed extension directory are machine-global,
-  single-writer state shared by every agent lane. Serialize setup/update/reload
-  operations; concurrent lanes may run recipes only against one frozen loaded
-  artifact.
+  single-writer state shared by every agent lane. Recipe runs hold the shared
+  side of the lifecycle lock; setup/update/reload/auto-heal require the
+  exclusive side and fail closed if a recipe is active. Recipe lanes may run
+  only against one frozen loaded artifact.
+- Independent ChatGPT and Claude recipes may run concurrently through one
+  connected extension profile: each job owns a separate background tab. Profile
+  selectors route among loaded profiles; they are not required for recipe
+  parallelism.
+  Every parallel recipe must use a distinct Yoetz bundle session directory;
+  reusing one managed `bundle.md` fails with `session_busy` before browser work.
 - ChatGPT and Claude conversation resume use
   `--var conversation=<site-specific-id|url>` or `--followup`
   (native-extension only, no automatic context management); callers own the
@@ -130,13 +138,20 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   is hidden/zero-size, so resolve the exact selector rather than accessibility
   snapshots; use the native `input.files` setter so page-world handlers observe
   files assigned from the extension's isolated world.
-- Claude jobs must open active because its SPA may not mount in a never-focused
-  tab. Keep the tab active through upload and accepted send, then restore the
-  previous tab before waiting for the response; ChatGPT jobs remain background.
+- Claude jobs open in background tabs. On released `v0.5.42`, a live run proved
+  exactly two concurrent Claude recipes in one connected profile on an
+  Enterprise workspace account. The jobs overlapped for 125s and used distinct
+  conversations. Both verified Fable 5 and Effort Max. Tab non-activation has
+  separate evidence: the released adapter sets `activateOnCreate:false`, a
+  single-job live probe measured `tab_active=false` at every phase, and
+  service-worker coverage asserts that no tab activation call occurs. The
+  concurrency evidence covers two jobs, not higher fanout or other account
+  types. Service-worker coverage separately proves two Claude jobs use distinct
+  background tabs through overlapping phases and that cancelling one does not
+  affect the other.
   Base UI picker choreography needs settle pacing, attributed pointer-event
-  hover fallback, visibility-gated Thinking reads, and diagnostics for every
-  verification leg. Early-exit and full-selection results must have the same
-  acceptable shape.
+  hover fallback, and diagnostics for every verification leg. Early-exit and
+  full-selection results must have the same acceptable shape.
 - Claude finality requires the last assistant turn to be non-streaming and no
   `Stop response` control; the CDP path adds a bounded no-progress failure,
   while the native path fails at the response deadline. The copy control

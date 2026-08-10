@@ -42,15 +42,14 @@ test("Claude adapter owns UUID conversations, exact model policy, and DOM-only f
   assert.equal(adapter.isAllowedTabUrl(`https://claude.ai/chat/${conversationId}`), true);
   assert.equal(adapter.isAllowedTabUrl("https://chatgpt.com/"), false);
   assert.deepEqual(adapter.tabActivation, {
-    activateOnCreate: true,
-    restorePreviousAfter: "send"
+    activateOnCreate: false,
+    restorePreviousAfter: null
   });
   assert.equal(adapter.isAcceptableModelSelection({
     status: "selected",
     requested_model: "fable-5-max",
     modelVerified: true,
     maxVerified: true,
-    thinkingChecked: true,
     model_used: "Fable 5 Max"
   }), true);
   assert.equal(adapter.isAcceptableModelSelection({
@@ -58,7 +57,6 @@ test("Claude adapter owns UUID conversations, exact model policy, and DOM-only f
     requested_model: "fable-5-max",
     modelVerified: true,
     maxVerified: false,
-    thinkingChecked: true,
     model_used: "Fable 5 High"
   }), false);
   assert.equal(adapter.completion.supportsBackendApiFallback, false);
@@ -81,12 +79,34 @@ test("Claude adapter owns UUID conversations, exact model policy, and DOM-only f
 
 test("ChatGPT adapter owns conversation and model policy", () => {
   const adapter = siteAdapterForRecipe("chatgpt");
+  const provisionalConversationId = "WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d";
+  const assignedConversationId = "6a5f60dc-8174-8329-949a-1f282d1dccbd";
   assert.deepEqual(adapter.tabActivation, {
     activateOnCreate: false,
     restorePreviousAfter: null
   });
   assert.deepEqual(adapter.normalizeConversationId(" conv-123 "), { ok: true, id: "conv-123" });
   assert.equal(adapter.conversationUrl("conv-123"), "https://chatgpt.com/c/conv-123");
+  assert.equal(adapter.isExpectedConversationIdAssignment({
+    conversation_id: null,
+    submitted_conversation_id: provisionalConversationId
+  }, provisionalConversationId, assignedConversationId), true);
+  assert.equal(adapter.isExpectedConversationIdAssignment({
+    conversation_id: null,
+    submitted_conversation_id: provisionalConversationId
+  }, provisionalConversationId, null), false);
+  assert.equal(adapter.isExpectedConversationIdAssignment({
+    conversation_id: null,
+    submitted_conversation_id: provisionalConversationId
+  }, provisionalConversationId, "WEB:different"), false);
+  assert.equal(adapter.isExpectedConversationIdAssignment({
+    conversation_id: "conv-requested",
+    submitted_conversation_id: provisionalConversationId
+  }, provisionalConversationId, assignedConversationId), false);
+  assert.equal(adapter.isExpectedConversationIdAssignment({
+    conversation_id: null,
+    submitted_conversation_id: "WEB:different"
+  }, provisionalConversationId, assignedConversationId), false);
   assert.equal(adapter.isAcceptableModelSelection({
     status: "selected",
     requested_model: "gpt-5-6-sol-pro",

@@ -1,6 +1,6 @@
 ---
 name: yoetz
-version: 0.5.36
+version: 0.5.49
 description: >
   Fast CLI-first LLM council, bundler, and multimodal gateway. Use ONLY when user
   explicitly mentions "yoetz", "yoetz ask", "yoetz council", "yoetz review",
@@ -220,7 +220,7 @@ cat "$BUNDLE"
 **For browser workflows**, pass the bundle.md path:
 ```bash
 PROMPT='Review the attached Rust code for correctness and regressions.
-Prioritize actionable findings with file and line evidence.
+Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence.
 Flag missing context instead of guessing, then list the checks you recommend.'
 BUNDLE=$(yoetz bundle -p "$PROMPT" -f "src/*.rs" --format json | jq -r .artifacts.bundle_md)
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --format json
@@ -256,6 +256,25 @@ run needs a deliberate override. If the extension returns a terminal
 upload/send/wait error, use
 `yoetz browser extension inspect --chatgpt --run-id <run-id>` before deciding
 whether an intentional rerun is safe.
+
+The two pre-response phases take the same kind of override, for both the
+`chatgpt` and `claude` recipes: `--var upload_timeout_ms=<milliseconds>` bounds
+the bundle attach and `--var send_timeout_ms=<milliseconds>` bounds the send.
+Send defaults to 120000. Upload defaults to 120000 plus 5000 per MiB of bundle,
+rounded up and capped at 3600000, so any non-empty sub-MiB bundle is bounded at
+125000; an empty bundle stays at 120000. Not every terminal upload error is a
+timeout — the phase also fails closed on invalid conversation, manual handoff,
+and rejected file chunks — but the specific `Claude page did not reach the
+requested state within <n>ms` error means the attachment thumbnail and an enabled
+send control never both appeared within that bound. Read that bound as processing
+latency, not transfer capacity: a small bundle can exhaust it when the site is
+slow to accept an attachment, and the attach can still land after the deadline,
+so raising `upload_timeout_ms` is the lever rather than an immediate rerun.
+Inspect the preserved tab before any rerun — use
+`yoetz browser extension inspect --claude --run-id <run-id>` for Claude runs, the
+`--chatgpt` form above for ChatGPT — because a late attach leaves a real
+attachment on that tab even though no conversation was created, so rerunning
+blind can duplicate the upload.
 
 If progress says `waiting for final assistant controls`, ChatGPT has exposed
 post-send assistant text but not a final scoped action affordance yet. Do not
@@ -293,7 +312,7 @@ If Chrome lands on `chrome://inspect/#devices` instead, that's fine. Keep "Disco
 **Step 2: Run a recipe**
 ```bash
 PROMPT='Review the attached Rust code for correctness and regressions.
-Prioritize actionable findings with file and line evidence.
+Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence.
 Flag missing context instead of guessing, then list the checks you recommend.'
 BUNDLE=$(yoetz bundle -p "$PROMPT" -f "src/*.rs" --format json | jq -r .artifacts.bundle_md)
 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --format json
@@ -359,9 +378,10 @@ yoetz browser extension inspect --chatgpt --run-id <run-id>
 yoetz browser extension grant-identity --chatgpt
 ```
 
-The extension transport is ChatGPT-only, native-host backed, and currently
-macOS/Linux-only. Do not use it as a general browser interpreter, and do not
-silently fall back to CDP after browser-side side effects have started.
+The extension transport supports ChatGPT and Claude, is native-host backed, and
+is currently macOS/Linux-only. Do not use it as a general browser interpreter,
+and do not silently fall back to CDP after browser-side side effects have
+started.
 For extension-native workflows, plain `yoetz browser check --format json`
 auto-selects `chrome-extension-native` when the extension reports connected,
 returns `auto_selected: true`, and avoids Chrome's remote-debugging approval
@@ -409,6 +429,25 @@ build a fresh bundle, and run a new native-extension recipe with a new
 nonsensical, report that the model response was unusable; rerun only when the
 current user task calls for another attempt.
 
+### Triage review findings without expanding scope
+
+Review findings are advisory input, not a work order. The consuming agent owns
+triage; the reviewer does not set or expand the current task's scope.
+
+1. Implement now only findings that are both in scope and urgent: correctness,
+   security, or data-loss blockers in the code being changed.
+2. Backlog every other finding, including non-urgent hardening, refactors,
+   adjacent bugs, and out-of-scope suggestions. Name and record each item using
+   the project's existing authorized convention; when an external write is not
+   authorized, report it explicitly as a pending backlog item. Never silently
+   drop it or implement it in the current change.
+3. After fixing in-scope blockers, re-review that bounded fix if the task calls
+   for iteration. Do not re-review while known in-scope blockers remain.
+4. End the review loop when all remaining findings are backlog-class. A review
+   does not need to return zero findings to converge.
+5. Treat any larger scope surfaced by the reviewer as a new task to propose to
+   the user, not as authorization for extra commits.
+
 If a run fails after upload/send/wait, inspect the marked tab with the run id
 from the error instead of rerunning blindly; reruns after browser side effects
 can duplicate the submission.
@@ -433,6 +472,24 @@ When multiple Chrome profiles have the extension loaded, pass
 `--var profile_email=<email>` if Chrome exposes one, or the stable
 `--var extension_instance_id=<id>` shown by `status --chatgpt`.
 
+Independent ChatGPT and Claude recipes may run concurrently through one
+connected profile: each job owns a separate background tab. Profile selectors
+only choose among loaded profiles and are not required for recipe parallelism.
+On released `v0.5.42`, a live run proved exactly two concurrent Claude recipes
+in one connected profile on an Enterprise workspace account. The jobs overlapped
+for 125s and used distinct conversations. Both verified Fable 5 and Effort Max.
+Tab non-activation has separate evidence: the released adapter sets
+`activateOnCreate:false`, a single-job live probe measured `tab_active=false` at
+every phase, and service-worker coverage asserts that no tab activation call
+occurs. The concurrency evidence covers two jobs, not higher fanout or other
+account types. Service-worker coverage separately proves two Claude jobs use
+distinct background tabs through overlapping phases and that cancelling one
+does not affect the other. Give every parallel recipe a distinct Yoetz bundle
+session directory; reusing one managed `bundle.md` fails with `session_busy`
+before browser work. Recipe runs share the lifecycle lock, while setup, update,
+reload, and auto-heal require its exclusive side and fail closed instead of
+changing the loaded artifact mid-run.
+
 ### Cookie sync (legacy fallback)
 
 If auto-connect isn't available, cookie sync is still supported:
@@ -453,7 +510,7 @@ Enterprise accounts that still expose the legacy picker.
 ```bash
 # Create bundle and get bundle.md path
 PROMPT='Review the attached Rust code for correctness and regressions.
-Prioritize actionable findings with file and line evidence.
+Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence.
 Flag missing context instead of guessing, then list the checks you recommend.'
 BUNDLE=$(yoetz bundle -p "$PROMPT" -f "src/*.rs" --format json | jq -r .artifacts.bundle_md)
 
@@ -493,7 +550,7 @@ copy-control recovery above is satisfied.
 OPENAI_MODEL=$(yoetz models frontier --family openai --format json | jq -r '.[0].model.id')
 GEMINI_MODEL=$(yoetz models frontier --family gemini --format json | jq -r '.[0].model.id')
 PROMPT='Review the attached Rust code for correctness and regressions.
-Prioritize actionable findings with file and line evidence.
+Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence.
 Flag missing context instead of guessing, then list the checks you recommend.'
 yoetz council -p "$PROMPT" -f "src/*.rs" \
   --models "$OPENAI_MODEL,$GEMINI_MODEL" --format json > api.json
@@ -539,7 +596,7 @@ When `yoetz browser recipe` needs manual browser automation, use `dev-browser` d
 
 1. **Create bundle**:
    ```bash
-   PROMPT='Review the attached TypeScript code for correctness and regressions. Prioritize actionable findings with file and line evidence. Flag missing context instead of guessing, then list the checks you recommend.'
+   PROMPT='Review the attached TypeScript code for correctness and regressions. Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence. Flag missing context instead of guessing, then list the checks you recommend.'
    BUNDLE=$(yoetz bundle -p "$PROMPT" -f "src/**/*.ts" --format json | jq -r .artifacts.bundle_md)
    ```
 2. **Connect to Chrome**:

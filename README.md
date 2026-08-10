@@ -271,7 +271,7 @@ Browser recipes let Yoetz use web-only model surfaces from the terminal. The
 built-in ChatGPT recipe targets GPT-5.6 Sol with Pro intelligence and is
 fail-closed: if Yoetz cannot prove the requested surface is available, it stops
 instead of silently downgrading. The built-in Claude recipe applies the same
-contract to claude.ai with exactly Fable 5, Effort Max, and Thinking enabled.
+contract to claude.ai with exactly Fable 5 and Effort Max.
 
 ```bash
 yoetz browser check --format json
@@ -308,8 +308,27 @@ yoetz browser recipe --recipe claude --transport chrome-extension-native --bundl
 Load the managed `$YOETZ_DIR/chatgpt-native-extension` directory unpacked in
 the Chrome profile that hosts the target AI sessions; do not load a repo
 checkout. Setup, update, and reload share machine-global native-host and managed
-extension state, so serialize those operations across agent lanes. Recipe runs
-may proceed concurrently only against one frozen loaded artifact.
+extension state. Recipe runs hold a shared lifecycle lock; setup, update,
+reload, and auto-heal require its exclusive side and fail with
+`extension_lifecycle_busy` instead of changing the loaded artifact mid-run.
+
+Independent ChatGPT and Claude recipe runs may share one connected extension
+profile: each job owns a separate background tab, and profile selectors are
+routing controls, not a prerequisite for parallelism. On released `v0.5.42`, a
+live run proved exactly two concurrent Claude recipes in one connected profile
+on an Enterprise workspace account. The jobs overlapped for 125s and used
+distinct conversations. Both verified Fable 5 and Effort Max. Tab
+non-activation has separate evidence: the released adapter sets
+`activateOnCreate:false`, a single-job live probe measured `tab_active=false` at
+every phase, and service-worker coverage asserts that no tab activation call
+occurs. The concurrency evidence covers two jobs, not higher fanout or other
+account types. Service-worker coverage separately proves two Claude jobs use
+distinct background tabs through overlapping phases and that cancelling one
+does not affect the other. Both sites may run only against one frozen loaded
+artifact.
+Give each parallel recipe its own Yoetz bundle session directory; reusing one
+managed `bundle.md` fails with `session_busy` rather than overwriting that
+session's `response.json` or `followup.json`.
 
 Upgrade the installed CLI before another lane runs extension auto-heal after a
 release. An older CLI can overwrite the newer stamped managed copy.

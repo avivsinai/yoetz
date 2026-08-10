@@ -69,7 +69,10 @@ async function fetchChatgptAccessToken() {
 }
 
 function resolveBackendAnswer(job, conversationId, data) {
-  const baseline = nonNegativeInt(job?.submitted_assistant_count ?? job?.response_baseline?.assistant_count ?? 0);
+  // Freshness is relative to the assistant turns that existed before this send.
+  // The post-send DOM count can already include the newly-created in-progress
+  // turn, and is not comparable to completed answer nodes in the backend mapping.
+  const baseline = nonNegativeInt(job?.response_baseline?.assistant_count ?? 0);
   const notReady = (detail) => ({
     method: "backend_api",
     text: "",
@@ -91,6 +94,13 @@ function resolveBackendAnswer(job, conversationId, data) {
   const { answerNode, count: lineageAnswerCount } = collectLineageAnswerNodes(mapping, data.current_node);
   if (!answerNode) {
     return notReady("no completed assistant answer node on the active lineage yet (still generating / tool-only)");
+  }
+  const currentNode = mapping[data.current_node];
+  if (currentNode !== answerNode) {
+    return notReady("latest assistant answer is not the conversation current_node (later reasoning / tool work is still active)");
+  }
+  if (hasInProgressMessage(mapping)) {
+    return notReady("conversation mapping still contains a status=in_progress message");
   }
   if (lineageAnswerCount <= baseline) {
     return notReady(`assistant answer not fresh past baseline (active-lineage ${lineageAnswerCount} <= ${baseline})`);
@@ -150,6 +160,12 @@ function collectLineageAnswerNodes(mapping, currentNodeId) {
     id = node.parent;
   }
   return { answerNode, count };
+}
+
+function hasInProgressMessage(mapping) {
+  return Object.values(mapping).some((node) =>
+    String(node?.message?.status ?? "").toLowerCase() === "in_progress"
+  );
 }
 
 function nonNegativeInt(value) {

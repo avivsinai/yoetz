@@ -1,4 +1,5 @@
 import { ChunkAssembler, uint8ArrayToBase64 } from "./chunks.js";
+import { completionWarnings } from "./completion-warnings.js";
 import {
   EXTENSION_ID,
   NATIVE_HOST,
@@ -59,6 +60,19 @@ const AFFORDANCE_CONFIRM_POLL_MS = Math.max(
   250,
   Number(globalThis.__YOETZ_AFFORDANCE_CONFIRM_POLL_MS ?? 1500) || 1500
 );
+// Once assistant text is visible after send, shorten only the observation
+// cadence. The stable-idle threshold remains derived from the configured job
+// interval so adaptive polling cannot weaken finality.
+const POST_SEND_ASSISTANT_ACTIVITY_POLL_MS = Math.max(
+  250,
+  Number(globalThis.__YOETZ_POST_SEND_ASSISTANT_ACTIVITY_POLL_MS ?? 2000) || 2000
+);
+const RESPONSE_FINALITY_STALL_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS))
+    ? Number(globalThis.__YOETZ_RESPONSE_FINALITY_STALL_MS)
+    : 5 * 60 * 1000
+);
 const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   1024,
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
@@ -70,12 +84,38 @@ const BACKEND_API_FETCH_COOLDOWN_MS = Math.max(
     ? Number(globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS)
     : 60000
 );
+const BACKEND_API_CONFIRMATION_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_CONFIRMATION_MS))
+    ? Number(globalThis.__YOETZ_BACKEND_API_CONFIRMATION_MS)
+    : 5000
+);
+const MAX_BACKEND_API_CONSECUTIVE_FAILURES = 3;
+const CHATGPT_DOM_ONLY_FINALITY_WARNING = "ChatGPT finality_anchor=dom_only: backend API positive-finality proof was unavailable; response relied on DOM-only completion";
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
 // Cap for the tail of last_response_progress_text persisted to chrome.storage.session.
 // The full streaming text remains on the in-memory job for delta calculation; only the
 // tail is written to disk so a multi-MB Pro response cannot blow the 10MB session quota.
 const RESPONSE_TEXT_PERSIST_TAIL = 8 * 1024;
+const ATTACHMENT_TRACE_TIMESTAMP_KEYS = Object.freeze([
+  "final_chunk_ack_at_ms",
+  "input_resolved_at_ms",
+  "files_assigned_at_ms",
+  "change_dispatched_at_ms",
+  "matching_thumbnail_at_ms",
+  "remove_control_at_ms",
+  "send_present_at_ms",
+  "send_enabled_at_ms",
+  "soft_timeout_at_ms",
+  "hard_timeout_at_ms"
+]);
+const ATTACHMENT_TRACE_PENDING_LEGS = new Set([
+  "matching_thumbnail",
+  "remove_control",
+  "send_present",
+  "send_enabled"
+]);
 
 const jobs = new Map();
 const terminalJobIds = new Map();
@@ -267,11 +307,8 @@ async function startJob(message) {
   const url = job.expected_conversation_id
     ? adapter.conversationJobUrl(job.expected_conversation_id, job.run_id)
     : adapter.jobUrl(job.run_id);
-  const tabActivation = await createJobTab(url, adapter);
-  const tab = tabActivation.tab;
+  const tab = await createJobTab(url, adapter);
   job.tab_id = tab.id;
-  job.previous_active_tab_id = tabActivation.previousTabId;
-  job.restore_previous_after = tabActivation.restorePreviousAfter;
   job.updated_at = Date.now();
   await persistJob(job);
   const inspectCommand = inspectCommandForJob(job);
@@ -317,6 +354,7 @@ async function startJob(message) {
     const diagnosticSummary = formatModelSelectionFailureDiagnostics(diagnostics);
     await failJob(job, "model_selection_failed", [
       `Requested ${adapter.displayName} model was not selected: ${modelSelection.status ?? "unknown"}`,
+      modelSelection.failure_reason ? `reason: ${modelSelection.failure_reason}` : null,
       diagnosticSummary ? `diagnostics: ${diagnosticSummary}` : null
     ].filter(Boolean).join(". "), {
       phase: "model_selection",
@@ -325,6 +363,7 @@ async function startJob(message) {
       model_strategy: job.model_strategy,
       model_used: job.model_used,
       model_selection_status: job.model_selection_status,
+      failure_reason: modelSelection.failure_reason ?? null,
       model_selection: modelSelection,
       ...(Object.keys(diagnostics).length > 0 ? { model_selection_diagnostics: diagnostics } : {})
     });
@@ -343,11 +382,16 @@ async function startJob(message) {
 function modelSelectionFailureDiagnostics(selection) {
   const diagnostics = {};
   for (const key of [
+    "failure_reason",
+    "picker_shape",
+    "effort_control",
+    "effort_move_method",
+    "family_status",
+    "effort_status",
+    "family_label",
     "modelVerified",
     "maxVerified",
-    "thinkingChecked",
-    "modelChip",
-    "thinkingAriaChecked"
+    "modelChip"
   ]) {
     if (Object.prototype.hasOwnProperty.call(selection ?? {}, key)) {
       diagnostics[key] = selection[key];
@@ -417,6 +461,9 @@ async function acceptFileChunk(message) {
   }
 
   const file = chunks.takeFile(job.job_id);
+  if (job.recipe === "claude") {
+    job.attachment_trace = { final_chunk_ack_at_ms: Date.now() };
+  }
   job.status = "file_received";
   job.updated_at = Date.now();
   await persistJob(job);
@@ -452,7 +499,11 @@ async function runJobWithFile(job, file) {
 
   const prompt = job.prompt ?? "";
   if (prompt) {
-    job.response_baseline = await sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
+    job.response_baseline = await sendToTab(job.tab_id, {
+      type: "yoetz_extract_response",
+      job,
+      blocking_context: "pre_send_baseline"
+    });
     assertJobConnectionCurrent(job);
     job.status = "sending_prompt";
     job.updated_at = Date.now();
@@ -469,7 +520,6 @@ async function runJobWithFile(job, file) {
     assertSubmittedConversationCurrent(job, sendResult);
     assertJobConnectionCurrent(job);
     if (job.cancelled) return;
-    await restorePreviousTabForJob(job, "send");
     const inspectCommand = inspectCommandForJob(job);
     if (!postNative(progress(job, "prompt_sent", {
       timeout_ms: responseWaitTimeoutMs(job),
@@ -506,6 +556,10 @@ async function runJobWithFile(job, file) {
 
 async function completeJobWithExtraction(job, extraction) {
   const conversationId = conversationIdForJob(job, extraction);
+  const adapter = adapterForJob(job);
+  const finalityAnchor = adapter.recipe === "chatgpt"
+    ? (extraction.method === "backend_api" ? "backend_api" : "dom_only")
+    : null;
   const completeEnvelope = makeEnvelope("job_complete", {
     job_id: job.job_id,
     run_id: job.run_id,
@@ -520,6 +574,7 @@ async function completeJobWithExtraction(job, extraction) {
       response: extraction.text,
       extraction_method: extraction.method,
       completion_reason: extraction.completion_reason,
+      finality_anchor: finalityAnchor,
       stable_for_ms: extraction.stable_for_ms,
       assistant_turn_count: extraction.assistant_turn_count ?? extraction.assistant_count ?? 0,
       copy_button_count: extraction.copy_button_count ?? 0,
@@ -528,11 +583,14 @@ async function completeJobWithExtraction(job, extraction) {
       model_strategy: job.model_strategy ?? "select",
       model_used: job.model_used ?? null,
       model_selection_status: job.model_selection_status ?? "unavailable",
-      warnings: [
-        ...(job.warnings ?? []),
-        ...(extraction.text ? [] : [adapterForJob(job).completion.emptyResponseWarning]),
-        ...(extraction.warning ? [extraction.warning] : [])
-      ]
+      warnings: completionWarnings({
+        jobWarnings: job.warnings,
+        extraction,
+        emptyResponseWarning: adapter.completion.emptyResponseWarning,
+        extractionWarnings: adapter.completion.extractionWarnings?.(extraction),
+        finalityAnchor,
+        domOnlyFinalityWarning: CHATGPT_DOM_ONLY_FINALITY_WARNING
+      })
     }
   });
   const completeBytes = nativeEnvelopeByteLength(completeEnvelope);
@@ -564,9 +622,34 @@ async function completeJobWithExtraction(job, extraction) {
     await recordTerminalDeliveryLost(job, "wait_response");
     return;
   }
+  await closeOwnedTabOnComplete(job);
   rememberTerminalJob(job.job_id);
   jobs.delete(job.job_id);
   chunks.discard(job.job_id);
+}
+
+async function closeOwnedTabOnComplete(job) {
+  if (!job.close_tab_on_complete || !job.tab_id) {
+    return;
+  }
+  let phase = "tab_closed";
+  let detail = { tab_id: job.tab_id };
+  try {
+    await chrome.tabs.remove(job.tab_id);
+    job.tab_disposition = "closed";
+  } catch (error) {
+    job.tab_disposition = "close_failed";
+    phase = "tab_close_failed";
+    detail = {
+      tab_id: job.tab_id,
+      error: String(error?.message ?? error)
+    };
+  }
+  await persistJob(job);
+  // The native host currently releases the per-job client after job_complete,
+  // so this progress event is intentionally unrouted until host routing grows
+  // an explicit post-terminal channel. The persisted shard is authoritative.
+  postNative(progress(job, phase, detail));
 }
 
 function conversationIdForJob(job, extraction = null) {
@@ -651,9 +734,11 @@ async function cancelJob(message) {
   // here through the tabGroups API instead of chrome.tabs.remove. This runs only
   // after the awaited cancelSend above resolves, so we never destroy the page
   // mid-abort.
+  let tabDisposition = job.tab_id ? "close_failed" : "closed";
   if (job.tab_id && chrome.tabs?.remove) {
     try {
       await chrome.tabs.remove(job.tab_id);
+      tabDisposition = "closed";
     } catch {
       // Tab already closed by the user, or removal racing with navigation.
     }
@@ -661,6 +746,7 @@ async function cancelJob(message) {
 
   postNative(progress(job, "cancelled", {
     tab_id: job.tab_id,
+    tab_disposition: tabDisposition,
     stop_clicked: stopClicked,
     stop_confirmed: stopConfirmed,
     generation_idle: stopConfirmed,
@@ -674,6 +760,7 @@ async function cancelJob(message) {
     capability_token: job.capability_token,
     payload: {
       cancelled: true,
+      tab_disposition: tabDisposition,
       stop_clicked: stopClicked,
       stop_confirmed: stopConfirmed,
       generation_idle: stopConfirmed,
@@ -750,13 +837,15 @@ async function handleDoctorAuthProbe(message) {
 
 async function probeSiteAuthentication(adapter) {
   const tabs = await chrome.tabs.query({ url: adapter.tabQueryPattern });
+  const ownedTabCounts = await countOwnedTabs(tabs, adapter);
   const selected = selectSiteAuthProbeTab(tabs, adapter);
   if (!selected) {
     return {
       status: adapter.auth.noTabStatus,
       authenticated: false,
       message: `No ${adapter.displayName} tab is open in this Chrome profile; open ${adapter.homeUrl} and rerun doctor`,
-      inspected_tabs: 0
+      inspected_tabs: 0,
+      ...ownedTabCounts
     };
   }
   try {
@@ -767,7 +856,8 @@ async function probeSiteAuthentication(adapter) {
       tab_url: selected.tab.url ?? null,
       tab_title: selected.tab.title ?? null,
       selection: selected.selection,
-      inspected_tabs: selected.total
+      inspected_tabs: selected.total,
+      ...ownedTabCounts
     };
   } catch (error) {
     return {
@@ -778,9 +868,54 @@ async function probeSiteAuthentication(adapter) {
       tab_url: selected.tab.url ?? null,
       tab_title: selected.tab.title ?? null,
       selection: selected.selection,
-      inspected_tabs: selected.total
+      inspected_tabs: selected.total,
+      ...ownedTabCounts
     };
   }
+}
+
+async function countOwnedTabs(tabs, adapter) {
+  const stored = await chrome.storage.session.get(null);
+  const storedJobs = Object.entries(stored)
+    .filter(([key, job]) =>
+      key.startsWith(JOBS_KEY_PREFIX)
+      && Number.isFinite(job?.tab_id)
+    )
+    .map(([, job]) => job);
+  const shardedTabIds = new Set(
+    storedJobs
+      .filter((job) => job.tab_disposition !== "closed")
+      .map((job) => job.tab_id)
+  );
+  const ownedTabIds = new Set(
+    (tabs ?? [])
+      .filter((tab) =>
+        isYoetzOwnedTab(tab, adapter)
+        || shardedTabIds.has(tab?.id)
+      )
+      .map((tab) => tab.id)
+  );
+  const completeTabIds = new Set(
+    storedJobs
+      .filter((job) =>
+        job.status === "complete"
+        && job.close_tab_on_complete === true
+        && job.tab_disposition !== "closed"
+      )
+      .map((job) => job.tab_id)
+  );
+  return {
+    yoetz_owned_tabs_open: ownedTabIds.size,
+    yoetz_owned_complete_tabs_open: [...ownedTabIds]
+      .filter((tabId) => completeTabIds.has(tabId))
+      .length
+  };
+}
+
+function isYoetzOwnedTab(tab, adapter) {
+  return Boolean(tab?.id)
+    && adapter.isAllowedTabUrl(tab.url)
+    && new URL(tab.url).searchParams.has("_yoetz");
 }
 
 function selectSiteAuthProbeTab(tabs, adapter) {
@@ -788,7 +923,7 @@ function selectSiteAuthProbeTab(tabs, adapter) {
     .filter((tab) => tab?.id && adapter.isAllowedTabUrl(tab.url))
     .map((tab) => ({
       tab,
-      yoetzOwned: new URL(tab.url).searchParams.has("_yoetz")
+      yoetzOwned: isYoetzOwnedTab(tab, adapter)
     }));
   if (candidates.length === 0) {
     return null;
@@ -1092,7 +1227,9 @@ function normalizeJob(message, adapter) {
     wait_timeout_ms: payload.wait_timeout_ms ?? DEFAULT_WAIT_TIMEOUT_MS,
     wait_interval_ms: payload.wait_interval_ms ?? 30000,
     upload_timeout_ms: payload.upload_timeout_ms ?? 120000,
+    attachment_stall_timeout_ms: payload.attachment_stall_timeout_ms ?? 0,
     send_timeout_ms: payload.send_timeout_ms ?? 120000,
+    close_tab_on_complete: payload.close_tab_on_complete === true,
     browser_context_id: payload.browser_context_id ?? null,
     profile_email: payload.profile_email ?? null,
     extension_instance_id: payload.extension_instance_id ?? null,
@@ -1131,6 +1268,17 @@ function errorContextForJob(job, error = null) {
       ? error.side_effect_started
       : Boolean(job.tab_id)
   };
+  for (const key of [
+    "state",
+    "provider_message",
+    "provider_dom",
+    "requested_model",
+    "send_committed"
+  ]) {
+    if (error?.[key] !== undefined) {
+      detail[key] = error[key];
+    }
+  }
   if (job.tab_id != null) {
     detail.tab_id = job.tab_id;
   }
@@ -1146,7 +1294,30 @@ function errorContextForJob(job, error = null) {
     detail.current_url = error?.current_url ?? job.submitted_url ?? null;
     detail.current_pathname = error?.current_pathname ?? null;
   }
+  const attachmentTrace = sanitizeAttachmentTrace(error?.attachment_trace);
+  if (attachmentTrace) {
+    detail.attachment_trace = attachmentTrace;
+  }
   return detail;
+}
+
+function sanitizeAttachmentTrace(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const trace = {};
+  for (const key of ATTACHMENT_TRACE_TIMESTAMP_KEYS) {
+    const timestamp = value[key];
+    if (Number.isSafeInteger(timestamp) && timestamp >= 0) {
+      trace[key] = timestamp;
+    }
+  }
+  for (const key of ["soft_timeout_pending_legs", "hard_timeout_pending_legs"]) {
+    if (Array.isArray(value[key])) {
+      trace[key] = value[key].filter((leg) => ATTACHMENT_TRACE_PENDING_LEGS.has(leg)).slice(0, 4);
+    }
+  }
+  return Object.keys(trace).length > 0 ? trace : null;
 }
 
 function jobErrorMessage(job, error, code, detail = {}) {
@@ -1366,45 +1537,7 @@ async function waitForSiteTab(tabId, adapter) {
 async function createJobTab(url, adapter) {
   const policy = adapter.tabActivation ?? {};
   const activateOnCreate = policy.activateOnCreate === true;
-  const restorePreviousAfter = typeof policy.restorePreviousAfter === "string"
-    ? policy.restorePreviousAfter
-    : null;
-  let previousTabId = null;
-  if (activateOnCreate && restorePreviousAfter) {
-    try {
-      const [previousTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      previousTabId = previousTab?.id ?? null;
-    } catch {
-      // Capturing focus is best effort; mounting the site is the correctness gate.
-    }
-  }
-  const tab = await chrome.tabs.create({ url, active: activateOnCreate });
-  return { tab, previousTabId, restorePreviousAfter };
-}
-
-async function restorePreviousTabForJob(job, phase) {
-  if (job.restore_previous_after !== phase) {
-    return;
-  }
-  await restorePreviousTab({
-    tab: { id: job.tab_id },
-    previousTabId: job.previous_active_tab_id
-  });
-  job.previous_active_tab_id = null;
-  job.restore_previous_after = null;
-  job.updated_at = Date.now();
-  await persistJob(job);
-}
-
-async function restorePreviousTab({ tab, previousTabId }) {
-  if (previousTabId == null || previousTabId === tab?.id) {
-    return;
-  }
-  try {
-    await chrome.tabs.update(previousTabId, { active: true });
-  } catch {
-    // The user may have closed or moved the prior tab while the site mounted.
-  }
+  return chrome.tabs.create({ url, active: activateOnCreate });
 }
 
 async function waitForContentScript(tabId, adapter) {
@@ -1438,7 +1571,15 @@ function tabCommandError(response) {
   if (typeof response?.side_effect_started === "boolean") {
     error.side_effect_started = response.side_effect_started;
   }
+  if (response?.attachment_trace !== undefined) {
+    error.attachment_trace = response.attachment_trace;
+  }
   for (const key of [
+    "state",
+    "provider_message",
+    "provider_dom",
+    "requested_model",
+    "send_committed",
     "requested_conversation_id",
     "current_conversation_id",
     "current_url",
@@ -1492,7 +1633,13 @@ async function waitForResponse(job) {
   let renderRefreshCandidate = null;
   let renderRefreshCandidateSinceMs = 0;
   let extractionFailureSinceMs = 0;
+  let finalityStallSignature = null;
+  let finalityStallCandidateSinceMs = 0;
+  let lastResponseProgressAt = 0;
+  let lastResponseProgressGenerating = null;
+  let lastResponseProgressInterimTurn = false;
   let lastWaitingProgressAt = startedAt;
+  let reportedAwaitingFinalAffordance = false;
   const timeoutMs = responseWaitTimeoutMs(job);
   while (Date.now() - startedAt <= timeoutMs) {
     assertJobConnectionCurrent(job);
@@ -1501,7 +1648,9 @@ async function waitForResponse(job) {
     }
     const extraction = await extractResponseForJob(job);
     assertJobConnectionCurrent(job);
-    assertJobConversationCurrent(job, extraction);
+    if (reconcileJobConversationCurrent(job, extraction)) {
+      await persistJob(job);
+    }
     if (extraction?.manual_handoff) {
       postNative(progress(job, "manual_handoff", extraction.manual_handoff));
       await failJob(job, "manual_handoff", extraction.manual_handoff.message, {
@@ -1516,28 +1665,93 @@ async function waitForResponse(job) {
     last = extraction ?? last;
     const postSend = isPostSendExtraction(job, extraction);
     const postSendAssistantActivity = isPostSendAssistantActivity(job, extraction, true);
+    const currentFinalityStallSignature = isClaudeFinalityConflict(job, extraction)
+      ? responseFinalityStallSignature(extraction)
+      : null;
+    if (currentFinalityStallSignature === null) {
+      finalityStallSignature = null;
+      finalityStallCandidateSinceMs = 0;
+    } else if (currentFinalityStallSignature !== finalityStallSignature) {
+      finalityStallSignature = currentFinalityStallSignature;
+      finalityStallCandidateSinceMs = Date.now();
+    } else if (!finalityStallCandidateSinceMs) {
+      finalityStallCandidateSinceMs = Date.now();
+    }
+    const finalityStalledForMs = finalityStallCandidateSinceMs
+      ? Date.now() - finalityStallCandidateSinceMs
+      : 0;
+    if (currentFinalityStallSignature !== null
+        && finalityStalledForMs >= RESPONSE_FINALITY_STALL_MS) {
+      const inspectCommand = inspectCommandForJob(job);
+      const adapter = adapterForJob(job);
+      await failJob(
+        job,
+        "response_finality_stalled",
+        `${adapter.displayName} response content remained unchanged for ${formatDurationForMessage(finalityStalledForMs)} without positive finality proof. The owned ${adapter.displayName} tab is left open; inspect it before rerunning with: ${inspectCommand}. Do not rerun until inspection because the prompt was already submitted.`,
+        {
+          phase: "wait_response",
+          side_effect_started: true,
+          completion_reason: "non_streaming_turn_with_persistent_stop",
+          send_committed: true,
+          stable_for_ms: finalityStalledForMs,
+          stall_timeout_ms: RESPONSE_FINALITY_STALL_MS,
+          extraction_method: extraction.method,
+          response_length: extraction.text.length,
+          assistant_count: extraction.assistant_count ?? 0,
+          assistant_identity: extraction.assistant_identity,
+          turn_index: extraction.turn_index ?? -1,
+          copy_button_count: extraction.copy_button_count ?? 0,
+          has_copy_button: Boolean(extraction.has_copy_button),
+          inspect_command: inspectCommand,
+          diagnostics: diagnosticPayload(extraction.diagnostics)
+        }
+      );
+      return null;
+    }
     if (postSend && extraction?.text && extraction.text.length >= best.text.length) {
       best = extraction;
     }
     if (postSend && extraction?.text) {
-      postResponseProgress(job, extraction);
-      assertJobConnectionCurrent(job);
+      const responseProgressState = interimTurnState(job, extraction);
+      const meaningfulProgressTransition = (
+        responseProgressState.interimAssistantTurn && !lastResponseProgressInterimTurn
+      ) || (
+        lastResponseProgressGenerating === true && !responseProgressState.generating
+      );
+      if (!lastResponseProgressAt
+          || meaningfulProgressTransition
+          || Date.now() - lastResponseProgressAt >= interval) {
+        postResponseProgress(job, extraction);
+        lastResponseProgressAt = Date.now();
+        assertJobConnectionCurrent(job);
+      }
+      lastResponseProgressGenerating = responseProgressState.generating;
+      lastResponseProgressInterimTurn = responseProgressState.interimAssistantTurn;
     }
     const extractionIdle = !extraction?.is_generating;
-    const scopedExtractionCandidate = Boolean(
+    const backendApiPending = Boolean(extraction?.backend_api_pending);
+    const scopedDomExtractionCandidate = Boolean(
       postSend
       && extractionIdle
       && extraction?.method !== "page_text_fallback"
     );
+    // Once the ChatGPT conversation API has answered but says the active
+    // lineage has no completed end_turn yet, DOM affordances are not proof of
+    // finality. Reasoning captions can temporarily render as copyable assistant
+    // content while stop/Answer-now controls disappear. Keep the DOM sample for
+    // render-refresh diagnostics, but require the backend positive anchor before
+    // allowing it to complete the job.
+    const scopedExtractionCandidate = scopedDomExtractionCandidate && !backendApiPending;
     const backendApiFinal = Boolean(scopedExtractionCandidate && completion.isFreshBackendApiExtraction(extraction));
     const finalAffordance = Boolean(scopedExtractionCandidate && completion.hasFinalAssistantAffordance(extraction));
     const finalStructuralResponse = finalAffordance || backendApiFinal;
-    // Broad page text is diagnostic only; final controls without scoped text
-    // means extraction failed, not that page chrome is safe to return.
+    // Broad page text is diagnostic only; final controls without scoped answer
+    // text means extraction failed, not that page chrome is safe to return.
     const finalAffordanceWithoutScopedText = Boolean(
       postSendAssistantActivity
       && extraction?.method === "page_text_fallback"
       && !extraction?.is_generating
+      && !backendApiPending
       && completion.hasFinalAssistantAffordance(extraction)
     );
     const stableIdleUnscopedCopy = Boolean(
@@ -1552,7 +1766,7 @@ async function waitForResponse(job) {
     const renderRefreshCandidateEligible = completion.isRenderFreezeRefreshCandidate(
       job,
       extraction,
-      scopedExtractionCandidate,
+      scopedDomExtractionCandidate,
       finalStructuralResponse,
       {
         conversationId: conversationIdForJob(job, extraction),
@@ -1600,7 +1814,7 @@ async function waitForResponse(job) {
       unscopedCopyCandidate = null;
       bestUnscopedCopyCandidate = null;
       unscopedCopyCandidateSinceMs = 0;
-    } else if (extraction?.is_generating) {
+    } else if (extraction?.is_generating || backendApiPending) {
       finalAffordanceCandidate = null;
       finalAffordanceCandidateSinceMs = 0;
       unscopedCopyCandidate = null;
@@ -1668,7 +1882,7 @@ async function waitForResponse(job) {
       renderRefreshCandidate = null;
       renderRefreshCandidateSinceMs = 0;
     }
-    const awaitingFinalAffordance = Boolean(scopedExtractionCandidate && !finalStructuralResponse);
+    const awaitingFinalAffordance = Boolean(scopedDomExtractionCandidate && !finalStructuralResponse);
     if (finalAffordanceWithoutScopedText) {
       if (!extractionFailureSinceMs) {
         extractionFailureSinceMs = Date.now();
@@ -1702,16 +1916,23 @@ async function waitForResponse(job) {
     } else {
       extractionFailureSinceMs = 0;
     }
-    const nextDelay = finalAffordance
+    const nextDelay = job.backend_api_confirmation
+      ? Math.min(interval, Math.max(50, BACKEND_API_CONFIRMATION_MS))
+      : finalAffordance
       // Poll fast while confirming a latched final affordance so the short confirm
       // window is sampled across several ticks rather than overshot by a coarse poll.
       ? Math.min(interval, AFFORDANCE_CONFIRM_POLL_MS)
-      : (finalAffordanceWithoutScopedText
-          ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500))
-          : interval);
+      : finalAffordanceWithoutScopedText
+        ? Math.min(interval, Math.max(finalAffordanceIdleMs, 500))
+      : postSendAssistantActivity
+        ? Math.min(interval, POST_SEND_ASSISTANT_ACTIVITY_POLL_MS)
+        : interval;
     const nowMs = Date.now();
     const elapsedMs = nowMs - startedAt;
-    if (nowMs - lastWaitingProgressAt >= WAITING_RESPONSE_PROGRESS_INTERVAL_MS) {
+    const enteredAwaitingFinalAffordance =
+      awaitingFinalAffordance && !reportedAwaitingFinalAffordance;
+    if (enteredAwaitingFinalAffordance
+        || nowMs - lastWaitingProgressAt >= WAITING_RESPONSE_PROGRESS_INTERVAL_MS) {
       const waitingDetail = {
         elapsed_ms: elapsedMs,
         timeout_ms: timeoutMs,
@@ -1721,13 +1942,15 @@ async function waitForResponse(job) {
         backend_api_final: backendApiFinal,
         stable_idle_unscoped_copy_candidate: stableIdleUnscopedCopy,
         extraction_failure_candidate: finalAffordanceWithoutScopedText,
-        render_refresh_candidate: renderRefreshCandidateEligible
+        render_refresh_candidate: renderRefreshCandidateEligible,
+        backend_api_pending: backendApiPending
       };
       if (awaitingFinalAffordance) {
         waitingDetail.awaiting_final_affordance = true;
         waitingDetail.inspect_command = inspectCommandForJob(job);
       }
       postWaitingResponseProgress(job, extraction, waitingDetail);
+      reportedAwaitingFinalAffordance ||= enteredAwaitingFinalAffordance;
       lastWaitingProgressAt = nowMs;
     }
     await sleep(nextDelay);
@@ -1777,7 +2000,7 @@ function assistantTurnsSinceSend(job, extraction) {
 // A second-or-later assistant turn appearing while generation is still active proves the earlier
 // turn(s) were interim status posts ("I'll review...", "I've narrowed..."), not the final answer.
 function interimTurnState(job, extraction) {
-  const generating = Boolean(extraction?.is_generating);
+  const generating = Boolean(extraction?.is_generating || extraction?.backend_api_pending);
   const turnsSinceSend = assistantTurnsSinceSend(job, extraction);
   return { generating, turnsSinceSend, interimAssistantTurn: generating && turnsSinceSend > 1 };
 }
@@ -1803,6 +2026,7 @@ function postResponseProgress(job, extraction) {
     response_tail: text.slice(-500),
     extraction_method: extraction.method,
     is_generating: generating,
+    backend_api_pending: Boolean(extraction.backend_api_pending),
     assistant_count: extraction.assistant_count ?? 0,
     turn_index: extraction.turn_index ?? -1,
     copy_button_count: extraction.copy_button_count ?? 0,
@@ -1827,6 +2051,7 @@ function postWaitingResponseProgress(job, extraction, detail = {}) {
     interim_assistant_turn: interimAssistantTurn,
     assistant_turns_since_send: turnsSinceSend,
     is_generating: generating,
+    backend_api_pending: Boolean(extraction?.backend_api_pending),
     assistant_count: extraction?.assistant_count ?? 0,
     turn_index: extraction?.turn_index ?? -1,
     copy_button_count: extraction?.copy_button_count ?? 0,
@@ -1875,6 +2100,7 @@ function diagnosticPayload(diagnostics) {
     page_text_chars: diagnostics.page_text_chars ?? null,
     page_text_content_chars: diagnostics.page_text_content_chars ?? null,
     counts: diagnostics.counts ?? {},
+    finality: diagnostics.finality ?? {},
     assistant_turn_snippets: (diagnostics.assistant_turn_snippets ?? []).slice(-3),
     article_snippets: (diagnostics.article_snippets ?? []).slice(-3),
     markdown_snippets: (diagnostics.markdown_snippets ?? []).slice(-3),
@@ -1902,12 +2128,32 @@ async function extractDomResponseForJob(job) {
 
 async function maybeBackendApiExtractionForJob(job, domExtraction) {
   const completion = adapterForJob(job).completion;
-  if (!shouldFetchBackendApi(job, domExtraction)) {
+  if (!completion.supportsBackendApiFallback || job?.backend_api_disabled) {
     return null;
   }
   const conversationId = conversationIdForJob(job, domExtraction);
-  job.backend_api_last_fetch_at = Date.now();
-  job.updated_at = Date.now();
+  if (!domExtraction || domExtraction.manual_handoff || !conversationId) {
+    return null;
+  }
+  // DOM generation state is a useful rendering hint, not an authority boundary.
+  // A settled reasoning-recap widget can be misclassified as still generating
+  // after a render refresh. Keep polling the active-lineage backend anchor so it
+  // can prove completion (or keep us pending) in either DOM state.
+  const now = Date.now();
+  const lastFetchAt = Number(job.backend_api_last_fetch_at ?? 0);
+  const confirmation = job.backend_api_confirmation;
+  const confirmationDue = Boolean(
+    confirmation
+    && now - Number(confirmation.observed_at ?? 0) >= BACKEND_API_CONFIRMATION_MS
+  );
+  if ((confirmation && !confirmationDue)
+      || (!confirmation && now - lastFetchAt < BACKEND_API_FETCH_COOLDOWN_MS)) {
+    return job.backend_api_pending
+      ? backendApiPendingExtraction(domExtraction, null)
+      : null;
+  }
+  job.backend_api_last_fetch_at = now;
+  job.updated_at = now;
   await persistJob(job);
   try {
     const backendExtraction = await sendToTab(job.tab_id, {
@@ -1916,31 +2162,81 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
       conversation_id: conversationId
     });
     const normalized = normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId);
-    return completion.isFreshBackendApiExtraction(normalized) ? normalized : null;
+    const fresh = completion.isFreshBackendApiExtraction(normalized);
+    job.backend_api_consecutive_failures = 0;
+    if (!fresh) {
+      job.backend_api_confirmation = null;
+      job.backend_api_pending = true;
+      job.updated_at = Date.now();
+      await persistJob(job);
+      return backendApiPendingExtraction(domExtraction, normalized);
+    }
+    const nodeId = String(normalized.node_id ?? "").trim();
+    if (!nodeId) {
+      job.backend_api_confirmation = null;
+      job.backend_api_pending = true;
+      job.updated_at = Date.now();
+      await persistJob(job);
+      return backendApiPendingExtraction(domExtraction, {
+        ...normalized,
+        backend_api_detail: "fresh backend answer omitted node_id required for confirmation"
+      });
+    }
+    if (!confirmation || String(confirmation.node_id ?? "") !== nodeId) {
+      job.backend_api_confirmation = { node_id: nodeId, observed_at: Date.now() };
+      job.backend_api_pending = true;
+      job.updated_at = Date.now();
+      await persistJob(job);
+      return backendApiPendingExtraction(domExtraction, {
+        ...normalized,
+        backend_api_detail: `awaiting confirmation of backend answer node ${nodeId}`
+      });
+    }
+    job.backend_api_confirmation = null;
+    job.backend_api_pending = false;
+    job.updated_at = Date.now();
+    await persistJob(job);
+    return normalized;
   } catch (error) {
     if (!completion.isBackendApiFallbackError(error)) {
       throw error;
     }
+    if (job.backend_api_pending) {
+      // Do not silently downgrade to DOM finality after the backend has already
+      // proved that the active lineage is unfinished. Transient fetch failures
+      // keep the DOM barred and retry on the normal cooldown; only a sustained
+      // loss of the positive anchor terminates the job.
+      job.backend_api_consecutive_failures = Math.max(
+        0,
+        Number(job.backend_api_consecutive_failures ?? 0) || 0
+      ) + 1;
+      job.backend_api_confirmation = null;
+      job.updated_at = Date.now();
+      if (job.backend_api_consecutive_failures < MAX_BACKEND_API_CONSECUTIVE_FAILURES) {
+        await persistJob(job);
+        return backendApiPendingExtraction(domExtraction, null);
+      }
+      job.backend_api_disabled = true;
+      job.backend_api_disabled_reason = error?.code ?? String(error?.message ?? error);
+      await persistJob(job);
+      throw error;
+    }
     job.backend_api_disabled = true;
     job.backend_api_disabled_reason = error?.code ?? String(error?.message ?? error);
+    job.backend_api_pending = false;
+    job.backend_api_confirmation = null;
     job.updated_at = Date.now();
     await persistJob(job);
     return null;
   }
 }
 
-function shouldFetchBackendApi(job, domExtraction) {
-  if (!adapterForJob(job).completion.supportsBackendApiFallback || job?.backend_api_disabled) {
-    return false;
-  }
-  if (!domExtraction || domExtraction.manual_handoff || domExtraction.is_generating) {
-    return false;
-  }
-  if (!conversationIdForJob(job, domExtraction)) {
-    return false;
-  }
-  const lastFetchAt = Number(job.backend_api_last_fetch_at ?? 0);
-  return Date.now() - lastFetchAt >= BACKEND_API_FETCH_COOLDOWN_MS;
+function backendApiPendingExtraction(domExtraction, backendExtraction) {
+  return {
+    ...domExtraction,
+    backend_api_pending: true,
+    backend_api_detail: backendExtraction?.backend_api_detail ?? null
+  };
 }
 
 function normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId) {
@@ -1991,6 +2287,28 @@ function isPostSendExtraction(job, extraction) {
     return true;
   }
   return isPostSendAssistantActivity(job, extraction);
+}
+
+function responseFinalityStallSignature(extraction) {
+  return JSON.stringify([
+    extraction.text,
+    extraction.assistant_count,
+    extraction.turn_index,
+    extraction.method,
+    extraction.assistant_identity
+  ]);
+}
+
+function isClaudeFinalityConflict(job, extraction) {
+  return adapterForJob(job).recipe === "claude"
+    && isPostSendExtraction(job, extraction)
+    && extraction.method === "assistant_dom"
+    && Boolean(extraction.text)
+    && typeof extraction.assistant_identity === "string"
+    && Boolean(extraction.assistant_identity.trim())
+    && extraction.is_generating === true
+    && extraction.diagnostics?.finality?.last_turn_streaming === "false"
+    && Number(extraction.diagnostics?.counts?.stop_controls ?? 0) > 0;
 }
 
 function isPostSendAssistantActivity(job, extraction, allowUnknownTurnIndex = false) {
@@ -2122,14 +2440,25 @@ function assertSubmittedConversationCurrent(job, sendResult) {
   );
 }
 
-function assertJobConversationCurrent(job, extraction) {
+function reconcileJobConversationCurrent(job, extraction) {
   const expectedConversationId = job.expected_conversation_id ?? job.submitted_conversation_id ?? job.conversation_id;
   if (!expectedConversationId) {
-    return;
+    return false;
   }
   const currentConversationId = extraction?.conversation_id ?? null;
   if (expectedConversationId === currentConversationId) {
-    return;
+    return false;
+  }
+  const currentUrl = extraction?.url ?? null;
+  if (adapterForJob(job).isExpectedConversationIdAssignment?.(
+    job,
+    expectedConversationId,
+    currentConversationId
+  )) {
+    job.submitted_conversation_id = currentConversationId;
+    job.submitted_url = currentUrl;
+    job.updated_at = Date.now();
+    return true;
   }
   throw commandError(
     "conversation_changed",
@@ -2179,6 +2508,11 @@ function cleanupTerminalJobIds() {
 
 async function failJob(job, code, message, detail = {}) {
   const { terminal_status: terminalStatus, ...payloadDetail } = detail;
+  if (job?.tab_id) {
+    // "kept" means Yoetz did not close the tab on this failure path. It does
+    // not assert that the user has not already closed the tab independently.
+    payloadDetail.tab_disposition = "kept";
+  }
   if (job) {
     job.status = terminalStatus ?? "failed";
     job.updated_at = Date.now();

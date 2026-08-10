@@ -45,7 +45,11 @@ class FakeElement {
   append(...children) {
     for (const child of children) {
       child.parentElement = this;
-      child.ownerDocument = this.ownerDocument;
+      if (this.ownerDocument) {
+        setOwner(child, this.ownerDocument);
+      } else {
+        child.ownerDocument = null;
+      }
       this.children.push(child);
     }
     return this;
@@ -97,6 +101,10 @@ class FakeElement {
     return [{}];
   }
 
+  getBoundingClientRect() {
+    return { left: 10, top: 20, width: 200, height: 20, right: 210, bottom: 40 };
+  }
+
   checkVisibility(options = {}) {
     const style = String(this.attrs.style ?? "");
     if (/display\s*:\s*none/i.test(style) || /visibility\s*:\s*hidden/i.test(style)) {
@@ -125,6 +133,25 @@ class FakeElement {
     }
     return null;
   }
+}
+
+class FakeTextNode {
+  constructor(text) {
+    this.nodeType = 3;
+    this.textContent = text;
+    this.parentElement = null;
+  }
+}
+
+function withChildNodes(element, ...nodes) {
+  element.childNodes = nodes;
+  element.children = nodes.filter((node) => node?.nodeType !== 3);
+  for (const node of nodes) {
+    node.parentElement = element;
+  }
+  element.textContent = nodes.map((node) => String(node.textContent ?? "")).join("");
+  element.innerText = element.textContent;
+  return element;
 }
 
 class FakeDocument {
@@ -1003,6 +1030,224 @@ test("extractResponse returns all rendered markdown blocks from one assistant tu
   assert.equal(extraction.has_copy_button, true);
 });
 
+test("extractResponse excludes a nested Sources citation affordance from the assistant answer", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "PASS\nReview evidence only.");
+  const sources = new FakeElement("button", {
+    "aria-label": "Sources",
+    "aria-expanded": "false",
+    "data-testid": "citations-button"
+  }, "Sources").append(new FakeElement("div", { class: "markdown" }, "Sources"));
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement(
+    "article",
+    { "data-message-author-role": "assistant" },
+    "PASS\nReview evidence only.\nSources\nCopy"
+  ).append(answer, sources, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle PASS Review evidence only. Sources Copy")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "Review bundle PASS Review evidence only. Sources Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "PASS\nReview evidence only.");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse preserves a legitimate answer button labeled Sources", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Choose an action");
+  const answerButton = withChildNodes(
+    new FakeElement("button", { "aria-label": "Sources" }),
+    new FakeTextNode("Sources")
+  );
+  const answer = withChildNodes(
+    new FakeElement("div", { class: "markdown prose" }),
+    new FakeTextNode("Choose "),
+    answerButton,
+    new FakeTextNode(" to continue.")
+  );
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement(
+    "article",
+    { "data-message-author-role": "assistant" },
+    "Choose Sources to continue.\nCopy"
+  ).append(answer, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Choose an action Choose Sources to continue. Copy")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "Choose an action Choose Sources to continue. Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Choose Sources to continue.");
+});
+
+test("extractResponse preserves a button-only answer in an explicit nested assistant node", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Choose an action");
+  const answerButton = withChildNodes(
+    new FakeElement("button", { "aria-label": "Sources" }),
+    new FakeTextNode("Sources")
+  );
+  const explicitAssistant = new FakeElement(
+    "div",
+    { "data-message-author-role": "assistant" },
+    "Sources"
+  ).append(answerButton);
+  const copy = new FakeElement("button", { "aria-label": "Copy response" }, "Copy response");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "Sources Copy response")
+    .append(explicitAssistant, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Choose an action Sources Copy response")
+    .append(user, assistantTurn);
+  const body = new FakeElement("body", {}, "Choose an action Sources Copy response").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Sources");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse preserves legitimate answer markup titled Open source repository", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Where is the code?");
+  const repositoryLink = withChildNodes(
+    new FakeElement("a", { title: "Open source repository" }),
+    new FakeTextNode("the repository")
+  );
+  const answer = withChildNodes(
+    new FakeElement("div", { class: "markdown prose" }),
+    new FakeTextNode("Visit "),
+    repositoryLink,
+    new FakeTextNode(" now.")
+  );
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement(
+    "article",
+    { "data-message-author-role": "assistant" },
+    "Visit the repository now.\nCopy"
+  ).append(answer, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Where is the code? Visit the repository now. Copy")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "Where is the code? Visit the repository now. Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Visit the repository now.");
+});
+
+test("extractResponse excludes a localized citation widget by stable structural class", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Revisar");
+  const citation = withChildNodes(
+    new FakeElement("button", { "aria-label": "Fuentes", class: "group/footnote bg-transparent" }),
+    new FakeTextNode("Fuentes")
+  );
+  const answer = withChildNodes(
+    new FakeElement("div", { class: "markdown prose" }),
+    new FakeTextNode("APROBADO"),
+    citation
+  );
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement(
+    "article",
+    { "data-message-author-role": "assistant" },
+    "APROBADO Fuentes Copy"
+  ).append(answer, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Revisar APROBADO Fuentes Copy")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "Revisar APROBADO Fuentes Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "APROBADO");
+});
+
+test("extractResponse preserves interleaved textContent semantics while removing a citation subtree", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review");
+  const emphasis = withChildNodes(
+    new FakeElement("strong"),
+    new FakeTextNode("inline")
+  );
+  const citation = withChildNodes(
+    new FakeElement("button", { "aria-label": "Sources", class: "group/footnote bg-transparent" }),
+    new FakeTextNode("Sources")
+  );
+  const answer = withChildNodes(
+    new FakeElement("div", { class: "markdown prose" }),
+    new FakeTextNode("Review "),
+    emphasis,
+    new FakeTextNode(" answer"),
+    citation,
+    new FakeTextNode(" after.")
+  );
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement(
+    "article",
+    { "data-message-author-role": "assistant" },
+    "Review inline answerSources after.\nCopy"
+  ).append(answer, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review Review inline answerSources after. Copy")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "Review Review inline answerSources after. Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Review inline answer after.");
+});
+
+test("extractResponse does not promote a Sources-only citation affordance to assistant text", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const sources = new FakeElement("button", {
+    "aria-label": "Sources",
+    "aria-expanded": "false",
+    "data-testid": "citations-button"
+  }, "Sources").append(new FakeElement("div", { class: "markdown" }, "Sources"));
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, "Sources\nCopy")
+    .append(sources, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle Sources Copy")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "Review bundle Sources Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "page_text_fallback");
+  assert.equal(extraction.turn_index, -1);
+});
+
+test("extractResponse preserves a legitimate Sources heading and answer content", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "List sources");
+  const answer = new FakeElement(
+    "div",
+    { class: "markdown prose" },
+    "Sources\n- Architecture.md\n- PLAN.md"
+  );
+  const copy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
+  const assistant = new FakeElement(
+    "article",
+    { "data-message-author-role": "assistant" },
+    "Sources\n- Architecture.md\n- PLAN.md\nCopy"
+  ).append(answer, copy);
+  const conversation = new FakeElement("main", { role: "main" }, "List sources Sources Architecture PLAN Copy")
+    .append(user, assistant);
+  const body = new FakeElement("body", {}, "List sources Sources Architecture PLAN Copy").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Sources\n- Architecture.md\n- PLAN.md");
+});
+
 test("extractResponse uses the latest user transcript scope for split action rows", () => {
   const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
   const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
@@ -1020,6 +1265,48 @@ test("extractResponse uses the latest user transcript scope for split action row
 
   assert.equal(extraction.method, "copy_scope_dom_fallback");
   assert.equal(extraction.text, "Final answer");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse does not promote a sibling response-action Sources button over assistant text", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user", class: "user-turn" }, "Review bundle");
+  const marker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
+  const markdown = new FakeElement("div", { class: "markdown prose" }, "PASS\nReview evidence only.");
+  const assistantTurn = new FakeElement("div", { class: "turn-messages" }, "PASS\nReview evidence only.")
+    .append(marker, markdown);
+  const copy = new FakeElement("button", { "aria-label": "Copy response" }, "Copy response");
+  const sources = new FakeElement("button", { "aria-label": "Sources" }, "Sources");
+  const actionRow = withChildNodes(
+    new FakeElement("div", { class: "agent-turn", "aria-label": "Response actions" }),
+    copy,
+    sources
+  );
+  const conversation = new FakeElement("main", { role: "main" }, "Review bundle PASS Review evidence only. Copy response Sources")
+    .append(user, assistantTurn, actionRow);
+  const body = new FakeElement("body", {}, "Review bundle PASS Review evidence only. Copy response Sources").append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "PASS\nReview evidence only.");
+  assert.equal(extraction.has_copy_button, true);
+});
+
+test("extractResponse preserves unmarked copy-scoped div text outside action controls", () => {
+  const copy = new FakeElement("button", { "aria-label": "Copy response" }, "Copy response");
+  const assistant = withChildNodes(
+    new FakeElement("div", { class: "agent-turn" }),
+    new FakeTextNode("Plain assistant answer"),
+    copy
+  );
+  const body = new FakeElement("body", {}, "Plain assistant answer Copy response").append(assistant);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Plain assistant answer");
   assert.equal(extraction.has_copy_button, true);
 });
 
@@ -2000,6 +2287,22 @@ test("GPT-5.6 Sol picker verifies already-correct state with one menu open", asy
   assert.equal(fixture.menusOpen(), 0);
 });
 
+test("GPT-5.6 Sol menu picker ignores transcript text that describes the Advanced picker", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "High",
+    transcriptPickerDecoy: true
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.picker_shape, "menu");
+  assert.equal(fixture.mainOpens(), 2);
+  assert.equal(fixture.effortClicks(), 1);
+  assert.equal(fixture.menusOpen(), 0);
+});
+
 test("GPT-5.6 Sol picker fails closed when Escape cannot close the menu", async () => {
   const fixture = makeSolPickerFixture({
     family: "GPT-5.6 Sol",
@@ -2038,6 +2341,94 @@ test("GPT-5.6 Sol picker fails loudly on the legacy model-switcher DOM", async (
   assert.equal(legacyButton.events.includes("pointerdown"), false);
 });
 
+test("GPT-5.6 Sol Advanced picker moves the scoped effort slider with End", async () => {
+  const fixture = makeSolSliderFixture({ keyboardMode: "end" });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.effort_move_method, "keyboard_end");
+  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
+  assert.deepEqual(fixture.keyAttempts(), ["End"]);
+  assert.equal(fixture.pointerAttempts(), 0);
+  assert.equal(fixture.pickerOpen(), false);
+  assert.equal(result.pill_text, "Pro");
+});
+
+test("GPT-5.6 Sol Advanced picker accepts trailing punctuation in aria-valuetext", async () => {
+  const fixture = makeSolSliderFixture({ keyboardMode: "end", valueTextSuffix: "." });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.effort_move_method, "keyboard_end");
+  assert.equal(result.effort_control.value_text, "Pro, 5 of 5.");
+});
+
+test("GPT-5.6 Sol Advanced picker falls through End to bounded ArrowRight steps", async () => {
+  const fixture = makeSolSliderFixture({ keyboardMode: "arrows" });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.effort_move_method, "keyboard_arrow_right");
+  assert.deepEqual(fixture.keyAttempts(), ["End", "ArrowRight", "ArrowRight"]);
+  assert.equal(fixture.pointerAttempts(), 0);
+});
+
+test("GPT-5.6 Sol Advanced picker uses a max-track pointer fallback after keyboard no-ops", async () => {
+  const fixture = makeSolSliderFixture({ keyboardMode: "none", pointerMoves: true });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.effort_move_method, "pointer_max");
+  assert.equal(fixture.keyAttempts()[0], "End");
+  assert.ok(fixture.keyAttempts().includes("ArrowRight"));
+  assert.equal(fixture.pointerAttempts(), 1);
+  assert.equal(result.effort_control.value_now, 5);
+});
+
+test("GPT-5.6 Sol Advanced picker fails closed when neither keyboard nor pointer moves effort", async () => {
+  const fixture = makeSolSliderFixture({ keyboardMode: "none", pointerMoves: false });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_slider_move_failed");
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.effort_status, "unverified");
+  assert.equal(result.effort_control.value_text, "High, 3 of 5");
+  assert.equal(fixture.pointerAttempts(), 1);
+  assert.equal(fixture.pickerOpen(), false);
+});
+
+test("GPT-5.6 Sol Advanced picker fails closed when the effort slider disappears after End", async () => {
+  const fixture = makeSolSliderFixture({ sliderDisappearsOnEnd: true });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_slider_move_failed");
+  assert.deepEqual(fixture.keyAttempts(), ["End"]);
+  assert.equal(fixture.pointerAttempts(), 0);
+  assert.equal(fixture.pickerOpen(), false);
+});
+
+test("GPT-5.6 Sol Advanced picker rejects the Faster/Smarter master slider as effort", async () => {
+  const fixture = makeSolSliderFixture({ includeEffortSlider: false });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_control_not_found");
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.effort_control, null);
+  assert.equal(fixture.pointerAttempts(), 0);
+  assert.equal(fixture.pickerOpen(), false);
+});
+
 test("current model strategy waits briefly for the pill and reads it without picker clicks", async () => {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
@@ -2066,7 +2457,8 @@ function makeSolPickerFixture({
   family,
   effort,
   escapeCloses = true,
-  remountPillOnSelection = false
+  remountPillOnSelection = false,
+  transcriptPickerDecoy = false
 }) {
   let currentFamily = family;
   let currentEffort = effort;
@@ -2080,6 +2472,13 @@ function makeSolPickerFixture({
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
   const body = new FakeElement("body", {}, "Ask anything").append(form);
+  if (transcriptPickerDecoy) {
+    body.append(new FakeElement(
+      "div",
+      { "data-message-author-role": "assistant" },
+      "Advanced Faster Smarter Model GPT-5.6 Sol Effort High, 3 of 5."
+    ));
+  }
 
   const removeMenu = (menu) => {
     if (!menu) return;
@@ -2193,6 +2592,103 @@ function makeSolPickerFixture({
     familyClicks: () => familyClickCount,
     effortClicks: () => effortClickCount,
     menusOpen: () => [mainMenu, familyMenu].filter(Boolean).length
+  };
+}
+
+function makeSolSliderFixture({
+  keyboardMode = "none",
+  pointerMoves = false,
+  includeEffortSlider = true,
+  sliderDisappearsOnEnd = false,
+  valueTextSuffix = ""
+} = {}) {
+  const levels = ["Instant", "Medium", "High", "Extra High", "Pro"];
+  let currentValue = 3;
+  let panel = null;
+  let effortSlider = null;
+  let pointerAttemptCount = 0;
+  const keyAttemptLog = [];
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask anything").append(form);
+
+  const closePanel = () => {
+    if (!panel) return;
+    body.children = body.children.filter((child) => child !== panel);
+    panel.parentElement = null;
+    panel = null;
+  };
+  const updateValue = (value) => {
+    currentValue = Math.max(1, Math.min(5, value));
+    effortSlider?.setAttribute("aria-valuenow", currentValue);
+    effortSlider?.setAttribute("aria-valuetext", `${levels[currentValue - 1]}, ${currentValue} of 5${valueTextSuffix}`);
+    pill.innerText = levels[currentValue - 1];
+    pill.textContent = levels[currentValue - 1];
+  };
+  const makeEffortSlider = () => new FakeElement("div", {
+    role: "slider",
+    "aria-label": "Effort",
+    "aria-valuemin": "1",
+    "aria-valuemax": "5",
+    "aria-valuenow": String(currentValue),
+    "aria-valuetext": `${levels[currentValue - 1]}, ${currentValue} of 5${valueTextSuffix}`,
+    onKeyDown: (event) => {
+      keyAttemptLog.push(event.key);
+      if (sliderDisappearsOnEnd && event.key === "End") {
+        panel.children = panel.children.filter((child) => child !== effortSlider);
+        effortSlider.parentElement = null;
+        effortSlider = null;
+        return;
+      }
+      if (keyboardMode === "end" && event.key === "End") updateValue(5);
+      if (keyboardMode === "arrows" && event.key === "ArrowRight") updateValue(currentValue + 1);
+    },
+    onPointerDown: () => {
+      pointerAttemptCount += 1;
+      if (pointerMoves) updateValue(5);
+    }
+  });
+  const openPanel = () => {
+    closePanel();
+    panel = new FakeElement(
+      "div",
+      { role: "dialog" },
+      "Advanced Faster Smarter Model GPT-5.6 Sol Effort High 3 of 5"
+    );
+    const masterSlider = new FakeElement("div", {
+      role: "slider",
+      "aria-label": "Faster or smarter",
+      "aria-valuemin": "1",
+      "aria-valuemax": "5",
+      "aria-valuenow": "3",
+      "aria-valuetext": "High, 3 of 5"
+    });
+    const family = new FakeElement("button", { "aria-haspopup": "menu" }, "GPT-5.6 Sol");
+    panel.append(masterSlider, family);
+    if (includeEffortSlider) {
+      effortSlider = makeEffortSlider();
+      panel.append(effortSlider);
+    } else {
+      effortSlider = null;
+    }
+    body.append(panel);
+  };
+  const pill = new FakeElement("button", {
+    class: "__composer-pill __composer-pill--neutral",
+    "aria-haspopup": "menu",
+    onPointerDown: openPanel,
+    onKeyDown: (event) => {
+      if (event.key === "Escape") closePanel();
+    }
+  }, levels[currentValue - 1]);
+  form.append(pill);
+  const doc = new FakeDocument(body);
+
+  return {
+    doc,
+    keyAttempts: () => [...keyAttemptLog],
+    pointerAttempts: () => pointerAttemptCount,
+    pickerOpen: () => Boolean(panel)
   };
 }
 
@@ -2396,6 +2892,12 @@ function matchesSimpleSelector(element, selector) {
   }
   if (selector.includes('[role="menu"]')) {
     return attr("role") === "menu";
+  }
+  if (selector.includes('[role="dialog"]')) {
+    return attr("role") === "dialog";
+  }
+  if (selector.includes('[role="slider"]')) {
+    return attr("role") === "slider";
   }
   if (selector.includes('[role="option"]')) {
     return attr("role") === "option";

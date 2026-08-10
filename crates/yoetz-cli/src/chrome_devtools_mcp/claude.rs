@@ -1,4 +1,4 @@
-//! Claude Fable 5 / Max / Thinking recipe over the live Chrome CDP client.
+//! Claude Fable 5 / Max recipe over the live Chrome CDP client.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
@@ -105,9 +105,9 @@ async fn run_with_client(
         .context("mark yoetz-owned Claude tab with window.name")?;
 
     wait_for_composer(client).await?;
-    let model_selection = select_fable_max_thinking(client).await?;
+    let model_selection = select_fable_max(client).await?;
     if model_selection != WebModelSelectionStatus::Selected {
-        bail!("Claude Fable 5 / Max / Thinking selection was not verified")
+        bail!("Claude Fable 5 / Max selection was not verified")
     }
 
     upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
@@ -208,7 +208,7 @@ async fn wait_for_composer(client: &ChromeCdpClient) -> Result<()> {
     }
 }
 
-async fn select_fable_max_thinking(client: &ChromeCdpClient) -> Result<WebModelSelectionStatus> {
+async fn select_fable_max(client: &ChromeCdpClient) -> Result<WebModelSelectionStatus> {
     open_model_menu(client).await?;
     let fable = client
         .evaluate_script(&claude_web::build_select_fable_function(), vec![])
@@ -225,19 +225,8 @@ async fn select_fable_max_thinking(client: &ChromeCdpClient) -> Result<WebModelS
     require_status(&max, "selected", "Max effort", "effortOptions")?;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    open_effort_submenu(client).await?;
-    let thinking = client
-        .evaluate_script(&claude_web::build_ensure_thinking_on_function(), vec![])
-        .await
-        .context("enable Claude Thinking")?;
-    match thinking.get("status").and_then(Value::as_str) {
-        Some("already_on" | "clicked") => {}
-        _ => bail!("Claude Thinking switch was unavailable; diagnostics={thinking}"),
-    }
-    tokio::time::sleep(Duration::from_millis(300)).await;
-
     // A successful click is not proof. Close, re-open, hover again, and read
-    // the selected model, selected effort, and Thinking switch postconditions.
+    // the selected model and selected effort postconditions.
     client
         .evaluate_script(&claude_web::build_close_model_menu_function(), vec![])
         .await
@@ -245,16 +234,13 @@ async fn select_fable_max_thinking(client: &ChromeCdpClient) -> Result<WebModelS
     tokio::time::sleep(Duration::from_millis(250)).await;
     open_effort_submenu(client).await?;
     let verification = client
-        .evaluate_script(
-            &claude_web::build_verify_fable_max_thinking_function(),
-            vec![],
-        )
+        .evaluate_script(&claude_web::build_verify_fable_max_function(), vec![])
         .await
-        .context("verify Claude Fable 5 / Max / Thinking postconditions")?;
+        .context("verify Claude Fable 5 / Max postconditions")?;
     let status = claude_web::model_selection_status(&verification);
     if status != WebModelSelectionStatus::Selected {
         bail!(
-            "Claude exact model contract is unavailable or mismatched; required Fable 5 + Max + Thinking on; diagnostics={verification}"
+            "Claude exact model contract is unavailable or mismatched; required Fable 5 + Max; diagnostics={verification}"
         );
     }
     client

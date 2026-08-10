@@ -36,7 +36,6 @@ function isAcceptableModelSelection(selection) {
     && selection?.requested_model === CLAUDE_MODEL
     && selection?.modelVerified === true
     && selection?.maxVerified === true
-    && selection?.thinkingChecked === true
     && selection?.model_used === "Fable 5 Max";
 }
 
@@ -49,23 +48,29 @@ function normalizedResponseText(value) {
 }
 
 function hasFinalAssistantAffordance(extraction) {
+  const artifactCount = Number(extraction?.artifact_blocks?.count ?? 0);
+  const hasArtifactCard = Number.isInteger(artifactCount)
+    && artifactCount > 0
+    && Number(extraction?.assistant_count ?? 0) > 0;
   return Boolean(
     !extraction?.is_generating
-    && extraction?.method === "assistant_dom"
-    && normalizedResponseText(extraction?.text)
+    && (
+      (extraction?.method === "assistant_dom" && normalizedResponseText(extraction?.text))
+      || hasArtifactCard
+    )
   );
 }
 
 function selectFinalAffordanceCandidate(candidate, extraction) {
+  if (!extraction) return { candidate, resetTimer: false };
   const candidateText = normalizedResponseText(candidate?.text);
   const nextText = normalizedResponseText(extraction?.text);
-  if (!candidate && extraction) return { candidate: extraction, resetTimer: true };
-  if (!nextText) return { candidate, resetTimer: false };
-  if (!candidateText) return { candidate: extraction, resetTimer: true };
-  if (nextText.length < candidateText.length || nextText === candidateText) {
-    return { candidate, resetTimer: false };
+  if (!candidate) return { candidate: extraction, resetTimer: true };
+  if (extraction.assistant_identity === candidate.assistant_identity
+      && nextText === candidateText) {
+    return { candidate: extraction, resetTimer: false };
   }
-  return { candidate: extraction, resetTimer: nextText.length > candidateText.length };
+  return { candidate: extraction, resetTimer: true };
 }
 
 function completedExtraction(extraction, completionReason, stableForMs) {
@@ -76,6 +81,19 @@ function completedExtraction(extraction, completionReason, stableForMs) {
     assistant_turn_count: Number(extraction.assistant_count ?? 0),
     copy_button_count: Number(extraction.copy_button_count ?? 0)
   };
+}
+
+export function artifactUnextractedWarnings(extraction) {
+  const count = Number(extraction?.artifact_blocks?.count ?? 0);
+  if (!Number.isInteger(count) || count <= 0) return [];
+  const titles = Array.isArray(extraction?.artifact_blocks?.titles)
+    ? extraction.artifact_blocks.titles.filter((title) => typeof title === "string" && title)
+    : [];
+  return [{
+    code: "artifact_unextracted",
+    count,
+    titles
+  }];
 }
 
 export const claudeSiteAdapter = Object.freeze({
@@ -95,8 +113,9 @@ export const claudeSiteAdapter = Object.freeze({
   isAllowedTabUrl: (url) => String(url ?? "").startsWith(`${CLAUDE_ORIGIN}/`),
   isAcceptableModelSelection,
   tabActivation: Object.freeze({
-    activateOnCreate: true,
-    restorePreviousAfter: "send"
+    activateOnCreate: false,
+    // Explicit policy marker: background jobs never capture or restore focus.
+    restorePreviousAfter: null
   }),
   auth: Object.freeze({
     noTabStatus: "no_claude_tab",
@@ -112,6 +131,7 @@ export const claudeSiteAdapter = Object.freeze({
     renderRefreshMode: "none",
     finalAffordanceRequiresStableIdle: true,
     emptyResponseWarning: "empty Claude response extracted",
+    extractionWarnings: artifactUnextractedWarnings,
     isFreshBackendApiExtraction: () => false,
     hasFinalAssistantAffordance,
     hasStableIdleUnscopedCopyAffordance: () => false,

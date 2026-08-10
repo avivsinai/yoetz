@@ -77,9 +77,44 @@ impl Transport {
         process_id: Option<u32>,
         idle_browser_timeout: Duration,
     ) -> Result<Self> {
+        Self::new_with_optional_handshake_timeout(
+            ws_url,
+            process_id,
+            idle_browser_timeout,
+            None,
+        )
+    }
+
+    pub(crate) fn new_with_handshake_timeout(
+        ws_url: Url,
+        process_id: Option<u32>,
+        idle_browser_timeout: Duration,
+        handshake_timeout: Duration,
+    ) -> Result<Self> {
+        Self::new_with_optional_handshake_timeout(
+            ws_url,
+            process_id,
+            idle_browser_timeout,
+            Some(handshake_timeout),
+        )
+    }
+
+    fn new_with_optional_handshake_timeout(
+        ws_url: Url,
+        process_id: Option<u32>,
+        idle_browser_timeout: Duration,
+        handshake_timeout: Option<Duration>,
+    ) -> Result<Self> {
         let (messages_tx, messages_rx) = mpsc::channel();
-        let web_socket_connection =
-            Arc::new(WebSocketConnection::new(&ws_url, process_id, messages_tx)?);
+        let web_socket_connection = Arc::new(match handshake_timeout {
+            Some(timeout) => WebSocketConnection::new_with_handshake_timeout(
+                &ws_url,
+                process_id,
+                messages_tx,
+                timeout,
+            )?,
+            None => WebSocketConnection::new(&ws_url, process_id, messages_tx)?,
+        });
 
         let waiting_call_registry = Arc::new(WaitingCallRegistry::new());
 

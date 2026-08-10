@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/yoetz-core", "crates/yoetz-cli"]
 
 [workspace.package]
-version = "0.5.36"
+version = "0.5.49"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT"
@@ -25,7 +25,7 @@ rand = "0.10"
 time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 sha2 = "0.11"
 hex = "0.4"
-base64 = "0.22"
+base64 = "0.23"
 mime_guess = "2.0"
 dotenvy = "0.15"
 

@@ -16,6 +16,206 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Disabled by default; `[sessions]` is ignored (with a warning) from untrusted
   repo-local configs because it controls data deletion.
 
+## [0.5.49] - 2026-08-07
+### Fixed
+
+- ChatGPT native-extension model selection now detects the picker shape on
+  every open and supports the Advanced effort slider that ChatGPT A/B-serves
+  alongside the Intelligence menu: Pro is set via keyboard (End, then bounded
+  ArrowRight) with a max-track pointer fallback, every attempt is verified
+  fail-closed against the slider's ARIA state and the composer pill, and the
+  effort slider is scoped away from the Faster/Smarter master control. The
+  existing menu path is unchanged. Selection failures now carry a
+  machine-readable `failure_reason` (for example `effort_slider_move_failed`
+  or `effort_control_not_found`) through the service worker and CLI error
+  text instead of the blanket `unavailable`. The slider path is
+  fixture-tested against the captured DOM evidence; live proof is pending
+  until the slider UI is served again.
+
+### Documentation
+
+- The yoetz skill now defines a scope-disciplined triage protocol for
+  consuming review findings: implement only in-scope urgent blockers,
+  explicitly backlog everything else, converge when only backlog-class
+  findings remain, and route scope expansion to the user. All canned review
+  prompts now request blocking-in-scope vs out-of-scope/backlog
+  classification with file/line evidence.
+
+
+## [0.5.48] - 2026-07-30
+### Fixed
+
+- ChatGPT native-extension jobs now scope login, challenge, and rate-limit
+  detection to transcript-free site context so sidebar history and conversation
+  text cannot trigger a false manual handoff, recognize common Cloudflare
+  interstitial metadata, and let live extension hellos supersede historical
+  manual-handoff records so reconnect restores transport auto-selection.
+
+
+## [0.5.47] - 2026-07-27
+### Fixed
+
+- Claude browser jobs now fail with `response_finality_stalled` after five
+  continuously unchanged minutes without positive finality proof, preserving
+  the owned tab for inspection instead of waiting until the general timeout.
+- Browser recipes now poll every two seconds after post-send assistant activity
+  becomes visible and emit `awaiting_final_affordance` on transition, while
+  preserving the configured cadence for outward response-progress events.
+- Claude browser recipes now detect the visible organization usage-credit
+  exhaustion banner, stop before clicking Send, and return structured provider
+  diagnostics without switching models.
+
+
+## [0.5.46] - 2026-07-27
+### Changed
+
+- Browser-extension inspect output now labels the current chip state at inspect
+  time as `current_model_chip_state` instead of the misleading
+  `model_selection` for both ChatGPT and Claude recipes.
+
+### Added
+
+- Claude upload timeouts now report per-leg readiness evidence for the file
+  input, attachment, and send control, including which wait stage expired.
+- Added the opt-in `attachment_stall_timeout_ms` Claude recipe var. When set
+  above `upload_timeout_ms`, it observes the already-dispatched attachment to
+  that deadline and returns `attachment_stalled` with a timestamped readiness
+  trace. Its default of `0` preserves the existing upload-timeout behavior.
+
+### Documentation
+
+- Document the `upload_timeout_ms` and `send_timeout_ms` recipe vars alongside
+  `wait_timeout_ms` in the yoetz skill, including the upload default of 120000
+  plus 5000 per MiB of bundle. Both overrides already existed for the `chatgpt`
+  and `claude` recipes but appeared in no guidance, so callers hitting the
+  125000 bound on a small bundle had no documented lever.
+
+
+## [0.5.45] - 2026-07-26
+### Fixed
+
+- Claude native recipes now detect file/artifact cards in the final assistant
+  turn and return a structured `artifact_unextracted` warning instead of
+  silently reporting a complete response while dropping the deliverable.
+- Built-in Claude prompts now require the deliverable to remain in the chat
+  message as plain Markdown, reducing artifact loss while preserving the
+  caller's task bytes exactly. Custom recipes remain unchanged.
+
+
+## [0.5.44] - 2026-07-25
+
+### Fixed
+
+- Browser recipe threads now hold a recipe-scoped per-label lock for the full
+  native run and metadata write, preventing concurrent agents from silently
+  interleaving prompts in one conversation. Collisions fail with actionable
+  holder details by default; `--on-thread-conflict wait[:<duration>]` and
+  `fork` provide explicit alternatives without ambiguously re-pointing labels.
+- Claude response extraction now removes the complete thinking/status row
+  structurally, preventing hidden caption copies from contaminating short
+  answers such as `ACK`.
+- ChatGPT response extraction no longer promotes a sibling response-action row
+  such as the `Sources` control over the model-authored answer.
+
+## [0.5.43] - 2026-07-25
+### Added
+
+- Added recipe-scoped `--thread <label>` aliases for ChatGPT and Claude, with
+  `--fresh` for an intentional new conversation, strict label validation, and
+  fail-closed persistence of the final native conversation identity.
+- Yoetz-owned tabs created by the native browser extension now close
+  automatically after successful terminal delivery for ChatGPT or Claude
+  recipes. Pass `--keep-tab` to retain one for debugging; failure,
+  manual-handoff, and terminal-delivery-loss tabs remain open for recovery.
+- Browser extension doctor output now reports open Yoetz-owned tabs and
+  completed close-eligible leaks. Tabs retained deliberately with `--keep-tab`
+  are not counted as leaks.
+
+### Fixed
+
+- Excluded ChatGPT citation and source controls from DOM response extraction,
+  so a Sources-only affordance cannot satisfy finality while legitimate answer
+  text and extraction diagnostics remain intact.
+
+
+## [0.5.42] - 2026-07-22
+### Changed
+
+- Claude native-extension recipes now use independent background tabs, matching
+  ChatGPT parallelism without an activation lease. A live probe completed model
+  selection, file upload, accepted send, response observation, and final
+  extraction in a never-focused tab; service-worker coverage proves two Claude
+  jobs keep distinct tabs and cancellation remains isolated.
+
+
+## [0.5.41] - 2026-07-21
+### Fixed
+
+- Restored built-in Claude runs after claude.ai removed the independent
+  Thinking picker control. Native-extension, CDP, dev-browser, and manual
+  transports now fail closed on the live exact contract: Fable 5 plus Effort
+  Max, each positively re-read after selection.
+
+
+## [0.5.40] - 2026-07-21
+### Fixed
+
+- Reconciled ChatGPT's provisional `WEB:<uuid>` conversation id with the
+  canonical id it is replaced by, so fresh native-extension ChatGPT runs no
+  longer fail `conversation_changed` ("tab moved") at `wait_response`. The
+  canonical-assignment navigation drops the URL query string, so post-assignment
+  tab ownership now relies on the durable `window.name` marker and the owning
+  tab id rather than the `_yoetz` URL marker. The reconciliation is fail-closed:
+  it applies only to fresh jobs whose submitted id matches the expected `WEB:`
+  id and whose replacement is a canonical conversation id; resume jobs stay
+  strict. Verified end to end against a live ChatGPT business/workspace account.
+
+### Added
+
+- Process-level regression proving the native host multiplexes concurrent jobs:
+  two local clients interleave chunk acknowledgements, complete out of order,
+  and a client disconnect cancels only its own job. Service-worker coverage now
+  asserts two concurrent ChatGPT jobs keep distinct tabs and that cancelling one
+  leaves the other running.
+
+### Changed
+
+- Documented that independent ChatGPT recipes may run concurrently through one
+  connected extension profile, each owning a separate background tab, and that
+  profile selectors route among loaded profiles rather than enabling
+  parallelism. Claude remains asymmetric because its tab must stay active
+  through upload and accepted send, so Claude recipes must still be serialized
+  within one loaded Chrome profile until activation coordination lands.
+
+
+## [0.5.39] - 2026-07-20
+### Fixed
+
+- Required ChatGPT backend finality to be the conversation's current answer
+  node with no messages still in progress, then confirm the same answer node
+  on a follow-up read, preventing completed interim captions from ending
+  long-running reasoning jobs.
+
+
+## [0.5.38] - 2026-07-20
+### Fixed
+
+- Prevented short ChatGPT answers from timing out when refreshed reasoning
+  chrome leaves the DOM generation signal stuck. Active-lineage backend
+  finality now polls independently, uses the pre-send answer baseline, and
+  tolerates two consecutive transient backend failures while remaining
+  fail-closed.
+
+
+## [0.5.37] - 2026-07-20
+### Fixed
+
+- Kept native ChatGPT runs in progress when the backend active lineage is not
+  yet final, preventing transient reasoning captions from winning the DOM
+  finality race. DOM-only fallback completions now emit explicit finality
+  provenance and a warning.
+
+
 ## [0.5.36] - 2026-07-19
 ### Fixed
 

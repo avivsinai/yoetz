@@ -3,7 +3,12 @@ import test from "node:test";
 import { uint8ArrayToBase64 } from "../src/chunks.js";
 
 const chatgptBackendModuleUrl = new URL("../src/sites/chatgpt-backend.js", import.meta.url).href;
+const chatgptDomModuleUrl = new URL("../src/chatgpt-dom.js", import.meta.url).href;
 const helperModule = `import { fetchConversationAnswer } from ${JSON.stringify(chatgptBackendModuleUrl)};
+import {
+  classifyManualHandoff as classifyRealManualHandoff,
+  classifyWaitManualHandoff as classifyRealWaitManualHandoff
+} from ${JSON.stringify(chatgptDomModuleUrl)};
 export { fetchConversationAnswer };
 const hooks = globalThis.__contentScriptTestHooks;
 
@@ -27,12 +32,38 @@ export function getPageText() {
   return hooks.pageText ?? "";
 }
 
-export function classifyManualHandoff() {
-  return hooks.manualHandoff ?? null;
+export function findComposer() {
+  return hooks.composer ?? null;
 }
 
-export function classifyWaitManualHandoff() {
-  return hooks.waitManualHandoff ?? null;
+export function findAuthenticatedComposer() {
+  return hooks.authenticatedComposer ?? null;
+}
+
+export function manualHandoffContext() {
+  return hooks.manualHandoffContext ?? {
+    authenticated: Boolean(hooks.authenticatedComposer),
+    title: globalThis.document.title,
+    text: hooks.pageText ?? ""
+  };
+}
+
+export function classifyManualHandoff(input) {
+  hooks.manualHandoffInputs.push(input);
+  return hooks.manualHandoff === undefined
+    ? classifyRealManualHandoff(input)
+    : hooks.manualHandoff;
+}
+
+export function classifyWaitManualHandoff(input) {
+  hooks.waitManualHandoffInputs.push(input);
+  return hooks.waitManualHandoff === undefined
+    ? classifyRealWaitManualHandoff(input)
+    : hooks.waitManualHandoff;
+}
+
+export function classifyBlockingState() {
+  return hooks.blockingState ?? null;
 }
 
 export async function ensureFreshChat(_document, job) {
@@ -72,6 +103,9 @@ export function markOwnership(_document, job) {
 
 export async function uploadFile(_document, file, options) {
   hooks.uploadFileCalls.push({ file_name: file.name, size: file.size, options });
+  if (hooks.uploadFileError) {
+    throw hooks.uploadFileError;
+  }
   return true;
 }
 
@@ -95,6 +129,7 @@ export async function clickSend(_document, options) {
 }
 
 export async function waitForSendAccepted() {
+  hooks.afterWaitForSendAccepted?.();
   return hooks.sendAccepted ?? { accepted: true };
 }
 
@@ -103,7 +138,7 @@ export function extractResponse() {
 }
 
 export function modelSelectionDiagnostics() {
-  return {};
+  return hooks.modelSelectionDiagnostics ?? {};
 }
 
 function conversationIdFromLocation() {
@@ -115,8 +150,12 @@ const dom = {
   ownedWindowName,
   parseOwnedWindowName,
   getPageText,
+  findComposer,
+  findAuthenticatedComposer,
+  manualHandoffContext,
   classifyManualHandoff,
   classifyWaitManualHandoff,
+  classifyBlockingState,
   ensureFreshChat,
   ensureConversationLoaded,
   markOwnership,
@@ -131,7 +170,7 @@ const dom = {
 };
 
 export const siteAdapter = {
-  recipe: "chatgpt",
+  recipe: hooks.recipe ?? "chatgpt",
   displayName: "ChatGPT",
   dom,
   fetchConversationAnswer,
@@ -142,6 +181,9 @@ export const siteAdapter = {
     } catch {
       return null;
     }
+  },
+  isExpectedConversationIdAssignment() {
+    return Boolean(hooks.allowConversationAssignment);
   },
   isConversationUrl(value) {
     return Boolean(this.conversationIdFromUrl(value));
@@ -189,6 +231,81 @@ test("content script resume path skips fresh enforcement and completes on reques
   }
 });
 
+test("content script preserves an attachment-stalled trace from the upload adapter", async () => {
+  const { send, hooks, restore } = await loadContentScript("attachment_trace", "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+  try {
+    const job = resumeJob();
+    const error = new Error("Claude attachment stalled");
+    error.code = "attachment_stalled";
+    error.phase = "upload";
+    error.side_effect_started = true;
+    error.attachment_trace = {
+      final_chunk_ack_at_ms: 100,
+      input_resolved_at_ms: 101,
+      files_assigned_at_ms: 102,
+      change_dispatched_at_ms: 103,
+      hard_timeout_at_ms: 420000,
+      hard_timeout_pending_legs: ["matching_thumbnail"]
+    };
+    hooks.uploadFileError = error;
+
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+
+    const response = await send({
+      type: "yoetz_upload_file",
+      job,
+      file: {
+        filename: "bundle.md",
+        mime_type: "text/markdown",
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+      }
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "attachment_stalled");
+    assert.deepEqual(response.attachment_trace, error.attachment_trace);
+  } finally {
+    restore();
+  }
+});
+
+test("content script extends Claude attachment observation only when the stall window is opt in", async () => {
+  const { send, hooks, restore } = await loadContentScript("claude_opt_in_stall", "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+  try {
+    hooks.recipe = "claude";
+    const job = { ...resumeJob(), recipe: "claude" };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+
+    const defaultUpload = await send({
+      type: "yoetz_upload_file",
+      job,
+      file: {
+        filename: "bundle.md",
+        mime_type: "text/markdown",
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+      }
+    });
+    assert.equal(defaultUpload.ok, true);
+    assert.equal(hooks.uploadFileCalls[0].options.stallTimeoutMs, undefined);
+
+    const optedInUpload = await send({
+      type: "yoetz_upload_file",
+      job: { ...job, attachment_stall_timeout_ms: 1500 },
+      file: {
+        filename: "bundle.md",
+        mime_type: "text/markdown",
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+      }
+    });
+    assert.equal(optedInUpload.ok, true);
+    assert.equal(hooks.uploadFileCalls[1].options.stallTimeoutMs, 1500);
+  } finally {
+    restore();
+  }
+});
+
 test("content script rejects an unavailable site adapter before DOM side effects", async () => {
   const { send, hooks, restore } = await loadContentScript("unsupported_recipe", "https://chatgpt.com/");
   try {
@@ -228,6 +345,135 @@ test("content script auth probe reports manual handoff without job side effects"
     assert.deepEqual(hooks.ensureFreshChatCalls, []);
     assert.deepEqual(hooks.ensureConversationLoadedCalls, []);
     assert.deepEqual(hooks.markOwnershipCalls, []);
+  } finally {
+    restore();
+  }
+});
+
+test("content script excludes sidebar challenge text even when authentication is unknown", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "auth_probe_scoped_text",
+    "https://chatgpt.com/?_yoetz=run_current"
+  );
+  try {
+    hooks.pageText = "New chat\nPre-execution security check\nAsk ChatGPT";
+    hooks.manualHandoffContext = {
+      authenticated: false,
+      title: "",
+      text: "Ask ChatGPT"
+    };
+    globalThis.document.title = "Pre-execution security check";
+    const job = {
+      job_id: "job_current",
+      run_id: "run_current",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    const auth = await send({ type: "yoetz_auth_probe" });
+    const extracted = await send({ type: "yoetz_extract_response", job });
+
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.payload.manual_handoff, null);
+    assert.equal(prepared.payload.window_name, "yoetz-chatgpt-native:run_current:job_current");
+    assert.equal(auth.ok, true);
+    assert.equal(auth.payload.status, "authentication_unknown");
+    assert.equal(auth.payload.authenticated, false);
+    assert.equal(auth.payload.manual_handoff, null);
+    assert.equal(extracted.ok, true);
+    assert.equal(extracted.payload.manual_handoff, null);
+    assert.deepEqual(hooks.markOwnershipCalls, [job]);
+    assert.deepEqual(hooks.manualHandoffInputs.map((input) => input.text), ["Ask ChatGPT", "Ask ChatGPT"]);
+    assert.equal(hooks.waitManualHandoffInputs[0].title, "");
+  } finally {
+    restore();
+  }
+});
+
+test("content script does not treat a generic visible editor as authenticated ChatGPT", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "auth_probe_generic_editor",
+    "https://chatgpt.com/?_yoetz=run_challenge"
+  );
+  try {
+    hooks.composer = {};
+    hooks.pageText = "Security check";
+    hooks.manualHandoffContext = {
+      authenticated: false,
+      title: "",
+      text: "Security check"
+    };
+    const job = {
+      job_id: "job_challenge",
+      run_id: "run_challenge",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    const auth = await send({ type: "yoetz_auth_probe" });
+
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.payload.manual_handoff.state, "challenge_required");
+    assert.equal(auth.ok, true);
+    assert.equal(auth.payload.status, "challenge_required");
+    assert.equal(auth.payload.authenticated, false);
+    assert.deepEqual(hooks.markOwnershipCalls, []);
+    assert.deepEqual(hooks.manualHandoffInputs.map((input) => input.text), ["Security check", "Security check"]);
+  } finally {
+    restore();
+  }
+});
+
+test("content script reports unknown authentication without a strict composer or handoff", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "auth_probe_unknown",
+    "https://chatgpt.com/"
+  );
+  try {
+    hooks.composer = {};
+    hooks.pageText = "Welcome";
+    hooks.manualHandoffContext = {
+      authenticated: false,
+      title: "",
+      text: "Welcome"
+    };
+
+    const auth = await send({ type: "yoetz_auth_probe" });
+
+    assert.equal(auth.ok, true);
+    assert.equal(auth.payload.status, "authentication_unknown");
+    assert.equal(auth.payload.authenticated, false);
+    assert.equal(auth.payload.manual_handoff, null);
+    assert.match(auth.payload.message, /composer is not visible/);
+    assert.equal(Object.hasOwn(hooks.manualHandoffInputs[0], "authenticated"), false);
+  } finally {
+    restore();
+  }
+});
+
+test("content script inspect labels model diagnostics as current chip state", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "inspect_current_model_chip",
+    "https://chatgpt.com/c/conv-123?_yoetz=run-inspect"
+  );
+  try {
+    globalThis.window.name = "yoetz-chatgpt-native:run-inspect:job-inspect";
+    hooks.modelSelectionDiagnostics = {
+      modelChip: "GPT-5.6 Sol Pro",
+      modelVerified: true
+    };
+
+    const response = await send({
+      type: "yoetz_inspect_page",
+      run_id: "run-inspect",
+      recipe: "chatgpt"
+    });
+
+    assert.equal(response.ok, true);
+    assert.deepEqual(response.payload.current_model_chip_state, hooks.modelSelectionDiagnostics);
+    assert.equal(response.payload.model_selection, undefined);
   } finally {
     restore();
   }
@@ -382,6 +628,80 @@ test("content script resume send rechecks conversation drift after prompt insert
   }
 });
 
+test("content script fails closed on Claude credits before marking prepare complete", async () => {
+  const { send, hooks, restore } = await loadContentScript("claude_credits_prepare", "https://claude.ai/new?_yoetz=run_credits");
+  try {
+    hooks.recipe = "claude";
+    hooks.blockingState = usageCreditsState();
+    const response = await send({
+      type: "yoetz_prepare_job",
+      job: { job_id: "job_credits", run_id: "run_credits", recipe: "claude" }
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "usage_credits_exhausted");
+    assert.equal(response.state, "usage_credits_exhausted");
+    assert.equal(response.requested_model, "fable-5-max");
+    assert.equal(response.phase, "upload");
+    assert.equal(response.side_effect_started, false);
+    assert.equal(response.send_committed, false);
+    assert.deepEqual(hooks.markOwnershipCalls, []);
+  } finally {
+    restore();
+  }
+});
+
+test("content script rechecks Claude credits after prompt insertion without clicking send", async () => {
+  const { send, hooks, restore } = await loadContentScript("claude_credits_presend", "https://claude.ai/new?_yoetz=run_credits");
+  try {
+    hooks.recipe = "claude";
+    const job = { job_id: "job_credits", run_id: "run_credits", recipe: "claude" };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+    hooks.afterInsertPrompt = () => {
+      hooks.blockingState = usageCreditsState();
+    };
+
+    const response = await send({ type: "yoetz_send_prompt", job, prompt: "review" });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "usage_credits_exhausted");
+    assert.equal(response.phase, "send");
+    assert.equal(response.side_effect_started, true);
+    assert.equal(response.send_committed, false);
+    assert.equal(response.provider_message, usageCreditsState().provider_message);
+    assert.deepEqual(response.provider_dom, usageCreditsState().provider_dom);
+    assert.equal(hooks.clickSendCalls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("content script classifies a credit banner during baseline extraction as pre-send", async () => {
+  const { send, hooks, restore } = await loadContentScript("claude_credits_baseline", "https://claude.ai/new?_yoetz=run_credits");
+  try {
+    hooks.recipe = "claude";
+    const job = { job_id: "job_credits", run_id: "run_credits", recipe: "claude" };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+    hooks.blockingState = usageCreditsState();
+
+    const response = await send({
+      type: "yoetz_extract_response",
+      job,
+      blocking_context: "pre_send_baseline"
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "usage_credits_exhausted");
+    assert.equal(response.phase, "send");
+    assert.equal(response.side_effect_started, true);
+    assert.equal(response.send_committed, false);
+  } finally {
+    restore();
+  }
+});
+
 test("content script fresh path still requires a fresh page after prepare", async () => {
   const { send, hooks, restore, location } = await loadContentScript("fresh_guard", "https://chatgpt.com/?_yoetz=run_fresh");
   try {
@@ -414,6 +734,76 @@ test("content script fresh path still requires a fresh page after prepare", asyn
   }
 });
 
+test("content script accepts ChatGPT replacing a submitted WEB conversation id on the owned tab", async () => {
+  const { send, hooks, restore, location } = await loadContentScript("fresh_web_assignment", "https://chatgpt.com/?_yoetz=run_fresh_assignment");
+  try {
+    hooks.allowConversationAssignment = true;
+    const job = {
+      job_id: "job_fresh_assignment",
+      run_id: "run_fresh_assignment",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+
+    globalThis.__contentScriptTestHooks.afterWaitForSendAccepted = () => {
+      location.href = "https://chatgpt.com/c/WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d?_yoetz=run_fresh_assignment";
+      location.pathname = "/c/WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d";
+    };
+    const sent = await send({ type: "yoetz_send_prompt", job, prompt: "review" });
+    assert.equal(sent.ok, true);
+    assert.equal(sent.payload.conversation_id, "WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d");
+
+    const waitingJob = {
+      ...job,
+      submitted_conversation_id: sent.payload.conversation_id
+    };
+    location.href = "https://chatgpt.com/c/6a5f60dc-8174-8329-949a-1f282d1dccbd";
+    location.pathname = "/c/6a5f60dc-8174-8329-949a-1f282d1dccbd";
+    const rebound = await send({ type: "yoetz_bind_job", job: waitingJob });
+    assert.equal(rebound.ok, true, JSON.stringify(rebound));
+    const extracted = await send({ type: "yoetz_extract_response", job: waitingJob });
+
+    assert.equal(extracted.ok, true, JSON.stringify(extracted));
+    assert.equal(extracted.payload.conversation_id, "6a5f60dc-8174-8329-949a-1f282d1dccbd");
+  } finally {
+    restore();
+  }
+});
+
+test("content script requires the surviving window.name marker for conversation assignment", async () => {
+  const { send, hooks, restore, location } = await loadContentScript(
+    "fresh_web_assignment_wrong_owner",
+    "https://chatgpt.com/?_yoetz=run_fresh_assignment"
+  );
+  try {
+    hooks.allowConversationAssignment = true;
+    const job = {
+      job_id: "job_fresh_assignment",
+      run_id: "run_fresh_assignment",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+
+    const waitingJob = {
+      ...job,
+      submitted_conversation_id: "WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d"
+    };
+    location.href = "https://chatgpt.com/c/6a5f60dc-8174-8329-949a-1f282d1dccbd";
+    location.pathname = "/c/6a5f60dc-8174-8329-949a-1f282d1dccbd";
+    globalThis.window.name = "yoetz-chatgpt-native:other_run:other_job";
+    const extracted = await send({ type: "yoetz_extract_response", job: waitingJob });
+
+    assert.equal(extracted.ok, false);
+    assert.match(extracted.error, /ownership marker mismatch/);
+  } finally {
+    restore();
+  }
+});
+
 async function loadContentScript(label, href) {
   const originalChrome = globalThis.chrome;
   const originalWindow = globalThis.window;
@@ -429,7 +819,9 @@ async function loadContentScript(label, href) {
     configureModelCalls: [],
     insertPromptCalls: [],
     clickSendCalls: [],
-    sendAcceptanceBaselineCalls: 0
+    sendAcceptanceBaselineCalls: 0,
+    manualHandoffInputs: [],
+    waitManualHandoffInputs: []
   };
   globalThis.__contentScriptTestHooks = hooks;
   globalThis.window = { name: "", location };
@@ -484,15 +876,30 @@ function resumeJob() {
   };
 }
 
+function usageCreditsState() {
+  return {
+    state: "usage_credits_exhausted",
+    code: "usage_credits_exhausted",
+    requested_model: "fable-5-max",
+    provider_message: "Your org is out of usage credits for the month. We let your admin know. Switch models to continue chatting.",
+    provider_dom: {
+      container: { found: true, tag: "div", role: "alert" },
+      switch_models_control: { found: false }
+    },
+    message: "Claude cannot run Fable 5 Max because this organization is out of monthly usage credits. Yoetz did not switch models."
+  };
+}
+
 // ---- T1 backend-api read (yoetz_fetch_conversation) ----
 
-function fetchJob(submittedAssistantCount = 0) {
+function fetchJob(preSendAssistantCount = 0) {
   return {
     job_id: "job_fetch",
     run_id: "run_fetch",
     conversation_id: "conv-123",
     expected_conversation_id: "conv-123",
-    submitted_assistant_count: submittedAssistantCount,
+    response_baseline: { assistant_count: preSendAssistantCount },
+    submitted_assistant_count: preSendAssistantCount,
     upload_timeout_ms: 1000,
     send_timeout_ms: 1000
   };
@@ -570,18 +977,46 @@ test("backend-api read returns the fresh final answer from the conversation mapp
   }
 });
 
-test("backend-api read walks past reasoning_recap and tool nodes to the real assistant answer", async () => {
-  const { send, hooks, restore } = await loadContentScript("backend_walk", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
-  const FINAL = "I reviewed the bundle end to end; the consumer guard is correct and the producer invariants hold.";
+test("backend-api freshness uses the pre-send answer baseline, not the post-send DOM turn count", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_post_send_dom_turn", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
   const restoreFetch = installBackendFetch({ conv: {
-    // current_node is a reasoning_recap with end_turn:true (the live trap) whose parent chain leads to the text answer
+    current_node: "a_final",
+    mapping: {
+      u1: { id: "u1", parent: null, children: ["a_final"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["Return only 7"] }, end_turn: null } },
+      a_final: asstTextNode("a_final", "u1", "7")
+    }
+  }});
+  try {
+    const job = {
+      ...fetchJob(),
+      response_baseline: { assistant_count: 0 },
+      // Send acceptance can observe the newly-created in-progress DOM turn.
+      // That count is not comparable to completed backend answer nodes.
+      submitted_assistant_count: 1
+    };
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.payload.node_fresh, true);
+    assert.equal(res.payload.text, "7");
+    assert.equal(res.payload.assistant_count, 1);
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
+
+test("backend-api read does not accept an answer buried below a later current node", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_buried_answer", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const CAPTION = "I'll review the bundle end to end, then report whether the producer and consumer invariants hold.";
+  const restoreFetch = installBackendFetch({ conv: {
+    // A backend caption can itself look like a completed answer. Once later
+    // work exists above it, the caption must not be treated as turn-final.
     current_node: "recap",
     mapping: {
-      u1: { id: "u1", parent: null, children: ["a_final"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["review"] }, end_turn: null } },
-      a_final: asstTextNode("a_final", "u1", FINAL),
-      // a tool turn (recipient not 'all') must NOT count or be selected
-      tool1: { id: "tool1", parent: "a_final", children: ["recap"], message: { author: { role: "assistant" }, content: { content_type: "text", parts: ["{search}"] }, end_turn: true, recipient: "file_search.msearch" } },
-      // reasoning_recap with end_turn:true must NOT be selected
+      u1: { id: "u1", parent: null, children: ["a_caption"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["review"] }, end_turn: null } },
+      a_caption: asstTextNode("a_caption", "u1", CAPTION),
+      tool1: { id: "tool1", parent: "a_caption", children: ["recap"], message: { author: { role: "assistant" }, content: { content_type: "text", parts: ["{search}"] }, end_turn: true, recipient: "file_search.msearch", status: "finished_successfully" } },
       recap: { id: "recap", parent: "tool1", children: [], message: { author: { role: "assistant" }, content: { content_type: "reasoning_recap", parts: ["recapped"] }, end_turn: true, recipient: "all" } }
     }
   }});
@@ -590,10 +1025,45 @@ test("backend-api read walks past reasoning_recap and tool nodes to the real ass
     await prepareFetchJob(send, hooks, job);
     const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
     assert.equal(res.ok, true, JSON.stringify(res));
-    assert.equal(res.payload.node_fresh, true);
-    assert.equal(res.payload.text, FINAL);
-    assert.equal(res.payload.node_id, "a_final");
-    assert.equal(res.payload.assistant_count, 1, "recap + tool nodes must not count as answer turns");
+    assert.equal(res.payload.node_fresh, false);
+    assert.equal(res.payload.is_generating, true);
+    assert.equal(res.payload.text, "");
+    assert.match(res.payload.backend_api_detail, /current_node/i);
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
+
+test("backend-api read rejects an end_turn caption while any mapping message is in progress", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_in_progress_caption", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const CAPTION = "I'll compare both mechanisms across failure recovery, takeover safety, and implementation guardrails.";
+  const restoreFetch = installBackendFetch({ conv: {
+    current_node: "a_caption",
+    mapping: {
+      u1: { id: "u1", parent: null, children: ["a_caption"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["compare"] }, end_turn: null } },
+      a_caption: asstTextNode("a_caption", "u1", CAPTION),
+      tool_in_flight: {
+        id: "tool_in_flight",
+        parent: "a_caption",
+        children: [],
+        message: {
+          author: { role: "tool" },
+          content: { content_type: "text", parts: [""] },
+          status: "in_progress"
+        }
+      }
+    }
+  }});
+  try {
+    const job = fetchJob(0);
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.payload.node_fresh, false);
+    assert.equal(res.payload.is_generating, true);
+    assert.equal(res.payload.text, "");
+    assert.match(res.payload.backend_api_detail, /in.progress/i);
   } finally {
     restoreFetch();
     restore();
