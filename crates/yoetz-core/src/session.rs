@@ -24,6 +24,17 @@ pub fn create_session_dir_in(root: &Path) -> Result<SessionInfo> {
     fs::create_dir_all(&base).with_context(|| format!("create sessions dir {}", base.display()))?;
     chmod_owner_only_dir(&base)?;
 
+    let id = new_session_id();
+    let path = base.join(&id);
+    fs::create_dir_all(&path).with_context(|| format!("create session {}", path.display()))?;
+    chmod_owner_only_dir(&path)?;
+
+    Ok(SessionInfo { id, path })
+}
+
+/// Generate a run id in the same `YYYYMMDD_HHMMSS_xxxxxx` format used for
+/// session directories, without creating anything on disk.
+pub fn new_session_id() -> String {
     let ts = OffsetDateTime::now_utc()
         .format(TS_FORMAT)
         .unwrap_or_else(|_| "unknown".to_string());
@@ -32,16 +43,76 @@ pub fn create_session_dir_in(root: &Path) -> Result<SessionInfo> {
         .take(6)
         .map(char::from)
         .collect();
-    let id = format!("{ts}_{rand}");
-    let path = base.join(&id);
-    fs::create_dir_all(&path).with_context(|| format!("create session {}", path.display()))?;
-    chmod_owner_only_dir(&path)?;
-
-    Ok(SessionInfo { id, path })
+    format!("{ts}_{rand}")
 }
 
 pub fn session_base_dir() -> PathBuf {
     yoetz_root_dir().join("sessions")
+}
+
+/// Prune old/excess session directories under `~/.yoetz/sessions/`.
+///
+/// No-op when both limits are `None`. Never creates the root or sessions
+/// directory. Returns the number of session directories removed.
+pub fn prune_sessions(max_age_days: Option<u64>, max_count: Option<usize>) -> Result<usize> {
+    prune_sessions_in(&session_base_dir(), max_age_days, max_count)
+}
+
+pub fn prune_sessions_in(
+    base: &Path,
+    max_age_days: Option<u64>,
+    max_count: Option<usize>,
+) -> Result<usize> {
+    if max_age_days.is_none() && max_count.is_none() {
+        return Ok(0);
+    }
+    if !base.exists() {
+        return Ok(0);
+    }
+
+    // (path, id, mtime) for real directories only; symlinks and files are
+    // never followed or removed.
+    let mut dirs: Vec<(PathBuf, String, std::time::SystemTime)> = Vec::new();
+    for entry in fs::read_dir(base).with_context(|| format!("read {}", base.display()))? {
+        let entry = entry?;
+        // DirEntry::file_type does not follow symlinks, so a symlink to a
+        // directory is excluded here.
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let meta = entry
+            .metadata()
+            .with_context(|| format!("stat {}", entry.path().display()))?;
+        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let id = entry.file_name().to_string_lossy().to_string();
+        dirs.push((entry.path(), id, mtime));
+    }
+
+    let mut doomed: Vec<PathBuf> = Vec::new();
+
+    if let Some(days) = max_age_days {
+        let cutoff = std::time::SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(days.saturating_mul(86_400)))
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let (old, kept): (Vec<_>, Vec<_>) = dirs.into_iter().partition(|(_, _, m)| *m < cutoff);
+        doomed.extend(old.into_iter().map(|(p, _, _)| p));
+        dirs = kept;
+    }
+
+    if let Some(count) = max_count {
+        if dirs.len() > count {
+            // Newest first by mtime, id as a stable tie-break.
+            dirs.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| b.1.cmp(&a.1)));
+            doomed.extend(dirs.split_off(count).into_iter().map(|(p, _, _)| p));
+        }
+    }
+
+    let mut removed = 0usize;
+    for path in doomed {
+        fs::remove_dir_all(&path).with_context(|| format!("prune session {}", path.display()))?;
+        removed += 1;
+    }
+    Ok(removed)
 }
 
 fn yoetz_root_dir() -> PathBuf {
@@ -99,4 +170,148 @@ pub fn list_sessions_in(base: &Path) -> Result<Vec<SessionInfo>> {
     }
     items.sort_by(|a, b| b.id.cmp(&a.id));
     Ok(items)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn mkdir(base: &Path, name: &str) -> PathBuf {
+        let path = base.join(name);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    fn set_mtime(path: &Path, age_secs: u64) {
+        let when = SystemTime::now() - Duration::from_secs(age_secs);
+        let file = fs::File::open(path).unwrap();
+        file.set_modified(when).unwrap();
+    }
+
+    #[test]
+    fn prune_is_noop_when_unset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("sessions");
+        mkdir(&base, "20200101_000000_aaaaaa");
+        let removed = prune_sessions_in(&base, None, None).unwrap();
+        assert_eq!(removed, 0);
+        assert!(base.join("20200101_000000_aaaaaa").exists());
+    }
+
+    #[test]
+    fn prune_does_not_create_missing_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("sessions");
+        let removed = prune_sessions_in(&base, Some(1), Some(1)).unwrap();
+        assert_eq!(removed, 0);
+        assert!(!base.exists());
+    }
+
+    #[test]
+    fn prune_skips_plain_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("sessions");
+        fs::create_dir_all(&base).unwrap();
+        fs::write(base.join("stray.txt"), "keep me").unwrap();
+        let removed = prune_sessions_in(&base, None, Some(0)).unwrap();
+        assert_eq!(removed, 0);
+        assert!(base.join("stray.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_skips_symlinked_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("sessions");
+        fs::create_dir_all(&base).unwrap();
+        let target = mkdir(tmp.path(), "outside");
+        std::os::unix::fs::symlink(&target, base.join("linked")).unwrap();
+        let removed = prune_sessions_in(&base, None, Some(0)).unwrap();
+        assert_eq!(removed, 0);
+        assert!(base.join("linked").exists());
+        assert!(target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_by_age_keeps_recent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("sessions");
+        let old = mkdir(&base, "20200101_000000_oldddd");
+        let fresh = mkdir(&base, "20990101_000000_freshh");
+        set_mtime(&old, 10 * 86_400);
+        set_mtime(&fresh, 60);
+        let removed = prune_sessions_in(&base, Some(7), None).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!old.exists());
+        assert!(fresh.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_by_count_keeps_newest_by_mtime() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("sessions");
+        let a = mkdir(&base, "a");
+        let b = mkdir(&base, "b");
+        let c = mkdir(&base, "c");
+        set_mtime(&a, 300);
+        set_mtime(&b, 200);
+        set_mtime(&c, 100);
+        let removed = prune_sessions_in(&base, None, Some(2)).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!a.exists());
+        assert!(b.exists());
+        assert!(c.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_count_tie_breaks_on_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("sessions");
+        let a = mkdir(&base, "20250101_000000_aaaaaa");
+        let b = mkdir(&base, "20250102_000000_bbbbbb");
+        // Identical mtimes: the lexically larger (newer-looking) id survives.
+        set_mtime(&a, 100);
+        set_mtime(&b, 100);
+        let removed = prune_sessions_in(&base, None, Some(1)).unwrap();
+        assert_eq!(removed, 1);
+        assert!(!a.exists());
+        assert!(b.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_applies_age_then_count_to_survivors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("sessions");
+        let ancient = mkdir(&base, "w");
+        let old = mkdir(&base, "x");
+        let mid = mkdir(&base, "y");
+        let fresh = mkdir(&base, "z");
+        set_mtime(&ancient, 30 * 86_400);
+        set_mtime(&old, 10 * 86_400);
+        set_mtime(&mid, 3_600);
+        set_mtime(&fresh, 60);
+        // Age prunes ancient+old; count=1 then prunes mid from the survivors.
+        let removed = prune_sessions_in(&base, Some(7), Some(1)).unwrap();
+        assert_eq!(removed, 3);
+        assert!(!ancient.exists());
+        assert!(!old.exists());
+        assert!(!mid.exists());
+        assert!(fresh.exists());
+    }
+
+    #[test]
+    fn new_session_id_has_expected_shape() {
+        let id = new_session_id();
+        let parts: Vec<&str> = id.split('_').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0].len(), 8);
+        assert_eq!(parts[1].len(), 6);
+        assert_eq!(parts[2].len(), 6);
+    }
 }

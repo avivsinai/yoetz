@@ -10,7 +10,6 @@ use crate::{
 };
 use crate::{budget, providers, registry};
 use std::env;
-use std::path::PathBuf;
 use std::time::Instant;
 use yoetz_core::bundle::{build_bundle, estimate_tokens, BundleOptions};
 use yoetz_core::media::MediaType;
@@ -95,13 +94,28 @@ pub(crate) async fn handle_ask(
         Some(build_bundle(&prompt, options)?)
     };
 
-    let session = create_session_dir()?;
+    // --no-session (or `[sessions] no_session = true` from trusted config)
+    // skips the session directory and every artifact write; stdout output is
+    // unchanged apart from the empty artifact paths.
+    let no_session = args.no_session || config.sessions.no_session.unwrap_or(false);
+    let session = if no_session {
+        None
+    } else {
+        Some(create_session_dir()?)
+    };
+    let run_id = session
+        .as_ref()
+        .map(|s| s.id.clone())
+        .unwrap_or_else(yoetz_core::session::new_session_id);
     let mut artifacts = ArtifactPaths {
-        session_dir: session.path.to_string_lossy().to_string(),
+        session_dir: session
+            .as_ref()
+            .map(|s| s.path.to_string_lossy().to_string())
+            .unwrap_or_default(),
         ..Default::default()
     };
 
-    if let Some(bundle_ref) = &bundle {
+    if let (Some(session), Some(bundle_ref)) = (&session, &bundle) {
         let bundle_json = session.path.join("bundle.json");
         let bundle_md = session.path.join("bundle.md");
         write_json_file(&bundle_json, bundle_ref)?;
@@ -245,8 +259,10 @@ pub(crate) async fn handle_ask(
                 )
                 .await?;
                 if ctx.debug || env::var("YOETZ_GEMINI_DEBUG").ok().as_deref() == Some("1") {
-                    let raw_path = session.path.join("gemini_response.json");
-                    let _ = write_json_file(&raw_path, &result.raw);
+                    if let Some(session) = &session {
+                        let raw_path = session.path.join("gemini_response.json");
+                        let _ = write_json_file(&raw_path, &result.raw);
+                    }
                 }
                 (result.content, result.usage, None, None)
             }
@@ -348,7 +364,7 @@ pub(crate) async fn handle_ask(
     }
 
     let mut result = RunResult {
-        id: session.id,
+        id: run_id,
         model: model_id,
         provider: provider_id,
         bundle,
@@ -358,9 +374,11 @@ pub(crate) async fn handle_ask(
         artifacts,
     };
 
-    let response_json = PathBuf::from(&result.artifacts.session_dir).join("response.json");
-    result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
-    write_json_file(&response_json, &result)?;
+    if let Some(session) = &session {
+        let response_json = session.path.join("response.json");
+        result.artifacts.response_json = Some(response_json.to_string_lossy().to_string());
+        write_json_file(&response_json, &result)?;
+    }
 
     maybe_write_output(ctx, &result)?;
     notifications::maybe_notify_completion(

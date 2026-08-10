@@ -191,6 +191,12 @@ struct AskArgs {
     /// Suppress native completion notifications for this run.
     #[arg(long)]
     no_notify: bool,
+
+    /// Skip creating a session directory under ~/.yoetz/sessions/ (no
+    /// bundle/response artifacts are written; stdout output is unchanged).
+    /// Can also be enabled via `[sessions] no_session = true` in config.
+    #[arg(long)]
+    no_session: bool,
 }
 
 #[derive(Args)]
@@ -1055,6 +1061,17 @@ async fn main() -> Result<()> {
         // (review finding #9).
         env::set_var(chrome_devtools_mcp::client::YOETZ_DEBUG_CDP_ENV, "1");
     }
+    // Opportunistic session retention: only when the user configured limits,
+    // and never fatal — a prune failure must not block the actual command.
+    if config.sessions.retention_enabled() {
+        if let Err(e) = yoetz_core::session::prune_sessions(
+            config.sessions.max_age_days,
+            config.sessions.max_count,
+        ) {
+            eprintln!("warning: session pruning failed: {e}");
+        }
+    }
+
     let client = build_client(cli.timeout_secs)?;
     let litellm = std::sync::Arc::new(build_litellm(&config, client.clone())?);
     let ctx = AppContext {

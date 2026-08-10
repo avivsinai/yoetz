@@ -751,3 +751,162 @@ fn allow_unknown_flag_accepted() {
         .success()
         .stdout(predicate::str::contains("--allow-unknown"));
 }
+
+// ---- issue #391: session opt-out and retention ----
+
+/// Trusted config (via YOETZ_CONFIG_PATH) with registry auto-sync disabled so
+/// dry-run asks never touch the network, plus optional extra sections.
+fn session_test_config(dir: &TempDir, extra: &str) -> PathBuf {
+    let config_path = dir.path().join("config.toml");
+    fs::write(
+        &config_path,
+        format!("[registry]\nauto_sync_secs = 0\n{extra}"),
+    )
+    .unwrap();
+    config_path
+}
+
+fn ask_dry_run(state: &PathBuf, config_path: &PathBuf) -> Command {
+    let mut cmd = yoetz();
+    cmd.env("YOETZ_DIR", state)
+        .env("YOETZ_CONFIG_PATH", config_path)
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("GEMINI_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("XAI_API_KEY");
+    cmd
+}
+
+#[test]
+fn ask_dry_run_creates_session_dir_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let config_path = session_test_config(&dir, "");
+
+    ask_dry_run(&state, &config_path)
+        .args(["--format", "json", "ask", "--prompt", "hi", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "(dry-run) no provider call executed",
+        ))
+        .stdout(predicate::str::contains("response.json"));
+
+    let sessions = state.join("sessions");
+    assert!(sessions.exists());
+    let entries: Vec<_> = fs::read_dir(&sessions).unwrap().collect();
+    assert_eq!(entries.len(), 1);
+    let session_dir = entries[0].as_ref().unwrap().path();
+    assert!(session_dir.join("response.json").exists());
+}
+
+#[test]
+fn ask_no_session_flag_leaves_sessions_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let config_path = session_test_config(&dir, "");
+
+    ask_dry_run(&state, &config_path)
+        .args([
+            "--format",
+            "json",
+            "ask",
+            "--prompt",
+            "hi",
+            "--dry-run",
+            "--no-session",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "(dry-run) no provider call executed",
+        ))
+        .stdout(predicate::str::contains("\"session_dir\": \"\""))
+        .stdout(predicate::str::contains("\"response_json\": null"));
+
+    assert!(!state.join("sessions").exists());
+}
+
+#[test]
+fn ask_no_session_via_trusted_config_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let config_path = session_test_config(&dir, "[sessions]\nno_session = true\n");
+
+    ask_dry_run(&state, &config_path)
+        .args(["--format", "json", "ask", "--prompt", "hi", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"session_dir\": \"\""));
+
+    assert!(!state.join("sessions").exists());
+}
+
+#[test]
+fn sessions_config_ignored_from_untrusted_repo_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let config_path = session_test_config(&dir, "");
+    let cwd = dir.path().join("repo");
+    fs::create_dir_all(&cwd).unwrap();
+    // Repo-local config is untrusted: its [sessions] must be ignored with a
+    // warning, so the session dir is still created.
+    fs::write(cwd.join("yoetz.toml"), "[sessions]\nno_session = true\n").unwrap();
+
+    ask_dry_run(&state, &config_path)
+        .current_dir(&cwd)
+        .args(["--format", "json", "ask", "--prompt", "hi", "--dry-run"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("ignoring [sessions]"));
+
+    assert!(state.join("sessions").exists());
+}
+
+#[test]
+fn retention_prunes_excess_sessions_on_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let sessions = state.join("sessions");
+    // The "2020" dir is created first (older-or-equal mtime) and has the
+    // lexically smaller id, so it loses under both orderings deterministically.
+    fs::create_dir_all(sessions.join("20200101_000000_aaaaaa")).unwrap();
+    fs::create_dir_all(sessions.join("20990101_000000_bbbbbb")).unwrap();
+    let config_path = session_test_config(&dir, "[sessions]\nmax_count = 1\n");
+
+    ask_dry_run(&state, &config_path)
+        .args(["--format", "json", "status"])
+        .assert()
+        .success();
+
+    assert!(!sessions.join("20200101_000000_aaaaaa").exists());
+    assert!(sessions.join("20990101_000000_bbbbbb").exists());
+}
+
+#[test]
+fn retention_disabled_by_default_keeps_all_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let sessions = state.join("sessions");
+    fs::create_dir_all(sessions.join("20200101_000000_aaaaaa")).unwrap();
+    fs::create_dir_all(sessions.join("20990101_000000_bbbbbb")).unwrap();
+    let config_path = session_test_config(&dir, "");
+
+    ask_dry_run(&state, &config_path)
+        .args(["--format", "json", "status"])
+        .assert()
+        .success();
+
+    assert!(sessions.join("20200101_000000_aaaaaa").exists());
+    assert!(sessions.join("20990101_000000_bbbbbb").exists());
+}
+
+#[test]
+fn ask_help_documents_no_session() {
+    yoetz()
+        .args(["ask", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--no-session"));
+}

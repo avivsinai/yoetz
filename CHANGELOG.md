@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+
+- `yoetz ask --no-session` (and a trusted-config `[sessions] no_session = true`
+  key) skips creating `~/.yoetz/sessions/<id>/` entirely for headless callers;
+  stdout output is unchanged apart from empty artifact paths.
+- Session retention: optional `[sessions] max_age_days` / `max_count` config
+  keys prune old or excess session directories opportunistically on startup.
+  Disabled by default; `[sessions]` is ignored (with a warning) from untrusted
+  repo-local configs because it controls data deletion.
 
 ## [0.5.36] - 2026-07-19
 ### Fixed
