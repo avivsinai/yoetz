@@ -66,8 +66,18 @@ pub fn prune_sessions_in(
     if max_age_days.is_none() && max_count.is_none() {
         return Ok(0);
     }
-    if !base.exists() {
-        return Ok(0);
+    // Refuse to prune through a symlinked (or non-directory) sessions root:
+    // read_dir would follow the link and remove_dir_all could then delete
+    // real directories outside the yoetz root.
+    let base_meta = match fs::symlink_metadata(base) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        other => other.with_context(|| format!("stat sessions base {}", base.display()))?,
+    };
+    if !base_meta.is_dir() {
+        anyhow::bail!(
+            "refusing to prune sessions: {} is not a real directory",
+            base.display()
+        );
     }
 
     // (path, id, mtime) for real directories only; symlinks and files are
@@ -83,7 +93,11 @@ pub fn prune_sessions_in(
         let meta = entry
             .metadata()
             .with_context(|| format!("stat {}", entry.path().display()))?;
-        let mtime = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        // An unknown mtime must never look "infinitely old" (guaranteed
+        // deletion); surface the error instead.
+        let mtime = meta
+            .modified()
+            .with_context(|| format!("read mtime of {}", entry.path().display()))?;
         let id = entry.file_name().to_string_lossy().to_string();
         dirs.push((entry.path(), id, mtime));
     }
@@ -184,10 +198,14 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn set_mtime(path: &Path, age_secs: u64) {
-        let when = SystemTime::now() - Duration::from_secs(age_secs);
+    fn set_mtime_to(path: &Path, when: SystemTime) {
         let file = fs::File::open(path).unwrap();
         file.set_modified(when).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn set_mtime(path: &Path, age_secs: u64) {
+        set_mtime_to(path, SystemTime::now() - Duration::from_secs(age_secs));
     }
 
     #[test]
@@ -218,6 +236,33 @@ mod tests {
         let removed = prune_sessions_in(&base, None, Some(0)).unwrap();
         assert_eq!(removed, 0);
         assert!(base.join("stray.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prune_refuses_symlinked_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Real directory outside the yoetz root, with a child session-like dir.
+        let external = mkdir(tmp.path(), "external");
+        let victim = mkdir(&external, "20200101_000000_victim");
+        let base = tmp.path().join("sessions");
+        std::os::unix::fs::symlink(&external, &base).unwrap();
+
+        let err = prune_sessions_in(&base, None, Some(0)).unwrap_err();
+        assert!(err.to_string().contains("not a real directory"));
+        // The external target and its child are untouched.
+        assert!(external.exists());
+        assert!(victim.exists());
+    }
+
+    #[test]
+    fn prune_refuses_file_base() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("sessions");
+        fs::write(&base, "not a dir").unwrap();
+        let err = prune_sessions_in(&base, Some(1), None).unwrap_err();
+        assert!(err.to_string().contains("not a real directory"));
+        assert!(base.exists());
     }
 
     #[cfg(unix)]
@@ -275,8 +320,9 @@ mod tests {
         let a = mkdir(&base, "20250101_000000_aaaaaa");
         let b = mkdir(&base, "20250102_000000_bbbbbb");
         // Identical mtimes: the lexically larger (newer-looking) id survives.
-        set_mtime(&a, 100);
-        set_mtime(&b, 100);
+        let when = SystemTime::now() - Duration::from_secs(100);
+        set_mtime_to(&a, when);
+        set_mtime_to(&b, when);
         let removed = prune_sessions_in(&base, None, Some(1)).unwrap();
         assert_eq!(removed, 1);
         assert!(!a.exists());

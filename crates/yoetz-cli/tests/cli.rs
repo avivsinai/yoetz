@@ -903,6 +903,89 @@ fn retention_disabled_by_default_keeps_all_sessions() {
 }
 
 #[test]
+fn ask_no_session_via_trusted_config_profile_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let config_path = session_test_config(&dir, "");
+    // Trusted profile overlay under an isolated $HOME:
+    // ~/.config/yoetz/profiles/quiet.toml
+    let home = dir.path().join("home");
+    let profiles = home.join(".config/yoetz/profiles");
+    fs::create_dir_all(&profiles).unwrap();
+    fs::write(
+        profiles.join("quiet.toml"),
+        "[sessions]\nno_session = true\n",
+    )
+    .unwrap();
+
+    ask_dry_run(&state, &config_path)
+        .env("HOME", &home)
+        .env_remove("XDG_CONFIG_HOME")
+        .args([
+            "--config-profile",
+            "quiet",
+            "--format",
+            "json",
+            "ask",
+            "--prompt",
+            "hi",
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"session_dir\": \"\""));
+
+    assert!(!state.join("sessions").exists());
+}
+
+/// Strip the volatile per-run fields (random id, session-dependent artifact
+/// paths) so the rest of the payload can be compared exactly.
+fn normalized_run_json(stdout: &[u8]) -> serde_json::Value {
+    let mut value: serde_json::Value = serde_json::from_slice(stdout).unwrap();
+    let obj = value.as_object_mut().unwrap();
+    obj.remove("id");
+    obj.remove("artifacts");
+    value
+}
+
+#[test]
+fn ask_no_session_json_payload_matches_default_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let config_path = session_test_config(&dir, "");
+
+    let default_out = ask_dry_run(&dir.path().join("state-default"), &config_path)
+        .args(["--format", "json", "ask", "--prompt", "hi", "--dry-run"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let no_session_out = ask_dry_run(&dir.path().join("state-nosession"), &config_path)
+        .args([
+            "--format",
+            "json",
+            "ask",
+            "--prompt",
+            "hi",
+            "--dry-run",
+            "--no-session",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let default_json = normalized_run_json(&default_out);
+    let no_session_json = normalized_run_json(&no_session_out);
+    assert_eq!(default_json, no_session_json);
+    assert_eq!(
+        no_session_json["content"],
+        serde_json::json!("(dry-run) no provider call executed")
+    );
+}
+
+#[test]
 fn ask_help_documents_no_session() {
     yoetz()
         .args(["ask", "--help"])
