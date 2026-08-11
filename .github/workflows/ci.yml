@@ -229,7 +229,9 @@ jobs:
         with:
           shared-key: rust-msrv-1.88-${{ runner.os }}
           cache-bin: false
-      - run: cargo check --workspace
+      # --all-targets compiles dev-dependencies too; without it a dev-dep with
+      # rust-version above the MSRV passes this job while `cargo test` breaks.
+      - run: cargo check --workspace --all-targets
 
   doc:
     name: Documentation
