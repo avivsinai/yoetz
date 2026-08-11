@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+
+- `yoetz ask --no-session` (and a trusted-config `[sessions] no_session = true`
+  key) skips creating `~/.yoetz/sessions/<id>/` entirely for headless callers;
+  stdout output is unchanged apart from empty artifact paths.
+- Session retention: optional `[sessions] max_age_days` / `max_count` config
+  keys prune old or excess session directories opportunistically on startup.
+  Disabled by default; `[sessions]` is ignored (with a warning) from untrusted
+  repo-local configs because it controls data deletion. Active session writers
+  are lease-protected from pruning, including browser recipes that reuse a
+  managed bundle session. Mixed old/new binaries are not lease-compatible:
+  the new pruner cannot see an old binary's `.browser-recipe.lock`.
 
 ## [0.5.49] - 2026-08-07
 ### Fixed

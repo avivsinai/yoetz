@@ -1,7 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use fs2::FileExt;
 use jsonschema::Validator;
 use litellm_rust::{
     ChatContentPart, ChatContentPartFile, ChatContentPartImageUrl, ChatContentPartText, ChatFile,
@@ -12,7 +11,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::env;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io::{self, IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -86,7 +85,6 @@ use http::send_json;
 /// simple queries when no explicit --max-output-tokens is provided.
 const REGISTRY_OUTPUT_TOKENS_CAP: usize = 16384;
 const DEFAULT_CHATGPT_RECIPE_PROMPT: &str = "Review the attached file and provide your analysis.";
-const BROWSER_RECIPE_SESSION_LOCK_FILENAME: &str = ".browser-recipe.lock";
 
 #[derive(Parser)]
 #[command(
@@ -227,6 +225,12 @@ struct AskArgs {
     /// Suppress native completion notifications for this run.
     #[arg(long)]
     no_notify: bool,
+
+    /// Skip creating a session directory under ~/.yoetz/sessions/ (no
+    /// bundle/response artifacts are written; stdout output is unchanged).
+    /// Can also be enabled via `[sessions] no_session = true` in config.
+    #[arg(long)]
+    no_session: bool,
 }
 
 #[derive(Args)]
@@ -1107,6 +1111,17 @@ async fn main() -> Result<()> {
         // (review finding #9).
         env::set_var(chrome_devtools_mcp::client::YOETZ_DEBUG_CDP_ENV, "1");
     }
+    // Opportunistic session retention: only when the user configured limits,
+    // and never fatal — a prune failure must not block the actual command.
+    if config.sessions.retention_enabled() {
+        if let Err(e) = yoetz_core::session::prune_sessions(
+            config.sessions.max_age_days,
+            config.sessions.max_count,
+        ) {
+            eprintln!("warning: session pruning failed: {e}");
+        }
+    }
+
     let client = build_client(cli.timeout_secs)?;
     let litellm = std::sync::Arc::new(build_litellm(&config, client.clone())?);
     let ctx = AppContext {
@@ -3092,47 +3107,26 @@ fn ensure_regular_file(path: &Path, name: &str, thread_label: &str) -> Result<()
     Ok(())
 }
 
-#[derive(Debug)]
-struct BrowserRecipeSessionLease {
-    _file: File,
-}
-
-impl Drop for BrowserRecipeSessionLease {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self._file);
-    }
-}
-
 fn acquire_browser_recipe_session_lease(
     bundle_path: Option<&Path>,
-) -> Result<Option<BrowserRecipeSessionLease>> {
+) -> Result<Option<yoetz_core::session::SessionLease>> {
     let Some(artifacts) = browser_recipe_artifact_paths(bundle_path) else {
         return Ok(None);
     };
     let session_dir = PathBuf::from(artifacts.session_dir);
-    let lock_path = session_dir.join(BROWSER_RECIPE_SESSION_LOCK_FILENAME);
-    let file = OpenOptions::new()
-        .create(true)
-        .read(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("open browser recipe session lock {}", lock_path.display()))?;
-    match FileExt::try_lock_exclusive(&file) {
-        Ok(()) => Ok(Some(BrowserRecipeSessionLease { _file: file })),
-        Err(err) if err.kind() == io::ErrorKind::WouldBlock => bail!(
+    match yoetz_core::session::try_acquire_session_lease(&session_dir)? {
+        Some(lease) => Ok(Some(lease)),
+        None => bail!(
             "session_busy: browser recipe session {} already has an active writer; use one session directory per parallel run",
             session_dir.display()
         ),
-        Err(err) => Err(err)
-            .with_context(|| format!("lock browser recipe session {}", lock_path.display())),
     }
 }
 
 fn acquire_browser_recipe_session_lease_in(
     recipe_args: &BrowserRecipeArgs,
     sessions_base: &Path,
-) -> Result<Option<BrowserRecipeSessionLease>> {
+) -> Result<Option<yoetz_core::session::SessionLease>> {
     validate_thread_persistence_preflight_in(recipe_args, sessions_base)?;
     acquire_browser_recipe_session_lease(recipe_args.bundle.as_deref())
 }
@@ -5897,6 +5891,33 @@ mod tests {
     }
 
     #[test]
+    fn browser_recipe_session_lease_blocks_retention_pruning() {
+        let dir = TempDir::new().unwrap();
+        let sessions = dir.path().join("sessions");
+        let session = sessions.join("20250101_000000_active");
+        fs::create_dir_all(&session).unwrap();
+        let bundle_md = session.join("bundle.md");
+        fs::write(&bundle_md, "# bundle").unwrap();
+        fs::write(session.join("bundle.json"), "{}").unwrap();
+        let lease = acquire_browser_recipe_session_lease(Some(&bundle_md))
+            .unwrap()
+            .expect("managed bundle session should be locked");
+
+        assert_eq!(
+            yoetz_core::session::prune_sessions_in(&sessions, None, Some(0)).unwrap(),
+            0
+        );
+        assert!(session.exists());
+
+        drop(lease);
+        assert_eq!(
+            yoetz_core::session::prune_sessions_in(&sessions, None, Some(0)).unwrap(),
+            1
+        );
+        assert!(!session.exists());
+    }
+
+    #[test]
     #[cfg(unix)]
     fn browser_recipe_session_lease_releases_a_fork_inherited_descriptor() {
         let dir = TempDir::new().unwrap();
@@ -6933,7 +6954,7 @@ mod tests {
             .to_string()
             .contains("direct child of the managed sessions directory"));
         assert!(!external_session
-            .join(BROWSER_RECIPE_SESSION_LOCK_FILENAME)
+            .join(yoetz_core::session::SESSION_LEASE_FILENAME)
             .exists());
     }
 

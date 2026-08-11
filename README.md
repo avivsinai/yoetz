@@ -145,6 +145,18 @@ shape.
 The default `models frontier` lab list is configurable with
 `[frontier].families`; `--all` and `--family` continue to bypass that list.
 
+`yoetz ask` writes artifacts to `~/.yoetz/sessions/<id>/` by default. Headless
+callers can skip that entirely with `yoetz ask --no-session` (or
+`[sessions] no_session = true`), and `[sessions] max_age_days` /
+`[sessions] max_count` prune old or excess session dirs on startup. Both are
+off by default, and `[sessions]` is only honored from trusted config
+locations, never from repo-local `./yoetz.toml`. A `max_count` of `0` removes
+all completed sessions while preserving active writers. A legacy session with
+no lease file is left alone for its first five minutes to avoid racing a writer
+that has just created the directory. In JSON output,
+`--no-session` emits `session_dir: ""` and `response_json: null`; artifact
+consumers must handle those values without constructing a path.
+
 Resolve live model IDs before putting them in scripts:
 
 ```bash

@@ -3250,6 +3250,7 @@ version = "0.5.49"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
+ "fs2",
  "hex",
  "ignore",
  "mime_guess",
@@ -3257,6 +3258,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.19",
  "time",
  "toml",

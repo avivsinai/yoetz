@@ -15,6 +15,7 @@ pub struct Config {
     pub registry: RegistryConfig,
     pub frontier: FrontierConfig,
     pub notifications: NotificationsConfig,
+    pub sessions: SessionsConfig,
     #[serde(default)]
     pub aliases: HashMap<String, String>,
 }
@@ -58,6 +59,26 @@ pub struct NotificationsConfig {
     pub notify_threshold_secs: Option<u64>,
 }
 
+/// Session artifact lifecycle: opt-out of session writes and retention limits.
+/// Only honored from trusted config sources: retention deletes user data and
+/// `no_session` suppresses audit artifacts, so repo-local configs must not
+/// control it.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SessionsConfig {
+    /// Skip creating session directories for `yoetz ask` (like `--no-session`).
+    pub no_session: Option<bool>,
+    /// Prune session dirs whose mtime is older than this many days.
+    pub max_age_days: Option<u64>,
+    /// Keep at most this many newest session dirs.
+    pub max_count: Option<usize>,
+}
+
+impl SessionsConfig {
+    pub fn retention_enabled(&self) -> bool {
+        self.max_age_days.is_some() || self.max_count.is_some()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ConfigFile {
     pub defaults: Option<Defaults>,
@@ -65,6 +86,7 @@ struct ConfigFile {
     pub registry: Option<RegistryConfig>,
     pub frontier: Option<FrontierConfig>,
     pub notifications: Option<NotificationsConfig>,
+    pub sessions: Option<SessionsConfig>,
     pub aliases: Option<HashMap<String, String>>,
 }
 
@@ -132,6 +154,16 @@ impl Config {
         }
         if let Some(notifications) = other.notifications {
             merge_notifications(&mut self.notifications, notifications);
+        }
+        if let Some(sessions) = other.sessions {
+            if trusted {
+                merge_sessions(&mut self.sessions, sessions);
+            } else {
+                eprintln!(
+                    "warning: ignoring [sessions] from untrusted config {}",
+                    source.display()
+                );
+            }
         }
         if let Some(aliases) = other.aliases {
             if trusted {
@@ -271,6 +303,11 @@ model = "gpt-5-4-pro"
                 families: Some(vec!["evil".to_string()]),
             }),
             notifications: None,
+            sessions: Some(SessionsConfig {
+                no_session: Some(true),
+                max_age_days: Some(1),
+                max_count: Some(1),
+            }),
             aliases: Some(HashMap::from([(
                 "fast".to_string(),
                 "gpt-5-4-pro".to_string(),
@@ -287,6 +324,12 @@ model = "gpt-5-4-pro"
         assert!(config.registry.openrouter_models_url.is_none());
         assert!(config.frontier.families.is_none());
         assert!(config.notifications.enabled.is_none());
+        // [sessions] controls data deletion and artifact suppression; untrusted
+        // repo-local configs must not set it.
+        assert!(config.sessions.no_session.is_none());
+        assert!(config.sessions.max_age_days.is_none());
+        assert!(config.sessions.max_count.is_none());
+        assert!(!config.sessions.retention_enabled());
     }
 
     #[test]
@@ -308,6 +351,7 @@ model = "gpt-5-4-pro"
             }),
             frontier: None,
             notifications: None,
+            sessions: None,
             aliases: None,
         };
         config.merge(
@@ -331,6 +375,7 @@ model = "gpt-5-4-pro"
                 enabled: Some(false),
                 notify_threshold_secs: Some(90),
             }),
+            sessions: None,
             aliases: None,
         };
         config.merge(file, false, Path::new("./yoetz.toml"));
@@ -349,6 +394,7 @@ model = "gpt-5-4-pro"
                 families: Some(vec!["openai".to_string(), "z-ai".to_string()]),
             }),
             notifications: None,
+            sessions: None,
             aliases: None,
         };
 
@@ -362,6 +408,50 @@ model = "gpt-5-4-pro"
             config.frontier.families,
             Some(vec!["openai".to_string(), "z-ai".to_string()])
         );
+    }
+
+    #[test]
+    fn trusted_config_applies_sessions() {
+        let mut config = Config::default();
+        let file = ConfigFile {
+            defaults: None,
+            providers: None,
+            registry: None,
+            frontier: None,
+            notifications: None,
+            sessions: Some(SessionsConfig {
+                no_session: Some(true),
+                max_age_days: Some(30),
+                max_count: Some(100),
+            }),
+            aliases: None,
+        };
+
+        config.merge(
+            file,
+            true,
+            Path::new("/home/user/.config/yoetz/config.toml"),
+        );
+
+        assert_eq!(config.sessions.no_session, Some(true));
+        assert_eq!(config.sessions.max_age_days, Some(30));
+        assert_eq!(config.sessions.max_count, Some(100));
+        assert!(config.sessions.retention_enabled());
+    }
+
+    #[test]
+    fn parse_sessions_from_toml() {
+        let toml_str = r#"
+[sessions]
+no_session = true
+max_age_days = 14
+max_count = 50
+"#;
+        let file: ConfigFile = toml::from_str(toml_str).unwrap();
+        let sessions = file.sessions.unwrap();
+        assert_eq!(sessions.no_session, Some(true));
+        assert_eq!(sessions.max_age_days, Some(14));
+        assert_eq!(sessions.max_count, Some(50));
     }
 }
 
@@ -404,5 +494,17 @@ fn merge_notifications(target: &mut NotificationsConfig, other: NotificationsCon
     }
     if other.notify_threshold_secs.is_some() {
         target.notify_threshold_secs = other.notify_threshold_secs;
+    }
+}
+
+fn merge_sessions(target: &mut SessionsConfig, other: SessionsConfig) {
+    if other.no_session.is_some() {
+        target.no_session = other.no_session;
+    }
+    if other.max_age_days.is_some() {
+        target.max_age_days = other.max_age_days;
+    }
+    if other.max_count.is_some() {
+        target.max_count = other.max_count;
     }
 }
