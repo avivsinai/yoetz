@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   managed bundle session. Mixed old/new binaries are not lease-compatible:
   the new pruner cannot see an old binary's `.browser-recipe.lock`.
 
+### Fixed
+
+- ChatGPT native-extension model selection now handles Advanced pickers whose
+  opacity animation is starved in a background recipe tab by structurally
+  trusting only the open surface named by the pill's `aria-controls`, while
+  retaining full ARIA verification and detailed picker visibility diagnostics.
+
 ## [0.5.49] - 2026-08-07
 ### Fixed
 
