@@ -6178,6 +6178,266 @@ test("service worker rebinds owned tab after content script reload during respon
   }
 });
 
+test("service worker idempotently rebinds a persisted bfcache restore without replaying side effects", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let runtimeListener = null;
+  let tabId = 0;
+  let sent = false;
+  let rebound = false;
+  let uploadCalls = 0;
+  let sendCalls = 0;
+  let bindCalls = 0;
+  let bfcacheRestoreStarted = false;
+  let rejectInFlightExtraction;
+  let markInFlightExtractionStarted;
+  let markLifecycleBindStarted;
+  let releaseLifecycleBind;
+  const inFlightExtractionStarted = new Promise((resolve) => {
+    markInFlightExtractionStarted = resolve;
+  });
+  const lifecycleBindStarted = new Promise((resolve) => {
+    markLifecycleBindStarted = resolve;
+  });
+  const lifecycleBindReleased = new Promise((resolve) => {
+    releaseLifecycleBind = resolve;
+  });
+  const chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            uploadCalls += 1;
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sendCalls += 1;
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_bind_job":
+            bindCalls += 1;
+            rebound = true;
+            if (bfcacheRestoreStarted) {
+              markLifecycleBindStarted();
+              await lifecycleBindReleased;
+            }
+            return { ok: true, payload: { rebound: true, url: "https://chatgpt.com/", title: "ChatGPT" } };
+          case "yoetz_extract_response":
+            if (sent && bindCalls === 0) {
+              throw new Error("Could not establish connection. Receiving end does not exist.");
+            }
+            if (sent && !bfcacheRestoreStarted) {
+              markInFlightExtractionStarted();
+              return new Promise((_resolve, reject) => {
+                rejectInFlightExtraction = reject;
+              });
+            }
+            return {
+              ok: true,
+              payload: sent && rebound
+                ? { method: "copy_scope_dom_fallback", text: "final after bfcache", is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0 }
+                : { method: "none", text: "", is_generating: true, assistant_count: 0, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?bfcache_rebind=${Date.now()}`);
+    port.emit(envelope("job_start", "job_bfcache_rebind", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1500
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_bfcache_rebind", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_bfcache_rebind.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => sent);
+    await inFlightExtractionStarted;
+
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: ["job_bfcache_rebind"] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    bfcacheRestoreStarted = true;
+    const restored = lifecycle("pageshow");
+    await lifecycleBindStarted;
+    rejectInFlightExtraction(new Error("Could not establish connection. Receiving end does not exist."));
+    releaseLifecycleBind();
+    assert.equal((await restored).ok, true);
+    // A duplicate restore observes the already rebound state without rebinding;
+    // provider-visible upload/send steps are never replayed.
+    assert.equal((await lifecycle("pageshow")).ok, true);
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    assert.equal(uploadCalls, 1);
+    assert.equal(sendCalls, 1);
+    assert.equal(bindCalls, 2);
+    assert.equal(
+      port.messages.find((message) => message.type === "job_complete")?.payload.response,
+      "final after bfcache"
+    );
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker terminates actionably when persisted bfcache reconnect fails", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousAttempts = globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS;
+  const previousDelay = globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS;
+  globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS = 1;
+  globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS = 0;
+  const port = makePort();
+  let runtimeListener = null;
+  let tabId = 0;
+  let sent = false;
+  let portLost = false;
+  let uploadCalls = 0;
+  let sendCalls = 0;
+  let rejectExtraction;
+  let markExtractionStarted;
+  const extractionStarted = new Promise((resolve) => {
+    markExtractionStarted = resolve;
+  });
+  const storage = makeStorage();
+  const chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        if (portLost && ["yoetz_probe", "yoetz_bind_job", "yoetz_extract_response"].includes(message.type)) {
+          throw new Error("Could not establish connection. Receiving end does not exist.");
+        }
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            uploadCalls += 1;
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sendCalls += 1;
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            if (!sent) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: true, assistant_count: 0, turn_index: -1 } };
+            }
+            markExtractionStarted();
+            return new Promise((_resolve, reject) => {
+              rejectExtraction = reject;
+            });
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?bfcache_rebind_failed=${Date.now()}`);
+    port.emit(envelope("job_start", "job_bfcache_failed", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_bfcache_failed", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_bfcache_failed.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => sent);
+    await extractionStarted;
+    await new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event: "pagehide", persisted: true, job_ids: ["job_bfcache_failed"] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    portLost = true;
+
+    const lifecycleResponse = new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event: "pageshow", persisted: true, job_ids: ["job_bfcache_failed"] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    await eventually(() => port.messages.some((message) => (
+      message.payload?.phase === "content_script_recovering"
+    )));
+    rejectExtraction(new Error("Could not establish connection. Receiving end does not exist."));
+    const response = await lifecycleResponse;
+    assert.equal(response.ok, true);
+    await eventually(() => port.messages.some((message) => (
+      message.type === "job_error" && message.payload.code === "content_script_reconnect_failed"
+    )));
+    const error = port.messages.find((message) => message.payload?.code === "content_script_reconnect_failed");
+    assert.equal(error.payload.phase, "wait_response");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.send_committed, true);
+    assert.equal(error.payload.tab_disposition, "kept");
+    assert.match(error.payload.message, /Do not rerun automatically/);
+    assert.equal(uploadCalls, 1);
+    assert.equal(sendCalls, 1);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    const jobErrors = port.messages.filter((message) => (
+      message.type === "job_error" && message.job_id === "job_bfcache_failed"
+    ));
+    assert.equal(jobErrors.length, 1);
+    assert.equal(jobErrors[0].payload.code, "content_script_reconnect_failed");
+    const persisted = await storage.get("jobs.job_bfcache_failed");
+    assert.notEqual(persisted["jobs.job_bfcache_failed"]?.status, "terminal_delivery_lost");
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousAttempts === undefined) delete globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS;
+    else globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS = previousAttempts;
+    if (previousDelay === undefined) delete globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS;
+    else globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS = previousDelay;
+  }
+});
+
 test("service worker preserves content-script committed-send error metadata", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

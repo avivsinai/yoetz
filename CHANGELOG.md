@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   managed bundle session. Mixed old/new binaries are not lease-compatible:
   the new pruner cannot see an old binary's `.browser-recipe.lock`.
 
+### Fixed
+
+- ChatGPT native-extension jobs now classify persisted background-tab
+  suspension and restore, idempotently rebind the owned job without replaying
+  upload or send, and fail terminally with an actionable inspect command when
+  the content script cannot reconnect after the prompt was submitted.
+
 ## [0.5.49] - 2026-08-07
 ### Fixed
 
