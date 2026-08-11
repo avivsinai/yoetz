@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.50] - 2026-08-11
 ### Added
 
 - `yoetz ask --no-session` (and a trusted-config `[sessions] no_session = true`
@@ -30,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   opacity animation is starved in a background recipe tab by structurally
   trusting only the open surface named by the pill's `aria-controls`, while
   retaining full ARIA verification and detailed picker visibility diagnostics.
+
 
 ## [0.5.49] - 2026-08-07
 ### Fixed
