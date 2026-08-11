@@ -11,6 +11,7 @@ import {
   findModelButton,
   insertPrompt,
   isResponseGenerating,
+  modelSelectionDiagnostics,
   sendAcceptanceBaseline,
   uploadFile,
   waitForSendAccepted
@@ -133,6 +134,10 @@ class FakeElement {
     }
     return null;
   }
+
+  contains(candidate) {
+    return this === candidate || this.children.some((child) => child.contains?.(candidate));
+  }
 }
 
 class FakeTextNode {
@@ -172,7 +177,8 @@ class FakeDocument {
           display: /display\s*:\s*none/i.test(style) ? "none" : "block",
           visibility: /visibility\s*:\s*hidden/i.test(style) ? "hidden" : "visible",
           opacity: /opacity\s*:\s*0(?:\.0+)?\b/i.test(style) ? "0" : "1",
-          pointerEvents: /pointer-events\s*:\s*none/i.test(style) ? "none" : "auto"
+          pointerEvents: /pointer-events\s*:\s*none/i.test(style) ? "none" : "auto",
+          contentVisibility: /content-visibility\s*:\s*hidden/i.test(style) ? "hidden" : "visible"
         };
       },
       location: {
@@ -184,6 +190,10 @@ class FakeDocument {
 
   querySelectorAll(selector) {
     return this.documentElement.querySelectorAll(selector);
+  }
+
+  getElementById(id) {
+    return flatten(this.documentElement).find((element) => element.getAttribute?.("id") === id) ?? null;
   }
 }
 
@@ -2356,6 +2366,125 @@ test("GPT-5.6 Sol Advanced picker moves the scoped effort slider with End", asyn
   assert.equal(result.pill_text, "Pro");
 });
 
+test("GPT-5.6 Sol Advanced picker waits for an expanded Radix surface to finish animating", async () => {
+  const fixture = makeSolSliderFixture({ keyboardMode: "end", animatedReveal: true });
+
+  const result = await configureModelState(fixture.doc, {
+    pickerTimeoutMs: 1600,
+    intervalMs: 25
+  });
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.effort_move_method, "keyboard_end");
+  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
+  assert.equal(fixture.pickerOpen(), false);
+});
+
+test("GPT-5.6 Sol structurally trusts its controlled open picker in a frozen background tab", async () => {
+  const fixture = makeSolSliderFixture({ keyboardMode: "end", animatedReveal: true, backgroundFrozen: true });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.surface_trust, "aria_controls_structural");
+  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
+  assert.deepEqual(fixture.keyAttempts(), ["End"]);
+});
+
+test("GPT-5.6 Sol fails closed when structural slider max is labeled Extra High", async () => {
+  const fixture = makeSolSliderFixture({
+    keyboardMode: "end",
+    animatedReveal: true,
+    backgroundFrozen: true,
+    maxLabelOverride: "Extra High",
+    transcriptEffortDecoy: "Pro, 5 of 5."
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_slider_move_failed");
+  assert.equal(result.effort_control.value_now, 4);
+  assert.equal(result.effort_control.label, "extra high");
+});
+
+test("GPT-5.6 Sol rejects an identical hidden picker without trigger ownership", async () => {
+  const fixture = makeSolSliderFixture({
+    keyboardMode: "end",
+    animatedReveal: true,
+    backgroundFrozen: true,
+    disconnectedTrigger: true
+  });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, intervalMs: 20 });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_picker_open_failed");
+  assert.deepEqual(fixture.keyAttempts(), []);
+});
+
+test("GPT-5.6 Sol selects a non-Sol family from a structurally controlled submenu", async () => {
+  const fixture = makeSolSliderFixture({
+    familyLabel: "GPT-5.5",
+    keyboardMode: "end",
+    animatedReveal: true,
+    backgroundFrozen: true
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+  assert.equal(result.surface_trust, "aria_controls_structural");
+  assert.equal(fixture.familyClicks(), 1);
+});
+
+test("structural picker failures capture bounded failure-time descendant topology", async () => {
+  const fixture = makeSolSliderFixture({
+    animatedReveal: true,
+    backgroundFrozen: true,
+    keyboardMode: "end",
+    maxLabelOverride: "Extra High"
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_slider_move_failed");
+  assert.equal(result.surface_trust, "aria_controls_structural");
+  assert.equal(result.surface_descendants.some((node) => node.role === "slider" && node.aria_valuenow === "4"), true);
+  assert.equal(result.surface_descendants.some((node) => node.role === "menuitem" && node.aria_haspopup === "menu"), true);
+});
+
+test("model selection diagnostics capture an invisible portaled Advanced surface and its sliders", () => {
+  const fixture = makeSolSliderFixture({ animatedReveal: true });
+  fixture.pill.dispatchEvent(new Event("pointerdown"));
+  const panel = fixture.panel();
+  fixture.doc.body.children = fixture.doc.body.children.filter((child) => child !== panel);
+  const ancestor = new FakeElement("div", { style: "display:none" }, "Advanced Effort page wrapper").append(panel);
+  fixture.doc.body.append(ancestor);
+
+  const diagnostics = modelSelectionDiagnostics(fixture.doc);
+
+  assert.equal(diagnostics.picker_shape, null);
+  assert.equal(diagnostics.surface_trust, null);
+  assert.equal(diagnostics.advanced_picker_candidates.length, 1);
+  assert.equal(diagnostics.advanced_picker_candidates[0].role, "dialog");
+  assert.equal(diagnostics.advanced_picker_candidates[0].opacity, "0");
+  assert.equal(diagnostics.advanced_picker_candidates[0].pointer_events, "none");
+  assert.equal(diagnostics.advanced_picker_candidates[0].check_visibility, false);
+  assert.equal(diagnostics.advanced_picker_candidates[0].inner_text_chars > 0, true);
+  assert.equal(diagnostics.advanced_picker_candidates[0].text_content_chars > 0, true);
+  assert.equal(diagnostics.advanced_picker_candidates[0].first_non_rendered_ancestor.display, "none");
+  assert.equal(diagnostics.advanced_picker_candidates[0].sliders.length, 2);
+  assert.equal(diagnostics.advanced_picker_candidates[0].sliders[1].role, "slider");
+  assert.equal(diagnostics.model_button_wiring.aria_controls, "advanced-picker");
+  assert.equal(diagnostics.model_button_wiring.controlled_node.role, "dialog");
+  assert.equal(diagnostics.mounted_picker_roles.sliders.length, 2);
+  assert.equal(diagnostics.mounted_picker_roles.dialogs.length, 1);
+});
+
 test("GPT-5.6 Sol Advanced picker accepts trailing punctuation in aria-valuetext", async () => {
   const fixture = makeSolSliderFixture({ keyboardMode: "end", valueTextSuffix: "." });
 
@@ -2600,38 +2729,65 @@ function makeSolSliderFixture({
   pointerMoves = false,
   includeEffortSlider = true,
   sliderDisappearsOnEnd = false,
-  valueTextSuffix = ""
+  valueTextSuffix = "",
+  animatedReveal = false,
+  backgroundFrozen = false,
+  disconnectedTrigger = false,
+  maxLabelOverride = null,
+  transcriptEffortDecoy = null,
+  familyLabel = "GPT-5.6 Sol"
 } = {}) {
   const levels = ["Instant", "Medium", "High", "Extra High", "Pro"];
   let currentValue = 3;
   let panel = null;
   let effortSlider = null;
+  let effortLabel = null;
   let pointerAttemptCount = 0;
+  let revealGeneration = 0;
+  let familyClickCount = 0;
+  let familyMenu = null;
+  let familyValueNode = null;
   const keyAttemptLog = [];
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
   const body = new FakeElement("body", {}, "Ask anything").append(form);
+  if (transcriptEffortDecoy) {
+    body.append(new FakeElement("div", { "data-message-author-role": "user" }, transcriptEffortDecoy));
+  }
 
   const closePanel = () => {
+    revealGeneration += 1;
     if (!panel) return;
     body.children = body.children.filter((child) => child !== panel);
     panel.parentElement = null;
     panel = null;
+    if (familyMenu) {
+      body.children = body.children.filter((child) => child !== familyMenu);
+      familyMenu = null;
+    }
+    pill?.setAttribute("aria-expanded", "false");
+    pill?.setAttribute("data-state", "closed");
   };
   const updateValue = (value) => {
     currentValue = Math.max(1, Math.min(5, value));
-    effortSlider?.setAttribute("aria-valuenow", currentValue);
-    effortSlider?.setAttribute("aria-valuetext", `${levels[currentValue - 1]}, ${currentValue} of 5${valueTextSuffix}`);
-    pill.innerText = levels[currentValue - 1];
-    pill.textContent = levels[currentValue - 1];
+    const label = currentValue === 5 && maxLabelOverride ? maxLabelOverride : levels[currentValue - 1];
+    effortSlider?.setAttribute("aria-valuenow", backgroundFrozen ? currentValue - 1 : currentValue);
+    if (!backgroundFrozen) effortSlider?.setAttribute("aria-valuetext", `${label}, ${currentValue} of 5${valueTextSuffix}`);
+    if (effortLabel) {
+      effortLabel.innerText = `${label}, ${currentValue} of 5${valueTextSuffix}`;
+      effortLabel.textContent = effortLabel.innerText;
+    }
+    pill.innerText = label;
+    pill.textContent = label;
   };
   const makeEffortSlider = () => new FakeElement("div", {
     role: "slider",
+    ...(backgroundFrozen ? { "aria-hidden": "true" } : {}),
     "aria-label": "Effort",
-    "aria-valuemin": "1",
-    "aria-valuemax": "5",
-    "aria-valuenow": String(currentValue),
-    "aria-valuetext": `${levels[currentValue - 1]}, ${currentValue} of 5${valueTextSuffix}`,
+    "aria-valuemin": backgroundFrozen ? "0" : "1",
+    "aria-valuemax": backgroundFrozen ? "4" : "5",
+    "aria-valuenow": String(backgroundFrozen ? currentValue - 1 : currentValue),
+    ...(!backgroundFrozen ? { "aria-valuetext": `${levels[currentValue - 1]}, ${currentValue} of 5${valueTextSuffix}` } : {}),
     onKeyDown: (event) => {
       keyAttemptLog.push(event.key);
       if (sliderDisappearsOnEnd && event.key === "End") {
@@ -2652,7 +2808,7 @@ function makeSolSliderFixture({
     closePanel();
     panel = new FakeElement(
       "div",
-      { role: "dialog" },
+      { id: "advanced-picker", role: "dialog", ...(backgroundFrozen ? { "data-state": "open" } : {}), ...(animatedReveal ? { style: "opacity:0; pointer-events:none" } : {}) },
       "Advanced Faster Smarter Model GPT-5.6 Sol Effort High 3 of 5"
     );
     const masterSlider = new FakeElement("div", {
@@ -2663,22 +2819,86 @@ function makeSolSliderFixture({
       "aria-valuenow": "3",
       "aria-valuetext": "High, 3 of 5"
     });
-    const family = new FakeElement("button", { "aria-haspopup": "menu" }, "GPT-5.6 Sol");
-    panel.append(masterSlider, family);
-    if (includeEffortSlider) {
-      effortSlider = makeEffortSlider();
-      panel.append(effortSlider);
+    const openFamilyMenu = () => {
+      family.setAttribute("aria-expanded", "true");
+      family.setAttribute("data-state", "open");
+      familyMenu = new FakeElement("div", { id: "family-picker", role: "menu", "data-state": "open", style: "opacity:0" });
+      const oldFamily = new FakeElement("div", { role: "menuitemradio", "aria-checked": familyLabel === "GPT-5.5" ? "true" : "false" }, "GPT-5.5");
+      const solFamily = new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": familyLabel === "GPT-5.6 Sol" ? "true" : "false",
+        onClick: () => {
+          familyClickCount += 1;
+          familyValueNode.innerText = "GPT-5.6 Sol";
+          familyValueNode.textContent = "GPT-5.6 Sol";
+          family.innerText = "Model\nGPT-5.6 Sol";
+          family.textContent = family.innerText;
+          family.setAttribute("aria-expanded", "false");
+          family.setAttribute("data-state", "closed");
+          body.children = body.children.filter((child) => child !== familyMenu);
+          familyMenu = null;
+        }
+      }, "GPT-5.6 Sol");
+      familyMenu.append(oldFamily, solFamily);
+      body.append(familyMenu);
+    };
+    const family = backgroundFrozen
+      ? new FakeElement("div", { role: "menuitem", tabindex: "0", "aria-haspopup": "menu", "aria-expanded": "false", "aria-controls": "family-picker", "data-state": "closed", onPointerDown: openFamilyMenu }, `Model\n${familyLabel}`)
+        .append(new FakeElement("div", {}, "Model"), (familyValueNode = new FakeElement("div", {}, familyLabel)))
+      : new FakeElement("button", { "aria-haspopup": "menu" }, "GPT-5.6 Sol");
+    if (backgroundFrozen) {
+      const group = new FakeElement("div", { role: "group", "data-testid": "composer-intelligence-picker-content" });
+      const simple = new FakeElement("div", { "data-testid": "composer-model-picker-slider-simple-view" });
+      const advanced = new FakeElement("div", { "data-testid": "composer-model-picker-slider-advanced-view" });
+      if (includeEffortSlider) {
+        effortSlider = makeEffortSlider();
+        effortLabel = new FakeElement("span", {}, `${levels[currentValue - 1]}, ${currentValue} of 5${valueTextSuffix}`);
+        const sliderControl = new FakeElement("div", { class: "d1BZWq_SliderControl" })
+          .append(new FakeElement("div", { class: "_9wXMRW_Container" })
+            .append(new FakeElement("span", { class: "_9wXMRW_Root" })
+              .append(new FakeElement("span").append(effortSlider))));
+        simple.append(sliderControl, effortLabel);
+      }
+      advanced.append(new FakeElement("div", { role: "menuitem", tabindex: "0", "aria-expanded": "false" }, "Advanced"), family);
+      group.append(simple, advanced);
+      panel.append(group);
     } else {
-      effortSlider = null;
+      panel.append(masterSlider, family);
+      if (includeEffortSlider) {
+        effortSlider = makeEffortSlider();
+        panel.append(effortSlider);
+      } else {
+        effortSlider = null;
+      }
     }
     body.append(panel);
+    pill.setAttribute("aria-expanded", "true");
+    pill.setAttribute("data-state", "open");
+    if (animatedReveal && !backgroundFrozen) {
+      const generation = revealGeneration;
+      const openingPanel = panel;
+      setTimeout(() => {
+        if (generation === revealGeneration && panel === openingPanel) {
+          openingPanel.setAttribute("style", "opacity:1; pointer-events:auto");
+        }
+      }, 900);
+    }
+  };
+  const togglePanel = () => {
+    if (panel) closePanel();
+    else openPanel();
   };
   const pill = new FakeElement("button", {
     class: "__composer-pill __composer-pill--neutral",
     "aria-haspopup": "menu",
-    onPointerDown: openPanel,
+    "aria-expanded": "false",
+    "data-state": "closed",
+    ...(disconnectedTrigger ? {} : { "aria-controls": "advanced-picker" }),
+    onPointerDown: animatedReveal ? togglePanel : openPanel,
+    onClick: animatedReveal ? togglePanel : undefined,
     onKeyDown: (event) => {
       if (event.key === "Escape") closePanel();
+      if (animatedReveal && (event.key === "Enter" || event.key === " ")) togglePanel();
     }
   }, levels[currentValue - 1]);
   form.append(pill);
@@ -2686,9 +2906,12 @@ function makeSolSliderFixture({
 
   return {
     doc,
+    pill,
     keyAttempts: () => [...keyAttemptLog],
     pointerAttempts: () => pointerAttemptCount,
-    pickerOpen: () => Boolean(panel)
+    pickerOpen: () => Boolean(panel),
+    panel: () => panel,
+    familyClicks: () => familyClickCount
   };
 }
 
@@ -2714,6 +2937,8 @@ function matchesSimpleSelector(element, selector) {
   const tag = element.tagName.toLowerCase();
   const attr = (name) => element.attrs[name];
   const text = String(element.innerText ?? element.textContent ?? "");
+
+  if (selector === "*") return true;
 
   if (selector.startsWith("button:has(")) {
     const inner = selector.slice("button:has(".length, -1);
@@ -2742,6 +2967,7 @@ function matchesSimpleSelector(element, selector) {
   if (selector === "#prompt-textarea") return attr("id") === "prompt-textarea";
   if (selector === "button") return tag === "button";
   if (selector === "div") return tag === "div";
+  if (selector === "span") return tag === "span";
   if (selector === "header") return tag === "header";
   if (selector === "article") return tag === "article";
   if (selector === "pre") return tag === "pre";

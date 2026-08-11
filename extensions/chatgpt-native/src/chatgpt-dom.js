@@ -378,6 +378,8 @@ export async function configureModelState(root, job = {}) {
       effort_status: "skipped",
       failure_reason: null,
       picker_shape: null,
+      surface_trust: null,
+      surface_descendants: [],
       effort_control: null,
       effort_move_method: null,
       pill_text: pillText ?? "",
@@ -400,6 +402,8 @@ export async function configureModelState(root, job = {}) {
     effort_status: selection.effort_status ?? "unverified",
     failure_reason: selection.failure_reason ?? null,
     picker_shape: selection.picker_shape ?? null,
+    surface_trust: selection.surface_trust ?? null,
+    surface_descendants: selection.surface_descendants ?? [],
     effort_control: selection.effort_control ?? null,
     effort_move_method: selection.effort_move_method ?? null,
     pill_text: selection.pill_text ?? null,
@@ -544,8 +548,10 @@ async function selectSolProModel(root, options = {}) {
 
   if (!familyIsSol(state.family_label)) {
     const familyMenu = await openFamilyPicker(root, state.menu ?? state.surface, state.family_trigger, options);
-    availableFamilies = familyMenu ? familyMenuRadios(familyMenu).map((item) => textOf(item)).filter(Boolean) : [];
-    const solOption = familyMenuRadios(familyMenu).find((item) => foldedModelText(textOf(item)) === foldedModelText(CHATGPT_SOL_FAMILY_LABEL));
+    const structuralFamilyMenu = familyMenu === structurallyOpenControlledSurfaceForTrigger(root, state.family_trigger);
+    availableFamilies = familyMenu ? familyMenuRadios(familyMenu, structuralFamilyMenu).map((item) => textOf(item)).filter(Boolean) : [];
+    const solOption = familyMenuRadios(familyMenu, structuralFamilyMenu)
+      .find((item) => foldedModelText(textOf(item)) === foldedModelText(CHATGPT_SOL_FAMILY_LABEL));
     if (!solOption) {
       await closeModelPicker(root, modelButton);
       return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol was not visible in the family submenu", "model_family_not_found");
@@ -616,7 +622,8 @@ async function selectSolProModel(root, options = {}) {
     family_status: "verified",
     effort_status: "verified",
     picker_shape: state.shape,
-    effort_control: state.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider) : null,
+    surface_trust: state.surface_trust,
+    effort_control: state.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider, state.surface) : null,
     effort_move_method: state.effort_move_method ?? null,
     pill_text: pillText,
     family_label: state.family_label,
@@ -651,32 +658,40 @@ async function openAndReadModelPicker(root, modelButton, options = {}) {
 async function openModelPicker(root, modelButton, options = {}) {
   const settleMs = Number(options.settleMs ?? 150);
   const opened = () => Boolean(findPickerState(root));
+  const openedOrTriggered = () => opened() || modelPickerTriggerIsOpen(modelButton);
   if (opened()) {
     return true;
   }
   const activators = [openWithPointerEvents, pressEnter, pressSpace];
   for (const activate of activators) {
     try {
-      if (await activate(modelButton, opened, { settleMs })) {
-        return true;
+      if (await activate(modelButton, openedOrTriggered, { settleMs })) {
+        return opened() || Boolean(await waitForPickerState(root, options));
       }
     } catch {
+      recordModelPickerActivationException(root);
       // Try the next activation path; ChatGPT changes this control frequently.
     }
   }
   return false;
 }
 
+function modelPickerTriggerIsOpen(modelButton) {
+  return modelButton?.getAttribute?.("aria-expanded") === "true"
+    || modelButton?.getAttribute?.("data-state") === "open";
+}
+
 async function openFamilyPicker(root, mainMenu, trigger, options = {}) {
   if (!trigger) {
     return null;
   }
-  const opened = () => findFamilySubmenu(root, mainMenu);
+  const opened = () => findFamilySubmenu(root, mainMenu)
+    ?? structurallyOpenControlledSurfaceForTrigger(root, trigger);
   const settleMs = Number(options.settleMs ?? 150);
   for (const activate of [openWithHoverEvents, openWithPointerEvents, pressEnter, pressSpace]) {
     try {
       if (await activate(trigger, opened, { settleMs })) {
-        return waitForFamilyMenu(root, mainMenu, options);
+        return waitForFamilyMenu(root, mainMenu, trigger, options);
       }
     } catch {
       // Try the next Radix activation path.
@@ -724,6 +739,9 @@ async function openWithPointerEvents(element, isOpen, options = {}) {
 async function dispatchActivationPhases(element, isOpen, phases, settleMs) {
   for (const [type, constructorName, init] of phases) {
     dispatchSyntheticEvent(element, type, constructorName, init);
+    // Deliberately abort the synthetic sequence as soon as Radix reports open:
+    // a trailing click on an already-open trigger can toggle it closed again.
+    if (isOpen()) return true;
     await sleep(settleMs);
     if (isOpen()) return true;
   }
@@ -802,15 +820,47 @@ async function waitForPickerState(root, options = {}) {
 
 function findPickerState(root) {
   const menu = findMainModelMenu(root);
-  return menu ? readMenuPickerState(menu) : readSliderPickerState(root);
+  if (menu) return readMenuPickerState(menu, false);
+  const slider = readSliderPickerState(root);
+  if (slider) return slider;
+  const controlledSurface = structurallyOpenControlledSurface(root);
+  return controlledSurface ? readStructurallyTrustedPickerState(controlledSurface) : null;
 }
 
-async function waitForFamilyMenu(root, mainMenu, options = {}) {
+function structurallyOpenControlledSurface(root) {
+  const trigger = findModelButton(root);
+  return structurallyOpenControlledSurfaceForTrigger(root, trigger);
+}
+
+function structurallyOpenControlledSurfaceForTrigger(root, trigger) {
+  if (!modelPickerTriggerIsOpen(trigger)) return null;
+  const controlledId = trigger?.getAttribute?.("aria-controls");
+  if (!controlledId) return null;
+  const surface = root.getElementById?.(controlledId);
+  return surface?.getAttribute?.("data-state") === "open" ? surface : null;
+}
+
+function readStructurallyTrustedPickerState(surface) {
+  const labels = menuRadioItems(surface, true).map((item) => foldedModelText(textOf(item)));
+  if (labels.includes("medium") && labels.includes("high")
+    && (labels.includes("pro") || labels.includes("pro extended"))) {
+    return readMenuPickerState(surface, true);
+  }
+  const text = normalizeText(textOf(surface));
+  if (/\bAdvanced\b/i.test(text) && /\bEffort\b/i.test(text)
+    && surface.querySelectorAll?.('[role="slider"]')?.length > 0) {
+    return readSliderPickerState(surface.ownerDocument, surface);
+  }
+  return null;
+}
+
+async function waitForFamilyMenu(root, mainMenu, trigger, options = {}) {
   const timeoutMs = Number(options.pickerTimeoutMs ?? 3000);
   const intervalMs = Number(options.intervalMs ?? 100);
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    const menu = findFamilySubmenu(root, mainMenu);
+    const menu = findFamilySubmenu(root, mainMenu)
+      ?? structurallyOpenControlledSurfaceForTrigger(root, trigger);
     if (menu) return menu;
     await sleep(intervalMs);
   }
@@ -833,8 +883,8 @@ function visibleMenus(root) {
   return Array.from(root.querySelectorAll('[role="menu"]')).filter((menu) => isVisible(menu));
 }
 
-function readMenuPickerState(menu) {
-  const effortItems = menuRadioItems(menu);
+function readMenuPickerState(menu, structurallyTrusted = false) {
+  const effortItems = menuRadioItems(menu, structurallyTrusted);
   const familyTrigger = Array.from(menu.querySelectorAll('[role="menuitem"]'))
     .find((item) => {
       const label = normalizeText(textOf(item));
@@ -849,30 +899,35 @@ function readMenuPickerState(menu) {
     family_label: textOf(familyTrigger),
     effort_items: effortItems,
     effort_slider: null,
-    effort_move_method: null
+    effort_move_method: null,
+    surface_trust: structurallyTrusted ? "aria_controls_structural" : "visible"
   };
 }
 
-function readSliderPickerState(root) {
-  const surface = findAdvancedPickerSurface(root);
+function readSliderPickerState(root, structurallyTrustedSurface = null) {
+  const surface = structurallyTrustedSurface ?? findAdvancedPickerSurface(root);
   if (!surface) return null;
+  const structurallyTrusted = Boolean(structurallyTrustedSurface);
   const familyTrigger = Array.from(surface.querySelectorAll('[role="menuitem"], button'))
     .find((item) => {
-      const label = normalizeText(textOf(item));
-      return /^(?:gpt|o\d)\b/i.test(label) && isVisible(item, { allowDisabled: true });
+      const label = structurallyTrusted ? structuralFamilyLabel(item) : normalizeText(textOf(item));
+      return Boolean(label)
+        && /^(?:gpt|o\d)\b/i.test(label)
+        && (structurallyTrusted || isVisible(item, { allowDisabled: true }));
     });
   const effortSlider = Array.from(surface.querySelectorAll('[role="slider"]'))
-    .filter((slider) => isVisible(slider))
-    .find((slider) => sliderIsEffortControl(slider, surface) && Boolean(sliderEffortSnapshot(slider))) ?? null;
+    .filter((slider) => structurallyTrusted || isVisible(slider))
+    .find((slider) => sliderIsEffortControl(slider, surface) && Boolean(sliderEffortSnapshot(slider, surface))) ?? null;
   return {
     shape: "slider",
     menu: null,
     surface,
     family_trigger: familyTrigger ?? null,
-    family_label: textOf(familyTrigger),
+    family_label: structurallyTrusted ? structuralFamilyLabel(familyTrigger) : textOf(familyTrigger),
     effort_items: [],
     effort_slider: effortSlider,
-    effort_move_method: null
+    effort_move_method: null,
+    surface_trust: structurallyTrusted ? "aria_controls_structural" : "visible"
   };
 }
 
@@ -881,7 +936,9 @@ function sliderIsEffortControl(slider, surface) {
     slider?.getAttribute?.("aria-label"),
     slider?.getAttribute?.("title")
   ].filter(Boolean).join(" "));
+  if (/\b(?:faster|smarter)\b/i.test(directLabel)) return false;
   if (/\beffort\b/i.test(directLabel)) return true;
+  if (sliderEffortSnapshot(slider, surface)) return true;
 
   const labelledBy = normalizeText(slider?.getAttribute?.("aria-labelledby") ?? "")
     .split(" ")
@@ -921,38 +978,62 @@ function findAdvancedPickerSurface(root) {
   ))[0] ?? null;
 }
 
-function menuRadioItems(menu) {
-  return Array.from(menu?.querySelectorAll?.('[role="menuitemradio"]') ?? []).filter((item) => isVisible(item));
+function menuRadioItems(menu, structurallyTrusted = false) {
+  return Array.from(menu?.querySelectorAll?.('[role="menuitemradio"]') ?? [])
+    .filter((item) => structurallyTrusted || isVisible(item));
 }
 
-function familyMenuRadios(menu) {
-  return menuRadioItems(menu).filter((item) => /^gpt\b|^o3$/i.test(normalizeText(textOf(item))));
+function familyMenuRadios(menu, structurallyTrusted = false) {
+  return menuRadioItems(menu, structurallyTrusted).filter((item) => /^gpt\b|^o3$/i.test(normalizeText(textOf(item))));
 }
 
 function effortIsPro(state) {
   if (state?.shape === "slider") {
-    const snapshot = sliderEffortSnapshot(state.effort_slider);
+    const snapshot = sliderEffortSnapshot(state.effort_slider, state.surface);
     return Boolean(snapshot && snapshot.label === "pro" && snapshot.now === snapshot.max);
   }
   return state?.effort_items?.some((item) => foldedModelText(textOf(item)) === "pro" && itemIsChecked(item)) ?? false;
 }
 
-function sliderEffortSnapshot(slider) {
+function sliderEffortSnapshot(slider, surface = null) {
   if (!slider) return null;
   const valueText = normalizeText(slider.getAttribute?.("aria-valuetext") ?? "");
-  const match = valueText.match(/^(Instant|Medium|High|Extra High|Pro)\s*,?\s*(\d+)\s+of\s+(\d+)\s*[.!?]?\s*$/i);
+  const nearbyLabel = valueText || effortLabelNearSlider(slider, surface);
+  const match = nearbyLabel.match(/^(Instant|Medium|High|Extra High|Pro)\s*,?\s*(\d+)\s+of\s+(\d+)\s*[.!?]?\s*$/i);
   const now = Number(slider.getAttribute?.("aria-valuenow"));
   const min = Number(slider.getAttribute?.("aria-valuemin"));
   const max = Number(slider.getAttribute?.("aria-valuemax"));
+  const ordinal = now - min + 1;
+  const total = max - min + 1;
   if (!match || !Number.isFinite(now) || !Number.isFinite(min) || !Number.isFinite(max)
-    || max <= min || now < min || now > max || Number(match[2]) !== now || Number(match[3]) !== max) {
+    || max <= min || now < min || now > max || Number(match[2]) !== ordinal || Number(match[3]) !== total) {
     return null;
   }
-  return { label: foldedModelText(match[1]), now, min, max, value_text: valueText };
+  return { label: foldedModelText(match[1]), now, min, max, value_text: nearbyLabel };
 }
 
-function sliderEffortDiagnostics(slider) {
-  const snapshot = sliderEffortSnapshot(slider);
+function effortLabelNearSlider(slider, surface) {
+  let scope = slider?.parentElement;
+  for (let depth = 0; scope && depth < 8; depth += 1, scope = scope.parentElement) {
+    const label = Array.from(scope.querySelectorAll?.("span, div") ?? [])
+      .map((node) => normalizeText(textOf(node)))
+      .find((text) => /^(?:Instant|Medium|High|Extra High|Pro)\s*,?\s*\d+\s+of\s+\d+\s*[.!?]?$/i.test(text));
+    if (label) return label;
+    if (scope === surface) break;
+  }
+  return "";
+}
+
+function structuralFamilyLabel(control) {
+  if (!control || control.getAttribute?.("aria-haspopup") !== "menu") return "";
+  if (!/\bModel\b/i.test(textOf(control))) return "";
+  return Array.from(control.querySelectorAll?.("*") ?? [])
+    .map((node) => normalizeText(textOf(node)))
+    .find((text) => /^(?:gpt|o\d)\b/i.test(text)) ?? "";
+}
+
+function sliderEffortDiagnostics(slider, surface = null) {
+  const snapshot = sliderEffortSnapshot(slider, surface);
   return snapshot ? {
     role: "slider",
     label: snapshot.label,
@@ -977,7 +1058,7 @@ async function moveEffortSliderToPro(root, initialState, options = {}) {
   let result = await attemptKey("End", "keyboard_end");
   if (result) return result;
 
-  const snapshot = sliderEffortSnapshot(state?.effort_slider);
+  const snapshot = sliderEffortSnapshot(state?.effort_slider, state?.surface);
   const arrowAttempts = Math.min(10, Math.max(1, Math.ceil((snapshot?.max ?? 5) - (snapshot?.min ?? 1)) + 1));
   for (let attempt = 0; attempt < arrowAttempts; attempt += 1) {
     result = await attemptKey("ArrowRight", "keyboard_arrow_right");
@@ -1034,7 +1115,11 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     family_status: familyIsSol(state?.family_label) ? "verified" : "unverified",
     effort_status: effortIsPro(state) ? "verified" : "unverified",
     picker_shape: state?.shape ?? null,
-    effort_control: state?.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider) : null,
+    surface_trust: state?.surface_trust ?? null,
+    surface_descendants: state?.surface_trust === "aria_controls_structural"
+      ? structuralSurfaceDescendants(state.surface)
+      : [],
+    effort_control: state?.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider, state.surface) : null,
     effort_move_method: state?.effort_move_method ?? null,
     pill_text: modelControlLabel(modelButton),
     family_label: state?.family_label ?? null,
@@ -1043,6 +1128,26 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     effort_options: effortDiagnostics(state?.effort_items ?? []),
     warning
   };
+}
+
+function structuralSurfaceDescendants(surface) {
+  return Array.from(surface?.querySelectorAll?.("*") ?? []).slice(0, 40).map((node) => ({
+    tag: node.tagName?.toLowerCase?.() ?? "element",
+    role: node.getAttribute?.("role") ?? null,
+    type: node.getAttribute?.("type") ?? null,
+    tabindex: node.getAttribute?.("tabindex") ?? null,
+    aria_haspopup: node.getAttribute?.("aria-haspopup") ?? null,
+    aria_expanded: node.getAttribute?.("aria-expanded") ?? null,
+    aria_controls: node.getAttribute?.("aria-controls") ?? null,
+    aria_checked: node.getAttribute?.("aria-checked") ?? null,
+    aria_valuetext: node.getAttribute?.("aria-valuetext") ?? null,
+    aria_valuenow: node.getAttribute?.("aria-valuenow") ?? null,
+    aria_valuemin: node.getAttribute?.("aria-valuemin") ?? null,
+    aria_valuemax: node.getAttribute?.("aria-valuemax") ?? null,
+    data_state: node.getAttribute?.("data-state") ?? null,
+    data_testid: node.getAttribute?.("data-testid") ?? null,
+    text: textOf(node).slice(0, 80)
+  }));
 }
 
 function visibleLegacyPickerMarkers(root) {
@@ -2599,6 +2704,8 @@ export function modelSelectionDiagnostics(root = document) {
   const modelButton = findModelButton(root);
   const state = findPickerState(root);
   const familyMenu = findFamilySubmenu(root, state?.menu ?? state?.surface);
+  const controlledId = modelButton?.getAttribute?.("aria-controls") ?? null;
+  const controlledNode = controlledId ? root.getElementById?.(controlledId) : null;
   return {
     requested_model: CHATGPT_SOL_PRO_MODEL,
     current_model_label: modelControlLabel(modelButton),
@@ -2607,14 +2714,99 @@ export function modelSelectionDiagnostics(root = document) {
     effort_status: effortIsPro(state) ? "verified" : "unverified",
     family_label: state?.family_label ?? null,
     picker_shape: state?.shape ?? null,
-    effort_control: state?.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider) : null,
+    surface_trust: state?.surface_trust ?? null,
+    effort_control: state?.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider, state.surface) : null,
     model_button: modelButton ? elementSummary(modelButton) : null,
+    model_button_wiring: modelButton ? {
+      aria_expanded: modelButton.getAttribute?.("aria-expanded") ?? null,
+      data_state: modelButton.getAttribute?.("data-state") ?? null,
+      aria_haspopup: modelButton.getAttribute?.("aria-haspopup") ?? null,
+      aria_controls: controlledId,
+      controlled_node: controlledNode ? pickerNodeDiagnostics(controlledNode) : null
+    } : null,
+    picker_activation_exceptions: modelPickerActivationExceptions.get(root) ?? 0,
+    advanced_picker_candidates: advancedPickerDiagnostics(root),
+    mounted_picker_roles: {
+      sliders: Array.from(root.querySelectorAll('[role="slider"]')).slice(0, 10).map(pickerNodeDiagnostics),
+      menus: Array.from(root.querySelectorAll('[role="menu"]')).slice(0, 10).map(pickerNodeDiagnostics),
+      dialogs: Array.from(root.querySelectorAll('[role="dialog"]')).slice(0, 10).map(pickerNodeDiagnostics)
+    },
     visible_options: state?.effort_items?.map((item) => textOf(item)).filter(Boolean).slice(0, 20) ?? [],
     visible_families: familyMenuRadios(familyMenu).map((item) => textOf(item)).filter(Boolean).slice(0, 20),
     legacy_picker: visibleLegacyPickerMarkers(root).slice(0, 10),
     composer: elementSummary(findComposer(root)),
     model_control_scopes: modelControlScopes(root).slice(0, 5).map(elementSummary)
   };
+}
+
+const modelPickerActivationExceptions = new WeakMap();
+
+function recordModelPickerActivationException(root) {
+  modelPickerActivationExceptions.set(root, (modelPickerActivationExceptions.get(root) ?? 0) + 1);
+}
+
+function advancedPickerDiagnostics(root) {
+  const matches = Array.from(root.querySelectorAll('div, [role="dialog"]'))
+    .filter((node) => /\bAdvanced\b/i.test(textOf(node)) && /\bEffort\b/i.test(textOf(node)));
+  return matches
+    .filter((node) => !matches.some((candidate) => candidate !== node && node.contains?.(candidate)))
+    .slice(0, 10)
+    .map((node) => ({
+      ...pickerNodeDiagnostics(node),
+      sliders: Array.from(node.querySelectorAll('[role="slider"]')).slice(0, 10).map(pickerNodeDiagnostics)
+    }));
+}
+
+function pickerNodeDiagnostics(node) {
+  const ancestors = pickerAncestorDiagnostics(node);
+  const style = node?.ownerDocument?.defaultView?.getComputedStyle?.(node);
+  let checkVisibility = null;
+  try {
+    checkVisibility = typeof node?.checkVisibility === "function"
+      ? node.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true, contentVisibilityAuto: true })
+      : null;
+  } catch {
+    checkVisibility = "threw";
+  }
+  return {
+    tag: node?.tagName?.toLowerCase?.() ?? "element",
+    role: node?.getAttribute?.("role") ?? null,
+    data_state: node?.getAttribute?.("data-state") ?? null,
+    aria_hidden: node?.getAttribute?.("aria-hidden") ?? null,
+    inert: node?.getAttribute?.("inert") != null,
+    opacity: style?.opacity ?? null,
+    pointer_events: style?.pointerEvents ?? null,
+    content_visibility: style?.contentVisibility ?? null,
+    check_visibility: checkVisibility,
+    inner_text_chars: normalizeText(node?.innerText ?? "").length,
+    text_content_chars: normalizeText(node?.textContent ?? "").length,
+    text: textOf(node).slice(0, 240),
+    ancestor_chain: ancestors,
+    first_non_rendered_ancestor: ancestors.find((ancestor) => ancestor.non_rendered) ?? null
+  };
+}
+
+function pickerAncestorDiagnostics(node) {
+  const ancestors = [];
+  let current = node?.parentElement;
+  while (current) {
+    const style = current.ownerDocument?.defaultView?.getComputedStyle?.(current);
+    const display = style?.display ?? null;
+    const visibility = style?.visibility ?? null;
+    const contentVisibility = style?.contentVisibility ?? null;
+    ancestors.push({
+      tag: current.tagName?.toLowerCase?.() ?? "element",
+      id: String(current.getAttribute?.("id") ?? "").slice(0, 120),
+      class: String(current.getAttribute?.("class") ?? "").slice(0, 160),
+      display,
+      visibility,
+      content_visibility: contentVisibility,
+      non_rendered: display === "none" || visibility === "hidden" || contentVisibility === "hidden"
+    });
+    if (current === current.ownerDocument?.body) break;
+    current = current.parentElement;
+  }
+  return ancestors;
 }
 
 function textOf(node) {
