@@ -4,6 +4,8 @@ const siteAdapterModules = Object.freeze({
   chatgpt: "src/sites/chatgpt.js",
   claude: "src/sites/claude.js"
 });
+const LIFECYCLE_RETRY_ATTEMPTS = 3;
+const LIFECYCLE_RETRY_DELAY_MS = 250;
 
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
   handleMessage(message)
@@ -11,6 +13,47 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     .catch((error) => sendResponse(errorResponse(error)));
   return true;
 });
+
+window.addEventListener("pagehide", (event) => {
+  if (event.persisted) {
+    void notifyPersistedLifecycle("pagehide");
+  }
+});
+
+window.addEventListener("pageshow", (event) => {
+  if (event.persisted) {
+    void notifyPersistedLifecycle("pageshow");
+  }
+});
+
+async function notifyPersistedLifecycle(event) {
+  const jobIds = Array.from(activeJobs.keys());
+  if (jobIds.length === 0) {
+    return;
+  }
+  const message = {
+    type: "yoetz_content_lifecycle",
+    event,
+    persisted: true,
+    job_ids: jobIds
+  };
+  const attempts = event === "pageshow" ? LIFECYCLE_RETRY_ATTEMPTS : 1;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      const response = await chrome.runtime.sendMessage(message);
+      if (!response?.ok) {
+        throw new Error(response?.error ?? "service worker rejected content lifecycle event");
+      }
+      return;
+    } catch (error) {
+      if (attempt === attempts) {
+        console.warn(`Yoetz ${event} reconnect notification failed: ${String(error?.message ?? error)}`);
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, LIFECYCLE_RETRY_DELAY_MS));
+    }
+  }
+}
 
 async function handleMessage(message) {
   switch (message?.type) {

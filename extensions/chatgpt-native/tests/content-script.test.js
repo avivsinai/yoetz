@@ -804,6 +804,35 @@ test("content script requires the surviving window.name marker for conversation 
   }
 });
 
+test("content script reports only persisted pagehide and pageshow for active jobs", async () => {
+  const { send, dispatchLifecycle, runtimeMessages, restore } = await loadContentScript(
+    "persisted_lifecycle",
+    "https://chatgpt.com/?_yoetz=run_lifecycle"
+  );
+  try {
+    const job = {
+      job_id: "job_lifecycle",
+      run_id: "run_lifecycle",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+    assert.equal((await send({ type: "yoetz_prepare_job", job })).ok, true);
+
+    dispatchLifecycle("pagehide", false);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(runtimeMessages.length, 0);
+
+    dispatchLifecycle("pagehide", true);
+    dispatchLifecycle("pageshow", true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(runtimeMessages.map((message) => message.event), ["pagehide", "pageshow"]);
+    assert.deepEqual(runtimeMessages[0].job_ids, ["job_lifecycle"]);
+    assert.deepEqual(runtimeMessages[1].job_ids, ["job_lifecycle"]);
+  } finally {
+    restore();
+  }
+});
+
 async function loadContentScript(label, href) {
   const originalChrome = globalThis.chrome;
   const originalWindow = globalThis.window;
@@ -811,6 +840,8 @@ async function loadContentScript(label, href) {
   const originalLocation = globalThis.location;
   const location = locationState(href);
   let listener = null;
+  const lifecycleListeners = new Map();
+  const runtimeMessages = [];
   const hooks = {
     ensureFreshChatCalls: [],
     ensureConversationLoadedCalls: [],
@@ -824,7 +855,11 @@ async function loadContentScript(label, href) {
     waitManualHandoffInputs: []
   };
   globalThis.__contentScriptTestHooks = hooks;
-  globalThis.window = { name: "", location };
+  globalThis.window = {
+    name: "",
+    location,
+    addEventListener: (type, callback) => lifecycleListeners.set(type, callback)
+  };
   globalThis.document = { title: "ChatGPT", defaultView: globalThis.window };
   globalThis.location = location;
   const helperUrl = `data:text/javascript,${encodeURIComponent(helperModule)}#${label}`;
@@ -832,6 +867,10 @@ async function loadContentScript(label, href) {
     runtime: {
       getURL: () => helperUrl,
       getManifest: () => ({ version: "test" }),
+      sendMessage: async (message) => {
+        runtimeMessages.push(message);
+        return { ok: true };
+      },
       onMessage: {
         addListener: (fn) => {
           listener = fn;
@@ -846,6 +885,8 @@ async function loadContentScript(label, href) {
   return {
     hooks,
     location,
+    runtimeMessages,
+    dispatchLifecycle: (type, persisted) => lifecycleListeners.get(type)?.({ persisted }),
     send: (message) => new Promise((resolve) => listener(message, {}, resolve)),
     restore: () => {
       globalThis.chrome = originalChrome;

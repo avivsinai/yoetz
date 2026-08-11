@@ -78,6 +78,14 @@ const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
 );
 const WAITING_RESPONSE_PROGRESS_INTERVAL_MS = Math.max(50, Number(globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS ?? 60000) || 60000);
+const CONTENT_SCRIPT_RECONNECT_ATTEMPTS = Math.max(
+  1,
+  Number(globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS ?? 40) || 40
+);
+const CONTENT_SCRIPT_RECONNECT_DELAY_MS = Math.max(
+  0,
+  Number(globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS ?? 500) || 500
+);
 const BACKEND_API_FETCH_COOLDOWN_MS = Math.max(
   0,
   Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS))
@@ -119,6 +127,8 @@ const ATTACHMENT_TRACE_PENDING_LEGS = new Set([
 
 const jobs = new Map();
 const terminalJobIds = new Map();
+const terminalFailureJobIds = new Set();
+const contentScriptRecoveries = new Map();
 const chunks = new ChunkAssembler();
 let nativePort = null;
 let extensionIdentityPromise = null;
@@ -142,8 +152,76 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ ok: true });
     return true;
   }
+  if (message?.type === "yoetz_content_lifecycle") {
+    handleContentLifecycle(message, sender)
+      .then((payload) => sendResponse({ ok: true, payload }))
+      .catch((error) => sendResponse({ ok: false, error: String(error?.message ?? error) }));
+    return true;
+  }
   return false;
 });
+
+async function handleContentLifecycle(message, sender) {
+  if (message.persisted !== true || !["pagehide", "pageshow"].includes(message.event)) {
+    throw new Error("invalid persisted content lifecycle event");
+  }
+  const tabId = sender?.tab?.id;
+  if (!Number.isInteger(tabId)) {
+    throw new Error("content lifecycle event is missing its sender tab");
+  }
+  const requestedIds = new Set(Array.isArray(message.job_ids) ? message.job_ids : []);
+  const ownedJobs = Array.from(jobs.values()).filter((job) => (
+    requestedIds.has(job.job_id)
+    && job.tab_id === tabId
+    && !TERMINAL_STATUSES.has(job.status)
+  ));
+  if (message.event === "pagehide") {
+    for (const job of ownedJobs) {
+      job.content_script_suspended_at = Date.now();
+      job.updated_at = Date.now();
+      await persistJob(job);
+      postNative(progress(job, "content_script_suspended", {
+        tab_id: tabId,
+        persisted: true,
+        message: "owned background tab entered bfcache; waiting for a persisted pageshow rebind"
+      }));
+    }
+    return { event: message.event, classified: ownedJobs.length };
+  }
+
+  let rebound = 0;
+  for (const job of ownedJobs) {
+    if (job.status !== "waiting_response") {
+      continue;
+    }
+    if (!job.content_script_suspended_at && !contentScriptRecoveries.has(job.job_id)) {
+      continue;
+    }
+    try {
+      await recoverContentScriptJob(job, new Error("owned tab restored from bfcache"), {
+        source: "pageshow",
+        restoredFromBfcache: true
+      });
+      rebound += 1;
+    } catch (error) {
+      const inspectCommand = inspectCommandForJob(job);
+      await failJob(
+        job,
+        "content_script_reconnect_failed",
+        `${adapterForJob(job).displayName} background tab returned from bfcache, but Yoetz could not reconnect its content script. The prompt was already submitted and the owned tab is left open. Inspect it before rerunning with: ${inspectCommand}. Do not rerun automatically.`,
+        {
+          phase: "wait_response",
+          side_effect_started: true,
+          send_committed: true,
+          persisted: true,
+          reconnect_reason: String(error?.message ?? error),
+          inspect_command: inspectCommand
+        }
+      );
+    }
+  }
+  return { event: message.event, classified: ownedJobs.length, rebound };
+}
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === HEARTBEAT_ALARM) {
@@ -242,7 +320,24 @@ async function handleNativeMessage(message) {
     }
   } catch (error) {
     const job = message?.job_id ? jobs.get(message.job_id) : null;
-    if (job) {
+    const recovery = job ? contentScriptRecoveries.get(job.job_id) : null;
+    if (recovery) {
+      try {
+        await recovery;
+      } catch {
+        return;
+      }
+      if (
+        jobs.has(job.job_id)
+        && !TERMINAL_STATUSES.has(job.status)
+        && job.status === "waiting_response"
+        && !job.cancelled
+      ) {
+        await continueWaitingResponseJob(job);
+      }
+      return;
+    }
+    if (job && !TERMINAL_STATUSES.has(job.status)) {
       const code = error?.code ?? "extension_error";
       const detail = errorContextForJob(job, error);
       await failJob(
@@ -251,7 +346,7 @@ async function handleNativeMessage(message) {
         jobErrorMessage(job, error, code, detail),
         detail
       );
-    } else {
+    } else if (!job && !terminalFailureJobIds.has(message?.job_id)) {
       postNative(errorEnvelope(message, "extension_error", String(error?.message ?? error), {
         request_id: message?.request_id
       }));
@@ -673,6 +768,23 @@ async function resumeWaitingResponseJob(job) {
       url: rebound?.url ?? null,
       title: rebound?.title ?? null
     }));
+  } catch (error) {
+    if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
+      return;
+    }
+    await failJob(
+      job,
+      error?.code ?? "extension_error",
+      String(error?.message ?? error),
+      errorContextForJob(job, error)
+    );
+    return;
+  }
+  await continueWaitingResponseJob(job);
+}
+
+async function continueWaitingResponseJob(job) {
+  try {
     const extraction = await waitForResponse(job);
     assertJobConnectionCurrent(job);
     if (job.cancelled || !extraction) return;
@@ -1543,12 +1655,12 @@ async function createJobTab(url, adapter) {
 }
 
 async function waitForContentScript(tabId, adapter) {
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  for (let attempt = 0; attempt < CONTENT_SCRIPT_RECONNECT_ATTEMPTS; attempt += 1) {
     try {
       await sendToTab(tabId, { type: "yoetz_probe", recipe: adapter.recipe });
       return;
     } catch {
-      await sleep(500);
+      await sleep(CONTENT_SCRIPT_RECONNECT_DELAY_MS);
     }
   }
   throw new Error(`Yoetz content script did not become ready in ${adapter.displayName} tab ${tabId}`);
@@ -1644,11 +1756,17 @@ async function waitForResponse(job) {
   let reportedAwaitingFinalAffordance = false;
   const timeoutMs = responseWaitTimeoutMs(job);
   while (Date.now() - startedAt <= timeoutMs) {
+    if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
+      return null;
+    }
     assertJobConnectionCurrent(job);
     if (job.cancelled) {
       return null;
     }
     const extraction = await extractResponseForJob(job);
+    if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
+      return null;
+    }
     assertJobConnectionCurrent(job);
     if (reconcileJobConversationCurrent(job, extraction)) {
       await persistJob(job);
@@ -2261,18 +2379,43 @@ function normalizeBackendApiExtraction(backendExtraction, domExtraction, convers
   };
 }
 
-async function recoverContentScriptJob(job, error) {
+async function recoverContentScriptJob(job, error, options = {}) {
+  const existing = contentScriptRecoveries.get(job.job_id);
+  if (existing) {
+    return existing;
+  }
+  const recovery = recoverContentScriptJobOnce(job, error, options);
+  contentScriptRecoveries.set(job.job_id, recovery);
+  try {
+    return await recovery;
+  } finally {
+    // Keep the settled recovery discoverable through the next task so an
+    // in-flight command unwinding from the same disconnect can transfer its
+    // response-polling ownership instead of racing the map deletion.
+    await sleep(0);
+    if (contentScriptRecoveries.get(job.job_id) === recovery) {
+      contentScriptRecoveries.delete(job.job_id);
+    }
+  }
+}
+
+async function recoverContentScriptJobOnce(job, error, options = {}) {
   job.content_script_recovery_attempted = true;
+  job.content_script_suspended_at = null;
   job.updated_at = Date.now();
   await persistJob(job);
   postNative(progress(job, "content_script_recovering", {
-    reason: String(error?.message ?? error)
+    reason: String(error?.message ?? error),
+    source: options.source ?? "command_error",
+    restored_from_bfcache: Boolean(options.restoredFromBfcache)
   }));
   await waitForContentScript(job.tab_id, adapterForJob(job));
   const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
   postNative(progress(job, "content_script_recovered", {
     url: rebound?.url ?? null,
-    title: rebound?.title ?? null
+    title: rebound?.title ?? null,
+    source: options.source ?? "command_error",
+    restored_from_bfcache: Boolean(options.restoredFromBfcache)
   }));
 }
 
@@ -2491,11 +2634,14 @@ function commandError(code, message, detail = {}) {
   return error;
 }
 
-function rememberTerminalJob(jobId) {
+function rememberTerminalJob(jobId, suppressLateErrors = false) {
   if (!jobId) {
     return;
   }
   terminalJobIds.set(jobId, Date.now() + JOB_TTL_MS);
+  if (suppressLateErrors) {
+    terminalFailureJobIds.add(jobId);
+  }
   cleanupTerminalJobIds();
 }
 
@@ -2504,11 +2650,15 @@ function cleanupTerminalJobIds() {
   for (const [jobId, expiresAt] of terminalJobIds.entries()) {
     if (expiresAt <= now) {
       terminalJobIds.delete(jobId);
+      terminalFailureJobIds.delete(jobId);
     }
   }
 }
 
 async function failJob(job, code, message, detail = {}) {
+  if (job && TERMINAL_STATUSES.has(job.status)) {
+    return;
+  }
   const { terminal_status: terminalStatus, ...payloadDetail } = detail;
   if (job?.tab_id) {
     // "kept" means Yoetz did not close the tab on this failure path. It does
@@ -2524,7 +2674,7 @@ async function failJob(job, code, message, detail = {}) {
   const delivered = postNative(errorEnvelope(job, code, message, payloadDetail));
   if (job) {
     if (delivered) {
-      rememberTerminalJob(job.job_id);
+      rememberTerminalJob(job.job_id, true);
       jobs.delete(job.job_id);
     } else {
       await recordTerminalDeliveryLost(job, payloadDetail.phase ?? phaseForStatus(job.status) ?? "upload");
