@@ -479,6 +479,8 @@ function modelSelectionFailureDiagnostics(selection) {
   for (const key of [
     "failure_reason",
     "picker_shape",
+    "surface_trust",
+    "surface_descendants",
     "effort_control",
     "effort_move_method",
     "family_status",

@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   upload or send, and fail terminally with an actionable inspect command when
   the content script cannot reconnect after the prompt was submitted.
 
+- ChatGPT native-extension model selection now handles Advanced pickers whose
+  opacity animation is starved in a background recipe tab by structurally
+  trusting only the open surface named by the pill's `aria-controls`, while
+  retaining full ARIA verification and detailed picker visibility diagnostics.
+
 ## [0.5.49] - 2026-08-07
 ### Fixed
 
