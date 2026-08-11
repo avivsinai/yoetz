@@ -3250,6 +3250,7 @@ version = "0.5.49"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
+ "fs2",
  "hex",
  "ignore",
  "mime_guess",

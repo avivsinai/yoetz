@@ -873,6 +873,20 @@ fn retention_prunes_excess_sessions_on_startup() {
     // lexically smaller id, so it loses under both orderings deterministically.
     fs::create_dir_all(sessions.join("20200101_000000_aaaaaa")).unwrap();
     fs::create_dir_all(sessions.join("20990101_000000_bbbbbb")).unwrap();
+    fs::write(
+        sessions
+            .join("20200101_000000_aaaaaa")
+            .join(yoetz_core::session::SESSION_LEASE_FILENAME),
+        "",
+    )
+    .unwrap();
+    fs::write(
+        sessions
+            .join("20990101_000000_bbbbbb")
+            .join(yoetz_core::session::SESSION_LEASE_FILENAME),
+        "",
+    )
+    .unwrap();
     let config_path = session_test_config(&dir, "[sessions]\nmax_count = 1\n");
 
     ask_dry_run(&state, &config_path)

@@ -122,4 +122,8 @@ pub struct BundleResult {
 pub struct SessionInfo {
     pub id: String,
     pub path: PathBuf,
+    /// Held for the lifetime of a session writer so retention cannot remove
+    /// the directory while artifacts are still being produced.
+    #[serde(skip)]
+    pub(crate) _lease: Option<std::sync::Arc<crate::session::SessionLease>>,
 }

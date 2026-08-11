@@ -28,6 +28,7 @@ hex = "0.4"
 base64 = "0.23"
 mime_guess = "2.0"
 dotenvy = "0.15"
+fs2 = "0.4"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

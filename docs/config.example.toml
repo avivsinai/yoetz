@@ -32,8 +32,11 @@ families = ["openai", "anthropic", "google", "x-ai", "z-ai", "meta-llama", "deep
 # config profiles); repo-local ./yoetz.toml cannot set these.
 [sessions]
 # Skip writing ~/.yoetz/sessions/<id>/ for `yoetz ask` (same as --no-session).
+# JSON artifact fields then use session_dir = "" and response_json = null.
 # no_session = true
 # Prune session dirs older than N days on startup.
 # max_age_days = 30
-# Keep at most N newest session dirs on startup.
+# Keep at most N newest completed session dirs on startup. Active writers are
+# always preserved; max_count = 0 removes every completed session. Legacy dirs
+# without a lease file receive a five-minute grace period before adoption.
 # max_count = 200
