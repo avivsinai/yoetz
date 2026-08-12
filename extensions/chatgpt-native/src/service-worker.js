@@ -77,6 +77,7 @@ const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   1024,
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
 );
+const MAX_PERSISTED_TERMINAL_ENVELOPE_BYTES = 1024 * 1024;
 const WAITING_RESPONSE_PROGRESS_INTERVAL_MS = Math.max(50, Number(globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS ?? 60000) || 60000);
 const CONTENT_SCRIPT_RECONNECT_ATTEMPTS = Math.max(
   1,
@@ -86,6 +87,7 @@ const CONTENT_SCRIPT_RECONNECT_DELAY_MS = Math.max(
   0,
   Number(globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS ?? 500) || 500
 );
+const MAX_CONTENT_SCRIPT_RECOVERY_INCIDENTS = 5;
 const BACKEND_API_FETCH_COOLDOWN_MS = Math.max(
   0,
   Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS))
@@ -127,7 +129,6 @@ const ATTACHMENT_TRACE_PENDING_LEGS = new Set([
 
 const jobs = new Map();
 const terminalJobIds = new Map();
-const terminalFailureJobIds = new Set();
 const contentScriptRecoveries = new Map();
 const chunks = new ChunkAssembler();
 let nativePort = null;
@@ -346,7 +347,7 @@ async function handleNativeMessage(message) {
         jobErrorMessage(job, error, code, detail),
         detail
       );
-    } else if (!job && !terminalFailureJobIds.has(message?.job_id)) {
+    } else if (!job && !terminalJobIds.has(message?.job_id)) {
       postNative(errorEnvelope(message, "extension_error", String(error?.message ?? error), {
         request_id: message?.request_id
       }));
@@ -481,6 +482,10 @@ function modelSelectionFailureDiagnostics(selection) {
     "picker_shape",
     "surface_trust",
     "surface_descendants",
+    "max_effort_label",
+    "advanced_rows",
+    "checkbox_probe",
+    "family_menu_probe",
     "effort_control",
     "effort_move_method",
     "family_status",
@@ -678,7 +683,7 @@ async function completeJobWithExtraction(job, extraction) {
       conversation_id: conversationId,
       conversation_url: conversationUrlForJob(job, conversationId),
       model_strategy: job.model_strategy ?? "select",
-      model_used: job.model_used ?? null,
+      model_used: extraction.model_slug ?? job.model_used ?? null,
       model_selection_status: job.model_selection_status ?? "unavailable",
       warnings: completionWarnings({
         jobWarnings: job.warnings,
@@ -711,16 +716,23 @@ async function completeJobWithExtraction(job, extraction) {
     );
     return;
   }
+  if (TERMINAL_STATUSES.has(job.status)) {
+    return;
+  }
   job.status = "complete";
+  job.terminal_envelope = completeEnvelope;
+  job.terminal_delivered_at = null;
   job.updated_at = Date.now();
-  await persistJob(job);
+  rememberTerminalJob(job.job_id);
+  await persistTerminalJobBestEffort(job);
   const delivered = postNative(completeEnvelope);
   if (!delivered) {
     await recordTerminalDeliveryLost(job, "wait_response");
     return;
   }
+  job.terminal_delivered_at = Date.now();
+  await persistTerminalJobBestEffort(job);
   await closeOwnedTabOnComplete(job);
-  rememberTerminalJob(job.job_id);
   jobs.delete(job.job_id);
   chunks.discard(job.job_id);
 }
@@ -805,11 +817,23 @@ async function continueWaitingResponseJob(job) {
 async function cancelJob(message) {
   const job = requireJob(message.job_id);
   assertJobConnectionCurrent(job);
+  if (TERMINAL_STATUSES.has(job.status)) {
+    postNative(makeEnvelope("job_cancel", {
+      request_id: message.request_id,
+      job_id: job.job_id,
+      run_id: job.run_id,
+      workspace_id: job.workspace_id,
+      capability_token: job.capability_token,
+      payload: { cancelled: false, already_terminal: true }
+    }));
+    return;
+  }
   job.cancelled = true;
   job.status = "cancelled";
+  rememberTerminalJob(job.job_id);
   job.updated_at = Date.now();
   chunks.discard(job.job_id);
-  await persistJob(job);
+  await persistTerminalJobBestEffort(job);
 
   // Best-effort: tell the content script to click the site's stop control AND
   // wait for generation to actually go idle before we tear the tab down — a bare
@@ -866,7 +890,7 @@ async function cancelJob(message) {
     generation_idle: stopConfirmed,
     may_still_be_running: cancelMayStillBeRunning
   }));
-  postNative(makeEnvelope("job_cancel", {
+  const cancelEnvelope = makeEnvelope("job_cancel", {
     request_id: message.request_id,
     job_id: job.job_id,
     run_id: job.run_id,
@@ -880,13 +904,19 @@ async function cancelJob(message) {
       generation_idle: stopConfirmed,
       may_still_be_running: cancelMayStillBeRunning
     }
-  }));
-  // Mark terminal and evict from the in-memory map AFTER the cancel envelope is
-  // posted and the job's terminal status is persisted. Subsequent extract /
-  // send / chunk messages for this job_id will hit requireJob → "unknown job",
-  // and a fresh job_start with the same id will be rejected as duplicate_job
-  // until the terminalJobIds TTL expires.
-  rememberTerminalJob(job.job_id);
+  });
+  job.terminal_envelope = cancelEnvelope;
+  job.terminal_delivered_at = null;
+  await persistTerminalJobBestEffort(job);
+  if (postNative(cancelEnvelope)) {
+    job.terminal_delivered_at = Date.now();
+    await persistTerminalJobBestEffort(job);
+  } else {
+    await recordTerminalDeliveryLost(job, "cancel");
+  }
+  // Evict only after the terminal envelope is posted and its delivery state is
+  // persisted. Late work for this job id is suppressed by terminalJobIds, and a
+  // fresh job_start remains rejected until that entry expires.
   jobs.delete(job.job_id);
 }
 
@@ -1257,6 +1287,15 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
       continue;
     }
     if (TERMINAL_STATUSES.has(job.status)) {
+      rememberTerminalJob(job.job_id);
+      if (job.terminal_envelope && !job.terminal_delivered_at) {
+        if (postNative(job.terminal_envelope)) {
+          job.terminal_delivered_at = Date.now();
+          await persistTerminalJobBestEffort(job);
+        } else {
+          await recordTerminalDeliveryLost(job, job.delivery_lost_phase ?? phaseForStatus(job.status) ?? "upload");
+        }
+      }
       continue;
     }
     if (jobs.has(job.job_id)) {
@@ -2238,7 +2277,10 @@ async function extractDomResponseForJob(job) {
   try {
     return await sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
   } catch (error) {
-    if (!isRecoverableContentScriptError(error) || job.content_script_recovery_attempted) {
+    if (
+      !isRecoverableContentScriptError(error)
+      || Number(job.content_script_recovery_incidents ?? 0) >= MAX_CONTENT_SCRIPT_RECOVERY_INCIDENTS
+    ) {
       throw error;
     }
     await recoverContentScriptJob(job, error);
@@ -2400,7 +2442,8 @@ async function recoverContentScriptJob(job, error, options = {}) {
 }
 
 async function recoverContentScriptJobOnce(job, error, options = {}) {
-  job.content_script_recovery_attempted = true;
+  job.content_script_recovery_incidents = Number(job.content_script_recovery_incidents ?? 0) + 1;
+  job.content_script_recovery_in_progress = true;
   job.content_script_suspended_at = null;
   job.updated_at = Date.now();
   await persistJob(job);
@@ -2411,6 +2454,9 @@ async function recoverContentScriptJobOnce(job, error, options = {}) {
   }));
   await waitForContentScript(job.tab_id, adapterForJob(job));
   const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
+  job.content_script_recovery_in_progress = false;
+  job.updated_at = Date.now();
+  await persistJob(job);
   postNative(progress(job, "content_script_recovered", {
     url: rebound?.url ?? null,
     title: rebound?.title ?? null,
@@ -2421,7 +2467,7 @@ async function recoverContentScriptJobOnce(job, error, options = {}) {
 
 function isRecoverableContentScriptError(error) {
   const message = String(error?.message ?? error);
-  return /Could not establish connection|Receiving end does not exist|Extension context invalidated|message port closed|is not active in this tab/i.test(message);
+  return /Could not establish connection|Receiving end does not exist|Extension context invalidated|message (?:port|channel)(?: is)? closed|A listener indicated an asynchronous response.*channel closed|is not active in this tab/i.test(message);
 }
 
 function isPostSendExtraction(job, extraction) {
@@ -2634,14 +2680,11 @@ function commandError(code, message, detail = {}) {
   return error;
 }
 
-function rememberTerminalJob(jobId, suppressLateErrors = false) {
+function rememberTerminalJob(jobId) {
   if (!jobId) {
     return;
   }
   terminalJobIds.set(jobId, Date.now() + JOB_TTL_MS);
-  if (suppressLateErrors) {
-    terminalFailureJobIds.add(jobId);
-  }
   cleanupTerminalJobIds();
 }
 
@@ -2650,7 +2693,6 @@ function cleanupTerminalJobIds() {
   for (const [jobId, expiresAt] of terminalJobIds.entries()) {
     if (expiresAt <= now) {
       terminalJobIds.delete(jobId);
-      terminalFailureJobIds.delete(jobId);
     }
   }
 }
@@ -2667,14 +2709,18 @@ async function failJob(job, code, message, detail = {}) {
   }
   if (job) {
     job.status = terminalStatus ?? "failed";
+    rememberTerminalJob(job.job_id);
     job.updated_at = Date.now();
     chunks.discard(job.job_id);
-    await persistJob(job);
+    job.terminal_envelope = errorEnvelope(job, code, message, payloadDetail);
+    job.terminal_delivered_at = null;
+    await persistTerminalJobBestEffort(job);
   }
-  const delivered = postNative(errorEnvelope(job, code, message, payloadDetail));
+  const delivered = postNative(job?.terminal_envelope ?? errorEnvelope(job, code, message, payloadDetail));
   if (job) {
     if (delivered) {
-      rememberTerminalJob(job.job_id, true);
+      job.terminal_delivered_at = Date.now();
+      await persistTerminalJobBestEffort(job);
       jobs.delete(job.job_id);
     } else {
       await recordTerminalDeliveryLost(job, payloadDetail.phase ?? phaseForStatus(job.status) ?? "upload");
@@ -2701,6 +2747,16 @@ async function persistJob(job) {
   });
 }
 
+async function persistTerminalJobBestEffort(job) {
+  try {
+    await persistJob(job);
+    return true;
+  } catch (error) {
+    console.warn(`could not persist terminal job ${job?.job_id ?? "unknown"}: ${String(error?.message ?? error)}`);
+    return false;
+  }
+}
+
 function jobsStorageKey(jobId) {
   return `${JOBS_KEY_PREFIX}${jobId}`;
 }
@@ -2715,6 +2771,13 @@ function jobsStorageKey(jobId) {
 // after a restart without bloating storage.
 function strippedJobForStorage(job) {
   const { last_response_progress_text: fullText, ...rest } = job;
+  if (
+    rest.terminal_envelope
+    && nativeEnvelopeByteLength(rest.terminal_envelope) > MAX_PERSISTED_TERMINAL_ENVELOPE_BYTES
+  ) {
+    delete rest.terminal_envelope;
+    rest.terminal_envelope_too_large = true;
+  }
   if (typeof fullText === "string" && fullText.length > 0) {
     rest.last_response_progress_length = fullText.length;
     rest.last_response_progress_tail = fullText.length > RESPONSE_TEXT_PERSIST_TAIL

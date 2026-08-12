@@ -255,15 +255,15 @@ pub fn build_set_window_name_js(run_id: &str) -> String {
 
 pub fn model_alias_map() -> BTreeMap<&'static str, &'static str> {
     BTreeMap::from([
-        ("gpt-5-6-sol-pro", "gpt-5-6-sol-pro"),
-        ("sol-pro", "gpt-5-6-sol-pro"),
+        ("gpt-5-6-sol-extra-high", "gpt-5-6-sol-extra-high"),
+        ("sol-extra-high", "gpt-5-6-sol-extra-high"),
     ])
 }
 
 pub fn model_candidate_map() -> BTreeMap<&'static str, Vec<&'static str>> {
     BTreeMap::from([
-        ("gpt-5-6-sol-pro", vec!["gpt-5-6-sol-pro"]),
-        ("sol-pro", vec!["gpt-5-6-sol-pro"]),
+        ("gpt-5-6-sol-extra-high", vec!["gpt-5-6-sol-extra-high"]),
+        ("sol-extra-high", vec!["gpt-5-6-sol-extra-high"]),
     ])
 }
 
@@ -323,7 +323,7 @@ pub fn select_reported_chatgpt_model(
     requested_model: &str,
 ) -> Option<String> {
     if is_current_model_selection(selection, requested_model)
-        || is_verified_sol_pro_selection(selection, requested_model)
+        || is_verified_sol_extra_high_selection(selection, requested_model)
     {
         return selection
             .get("modelUsed")
@@ -342,7 +342,7 @@ pub(crate) fn chatgpt_model_selection_status(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
     match status {
-        "selected" if is_verified_sol_pro_selection(selection, requested_model) => {
+        "selected" if is_verified_sol_extra_high_selection(selection, requested_model) => {
             ChatgptModelSelectionStatus::Selected
         }
         "selected" | "selection-mismatch" => ChatgptModelSelectionStatus::Mismatch,
@@ -372,13 +372,16 @@ fn is_current_model_selection(selection: &serde_json::Value, requested_model: &s
             == Some("skipped")
 }
 
-fn is_verified_sol_pro_selection(selection: &serde_json::Value, requested_model: &str) -> bool {
+fn is_verified_sol_extra_high_selection(
+    selection: &serde_json::Value,
+    requested_model: &str,
+) -> bool {
     if selection.get("status").and_then(serde_json::Value::as_str) != Some("selected")
-        || requested_model.trim() != crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL
+        || requested_model.trim() != crate::chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL
         || selection
             .get("requested")
             .and_then(serde_json::Value::as_str)
-            != Some(crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL)
+            != Some(crate::chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL)
         || selection
             .get("familyStatus")
             .and_then(serde_json::Value::as_str)
@@ -395,7 +398,7 @@ fn is_verified_sol_pro_selection(selection: &serde_json::Value, requested_model:
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default();
     canonical_chatgpt_model_slug(model_used).as_deref()
-        == Some(crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL)
+        == Some(crate::chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL)
 }
 
 pub fn model_selector_button_selector_json() -> String {
@@ -442,7 +445,7 @@ pub fn build_model_selection_function(
 async () => {{
   const requested = {requested_model};
   const strategy = {model_strategy};
-  const supported = "gpt-5-6-sol-pro";
+  const supported = "gpt-5-6-sol-extra-high";
   const MODEL_BUTTON_SELECTOR = {model_button_selector};
   const COMPOSER_SELECTOR = {composer_selector};
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
@@ -634,7 +637,7 @@ async () => {{
   }}
 
   function effortVerified(state) {{
-    return state?.effortItems?.some((item) => fold(textOf(item)) === "pro" && isChecked(item)) || false;
+    return state?.effortItems?.some((item) => fold(textOf(item)) === "extra high" && isChecked(item)) || false;
   }}
 
   function result(status, pill, state, families, warning = null) {{
@@ -642,7 +645,7 @@ async () => {{
     const effortIsVerified = effortVerified(state);
     const modelUsed = status === "current"
       ? (pill ? textOf(pill) : "")
-      : (familyIsVerified && effortIsVerified ? "GPT-5.6 Sol Pro" : null);
+      : (familyIsVerified && effortIsVerified ? "GPT-5.6 Sol Extra High" : null);
     return {{
       requested,
       status,
@@ -678,7 +681,7 @@ async () => {{
   }}
 
   if (requested !== supported) {{
-    return result("not-found", null, null, [], "this recipe supports only GPT-5.6 Sol + Pro intelligence");
+    return result("not-found", null, null, [], "this recipe supports only GPT-5.6 Sol + Extra High effort");
   }}
   const legacy = legacyPickerMarkers();
   if (legacy.length > 0) {{
@@ -722,25 +725,25 @@ async () => {{
   }}
 
   if (!effortVerified(state)) {{
-    const pro = state.effortItems.find((item) => fold(textOf(item)) === "pro") || null;
-    if (!pro) {{
+    const maxTier = state.effortItems.find((item) => fold(textOf(item)) === "extra high") || null;
+    if (!maxTier) {{
       await closeMenus(pill);
-      return result("not-found", pill, state, families, "Pro intelligence was not visible for GPT-5.6 Sol");
+      return result("not-found", pill, state, families, "Extra High effort was not visible for GPT-5.6 Sol");
     }}
-    realClick(pro);
+    realClick(maxTier);
     await wait(250);
     pill = await waitForPill();
-    if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting Pro intelligence");
+    if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting Extra High effort");
     menu = await openMain(pill);
     state = menu ? readState(menu) : null;
-    if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting Pro intelligence");
+    if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting Extra High effort");
   }}
 
   const familyIsVerified = familyVerified(state);
   const effortIsVerified = effortVerified(state);
   if (!familyIsVerified || !effortIsVerified) {{
     await closeMenus(pill);
-    return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol + Pro could not be verified in one picker pass");
+    return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol + Extra High could not be verified in one picker pass");
   }}
   if (!await closeMenus(pill)) {{
     return result("selection-mismatch", pill, state, families, "ChatGPT model picker remained open after verification");
@@ -1243,13 +1246,19 @@ mod tests {
     #[test]
     fn model_aliases_cover_shortcuts() {
         let aliases = model_alias_map();
-        assert_eq!(aliases.get("gpt-5-6-sol-pro"), Some(&"gpt-5-6-sol-pro"));
-        assert_eq!(aliases.get("sol-pro"), Some(&"gpt-5-6-sol-pro"));
+        assert_eq!(
+            aliases.get("gpt-5-6-sol-extra-high"),
+            Some(&"gpt-5-6-sol-extra-high")
+        );
+        assert_eq!(
+            aliases.get("sol-extra-high"),
+            Some(&"gpt-5-6-sol-extra-high")
+        );
         assert_eq!(aliases.get("gpt-5-4-pro"), None);
         let candidates = model_candidate_map();
         assert_eq!(
-            candidates.get("gpt-5-6-sol-pro"),
-            Some(&vec!["gpt-5-6-sol-pro"])
+            candidates.get("gpt-5-6-sol-extra-high"),
+            Some(&vec!["gpt-5-6-sol-extra-high"])
         );
         assert_eq!(candidates.get("gpt-5-4-pro"), None);
     }
@@ -1261,23 +1270,23 @@ mod tests {
         assert_eq!(canonical_chatgpt_model_slug("Pro"), None);
         assert_eq!(canonical_chatgpt_model_slug("Extended Pro"), None);
         assert_eq!(
-            canonical_chatgpt_model_slug("GPT-5.6 Sol Pro"),
-            Some("gpt-5-6-sol-pro".to_string())
+            canonical_chatgpt_model_slug("GPT-5.6 Sol Extra High"),
+            Some("gpt-5-6-sol-extra-high".to_string())
         );
     }
 
     #[test]
-    fn reported_chatgpt_model_requires_verified_sol_and_pro_proofs() {
+    fn reported_chatgpt_model_requires_verified_sol_and_extra_high_proofs() {
         let selection = serde_json::json!({
             "status": "selected",
-            "requested": "gpt-5-6-sol-pro",
-            "modelUsed": "GPT-5.6 Sol Pro",
+            "requested": "gpt-5-6-sol-extra-high",
+            "modelUsed": "GPT-5.6 Sol Extra High",
             "familyStatus": "verified",
             "effortStatus": "verified"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-pro"),
-            Some("GPT-5.6 Sol Pro".to_string())
+            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-extra-high"),
+            Some("GPT-5.6 Sol Extra High".to_string())
         );
     }
 
@@ -1285,12 +1294,12 @@ mod tests {
     fn reported_chatgpt_model_never_echoes_an_unverified_request() {
         let selection = serde_json::json!({
             "status": "selected",
-            "requested": "gpt-5-6-sol-pro",
+            "requested": "gpt-5-6-sol-extra-high",
             "modelUsed": "Pro Extended",
             "extendedStatus": "required"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-pro"),
+            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-extra-high"),
             None
         );
     }
@@ -1316,12 +1325,12 @@ mod tests {
             chatgpt_model_selection_status(
                 &serde_json::json!({
                     "status": "selected",
-                    "requested": "gpt-5-6-sol-pro",
-                    "modelUsed": "GPT-5.6 Sol Pro",
+                    "requested": "gpt-5-6-sol-extra-high",
+                    "modelUsed": "GPT-5.6 Sol Extra High",
                     "familyStatus": "verified",
                     "effortStatus": "verified"
                 }),
-                "gpt-5-6-sol-pro"
+                "gpt-5-6-sol-extra-high"
             ),
             ChatgptModelSelectionStatus::Selected
         );
@@ -1346,7 +1355,7 @@ mod tests {
                     "modelUsed": "Pro Extended",
                     "extendedStatus": "required"
                 }),
-                "gpt-5-6-sol-pro"
+                "gpt-5-6-sol-extra-high"
             ),
             ChatgptModelSelectionStatus::Mismatch
         );
@@ -1360,7 +1369,7 @@ mod tests {
         assert_eq!(
             chatgpt_model_selection_status(
                 &serde_json::json!({"status": "selection-mismatch"}),
-                "gpt-5-6-sol-pro"
+                "gpt-5-6-sol-extra-high"
             ),
             ChatgptModelSelectionStatus::Mismatch
         );
@@ -1390,10 +1399,10 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_function_requires_verified_sol_family_and_pro_effort() {
+    fn model_selection_function_requires_verified_sol_family_and_extra_high_effort() {
         let script =
-            build_model_selection_function("gpt-5-6-sol-pro", ChatgptModelStrategy::Select);
-        assert!(script.contains(r#"const requested = "gpt-5-6-sol-pro";"#));
+            build_model_selection_function("gpt-5-6-sol-extra-high", ChatgptModelStrategy::Select);
+        assert!(script.contains(r#"const requested = "gpt-5-6-sol-extra-high";"#));
         assert!(script.contains("classList.contains(\"__composer-pill\")"));
         assert!(script.contains(
             "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI"
@@ -1401,7 +1410,7 @@ mod tests {
         assert!(script.contains(r#"familyStatus: familyIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"effortStatus: effortIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"fold(textOf(item)) === "gpt-5.6 sol""#));
-        assert!(script.contains(r#"fold(textOf(item)) === "pro""#));
+        assert!(script.contains(r#"fold(textOf(item)) === "extra high""#));
         assert!(script.contains(r#"/^(?:gpt|o\d)\b/i.test(textOf(item))"#));
         assert!(script.contains("await openFamilyMenu"));
         assert!(script.contains("async function waitForPill()"));
@@ -1409,7 +1418,7 @@ mod tests {
         assert!(script
             .contains("ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol"));
         assert!(script.contains(
-            "ChatGPT composer model pill did not remount after selecting Pro intelligence"
+            "ChatGPT composer model pill did not remount after selecting Extra High effort"
         ));
         assert!(script.contains("return visibleMenus().length === 0;"));
         assert!(script.contains("if (!await closeMenus(pill))"));

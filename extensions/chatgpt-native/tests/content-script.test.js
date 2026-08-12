@@ -111,7 +111,7 @@ export async function uploadFile(_document, file, options) {
 
 export function configureModelState(_document, job) {
   hooks.configureModelCalls.push(job);
-  return { status: "selected", model_used: "GPT-5.6 Sol Pro", requested_model: "gpt-5-6-sol-pro", family_status: "verified", effort_status: "verified" };
+  return { status: "selected", model_used: "GPT-5.6 Sol Extra High", requested_model: "gpt-5-6-sol-extra-high", family_status: "verified", effort_status: "verified" };
 }
 
 export function sendAcceptanceBaseline() {
@@ -461,7 +461,7 @@ test("content script inspect labels model diagnostics as current chip state", as
   try {
     globalThis.window.name = "yoetz-chatgpt-native:run-inspect:job-inspect";
     hooks.modelSelectionDiagnostics = {
-      modelChip: "GPT-5.6 Sol Pro",
+      modelChip: "GPT-5.6 Sol Extra High",
       modelVerified: true
     };
 

@@ -334,7 +334,7 @@ async fn run_attached_recipe_inner(
         .await
         .context("mark yoetz-owned ChatGPT tab with window.name")?;
 
-    // Step 2: wait for the composer to mount, then verify GPT-5.6 Sol + Pro
+    // Step 2: wait for the composer to mount, then verify GPT-5.6 Sol + Extra High
     // before any upload/send side effects.
     wait_for_composer_ready(client, /* focus_composer */ true).await?;
     let model_selection = maybe_select_model(client, &ctx.model).await?;
@@ -758,7 +758,7 @@ async fn maybe_select_model(
             })
         }
         "selected" => Err(anyhow!(
-            "ChatGPT reported selected without verified GPT-5.6 Sol + Pro proof.{} {}",
+            "ChatGPT reported selected without verified GPT-5.6 Sol + Extra High proof.{} {}",
             format_model_selection_diagnostics(&selection),
             format_page_probe_summary(&selection)
         )),
@@ -2097,10 +2097,10 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_script_requires_verified_sol_pro_contract() {
+    fn model_selection_script_requires_verified_sol_extra_high_contract() {
         let explicit_script =
-            build_model_selection_script(crate::chatgpt_recipe::CHATGPT_SOL_PRO_MODEL);
-        assert!(explicit_script.contains(r#"const requested = "gpt-5-6-sol-pro";"#));
+            build_model_selection_script(crate::chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL);
+        assert!(explicit_script.contains(r#"const requested = "gpt-5-6-sol-extra-high";"#));
         assert!(explicit_script.contains("classList.contains(\"__composer-pill\")"));
         assert!(explicit_script.contains("familyStatus"));
         assert!(explicit_script.contains("effortStatus"));

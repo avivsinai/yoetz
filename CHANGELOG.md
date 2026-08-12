@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- OpenAI removed the Pro tier from the composer picker for this account class
+  on 2026-08-12. Live probes exhausted the effort maximum, Standard/Fast speed
+  toggle, and family menu (Sol, Terra, Luna, and legacy 5.5) without finding a
+  Pro control. The ChatGPT recipe now pins GPT-5.6 Sol with the maximum available
+  `Extra High` effort tier and still fails closed on every unverified leg. Drift
+  diagnostics recognize volatile tier grammar, probe and restore controls, and
+  report the available surfaces without weakening the exact target label.
+- Deep-review findings hardened native-extension completion delivery: repeated
+  content-script disconnects can recover per incident, Chrome's current
+  message-channel errors are reconnectable, terminal races emit exactly one
+  outcome, and bounded persisted terminal envelopes replay once after a native
+  reconnect without risking Chrome session-storage quota failures.
 
 ## [0.5.50] - 2026-08-11
 ### Added
