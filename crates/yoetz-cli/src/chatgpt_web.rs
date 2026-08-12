@@ -2,7 +2,6 @@
 
 use anyhow::{anyhow, Result};
 use rand::random;
-use std::collections::BTreeMap;
 use std::path::Path;
 use time::{format_description::FormatItem, macros::format_description, OffsetDateTime};
 
@@ -251,71 +250,6 @@ pub fn build_set_window_name_js(run_id: &str) -> String {
   return window.name;
 }}"#
     )
-}
-
-pub fn model_alias_map() -> BTreeMap<&'static str, &'static str> {
-    BTreeMap::from([
-        ("gpt-5-6-sol-extra-high", "gpt-5-6-sol-extra-high"),
-        ("sol-extra-high", "gpt-5-6-sol-extra-high"),
-    ])
-}
-
-pub fn model_candidate_map() -> BTreeMap<&'static str, Vec<&'static str>> {
-    BTreeMap::from([
-        ("gpt-5-6-sol-extra-high", vec!["gpt-5-6-sol-extra-high"]),
-        ("sol-extra-high", vec!["gpt-5-6-sol-extra-high"]),
-    ])
-}
-
-fn normalize_chatgpt_model_key(value: &str) -> Option<String> {
-    let mut normalized = String::new();
-    let mut last_was_separator = false;
-    for ch in value.trim().chars() {
-        if ch.is_ascii_alphanumeric() {
-            normalized.push(ch.to_ascii_lowercase());
-            last_was_separator = false;
-        } else if !normalized.is_empty() && !last_was_separator {
-            normalized.push('-');
-            last_was_separator = true;
-        }
-    }
-    let normalized = normalized.trim_matches('-').to_string();
-    if normalized.is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
-}
-
-fn is_low_signal_chatgpt_model_key(key: &str) -> bool {
-    matches!(
-        key,
-        "chatgpt"
-            | "chat-gpt"
-            | "openai"
-            | "configure"
-            | "model-selector"
-            | "selected-model"
-            | "dropdown-button"
-            | "pro"
-            | "extended-pro"
-            | "thinking"
-            | "instant"
-    )
-}
-
-pub fn canonical_chatgpt_model_slug(value: &str) -> Option<String> {
-    let normalized = normalize_chatgpt_model_key(value)?;
-    if let Some(candidates) = model_candidate_map().get(normalized.as_str()) {
-        return candidates.first().map(|value| (*value).to_string());
-    }
-    if let Some(alias) = model_alias_map().get(normalized.as_str()) {
-        return Some((*alias).to_string());
-    }
-    if is_low_signal_chatgpt_model_key(&normalized) {
-        return None;
-    }
-    Some(normalized)
 }
 
 pub fn select_reported_chatgpt_model(
@@ -1250,38 +1184,6 @@ mod tests {
         assert_eq!(stable_idle_threshold_ms(30_000), 90_000);
         assert_eq!(stable_idle_threshold_ms(60_000), 180_000);
         assert_eq!(stable_idle_threshold_ms(120_000), 360_000);
-    }
-
-    #[test]
-    fn model_aliases_cover_shortcuts() {
-        let aliases = model_alias_map();
-        assert_eq!(
-            aliases.get("gpt-5-6-sol-extra-high"),
-            Some(&"gpt-5-6-sol-extra-high")
-        );
-        assert_eq!(
-            aliases.get("sol-extra-high"),
-            Some(&"gpt-5-6-sol-extra-high")
-        );
-        assert_eq!(aliases.get("gpt-5-4-pro"), None);
-        let candidates = model_candidate_map();
-        assert_eq!(
-            candidates.get("gpt-5-6-sol-extra-high"),
-            Some(&vec!["gpt-5-6-sol-extra-high"])
-        );
-        assert_eq!(candidates.get("gpt-5-4-pro"), None);
-    }
-
-    #[test]
-    fn canonical_chatgpt_model_slug_rejects_generic_labels() {
-        assert_eq!(canonical_chatgpt_model_slug("ChatGPT"), None);
-        assert_eq!(canonical_chatgpt_model_slug("Configure..."), None);
-        assert_eq!(canonical_chatgpt_model_slug("Pro"), None);
-        assert_eq!(canonical_chatgpt_model_slug("Extended Pro"), None);
-        assert_eq!(
-            canonical_chatgpt_model_slug("GPT-5.6 Sol Extra High"),
-            Some("gpt-5-6-sol-extra-high".to_string())
-        );
     }
 
     #[test]
