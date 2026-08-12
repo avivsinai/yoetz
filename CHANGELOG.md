@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - OpenAI removed the Pro tier from the composer picker for this account class
   on 2026-08-12. Live probes exhausted the effort maximum, Standard/Fast speed
   toggle, and family menu (Sol, Terra, Luna, and legacy 5.5) without finding a
-  Pro control. The ChatGPT recipe now pins GPT-5.6 Sol with the maximum available
-  `Extra High` effort tier and still fails closed on every unverified leg. Drift
+  Pro control. Enterprise and personal profiles use different picker variants,
+  so the ChatGPT recipe now pins GPT-5.6 Sol at the account's maximum tier
+  (`Pro` or `Extra High`) and fails closed on unknown top tiers or any unverified leg. Drift
   diagnostics recognize volatile tier grammar, probe and restore controls, and
   report the available surfaces without weakening the exact target label.
 - Deep-review findings hardened native-extension completion delivery: repeated

@@ -1995,7 +1995,7 @@ fn run_chatgpt_select_model(
             .to_string())
         }
         "selected" => Err(anyhow!(
-            "ChatGPT reported selected without verified GPT-5.6 Sol + Extra High proof"
+            "ChatGPT reported selected without verified GPT-5.6 Sol maximum-tier proof"
         )),
         "missing-selector" => Err(anyhow!(
             "ChatGPT model selector button not found. url={:?}, title={:?}",

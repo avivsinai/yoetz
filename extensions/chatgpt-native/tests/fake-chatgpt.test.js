@@ -2297,6 +2297,19 @@ test("GPT-5.6 Sol picker verifies already-correct state with one menu open", asy
   assert.equal(fixture.menusOpen(), 0);
 });
 
+test("GPT-5.6 Sol picker accepts an Enterprise Pro maximum and reports the actual tier", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.requested_model, "gpt-5-6-sol-extra-high");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(fixture.effortClicks(), 0);
+});
+
 test("GPT-5.6 Sol menu picker ignores transcript text that describes the Advanced picker", async () => {
   const fixture = makeSolPickerFixture({
     family: "GPT-5.6 Sol",
@@ -2366,6 +2379,21 @@ test("GPT-5.6 Sol Advanced picker moves the scoped effort slider with End", asyn
   assert.equal(result.pill_text, "Extra High");
 });
 
+test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum", async () => {
+  const fixture = makeSolSliderFixture({
+    keyboardMode: "end",
+    levels: ["Instant", "Medium", "High", "Heavy", "Pro"]
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.requested_model, "gpt-5-6-sol-extra-high");
+  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
+  assert.equal(result.pill_text, "Pro");
+});
+
 test("GPT-5.6 Sol Advanced picker waits for an expanded Radix surface to finish animating", async () => {
   const fixture = makeSolSliderFixture({ keyboardMode: "end", animatedReveal: true });
 
@@ -2392,7 +2420,7 @@ test("GPT-5.6 Sol structurally trusts its controlled open picker in a frozen bac
   assert.deepEqual(fixture.keyAttempts(), ["End"]);
 });
 
-test("GPT-5.6 Sol fails closed when structural slider max is not Extra High", async () => {
+test("GPT-5.6 Sol fails closed when the structural slider maximum has an unknown label", async () => {
   const fixture = makeSolSliderFixture({
     keyboardMode: "end",
     animatedReveal: true,

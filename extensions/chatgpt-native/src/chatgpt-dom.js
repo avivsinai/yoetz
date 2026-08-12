@@ -5,7 +5,7 @@ const DEFAULT_WAIT_INTERVAL_MS = 250;
 const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
 const CHATGPT_SOL_EXTRA_HIGH_MODEL = "gpt-5-6-sol-extra-high";
 const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
-const CHATGPT_MAX_EFFORT_LABEL = "Extra High";
+const CHATGPT_MAX_EFFORT_LABELS = new Set(["pro", "extra high"]);
 const MANUAL_HANDOFF_SHELL_SELECTORS = Object.freeze([
   "nav",
   "aside",
@@ -587,23 +587,24 @@ async function selectSolMaxTierModel(root, options = {}) {
       state.effort_move_method = moved.method;
       if (!moved.ok) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to Extra High", "effort_slider_move_failed");
+        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to a verified maximum tier", "effort_slider_move_failed");
       }
     } else {
-      const maxOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === foldedModelText(CHATGPT_MAX_EFFORT_LABEL));
+      const maxOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === "extra high")
+        ?? state.effort_items.find((item) => foldedModelText(textOf(item)) === "pro");
       if (!maxOption) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "Extra High effort was not visible for GPT-5.6 Sol", "effort_control_not_found");
+        return selectionFailure(base, modelButton, state, availableFamilies, "Neither Pro nor Extra High was visible as the GPT-5.6 Sol maximum tier", "effort_control_not_found");
       }
       realClick(maxOption);
       await sleep(Number(options.actionSettleMs ?? 250));
       modelButton = await waitForModelButton(root, options);
       if (!modelButton) {
-        return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting Extra High effort", "effort_control_remount_failed");
+        return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting the maximum effort tier", "effort_control_remount_failed");
       }
       state = await openAndReadModelPicker(root, modelButton, options);
       if (!state) {
-        return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting Extra High effort", "model_picker_reopen_failed");
+        return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting the maximum effort tier", "model_picker_reopen_failed");
       }
     }
   }
@@ -612,19 +613,19 @@ async function selectSolMaxTierModel(root, options = {}) {
   const effortVerified = effortIsMaxTier(state);
   if (!familyVerified || !effortVerified) {
     await closeModelPicker(root, modelButton);
-    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol + Extra High could not be verified in one picker pass", "model_selection_verification_failed");
+    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol at a verified maximum tier (Pro or Extra High) could not be confirmed in one picker pass", "model_selection_verification_failed");
   }
   if (!await closeModelPicker(root, modelButton)) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
   }
   modelButton = await waitForModelButton(root, options);
   const pillText = modelControlLabel(modelButton);
-  if (state.shape === "slider" && !/\bextra\s+high\b/i.test(pillText)) {
-    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm Extra High after closing the slider picker", "effort_composer_pill_unverified");
-  }
   const verifiedEffortLabel = state.shape === "slider"
     ? sliderEffortSnapshot(state.effort_slider, state.surface)?.display_label
     : normalizeText(textOf(state.effort_items.find((item) => itemIsChecked(item))));
+  if (state.shape === "slider" && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel)) {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm the verified maximum tier after closing the slider picker", "effort_composer_pill_unverified");
+  }
 
   return {
     status: "selected",
@@ -999,9 +1000,15 @@ function familyMenuRadios(menu, structurallyTrusted = false) {
 function effortIsMaxTier(state) {
   if (state?.shape === "slider") {
     const snapshot = sliderEffortSnapshot(state.effort_slider, state.surface);
-    return Boolean(snapshot && snapshot.label === "extra high" && snapshot.now === snapshot.max);
+    return Boolean(snapshot && CHATGPT_MAX_EFFORT_LABELS.has(snapshot.label) && snapshot.now === snapshot.max);
   }
-  return state?.effort_items?.some((item) => foldedModelText(textOf(item)) === "extra high" && itemIsChecked(item)) ?? false;
+  return state?.effort_items?.some((item) => CHATGPT_MAX_EFFORT_LABELS.has(foldedModelText(textOf(item))) && itemIsChecked(item)) ?? false;
+}
+
+function pillConfirmsEffortLabel(pillText, effortLabel) {
+  const foldedPill = foldedModelText(pillText);
+  const foldedEffort = foldedModelText(effortLabel);
+  return foldedPill === foldedEffort || foldedPill.endsWith(` ${foldedEffort}`);
 }
 
 function sliderEffortSnapshot(slider, surface = null) {

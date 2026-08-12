@@ -1922,7 +1922,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
         }
         if model_selection_status != chatgpt_recipe::ChatgptModelSelectionStatus::Selected {
             return Err(anyhow!(
-                "ChatGPT did not provide verified GPT-5.6 Sol + Extra High selection proof: {}",
+                "ChatGPT did not provide verified GPT-5.6 Sol maximum-tier selection proof: {}",
                 model_selection
             ));
         }

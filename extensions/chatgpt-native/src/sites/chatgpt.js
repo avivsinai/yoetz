@@ -52,9 +52,9 @@ function isExpectedConversationIdAssignment(job, expectedConversationId, current
     && normalizeConversationId(current).ok;
 }
 
-function modelUsedLooksLikeSolExtraHigh(value) {
-  const folded = String(value ?? "").toLowerCase();
-  return /\bsol\b/.test(folded) && /\bextra\s+high\b/.test(folded);
+function modelUsedLooksLikeSolMaximum(value) {
+  const folded = String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  return folded === "gpt-5.6 sol pro" || folded === "gpt-5.6 sol extra high";
 }
 
 function isAcceptableModelSelection(selection) {
@@ -67,7 +67,7 @@ function isAcceptableModelSelection(selection) {
     && selection?.requested_model === CHATGPT_MODEL
     && selection?.family_status === "verified"
     && selection?.effort_status === "verified"
-    && modelUsedLooksLikeSolExtraHigh(selection?.model_used);
+    && modelUsedLooksLikeSolMaximum(selection?.model_used);
 }
 
 function normalizedResponseText(value) {

@@ -2651,7 +2651,7 @@ fn ensure_chatgpt_sol_extra_high_only_vars(recipe_vars: &BTreeMap<String, String
         return Ok(());
     }
     bail!(
-        "ChatGPT recipe supports only GPT-5.6 Sol + Extra High effort; remove unsupported var(s): {}",
+        "ChatGPT recipe supports only GPT-5.6 Sol at the account maximum tier (Pro or Extra High); remove unsupported var(s): {}",
         unsupported.join(", ")
     )
 }
@@ -8016,7 +8016,7 @@ mod tests {
 
         let err = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap_err();
         let message = format!("{err:#}");
-        assert!(message.contains("only GPT-5.6 Sol + Extra High effort"));
+        assert!(message.contains("only GPT-5.6 Sol at the account maximum tier"));
         assert!(message.contains("model"));
         assert!(message.contains("extended"));
     }
