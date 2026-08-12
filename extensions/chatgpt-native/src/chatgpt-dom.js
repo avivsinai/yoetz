@@ -3,9 +3,9 @@ export const OWNERSHIP_ATTR = "data-yoetz-chatgpt-native-job";
 const DEFAULT_WAIT_TIMEOUT_MS = 15000;
 const DEFAULT_WAIT_INTERVAL_MS = 250;
 const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
-const CHATGPT_SOL_PRO_MODEL = "gpt-5-6-sol-pro";
+const CHATGPT_SOL_EXTRA_HIGH_MODEL = "gpt-5-6-sol-extra-high";
 const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
-const CHATGPT_PRO_EFFORT_LABEL = "Pro";
+const CHATGPT_MAX_EFFORT_LABELS = new Set(["pro", "extra high"]);
 const MANUAL_HANDOFF_SHELL_SELECTORS = Object.freeze([
   "nav",
   "aside",
@@ -380,6 +380,10 @@ export async function configureModelState(root, job = {}) {
       picker_shape: null,
       surface_trust: null,
       surface_descendants: [],
+      max_effort_label: null,
+      advanced_rows: [],
+      checkbox_probe: null,
+      family_menu_probe: null,
       effort_control: null,
       effort_move_method: null,
       pill_text: pillText ?? "",
@@ -390,12 +394,12 @@ export async function configureModelState(root, job = {}) {
     };
   }
 
-  const selection = await selectSolProModel(root, modelSelectionOptionsForJob(job));
+  const selection = await selectSolMaxTierModel(root, modelSelectionOptionsForJob(job));
   const warnings = selection.warning ? [selection.warning] : [];
   return {
     status: selection.status,
     model_used: selection.model_used,
-    requested_model: CHATGPT_SOL_PRO_MODEL,
+    requested_model: CHATGPT_SOL_EXTRA_HIGH_MODEL,
     available_options: selection.available_options ?? [],
     available_families: selection.available_families ?? [],
     family_status: selection.family_status ?? "unverified",
@@ -404,6 +408,10 @@ export async function configureModelState(root, job = {}) {
     picker_shape: selection.picker_shape ?? null,
     surface_trust: selection.surface_trust ?? null,
     surface_descendants: selection.surface_descendants ?? [],
+    max_effort_label: selection.max_effort_label ?? null,
+    advanced_rows: selection.advanced_rows ?? [],
+    checkbox_probe: selection.checkbox_probe ?? null,
+    family_menu_probe: selection.family_menu_probe ?? null,
     effort_control: selection.effort_control ?? null,
     effort_move_method: selection.effort_move_method ?? null,
     pill_text: selection.pill_text ?? null,
@@ -493,7 +501,7 @@ function modelControlLabel(node) {
   ].filter(Boolean).join(" "));
 }
 
-async function selectSolProModel(root, options = {}) {
+async function selectSolMaxTierModel(root, options = {}) {
   const base = {
     status: "unavailable",
     model_used: null,
@@ -568,56 +576,60 @@ async function selectSolProModel(root, options = {}) {
     }
   }
 
-  if (!effortIsPro(state)) {
+  if (!effortIsMaxTier(state)) {
     if (state.shape === "slider") {
       if (!state.effort_slider) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider was not found in the Advanced picker", "effort_control_not_found");
       }
-      const moved = await moveEffortSliderToPro(root, state, options);
+      const moved = await moveEffortSliderToMaxTier(root, state, options);
       state = moved.state ?? state;
       state.effort_move_method = moved.method;
       if (!moved.ok) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to Pro", "effort_slider_move_failed");
+        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to a verified maximum tier", "effort_slider_move_failed");
       }
     } else {
-      const proOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === foldedModelText(CHATGPT_PRO_EFFORT_LABEL));
-      if (!proOption) {
+      const maxOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === "extra high")
+        ?? state.effort_items.find((item) => foldedModelText(textOf(item)) === "pro");
+      if (!maxOption) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "Pro intelligence was not visible for GPT-5.6 Sol", "effort_control_not_found");
+        return selectionFailure(base, modelButton, state, availableFamilies, "Neither Pro nor Extra High was visible as the GPT-5.6 Sol maximum tier", "effort_control_not_found");
       }
-      realClick(proOption);
+      realClick(maxOption);
       await sleep(Number(options.actionSettleMs ?? 250));
       modelButton = await waitForModelButton(root, options);
       if (!modelButton) {
-        return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting Pro intelligence", "effort_control_remount_failed");
+        return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting the maximum effort tier", "effort_control_remount_failed");
       }
       state = await openAndReadModelPicker(root, modelButton, options);
       if (!state) {
-        return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting Pro intelligence", "model_picker_reopen_failed");
+        return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting the maximum effort tier", "model_picker_reopen_failed");
       }
     }
   }
 
   const familyVerified = familyIsSol(state.family_label);
-  const effortVerified = effortIsPro(state);
+  const effortVerified = effortIsMaxTier(state);
   if (!familyVerified || !effortVerified) {
     await closeModelPicker(root, modelButton);
-    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol + Pro could not be verified in one picker pass", "model_selection_verification_failed");
+    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol at a verified maximum tier (Pro or Extra High) could not be confirmed in one picker pass", "model_selection_verification_failed");
   }
   if (!await closeModelPicker(root, modelButton)) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
   }
   modelButton = await waitForModelButton(root, options);
   const pillText = modelControlLabel(modelButton);
-  if (state.shape === "slider" && !/\bpro\b/i.test(pillText)) {
-    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm Pro after closing the slider picker", "effort_composer_pill_unverified");
+  const verifiedEffortLabel = state.shape === "slider"
+    ? sliderEffortSnapshot(state.effort_slider, state.surface)?.display_label
+    : normalizeText(textOf(state.effort_items.find((item) => itemIsChecked(item))));
+  if (state.shape === "slider" && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel)) {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm the verified maximum tier after closing the slider picker", "effort_composer_pill_unverified");
   }
 
   return {
     status: "selected",
-    model_used: `${CHATGPT_SOL_FAMILY_LABEL} ${CHATGPT_PRO_EFFORT_LABEL}`,
+    model_used: `${normalizeText(state.family_label)} ${verifiedEffortLabel}`,
     failure_reason: null,
     family_status: "verified",
     effort_status: "verified",
@@ -842,8 +854,7 @@ function structurallyOpenControlledSurfaceForTrigger(root, trigger) {
 
 function readStructurallyTrustedPickerState(surface) {
   const labels = menuRadioItems(surface, true).map((item) => foldedModelText(textOf(item)));
-  if (labels.includes("medium") && labels.includes("high")
-    && (labels.includes("pro") || labels.includes("pro extended"))) {
+  if (labels.includes("medium") && labels.includes("high") && labels.includes("extra high")) {
     return readMenuPickerState(surface, true);
   }
   const text = normalizeText(textOf(surface));
@@ -870,8 +881,7 @@ async function waitForFamilyMenu(root, mainMenu, trigger, options = {}) {
 function findMainModelMenu(root) {
   return visibleMenus(root).find((menu) => {
     const labels = menuRadioItems(menu).map((item) => foldedModelText(textOf(item)));
-    return labels.includes("medium") && labels.includes("high")
-      && (labels.includes("pro") || labels.includes("pro extended"));
+    return labels.includes("medium") && labels.includes("high") && labels.includes("extra high");
   }) ?? null;
 }
 
@@ -987,19 +997,25 @@ function familyMenuRadios(menu, structurallyTrusted = false) {
   return menuRadioItems(menu, structurallyTrusted).filter((item) => /^gpt\b|^o3$/i.test(normalizeText(textOf(item))));
 }
 
-function effortIsPro(state) {
+function effortIsMaxTier(state) {
   if (state?.shape === "slider") {
     const snapshot = sliderEffortSnapshot(state.effort_slider, state.surface);
-    return Boolean(snapshot && snapshot.label === "pro" && snapshot.now === snapshot.max);
+    return Boolean(snapshot && CHATGPT_MAX_EFFORT_LABELS.has(snapshot.label) && snapshot.now === snapshot.max);
   }
-  return state?.effort_items?.some((item) => foldedModelText(textOf(item)) === "pro" && itemIsChecked(item)) ?? false;
+  return state?.effort_items?.some((item) => CHATGPT_MAX_EFFORT_LABELS.has(foldedModelText(textOf(item))) && itemIsChecked(item)) ?? false;
+}
+
+function pillConfirmsEffortLabel(pillText, effortLabel) {
+  const foldedPill = foldedModelText(pillText);
+  const foldedEffort = foldedModelText(effortLabel);
+  return foldedPill === foldedEffort || foldedPill.endsWith(` ${foldedEffort}`);
 }
 
 function sliderEffortSnapshot(slider, surface = null) {
   if (!slider) return null;
   const valueText = normalizeText(slider.getAttribute?.("aria-valuetext") ?? "");
   const nearbyLabel = valueText || effortLabelNearSlider(slider, surface);
-  const match = nearbyLabel.match(/^(Instant|Medium|High|Extra High|Pro)\s*,?\s*(\d+)\s+of\s+(\d+)\s*[.!?]?\s*$/i);
+  const match = nearbyLabel.match(/^([A-Z][A-Za-z ]{1,24}),\s*(\d+)\s+of\s+(\d+)\s*\.?\s*$/);
   const now = Number(slider.getAttribute?.("aria-valuenow"));
   const min = Number(slider.getAttribute?.("aria-valuemin"));
   const max = Number(slider.getAttribute?.("aria-valuemax"));
@@ -1009,7 +1025,7 @@ function sliderEffortSnapshot(slider, surface = null) {
     || max <= min || now < min || now > max || Number(match[2]) !== ordinal || Number(match[3]) !== total) {
     return null;
   }
-  return { label: foldedModelText(match[1]), now, min, max, value_text: nearbyLabel };
+  return { label: foldedModelText(match[1]), display_label: match[1], now, min, max, value_text: nearbyLabel };
 }
 
 function effortLabelNearSlider(slider, surface) {
@@ -1017,7 +1033,7 @@ function effortLabelNearSlider(slider, surface) {
   for (let depth = 0; scope && depth < 8; depth += 1, scope = scope.parentElement) {
     const label = Array.from(scope.querySelectorAll?.("span, div") ?? [])
       .map((node) => normalizeText(textOf(node)))
-      .find((text) => /^(?:Instant|Medium|High|Extra High|Pro)\s*,?\s*\d+\s+of\s+\d+\s*[.!?]?$/i.test(text));
+      .find((text) => /^[A-Z][A-Za-z ]{1,24},\s*\d+\s+of\s+\d+\s*\.?$/.test(text));
     if (label) return label;
     if (scope === surface) break;
   }
@@ -1044,19 +1060,40 @@ function sliderEffortDiagnostics(slider, surface = null) {
   } : null;
 }
 
-async function moveEffortSliderToPro(root, initialState, options = {}) {
+async function moveEffortSliderToMaxTier(root, initialState, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   let state = initialState;
+  const originalSnapshot = sliderEffortSnapshot(initialState?.effort_slider, initialState?.surface);
   const attemptKey = async (key, method) => {
     if (state?.shape !== "slider" || !state.effort_slider) return null;
     pressActivationKey(state.effort_slider, key);
     await sleep(settleMs);
     state = findPickerState(root);
-    return effortIsPro(state) ? { ok: true, state, method } : null;
+    return effortIsMaxTier(state) ? { ok: true, state, method } : null;
   };
 
   let result = await attemptKey("End", "keyboard_end");
   if (result) return result;
+
+  const maxSnapshot = sliderEffortSnapshot(state?.effort_slider, state?.surface);
+  if (maxSnapshot && originalSnapshot && maxSnapshot.now === maxSnapshot.max) {
+    state.max_effort_label = maxSnapshot.display_label;
+    const restoreSteps = Math.max(0, maxSnapshot.now - originalSnapshot.now);
+    for (let step = 0; step < restoreSteps; step += 1) {
+      pressActivationKey(state.effort_slider, "ArrowLeft");
+      await sleep(settleMs);
+      state = findPickerState(root) ?? state;
+      state.max_effort_label = maxSnapshot.display_label;
+    }
+    const checkboxProbe = await probeProCheckbox(root, state, options);
+    state = checkboxProbe.state;
+    const familyProbe = await probeFamilyMenu(root, state, options);
+    state = familyProbe.state;
+    state.max_effort_label = maxSnapshot.display_label;
+    state.checkbox_probe = checkboxProbe.diagnostics;
+    state.family_menu_probe = familyProbe.diagnostics;
+    return { ok: false, state, method: familyProbe.diagnostics ? "family_menu_probe" : "keyboard_end_probe" };
+  }
 
   const snapshot = sliderEffortSnapshot(state?.effort_slider, state?.surface);
   const arrowAttempts = Math.min(10, Math.max(1, Math.ceil((snapshot?.max ?? 5) - (snapshot?.min ?? 1)) + 1));
@@ -1070,9 +1107,103 @@ async function moveEffortSliderToPro(root, initialState, options = {}) {
     clickSliderTrackMax(state.effort_slider);
     await sleep(settleMs);
     state = findPickerState(root);
-    if (effortIsPro(state)) return { ok: true, state, method: "pointer_max" };
+    if (effortIsMaxTier(state)) return { ok: true, state, method: "pointer_max" };
   }
   return { ok: false, state, method: null };
+}
+
+async function probeFamilyMenu(root, initialState, options = {}) {
+  if (!initialState?.family_trigger || !initialState?.surface) {
+    return { state: initialState, diagnostics: null };
+  }
+  const menu = await openFamilyPicker(root, initialState.surface, initialState.family_trigger, options);
+  if (!menu) return { state: initialState, diagnostics: null };
+  const structurallyTrusted = menu === structurallyOpenControlledSurfaceForTrigger(root, initialState.family_trigger);
+  const candidates = Array.from(menu.querySelectorAll?.("*") ?? [])
+    .filter((node) => ["menuitem", "menuitemradio"].includes(node.getAttribute?.("role")))
+    .slice(0, 20)
+    .map((node) => ({
+      role: node.getAttribute?.("role") ?? null,
+      label: normalizeText(textOf(node)),
+      checked: node.getAttribute?.("aria-checked") ?? null
+    }));
+  const radioLabels = familyMenuRadios(menu, structurallyTrusted)
+    .map((node) => normalizeText(textOf(node)))
+    .filter(Boolean)
+    .slice(0, 20);
+  pressActivationKey(initialState.family_trigger, "Escape");
+  await sleep(Number(options.actionSettleMs ?? 250));
+  const closed = !findFamilySubmenu(root, initialState.surface)
+    && !structurallyOpenControlledSurfaceForTrigger(root, initialState.family_trigger);
+  const state = findPickerState(root) ?? initialState;
+  return {
+    state,
+    diagnostics: {
+      family_options: candidates,
+      family_radio_labels: radioLabels,
+      close_verified: closed
+    }
+  };
+}
+
+async function probeProCheckbox(root, initialState, options = {}) {
+  const checkbox = Array.from(initialState?.surface?.querySelectorAll?.("*") ?? [])
+    .find((node) => node.getAttribute?.("role") === "menuitemcheckbox");
+  if (!checkbox || checkbox.getAttribute?.("aria-checked") !== "false") {
+    return { state: initialState, diagnostics: null };
+  }
+  const settleMs = Number(options.actionSettleMs ?? 250);
+  const before = checkboxProbeSnapshot(root, initialState, checkbox);
+  pressActivationKey(checkbox, " ");
+  await sleep(settleMs);
+  let state = findPickerState(root) ?? initialState;
+  const enabledCheckbox = Array.from(state.surface?.querySelectorAll?.("*") ?? [])
+    .find((node) => node.getAttribute?.("role") === "menuitemcheckbox");
+  const enabled = checkboxProbeSnapshot(root, state, enabledCheckbox);
+  if (enabledCheckbox) pressActivationKey(enabledCheckbox, " ");
+  await sleep(settleMs);
+  state = findPickerState(root) ?? state;
+  const restoredCheckbox = Array.from(state.surface?.querySelectorAll?.("*") ?? [])
+    .find((node) => node.getAttribute?.("role") === "menuitemcheckbox");
+  const restored = checkboxProbeSnapshot(root, state, restoredCheckbox);
+  return {
+    state,
+    diagnostics: {
+      before,
+      enabled,
+      restored,
+      restore_verified: restoredCheckbox?.getAttribute?.("aria-checked") === "false"
+    }
+  };
+}
+
+function checkboxProbeSnapshot(root, state, checkbox) {
+  const advanced = Array.from(state?.surface?.querySelectorAll?.("*") ?? [])
+    .find((node) => node.getAttribute?.("data-testid") === "composer-model-picker-slider-advanced-view");
+  const speedRowNode = Array.from(advanced?.querySelectorAll?.("*") ?? [])
+    .find((node) => node.getAttribute?.("role") === "menuitem" && /\bSpeed\b/i.test(textOf(node)));
+  const speedOptions = Array.from(speedRowNode?.querySelectorAll?.("*") ?? [])
+    .filter((node) => ["radio", "menuitemradio", "option"].includes(node.getAttribute?.("role")))
+    .map((node) => normalizeText(textOf(node)))
+    .filter(Boolean)
+    .slice(0, 12);
+  const effort = sliderEffortDiagnostics(state?.effort_slider, state?.surface);
+  return {
+    checked: checkbox?.getAttribute?.("aria-checked") ?? null,
+    pill_text: modelControlLabel(findModelButton(root)),
+    advanced_rows: advancedViewRows(state?.surface),
+    speed_options: speedOptions,
+    effort: effort ? {
+      label: effort.label,
+      value_now: effort.value_now,
+      value_min: effort.value_min,
+      value_max: effort.value_max,
+      aria_disabled: state.effort_slider?.getAttribute?.("aria-disabled") ?? null,
+      disabled: Boolean(state.effort_slider?.disabled),
+      aria_hidden: state.effort_slider?.getAttribute?.("aria-hidden") ?? null,
+      hidden: Boolean(state.effort_slider?.hidden)
+    } : null
+  };
 }
 
 function clickSliderTrackMax(slider) {
@@ -1113,12 +1244,16 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     ...base,
     failure_reason: failureReason,
     family_status: familyIsSol(state?.family_label) ? "verified" : "unverified",
-    effort_status: effortIsPro(state) ? "verified" : "unverified",
+    effort_status: effortIsMaxTier(state) ? "verified" : "unverified",
     picker_shape: state?.shape ?? null,
     surface_trust: state?.surface_trust ?? null,
     surface_descendants: state?.surface_trust === "aria_controls_structural"
       ? structuralSurfaceDescendants(state.surface)
       : [],
+    max_effort_label: state?.max_effort_label ?? null,
+    advanced_rows: advancedViewRows(state?.surface),
+    checkbox_probe: state?.checkbox_probe ?? null,
+    family_menu_probe: state?.family_menu_probe ?? null,
     effort_control: state?.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider, state.surface) : null,
     effort_move_method: state?.effort_move_method ?? null,
     pill_text: modelControlLabel(modelButton),
@@ -1128,6 +1263,26 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     effort_options: effortDiagnostics(state?.effort_items ?? []),
     warning
   };
+}
+
+function advancedViewRows(surface) {
+  const advanced = Array.from(surface?.querySelectorAll?.("*") ?? [])
+    .find((node) => node.getAttribute?.("data-testid") === "composer-model-picker-slider-advanced-view");
+  return Array.from(advanced?.querySelectorAll?.("*") ?? [])
+    .filter((row) => ["menuitem", "menuitemcheckbox"].includes(row.getAttribute?.("role")))
+    .slice(0, 20)
+    .map((row) => {
+      const parts = Array.from(row.querySelectorAll?.("span, div") ?? [])
+        .map((node) => normalizeText(textOf(node)))
+        .filter((text, index, all) => text && all.indexOf(text) === index)
+        .slice(0, 2);
+      return {
+        role: row.getAttribute?.("role") ?? null,
+        checked: row.getAttribute?.("aria-checked") ?? null,
+        label: parts[0] ?? normalizeText(textOf(row)),
+        value: parts[1] ?? null
+      };
+    });
 }
 
 function structuralSurfaceDescendants(surface) {
@@ -2707,11 +2862,11 @@ export function modelSelectionDiagnostics(root = document) {
   const controlledId = modelButton?.getAttribute?.("aria-controls") ?? null;
   const controlledNode = controlledId ? root.getElementById?.(controlledId) : null;
   return {
-    requested_model: CHATGPT_SOL_PRO_MODEL,
+    requested_model: CHATGPT_SOL_EXTRA_HIGH_MODEL,
     current_model_label: modelControlLabel(modelButton),
-    current_matches_requested: Boolean(familyIsSol(state?.family_label) && effortIsPro(state)),
+    current_matches_requested: Boolean(familyIsSol(state?.family_label) && effortIsMaxTier(state)),
     family_status: familyIsSol(state?.family_label) ? "verified" : "unverified",
-    effort_status: effortIsPro(state) ? "verified" : "unverified",
+    effort_status: effortIsMaxTier(state) ? "verified" : "unverified",
     family_label: state?.family_label ?? null,
     picker_shape: state?.shape ?? null,
     surface_trust: state?.surface_trust ?? null,

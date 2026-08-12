@@ -78,7 +78,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
             return {
               ok: true,
               payload: sentJobs.has(message.job.job_id) && releasableJobs.has(message.job.job_id)
-                ? { method: "assistant_dom_fallback", text: `answer ${message.job.job_id}`, is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0, conversation_id: `conv-${message.job.job_id}` }
+                ? { method: "assistant_dom_fallback", text: `answer ${message.job.job_id}`, is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0, conversation_id: `conv-${message.job.job_id}`, model_slug: "gpt-5-6-pro" }
                 : sentJobs.has(message.job.job_id)
                   ? { method: "assistant_dom_fallback", text: `partial ${message.job.job_id}`, is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0, conversation_id: `conv-${message.job.job_id}` }
                   : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
@@ -162,6 +162,10 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.conversation_url,
       "https://chatgpt.com/c/conv-job_a"
     );
+    assert.equal(
+      port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.model_used,
+      "gpt-5-6-pro"
+    );
     assert.equal(sentToTabs.filter((item) => item.message.type === "yoetz_upload_file").length, 2);
     for (const jobId of jobs) {
       const ownedTabIds = new Set(
@@ -173,7 +177,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     }
     assert.equal(
       sentToTabs.find((item) => item.message.type === "yoetz_configure_model" && item.message.job.job_id === "job_b")?.message.job.model,
-      "gpt-5-6-sol-pro"
+      "gpt-5-6-sol-extra-high"
     );
   } finally {
     globalThis.chrome = originalChrome;
@@ -1641,7 +1645,7 @@ test("service worker fails fast on metadata manual handoff detected while waitin
   }
 });
 
-test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async () => {
+test("service worker fails closed when GPT-5.6 Sol Extra High is unavailable", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
@@ -1664,7 +1668,7 @@ test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async ()
               payload: {
                 status: "unavailable",
                 model_used: "Default",
-                requested_model: "gpt-5-6-sol-pro",
+                requested_model: "gpt-5-6-sol-extra-high",
                 available_options: ["Default"],
                 failure_reason: "effort_slider_move_failed",
                 picker_shape: "slider",
@@ -1710,7 +1714,7 @@ test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async ()
   }
 });
 
-test("service worker fails resumed jobs before upload when GPT-5.6 Sol Pro is unavailable", async () => {
+test("service worker fails resumed jobs before upload when GPT-5.6 Sol Extra High is unavailable", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const createdTabs = [];
@@ -1737,7 +1741,7 @@ test("service worker fails resumed jobs before upload when GPT-5.6 Sol Pro is un
               payload: {
                 status: "unavailable",
                 model_used: "Default",
-                requested_model: "gpt-5-6-sol-pro",
+                requested_model: "gpt-5-6-sol-extra-high",
                 family_status: "unverified",
                 effort_status: "unverified",
                 available_options: ["Default"],
@@ -1775,7 +1779,7 @@ test("service worker fails resumed jobs before upload when GPT-5.6 Sol Pro is un
   }
 });
 
-test("service worker fails closed when GPT-5.6 Sol Pro selection is only kept_current", async () => {
+test("service worker fails closed when GPT-5.6 Sol Extra High selection is only kept_current", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
@@ -1903,7 +1907,7 @@ test("service worker keeps the current-model warning to one final payload entry"
   }
 });
 
-test("service worker fails closed when GPT-5.6 Sol Pro selection fails", async () => {
+test("service worker fails closed when GPT-5.6 Sol Extra High selection fails", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -1942,7 +1946,7 @@ test("service worker fails closed when GPT-5.6 Sol Pro selection fails", async (
     await eventually(() => port.messages.some((message) => message.type === "job_error"));
     const error = port.messages.find((message) => message.type === "job_error");
     assert.equal(error.payload.code, "model_selection_failed");
-    assert.equal(error.payload.requested_model, "gpt-5-6-sol-pro");
+    assert.equal(error.payload.requested_model, "gpt-5-6-sol-extra-high");
     assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
   } finally {
     globalThis.chrome = originalChrome;
@@ -2001,7 +2005,7 @@ test("service worker rejects the legacy extended_status selection proof", async 
   }
 });
 
-test("service worker accepts only verified GPT-5.6 Sol Pro selection", async () => {
+test("service worker accepts only verified GPT-5.6 Sol Extra High selection", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -2021,8 +2025,8 @@ test("service worker accepts only verified GPT-5.6 Sol Pro selection", async () 
               ok: true,
               payload: {
                 status: "selected",
-                model_used: "GPT-5.6 Sol Pro",
-                requested_model: "gpt-5-6-sol-pro",
+                model_used: "GPT-5.6 Sol Extra High",
+                requested_model: "gpt-5-6-sol-extra-high",
                 family_status: "verified",
                 effort_status: "verified"
               }
@@ -2756,7 +2760,7 @@ test("service worker classifies final affordance without scoped assistant text",
               payload: sent
                 ? {
                     method: "page_text_fallback",
-                    text: "Skip to content\nbundle.md\nFile\nReview the attached file and provide your analysis.\n\nI\n\nGPT-5.6 Sol Pro",
+                    text: "Skip to content\nbundle.md\nFile\nReview the attached file and provide your analysis.\n\nI\n\nGPT-5.6 Sol Extra High",
                     is_generating: false,
                     assistant_count: 1,
                     user_count: 1,
@@ -6232,7 +6236,7 @@ test("service worker idempotently rebinds a persisted bfcache restore without re
             return { ok: true, payload: { rebound: true, url: "https://chatgpt.com/", title: "ChatGPT" } };
           case "yoetz_extract_response":
             if (sent && bindCalls === 0) {
-              throw new Error("Could not establish connection. Receiving end does not exist.");
+              throw new Error("A listener indicated an asynchronous response by returning true, but the message channel closed before a response was received");
             }
             if (sent && !bfcacheRestoreStarted) {
               markInFlightExtractionStarted();
@@ -6287,7 +6291,7 @@ test("service worker idempotently rebinds a persisted bfcache restore without re
     bfcacheRestoreStarted = true;
     const restored = lifecycle("pageshow");
     await lifecycleBindStarted;
-    rejectInFlightExtraction(new Error("Could not establish connection. Receiving end does not exist."));
+    rejectInFlightExtraction(new Error("The message channel closed before a response was received."));
     releaseLifecycleBind();
     assert.equal((await restored).ok, true);
     // A duplicate restore observes the already rebound state without rebinding;
@@ -7129,6 +7133,55 @@ test("service worker preserves terminal_delivery_lost jobs on restore", async ()
   }
 });
 
+test("service worker replays an undelivered persisted terminal envelope once on reconnect", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const terminalEnvelope = envelope("job_complete", "job_terminal_replay", {
+    is_final: true,
+    response: "persisted answer"
+  });
+  await storage.set({
+    "jobs.job_terminal_replay": {
+      job_id: "job_terminal_replay",
+      run_id: "run_test",
+      workspace_id: "workspace_test",
+      capability_token: "cap_test",
+      status: "complete",
+      terminal_envelope: terminalEnvelope,
+      terminal_delivered_at: null,
+      started_at: Date.now(),
+      updated_at: Date.now()
+    },
+    "jobs.job_terminal_too_large": {
+      job_id: "job_terminal_too_large",
+      status: "complete",
+      terminal_envelope_too_large: true,
+      terminal_delivered_at: null,
+      started_at: Date.now(),
+      updated_at: Date.now()
+    }
+  });
+  globalThis.chrome = chromeStub({ port, storage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_replay=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_replay"
+    )));
+    const persisted = (await storage.get("jobs.job_terminal_replay"))["jobs.job_terminal_replay"];
+    assert.ok(persisted.terminal_delivered_at);
+    assert.equal(port.messages.some((message) => message.job_id === "job_terminal_too_large"), false);
+
+    port.messages.length = 0;
+    port.emit(envelope("reconnect", "reconnect_after_terminal"));
+    await eventually(() => port.messages.some((message) => message.type === "reconnect"));
+    assert.equal(port.messages.some((message) => message.job_id === "job_terminal_replay"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker cancelJob isolates one of two active ChatGPT jobs", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -7223,6 +7276,9 @@ test("service worker cancelJob isolates one of two active ChatGPT jobs", async (
     assert.equal(cancelEnvelope.payload.cancelled, true);
     assert.equal(cancelEnvelope.payload.stop_clicked, true);
     assert.equal(cancelEnvelope.payload.tab_disposition, "closed");
+    assert.equal(port.messages.filter((m) => (
+      m.job_id === "job_cancel_a" && ["job_cancel", "job_complete", "job_error"].includes(m.type)
+    )).length, 1);
     const cancelledProgress = port.messages.find((m) =>
       m.type === "job_progress"
       && m.job_id === "job_cancel_a"
@@ -7236,8 +7292,8 @@ test("service worker cancelJob isolates one of two active ChatGPT jobs", async (
     assert.equal(survivor.payload.response, "survivor complete");
     assert.notEqual(jobTabs.get("job_cancel_a"), jobTabs.get("job_survivor_b"));
 
-    // Subsequent extract_response for the cancelled job_id must surface
-    // "unknown job" — the in-memory map can no longer carry a cancelled entry.
+    // Late work unwinding after a terminal claim must not emit a second terminal
+    // envelope for the cancelled job.
     port.messages.length = 0;
     port.emit(envelope("job_file_chunk", "job_cancel_a", {
       sequence: 0,
@@ -7247,9 +7303,8 @@ test("service worker cancelJob isolates one of two active ChatGPT jobs", async (
       mime_type: "text/markdown",
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
-    await eventually(() => port.messages.some((m) => m.type === "job_error" && m.job_id === "job_cancel_a"));
-    const followupError = port.messages.find((m) => m.type === "job_error" && m.job_id === "job_cancel_a");
-    assert.match(String(followupError.payload.message ?? ""), /unknown job/);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assert.equal(port.messages.some((m) => m.job_id === "job_cancel_a"), false);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -7646,6 +7701,22 @@ test("service worker preserves legacy success behavior when the close gate is ab
   assert.equal(result.shard.tab_disposition, undefined);
 });
 
+test("service worker delivers a large terminal response live without persisting its envelope", async () => {
+  const responseText = "x".repeat(1024 * 1024 + 4096);
+  const result = await runSuccessfulCompletionCase({
+    jobId: "job_large_terminal_envelope",
+    responseText
+  });
+
+  assert.equal(
+    result.messages.find((message) => message.type === "job_complete")?.payload.response.length,
+    responseText.length
+  );
+  assert.equal(result.shard.status, "complete");
+  assert.equal(result.shard.terminal_envelope, undefined);
+  assert.equal(result.shard.terminal_envelope_too_large, true);
+});
+
 test("service worker keeps the tab when successful completion delivery is lost", async () => {
   const result = await runSuccessfulCompletionCase({
     jobId: "job_close_delivery_lost",
@@ -7917,7 +7988,8 @@ async function runSuccessfulCompletionCase({
   jobId,
   closeTabOnComplete,
   failCompleteDelivery = false,
-  removeError = null
+  removeError = null,
+  responseText = "done"
 }) {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -7973,7 +8045,7 @@ async function runSuccessfulCompletionCase({
               ok: true,
               payload: {
                 method: "backend_api",
-                text: "done",
+                text: responseText,
                 is_generating: false,
                 node_fresh: true,
                 node_id: `answer-${jobId}`,
@@ -7990,7 +8062,7 @@ async function runSuccessfulCompletionCase({
               payload: sent
                 ? {
                     method: "assistant_dom_fallback",
-                    text: "done",
+                    text: responseText,
                     is_generating: false,
                     assistant_count: 1,
                     user_count: 1,
@@ -8066,8 +8138,8 @@ async function runSuccessfulCompletionCase({
 function verifiedSolProSelection() {
   return {
     status: "selected",
-    model_used: "GPT-5.6 Sol Pro",
-    requested_model: "gpt-5-6-sol-pro",
+    model_used: "GPT-5.6 Sol Extra High",
+    requested_model: "gpt-5-6-sol-extra-high",
     family_status: "verified",
     effort_status: "verified"
   };

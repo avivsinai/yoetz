@@ -2225,21 +2225,21 @@ test("GPT-5.6 Sol picker rejects checked GPT-5.5 Pro Extended as stale", async (
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.requested_model, "gpt-5-6-sol-pro");
+  assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
+  assert.equal(result.requested_model, "gpt-5-6-sol-extra-high");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.familyClicks(), 1);
-  assert.equal(fixture.effortClicks(), 0, "family switch should preserve the Pro tier");
+  assert.equal(fixture.effortClicks(), 0, "family switch should preserve the Extra High tier");
 });
 
-test("GPT-5.6 Sol picker upgrades High effort to Pro and verifies both proofs", async () => {
+test("GPT-5.6 Sol picker upgrades High effort to Extra High and verifies both proofs", async () => {
   const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "High" });
 
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.familyClicks(), 0);
@@ -2248,7 +2248,7 @@ test("GPT-5.6 Sol picker upgrades High effort to Pro and verifies both proofs", 
   assert.equal(fixture.menusOpen(), 0, "verification must leave the picker closed");
 });
 
-test("GPT-5.6 Sol picker switches GPT-5.5 Instant to Sol Pro", async () => {
+test("GPT-5.6 Sol picker switches GPT-5.5 Instant to Sol Extra High", async () => {
   const fixture = makeSolPickerFixture({
     family: "GPT-5.5",
     effort: "Instant",
@@ -2258,7 +2258,7 @@ test("GPT-5.6 Sol picker switches GPT-5.5 Instant to Sol Pro", async () => {
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.familyClicks(), 1);
@@ -2273,7 +2273,7 @@ test("GPT-5.6 Sol picker recovers from the o3 family", async () => {
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.familyClicks(), 1);
@@ -2282,12 +2282,12 @@ test("GPT-5.6 Sol picker recovers from the o3 family", async () => {
 });
 
 test("GPT-5.6 Sol picker verifies already-correct state with one menu open", async () => {
-  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Extra High" });
 
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.deepEqual(result.available_families, []);
@@ -2295,6 +2295,19 @@ test("GPT-5.6 Sol picker verifies already-correct state with one menu open", asy
   assert.equal(fixture.familyClicks(), 0);
   assert.equal(fixture.effortClicks(), 0);
   assert.equal(fixture.menusOpen(), 0);
+});
+
+test("GPT-5.6 Sol picker accepts an Enterprise Pro maximum and reports the actual tier", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.requested_model, "gpt-5-6-sol-extra-high");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(fixture.effortClicks(), 0);
 });
 
 test("GPT-5.6 Sol menu picker ignores transcript text that describes the Advanced picker", async () => {
@@ -2359,10 +2372,25 @@ test("GPT-5.6 Sol Advanced picker moves the scoped effort slider with End", asyn
   assert.equal(result.status, "selected");
   assert.equal(result.picker_shape, "slider");
   assert.equal(result.effort_move_method, "keyboard_end");
-  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
+  assert.equal(result.effort_control.value_text, "Extra High, 5 of 5");
   assert.deepEqual(fixture.keyAttempts(), ["End"]);
   assert.equal(fixture.pointerAttempts(), 0);
   assert.equal(fixture.pickerOpen(), false);
+  assert.equal(result.pill_text, "Extra High");
+});
+
+test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum", async () => {
+  const fixture = makeSolSliderFixture({
+    keyboardMode: "end",
+    levels: ["Instant", "Medium", "High", "Heavy", "Pro"]
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.requested_model, "gpt-5-6-sol-extra-high");
+  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
   assert.equal(result.pill_text, "Pro");
 });
 
@@ -2377,7 +2405,7 @@ test("GPT-5.6 Sol Advanced picker waits for an expanded Radix surface to finish 
   assert.equal(result.status, "selected");
   assert.equal(result.picker_shape, "slider");
   assert.equal(result.effort_move_method, "keyboard_end");
-  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
+  assert.equal(result.effort_control.value_text, "Extra High, 5 of 5");
   assert.equal(fixture.pickerOpen(), false);
 });
 
@@ -2388,16 +2416,16 @@ test("GPT-5.6 Sol structurally trusts its controlled open picker in a frozen bac
 
   assert.equal(result.status, "selected");
   assert.equal(result.surface_trust, "aria_controls_structural");
-  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
+  assert.equal(result.effort_control.value_text, "Extra High, 5 of 5");
   assert.deepEqual(fixture.keyAttempts(), ["End"]);
 });
 
-test("GPT-5.6 Sol fails closed when structural slider max is labeled Extra High", async () => {
+test("GPT-5.6 Sol fails closed when the structural slider maximum has an unknown label", async () => {
   const fixture = makeSolSliderFixture({
     keyboardMode: "end",
     animatedReveal: true,
     backgroundFrozen: true,
-    maxLabelOverride: "Extra High",
+    maxLabelOverride: "Expert",
     transcriptEffortDecoy: "Pro, 5 of 5."
   });
 
@@ -2405,8 +2433,40 @@ test("GPT-5.6 Sol fails closed when structural slider max is labeled Extra High"
 
   assert.equal(result.status, "unavailable");
   assert.equal(result.failure_reason, "effort_slider_move_failed");
-  assert.equal(result.effort_control.value_now, 4);
-  assert.equal(result.effort_control.label, "extra high");
+  assert.equal(result.effort_control.value_now, 2);
+  assert.equal(result.max_effort_label, "Expert");
+  assert.deepEqual(fixture.keyAttempts(), ["End", "ArrowLeft", "ArrowLeft"]);
+});
+
+test("GPT-5.6 Sol recognizes volatile effort names, probes max, restores, and fails closed", async () => {
+  const fixture = makeSolSliderFixture({
+    keyboardMode: "end",
+    backgroundFrozen: true,
+    levels: ["Minimal", "Light", "Standard", "Heavy", "Expert"],
+    initialValue: 2,
+    includeSpeedRows: true
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_slider_move_failed");
+  assert.equal(result.max_effort_label, "Expert");
+  assert.equal(result.effort_control.label, "light");
+  assert.equal(result.effort_control.value_now, 1);
+  assert.deepEqual(fixture.keyAttempts(), ["End", "ArrowLeft", "ArrowLeft", "ArrowLeft"]);
+  assert.equal(result.effort_move_method, "family_menu_probe");
+  assert.equal(result.checkbox_probe.before.checked, "false");
+  assert.equal(result.checkbox_probe.enabled.checked, "true");
+  assert.equal(result.checkbox_probe.restored.checked, "false");
+  assert.equal(result.checkbox_probe.restore_verified, true);
+  assert.deepEqual(result.family_menu_probe.family_radio_labels, ["GPT-5.6 Sol", "GPT-5.6 Sol Pro", "GPT-5.5"]);
+  assert.equal(result.family_menu_probe.family_options.some((option) => option.label === "GPT-5.6 Sol" && option.checked === "true"), true);
+  assert.equal(result.family_menu_probe.family_options.some((option) => option.label === "GPT-5.6 Sol Pro" && option.checked === "false"), true);
+  assert.equal(result.family_menu_probe.close_verified, true);
+  assert.equal(fixture.familyMenuOpen(), false);
+  assert.equal(result.advanced_rows.some((row) => row.label === "Speed" && row.value === "Standard"), true);
+  assert.equal(result.advanced_rows.some((row) => row.role === "menuitemcheckbox" && row.checked === "false"), true);
 });
 
 test("GPT-5.6 Sol rejects an identical hidden picker without trigger ownership", async () => {
@@ -2445,7 +2505,7 @@ test("structural picker failures capture bounded failure-time descendant topolog
     animatedReveal: true,
     backgroundFrozen: true,
     keyboardMode: "end",
-    maxLabelOverride: "Extra High"
+    maxLabelOverride: "Expert"
   });
 
   const result = await configureModelState(fixture.doc, {});
@@ -2453,7 +2513,7 @@ test("structural picker failures capture bounded failure-time descendant topolog
   assert.equal(result.status, "unavailable");
   assert.equal(result.failure_reason, "effort_slider_move_failed");
   assert.equal(result.surface_trust, "aria_controls_structural");
-  assert.equal(result.surface_descendants.some((node) => node.role === "slider" && node.aria_valuenow === "4"), true);
+  assert.equal(result.surface_descendants.some((node) => node.role === "slider" && node.aria_valuenow === "2"), true);
   assert.equal(result.surface_descendants.some((node) => node.role === "menuitem" && node.aria_haspopup === "menu"), true);
 });
 
@@ -2492,7 +2552,7 @@ test("GPT-5.6 Sol Advanced picker accepts trailing punctuation in aria-valuetext
 
   assert.equal(result.status, "selected");
   assert.equal(result.effort_move_method, "keyboard_end");
-  assert.equal(result.effort_control.value_text, "Pro, 5 of 5.");
+  assert.equal(result.effort_control.value_text, "Extra High, 5 of 5.");
 });
 
 test("GPT-5.6 Sol Advanced picker falls through End to bounded ArrowRight steps", async () => {
@@ -2621,7 +2681,7 @@ function makeSolPickerFixture({
     familyMenu = null;
   };
   const updatePill = (remount = false) => {
-    const pillEffort = currentEffort === "Pro Extended" ? "Pro" : currentEffort;
+    const pillEffort = currentEffort === "Pro Extended" ? "Extra High" : currentEffort;
     const label = currentFamily === "GPT-5.6 Sol" ? pillEffort : `5.5\n${pillEffort}`;
     if (remount && remountPillOnSelection) {
       const previousPill = pill;
@@ -2652,8 +2712,8 @@ function makeSolPickerFixture({
           if (label === "GPT-5.6 Sol" || label === "GPT-5.5") {
             currentFamily = label;
             if (currentFamily === "GPT-5.6 Sol") {
-              currentEffort = currentEffort === "Pro Extended" ? "Pro" : currentEffort === "Instant" ? "Medium" : currentEffort;
-            } else if (currentEffort === "Pro") {
+              currentEffort = currentEffort === "Pro Extended" ? "Extra High" : currentEffort === "Instant" ? "Medium" : currentEffort;
+            } else if (currentEffort === "Extra High") {
               currentEffort = "Pro Extended";
             }
             familyClickCount += 1;
@@ -2734,11 +2794,13 @@ function makeSolSliderFixture({
   backgroundFrozen = false,
   disconnectedTrigger = false,
   maxLabelOverride = null,
+  levels = ["Instant", "Medium", "High", "Heavy", "Extra High"],
+  initialValue = 3,
+  includeSpeedRows = false,
   transcriptEffortDecoy = null,
   familyLabel = "GPT-5.6 Sol"
 } = {}) {
-  const levels = ["Instant", "Medium", "High", "Extra High", "Pro"];
-  let currentValue = 3;
+  let currentValue = initialValue;
   let panel = null;
   let effortSlider = null;
   let effortLabel = null;
@@ -2798,6 +2860,7 @@ function makeSolSliderFixture({
       }
       if (keyboardMode === "end" && event.key === "End") updateValue(5);
       if (keyboardMode === "arrows" && event.key === "ArrowRight") updateValue(currentValue + 1);
+      if (event.key === "ArrowLeft") updateValue(currentValue - 1);
     },
     onPointerDown: () => {
       pointerAttemptCount += 1;
@@ -2824,6 +2887,7 @@ function makeSolSliderFixture({
       family.setAttribute("data-state", "open");
       familyMenu = new FakeElement("div", { id: "family-picker", role: "menu", "data-state": "open", style: "opacity:0" });
       const oldFamily = new FakeElement("div", { role: "menuitemradio", "aria-checked": familyLabel === "GPT-5.5" ? "true" : "false" }, "GPT-5.5");
+      const proFamily = new FakeElement("div", { role: "menuitemradio", "aria-checked": "false" }, "GPT-5.6 Sol Pro");
       const solFamily = new FakeElement("div", {
         role: "menuitemradio",
         "aria-checked": familyLabel === "GPT-5.6 Sol" ? "true" : "false",
@@ -2839,11 +2903,20 @@ function makeSolSliderFixture({
           familyMenu = null;
         }
       }, "GPT-5.6 Sol");
-      familyMenu.append(oldFamily, solFamily);
+      familyMenu.append(solFamily, proFamily, oldFamily);
       body.append(familyMenu);
     };
     const family = backgroundFrozen
-      ? new FakeElement("div", { role: "menuitem", tabindex: "0", "aria-haspopup": "menu", "aria-expanded": "false", "aria-controls": "family-picker", "data-state": "closed", onPointerDown: openFamilyMenu }, `Model\n${familyLabel}`)
+      ? new FakeElement("div", { role: "menuitem", tabindex: "0", "aria-haspopup": "menu", "aria-expanded": "false", "aria-controls": "family-picker", "data-state": "closed", onPointerDown: openFamilyMenu, onKeyDown: (event) => {
+        if (event.key !== "Escape") return;
+        family.setAttribute("aria-expanded", "false");
+        family.setAttribute("data-state", "closed");
+        if (familyMenu) {
+          body.children = body.children.filter((child) => child !== familyMenu);
+          familyMenu.parentElement = null;
+          familyMenu = null;
+        }
+      } }, `Model\n${familyLabel}`)
         .append(new FakeElement("div", {}, "Model"), (familyValueNode = new FakeElement("div", {}, familyLabel)))
       : new FakeElement("button", { "aria-haspopup": "menu" }, "GPT-5.6 Sol");
     if (backgroundFrozen) {
@@ -2860,6 +2933,35 @@ function makeSolSliderFixture({
         simple.append(sliderControl, effortLabel);
       }
       advanced.append(new FakeElement("div", { role: "menuitem", tabindex: "0", "aria-expanded": "false" }, "Advanced"), family);
+      if (includeSpeedRows) {
+        const speedRow = new FakeElement("div", { role: "menuitem" }, "Speed Standard")
+          .append(new FakeElement("span", {}, "Speed"), new FakeElement("span", {}, "Standard"));
+        const tooltip = new FakeElement("div", { id: "pro-speed-tooltip", role: "tooltip" }, "Consumes usage limits faster");
+        let speedMenu = null;
+        const checkbox = new FakeElement("div", {
+          role: "menuitemcheckbox",
+          "aria-checked": "false",
+          "aria-describedby": "pro-speed-tooltip",
+          onKeyDown: (event) => {
+            if (event.key !== " ") return;
+            const enabled = checkbox.getAttribute("aria-checked") !== "true";
+            checkbox.setAttribute("aria-checked", String(enabled));
+            if (enabled) {
+              speedMenu = new FakeElement("div", { role: "menu" })
+                .append(
+                  new FakeElement("div", { role: "menuitemradio", "aria-checked": "true" }, "Standard"),
+                  new FakeElement("div", { role: "menuitemradio", "aria-checked": "false" }, "Extended")
+                );
+              speedRow.append(speedMenu);
+            } else if (speedMenu) {
+              speedRow.children = speedRow.children.filter((child) => child !== speedMenu);
+              speedMenu.parentElement = null;
+              speedMenu = null;
+            }
+          }
+        }, "Faster Smarter").append(new FakeElement("span", {}, "Faster"), new FakeElement("span", {}, "Smarter"));
+        advanced.append(speedRow, checkbox, tooltip);
+      }
       group.append(simple, advanced);
       panel.append(group);
     } else {
@@ -2911,7 +3013,8 @@ function makeSolSliderFixture({
     pointerAttempts: () => pointerAttemptCount,
     pickerOpen: () => Boolean(panel),
     panel: () => panel,
-    familyClicks: () => familyClickCount
+    familyClicks: () => familyClickCount,
+    familyMenuOpen: () => Boolean(familyMenu)
   };
 }
 

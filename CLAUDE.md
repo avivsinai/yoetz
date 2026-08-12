@@ -84,6 +84,12 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 
 ## Browser Architecture
 
+- The built-in ChatGPT recipe pins GPT-5.6 Sol at the account's verified maximum
+  effort tier: `Pro` for the known Enterprise picker or `Extra High` for the
+  validated personal picker observed on 2026-08-12. Selection remains
+  fail-closed on the family, one of those two exact labels, and numeric maximum
+  proofs; unknown top tiers are rejected. Speed stays at the user's default and
+  is never toggled by selection.
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
 - Extension-free by default. Preferred live-Chrome transport order:
