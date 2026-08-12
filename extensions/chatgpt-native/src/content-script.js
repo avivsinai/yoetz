@@ -227,7 +227,10 @@ async function sendPrompt(job, prompt) {
     side_effect_started: true,
     send_committed: false
   });
-  const clickOptions = { timeoutMs: Number(job.send_timeout_ms) || 120000 };
+  const clickOptions = {
+    timeoutMs: Number(job.send_timeout_ms) || 120000,
+    requiredStableTicks: 2
+  };
   const expectedConversationId = expectedConversationIdForJob(job);
   if (expectedConversationId) {
     clickOptions.expectedConversationId = expectedConversationId;

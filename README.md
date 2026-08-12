@@ -209,13 +209,16 @@ stale provider names or hand-written wrapper paths.
 ```bash
 yoetz bundle \
   -p "Review the browser transport design" \
+  --name browser-transport-review \
   -f "crates/yoetz-cli/src/browser*.rs" \
   -f recipes/chatgpt.yaml \
   --format json
 ```
 
 The JSON response points to session artifacts under `~/.yoetz/sessions/<id>/`,
-including `bundle.md`.
+including a descriptive Markdown file such as
+`browser-transport-review_20260812-193000Z.md`. If `--name` is omitted, Yoetz
+derives the name from the prompt.
 
 ### Multimodal Input
 
@@ -281,9 +284,9 @@ contract to claude.ai with exactly Fable 5 and Effort Max.
 
 ```bash
 yoetz browser check --format json
-yoetz browser recipe --recipe chatgpt --bundle ~/.yoetz/sessions/<id>/bundle.md --format json
+yoetz browser recipe --recipe chatgpt --bundle ~/.yoetz/sessions/<id>/<named-bundle>.md --format json
 yoetz browser check --claude --format json
-yoetz browser recipe --recipe claude --bundle ~/.yoetz/sessions/<id>/bundle.md --format json
+yoetz browser recipe --recipe claude --bundle ~/.yoetz/sessions/<id>/<named-bundle>.md --format json
 ```
 
 Both recipes support `chrome-devtools-mcp`, `dev-browser`, `agent-browser`, and
@@ -302,13 +305,13 @@ checking it:
 yoetz browser extension setup --chatgpt --open-chrome
 yoetz browser extension doctor --chatgpt
 yoetz browser extension status --chatgpt --format json
-yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle bundle.md --format json
+yoetz browser recipe --recipe chatgpt --transport chrome-extension-native --bundle <named-bundle>.md --format json
 
 yoetz browser extension setup --claude --open-chrome
 yoetz browser extension doctor --claude
 yoetz browser extension status --claude --format json
 yoetz browser extension canary --claude
-yoetz browser recipe --recipe claude --transport chrome-extension-native --bundle bundle.md --format json
+yoetz browser recipe --recipe claude --transport chrome-extension-native --bundle <named-bundle>.md --format json
 ```
 
 Load the managed `$YOETZ_DIR/chatgpt-native-extension` directory unpacked in
@@ -333,7 +336,7 @@ distinct background tabs through overlapping phases and that cancelling one
 does not affect the other. Both sites may run only against one frozen loaded
 artifact.
 Give each parallel recipe its own Yoetz bundle session directory; reusing one
-managed `bundle.md` fails with `session_busy` rather than overwriting that
+managed named Markdown bundle fails with `session_busy` rather than overwriting that
 session's `response.json` or `followup.json`.
 
 Upgrade the installed CLI before another lane runs extension auto-heal after a

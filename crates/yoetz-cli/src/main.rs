@@ -241,6 +241,10 @@ struct BundleArgs {
     #[arg(long)]
     prompt_file: Option<PathBuf>,
 
+    /// Descriptive bundle name. A UTC timestamp is appended automatically.
+    #[arg(long, value_name = "NAME")]
+    name: Option<String>,
+
     #[arg(long, short = 'f')]
     files: Vec<String>,
 
@@ -2693,7 +2697,7 @@ fn bundle_prompt_for_recipe(bundle_path: Option<&Path>) -> Result<Option<String>
     let Some(bundle_path) = bundle_path else {
         return Ok(None);
     };
-    if bundle_path.file_name().and_then(|name| name.to_str()) != Some("bundle.md") {
+    if !is_managed_bundle_markdown(bundle_path) {
         return Ok(None);
     }
     let Some(session_dir) = bundle_path.parent() else {
@@ -2711,6 +2715,13 @@ fn bundle_prompt_for_recipe(bundle_path: Option<&Path>) -> Result<Option<String>
         return Ok(None);
     }
     Ok(Some(bundle.prompt))
+}
+
+fn is_managed_bundle_markdown(bundle_path: &Path) -> bool {
+    bundle_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("md"))
 }
 
 fn prepare_native_thread_run_in(
@@ -3017,9 +3028,8 @@ fn attach_browser_recipe_artifacts(payload: &mut Value, bundle_path: Option<&Pat
 fn browser_recipe_artifact_paths(bundle_path: Option<&Path>) -> Option<ArtifactPaths> {
     let bundle_path = bundle_path?;
     let session_dir = bundle_path.parent()?;
-    let bundle_name = bundle_path.file_name()?.to_string_lossy();
     let sibling_bundle_json = session_dir.join("bundle.json");
-    if bundle_name != "bundle.md" || !sibling_bundle_json.exists() {
+    if !is_managed_bundle_markdown(bundle_path) || !sibling_bundle_json.exists() {
         return None;
     }
     Some(ArtifactPaths {
@@ -3047,18 +3057,18 @@ fn validate_thread_persistence_preflight_in(
     };
     let bundle_path = recipe_args.bundle.as_deref().ok_or_else(|| {
         anyhow!(
-            "thread `{thread_label}` requires a managed bundle session with bundle.md and bundle.json"
+                "thread `{thread_label}` requires a managed bundle session with a named .md file and bundle.json"
         )
     })?;
-    if bundle_path.file_name().and_then(|name| name.to_str()) != Some("bundle.md") {
-        bail!("thread `{thread_label}` bundle must be named bundle.md");
+    if !is_managed_bundle_markdown(bundle_path) {
+        bail!("thread `{thread_label}` bundle must be a Markdown file");
     }
     let session_dir = bundle_path
         .parent()
         .ok_or_else(|| anyhow!("thread `{thread_label}` bundle has no session directory"))?;
     let bundle_json = session_dir.join("bundle.json");
 
-    ensure_regular_file(bundle_path, "bundle.md", thread_label)?;
+    ensure_regular_file(bundle_path, "named bundle Markdown file", thread_label)?;
     ensure_regular_file(&bundle_json, "bundle.json", thread_label)?;
     let canonical_base = fs::canonicalize(sessions_base).with_context(|| {
         format!(
@@ -3171,7 +3181,7 @@ fn write_followup_session_metadata_with_lineage(
     let session_artifacts = browser_recipe_artifact_paths(recipe_args.bundle.as_deref())
         .ok_or_else(|| {
             anyhow!(
-                "followup metadata requires a managed bundle session with bundle.md and bundle.json"
+                "followup metadata requires a managed bundle session with a named .md file and bundle.json"
             )
         })?;
     let conversation_raw = final_conversation_identity(payload)
@@ -6984,7 +6994,9 @@ mod tests {
             &sessions_base,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("bundle.md must be a regular file"));
+        assert!(err
+            .to_string()
+            .contains("named bundle Markdown file must be a regular file"));
 
         let json_dir_session = sessions_base.join("json-dir");
         fs::create_dir_all(json_dir_session.join("bundle.json")).unwrap();
