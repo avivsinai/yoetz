@@ -1447,15 +1447,22 @@ export async function clickSend(root, options = {}) {
   const minTimeoutMs = Number(options.minTimeoutMs ?? DEFAULT_SEND_MIN_TIMEOUT_MS);
   const timeoutMs = Math.max(requestedTimeoutMs, minTimeoutMs);
   const intervalMs = Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS);
+  const requiredStableTicks = Math.max(1, Number(options.requiredStableTicks ?? 2));
   const startedAt = Date.now();
   let lastCandidate = null;
+  let enabledTicks = 0;
 
   while (Date.now() - startedAt < timeoutMs) {
     const button = findSendButtonControl(root, { requireEnabled: true });
     if (button) {
-      assertExpectedConversationBeforeSendClick(root, options.expectedConversationId);
-      button.click();
-      return true;
+      enabledTicks += 1;
+      if (enabledTicks >= requiredStableTicks) {
+        assertExpectedConversationBeforeSendClick(root, options.expectedConversationId);
+        button.click();
+        return true;
+      }
+    } else {
+      enabledTicks = 0;
     }
     lastCandidate = findSendButtonControl(root, { requireEnabled: false }) ?? lastCandidate;
     await sleep(intervalMs);
@@ -2277,22 +2284,11 @@ async function waitForUploadComplete(root, file, options = {}) {
     }
     const attached = hasAttachmentNamed(root, file.name, baselineAttachments);
     const pending = hasUploadPending(root);
-    // ChatGPT renders the attachment chip almost immediately (~0.4s), long
-    // before the file finishes uploading server-side (often 10-30s). Returning
-    // at chip-appearance races the prompt-type + send that follow this step:
-    // the send button is briefly clickable (enabled by the typed prompt text)
-    // before ChatGPT re-gates it on the in-flight upload, so the message is
-    // submitted text-only and the attachment is silently dropped. ChatGPT keeps
-    // the send button disabled while an attachment is uploading and only
-    // re-enables it once the upload commits. waitForUploadComplete runs before
-    // any prompt text is inserted (the composer is still empty), so an enabled
-    // send button here is a reliable "upload committed" signal that does not
-    // depend on ChatGPT's progress-spinner markup. Requiring the chip to be
-    // present (`attached`) also rules out the pre-upload window where the send
-    // button is still enabled because ChatGPT has not yet registered the file.
-    const committed = uploadCommitted(root);
-    lastState = `attached=${attached}, pending=${pending}, committed=${committed}, diagnostics=${sendReadinessDiagnostics(root)}`;
-    if (attached && !pending && committed) {
+    // The attachment chip is the only reliable pre-prompt signal. ChatGPT's
+    // current UI keeps Send disabled while the composer is empty, so using
+    // Send as an upload-commit signal deadlocks before insertPrompt runs.
+    lastState = `attached=${attached}, pending=${pending}, diagnostics=${sendReadinessDiagnostics(root)}`;
+    if (attached && !pending) {
       stableTicks += 1;
       if (stableTicks >= requiredStableTicks) {
         return true;
@@ -2303,21 +2299,6 @@ async function waitForUploadComplete(root, file, options = {}) {
     await sleep(intervalMs);
   }
   throw new Error(`ChatGPT file upload did not complete for ${file.name} (${lastState})`);
-}
-
-// Upload commit signal: ChatGPT disables the send control while an attachment
-// uploads and re-enables it once the upload commits. This is checked while the
-// composer is still empty (before insertPrompt), so an enabled send button means
-// the attachment is ready, not that a prompt is ready to send. When ChatGPT
-// exposes no send control at all (an unexpected or minimal DOM), this signal is
-// unavailable and we fall back to treating the attachment chip as sufficient
-// rather than blocking the upload step indefinitely.
-function uploadCommitted(root) {
-  const present = findSendButtonControl(root, { requireEnabled: false });
-  if (!present) {
-    return true;
-  }
-  return Boolean(findSendButtonControl(root, { requireEnabled: true }));
 }
 
 async function openAttachmentUi(root, options = {}) {

@@ -259,7 +259,7 @@ test("fake ChatGPT page supports prompt upload send and stable extraction", asyn
   }
 });
 
-test("uploadFile waits for the upload to commit before returning", async () => {
+test("uploadFile returns from the attachment stage and clickSend waits for readiness", async () => {
   const previousDataTransfer = globalThis.DataTransfer;
   const previousInputEvent = globalThis.InputEvent;
   globalThis.DataTransfer = FakeDataTransfer;
@@ -272,8 +272,9 @@ test("uploadFile waits for the upload to commit before returning", async () => {
   };
   try {
     const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
-    // ChatGPT renders the chip immediately but keeps the send button disabled
-    // until the upload commits server-side, then re-enables it. Model that race.
+    // ChatGPT renders the chip immediately but keeps Send disabled while the
+    // composer is empty. Model the current UI and let clickSend own the final
+    // readiness gate after insertPrompt has populated the composer.
     const send = new FakeElement("button", { "aria-label": "Send message" }, "Send");
     send.disabled = true;
     let committedAt = null;
@@ -295,14 +296,14 @@ test("uploadFile waits for the upload to commit before returning", async () => {
     await uploadFile(doc, file, { timeoutMs: 5000, intervalMs: 20, requiredStableTicks: 2 });
     const returnedAt = Date.now();
 
-    // The previous implementation returned at chip-appearance, while the send
-    // button was still disabled (upload in flight), which dropped the attachment
-    // on the subsequent send. The fix must not return until the upload commits.
-    assert.equal(send.disabled, false, "uploadFile returned before the upload committed");
+    assert.equal(send.disabled, true, "uploadFile should not use empty-composer Send as its completion signal");
     assert.ok(
-      committedAt !== null && returnedAt >= committedAt,
-      "uploadFile must wait for the send control to re-enable (upload committed)"
+      committedAt === null || returnedAt < committedAt,
+      "uploadFile should return before the delayed Send readiness transition"
     );
+    await clickSend(doc, { timeoutMs: 5000, intervalMs: 20, requiredStableTicks: 2, minTimeoutMs: 0 });
+    assert.equal(send.clicked, true, "clickSend should wait for Send to become enabled");
+    assert.ok(committedAt !== null, "the delayed upload readiness transition should occur");
     assert.equal(upload.files[0].name, "fixture.md");
   } finally {
     globalThis.DataTransfer = previousDataTransfer;
