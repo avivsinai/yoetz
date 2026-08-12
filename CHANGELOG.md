@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.51] - 2026-08-12
 ### Fixed
 
 - OpenAI removed the Pro tier from the composer picker for this account class
@@ -21,6 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   message-channel errors are reconnectable, terminal races emit exactly one
   outcome, and bounded persisted terminal envelopes replay once after a native
   reconnect without risking Chrome session-storage quota failures.
+
 
 ## [0.5.50] - 2026-08-11
 ### Added
