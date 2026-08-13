@@ -3,7 +3,7 @@
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -136,10 +136,147 @@ fn native_host_multiplexes_clients_and_isolates_disconnect_cancellation() {
     assert_eq!(cancel["payload"]["reason"], "local_client_disconnected");
 }
 
+#[test]
+fn native_host_deduplicates_terminals_and_capability_gates_acknowledgements() {
+    let mut host = NativeHost::start();
+    let token = wait_for_token(&host.token_path);
+
+    let legacy_bundle = write_bundle(host.temp.path(), "legacy.md", 4, b'l');
+    let legacy_client =
+        LocalClient::connect(&host.socket_path, "job_legacy", &legacy_bundle, &token);
+    host.output.take("job_start", "job_legacy");
+
+    let legacy_terminal = extension_frame(
+        "job_complete",
+        "job_legacy",
+        json!({"response": "legacy first wins"}),
+    );
+    host.send(legacy_terminal.clone());
+    assert_eq!(
+        legacy_client.take("job_complete")["payload"]["response"],
+        "legacy first wins"
+    );
+    host.output
+        .assert_absent("terminal_ack", "job_legacy", Duration::from_millis(500));
+
+    host.send(legacy_terminal);
+    legacy_client.assert_no_frame();
+    host.output
+        .assert_absent("terminal_ack", "job_legacy", Duration::from_millis(500));
+    host.stderr
+        .take_containing("dropped duplicate terminal envelope `job_complete` for job_legacy");
+
+    host.send(json!({
+        "protocol_version": 1,
+        "transport": "chrome-extension-native",
+        "request_id": "req_hello_unknown_capability",
+        "type": "hello",
+        "payload": {
+            "capabilities": ["unknown_future_capability"]
+        }
+    }));
+    let unknown_bundle = write_bundle(host.temp.path(), "unknown.md", 4, b'u');
+    let unknown_client =
+        LocalClient::connect(&host.socket_path, "job_unknown", &unknown_bundle, &token);
+    host.output.take("job_start", "job_unknown");
+    host.send(extension_frame(
+        "job_complete",
+        "job_unknown",
+        json!({"response": "unknown is not terminal_ack", "sequence": 3}),
+    ));
+    unknown_client.take("job_complete");
+    host.output
+        .assert_absent("terminal_ack", "job_unknown", Duration::from_millis(500));
+
+    host.send(json!({
+        "protocol_version": 1,
+        "transport": "chrome-extension-native",
+        "request_id": "req_hello_terminal_ack",
+        "type": "hello",
+        "payload": {
+            "capabilities": ["unknown_future_capability", "terminal_ack"]
+        }
+    }));
+
+    let unrouted_terminal = extension_frame(
+        "job_complete",
+        "job_unrouted",
+        json!({"response": "retain until routed", "sequence": 6}),
+    );
+    host.send(unrouted_terminal.clone());
+    host.output
+        .assert_absent("terminal_ack", "job_unrouted", Duration::from_millis(500));
+    let unrouted_bundle = write_bundle(host.temp.path(), "unrouted.md", 4, b'r');
+    let unrouted_client =
+        LocalClient::connect(&host.socket_path, "job_unrouted", &unrouted_bundle, &token);
+    host.output.take("job_start", "job_unrouted");
+    host.send(unrouted_terminal);
+    assert_eq!(
+        unrouted_client.take("job_complete")["payload"]["response"],
+        "retain until routed"
+    );
+    assert_eq!(
+        host.output.take("terminal_ack", "job_unrouted")["payload"]["sequence"],
+        6
+    );
+
+    let capable_bundle = write_bundle(host.temp.path(), "capable.md", 4, b'c');
+    let capable_client =
+        LocalClient::connect(&host.socket_path, "job_capable", &capable_bundle, &token);
+    host.output.take("job_start", "job_capable");
+
+    host.send(extension_frame(
+        "job_complete",
+        "job_capable",
+        json!({"response": "capable first wins", "sequence": 7}),
+    ));
+    assert_eq!(
+        capable_client.take("job_complete")["payload"]["response"],
+        "capable first wins"
+    );
+    assert_eq!(
+        host.output.take("terminal_ack", "job_capable")["payload"]["sequence"],
+        7
+    );
+
+    host.send(extension_frame(
+        "job_error",
+        "job_capable",
+        json!({"message": "must be dropped", "sequence": 8}),
+    ));
+    capable_client.assert_no_frame();
+    assert_eq!(
+        host.output.take("terminal_ack", "job_capable")["payload"]["sequence"],
+        8
+    );
+    host.stderr
+        .take_containing("dropped duplicate terminal envelope `job_error` for job_capable");
+
+    let default_bundle = write_bundle(host.temp.path(), "default.md", 4, b'd');
+    let default_client = LocalClient::connect(
+        &host.socket_path,
+        "job_default_sequence",
+        &default_bundle,
+        &token,
+    );
+    host.output.take("job_start", "job_default_sequence");
+    host.send(extension_frame(
+        "job_cancel",
+        "job_default_sequence",
+        json!({"reason": "legacy replay"}),
+    ));
+    default_client.take("job_cancel");
+    assert_eq!(
+        host.output.take("terminal_ack", "job_default_sequence")["payload"]["sequence"],
+        0
+    );
+}
+
 struct NativeHost {
     child: Child,
     stdin: ChildStdin,
     output: FrameInbox,
+    stderr: LineInbox,
     temp: TempDir,
     socket_path: PathBuf,
     token_path: PathBuf,
@@ -163,17 +300,20 @@ impl NativeHost {
             )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
         let output = FrameInbox::from_reader(stdout);
+        let stderr = LineInbox::from_reader(stderr);
         wait_for_path(&socket_path);
         Self {
             child,
             stdin,
             output,
+            stderr,
             temp,
             socket_path,
             token_path,
@@ -237,6 +377,24 @@ impl LocalClient {
         assert_eq!(frame["type"], kind, "client received an unexpected frame");
         frame
     }
+
+    fn assert_no_frame(&self) {
+        self.stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let result = try_read_frame(&mut &self.stream);
+        match result {
+            Ok(frame) => panic!("client received unexpected second terminal frame: {frame}"),
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::UnexpectedEof
+                ) => {}
+            Err(err) => panic!("unexpected client read error: {err}"),
+        }
+    }
 }
 
 struct FrameInbox {
@@ -279,6 +437,59 @@ impl FrameInbox {
                 return frame;
             }
             self.pending.push_back(frame);
+        }
+    }
+
+    fn assert_absent(&mut self, kind: &str, job_id: &str, duration: Duration) {
+        assert!(
+            !self
+                .pending
+                .iter()
+                .any(|frame| frame["type"] == kind && frame["job_id"] == job_id),
+            "found unexpected {kind} for {job_id}"
+        );
+        let deadline = Instant::now() + duration;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match self.receiver.recv_timeout(remaining) {
+                Ok(frame) if frame["type"] == kind && frame["job_id"] == job_id => {
+                    panic!("found unexpected {kind} for {job_id}: {frame}")
+                }
+                Ok(frame) => self.pending.push_back(frame),
+                Err(mpsc::RecvTimeoutError::Timeout) => return,
+                Err(err) => panic!("native host output closed while checking absence: {err}"),
+            }
+        }
+    }
+}
+
+struct LineInbox {
+    receiver: Receiver<String>,
+}
+
+impl LineInbox {
+    fn from_reader(reader: impl Read + Send + 'static) -> Self {
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(reader).lines().map_while(Result::ok) {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { receiver }
+    }
+
+    fn take_containing(&self, expected: &str) -> String {
+        let deadline = Instant::now() + FRAME_TIMEOUT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = self.receiver.recv_timeout(remaining).unwrap_or_else(|err| {
+                panic!("timed out waiting for stderr containing {expected:?}: {err}")
+            });
+            if line.contains(expected) {
+                return line;
+            }
         }
     }
 }
