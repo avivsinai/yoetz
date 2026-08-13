@@ -130,6 +130,7 @@ const ATTACHMENT_TRACE_PENDING_LEGS = new Set([
 const jobs = new Map();
 const terminalJobIds = new Map();
 const contentScriptRecoveries = new Map();
+const suspensionGates = new Map();
 const chunks = new ChunkAssembler();
 let nativePort = null;
 let extensionIdentityPromise = null;
@@ -195,10 +196,11 @@ async function handleContentLifecycle(message, sender) {
     if (job.status !== "waiting_response") {
       continue;
     }
-    if (!job.content_script_suspended_at && !contentScriptRecoveries.has(job.job_id)) {
+    if (!job.content_script_suspended_at && contentScriptRecoveries.get(job.job_id)?.settled !== "pending") {
       continue;
     }
     try {
+      openSuspensionGate(job);
       await recoverContentScriptJob(job, new Error("owned tab restored from bfcache"), {
         source: "pageshow",
         restoredFromBfcache: true
@@ -321,33 +323,11 @@ async function handleNativeMessage(message) {
     }
   } catch (error) {
     const job = message?.job_id ? jobs.get(message.job_id) : null;
-    const recovery = job ? contentScriptRecoveries.get(job.job_id) : null;
-    if (recovery) {
-      try {
-        await recovery;
-      } catch {
-        return;
-      }
-      if (
-        jobs.has(job.job_id)
-        && !TERMINAL_STATUSES.has(job.status)
-        && job.status === "waiting_response"
-        && !job.cancelled
-      ) {
-        await continueWaitingResponseJob(job);
-      }
+    if (job) {
+      await handlePollerError(job, error);
       return;
     }
-    if (job && !TERMINAL_STATUSES.has(job.status)) {
-      const code = error?.code ?? "extension_error";
-      const detail = errorContextForJob(job, error);
-      await failJob(
-        job,
-        code,
-        jobErrorMessage(job, error, code, detail),
-        detail
-      );
-    } else if (!job && !terminalJobIds.has(message?.job_id)) {
+    if (!terminalJobIds.has(message?.job_id)) {
       postNative(errorEnvelope(message, "extension_error", String(error?.message ?? error), {
         request_id: message?.request_id
       }));
@@ -720,6 +700,7 @@ async function completeJobWithExtraction(job, extraction) {
     return;
   }
   job.status = "complete";
+  forgetContentScriptRecovery(job.job_id);
   job.terminal_envelope = completeEnvelope;
   job.terminal_delivered_at = null;
   job.updated_at = Date.now();
@@ -773,45 +754,100 @@ async function resumeWaitingResponseJob(job) {
   try {
     const adapter = adapterForJob(job);
     await waitForSiteTab(job.tab_id, adapter);
-    await waitForContentScript(job.tab_id, adapter);
-    const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
-    postNative(progress(job, "content_script_recovered", {
-      restored: true,
-      url: rebound?.url ?? null,
-      title: rebound?.title ?? null
-    }));
-  } catch (error) {
-    if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
-      return;
+    if (job.content_script_suspended_at) {
+      await recoverContentScriptJob(job, new Error("owned tab is parked in bfcache after worker restore"), {
+        source: "worker_restore"
+      });
+    } else {
+      await waitForContentScript(job.tab_id, adapter);
+      const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
+      postNative(progress(job, "content_script_recovered", {
+        restored: true,
+        url: rebound?.url ?? null,
+        title: rebound?.title ?? null
+      }));
     }
-    await failJob(
-      job,
-      error?.code ?? "extension_error",
-      String(error?.message ?? error),
-      errorContextForJob(job, error)
-    );
+  } catch (error) {
+    await handlePollerError(job, error);
     return;
   }
   await continueWaitingResponseJob(job);
 }
 
 async function continueWaitingResponseJob(job) {
+  const lease = acquirePollerLease(job);
+  if (lease == null) {
+    return;
+  }
   try {
     const extraction = await waitForResponse(job);
+    if (!holdsPollerLease(job, lease)) {
+      return;
+    }
     assertJobConnectionCurrent(job);
     if (job.cancelled || !extraction) return;
     await completeJobWithExtraction(job, extraction);
   } catch (error) {
-    if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
+    if (!holdsPollerLease(job, lease)) {
       return;
     }
-    await failJob(
-      job,
-      error?.code ?? "extension_error",
-      String(error?.message ?? error),
-      errorContextForJob(job, error)
-    );
+    releasePollerLease(job, lease);
+    await handlePollerError(job, error);
+  } finally {
+    releasePollerLease(job, lease);
   }
+}
+
+function acquirePollerLease(job) {
+  if (job.poller_lease != null) {
+    return null;
+  }
+  const lease = Number(job.poller_lease_seq ?? 0) + 1;
+  job.poller_lease_seq = lease;
+  job.poller_lease = lease;
+  return lease;
+}
+
+function holdsPollerLease(job, lease) {
+  return job.poller_lease === lease;
+}
+
+function releasePollerLease(job, lease) {
+  if (job.poller_lease === lease) {
+    job.poller_lease = null;
+  }
+}
+
+function jobCanResumePolling(job) {
+  return Boolean(
+    job
+    && jobs.has(job.job_id)
+    && !TERMINAL_STATUSES.has(job.status)
+    && job.status === "waiting_response"
+    && !job.cancelled
+  );
+}
+
+async function handlePollerError(job, error) {
+  const recovery = contentScriptRecoveries.get(job.job_id);
+  if (recovery) {
+    try {
+      await recovery;
+    } catch {
+      return;
+    }
+    if (!jobCanResumePolling(job)) {
+      return;
+    }
+    await continueWaitingResponseJob(job);
+    return;
+  }
+  if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
+    return;
+  }
+  const code = error?.code ?? "extension_error";
+  const detail = errorContextForJob(job, error);
+  await failJob(job, code, jobErrorMessage(job, error, code, detail), detail);
 }
 
 async function cancelJob(message) {
@@ -830,6 +866,7 @@ async function cancelJob(message) {
   }
   job.cancelled = true;
   job.status = "cancelled";
+  forgetContentScriptRecovery(job.job_id);
   rememberTerminalJob(job.job_id);
   job.updated_at = Date.now();
   chunks.discard(job.job_id);
@@ -2275,7 +2312,9 @@ async function extractResponseForJob(job) {
 
 async function extractDomResponseForJob(job) {
   try {
-    return await sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
+    const extraction = await sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
+    forgetSettledSuccessfulRecovery(job.job_id);
+    return extraction;
   } catch (error) {
     if (
       !isRecoverableContentScriptError(error)
@@ -2423,25 +2462,62 @@ function normalizeBackendApiExtraction(backendExtraction, domExtraction, convers
 
 async function recoverContentScriptJob(job, error, options = {}) {
   const existing = contentScriptRecoveries.get(job.job_id);
-  if (existing) {
+  if (existing && existing.settled === "pending") {
     return existing;
   }
-  const recovery = recoverContentScriptJobOnce(job, error, options);
-  contentScriptRecoveries.set(job.job_id, recovery);
-  try {
-    return await recovery;
-  } finally {
-    // Keep the settled recovery discoverable through the next task so an
-    // in-flight command unwinding from the same disconnect can transfer its
-    // response-polling ownership instead of racing the map deletion.
-    await sleep(0);
-    if (contentScriptRecoveries.get(job.job_id) === recovery) {
-      contentScriptRecoveries.delete(job.job_id);
+  if (existing && existing.settled !== "fulfilled") {
+    return existing;
+  }
+  if (existing && existing.settled === "fulfilled" && !options.restoredFromBfcache) {
+    return existing;
+  }
+  return trackContentScriptRecovery(job.job_id, recoverContentScriptJobOnce(job, error, options));
+}
+
+function trackContentScriptRecovery(jobId, promise) {
+  const tracked = promise.then(
+    (value) => {
+      tracked.settled = "fulfilled";
+      return value;
+    },
+    (error) => {
+      tracked.settled = "rejected";
+      throw error;
     }
+  );
+  tracked.settled = "pending";
+  contentScriptRecoveries.set(jobId, tracked);
+  return tracked;
+}
+
+function forgetSettledSuccessfulRecovery(jobId) {
+  const recovery = contentScriptRecoveries.get(jobId);
+  if (recovery?.settled === "fulfilled") {
+    contentScriptRecoveries.delete(jobId);
+  }
+}
+
+function forgetContentScriptRecovery(jobId) {
+  if (!jobId) {
+    return;
+  }
+  contentScriptRecoveries.delete(jobId);
+  const gate = suspensionGates.get(jobId);
+  if (gate) {
+    gate.reject(commandError("extension_error", "job terminated while parked for pageshow", {
+      phase: "wait_response",
+      side_effect_started: true
+    }));
   }
 }
 
 async function recoverContentScriptJobOnce(job, error, options = {}) {
+  if (job.content_script_suspended_at && !options.restoredFromBfcache) {
+    await parkForPageshow(job);
+    if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status) || job.cancelled) {
+      return;
+    }
+  }
   job.content_script_recovery_incidents = Number(job.content_script_recovery_incidents ?? 0) + 1;
   job.content_script_recovery_in_progress = true;
   job.content_script_suspended_at = null;
@@ -2463,6 +2539,95 @@ async function recoverContentScriptJobOnce(job, error, options = {}) {
     source: options.source ?? "command_error",
     restored_from_bfcache: Boolean(options.restoredFromBfcache)
   }));
+}
+
+function remainingResponseDeadlineMs(job) {
+  const startedAt = Number(job.response_wait_started_at) || Date.now();
+  return Math.max(0, startedAt + responseWaitTimeoutMs(job) - Date.now());
+}
+
+function parkedDeadlineError(job) {
+  return commandError(
+    "response_timeout",
+    "owned tab stayed in bfcache past the response deadline",
+    {
+      phase: "wait_response",
+      side_effect_started: true,
+      inspect_command: inspectCommandForJob(job)
+    }
+  );
+}
+
+async function failParkedJobAtDeadline(job) {
+  if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
+    return;
+  }
+  const inspectCommand = inspectCommandForJob(job);
+  const adapter = adapterForJob(job);
+  await failJob(
+    job,
+    "response_timeout",
+    `${adapter.displayName} response wait expired while the owned tab stayed in bfcache with no persisted pageshow. The owned tab is left open; inspect it before rerunning with: ${inspectCommand}`,
+    {
+      phase: "wait_response",
+      side_effect_started: true,
+      completion_reason: "timeout",
+      send_committed: true,
+      inspect_command: inspectCommand
+    }
+  );
+}
+
+async function parkForPageshow(job) {
+  const remainingMs = remainingResponseDeadlineMs(job);
+  postNative(progress(job, "parked_for_pageshow", {
+    inspect_command: inspectCommandForJob(job),
+    remaining_ms: remainingMs,
+    tab_id: job.tab_id,
+    message: "owned background tab is in bfcache; parked until persisted pageshow or response deadline"
+  }));
+  if (remainingMs <= 0) {
+    await failParkedJobAtDeadline(job);
+    throw parkedDeadlineError(job);
+  }
+  await waitForSuspensionGate(job, remainingMs);
+}
+
+function waitForSuspensionGate(job, remainingMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const current = suspensionGates.get(job.job_id);
+      if (current?.timer === timer) {
+        suspensionGates.delete(job.job_id);
+      }
+      failParkedJobAtDeadline(job).then(
+        () => reject(parkedDeadlineError(job)),
+        reject
+      );
+    }, remainingMs);
+    suspensionGates.set(job.job_id, {
+      resolve: () => {
+        clearTimeout(timer);
+        suspensionGates.delete(job.job_id);
+        resolve();
+      },
+      reject: (error) => {
+        clearTimeout(timer);
+        suspensionGates.delete(job.job_id);
+        reject(error);
+      },
+      timer
+    });
+  });
+}
+
+function openSuspensionGate(job) {
+  const gate = suspensionGates.get(job.job_id);
+  if (!gate) {
+    return false;
+  }
+  gate.resolve();
+  return true;
 }
 
 function isRecoverableContentScriptError(error) {
@@ -2709,6 +2874,7 @@ async function failJob(job, code, message, detail = {}) {
   }
   if (job) {
     job.status = terminalStatus ?? "failed";
+    forgetContentScriptRecovery(job.job_id);
     rememberTerminalJob(job.job_id);
     job.updated_at = Date.now();
     chunks.discard(job.job_id);
@@ -2730,6 +2896,7 @@ async function failJob(job, code, message, detail = {}) {
 
 async function recordTerminalDeliveryLost(job, phase) {
   job.status = "terminal_delivery_lost";
+  forgetContentScriptRecovery(job.job_id);
   job.delivery_lost_phase = phase;
   job.updated_at = Date.now();
   await persistJob(job);
@@ -2768,9 +2935,16 @@ function jobsStorageKey(jobId) {
 // transition (or on failJob's error path) would chew through the 10MB session
 // quota and risk masking the real failure with a quota throw. We persist only a
 // bounded tail plus the length, which is enough to reconstruct progress context
-// after a restart without bloating storage.
+// after a restart without bloating storage. Poller leases are process-local
+// coordination and must never be durable: a restored shard that still carries
+// poller_lease would make acquirePollerLease return null and wedge the job.
 function strippedJobForStorage(job) {
-  const { last_response_progress_text: fullText, ...rest } = job;
+  const {
+    last_response_progress_text: fullText,
+    poller_lease: _pollerLease,
+    poller_lease_seq: _pollerLeaseSeq,
+    ...rest
+  } = job;
   if (
     rest.terminal_envelope
     && nativeEnvelopeByteLength(rest.terminal_envelope) > MAX_PERSISTED_TERMINAL_ENVELOPE_BYTES

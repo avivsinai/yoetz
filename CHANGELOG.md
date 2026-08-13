@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- Native-extension ChatGPT/Claude jobs now park on a per-job pageshow gate when
+  a submitted tab is in bfcache instead of burning the 20s content-script probe
+  loop, and both poller catch paths join in-flight or settled recovery under a
+  single poller lease so a restored waiter cannot failJob a live rebound.
 
 ## [0.5.51] - 2026-08-12
 ### Fixed
