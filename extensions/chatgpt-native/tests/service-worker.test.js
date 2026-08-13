@@ -101,6 +101,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     assert.equal(port.messages[0].payload.profile_id, "gaia-work");
     assert.match(port.messages[0].payload.extension_instance_id, /^ext_/);
     assert.deepEqual(port.messages[0].payload.recipes, ["chatgpt", "claude"]);
+    assert.deepEqual(port.messages[0].payload.capabilities, ["terminal_ack"]);
 
     port.emit(envelope("reconnect", "job_reconnect"));
     await eventually(() => port.messages.some((message) => message.type === "reconnect" && message.job_id === "job_reconnect"));
@@ -2389,6 +2390,7 @@ test("service worker hello falls back with instance id when profile identity fai
     assert.equal(hello.payload.profile_email, null);
     assert.equal(hello.payload.profile_id, null);
     assert.deepEqual(hello.payload.recipes, ["chatgpt", "claude"]);
+    assert.deepEqual(hello.payload.capabilities, ["terminal_ack"]);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -7808,14 +7810,247 @@ test("service worker replays an undelivered persisted terminal envelope once on 
     await eventually(() => port.messages.some((message) => (
       message.type === "job_complete" && message.job_id === "job_terminal_replay"
     )));
+    const replayed = port.messages.find((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_replay"
+    ));
+    assert.equal(replayed.payload.sequence, 0);
     const persisted = (await storage.get("jobs.job_terminal_replay"))["jobs.job_terminal_replay"];
-    assert.ok(persisted.terminal_delivered_at);
+    assert.equal(persisted.terminal_delivered_at, null);
     assert.equal(port.messages.some((message) => message.job_id === "job_terminal_too_large"), false);
+
+    port.emit(envelope("terminal_ack", "job_terminal_replay", { sequence: 0 }));
+    await eventually(async () => {
+      const afterAck = (await storage.get("jobs.job_terminal_replay"))["jobs.job_terminal_replay"];
+      return Boolean(afterAck.terminal_delivered_at);
+    });
 
     port.messages.length = 0;
     port.emit(envelope("reconnect", "reconnect_after_terminal"));
     await eventually(() => port.messages.some((message) => message.type === "reconnect"));
     assert.equal(port.messages.some((message) => message.job_id === "job_terminal_replay"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker hello advertises the terminal_ack capability", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  globalThis.chrome = chromeStub({ port, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?hello_terminal_ack_capability=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    const hello = port.messages.find((message) => message.type === "hello");
+    assert.ok(hello.payload.capabilities.includes("terminal_ack"));
+    assert.deepEqual(hello.payload.recipes, ["chatgpt", "claude"]);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker terminal_ack marks a persisted envelope delivered so restore does not replay", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const terminalEnvelope = envelope("job_complete", "job_terminal_ack_before_restore", {
+    is_final: true,
+    response: "acked before restore",
+    sequence: 0
+  });
+  globalThis.chrome = chromeStub({ port, storage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_ack_before_restore=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+
+    await storage.set({
+      "jobs.job_terminal_ack_before_restore": {
+        job_id: "job_terminal_ack_before_restore",
+        run_id: "run_test",
+        workspace_id: "workspace_test",
+        capability_token: "cap_test",
+        status: "complete",
+        terminal_envelope: terminalEnvelope,
+        terminal_sequence: 0,
+        terminal_delivered_at: null,
+        started_at: Date.now(),
+        updated_at: Date.now()
+      }
+    });
+    port.emit(envelope("terminal_ack", "job_terminal_ack_before_restore", { sequence: 0 }));
+    await eventually(async () => {
+      const shard = (await storage.get("jobs.job_terminal_ack_before_restore"))["jobs.job_terminal_ack_before_restore"];
+      return Boolean(shard?.terminal_delivered_at);
+    });
+
+    port.messages.length = 0;
+    port.emit(envelope("reconnect", "reconnect_after_ack_before_restore"));
+    await eventually(() => port.messages.some((message) => message.type === "reconnect"));
+    assert.equal(port.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_ack_before_restore"
+    )), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker terminal_ack for an unknown job is a silent no-op", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  globalThis.chrome = chromeStub({ port, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_ack_unknown=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+    port.emit(envelope("terminal_ack", "job_terminal_ack_unknown", { sequence: 0 }));
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+    assert.equal(port.messages.some((message) => message.payload?.code === "unsupported_type"), false);
+    assert.equal(port.messages.length, 0);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker replay then terminal_ack then restart does not replay again", async () => {
+  const originalChrome = globalThis.chrome;
+  const firstPort = makePort();
+  const storage = makeStorage();
+  const terminalEnvelope = envelope("job_complete", "job_terminal_ack_restart", {
+    is_final: true,
+    response: "replay then ack",
+    sequence: 0
+  });
+  await storage.set({
+    "jobs.job_terminal_ack_restart": {
+      job_id: "job_terminal_ack_restart",
+      run_id: "run_test",
+      workspace_id: "workspace_test",
+      capability_token: "cap_test",
+      status: "complete",
+      terminal_envelope: terminalEnvelope,
+      terminal_sequence: 0,
+      terminal_delivered_at: null,
+      started_at: Date.now(),
+      updated_at: Date.now()
+    }
+  });
+  globalThis.chrome = chromeStub({ port: firstPort, storage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_ack_restart_first=${Date.now()}`);
+    await eventually(() => firstPort.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_ack_restart"
+    )));
+    const afterReplay = (await storage.get("jobs.job_terminal_ack_restart"))["jobs.job_terminal_ack_restart"];
+    assert.equal(afterReplay.terminal_delivered_at, null, "postNative is not a delivery receipt");
+    firstPort.emit(envelope("terminal_ack", "job_terminal_ack_restart", { sequence: 0 }));
+    await eventually(async () => {
+      const shard = (await storage.get("jobs.job_terminal_ack_restart"))["jobs.job_terminal_ack_restart"];
+      return Boolean(shard?.terminal_delivered_at);
+    });
+
+    const secondPort = makePort();
+    globalThis.chrome = chromeStub({ port: secondPort, storage, tabs: {} });
+    await import(`../src/service-worker.js?terminal_ack_restart_second=${Date.now()}`);
+    await eventually(() => secondPort.messages.some((message) => message.type === "hello"));
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(secondPort.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_ack_restart"
+    )), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker terminal_ack marks a too-large persisted envelope delivered", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  await storage.set({
+    "jobs.job_terminal_ack_too_large": {
+      job_id: "job_terminal_ack_too_large",
+      status: "complete",
+      terminal_envelope_too_large: true,
+      terminal_sequence: 0,
+      terminal_delivered_at: null,
+      started_at: Date.now(),
+      updated_at: Date.now()
+    }
+  });
+  globalThis.chrome = chromeStub({ port, storage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_ack_too_large=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    assert.equal(port.messages.some((message) => message.job_id === "job_terminal_ack_too_large"), false);
+    port.emit(envelope("terminal_ack", "job_terminal_ack_too_large", { sequence: 0 }));
+    await eventually(async () => {
+      const shard = (await storage.get("jobs.job_terminal_ack_too_large"))["jobs.job_terminal_ack_too_large"];
+      return Boolean(shard?.terminal_delivered_at);
+    });
+    const shard = (await storage.get("jobs.job_terminal_ack_too_large"))["jobs.job_terminal_ack_too_large"];
+    assert.equal(shard.terminal_envelope_too_large, true);
+    assert.equal(shard.terminal_envelope, undefined);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker purges an aged unacked terminal shard instead of replaying it", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+  const agedAt = now - (3 * 60 * 60 * 1000) - 1000;
+  await storage.set({
+    "jobs.job_terminal_aged": {
+      job_id: "job_terminal_aged",
+      status: "complete",
+      terminal_envelope: envelope("job_complete", "job_terminal_aged", {
+        is_final: true,
+        response: "aged unacked"
+      }),
+      terminal_sequence: 0,
+      terminal_delivered_at: null,
+      terminal_at: agedAt,
+      started_at: agedAt,
+      // Fresh updated_at simulates restore/ACK-path churn so the generic TTL
+      // skip cannot hide an unbounded terminal replay.
+      updated_at: now
+    },
+    "jobs.job_terminal_fresh_unacked": {
+      job_id: "job_terminal_fresh_unacked",
+      status: "complete",
+      terminal_envelope: envelope("job_complete", "job_terminal_fresh_unacked", {
+        is_final: true,
+        response: "fresh unacked"
+      }),
+      terminal_sequence: 0,
+      terminal_delivered_at: null,
+      terminal_at: now,
+      started_at: now,
+      updated_at: now
+    }
+  });
+  globalThis.chrome = chromeStub({ port, storage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_ack_aged_purge=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    await eventually(() => port.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_fresh_unacked"
+    )));
+    assert.equal(port.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_aged"
+    )), false);
+    const aged = (await storage.get("jobs.job_terminal_aged"))["jobs.job_terminal_aged"];
+    const fresh = (await storage.get("jobs.job_terminal_fresh_unacked"))["jobs.job_terminal_fresh_unacked"];
+    assert.equal(aged, undefined);
+    assert.ok(fresh);
+    assert.equal(fresh.terminal_delivered_at, null);
   } finally {
     globalThis.chrome = originalChrome;
   }
