@@ -17,7 +17,8 @@ export const MESSAGE_TYPES = Object.freeze([
   "heartbeat",
   "reconnect",
   "inspect_run",
-  "request_identity_permission"
+  "request_identity_permission",
+  "terminal_ack"
 ]);
 
 export function nowIso() {
