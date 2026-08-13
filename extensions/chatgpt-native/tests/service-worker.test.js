@@ -6267,6 +6267,183 @@ test("service worker restarts model selection from scratch after persisted bfcac
   }
 });
 
+test("service worker retries model selection once after a transient content-script loss", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  const tabMessages = [];
+  const configureAttempts = [];
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        tabMessages.push(message.type);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            configureAttempts.push(message.job.model_selection_attempt);
+            if (configureAttempts.length === 1) {
+              throw new Error("Could not establish connection. Receiving end does not exist.");
+            }
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_bind_job":
+            return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT" } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?selecting_model_transient_cs=${Date.now()}`);
+    port.emit(envelope("job_start", "job_selecting_model_transient_cs", { prompt: "prompt" }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    assert.deepEqual(configureAttempts, [1, 2]);
+    assert.ok(tabMessages.includes("yoetz_bind_job"));
+    assert.equal(port.messages.filter((message) => message.payload?.phase === "ready_for_file").length, 1);
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker fail-closes model selection after one content-script recovery retry", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  let configureCalls = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            configureCalls += 1;
+            throw new Error("Could not establish connection. Receiving end does not exist.");
+          case "yoetz_bind_job":
+            return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT" } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?selecting_model_persistent_cs=${Date.now()}`);
+    port.emit(envelope("job_start", "job_selecting_model_persistent_cs", { prompt: "prompt" }));
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    assert.equal(configureCalls, 2);
+    assert.equal(port.messages.filter((message) => message.type === "job_error").length, 1);
+    assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker keeps one live model-selection attempt when recovery retry races a pageshow restart", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let runtimeListener = null;
+  let tabId = 0;
+  let releaseBind;
+  let resolveSecondConfigure;
+  let markBindStarted;
+  let markSecondConfigureStarted;
+  const bindStarted = new Promise((resolve) => {
+    markBindStarted = resolve;
+  });
+  const secondConfigureStarted = new Promise((resolve) => {
+    markSecondConfigureStarted = resolve;
+  });
+  let bindCalls = 0;
+  const configureCalls = [];
+  const chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            configureCalls.push(message.job.model_selection_attempt);
+            if (configureCalls.length === 1) {
+              throw new Error("Could not establish connection. Receiving end does not exist.");
+            }
+            if (configureCalls.length === 2) {
+              markSecondConfigureStarted();
+              return new Promise((resolve) => {
+                resolveSecondConfigure = () => resolve({ ok: true, payload: verifiedSolProSelection() });
+              });
+            }
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_bind_job":
+            bindCalls += 1;
+            markBindStarted();
+            return new Promise((resolve) => {
+              releaseBind = () => resolve({ ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT" } });
+            });
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?selecting_model_pageshow_race=${Date.now()}`);
+    const jobId = "job_selecting_model_pageshow_race";
+    port.emit(envelope("job_start", jobId, { prompt: "prompt" }));
+    await Promise.race([
+      bindStarted,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("content-script bind did not start")), 5000))
+    ]);
+
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: [jobId] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    const firstPageshow = lifecycle("pageshow");
+    await secondConfigureStarted;
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    assert.equal((await lifecycle("pageshow")).ok, true);
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    releaseBind();
+    resolveSecondConfigure();
+    assert.equal((await firstPageshow).ok, true);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.ok(bindCalls >= 1);
+    assert.equal(port.messages.filter((message) => message.payload?.phase === "ready_for_file").length, 1);
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker keeps the fail-closed model-selection result when bfcache restart fails", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
