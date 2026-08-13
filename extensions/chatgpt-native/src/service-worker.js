@@ -19,6 +19,8 @@ const RECONNECT_ALARM = "yoetz-reconnect";
 const TERMINAL_STATUSES = new Set(["complete", "cancelled", "failed", "manual_handoff", "state_lost", "terminal_delivery_lost"]);
 const EXTENSION_ID_STORAGE_KEY = "yoetz_extension_instance_id";
 const ADVERTISED_RECIPES = Object.freeze(advertisedRecipes());
+const TERMINAL_ACK_CAPABILITY = "terminal_ack";
+const ADVERTISED_CAPABILITIES = Object.freeze([TERMINAL_ACK_CAPABILITY]);
 const MIN_STABLE_IDLE_MS = Number(globalThis.__YOETZ_MIN_STABLE_IDLE_MS ?? 90000);
 // Require multiple stable polls so final controls cannot win before late text hydration.
 const STABLE_IDLE_INTERVAL_MULTIPLIER = Number(globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER ?? 3);
@@ -317,6 +319,9 @@ async function handleNativeMessage(message) {
         break;
       case "request_identity_permission":
         await handleRequestIdentityPermission(message);
+        break;
+      case "terminal_ack":
+        await handleTerminalAck(message);
         break;
       default:
         postNative(errorEnvelope(message, "unsupported_type", `unsupported service-worker message ${message.type}`));
@@ -701,18 +706,17 @@ async function completeJobWithExtraction(job, extraction) {
   }
   job.status = "complete";
   forgetContentScriptRecovery(job.job_id);
+  rememberTerminalJob(job.job_id);
+  stampTerminalSequence(job, completeEnvelope);
   job.terminal_envelope = completeEnvelope;
   job.terminal_delivered_at = null;
   job.updated_at = Date.now();
-  rememberTerminalJob(job.job_id);
   await persistTerminalJobBestEffort(job);
-  const delivered = postNative(completeEnvelope);
-  if (!delivered) {
+  const posted = postNative(completeEnvelope);
+  if (!posted) {
     await recordTerminalDeliveryLost(job, "wait_response");
     return;
   }
-  job.terminal_delivered_at = Date.now();
-  await persistTerminalJobBestEffort(job);
   await closeOwnedTabOnComplete(job);
   jobs.delete(job.job_id);
   chunks.discard(job.job_id);
@@ -944,16 +948,13 @@ async function cancelJob(message) {
   });
   job.terminal_envelope = cancelEnvelope;
   job.terminal_delivered_at = null;
+  stampTerminalSequence(job, cancelEnvelope);
   await persistTerminalJobBestEffort(job);
-  if (postNative(cancelEnvelope)) {
-    job.terminal_delivered_at = Date.now();
-    await persistTerminalJobBestEffort(job);
-  } else {
+  if (!postNative(cancelEnvelope)) {
     await recordTerminalDeliveryLost(job, "cancel");
   }
-  // Evict only after the terminal envelope is posted and its delivery state is
-  // persisted. Late work for this job id is suppressed by terminalJobIds, and a
-  // fresh job_start remains rejected until that entry expires.
+  // Evict only after the terminal envelope is posted. Delivery is confirmed by
+  // terminal_ack; Port.postMessage returning is not a receipt.
   jobs.delete(job.job_id);
 }
 
@@ -1320,19 +1321,19 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
     if (!job?.job_id) {
       continue;
     }
-    if (Date.now() - (job.updated_at ?? job.started_at ?? 0) > JOB_TTL_MS) {
+    if (TERMINAL_STATUSES.has(job.status)) {
+      if (isExpiredTerminalJob(job)) {
+        await removeJobShard(job.job_id);
+        continue;
+      }
+      rememberTerminalJob(job.job_id);
+      if (!job.terminal_delivered_at && job.terminal_envelope) {
+        stampTerminalSequence(job, job.terminal_envelope);
+        postNative(job.terminal_envelope);
+      }
       continue;
     }
-    if (TERMINAL_STATUSES.has(job.status)) {
-      rememberTerminalJob(job.job_id);
-      if (job.terminal_envelope && !job.terminal_delivered_at) {
-        if (postNative(job.terminal_envelope)) {
-          job.terminal_delivered_at = Date.now();
-          await persistTerminalJobBestEffort(job);
-        } else {
-          await recordTerminalDeliveryLost(job, job.delivery_lost_phase ?? phaseForStatus(job.status) ?? "upload");
-        }
-      }
+    if (Date.now() - (job.updated_at ?? job.started_at ?? 0) > JOB_TTL_MS) {
       continue;
     }
     if (jobs.has(job.job_id)) {
@@ -1539,7 +1540,8 @@ function postHello() {
         extension_instance_id: identity.extension_instance_id,
         profile_email: identity.profile_email || null,
         profile_id: identity.profile_id || null,
-        recipes: [...ADVERTISED_RECIPES]
+        recipes: [...ADVERTISED_RECIPES],
+        capabilities: [...ADVERTISED_CAPABILITIES]
       }
     }));
   }).catch(async (error) => {
@@ -1561,7 +1563,8 @@ function postHello() {
         extension_instance_id: extensionInstanceId,
         profile_email: null,
         profile_id: null,
-        recipes: [...ADVERTISED_RECIPES]
+        recipes: [...ADVERTISED_RECIPES],
+        capabilities: [...ADVERTISED_CAPABILITIES]
       }
     }));
   });
@@ -2748,7 +2751,7 @@ function nativeEnvelopeByteLength(message) {
 }
 
 function enforceMessageCapability(message) {
-  if (!message?.job_id || message.type === "job_start") {
+  if (!message?.job_id || message.type === "job_start" || message.type === "terminal_ack") {
     return;
   }
   const job = jobs.get(message.job_id);
@@ -2879,17 +2882,16 @@ async function failJob(job, code, message, detail = {}) {
     job.updated_at = Date.now();
     chunks.discard(job.job_id);
     job.terminal_envelope = errorEnvelope(job, code, message, payloadDetail);
+    stampTerminalSequence(job, job.terminal_envelope);
     job.terminal_delivered_at = null;
     await persistTerminalJobBestEffort(job);
   }
-  const delivered = postNative(job?.terminal_envelope ?? errorEnvelope(job, code, message, payloadDetail));
+  const posted = postNative(job?.terminal_envelope ?? errorEnvelope(job, code, message, payloadDetail));
   if (job) {
-    if (delivered) {
-      job.terminal_delivered_at = Date.now();
-      await persistTerminalJobBestEffort(job);
-      jobs.delete(job.job_id);
-    } else {
+    if (!posted) {
       await recordTerminalDeliveryLost(job, payloadDetail.phase ?? phaseForStatus(job.status) ?? "upload");
+    } else {
+      jobs.delete(job.job_id);
     }
   }
 }
@@ -2926,6 +2928,118 @@ async function persistTerminalJobBestEffort(job) {
 
 function jobsStorageKey(jobId) {
   return `${JOBS_KEY_PREFIX}${jobId}`;
+}
+
+function terminalAgeStamp(job) {
+  for (const value of [job?.terminal_at, job?.updated_at, job?.started_at]) {
+    if (Number.isSafeInteger(value) && value > 0) {
+      return value;
+    }
+  }
+  return null;
+}
+
+function isExpiredTerminalJob(job) {
+  const stamp = terminalAgeStamp(job);
+  return stamp != null && Date.now() - stamp > JOB_TTL_MS;
+}
+
+async function removeJobShard(jobId) {
+  if (!jobId || !chrome.storage.session.remove) {
+    return;
+  }
+  try {
+    await chrome.storage.session.remove(jobsStorageKey(jobId));
+  } catch (error) {
+    console.warn(`could not remove expired job ${jobId}: ${String(error?.message ?? error)}`);
+  }
+}
+
+function stampTerminalSequence(job, envelope) {
+  if (!job || !envelope || typeof envelope !== "object") {
+    return envelope;
+  }
+  if (job.terminal_sequence == null) {
+    job.terminal_sequence = 0;
+  }
+  if (job.terminal_at == null) {
+    job.terminal_at = Date.now();
+  }
+  if (!envelope.payload || typeof envelope.payload !== "object" || Array.isArray(envelope.payload)) {
+    envelope.payload = {};
+  }
+  if (envelope.payload.sequence == null) {
+    envelope.payload.sequence = job.terminal_sequence;
+  }
+  return envelope;
+}
+
+function expectedTerminalSequence(job) {
+  if (Number.isSafeInteger(job?.terminal_sequence) && job.terminal_sequence >= 0) {
+    return job.terminal_sequence;
+  }
+  const stamped = job?.terminal_envelope?.payload?.sequence;
+  if (Number.isSafeInteger(stamped) && stamped >= 0) {
+    return stamped;
+  }
+  return 0;
+}
+
+function inboundAckSequence(message) {
+  const sequence = message?.payload?.sequence;
+  if (sequence == null) {
+    return 0;
+  }
+  if (!Number.isSafeInteger(sequence) || sequence < 0) {
+    return null;
+  }
+  return sequence;
+}
+
+async function loadJobForTerminalAck(jobId) {
+  const live = jobs.get(jobId);
+  if (live) {
+    return live;
+  }
+  const key = jobsStorageKey(jobId);
+  const stored = (await chrome.storage.session.get(key))?.[key];
+  if (stored && typeof stored === "object") {
+    return stored;
+  }
+  if (terminalJobIds.has(jobId)) {
+    return {
+      job_id: jobId,
+      status: "complete",
+      terminal_sequence: 0,
+      updated_at: Date.now()
+    };
+  }
+  return null;
+}
+
+async function handleTerminalAck(message) {
+  const jobId = message?.job_id;
+  if (!jobId || typeof jobId !== "string") {
+    return;
+  }
+  const sequence = inboundAckSequence(message);
+  if (sequence == null) {
+    return;
+  }
+  const job = await loadJobForTerminalAck(jobId);
+  if (!job) {
+    return;
+  }
+  if (expectedTerminalSequence(job) !== sequence) {
+    return;
+  }
+  if (job.terminal_delivered_at) {
+    return;
+  }
+  job.terminal_delivered_at = Date.now();
+  job.updated_at = Date.now();
+  rememberTerminalJob(jobId);
+  await persistTerminalJobBestEffort(job);
 }
 
 // Build a JSON-cloneable, size-bounded view of a job for chrome.storage.session.
@@ -2969,8 +3083,10 @@ async function cleanupExpiredJobs() {
     if (!key.startsWith(JOBS_KEY_PREFIX) || !value) {
       continue;
     }
-    const stamp = value.updated_at ?? value.started_at ?? 0;
-    if (stamp < cutoff) {
+    const stamp = TERMINAL_STATUSES.has(value.status)
+      ? terminalAgeStamp(value)
+      : (value.updated_at ?? value.started_at ?? 0);
+    if (stamp != null && stamp < cutoff) {
       expiredKeys.push(key);
     }
   }

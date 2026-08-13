@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   a submitted tab is in bfcache instead of burning the 20s content-script probe
   loop, and both poller catch paths join in-flight or settled recovery under a
   single poller lease so a restored waiter cannot failJob a live rebound.
+- Native-extension terminal envelopes advertise `terminal_ack`, stamp
+  `payload.sequence`, and treat a host ACK as the delivery receipt so restore
+  replay stops only after the host confirms it received the envelope. Unacked
+  terminal shards older than the job TTL are purged instead of replayed.
 
 ## [0.5.51] - 2026-08-12
 ### Fixed
