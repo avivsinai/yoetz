@@ -64,7 +64,7 @@ async function handleMessage(message) {
     case "yoetz_upload_file":
       return uploadJobFile(message.job, message.file);
     case "yoetz_configure_model":
-      return configureModel(message.job);
+      return configureModel(message.job, { reset: message.reset === true });
     case "yoetz_send_prompt":
       return sendPrompt(message.job, message.prompt);
     case "yoetz_extract_response":
@@ -181,8 +181,13 @@ async function uploadJobFile(job, filePayload) {
   return { filename: file.name, size: file.size };
 }
 
-async function configureModel(job) {
-  const { classifyBlockingState, configureModelState, parseOwnedWindowName } = await domHelpers(job);
+async function configureModel(job, options = {}) {
+  const {
+    classifyBlockingState,
+    configureModelState,
+    parseOwnedWindowName,
+    resetModelSelectionState
+  } = await domHelpers(job);
   const adapter = await siteAdapter(job);
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "model_selection", adapter));
   assertNoBlockingState(classifyBlockingState, {
@@ -190,6 +195,9 @@ async function configureModel(job) {
     side_effect_started: false,
     send_committed: false
   });
+  if (options.reset) {
+    await resetModelSelectionState(document);
+  }
   const selection = await configureModelState(document, job);
   assertNoBlockingState(classifyBlockingState, {
     phase: "model_selection",

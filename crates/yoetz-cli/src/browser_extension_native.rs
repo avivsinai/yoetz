@@ -3340,7 +3340,7 @@ fn unsupported_socket_error() -> io::Error {
 #[cfg(unix)]
 mod native_host_unix {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::os::unix::fs::{FileTypeExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::thread;
@@ -3381,6 +3381,12 @@ mod native_host_unix {
         native_instance_id: String,
         socket_path: PathBuf,
         instance_path: PathBuf,
+    }
+
+    #[derive(Default)]
+    struct ExtensionSessionState {
+        terminal_ack_capable: bool,
+        terminal_job_ids: HashSet<String>,
     }
 
     impl SocketFileGuard {
@@ -3438,6 +3444,7 @@ mod native_host_unix {
 
         let stdout = Arc::new(Mutex::new(io::stdout()));
         let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+        let mut extension_session = ExtensionSessionState::default();
         let accept_stdout = Arc::clone(&stdout);
         let accept_clients = Arc::clone(&clients);
         thread::spawn(move || {
@@ -3469,7 +3476,14 @@ mod native_host_unix {
                         record_protocol_mismatch(&paths, &envelope, &err)?;
                         continue;
                     }
-                    route_extension_message(envelope, &clients, &stdout, &paths, &runtime)?;
+                    route_extension_message(
+                        envelope,
+                        &clients,
+                        &stdout,
+                        &paths,
+                        &runtime,
+                        &mut extension_session,
+                    )?;
                 }
                 Err(err) if is_disconnect_error(&err) => {
                     notify_clients_transport_lost(&clients);
@@ -3731,12 +3745,38 @@ mod native_host_unix {
         stdout: &Arc<Mutex<io::Stdout>>,
         paths: &ExtensionPaths,
         runtime: &NativeHostRuntime,
+        extension_session: &mut ExtensionSessionState,
     ) -> Result<()> {
+        if envelope.kind == "hello" {
+            extension_session.terminal_ack_capable = envelope
+                .payload
+                .get("capabilities")
+                .and_then(Value::as_array)
+                .is_some_and(|capabilities| {
+                    capabilities
+                        .iter()
+                        .any(|capability| capability.as_str() == Some("terminal_ack"))
+                });
+        }
+
         let Some(job_id) = envelope.job_id.clone() else {
             record_unrouted_extension_message(paths, &envelope)?;
             record_instance_activity(runtime, &envelope)?;
             return Ok(());
         };
+        let terminal_sequence = terminal_sequence(&envelope)?;
+        if let Some(sequence) = terminal_sequence {
+            if extension_session.terminal_job_ids.contains(&job_id) {
+                eprintln!(
+                    "yoetz chrome native dropped duplicate terminal envelope `{}` for {job_id}",
+                    envelope.kind
+                );
+                acknowledge_terminal(stdout, &envelope, sequence, extension_session)?;
+                record_instance_activity(runtime, &envelope)?;
+                return Ok(());
+            }
+        }
+        let mut delivered_terminal_sequence = None;
         let mut remove_client = matches!(
             envelope.kind.as_str(),
             "job_complete" | "job_error" | "job_cancel" | "pair_complete"
@@ -3808,22 +3848,27 @@ mod native_host_unix {
                     let _ = forward_to_extension(stdout, &cancel);
                 }
                 clients.lock().unwrap().remove(&job_id);
-            } else if let Some(error) = delivery.client_error {
-                let _ = write_json_frame(&mut delivery.stream, &error);
-                remove_client = true;
-            } else if let Some(chunk) = delivery.next_chunk {
-                if let Err(err) = forward_to_extension(stdout, &chunk) {
-                    eprintln!("yoetz chrome native chunk send failed for {job_id}: {err:#}");
-                    let error = client_error_envelope_from_parts(
-                        &delivery.job_id,
-                        delivery.run_id.clone(),
-                        "forward_to_extension_failed",
-                        &format!("native host could not forward file chunk to extension: {err}"),
-                        delivery.fallback_phase,
-                        delivery.side_effect_started,
-                    );
+            } else {
+                delivered_terminal_sequence = terminal_sequence;
+                if let Some(error) = delivery.client_error {
                     let _ = write_json_frame(&mut delivery.stream, &error);
                     remove_client = true;
+                } else if let Some(chunk) = delivery.next_chunk {
+                    if let Err(err) = forward_to_extension(stdout, &chunk) {
+                        eprintln!("yoetz chrome native chunk send failed for {job_id}: {err:#}");
+                        let error = client_error_envelope_from_parts(
+                            &delivery.job_id,
+                            delivery.run_id.clone(),
+                            "forward_to_extension_failed",
+                            &format!(
+                                "native host could not forward file chunk to extension: {err}"
+                            ),
+                            delivery.fallback_phase,
+                            delivery.side_effect_started,
+                        );
+                        let _ = write_json_frame(&mut delivery.stream, &error);
+                        remove_client = true;
+                    }
                 }
             }
 
@@ -3832,11 +3877,49 @@ mod native_host_unix {
             }
         }
 
+        if let Some(sequence) = delivered_terminal_sequence {
+            extension_session.terminal_job_ids.insert(job_id.clone());
+            acknowledge_terminal(stdout, &envelope, sequence, extension_session)?;
+        }
         if is_manual_handoff(&envelope) {
             record_manual_handoff(paths, &envelope)?;
         }
         record_instance_activity(runtime, &envelope)?;
         Ok(())
+    }
+
+    fn terminal_sequence(envelope: &ProtocolEnvelope) -> Result<Option<u64>> {
+        if !matches!(
+            envelope.kind.as_str(),
+            "job_complete" | "job_error" | "job_cancel"
+        ) {
+            return Ok(None);
+        }
+        match envelope.payload.get("sequence") {
+            Some(sequence) => sequence
+                .as_u64()
+                .map(Some)
+                .context("terminal envelope payload.sequence must be a u64"),
+            None => Ok(Some(0)),
+        }
+    }
+
+    fn acknowledge_terminal(
+        stdout: &Arc<Mutex<io::Stdout>>,
+        envelope: &ProtocolEnvelope,
+        sequence: u64,
+        extension_session: &ExtensionSessionState,
+    ) -> Result<()> {
+        if !extension_session.terminal_ack_capable {
+            return Ok(());
+        }
+        let ack = ProtocolEnvelope::new(
+            "terminal_ack",
+            envelope.job_id.clone(),
+            envelope.run_id.clone(),
+            json!({ "sequence": sequence }),
+        );
+        forward_to_extension(stdout, &ack)
     }
 
     fn next_bundle_chunk_envelope(client: &mut ClientJob) -> Result<Option<ProtocolEnvelope>> {

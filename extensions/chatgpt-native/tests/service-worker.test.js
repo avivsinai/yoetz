@@ -101,6 +101,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     assert.equal(port.messages[0].payload.profile_id, "gaia-work");
     assert.match(port.messages[0].payload.extension_instance_id, /^ext_/);
     assert.deepEqual(port.messages[0].payload.recipes, ["chatgpt", "claude"]);
+    assert.deepEqual(port.messages[0].payload.capabilities, ["terminal_ack"]);
 
     port.emit(envelope("reconnect", "job_reconnect"));
     await eventually(() => port.messages.some((message) => message.type === "reconnect" && message.job_id === "job_reconnect"));
@@ -2389,6 +2390,7 @@ test("service worker hello falls back with instance id when profile identity fai
     assert.equal(hello.payload.profile_email, null);
     assert.equal(hello.payload.profile_id, null);
     assert.deepEqual(hello.payload.recipes, ["chatgpt", "claude"]);
+    assert.deepEqual(hello.payload.capabilities, ["terminal_ack"]);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -6182,6 +6184,273 @@ test("service worker rebinds owned tab after content script reload during respon
   }
 });
 
+test("service worker restarts model selection from scratch after persisted bfcache pageshow", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let runtimeListener = null;
+  let tabId = 0;
+  let resolveSuspendedSelection;
+  let markSuspendedSelectionStarted;
+  const suspendedSelectionStarted = new Promise((resolve) => {
+    markSuspendedSelectionStarted = resolve;
+  });
+  const configureCalls = [];
+  const chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            configureCalls.push({ reset: message.reset, attempt: message.job.model_selection_attempt });
+            if (configureCalls.length === 1) {
+              markSuspendedSelectionStarted();
+              return new Promise((resolve) => {
+                resolveSuspendedSelection = resolve;
+              });
+            }
+            return { ok: true, payload: verifiedSolProSelection() };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?bfcache_model_restart=${Date.now()}`);
+    port.emit(envelope("job_start", "job_bfcache_model_restart", { prompt: "prompt" }));
+    await suspendedSelectionStarted;
+
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: ["job_bfcache_model_restart"] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    assert.equal((await lifecycle("pageshow")).ok, true);
+
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    assert.deepEqual(configureCalls, [
+      { reset: false, attempt: 1 },
+      { reset: true, attempt: 2 }
+    ]);
+    assert.equal(
+      port.messages.filter((message) => message.payload?.phase === "model_selection_restarting").length,
+      1
+    );
+
+    resolveSuspendedSelection({
+      ok: true,
+      payload: {
+        status: "unavailable",
+        requested_model: "gpt-5-6-sol-extra-high",
+        failure_reason: "stale_suspended_attempt"
+      }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(port.messages.filter((message) => message.payload?.phase === "ready_for_file").length, 1);
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker keeps the fail-closed model-selection result when bfcache restart fails", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let runtimeListener = null;
+  let tabId = 0;
+  let resolveSuspendedSelection;
+  let markSuspendedSelectionStarted;
+  const suspendedSelectionStarted = new Promise((resolve) => {
+    markSuspendedSelectionStarted = resolve;
+  });
+  let configureCalls = 0;
+  const failedSelection = {
+    status: "unavailable",
+    model_used: null,
+    requested_model: "gpt-5-6-sol-extra-high",
+    family_status: "unverified",
+    effort_status: "unverified",
+    failure_reason: "model_picker_open_failed",
+    warning: "ChatGPT GPT-5.6 model picker did not open"
+  };
+  const chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            configureCalls += 1;
+            if (configureCalls === 1) {
+              markSuspendedSelectionStarted();
+              return new Promise((resolve) => {
+                resolveSuspendedSelection = resolve;
+              });
+            }
+            assert.equal(message.reset, true);
+            return { ok: true, payload: failedSelection };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?bfcache_model_restart_failed=${Date.now()}`);
+    port.emit(envelope("job_start", "job_bfcache_model_restart_failed", { prompt: "prompt" }));
+    await suspendedSelectionStarted;
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: ["job_bfcache_model_restart_failed"] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    assert.equal((await lifecycle("pageshow")).ok, true);
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.payload.code, "model_selection_failed");
+    assert.equal(error.payload.phase, "model_selection");
+    assert.equal(error.payload.side_effect_started, false);
+    assert.equal(error.payload.failure_reason, failedSelection.failure_reason);
+    assert.deepEqual(error.payload.model_selection, failedSelection);
+
+    resolveSuspendedSelection({ ok: true, payload: verifiedSolProSelection() });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
+    assert.equal(port.messages.filter((message) => message.type === "job_error").length, 1);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker does not resurrect a terminal model selection from a stale post-configure tail", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  let runtimeListener = null;
+  let tabId = 0;
+  let configureCalls = 0;
+  let releaseAttemptTwoGrouping;
+  let markAttemptTwoGroupingStarted;
+  const attemptTwoGroupingStarted = new Promise((resolve) => {
+    markAttemptTwoGroupingStarted = resolve;
+  });
+  const failedSelection = {
+    status: "unavailable",
+    model_used: null,
+    requested_model: "gpt-5-6-sol-extra-high",
+    family_status: "unverified",
+    effort_status: "unverified",
+    failure_reason: "model_picker_open_failed",
+    warning: "ChatGPT GPT-5.6 model picker did not open"
+  };
+  let resolveInitialSelection;
+  const chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      group: async () => {
+        markAttemptTwoGroupingStarted();
+        return new Promise((resolve) => {
+          releaseAttemptTwoGrouping = () => resolve(1);
+        });
+      },
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            configureCalls += 1;
+            if (configureCalls === 1) {
+              return new Promise((resolve) => {
+                resolveInitialSelection = resolve;
+              });
+            }
+            return {
+              ok: true,
+              payload: configureCalls === 2 ? verifiedSolProSelection() : failedSelection
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?bfcache_model_tail_liveness=${Date.now()}`);
+    const jobId = "job_bfcache_model_tail_liveness";
+    port.emit(envelope("job_start", jobId, { prompt: "prompt" }));
+    await eventually(() => configureCalls === 1);
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: [jobId] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    const attemptTwoPageshow = lifecycle("pageshow");
+    await attemptTwoGroupingStarted;
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    assert.equal((await lifecycle("pageshow")).ok, true);
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+
+    releaseAttemptTwoGrouping();
+    assert.equal((await attemptTwoPageshow).ok, true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    resolveInitialSelection({ ok: true, payload: verifiedSolProSelection() });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const persisted = await storage.get(`jobs.${jobId}`);
+    assert.equal(persisted[`jobs.${jobId}`].status, "failed");
+    const errorIndex = port.messages.findIndex((message) => message.type === "job_error");
+    assert.notEqual(errorIndex, -1);
+    assert.equal(
+      port.messages.slice(errorIndex + 1).some((message) => message.payload?.phase === "ready_for_file"),
+      false
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker idempotently rebinds a persisted bfcache restore without replaying side effects", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -6433,6 +6702,479 @@ test("service worker terminates actionably when persisted bfcache reconnect fail
     assert.equal(jobErrors[0].payload.code, "content_script_reconnect_failed");
     const persisted = await storage.get("jobs.job_bfcache_failed");
     assert.notEqual(persisted["jobs.job_bfcache_failed"]?.status, "terminal_delivery_lost");
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousAttempts === undefined) delete globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS;
+    else globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS = previousAttempts;
+    if (previousDelay === undefined) delete globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS;
+    else globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS = previousDelay;
+  }
+});
+
+test("service worker parks a suspended waiting_response job past the reconnect probe window then completes on pageshow", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousAttempts = globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS;
+  const previousDelay = globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS;
+  globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS = 2;
+  globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS = 20;
+  const port = makePort();
+  let runtimeListener = null;
+  let tabId = 0;
+  let sent = false;
+  let hidden = false;
+  let allowProbe = true;
+  let uploadCalls = 0;
+  let sendCalls = 0;
+  let probesWhileHidden = 0;
+  let rejectInFlightExtraction;
+  let markInFlightExtractionStarted;
+  const inFlightExtractionStarted = new Promise((resolve) => {
+    markInFlightExtractionStarted = resolve;
+  });
+  const chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            if (hidden) {
+              probesWhileHidden += 1;
+            }
+            if (!allowProbe) {
+              throw new Error("Could not establish connection. Receiving end does not exist.");
+            }
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            uploadCalls += 1;
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sendCalls += 1;
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_bind_job":
+            return { ok: true, payload: { rebound: true, url: "https://chatgpt.com/", title: "ChatGPT" } };
+          case "yoetz_extract_response":
+            if (sent && !hidden) {
+              markInFlightExtractionStarted();
+              return new Promise((_resolve, reject) => {
+                rejectInFlightExtraction = reject;
+              });
+            }
+            return {
+              ok: true,
+              payload: sent && allowProbe
+                ? { method: "copy_scope_dom_fallback", text: "final after long suspension", is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0 }
+                : { method: "none", text: "", is_generating: true, assistant_count: 0, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?park_past_probe=${Date.now()}`);
+    port.emit(envelope("job_start", "job_park_past_probe", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 4000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_park_past_probe", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_park_past_probe.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => sent);
+    await inFlightExtractionStarted;
+
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: ["job_park_past_probe"] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    hidden = true;
+    allowProbe = false;
+    rejectInFlightExtraction(new Error("The message channel closed before a response was received."));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "parked_for_pageshow"));
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    assert.equal(probesWhileHidden, 0, "recovery must not probe while the tab is in bfcache");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+    allowProbe = true;
+    assert.equal((await lifecycle("pageshow")).ok, true);
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    assert.equal(uploadCalls, 1);
+    assert.equal(sendCalls, 1);
+    assert.equal(
+      port.messages.find((message) => message.type === "job_complete")?.payload.response,
+      "final after long suspension"
+    );
+    const parked = port.messages.find((message) => message.payload?.phase === "parked_for_pageshow");
+    assert.equal(typeof parked?.payload.inspect_command, "string");
+    assert.match(parked.payload.inspect_command, /yoetz browser extension inspect/);
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousAttempts === undefined) delete globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS;
+    else globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS = previousAttempts;
+    if (previousDelay === undefined) delete globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS;
+    else globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS = previousDelay;
+  }
+});
+
+test("service worker restored waiting_response poller joins an in-flight pageshow recovery", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+  let runtimeListener = null;
+  let bindCalls = 0;
+  let rebound = false;
+  let inFlightExtracts = 0;
+  let maxInFlightExtracts = 0;
+  let rejectInFlightExtraction;
+  let markInFlightExtractionStarted;
+  const inFlightExtractionStarted = new Promise((resolve) => {
+    markInFlightExtractionStarted = resolve;
+  });
+  await storage.set({
+    "jobs.job_restore_pageshow_race": {
+      job_id: "job_restore_pageshow_race",
+      run_id: "run_job_restore_pageshow_race",
+      workspace_id: "workspace_test",
+      status: "waiting_response",
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 4000,
+      tab_id: 77,
+      response_baseline: {
+        method: "none",
+        text: "",
+        is_generating: false,
+        assistant_count: 0,
+        turn_index: -1
+      },
+      submitted_user_count: 1,
+      submitted_assistant_count: 0,
+      started_at: now,
+      response_wait_started_at: now,
+      updated_at: now
+    }
+  });
+  const chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      create: async () => {
+        throw new Error("restore must reuse the submitted tab");
+      },
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_restore_pageshow_race" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_bind_job":
+            bindCalls += 1;
+            rebound = bindCalls >= 2;
+            return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT" } };
+          case "yoetz_extract_response": {
+            if (bindCalls < 2) {
+              markInFlightExtractionStarted();
+              return new Promise((_resolve, reject) => {
+                rejectInFlightExtraction = reject;
+              });
+            }
+            inFlightExtracts += 1;
+            maxInFlightExtracts = Math.max(maxInFlightExtracts, inFlightExtracts);
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            inFlightExtracts -= 1;
+            return {
+              ok: true,
+              payload: {
+                method: "copy_scope_dom_fallback",
+                text: "restored after pageshow race",
+                is_generating: false,
+                assistant_count: 1,
+                copy_button_count: 1,
+                has_copy_button: true,
+                turn_index: 0,
+                preceding_user_count: 1
+              }
+            };
+          }
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?restore_pageshow_race=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    await inFlightExtractionStarted;
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: ["job_restore_pageshow_race"] },
+        { tab: { id: 77 } },
+        resolve
+      ), true);
+    });
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    const restored = lifecycle("pageshow");
+    await eventually(() => bindCalls >= 2 || port.messages.some((message) => message.payload?.phase === "content_script_recovering"));
+    rejectInFlightExtraction(new Error("poller exploded after worker restore"));
+    assert.equal((await restored).ok, true);
+    await eventually(() => port.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_restore_pageshow_race"
+    )));
+    assert.equal(port.messages.some((message) => message.type === "job_error" && message.job_id === "job_restore_pageshow_race"), false);
+    assert.equal(maxInFlightExtracts, 1, "exactly one poller may extract after rebind");
+    assert.equal(
+      port.messages.find((message) => message.type === "job_complete")?.payload.response,
+      "restored after pageshow race"
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker joins an extraction rejection delivered several tasks after recovery settles", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousAttempts = globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS;
+  const previousDelay = globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS;
+  globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS = 1;
+  globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS = 0;
+  const port = makePort();
+  let runtimeListener = null;
+  let tabId = 0;
+  let sent = false;
+  let recovered = false;
+  let uploadCalls = 0;
+  let sendCalls = 0;
+  let rejectInFlightExtraction;
+  let markInFlightExtractionStarted;
+  const inFlightExtractionStarted = new Promise((resolve) => {
+    markInFlightExtractionStarted = resolve;
+  });
+  const chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            if (recovered) {
+              throw new Error("Could not establish connection. Receiving end does not exist.");
+            }
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            uploadCalls += 1;
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sendCalls += 1;
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_bind_job":
+            recovered = true;
+            return { ok: true, payload: { rebound: true, url: "https://chatgpt.com/", title: "ChatGPT" } };
+          case "yoetz_extract_response":
+            if (sent && !recovered) {
+              markInFlightExtractionStarted();
+              return new Promise((_resolve, reject) => {
+                rejectInFlightExtraction = reject;
+              });
+            }
+            return {
+              ok: true,
+              payload: recovered
+                ? { method: "copy_scope_dom_fallback", text: "final after late rejection", is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0 }
+                : { method: "none", text: "", is_generating: true, assistant_count: 0, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?late_extract_reject=${Date.now()}`);
+    port.emit(envelope("job_start", "job_late_extract_reject", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 4000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_late_extract_reject", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_late_extract_reject.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => sent);
+    await inFlightExtractionStarted;
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: ["job_late_extract_reject"] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    assert.equal((await lifecycle("pageshow")).ok, true);
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "content_script_recovered"));
+    for (let i = 0; i < 5; i += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    rejectInFlightExtraction(new Error("The message channel closed before a response was received."));
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+    assert.equal(uploadCalls, 1);
+    assert.equal(sendCalls, 1);
+    assert.equal(
+      port.messages.find((message) => message.type === "job_complete")?.payload.response,
+      "final after late rejection"
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousAttempts === undefined) delete globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS;
+    else globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS = previousAttempts;
+    if (previousDelay === undefined) delete globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS;
+    else globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS = previousDelay;
+  }
+});
+
+test("service worker times out a parked suspension at the response deadline without probing", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousAttempts = globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS;
+  const previousDelay = globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS;
+  globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS = 2;
+  globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS = 20;
+  const port = makePort();
+  let runtimeListener = null;
+  let tabId = 0;
+  let sent = false;
+  let hidden = false;
+  let probesWhileHidden = 0;
+  let rejectInFlightExtraction;
+  let markInFlightExtractionStarted;
+  const inFlightExtractionStarted = new Promise((resolve) => {
+    markInFlightExtractionStarted = resolve;
+  });
+  const chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            if (hidden) {
+              probesWhileHidden += 1;
+              throw new Error("Could not establish connection. Receiving end does not exist.");
+            }
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_bind_job":
+            return { ok: true, payload: { rebound: true } };
+          case "yoetz_extract_response":
+            if (sent) {
+              markInFlightExtractionStarted();
+              return new Promise((_resolve, reject) => {
+                rejectInFlightExtraction = reject;
+              });
+            }
+            return { ok: true, payload: { method: "none", text: "", is_generating: true, assistant_count: 0, turn_index: -1 } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?park_deadline=${Date.now()}`);
+    port.emit(envelope("job_start", "job_park_deadline", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 250
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_park_deadline", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_park_deadline.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => sent);
+    await inFlightExtractionStarted;
+    await new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event: "pagehide", persisted: true, job_ids: ["job_park_deadline"] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    hidden = true;
+    rejectInFlightExtraction(new Error("The message channel closed before a response was received."));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "parked_for_pageshow"));
+    await eventually(() => port.messages.some((message) => (
+      message.type === "job_error" && message.job_id === "job_park_deadline"
+    )), 2000);
+    const errors = port.messages.filter((message) => (
+      message.type === "job_error" && message.job_id === "job_park_deadline"
+    ));
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].payload.code, "response_timeout");
+    assert.equal(errors[0].payload.message.includes("did not become ready"), false);
+    assert.equal(probesWhileHidden, 0, "deadline expiry must not run the reconnect probe loop");
   } finally {
     globalThis.chrome = originalChrome;
     if (previousAttempts === undefined) delete globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS;
@@ -7169,14 +7911,247 @@ test("service worker replays an undelivered persisted terminal envelope once on 
     await eventually(() => port.messages.some((message) => (
       message.type === "job_complete" && message.job_id === "job_terminal_replay"
     )));
+    const replayed = port.messages.find((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_replay"
+    ));
+    assert.equal(replayed.payload.sequence, 0);
     const persisted = (await storage.get("jobs.job_terminal_replay"))["jobs.job_terminal_replay"];
-    assert.ok(persisted.terminal_delivered_at);
+    assert.equal(persisted.terminal_delivered_at, null);
     assert.equal(port.messages.some((message) => message.job_id === "job_terminal_too_large"), false);
+
+    port.emit(envelope("terminal_ack", "job_terminal_replay", { sequence: 0 }));
+    await eventually(async () => {
+      const afterAck = (await storage.get("jobs.job_terminal_replay"))["jobs.job_terminal_replay"];
+      return Boolean(afterAck.terminal_delivered_at);
+    });
 
     port.messages.length = 0;
     port.emit(envelope("reconnect", "reconnect_after_terminal"));
     await eventually(() => port.messages.some((message) => message.type === "reconnect"));
     assert.equal(port.messages.some((message) => message.job_id === "job_terminal_replay"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker hello advertises the terminal_ack capability", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  globalThis.chrome = chromeStub({ port, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?hello_terminal_ack_capability=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    const hello = port.messages.find((message) => message.type === "hello");
+    assert.ok(hello.payload.capabilities.includes("terminal_ack"));
+    assert.deepEqual(hello.payload.recipes, ["chatgpt", "claude"]);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker terminal_ack marks a persisted envelope delivered so restore does not replay", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const terminalEnvelope = envelope("job_complete", "job_terminal_ack_before_restore", {
+    is_final: true,
+    response: "acked before restore",
+    sequence: 0
+  });
+  globalThis.chrome = chromeStub({ port, storage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_ack_before_restore=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+
+    await storage.set({
+      "jobs.job_terminal_ack_before_restore": {
+        job_id: "job_terminal_ack_before_restore",
+        run_id: "run_test",
+        workspace_id: "workspace_test",
+        capability_token: "cap_test",
+        status: "complete",
+        terminal_envelope: terminalEnvelope,
+        terminal_sequence: 0,
+        terminal_delivered_at: null,
+        started_at: Date.now(),
+        updated_at: Date.now()
+      }
+    });
+    port.emit(envelope("terminal_ack", "job_terminal_ack_before_restore", { sequence: 0 }));
+    await eventually(async () => {
+      const shard = (await storage.get("jobs.job_terminal_ack_before_restore"))["jobs.job_terminal_ack_before_restore"];
+      return Boolean(shard?.terminal_delivered_at);
+    });
+
+    port.messages.length = 0;
+    port.emit(envelope("reconnect", "reconnect_after_ack_before_restore"));
+    await eventually(() => port.messages.some((message) => message.type === "reconnect"));
+    assert.equal(port.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_ack_before_restore"
+    )), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker terminal_ack for an unknown job is a silent no-op", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  globalThis.chrome = chromeStub({ port, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_ack_unknown=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+    port.emit(envelope("terminal_ack", "job_terminal_ack_unknown", { sequence: 0 }));
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+    assert.equal(port.messages.some((message) => message.payload?.code === "unsupported_type"), false);
+    assert.equal(port.messages.length, 0);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker replay then terminal_ack then restart does not replay again", async () => {
+  const originalChrome = globalThis.chrome;
+  const firstPort = makePort();
+  const storage = makeStorage();
+  const terminalEnvelope = envelope("job_complete", "job_terminal_ack_restart", {
+    is_final: true,
+    response: "replay then ack",
+    sequence: 0
+  });
+  await storage.set({
+    "jobs.job_terminal_ack_restart": {
+      job_id: "job_terminal_ack_restart",
+      run_id: "run_test",
+      workspace_id: "workspace_test",
+      capability_token: "cap_test",
+      status: "complete",
+      terminal_envelope: terminalEnvelope,
+      terminal_sequence: 0,
+      terminal_delivered_at: null,
+      started_at: Date.now(),
+      updated_at: Date.now()
+    }
+  });
+  globalThis.chrome = chromeStub({ port: firstPort, storage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_ack_restart_first=${Date.now()}`);
+    await eventually(() => firstPort.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_ack_restart"
+    )));
+    const afterReplay = (await storage.get("jobs.job_terminal_ack_restart"))["jobs.job_terminal_ack_restart"];
+    assert.equal(afterReplay.terminal_delivered_at, null, "postNative is not a delivery receipt");
+    firstPort.emit(envelope("terminal_ack", "job_terminal_ack_restart", { sequence: 0 }));
+    await eventually(async () => {
+      const shard = (await storage.get("jobs.job_terminal_ack_restart"))["jobs.job_terminal_ack_restart"];
+      return Boolean(shard?.terminal_delivered_at);
+    });
+
+    const secondPort = makePort();
+    globalThis.chrome = chromeStub({ port: secondPort, storage, tabs: {} });
+    await import(`../src/service-worker.js?terminal_ack_restart_second=${Date.now()}`);
+    await eventually(() => secondPort.messages.some((message) => message.type === "hello"));
+    await new Promise((resolve) => setTimeout(resolve, 75));
+    assert.equal(secondPort.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_ack_restart"
+    )), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker terminal_ack marks a too-large persisted envelope delivered", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  await storage.set({
+    "jobs.job_terminal_ack_too_large": {
+      job_id: "job_terminal_ack_too_large",
+      status: "complete",
+      terminal_envelope_too_large: true,
+      terminal_sequence: 0,
+      terminal_delivered_at: null,
+      started_at: Date.now(),
+      updated_at: Date.now()
+    }
+  });
+  globalThis.chrome = chromeStub({ port, storage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_ack_too_large=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    assert.equal(port.messages.some((message) => message.job_id === "job_terminal_ack_too_large"), false);
+    port.emit(envelope("terminal_ack", "job_terminal_ack_too_large", { sequence: 0 }));
+    await eventually(async () => {
+      const shard = (await storage.get("jobs.job_terminal_ack_too_large"))["jobs.job_terminal_ack_too_large"];
+      return Boolean(shard?.terminal_delivered_at);
+    });
+    const shard = (await storage.get("jobs.job_terminal_ack_too_large"))["jobs.job_terminal_ack_too_large"];
+    assert.equal(shard.terminal_envelope_too_large, true);
+    assert.equal(shard.terminal_envelope, undefined);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker purges an aged unacked terminal shard instead of replaying it", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+  const agedAt = now - (3 * 60 * 60 * 1000) - 1000;
+  await storage.set({
+    "jobs.job_terminal_aged": {
+      job_id: "job_terminal_aged",
+      status: "complete",
+      terminal_envelope: envelope("job_complete", "job_terminal_aged", {
+        is_final: true,
+        response: "aged unacked"
+      }),
+      terminal_sequence: 0,
+      terminal_delivered_at: null,
+      terminal_at: agedAt,
+      started_at: agedAt,
+      // Fresh updated_at simulates restore/ACK-path churn so the generic TTL
+      // skip cannot hide an unbounded terminal replay.
+      updated_at: now
+    },
+    "jobs.job_terminal_fresh_unacked": {
+      job_id: "job_terminal_fresh_unacked",
+      status: "complete",
+      terminal_envelope: envelope("job_complete", "job_terminal_fresh_unacked", {
+        is_final: true,
+        response: "fresh unacked"
+      }),
+      terminal_sequence: 0,
+      terminal_delivered_at: null,
+      terminal_at: now,
+      started_at: now,
+      updated_at: now
+    }
+  });
+  globalThis.chrome = chromeStub({ port, storage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?terminal_ack_aged_purge=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    await eventually(() => port.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_fresh_unacked"
+    )));
+    assert.equal(port.messages.some((message) => (
+      message.type === "job_complete" && message.job_id === "job_terminal_aged"
+    )), false);
+    const aged = (await storage.get("jobs.job_terminal_aged"))["jobs.job_terminal_aged"];
+    const fresh = (await storage.get("jobs.job_terminal_fresh_unacked"))["jobs.job_terminal_fresh_unacked"];
+    assert.equal(aged, undefined);
+    assert.ok(fresh);
+    assert.equal(fresh.terminal_delivered_at, null);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -7940,6 +8915,168 @@ test("service worker resumes waiting_response jobs after service-worker restart"
     assert.equal(port.messages.filter((message) =>
       message.type === "job_complete" && message.job_id === "job_restore_waiting_response"
     ).length, 1);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker restores a waiting_response shard persisted while a poller lease was held", async () => {
+  const originalChrome = globalThis.chrome;
+  const firstPort = makePort();
+  const firstStorage = makeStorage();
+  const now = Date.now();
+  const provisionalConversationId = "WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d";
+  const assignedConversationId = "6a5f60dc-8174-8329-949a-1f282d1dccbd";
+  let firstExtractCount = 0;
+  await firstStorage.set({
+    "jobs.job_restore_lease_persist": {
+      job_id: "job_restore_lease_persist",
+      run_id: "run_job_restore_lease_persist",
+      workspace_id: "workspace_test",
+      status: "waiting_response",
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 4000,
+      tab_id: 88,
+      submitted_conversation_id: provisionalConversationId,
+      response_baseline: {
+        method: "none",
+        text: "",
+        is_generating: false,
+        assistant_count: 0,
+        turn_index: -1
+      },
+      submitted_user_count: 1,
+      submitted_assistant_count: 0,
+      started_at: now,
+      response_wait_started_at: now,
+      updated_at: now
+    }
+  });
+  globalThis.chrome = chromeStub({
+    port: firstPort,
+    storage: firstStorage,
+    tabs: {
+      create: async () => {
+        throw new Error("restore must reuse the submitted tab");
+      },
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_restore_lease_persist" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_bind_job":
+            return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT" } };
+          case "yoetz_extract_response": {
+            firstExtractCount += 1;
+            if (firstExtractCount === 1) {
+              return {
+                ok: true,
+                payload: {
+                  method: "assistant_dom_fallback",
+                  text: "I",
+                  is_generating: true,
+                  assistant_count: 1,
+                  copy_button_count: 0,
+                  has_copy_button: false,
+                  turn_index: 0,
+                  preceding_user_count: 1,
+                  conversation_id: assignedConversationId
+                }
+              };
+            }
+            return new Promise(() => {});
+          }
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  let persistedShard;
+  try {
+    await import(`../src/service-worker.js?restore_lease_persist_first=${Date.now()}`);
+    await eventually(() => firstPort.messages.some((message) => message.type === "hello"));
+    await eventually(async () => {
+      const shard = (await firstStorage.get("jobs.job_restore_lease_persist"))["jobs.job_restore_lease_persist"];
+      return shard?.submitted_conversation_id === assignedConversationId;
+    });
+    persistedShard = {
+      ...(await firstStorage.get("jobs.job_restore_lease_persist"))["jobs.job_restore_lease_persist"]
+    };
+    assert.equal(persistedShard.poller_lease, undefined, "poller_lease must not be durable");
+    assert.equal(persistedShard.poller_lease_seq, undefined, "poller_lease_seq must not be durable");
+  } catch (error) {
+    globalThis.chrome = originalChrome;
+    throw error;
+  }
+
+  const secondPort = makePort();
+  const secondStorage = makeStorage();
+  await secondStorage.set({
+    "jobs.job_restore_lease_persist": persistedShard
+  });
+  let secondExtractCount = 0;
+  globalThis.chrome = chromeStub({
+    port: secondPort,
+    storage: secondStorage,
+    tabs: {
+      create: async () => {
+        throw new Error("restore must reuse the submitted tab");
+      },
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_restore_lease_persist" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_bind_job":
+            return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT" } };
+          case "yoetz_extract_response": {
+            secondExtractCount += 1;
+            const streaming = {
+              method: "assistant_dom_fallback",
+              text: "I",
+              is_generating: true,
+              assistant_count: 1,
+              copy_button_count: 0,
+              has_copy_button: false,
+              turn_index: 0,
+              preceding_user_count: 1,
+              conversation_id: assignedConversationId
+            };
+            const complete = {
+              method: "assistant_dom_fallback",
+              text: "restored after lease persist",
+              is_generating: false,
+              assistant_count: 1,
+              copy_button_count: 1,
+              has_copy_button: true,
+              turn_index: 0,
+              preceding_user_count: 1,
+              conversation_id: assignedConversationId
+            };
+            return { ok: true, payload: secondExtractCount < 3 ? streaming : complete };
+          }
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?restore_lease_persist_second=${Date.now()}`);
+    await eventually(() => secondPort.messages.some((message) =>
+      message.type === "job_complete" && message.job_id === "job_restore_lease_persist"
+    ));
+    assert.equal(secondPort.messages.some((message) => (
+      message.type === "job_error" && message.job_id === "job_restore_lease_persist"
+    )), false);
+    assert.equal(
+      secondPort.messages.find((message) => message.type === "job_complete")?.payload.response,
+      "restored after lease persist"
+    );
   } finally {
     globalThis.chrome = originalChrome;
   }

@@ -422,6 +422,21 @@ export async function configureModelState(root, job = {}) {
   };
 }
 
+export async function resetModelSelectionState(root) {
+  if (!findPickerState(root)) {
+    return { reset: true, picker_was_open: false };
+  }
+  const modelButton = findModelButton(root) ?? root.activeElement ?? root.body;
+  if (!await closeModelPicker(root, modelButton)) {
+    throw chatgptCommandError(
+      "model_picker_close_failed",
+      "ChatGPT model picker remained open while resetting a restored model selection",
+      { phase: "model_selection", side_effect_started: false }
+    );
+  }
+  return { reset: true, picker_was_open: true };
+}
+
 function modelSelectionOptionsForJob(job = {}) {
   const options = {};
   const timeoutMs = Number(job?.model_selection_timeout_ms);
@@ -1006,8 +1021,8 @@ function effortIsMaxTier(state) {
 }
 
 function pillConfirmsEffortLabel(pillText, effortLabel) {
-  const foldedPill = foldedModelText(pillText);
-  const foldedEffort = foldedModelText(effortLabel);
+  const foldedPill = foldedModelText(pillText).replace(/\s+/g, " ");
+  const foldedEffort = foldedModelText(effortLabel).replace(/\s+/g, " ");
   return foldedPill === foldedEffort || foldedPill.endsWith(` ${foldedEffort}`);
 }
 

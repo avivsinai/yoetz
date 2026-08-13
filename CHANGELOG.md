@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.52] - 2026-08-13
+### Fixed
+
+- Native-extension model-selection restarts now recheck attempt ownership and
+  job liveness after awaited tail work so a stale attempt cannot resurrect a
+  terminal job or announce bundle readiness.
+- Native-extension GPT-5.6 effort verification now accepts the live two-line
+  composer pill while still requiring the exact verified maximum-tier label.
+- Native-extension model selection now closes stale picker state and restarts
+  from scratch after a persisted bfcache `pageshow`; only the restarted attempt
+  can advance or fail the pre-upload job.
+- Native host: terminal-envelope dedup (first-wins by job id) and
+  capability-gated terminal_ack; unrouted terminals stay replayable.
+- Native-extension ChatGPT/Claude jobs now park on a per-job pageshow gate when
+  a submitted tab is in bfcache instead of burning the 20s content-script probe
+  loop, and both poller catch paths join in-flight or settled recovery under a
+  single poller lease so a restored waiter cannot failJob a live rebound.
+- Native-extension terminal envelopes advertise `terminal_ack`, stamp
+  `payload.sequence`, and treat a host ACK as the delivery receipt so restore
+  replay stops only after the host confirms it received the envelope. Unacked
+  terminal shards older than the job TTL are purged instead of replayed.
+
+
 ## [0.5.51] - 2026-08-12
 ### Fixed
 
