@@ -8,6 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 ### Fixed
 
+- Native-extension GPT-5.6 effort verification now accepts the live two-line
+  composer pill while still requiring the exact verified maximum-tier label.
 - Native-extension model selection now closes stale picker state and restarts
   from scratch after a persisted bfcache `pageshow`; only the restarted attempt
   can advance or fail the pre-upload job.

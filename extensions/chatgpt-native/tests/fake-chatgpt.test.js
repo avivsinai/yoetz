@@ -2391,6 +2391,37 @@ test("GPT-5.6 Sol Advanced picker moves the scoped effort slider with End", asyn
   assert.equal(result.pill_text, "Extra High");
 });
 
+test("GPT-5.6 Sol Advanced picker verifies the live two-line composer pill", async () => {
+  const fixture = makeSolSliderFixture({
+    levels: ["Instant", "Medium", "High", "Heavy", "Extra High"],
+    initialValue: 5,
+    pillFamilyLabel: "5.6 Sol"
+  });
+  assert.equal(fixture.pill.innerText, "5.6 Sol\nExtra High");
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.effort_control.label, "extra high");
+  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+});
+
+test("GPT-5.6 Sol Advanced picker upgrades the live two-line Light pill", async () => {
+  const fixture = makeSolSliderFixture({
+    keyboardMode: "end",
+    levels: ["Instant", "Light", "Standard", "Heavy", "Extra High"],
+    initialValue: 2,
+    pillFamilyLabel: "5.6 Sol"
+  });
+  assert.equal(fixture.pill.innerText, "5.6 Sol\nLight");
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.effort_control.label, "extra high");
+  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+});
+
 test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum", async () => {
   const fixture = makeSolSliderFixture({
     keyboardMode: "end",
@@ -2810,7 +2841,8 @@ function makeSolSliderFixture({
   initialValue = 3,
   includeSpeedRows = false,
   transcriptEffortDecoy = null,
-  familyLabel = "GPT-5.6 Sol"
+  familyLabel = "GPT-5.6 Sol",
+  pillFamilyLabel = ""
 } = {}) {
   let currentValue = initialValue;
   let panel = null;
@@ -2822,6 +2854,7 @@ function makeSolSliderFixture({
   let familyMenu = null;
   let familyValueNode = null;
   const keyAttemptLog = [];
+  const pillTextForEffort = (label) => pillFamilyLabel ? `${pillFamilyLabel}\n${label}` : label;
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
   const body = new FakeElement("body", {}, "Ask anything").append(form);
@@ -2851,8 +2884,8 @@ function makeSolSliderFixture({
       effortLabel.innerText = `${label}, ${currentValue} of 5${valueTextSuffix}`;
       effortLabel.textContent = effortLabel.innerText;
     }
-    pill.innerText = label;
-    pill.textContent = label;
+    pill.innerText = pillTextForEffort(label);
+    pill.textContent = pill.innerText;
   };
   const makeEffortSlider = () => new FakeElement("div", {
     role: "slider",
@@ -3014,7 +3047,7 @@ function makeSolSliderFixture({
       if (event.key === "Escape") closePanel();
       if (animatedReveal && (event.key === "Enter" || event.key === " ")) togglePanel();
     }
-  }, levels[currentValue - 1]);
+  }, pillTextForEffort(levels[currentValue - 1]));
   form.append(pill);
   const doc = new FakeDocument(body);
 
