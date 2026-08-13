@@ -2388,7 +2388,7 @@ test("GPT-5.6 Sol Advanced picker moves the scoped effort slider with End", asyn
   assert.deepEqual(fixture.keyAttempts(), ["End"]);
   assert.equal(fixture.pointerAttempts(), 0);
   assert.equal(fixture.pickerOpen(), false);
-  assert.equal(result.pill_text, "Extra High");
+  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
 });
 
 test("GPT-5.6 Sol Advanced picker verifies the live two-line composer pill", async () => {
@@ -2434,7 +2434,7 @@ test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum",
   assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.requested_model, "gpt-5-6-sol-extra-high");
   assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
-  assert.equal(result.pill_text, "Pro");
+  assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
 test("GPT-5.6 Sol Advanced picker waits for an expanded Radix surface to finish animating", async () => {
@@ -2460,7 +2460,56 @@ test("GPT-5.6 Sol structurally trusts its controlled open picker in a frozen bac
   assert.equal(result.status, "selected");
   assert.equal(result.surface_trust, "aria_controls_structural");
   assert.equal(result.effort_control.value_text, "Extra High, 5 of 5");
+  assert.equal(result.family_label_source, "deepest_unique");
   assert.deepEqual(fixture.keyAttempts(), ["End"]);
+});
+
+test("GPT-5.6 Sol rejects differing structural family descendants as ambiguous", async () => {
+  const fixture = makeSolSliderFixture({
+    animatedReveal: true,
+    backgroundFrozen: true,
+    familyLabel: "GPT-5.5",
+    familyGhostLabels: ["GPT-5.6 Sol"],
+    initialValue: 5
+  });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "family_label_ambiguous");
+  assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol", "GPT-5.5"]);
+  assert.equal(fixture.familyClicks(), 0);
+});
+
+test("GPT-5.6 Sol accepts identical structural family ghosts and prefers the checked value node", async () => {
+  const fixture = makeSolSliderFixture({
+    animatedReveal: true,
+    backgroundFrozen: true,
+    familyGhostLabels: ["GPT-5.6 Sol"],
+    familyValueAttributes: { "data-state": "checked" },
+    initialValue: 5
+  });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
+
+  assert.equal(result.status, "selected");
+  assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol"]);
+  assert.equal(result.family_label_source, "data_state_checked");
+});
+
+test("GPT-5.6 Sol fails closed when the closed composer pill corroborates another family", async () => {
+  const fixture = makeSolSliderFixture({
+    animatedReveal: true,
+    backgroundFrozen: true,
+    initialValue: 5,
+    pillFamilyLabel: "5.5"
+  });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "family_composer_pill_unverified");
+  assert.equal(result.pill_text, "5.5\nExtra High");
 });
 
 test("GPT-5.6 Sol fails closed when the structural slider maximum has an unknown label", async () => {
@@ -2842,7 +2891,9 @@ function makeSolSliderFixture({
   includeSpeedRows = false,
   transcriptEffortDecoy = null,
   familyLabel = "GPT-5.6 Sol",
-  pillFamilyLabel = ""
+  familyGhostLabels = [],
+  familyValueAttributes = {},
+  pillFamilyLabel = "5.6 Sol"
 } = {}) {
   let currentValue = initialValue;
   let panel = null;
@@ -2962,7 +3013,11 @@ function makeSolSliderFixture({
           familyMenu = null;
         }
       } }, `Model\n${familyLabel}`)
-        .append(new FakeElement("div", {}, "Model"), (familyValueNode = new FakeElement("div", {}, familyLabel)))
+        .append(
+          new FakeElement("div", {}, "Model"),
+          ...familyGhostLabels.map((label) => new FakeElement("div", {}, label)),
+          (familyValueNode = new FakeElement("div", familyValueAttributes, familyLabel))
+        )
       : new FakeElement("button", { "aria-haspopup": "menu" }, "GPT-5.6 Sol");
     if (backgroundFrozen) {
       const group = new FakeElement("div", { role: "group", "data-testid": "composer-intelligence-picker-content" });
