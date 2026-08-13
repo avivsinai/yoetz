@@ -1,3 +1,5 @@
+
+
 # yoetz
 
 <p>
@@ -220,7 +222,7 @@ including `bundle.md`.
 ### Multimodal Input
 
 ```bash
-MODEL_ID=$(yoetz models resolve "gemini" --format json | jq -r '.[0].id')
+MODEL_ID=$(yoetz models frontier --family gemini --format json | jq -r '.[0].model.id')
 yoetz ask -p "Describe this diagram" --image diagram.png --provider gemini --model "$MODEL_ID" --format json
 yoetz ask -p "Summarize this clip" --video demo.mp4 --provider gemini --model "$MODEL_ID" --format json
 ```
