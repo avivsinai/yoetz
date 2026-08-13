@@ -201,6 +201,7 @@ async function handleContentLifecycle(message, sender) {
       }
       const attempt = Number(job.model_selection_attempt ?? 0) + 1;
       job.model_selection_attempt = attempt;
+      openSuspensionGate(job);
       job.content_script_suspended_at = null;
       job.updated_at = Date.now();
       await persistJob(job);
@@ -459,7 +460,36 @@ async function completeModelSelection(job, tabId, attempt, options = {}) {
     if (staleSelectionAttempt(job, attempt)) {
       return;
     }
-    throw error;
+    if (
+      options.selectionRecoveryRetried
+      || !isRecoverableContentScriptError(error)
+    ) {
+      throw error;
+    }
+    try {
+      await recoverContentScriptJob(job, error, { source: "model_selection" });
+    } catch (recoveryError) {
+      if (staleSelectionAttempt(job, attempt)) {
+        return;
+      }
+      throw recoveryError;
+    }
+    forgetSettledSuccessfulRecovery(job.job_id);
+    if (staleSelectionAttempt(job, attempt)) {
+      return;
+    }
+    const retryAttempt = Number(job.model_selection_attempt ?? 0) + 1;
+    job.model_selection_attempt = retryAttempt;
+    job.updated_at = Date.now();
+    await persistJob(job);
+    if (staleSelectionAttempt(job, retryAttempt)) {
+      return;
+    }
+    return completeModelSelection(job, tabId, retryAttempt, {
+      ...options,
+      reset: true,
+      selectionRecoveryRetried: true
+    });
   }
   if (staleSelectionAttempt(job, attempt)) {
     return;
