@@ -1021,8 +1021,8 @@ function effortIsMaxTier(state) {
 }
 
 function pillConfirmsEffortLabel(pillText, effortLabel) {
-  const foldedPill = foldedModelText(pillText);
-  const foldedEffort = foldedModelText(effortLabel);
+  const foldedPill = foldedModelText(pillText).replace(/\s+/g, " ");
+  const foldedEffort = foldedModelText(effortLabel).replace(/\s+/g, " ");
   return foldedPill === foldedEffort || foldedPill.endsWith(` ${foldedEffort}`);
 }
 
