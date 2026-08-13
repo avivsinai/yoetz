@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 ### Fixed
 
+- Native-extension model-selection restarts now recheck attempt ownership and
+  job liveness after awaited tail work so a stale attempt cannot resurrect a
+  terminal job or announce bundle readiness.
 - Native-extension GPT-5.6 effort verification now accepts the live two-line
   composer pill while still requiring the exact verified maximum-tier label.
 - Native-extension model selection now closes stale picker state and restarts

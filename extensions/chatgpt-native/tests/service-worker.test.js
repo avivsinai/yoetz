@@ -6350,6 +6350,107 @@ test("service worker keeps the fail-closed model-selection result when bfcache r
   }
 });
 
+test("service worker does not resurrect a terminal model selection from a stale post-configure tail", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  let runtimeListener = null;
+  let tabId = 0;
+  let configureCalls = 0;
+  let releaseAttemptTwoGrouping;
+  let markAttemptTwoGroupingStarted;
+  const attemptTwoGroupingStarted = new Promise((resolve) => {
+    markAttemptTwoGroupingStarted = resolve;
+  });
+  const failedSelection = {
+    status: "unavailable",
+    model_used: null,
+    requested_model: "gpt-5-6-sol-extra-high",
+    family_status: "unverified",
+    effort_status: "unverified",
+    failure_reason: "model_picker_open_failed",
+    warning: "ChatGPT GPT-5.6 model picker did not open"
+  };
+  let resolveInitialSelection;
+  const chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      group: async () => {
+        markAttemptTwoGroupingStarted();
+        return new Promise((resolve) => {
+          releaseAttemptTwoGrouping = () => resolve(1);
+        });
+      },
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            configureCalls += 1;
+            if (configureCalls === 1) {
+              return new Promise((resolve) => {
+                resolveInitialSelection = resolve;
+              });
+            }
+            return {
+              ok: true,
+              payload: configureCalls === 2 ? verifiedSolProSelection() : failedSelection
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?bfcache_model_tail_liveness=${Date.now()}`);
+    const jobId = "job_bfcache_model_tail_liveness";
+    port.emit(envelope("job_start", jobId, { prompt: "prompt" }));
+    await eventually(() => configureCalls === 1);
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: [jobId] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    const attemptTwoPageshow = lifecycle("pageshow");
+    await attemptTwoGroupingStarted;
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    assert.equal((await lifecycle("pageshow")).ok, true);
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+
+    releaseAttemptTwoGrouping();
+    assert.equal((await attemptTwoPageshow).ok, true);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    resolveInitialSelection({ ok: true, payload: verifiedSolProSelection() });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const persisted = await storage.get(`jobs.${jobId}`);
+    assert.equal(persisted[`jobs.${jobId}`].status, "failed");
+    const errorIndex = port.messages.findIndex((message) => message.type === "job_error");
+    assert.notEqual(errorIndex, -1);
+    assert.equal(
+      port.messages.slice(errorIndex + 1).some((message) => message.payload?.phase === "ready_for_file"),
+      false
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker idempotently rebinds a persisted bfcache restore without replaying side effects", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

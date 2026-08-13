@@ -456,12 +456,12 @@ async function completeModelSelection(job, tabId, attempt, options = {}) {
       reset: options.reset === true
     });
   } catch (error) {
-    if (Number(job.model_selection_attempt) !== attempt) {
+    if (staleSelectionAttempt(job, attempt)) {
       return;
     }
     throw error;
   }
-  if (Number(job.model_selection_attempt) !== attempt) {
+  if (staleSelectionAttempt(job, attempt)) {
     return;
   }
   job.model_used = modelSelection.model_used ?? null;
@@ -496,12 +496,25 @@ async function completeModelSelection(job, tabId, attempt, options = {}) {
   }
 
   await maybeGroupTab(tabId, job);
+  if (staleSelectionAttempt(job, attempt)) {
+    return;
+  }
   job.status = "waiting_for_file";
   job.updated_at = Date.now();
   await persistJob(job);
+  if (staleSelectionAttempt(job, attempt)) {
+    return;
+  }
   if (!postNative(progress(job, "ready_for_file", { tab_id: tabId, message: `${adapter.displayName} tab is ready for bundle upload` }))) {
     await recordTerminalDeliveryLost(job, "upload");
   }
+}
+
+function staleSelectionAttempt(job, attempt) {
+  return Number(job.model_selection_attempt) !== attempt
+    || !jobs.has(job.job_id)
+    || TERMINAL_STATUSES.has(job.status)
+    || job.cancelled;
 }
 
 function modelSelectionFailureDiagnostics(selection) {
