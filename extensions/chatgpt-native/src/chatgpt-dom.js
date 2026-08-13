@@ -388,6 +388,8 @@ export async function configureModelState(root, job = {}) {
       effort_move_method: null,
       pill_text: pillText ?? "",
       family_label: null,
+      family_label_candidates: [],
+      family_label_source: null,
       effort_options: [],
       warning: "model pinning bypassed — answer may come from any model",
       warnings: []
@@ -416,6 +418,8 @@ export async function configureModelState(root, job = {}) {
     effort_move_method: selection.effort_move_method ?? null,
     pill_text: selection.pill_text ?? null,
     family_label: selection.family_label ?? null,
+    family_label_candidates: selection.family_label_candidates ?? [],
+    family_label_source: selection.family_label_source ?? null,
     effort_options: selection.effort_options ?? [],
     warning: warnings[0] ?? null,
     warnings
@@ -568,6 +572,8 @@ async function selectSolMaxTierModel(root, options = {}) {
       warning: "ChatGPT GPT-5.6 model picker did not open"
     };
   }
+  let ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
+  if (ambiguityFailure) return ambiguityFailure;
 
   if (!familyIsSol(state.family_label)) {
     const familyMenu = await openFamilyPicker(root, state.menu ?? state.surface, state.family_trigger, options);
@@ -589,6 +595,8 @@ async function selectSolMaxTierModel(root, options = {}) {
     if (!state) {
       return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting GPT-5.6 Sol", "model_picker_reopen_failed");
     }
+    ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
+    if (ambiguityFailure) return ambiguityFailure;
   }
 
   if (!effortIsMaxTier(state)) {
@@ -621,9 +629,13 @@ async function selectSolMaxTierModel(root, options = {}) {
       if (!state) {
         return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting the maximum effort tier", "model_picker_reopen_failed");
       }
+      ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
+      if (ambiguityFailure) return ambiguityFailure;
     }
   }
 
+  ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
+  if (ambiguityFailure) return ambiguityFailure;
   const familyVerified = familyIsSol(state.family_label);
   const effortVerified = effortIsMaxTier(state);
   if (!familyVerified || !effortVerified) {
@@ -638,6 +650,9 @@ async function selectSolMaxTierModel(root, options = {}) {
   const verifiedEffortLabel = state.shape === "slider"
     ? sliderEffortSnapshot(state.effort_slider, state.surface)?.display_label
     : normalizeText(textOf(state.effort_items.find((item) => itemIsChecked(item))));
+  if (state.shape === "slider" && !pillConfirmsFamilyLabel(pillText, state.family_label)) {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm GPT-5.6 Sol after closing the slider picker", "family_composer_pill_unverified");
+  }
   if (state.shape === "slider" && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel)) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm the verified maximum tier after closing the slider picker", "effort_composer_pill_unverified");
   }
@@ -654,10 +669,25 @@ async function selectSolMaxTierModel(root, options = {}) {
     effort_move_method: state.effort_move_method ?? null,
     pill_text: pillText,
     family_label: state.family_label,
+    family_label_candidates: state.family_label_candidates ?? [],
+    family_label_source: state.family_label_source ?? null,
     available_options: state.effort_items.map((item) => textOf(item)).filter(Boolean),
     available_families: availableFamilies,
     effort_options: effortDiagnostics(state.effort_items)
   };
+}
+
+async function familyAmbiguityFailure(root, base, modelButton, state, availableFamilies) {
+  if (!state?.family_label_ambiguous) return null;
+  await closeModelPicker(root, modelButton);
+  return selectionFailure(
+    base,
+    modelButton,
+    state,
+    availableFamilies,
+    "ChatGPT family control exposed conflicting current-model labels",
+    "family_label_ambiguous"
+  );
 }
 
 async function waitForModelButton(root, options = {}) {
@@ -933,11 +963,13 @@ function readSliderPickerState(root, structurallyTrustedSurface = null) {
   const surface = structurallyTrustedSurface ?? findAdvancedPickerSurface(root);
   if (!surface) return null;
   const structurallyTrusted = Boolean(structurallyTrustedSurface);
+  let familyEvidence = null;
   const familyTrigger = Array.from(surface.querySelectorAll('[role="menuitem"], button'))
     .find((item) => {
-      const label = structurallyTrusted ? structuralFamilyLabel(item) : normalizeText(textOf(item));
-      return Boolean(label)
-        && /^(?:gpt|o\d)\b/i.test(label)
+      const evidence = structurallyTrusted ? structuralFamilyEvidence(item) : null;
+      const label = evidence?.label ?? normalizeText(textOf(item));
+      if (evidence?.label || evidence?.ambiguous) familyEvidence = evidence;
+      return (evidence?.ambiguous || (Boolean(label) && /^(?:gpt|o\d)\b/i.test(label)))
         && (structurallyTrusted || isVisible(item, { allowDisabled: true }));
     });
   const effortSlider = Array.from(surface.querySelectorAll('[role="slider"]'))
@@ -948,7 +980,10 @@ function readSliderPickerState(root, structurallyTrustedSurface = null) {
     menu: null,
     surface,
     family_trigger: familyTrigger ?? null,
-    family_label: structurallyTrusted ? structuralFamilyLabel(familyTrigger) : textOf(familyTrigger),
+    family_label: structurallyTrusted ? familyEvidence?.label ?? "" : textOf(familyTrigger),
+    family_label_candidates: structurallyTrusted ? familyEvidence?.labels ?? [] : [],
+    family_label_source: structurallyTrusted ? familyEvidence?.source ?? null : null,
+    family_label_ambiguous: structurallyTrusted ? familyEvidence?.ambiguous ?? false : false,
     effort_items: [],
     effort_slider: effortSlider,
     effort_move_method: null,
@@ -1026,6 +1061,11 @@ function pillConfirmsEffortLabel(pillText, effortLabel) {
   return foldedPill === foldedEffort || foldedPill.endsWith(` ${foldedEffort}`);
 }
 
+function pillConfirmsFamilyLabel(pillText, familyLabel) {
+  const firstLine = normalizeText(pillText).split("\n", 1)[0];
+  return foldedFamilyLabel(firstLine) === foldedFamilyLabel(familyLabel);
+}
+
 function sliderEffortSnapshot(slider, surface = null) {
   if (!slider) return null;
   const valueText = normalizeText(slider.getAttribute?.("aria-valuetext") ?? "");
@@ -1055,12 +1095,44 @@ function effortLabelNearSlider(slider, surface) {
   return "";
 }
 
-function structuralFamilyLabel(control) {
-  if (!control || control.getAttribute?.("aria-haspopup") !== "menu") return "";
-  if (!/\bModel\b/i.test(textOf(control))) return "";
-  return Array.from(control.querySelectorAll?.("*") ?? [])
-    .map((node) => normalizeText(textOf(node)))
-    .find((text) => /^(?:gpt|o\d)\b/i.test(text)) ?? "";
+function structuralFamilyEvidence(control) {
+  const empty = { label: "", labels: [], source: null, ambiguous: false };
+  if (!control || control.getAttribute?.("aria-haspopup") !== "menu") return empty;
+  if (!/\bModel\b/i.test(textOf(control))) return empty;
+  const matches = Array.from(control.querySelectorAll?.("*") ?? [])
+    .map((node) => ({ node, label: normalizeText(textOf(node)) }))
+    .filter(({ label }) => /^(?:gpt|o\d)\b/i.test(label));
+  const labelsByFold = new Map();
+  for (const match of matches) {
+    const folded = foldedModelText(match.label);
+    if (!labelsByFold.has(folded)) labelsByFold.set(folded, match.label);
+  }
+  const labels = [...labelsByFold.values()];
+  if (labels.length > 1) {
+    return { label: "", labels, source: null, ambiguous: true };
+  }
+  if (matches.length === 0) return empty;
+  const explicit = matches.find(({ node }) => {
+    const ariaCurrent = normalizeText(node.getAttribute?.("aria-current") ?? "").toLowerCase();
+    return (ariaCurrent && ariaCurrent !== "false") || node.getAttribute?.("data-state") === "checked";
+  });
+  const selected = explicit ?? matches.reduce((deepest, match) => (
+    descendantDepth(match.node, control) >= descendantDepth(deepest.node, control) ? match : deepest
+  ));
+  const source = explicit
+    ? (selected.node.getAttribute?.("data-state") === "checked" ? "data_state_checked" : "aria_current")
+    : "deepest_unique";
+  return { label: selected.label, labels, source, ambiguous: false };
+}
+
+function descendantDepth(node, ancestor) {
+  let depth = 0;
+  for (let current = node; current && current !== ancestor; current = current.parentElement) depth += 1;
+  return depth;
+}
+
+function foldedFamilyLabel(value) {
+  return foldedModelText(value).replace(/\s+/g, " ").replace(/^gpt[\s-]*/, "");
 }
 
 function sliderEffortDiagnostics(slider, surface = null) {
@@ -1273,6 +1345,8 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     effort_move_method: state?.effort_move_method ?? null,
     pill_text: modelControlLabel(modelButton),
     family_label: state?.family_label ?? null,
+    family_label_candidates: state?.family_label_candidates ?? [],
+    family_label_source: state?.family_label_source ?? null,
     available_options: state?.effort_items?.map((item) => textOf(item)).filter(Boolean) ?? [],
     available_families: availableFamilies,
     effort_options: effortDiagnostics(state?.effort_items ?? []),
