@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- Native-extension model selection now runs one bounded content-script recovery
+  when a `selecting_model` configure send hits a recoverable port error, then
+  retries selection exactly once instead of terminalizing the pre-upload job.
 
 ## [0.5.52] - 2026-08-13
 ### Fixed
