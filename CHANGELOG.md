@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.52] - 2026-08-13
 ### Fixed
 
 - Native-extension model-selection restarts now recheck attempt ownership and
@@ -26,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `payload.sequence`, and treat a host ACK as the delivery receipt so restore
   replay stops only after the host confirms it received the envelope. Unacked
   terminal shards older than the job TTL are purged instead of replayed.
+
 
 ## [0.5.51] - 2026-08-12
 ### Fixed
