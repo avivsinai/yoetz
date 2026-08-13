@@ -6184,6 +6184,172 @@ test("service worker rebinds owned tab after content script reload during respon
   }
 });
 
+test("service worker restarts model selection from scratch after persisted bfcache pageshow", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let runtimeListener = null;
+  let tabId = 0;
+  let resolveSuspendedSelection;
+  let markSuspendedSelectionStarted;
+  const suspendedSelectionStarted = new Promise((resolve) => {
+    markSuspendedSelectionStarted = resolve;
+  });
+  const configureCalls = [];
+  const chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            configureCalls.push({ reset: message.reset, attempt: message.job.model_selection_attempt });
+            if (configureCalls.length === 1) {
+              markSuspendedSelectionStarted();
+              return new Promise((resolve) => {
+                resolveSuspendedSelection = resolve;
+              });
+            }
+            return { ok: true, payload: verifiedSolProSelection() };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?bfcache_model_restart=${Date.now()}`);
+    port.emit(envelope("job_start", "job_bfcache_model_restart", { prompt: "prompt" }));
+    await suspendedSelectionStarted;
+
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: ["job_bfcache_model_restart"] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    assert.equal((await lifecycle("pageshow")).ok, true);
+
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    assert.deepEqual(configureCalls, [
+      { reset: false, attempt: 1 },
+      { reset: true, attempt: 2 }
+    ]);
+    assert.equal(
+      port.messages.filter((message) => message.payload?.phase === "model_selection_restarting").length,
+      1
+    );
+
+    resolveSuspendedSelection({
+      ok: true,
+      payload: {
+        status: "unavailable",
+        requested_model: "gpt-5-6-sol-extra-high",
+        failure_reason: "stale_suspended_attempt"
+      }
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(port.messages.filter((message) => message.payload?.phase === "ready_for_file").length, 1);
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker keeps the fail-closed model-selection result when bfcache restart fails", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let runtimeListener = null;
+  let tabId = 0;
+  let resolveSuspendedSelection;
+  let markSuspendedSelectionStarted;
+  const suspendedSelectionStarted = new Promise((resolve) => {
+    markSuspendedSelectionStarted = resolve;
+  });
+  let configureCalls = 0;
+  const failedSelection = {
+    status: "unavailable",
+    model_used: null,
+    requested_model: "gpt-5-6-sol-extra-high",
+    family_status: "unverified",
+    effort_status: "unverified",
+    failure_reason: "model_picker_open_failed",
+    warning: "ChatGPT GPT-5.6 model picker did not open"
+  };
+  const chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            configureCalls += 1;
+            if (configureCalls === 1) {
+              markSuspendedSelectionStarted();
+              return new Promise((resolve) => {
+                resolveSuspendedSelection = resolve;
+              });
+            }
+            assert.equal(message.reset, true);
+            return { ok: true, payload: failedSelection };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+  chrome.runtime.onMessage.addListener = (listener) => {
+    runtimeListener = listener;
+  };
+  globalThis.chrome = chrome;
+
+  try {
+    await import(`../src/service-worker.js?bfcache_model_restart_failed=${Date.now()}`);
+    port.emit(envelope("job_start", "job_bfcache_model_restart_failed", { prompt: "prompt" }));
+    await suspendedSelectionStarted;
+    const lifecycle = (event) => new Promise((resolve) => {
+      assert.equal(runtimeListener(
+        { type: "yoetz_content_lifecycle", event, persisted: true, job_ids: ["job_bfcache_model_restart_failed"] },
+        { tab: { id: tabId } },
+        resolve
+      ), true);
+    });
+    assert.equal((await lifecycle("pagehide")).ok, true);
+    assert.equal((await lifecycle("pageshow")).ok, true);
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.payload.code, "model_selection_failed");
+    assert.equal(error.payload.phase, "model_selection");
+    assert.equal(error.payload.side_effect_started, false);
+    assert.equal(error.payload.failure_reason, failedSelection.failure_reason);
+    assert.deepEqual(error.payload.model_selection, failedSelection);
+
+    resolveSuspendedSelection({ ok: true, payload: verifiedSolProSelection() });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
+    assert.equal(port.messages.filter((message) => message.type === "job_error").length, 1);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker idempotently rebinds a persisted bfcache restore without replaying side effects", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

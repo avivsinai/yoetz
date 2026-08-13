@@ -195,6 +195,29 @@ async function handleContentLifecycle(message, sender) {
 
   let rebound = 0;
   for (const job of ownedJobs) {
+    if (job.status === "selecting_model") {
+      if (!job.content_script_suspended_at) {
+        continue;
+      }
+      const attempt = Number(job.model_selection_attempt ?? 0) + 1;
+      job.model_selection_attempt = attempt;
+      job.content_script_suspended_at = null;
+      job.updated_at = Date.now();
+      await persistJob(job);
+      postNative(progress(job, "model_selection_restarting", {
+        tab_id: tabId,
+        persisted: true,
+        attempt,
+        message: "owned background tab returned from bfcache; restarting model selection from a closed picker"
+      }));
+      try {
+        await completeModelSelection(job, tabId, attempt, { reset: true });
+      } catch (error) {
+        await handlePollerError(job, error);
+      }
+      rebound += 1;
+      continue;
+    }
     if (job.status !== "waiting_response") {
       continue;
     }
@@ -417,9 +440,30 @@ async function startJob(message) {
     return;
   }
   job.status = "selecting_model";
+  job.model_selection_attempt = Number(job.model_selection_attempt ?? 0) + 1;
   job.updated_at = Date.now();
   await persistJob(job);
-  const modelSelection = await sendToTab(tab.id, { type: "yoetz_configure_model", job });
+  await completeModelSelection(job, tab.id, job.model_selection_attempt);
+}
+
+async function completeModelSelection(job, tabId, attempt, options = {}) {
+  const adapter = adapterForJob(job);
+  let modelSelection;
+  try {
+    modelSelection = await sendToTab(tabId, {
+      type: "yoetz_configure_model",
+      job,
+      reset: options.reset === true
+    });
+  } catch (error) {
+    if (Number(job.model_selection_attempt) !== attempt) {
+      return;
+    }
+    throw error;
+  }
+  if (Number(job.model_selection_attempt) !== attempt) {
+    return;
+  }
   job.model_used = modelSelection.model_used ?? null;
   job.model_selection_status = modelSelection.status ?? "unavailable";
   job.warnings = [
@@ -451,11 +495,11 @@ async function startJob(message) {
     return;
   }
 
-  await maybeGroupTab(tab.id, job);
+  await maybeGroupTab(tabId, job);
   job.status = "waiting_for_file";
   job.updated_at = Date.now();
   await persistJob(job);
-  if (!postNative(progress(job, "ready_for_file", { tab_id: tab.id, message: `${adapter.displayName} tab is ready for bundle upload` }))) {
+  if (!postNative(progress(job, "ready_for_file", { tab_id: tabId, message: `${adapter.displayName} tab is ready for bundle upload` }))) {
     await recordTerminalDeliveryLost(job, "upload");
   }
 }

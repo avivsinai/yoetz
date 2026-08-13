@@ -5,6 +5,7 @@ import {
   classifyBlockingState,
   clickSend,
   configureModelState,
+  resetModelSelectionState,
   ensureConversationLoaded,
   ensureFreshChat,
   extractResponse,
@@ -883,6 +884,17 @@ test("fake Claude model picker keeps shared menu visibility semantics for offscr
     globalThis.MouseEvent = previousMouseEvent;
     globalThis.KeyboardEvent = previousKeyboardEvent;
   }
+});
+
+test("restored Claude model selection closes an open picker before restart", async () => {
+  const fixture = makeClaudeModelFixture();
+  fixture.modelButton.click();
+  assert.equal(fixture.modelButton.getAttribute("aria-expanded"), "true");
+
+  const result = await resetModelSelectionState(fixture.root);
+
+  assert.deepEqual(result, { reset: true, picker_was_open: true });
+  assert.equal(fixture.modelButton.getAttribute("aria-expanded"), "false");
 });
 
 test("fake Claude model picker reclassifies credits immediately after Fable selection", async () => {
