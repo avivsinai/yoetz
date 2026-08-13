@@ -12,6 +12,7 @@ import {
   insertPrompt,
   isResponseGenerating,
   modelSelectionDiagnostics,
+  resetModelSelectionState,
   sendAcceptanceBaseline,
   uploadFile,
   waitForSendAccepted
@@ -2246,6 +2247,17 @@ test("GPT-5.6 Sol picker upgrades High effort to Extra High and verifies both pr
   assert.equal(fixture.effortClicks(), 1);
   assert.ok(fixture.mainOpens() >= 2, "selection must reopen the picker to verify");
   assert.equal(fixture.menusOpen(), 0, "verification must leave the picker closed");
+});
+
+test("restored ChatGPT model selection closes an open picker before restart", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "High" });
+  fixture.pill.onPointerDown();
+  assert.equal(fixture.menusOpen(), 1);
+
+  const result = await resetModelSelectionState(fixture.doc);
+
+  assert.deepEqual(result, { reset: true, picker_was_open: true });
+  assert.equal(fixture.menusOpen(), 0);
 });
 
 test("GPT-5.6 Sol picker switches GPT-5.5 Instant to Sol Extra High", async () => {

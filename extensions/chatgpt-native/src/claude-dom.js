@@ -467,6 +467,23 @@ export async function configureModelState(root, job = {}) {
   };
 }
 
+export async function resetModelSelectionState(root) {
+  const modelButton = root.querySelector(MODEL_SELECTOR);
+  if (!modelButton) {
+    return { reset: true, picker_was_open: false };
+  }
+  const pickerWasOpen = modelButton.getAttribute("aria-expanded") === "true"
+    || Boolean(root.querySelector("[role='menu']"));
+  if (pickerWasOpen && !await closeModelMenu(root, modelButton)) {
+    throw commandError(
+      "model_picker_close_failed",
+      "Claude model picker remained open while resetting a restored model selection",
+      { phase: "model_selection", side_effect_started: false }
+    );
+  }
+  return { reset: true, picker_was_open: pickerWasOpen };
+}
+
 export async function clickSend(root, options = {}) {
   const send = await waitForClaudeState(root, () => {
     const candidate = findSendButton(root);

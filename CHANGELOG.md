@@ -8,6 +8,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 ### Fixed
 
+- Native-extension model selection now closes stale picker state and restarts
+  from scratch after a persisted bfcache `pageshow`; only the restarted attempt
+  can advance or fail the pre-upload job.
+- Native host: terminal-envelope dedup (first-wins by job id) and
+  capability-gated terminal_ack; unrouted terminals stay replayable.
 - Native-extension ChatGPT/Claude jobs now park on a per-job pageshow gate when
   a submitted tab is in bfcache instead of burning the 20s content-script probe
   loop, and both poller catch paths join in-flight or settled recovery under a
