@@ -106,7 +106,7 @@ export async function uploadFile(_document, file, options) {
   if (hooks.uploadFileError) {
     throw hooks.uploadFileError;
   }
-  return true;
+  return hooks.uploadFileResult ?? { upload_commit_signal: "send_enabled" };
 }
 
 export function configureModelState(_document, job) {
@@ -213,6 +213,7 @@ test("content script resume path skips fresh enforcement and completes on reques
       }
     });
     assert.equal(uploaded.ok, true);
+    assert.equal(uploaded.payload.upload_commit_signal, "send_enabled");
     assert.equal(hooks.uploadFileCalls.length, 1);
 
     const configured = await send({ type: "yoetz_configure_model", job });

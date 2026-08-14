@@ -651,7 +651,7 @@ async function runJobWithFile(job, file) {
   job.status = "uploading_file";
   job.updated_at = Date.now();
   await persistJob(job);
-  await sendToTab(job.tab_id, {
+  const uploadResult = await sendToTab(job.tab_id, {
     type: "yoetz_upload_file",
     job,
     file: {
@@ -665,6 +665,9 @@ async function runJobWithFile(job, file) {
   if (!postNative(progress(job, "file_uploaded", {
     filename: file.filename,
     bytes: file.bytes.byteLength,
+    ...(uploadResult?.upload_commit_signal
+      ? { upload_commit_signal: uploadResult.upload_commit_signal }
+      : {}),
     message: `bundle uploaded (${file.bytes.byteLength} bytes); sending prompt`
   }))) {
     await recordTerminalDeliveryLost(job, "upload");

@@ -228,8 +228,7 @@ export async function uploadFile(root, file, options = {}) {
   input.files = dataTransfer.files;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
-  await waitForUploadComplete(root, file, { ...options, baselineAttachments });
-  return true;
+  return waitForUploadComplete(root, file, { ...options, baselineAttachments });
 }
 
 export async function ensureFreshChat(root = document, job = {}, options = {}) {
@@ -2274,9 +2273,14 @@ async function waitForUploadComplete(root, file, options = {}) {
   const intervalMs = Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS);
   const baselineAttachments = options.baselineAttachments ?? new Set();
   const requiredStableTicks = Math.max(1, Number(options.requiredStableTicks ?? 2));
+  const emptyComposerVariantStableTicks = Math.max(
+    1,
+    Number(options.emptyComposerVariantStableTicks ?? 8)
+  );
   const startedAt = Date.now();
   let lastState = "";
-  let stableTicks = 0;
+  let enabledTicks = 0;
+  let emptyComposerVariantTicks = 0;
   while (Date.now() - startedAt < timeoutMs) {
     const error = uploadErrorText(root);
     if (error) {
@@ -2284,21 +2288,55 @@ async function waitForUploadComplete(root, file, options = {}) {
     }
     const attached = hasAttachmentNamed(root, file.name, baselineAttachments);
     const pending = hasUploadPending(root);
-    // The attachment chip is the only reliable pre-prompt signal. ChatGPT's
-    // current UI keeps Send disabled while the composer is empty, so using
-    // Send as an upload-commit signal deadlocks before insertPrompt runs.
-    lastState = `attached=${attached}, pending=${pending}, diagnostics=${sendReadinessDiagnostics(root)}`;
+    const sendControl = findSendButtonControl(root, { requireEnabled: false });
+    const sendEnabled = Boolean(sendControl && isEnabled(sendControl));
+    const legacyCommitSignal = uploadCommitted(root);
+    const emptyComposerVariant = Boolean(
+      sendControl
+      && !sendEnabled
+      && !editableText(findComposer(root))
+    );
+    lastState = `attached=${attached}, pending=${pending}, send_enabled=${sendEnabled}, empty_composer_variant=${emptyComposerVariant}, diagnostics=${sendReadinessDiagnostics(root)}`;
     if (attached && !pending) {
-      stableTicks += 1;
-      if (stableTicks >= requiredStableTicks) {
-        return true;
+      // Older ChatGPT variants enable Send once the attachment is committed,
+      // even with an empty composer. Keep that stronger signal as the fast path.
+      if (legacyCommitSignal) {
+        enabledTicks += 1;
+        emptyComposerVariantTicks = 0;
+        if (enabledTicks >= requiredStableTicks) {
+          return { upload_commit_signal: "send_enabled" };
+        }
+      } else if (emptyComposerVariant) {
+        // Newer variants keep Send disabled until prompt text exists. A bounded
+        // run of a committed chip, no pending marker, a present disabled Send,
+        // and an empty composer distinguishes that UI from a transient upload.
+        enabledTicks = 0;
+        emptyComposerVariantTicks += 1;
+        if (emptyComposerVariantTicks >= emptyComposerVariantStableTicks) {
+          return { upload_commit_signal: "empty_composer_variant" };
+        }
+      } else {
+        enabledTicks = 0;
+        emptyComposerVariantTicks = 0;
       }
     } else {
-      stableTicks = 0;
+      enabledTicks = 0;
+      emptyComposerVariantTicks = 0;
     }
     await sleep(intervalMs);
   }
   throw new Error(`ChatGPT file upload did not complete for ${file.name} (${lastState})`);
+}
+
+// Before prompt insertion, older ChatGPT variants expose upload commitment by
+// enabling Send. If a minimal DOM has no Send control, preserve the historical
+// chip-only fallback instead of blocking the upload step indefinitely.
+function uploadCommitted(root) {
+  const present = findSendButtonControl(root, { requireEnabled: false });
+  if (!present) {
+    return true;
+  }
+  return Boolean(findSendButtonControl(root, { requireEnabled: true }));
 }
 
 async function openAttachmentUi(root, options = {}) {

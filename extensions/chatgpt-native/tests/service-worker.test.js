@@ -3228,7 +3228,14 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
           case "yoetz_configure_model":
             return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
-            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+            return {
+              ok: true,
+              payload: {
+                filename: message.file.filename,
+                size: 4,
+                upload_commit_signal: "empty_composer_variant"
+              }
+            };
           case "yoetz_send_prompt":
             sent = true;
             return { ok: true, payload: { sent: true, conversation_id: "conv-waiting-progress" } };
@@ -3272,6 +3279,7 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
     assert.equal(opened?.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_waiting_progress");
     assert.match(opened?.payload.message, /https:\/\/chatgpt\.com\/\?_yoetz=run_job_waiting_progress/);
     assert.match(uploaded?.payload.message, /bundle uploaded/);
+    assert.equal(uploaded?.payload.upload_commit_signal, "empty_composer_variant");
     assert.match(sentProgress?.payload.message, /waiting for ChatGPT response/);
     assert.equal(sentProgress?.payload.inspect_command, "yoetz browser extension inspect --chatgpt --run-id run_job_waiting_progress");
     assert.equal(sentProgress?.payload.yoetz_url, "https://chatgpt.com/?_yoetz=run_job_waiting_progress");

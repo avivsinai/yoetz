@@ -6953,9 +6953,10 @@ mod tests {
         let external_session = root.path().join("external").join("session-lookalike");
         fs::create_dir_all(&sessions_base).unwrap();
         fs::create_dir_all(&external_session).unwrap();
-        fs::write(external_session.join("bundle.md"), "# bundle").unwrap();
+        let named_bundle = external_session.join("review-context_20260814T064500Z.md");
+        fs::write(&named_bundle, "# bundle").unwrap();
         fs::write(external_session.join("bundle.json"), "{}").unwrap();
-        let recipe_args = thread_recipe_args(external_session.join("bundle.md"));
+        let recipe_args = thread_recipe_args(named_bundle);
 
         let err =
             acquire_browser_recipe_session_lease_in(&recipe_args, &sessions_base).unwrap_err();
@@ -6969,14 +6970,15 @@ mod tests {
     }
 
     #[test]
-    fn thread_accepts_canonical_managed_session_with_regular_artifacts() {
+    fn thread_accepts_named_bundle_in_canonical_managed_session() {
         let root = TempDir::new().unwrap();
         let sessions_base = root.path().join("sessions");
         let session = sessions_base.join("20260725_120000_abcdef");
         fs::create_dir_all(&session).unwrap();
-        fs::write(session.join("bundle.md"), "# bundle").unwrap();
+        let named_bundle = session.join("review-context_20260814T064500Z.md");
+        fs::write(&named_bundle, "# bundle").unwrap();
         fs::write(session.join("bundle.json"), "{}").unwrap();
-        let recipe_args = thread_recipe_args(session.join("bundle.md"));
+        let recipe_args = thread_recipe_args(named_bundle);
 
         assert!(validate_thread_persistence_preflight_in(&recipe_args, &sessions_base).is_ok());
     }

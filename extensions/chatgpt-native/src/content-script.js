@@ -177,8 +177,14 @@ async function uploadJobFile(job, filePayload) {
     }
     uploadOptions.initialAttachmentTrace = job.attachment_trace;
   }
-  await uploadFile(document, file, uploadOptions);
-  return { filename: file.name, size: file.size };
+  const uploadResult = await uploadFile(document, file, uploadOptions);
+  return {
+    filename: file.name,
+    size: file.size,
+    ...(uploadResult?.upload_commit_signal
+      ? { upload_commit_signal: uploadResult.upload_commit_signal }
+      : {})
+  };
 }
 
 async function configureModel(job, options = {}) {
