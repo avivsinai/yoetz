@@ -65,6 +65,21 @@ safely.
 - Always use `--format json` for parsing
 - Set `YOETZ_AGENT=1` environment variable
 - Parse JSON results and present summary to user
+- Do not confuse `--response-schema <path>` with `--output-schema <path>`.
+  The first requests provider-side structured model output for `ask`,
+  `council`, or `review`; the second validates the serialized Yoetz CLI result
+  envelope before `--output-final` is written.
+- Global `--timeout-secs` controls the HTTP client timeout and defaults to
+  `180`. Use `--config-profile <name>` for a config profile overlay. Use
+  `--allow-unknown` only for self-hosted model IDs that are absent from the
+  registry.
+- `yoetz ask --no-session` (or trusted config `[sessions] no_session = true`)
+  skips the session directory and all bundle/response artifact writes. Its JSON
+  artifact paths are empty or null; do not construct paths from them.
+- Trusted `[sessions] max_age_days` and `max_count` settings prune completed
+  sessions opportunistically on startup. They are off by default, preserve
+  active leases, and are ignored in repo-local config. `max_count = 0` removes
+  all completed sessions.
 - For large bundles, run `yoetz bundle` first to inspect size
 - When the caller supplies a bundle, pass it through unchanged; do not split,
   trim, or rebuild it because the target is ChatGPT Pro.
@@ -203,21 +218,49 @@ MODEL_ID=$(yoetz models frontier --family openai --format json | jq -r '.[0].mod
 yoetz review diff --staged --provider openrouter --model "$MODEL_ID" --format json
 ```
 
+### Check and apply a returned patch
+
+```bash
+cat > patches-schema.json <<'JSON'
+{
+  "type": "object",
+  "properties": {
+    "patches": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["patches"],
+  "additionalProperties": false
+}
+JSON
+
+yoetz review diff --staged --response-schema patches-schema.json \
+  --format json > review.json
+jq -r '.content | fromjson | .patches | join("\n")' review.json > review.patch
+yoetz apply --patch-file review.patch --check
+yoetz apply --patch-file review.patch
+```
+
+`--response-schema` makes the extraction contract explicit; without it,
+`content` is free-form model text. `--check` runs `git apply --check` without
+changing files. Read the review and inspect `review.patch` before the final
+command. A model finding is advisory; `yoetz apply` applies the supplied patch
+but does not approve it.
+
 ## Bundle (for manual paste or browser mode)
 
-Bundle creates a session with files at `~/.yoetz/sessions/<id>/bundle.md`.
+Bundle creates a session with `bundle.json` and a descriptive, timestamped
+Markdown file under `~/.yoetz/sessions/<id>/`.
 
 ```bash
 # Get bundle path from JSON output
 yoetz bundle -p "Explain this" -f "src/**/*.rs" --format json
-# Output includes: {"artifacts":{"bundle_md":"/Users/.../.yoetz/sessions/.../bundle.md",...},...}
+# Output includes the exact generated path in artifacts.bundle_md.
 
 # Extract bundle_md path directly
 BUNDLE=$(yoetz bundle -p "Review" -f "src/*.rs" --format json | jq -r .artifacts.bundle_md)
 cat "$BUNDLE"
 ```
 
-**For browser workflows**, pass the bundle.md path:
+**For browser workflows**, pass the exact `artifacts.bundle_md` path:
 ```bash
 PROMPT='Review the attached Rust code for correctness and regressions.
 Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence.
@@ -415,10 +458,10 @@ YOETZ_AGENT=1 yoetz browser recipe \
   --var extension_instance_id=ext_...
 ```
 
-When `--bundle` points at a Yoetz session `bundle.md`, the ChatGPT composer
-prompt defaults to the user prompt stored in the adjacent `bundle.json`; use
-`--var prompt=...` only when intentionally overriding that prompt for a test or
-manual run.
+When `--bundle` points at a Yoetz session's named Markdown artifact, the
+ChatGPT composer prompt defaults to the user prompt stored in the adjacent
+`bundle.json`; use `--var prompt=...` only when intentionally overriding that
+prompt for a test or manual run.
 
 Keep the process attached until it returns. Parse the JSON `response` as the
 model's answer to the prompt; Yoetz does not attach pass/fail/review semantics
@@ -485,10 +528,10 @@ occurs. The concurrency evidence covers two jobs, not higher fanout or other
 account types. Service-worker coverage separately proves two Claude jobs use
 distinct background tabs through overlapping phases and that cancelling one
 does not affect the other. Give every parallel recipe a distinct Yoetz bundle
-session directory; reusing one managed `bundle.md` fails with `session_busy`
-before browser work. Recipe runs share the lifecycle lock, while setup, update,
-reload, and auto-heal require its exclusive side and fail closed instead of
-changing the loaded artifact mid-run.
+session directory; reusing one managed named Markdown bundle fails with
+`session_busy` before browser work. Recipe runs share the lifecycle lock.
+Setup, update, reload, and auto-heal require its exclusive side and fail closed
+instead of changing the loaded artifact mid-run.
 
 ### Cookie sync (legacy fallback)
 
@@ -508,7 +551,7 @@ GPT-5.6 Sol maximum-tier selection is a hard failure before upload/send, includi
 Enterprise accounts that still expose the legacy picker.
 
 ```bash
-# Create bundle and get bundle.md path
+# Create a bundle and get its exact named Markdown path.
 PROMPT='Review the attached Rust code for correctness and regressions.
 Classify every finding as blocking-in-scope or out-of-scope/backlog, with file and line evidence.
 Flag missing context instead of guessing, then list the checks you recommend.'
@@ -524,12 +567,31 @@ yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --format json
 ```
 
 For follow-up resumes, use `--followup <session-id|conversation-id|url>`.
-That path is native-only, is mutually exclusive with `--var conversation=`,
-and `session-id` lookups resume from that session's stored conversation
-metadata. `--allow-duplicate-prompt` is only for intentionally replaying the
-same prompt+bundle hash to the same conversation. A session-id follow-up
-compares against that session's last recorded prompt hash, not the current
-conversation head.
+That path is native-only; a session ID resumes from stored conversation
+metadata. For a reusable semantic address, use `--thread <label>`:
+
+```bash
+# Create a new conversation and point the label at its final conversation.
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" \
+  --thread release-review --fresh --format json
+
+# Reuse it, waiting at most five minutes if another process owns the label.
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" \
+  --thread release-review --on-thread-conflict wait:5m --format json
+```
+
+`--fresh` and `--on-thread-conflict` require `--thread`. Conflict mode defaults
+to `fail`; `wait` blocks indefinitely, `wait:<duration>` accepts `ms`, `s`, `m`,
+or `h`, and `fork` starts an unlabelled conversation without moving the label.
+`--thread`, `--followup`, and `--var conversation=` are mutually exclusive.
+Use `--keep-tab` to retain a successful Yoetz-owned tab. Use
+`--browser-id <id>` to select a local Chrome instance by its published
+`/devtools/browser/<id>` suffix.
+
+`--allow-duplicate-prompt` is only for intentionally replaying the same
+prompt+bundle hash to the same conversation. A session-ID follow-up compares
+against that session's last recorded prompt hash, not the current conversation
+head.
 
 The wait loop reports `completion_reason` in its JSON output:
 - `copy_button` — the strong signal: a copy control rendered on the new
@@ -572,7 +634,11 @@ yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" --format json
 yoetz browser recipe --recipe ./my-recipes/custom.yaml --bundle "$BUNDLE" --format json
 ```
 
-Built-in recipes: `chatgpt`, `claude`, `gemini`.
+Typed built-in recipes: `chatgpt`, `claude`.
+
+The bundled `gemini` recipe remains for compatibility, but it is
+**legacy/experimental**. It is a minimal `agent-browser` action sequence and
+does not implement the typed, fail-closed contract used by ChatGPT and Claude.
 
 ### Troubleshooting
 

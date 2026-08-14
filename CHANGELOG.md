@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- Document agent-facing CLI contracts, browser thread controls, patch apply
+  workflow, and the legacy status of the bundled Gemini browser recipe.
+
 ## [0.5.54] - 2026-08-14
 ### Added
 
