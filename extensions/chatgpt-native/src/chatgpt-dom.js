@@ -228,8 +228,7 @@ export async function uploadFile(root, file, options = {}) {
   input.files = dataTransfer.files;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
-  await waitForUploadComplete(root, file, { ...options, baselineAttachments });
-  return true;
+  return waitForUploadComplete(root, file, { ...options, baselineAttachments });
 }
 
 export async function ensureFreshChat(root = document, job = {}, options = {}) {
@@ -1447,15 +1446,22 @@ export async function clickSend(root, options = {}) {
   const minTimeoutMs = Number(options.minTimeoutMs ?? DEFAULT_SEND_MIN_TIMEOUT_MS);
   const timeoutMs = Math.max(requestedTimeoutMs, minTimeoutMs);
   const intervalMs = Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS);
+  const requiredStableTicks = Math.max(1, Number(options.requiredStableTicks ?? 2));
   const startedAt = Date.now();
   let lastCandidate = null;
+  let enabledTicks = 0;
 
   while (Date.now() - startedAt < timeoutMs) {
     const button = findSendButtonControl(root, { requireEnabled: true });
     if (button) {
-      assertExpectedConversationBeforeSendClick(root, options.expectedConversationId);
-      button.click();
-      return true;
+      enabledTicks += 1;
+      if (enabledTicks >= requiredStableTicks) {
+        assertExpectedConversationBeforeSendClick(root, options.expectedConversationId);
+        button.click();
+        return true;
+      }
+    } else {
+      enabledTicks = 0;
     }
     lastCandidate = findSendButtonControl(root, { requireEnabled: false }) ?? lastCandidate;
     await sleep(intervalMs);
@@ -2267,9 +2273,14 @@ async function waitForUploadComplete(root, file, options = {}) {
   const intervalMs = Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS);
   const baselineAttachments = options.baselineAttachments ?? new Set();
   const requiredStableTicks = Math.max(1, Number(options.requiredStableTicks ?? 2));
+  const emptyComposerVariantStableTicks = Math.max(
+    1,
+    Number(options.emptyComposerVariantStableTicks ?? 8)
+  );
   const startedAt = Date.now();
   let lastState = "";
-  let stableTicks = 0;
+  let enabledTicks = 0;
+  let emptyComposerVariantTicks = 0;
   while (Date.now() - startedAt < timeoutMs) {
     const error = uploadErrorText(root);
     if (error) {
@@ -2277,41 +2288,49 @@ async function waitForUploadComplete(root, file, options = {}) {
     }
     const attached = hasAttachmentNamed(root, file.name, baselineAttachments);
     const pending = hasUploadPending(root);
-    // ChatGPT renders the attachment chip almost immediately (~0.4s), long
-    // before the file finishes uploading server-side (often 10-30s). Returning
-    // at chip-appearance races the prompt-type + send that follow this step:
-    // the send button is briefly clickable (enabled by the typed prompt text)
-    // before ChatGPT re-gates it on the in-flight upload, so the message is
-    // submitted text-only and the attachment is silently dropped. ChatGPT keeps
-    // the send button disabled while an attachment is uploading and only
-    // re-enables it once the upload commits. waitForUploadComplete runs before
-    // any prompt text is inserted (the composer is still empty), so an enabled
-    // send button here is a reliable "upload committed" signal that does not
-    // depend on ChatGPT's progress-spinner markup. Requiring the chip to be
-    // present (`attached`) also rules out the pre-upload window where the send
-    // button is still enabled because ChatGPT has not yet registered the file.
-    const committed = uploadCommitted(root);
-    lastState = `attached=${attached}, pending=${pending}, committed=${committed}, diagnostics=${sendReadinessDiagnostics(root)}`;
-    if (attached && !pending && committed) {
-      stableTicks += 1;
-      if (stableTicks >= requiredStableTicks) {
-        return true;
+    const sendControl = findSendButtonControl(root, { requireEnabled: false });
+    const sendEnabled = Boolean(sendControl && isEnabled(sendControl));
+    const legacyCommitSignal = uploadCommitted(root);
+    const emptyComposerVariant = Boolean(
+      sendControl
+      && !sendEnabled
+      && !editableText(findComposer(root))
+    );
+    lastState = `attached=${attached}, pending=${pending}, send_enabled=${sendEnabled}, empty_composer_variant=${emptyComposerVariant}, diagnostics=${sendReadinessDiagnostics(root)}`;
+    if (attached && !pending) {
+      // Older ChatGPT variants enable Send once the attachment is committed,
+      // even with an empty composer. Keep that stronger signal as the fast path.
+      if (legacyCommitSignal) {
+        enabledTicks += 1;
+        emptyComposerVariantTicks = 0;
+        if (enabledTicks >= requiredStableTicks) {
+          return { upload_commit_signal: "send_enabled" };
+        }
+      } else if (emptyComposerVariant) {
+        // Newer variants keep Send disabled until prompt text exists. A bounded
+        // run of a committed chip, no pending marker, a present disabled Send,
+        // and an empty composer distinguishes that UI from a transient upload.
+        enabledTicks = 0;
+        emptyComposerVariantTicks += 1;
+        if (emptyComposerVariantTicks >= emptyComposerVariantStableTicks) {
+          return { upload_commit_signal: "empty_composer_variant" };
+        }
+      } else {
+        enabledTicks = 0;
+        emptyComposerVariantTicks = 0;
       }
     } else {
-      stableTicks = 0;
+      enabledTicks = 0;
+      emptyComposerVariantTicks = 0;
     }
     await sleep(intervalMs);
   }
   throw new Error(`ChatGPT file upload did not complete for ${file.name} (${lastState})`);
 }
 
-// Upload commit signal: ChatGPT disables the send control while an attachment
-// uploads and re-enables it once the upload commits. This is checked while the
-// composer is still empty (before insertPrompt), so an enabled send button means
-// the attachment is ready, not that a prompt is ready to send. When ChatGPT
-// exposes no send control at all (an unexpected or minimal DOM), this signal is
-// unavailable and we fall back to treating the attachment chip as sufficient
-// rather than blocking the upload step indefinitely.
+// Before prompt insertion, older ChatGPT variants expose upload commitment by
+// enabling Send. If a minimal DOM has no Send control, preserve the historical
+// chip-only fallback instead of blocking the upload step indefinitely.
 function uploadCommitted(root) {
   const present = findSendButtonControl(root, { requireEnabled: false });
   if (!present) {

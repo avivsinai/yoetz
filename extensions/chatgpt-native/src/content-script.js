@@ -177,8 +177,14 @@ async function uploadJobFile(job, filePayload) {
     }
     uploadOptions.initialAttachmentTrace = job.attachment_trace;
   }
-  await uploadFile(document, file, uploadOptions);
-  return { filename: file.name, size: file.size };
+  const uploadResult = await uploadFile(document, file, uploadOptions);
+  return {
+    filename: file.name,
+    size: file.size,
+    ...(uploadResult?.upload_commit_signal
+      ? { upload_commit_signal: uploadResult.upload_commit_signal }
+      : {})
+  };
 }
 
 async function configureModel(job, options = {}) {
@@ -235,7 +241,10 @@ async function sendPrompt(job, prompt) {
     side_effect_started: true,
     send_committed: false
   });
-  const clickOptions = { timeoutMs: Number(job.send_timeout_ms) || 120000 };
+  const clickOptions = {
+    timeoutMs: Number(job.send_timeout_ms) || 120000,
+    requiredStableTicks: 2
+  };
   const expectedConversationId = expectedConversationIdForJob(job);
   if (expectedConversationId) {
     clickOptions.expectedConversationId = expectedConversationId;

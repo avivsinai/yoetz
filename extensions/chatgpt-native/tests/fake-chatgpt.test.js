@@ -259,7 +259,7 @@ test("fake ChatGPT page supports prompt upload send and stable extraction", asyn
   }
 });
 
-test("uploadFile waits for the upload to commit before returning", async () => {
+test("uploadFile preserves the legacy enabled-Send upload commit signal", async () => {
   const previousDataTransfer = globalThis.DataTransfer;
   const previousInputEvent = globalThis.InputEvent;
   globalThis.DataTransfer = FakeDataTransfer;
@@ -272,8 +272,7 @@ test("uploadFile waits for the upload to commit before returning", async () => {
   };
   try {
     const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
-    // ChatGPT renders the chip immediately but keeps the send button disabled
-    // until the upload commits server-side, then re-enables it. Model that race.
+    // The legacy UI enables Send only after the uploaded attachment commits.
     const send = new FakeElement("button", { "aria-label": "Send message" }, "Send");
     send.disabled = true;
     let committedAt = null;
@@ -292,18 +291,106 @@ test("uploadFile waits for the upload to commit before returning", async () => {
     const doc = new FakeDocument(body);
 
     const file = new File(["bundle"], "fixture.md", { type: "text/markdown" });
-    await uploadFile(doc, file, { timeoutMs: 5000, intervalMs: 20, requiredStableTicks: 2 });
+    const result = await uploadFile(doc, file, {
+      timeoutMs: 5000,
+      intervalMs: 20,
+      requiredStableTicks: 2
+    });
     const returnedAt = Date.now();
 
-    // The previous implementation returned at chip-appearance, while the send
-    // button was still disabled (upload in flight), which dropped the attachment
-    // on the subsequent send. The fix must not return until the upload commits.
-    assert.equal(send.disabled, false, "uploadFile returned before the upload committed");
-    assert.ok(
-      committedAt !== null && returnedAt >= committedAt,
-      "uploadFile must wait for the send control to re-enable (upload committed)"
-    );
+    assert.deepEqual(result, { upload_commit_signal: "send_enabled" });
+    assert.ok(committedAt !== null, "the delayed upload readiness transition should occur");
+    assert.ok(returnedAt >= committedAt, "uploadFile must not outrun the legacy commit signal");
     assert.equal(upload.files[0].name, "fixture.md");
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+    globalThis.InputEvent = previousInputEvent;
+  }
+});
+
+test("uploadFile accepts the disabled-empty composer variant after a bounded stable window", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+    const send = new FakeElement("button", { "aria-label": "Send message" }, "Send");
+    send.disabled = true;
+    const upload = new FakeElement("input", {
+      type: "file",
+      accept: "text/markdown",
+      onChange: () => body.append(
+        new FakeElement("div", { "data-testid": "attachment-file" }, "fixture.md")
+      )
+    });
+    const body = new FakeElement("body", {}, "Message ChatGPT").append(composer, upload, send);
+    const doc = new FakeDocument(body);
+
+    const startedAt = Date.now();
+    const result = await uploadFile(
+      doc,
+      new File(["bundle"], "fixture.md", { type: "text/markdown" }),
+      { timeoutMs: 1000, intervalMs: 10, emptyComposerVariantStableTicks: 8 }
+    );
+
+    assert.deepEqual(result, { upload_commit_signal: "empty_composer_variant" });
+    assert.equal(send.disabled, true);
+    assert.ok(Date.now() - startedAt >= 60, "the variant fallback must not accept one transient tick");
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
+test("new upload variant survives a text-enabled drop race before final Send readiness", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  const previousInputEvent = globalThis.InputEvent;
+  globalThis.DataTransfer = FakeDataTransfer;
+  globalThis.InputEvent = class extends Event {
+    constructor(type, init = {}) {
+      super(type, init);
+      this.inputType = init.inputType;
+      this.data = init.data;
+    }
+  };
+  try {
+    const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+    const send = new FakeElement("button", { "aria-label": "Send message" }, "Send");
+    send.disabled = true;
+    const upload = new FakeElement("input", {
+      type: "file",
+      accept: "text/markdown",
+      onChange: () => body.append(
+        new FakeElement("div", { "data-testid": "attachment-file" }, "fixture.md")
+      )
+    });
+    const body = new FakeElement("body", {}, "Message ChatGPT").append(composer, upload, send);
+    const doc = new FakeDocument(body);
+
+    const uploadResult = await uploadFile(
+      doc,
+      new File(["bundle"], "fixture.md", { type: "text/markdown" }),
+      { timeoutMs: 1000, intervalMs: 5, emptyComposerVariantStableTicks: 8 }
+    );
+    assert.deepEqual(uploadResult, { upload_commit_signal: "empty_composer_variant" });
+
+    await insertPrompt(doc, "Review this bundle", { timeoutMs: 250, intervalMs: 5 });
+    send.disabled = false;
+    setTimeout(() => {
+      send.disabled = true;
+    }, 4);
+    setTimeout(() => {
+      send.disabled = false;
+    }, 50);
+
+    const sending = clickSend(doc, {
+      timeoutMs: 500,
+      intervalMs: 10,
+      requiredStableTicks: 2,
+      minTimeoutMs: 0
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.equal(send.clicked, false, "clickSend must not accept the text-enabled upload blip");
+    await sending;
+    assert.equal(send.clicked, true, "clickSend should accept two stable ticks after final commit");
   } finally {
     globalThis.DataTransfer = previousDataTransfer;
     globalThis.InputEvent = previousInputEvent;

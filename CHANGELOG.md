@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- `yoetz bundle --name` writes a descriptive, timestamped Markdown artifact;
+  when omitted, the name is derived from the prompt. Contributed by @bnsd55.
+
+### Fixed
+
+- ChatGPT native-extension uploads now support both the legacy enabled-Send
+  commit signal and the disabled-Send empty-composer variant, then require two
+  stable enabled ticks before sending. Contributed by @bnsd55.
+
 ## [0.5.53] - 2026-08-13
 ### Fixed
 
