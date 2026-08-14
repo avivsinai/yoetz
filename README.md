@@ -140,9 +140,12 @@ From a source checkout, you can start from the full example instead:
 cp docs/config.example.toml ~/.config/yoetz/config.toml
 ```
 
-Yoetz also supports `YOETZ_CONFIG_PATH`, repo-local `./yoetz.toml`, and config
-profiles. See [docs/config.example.toml](docs/config.example.toml) for the
-shape.
+Yoetz also supports `YOETZ_CONFIG_PATH`, repo-local `./yoetz.toml`, and profile
+overlays selected with `--config-profile <name>`. See
+[docs/config.example.toml](docs/config.example.toml) for the shape. Global
+`--timeout-secs` controls the HTTP client timeout and defaults to `180`.
+`--allow-unknown` permits model IDs that are absent from the registry; reserve
+it for self-hosted models whose IDs cannot be registered.
 
 The default `models frontier` lab list is configurable with
 `[frontier].families`; `--all` and `--family` continue to bypass that list.
@@ -187,6 +190,33 @@ yoetz ask \
 yoetz review diff --staged --format json
 yoetz review file --path crates/yoetz-core/src/bundle.rs --format json
 ```
+
+To inspect and apply a patch returned in the review's `content` JSON:
+
+```bash
+cat > patches-schema.json <<'JSON'
+{
+  "type": "object",
+  "properties": {
+    "patches": { "type": "array", "items": { "type": "string" } }
+  },
+  "required": ["patches"],
+  "additionalProperties": false
+}
+JSON
+
+yoetz review diff --staged --response-schema patches-schema.json \
+  --format json > review.json
+jq -r '.content | fromjson | .patches | join("\n")' review.json > review.patch
+yoetz apply --patch-file review.patch --check
+yoetz apply --patch-file review.patch
+```
+
+`--response-schema` makes the extraction contract explicit; without it,
+`content` is free-form model text. `--check` runs `git apply --check` and does
+not change files. Inspect the patch before the final command; `yoetz apply`
+invokes `git apply` but does not accept or adjudicate the review findings for
+you.
 
 ### Run A Council
 
@@ -265,8 +295,13 @@ yoetz ask -p "Return JSON only" -f src/lib.rs --format json --output-final /tmp/
 Useful agent-facing guarantees:
 
 - `--format json` keeps stdout parseable.
-- `--response-format json` and `--response-schema` request model-side
-  structured output; `--format json` only controls the Yoetz CLI envelope.
+- `--response-schema <path>` requests model-side structured output for
+  `ask`, `council`, or `review`; the provider must produce a response that
+  matches that schema.
+- `--output-schema <path>` validates the final serialized Yoetz CLI envelope.
+  It is checked after the command completes and before `--output-final` is
+  written. The names differ by only one word, but they protect different
+  layers. `--format json` only selects the envelope representation.
 - Progress and diagnostics use stderr where possible.
 - `--output-final` writes the final response to a stable path.
 - `ask`, `bundle`, `council`, and `review` create replayable session artifacts.
@@ -283,6 +318,9 @@ built-in ChatGPT recipe targets GPT-5.6 Sol at the account's known top tier
 surface is available, it stops
 instead of silently downgrading. The built-in Claude recipe applies the same
 contract to claude.ai with exactly Fable 5 and Effort Max.
+The bundled `gemini` recipe remains for compatibility, but it is
+legacy/experimental: it is a minimal `agent-browser` action sequence and does
+not implement the typed, fail-closed contract used by ChatGPT and Claude.
 
 ```bash
 yoetz browser check --format json
@@ -345,9 +383,36 @@ Upgrade the installed CLI before another lane runs extension auto-heal after a
 release. An older CLI can overwrite the newer stamped managed copy.
 
 Claude conversation resume supports `--var conversation=<uuid|url>` and
-`--followup` on the native transport. `inline_warn_tokens` defaults to 150,000
-and warns when a bundle is likely to become retrieval-backed; set it to `0` to
-disable the heuristic. This warning does not change Yoetz's byte limits.
+`--followup <session-id|conversation-id|url>` on the native transport. For a
+stable semantic address, use `--thread <label>`:
+
+```bash
+# Start a new conversation and point the label at its final conversation.
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" \
+  --thread release-review --fresh --format json
+
+# Reuse the label. Fail immediately if another process owns it.
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" \
+  --thread release-review --on-thread-conflict fail --format json
+
+# Other collision policies: wait indefinitely, wait with a bound, or fork an
+# unlabelled conversation without moving the existing label.
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" \
+  --thread release-review --on-thread-conflict wait:5m --format json
+yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" \
+  --thread release-review --on-thread-conflict fork --format json
+```
+
+`--fresh` and `--on-thread-conflict` require `--thread`; the default conflict
+policy is `fail`. A `wait:<duration>` bound accepts `ms`, `s`, `m`, or `h` and
+fails with `thread_busy_timeout` when it expires. `--thread`, `--followup`, and
+`--var conversation=` are mutually exclusive. Use `--keep-tab` to retain a
+successful Yoetz-owned browser tab. Use `--browser-id <id>` to select a local
+Chrome instance by its published `/devtools/browser/<id>` suffix.
+
+`inline_warn_tokens` defaults to 150,000 and warns when a bundle is likely to
+become retrieval-backed; set it to `0` to disable the heuristic. This warning
+does not change Yoetz's byte limits.
 
 The native-host extension transport is currently macOS/Linux-only. Windows CLI
 and Scoop installs work for the API-backed Yoetz flows, but
