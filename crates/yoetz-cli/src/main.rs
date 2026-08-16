@@ -85,6 +85,7 @@ use http::send_json;
 /// simple queries when no explicit --max-output-tokens is provided.
 const REGISTRY_OUTPUT_TOKENS_CAP: usize = 16384;
 const DEFAULT_CHATGPT_RECIPE_PROMPT: &str = "Review the attached file and provide your analysis.";
+const DEFAULT_TEMPERATURE: f32 = 0.1;
 
 #[derive(Parser)]
 #[command(
@@ -128,6 +129,7 @@ struct AppContext {
     output_schema: Option<PathBuf>,
     debug: bool,
     allow_unknown: bool,
+    timeout_duration: Duration,
 }
 
 #[derive(Subcommand)]
@@ -171,7 +173,7 @@ struct AskArgs {
     #[arg(long)]
     model: Option<String>,
 
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
     temperature: f32,
 
     #[arg(long)]
@@ -620,7 +622,7 @@ struct CouncilArgs {
     #[arg(long)]
     provider: Option<String>,
 
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
     temperature: f32,
 
     #[arg(long)]
@@ -804,7 +806,7 @@ struct ReviewDiffArgs {
     #[arg(long)]
     model: Option<String>,
 
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
     temperature: f32,
 
     #[arg(long)]
@@ -847,7 +849,7 @@ struct ReviewFileArgs {
     #[arg(long)]
     model: Option<String>,
 
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
     temperature: f32,
 
     #[arg(long)]
@@ -1032,6 +1034,7 @@ struct ModelEstimate {
 }
 
 const BASE_PROTECTED_DOTENV_ENV_VARS: &[&str] = &[
+    "PATH",
     "YOETZ_AGENT_BROWSER_BIN",
     "YOETZ_DEV_BROWSER_BIN",
     "YOETZ_SCRIPTS_DIR",
@@ -1054,6 +1057,8 @@ const BASE_PROTECTED_DOTENV_ENV_VARS: &[&str] = &[
     "XAI_API_KEY",
     "ZAI_API_KEY",
     "LITELLM_API_KEY",
+    "CURSOR_API_KEY",
+    "CURSOR_API_ENDPOINT",
 ];
 
 fn protected_dotenv_env_vars(config: &Config) -> Vec<String> {
@@ -1144,6 +1149,7 @@ async fn main() -> Result<()> {
         output_schema: cli.output_schema,
         debug: cli.debug,
         allow_unknown: cli.allow_unknown,
+        timeout_duration: Duration::from_secs(cli.timeout_secs),
     };
 
     match cli.command {
@@ -5638,6 +5644,7 @@ mod tests {
             output_schema: None,
             debug: false,
             allow_unknown: false,
+            timeout_duration: Duration::from_secs(1),
         }
     }
 
@@ -6277,6 +6284,9 @@ mod tests {
             "NODE_EXTRA_CA_CERTS",
             "ZAI_API_KEY",
             "LITELLM_API_KEY",
+            "CURSOR_API_KEY",
+            "CURSOR_API_ENDPOINT",
+            "PATH",
         ] {
             assert!(
                 BASE_PROTECTED_DOTENV_ENV_VARS.contains(&key),
@@ -8769,27 +8779,27 @@ mod tests {
     }
 
     #[test]
-    fn resolve_provider_from_registry_strips_openrouter_prefix() {
+    fn resolve_provider_for_model_strips_openrouter_prefix() {
         let registry = registry_with_provider_model("google/gemini-3.1-pro-preview", "openrouter");
 
         assert_eq!(
-            resolve_provider_from_registry("openrouter/google/gemini-3.1-pro-preview", &registry),
+            resolve_provider_for_model("openrouter/google/gemini-3.1-pro-preview", Some(&registry)),
             Some("openrouter".to_string())
         );
     }
 
     #[test]
-    fn resolve_provider_from_registry_strips_models_prefix() {
+    fn resolve_provider_for_model_strips_models_prefix() {
         let registry = registry_with_provider_model("google/gemini-3.1-pro-preview", "openrouter");
 
         assert_eq!(
-            resolve_provider_from_registry("models/google/gemini-3.1-pro-preview", &registry),
+            resolve_provider_for_model("models/google/gemini-3.1-pro-preview", Some(&registry)),
             Some("openrouter".to_string())
         );
     }
 
     #[test]
-    fn resolve_provider_from_registry_prefers_literal_match() {
+    fn resolve_provider_for_model_prefers_literal_match() {
         let mut registry =
             registry_with_provider_model("google/gemini-3.1-pro-preview", "openrouter");
         registry.models.push(yoetz_core::registry::ModelEntry {
@@ -8805,16 +8815,67 @@ mod tests {
         registry.rebuild_index();
 
         assert_eq!(
-            resolve_provider_from_registry("openrouter/google/gemini-3.1-pro-preview", &registry),
+            resolve_provider_for_model("openrouter/google/gemini-3.1-pro-preview", Some(&registry)),
             Some("gateway".to_string())
         );
     }
 
     #[test]
-    fn resolve_provider_from_registry_keeps_no_slash_guard() {
+    fn resolve_provider_for_model_keeps_no_slash_guard() {
         let registry = registry_with_provider_model("gpt-5.4", "openrouter");
 
-        assert_eq!(resolve_provider_from_registry("gpt-5.4", &registry), None);
+        assert_eq!(resolve_provider_for_model("gpt-5.4", Some(&registry)), None);
+    }
+
+    #[test]
+    fn resolve_provider_accepts_cursor_council_prefix_without_registry_entry() {
+        assert_eq!(
+            resolve_provider_for_model("cursor/cursor-grok-4.6-xhigh", None),
+            Some("cursor".to_string())
+        );
+    }
+
+    #[test]
+    fn cursor_options_fail_closed_for_unavailable_contracts() {
+        let response_format = serde_json::json!({"type": "json_object"});
+        assert!(validate_cursor_options(
+            Some("cursor"),
+            None,
+            Some(&response_format),
+            false,
+            DEFAULT_TEMPERATURE,
+            None,
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("response-format"));
+        assert!(validate_cursor_options(
+            Some("cursor"),
+            None,
+            None,
+            false,
+            DEFAULT_TEMPERATURE,
+            Some(1.0),
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not report dollar cost"));
+        let error = validate_cursor_options(Some("cursor"), None, None, false, 0.2, None, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot honor --temperature"));
+        assert!(error.to_string().contains(&DEFAULT_TEMPERATURE.to_string()));
+        validate_cursor_options(
+            Some("cursor"),
+            None,
+            None,
+            false,
+            DEFAULT_TEMPERATURE,
+            None,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -8830,6 +8891,21 @@ mod tests {
     fn resolve_max_output_tokens_fallback() {
         let config = Config::default();
         assert_eq!(resolve_max_output_tokens(None, &config, None, None), None);
+    }
+
+    #[test]
+    fn cursor_ignores_inherited_max_output_tokens() {
+        let mut config = Config::default();
+        config.defaults.max_output_tokens = Some(1024);
+
+        assert_eq!(
+            resolve_max_output_tokens_for_provider(Some("cursor"), None, &config, None, None,),
+            None
+        );
+        assert_eq!(
+            resolve_max_output_tokens_for_provider(Some("cursor"), Some(2048), &config, None, None,),
+            Some(2048)
+        );
     }
 
     #[test]
@@ -9072,15 +9148,108 @@ async fn call_litellm(
     })
 }
 
-/// Look up a model in the registry and return its provider if the model
-/// contains a `/` (i.e. looks like `vendor/model`).
-pub(crate) fn resolve_provider_from_registry(
+async fn call_model(
+    litellm: &LiteLLM,
+    cursor_timeout: Duration,
+    provider: Option<&str>,
     model: &str,
-    registry: &ModelRegistry,
+    prompt: &str,
+    temperature: f32,
+    max_output_tokens: Option<usize>,
+    response_format: Option<Value>,
+    images: &[MediaInput],
+    video: Option<&MediaInput>,
+) -> Result<CallResult> {
+    if is_cursor_provider(provider) {
+        validate_cursor_options(
+            provider,
+            max_output_tokens,
+            response_format.as_ref(),
+            !images.is_empty() || video.is_some(),
+            temperature,
+            None,
+            None,
+        )?;
+        let result = providers::cursor::complete(model, prompt, cursor_timeout).await?;
+        return Ok(CallResult {
+            content: result.content,
+            usage: result.usage,
+            response_id: result.response_id,
+            header_cost: None,
+        });
+    }
+    call_litellm(
+        litellm,
+        provider,
+        model,
+        prompt,
+        temperature,
+        max_output_tokens,
+        response_format,
+        images,
+        video,
+    )
+    .await
+}
+
+fn is_cursor_provider(provider: Option<&str>) -> bool {
+    provider.is_some_and(|provider| provider.eq_ignore_ascii_case("cursor"))
+}
+
+fn validate_cursor_options(
+    provider: Option<&str>,
+    max_output_tokens: Option<usize>,
+    response_format: Option<&Value>,
+    has_media: bool,
+    temperature: f32,
+    max_cost_usd: Option<f64>,
+    daily_budget_usd: Option<f64>,
+) -> Result<()> {
+    if !is_cursor_provider(provider) {
+        return Ok(());
+    }
+    if has_media {
+        return Err(anyhow!("Cursor CLI provider does not support media inputs"));
+    }
+    if response_format.is_some() {
+        return Err(anyhow!(
+            "Cursor CLI provider does not support --response-format or --response-schema"
+        ));
+    }
+    if max_output_tokens.is_some() {
+        return Err(anyhow!(
+            "Cursor CLI provider does not support --max-output-tokens"
+        ));
+    }
+    if temperature != DEFAULT_TEMPERATURE {
+        return Err(anyhow!(
+            "Cursor CLI provider cannot honor --temperature; only Yoetz's default {DEFAULT_TEMPERATURE} is accepted because omission and explicit {DEFAULT_TEMPERATURE} are indistinguishable"
+        ));
+    }
+    if max_cost_usd.is_some() || daily_budget_usd.is_some() {
+        return Err(anyhow!(
+            "Cursor CLI provider does not report dollar cost, so --max-cost-usd and --daily-budget-usd are unavailable"
+        ));
+    }
+    Ok(())
+}
+
+/// Resolve provider identity from local model namespaces first, then the API
+/// registry when one is available.
+pub(crate) fn resolve_provider_for_model(
+    model: &str,
+    registry: Option<&ModelRegistry>,
 ) -> Option<String> {
+    if model
+        .split_once('/')
+        .is_some_and(|(prefix, rest)| prefix.eq_ignore_ascii_case("cursor") && !rest.is_empty())
+    {
+        return Some("cursor".to_string());
+    }
     if !model.contains('/') {
         return None;
     }
+    let registry = registry?;
     for candidate in registry_lookup_candidates(model) {
         if let Some(entry) = registry.find(&candidate) {
             return entry.provider.clone();
@@ -9220,11 +9389,27 @@ fn resolve_max_output_tokens(
     None
 }
 
+fn resolve_max_output_tokens_for_provider(
+    provider: Option<&str>,
+    requested: Option<usize>,
+    config: &Config,
+    registry: Option<&ModelRegistry>,
+    model_id: Option<&str>,
+) -> Option<usize> {
+    if is_cursor_provider(provider) {
+        return requested;
+    }
+    resolve_max_output_tokens(requested, config, registry, model_id)
+}
+
 fn resolve_registry_model_id(
     provider: Option<&str>,
     model_id: Option<&str>,
     registry: Option<&ModelRegistry>,
 ) -> Option<String> {
+    if is_cursor_provider(provider) {
+        return None;
+    }
     let model_id = model_id?;
     let mut candidates = registry_lookup_candidates(model_id);
 

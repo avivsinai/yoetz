@@ -3,10 +3,10 @@ use anyhow::{anyhow, Result};
 use crate::ReviewResult;
 use crate::{budget, registry};
 use crate::{
-    build_review_diff_prompt, build_review_file_prompt, call_litellm, git_diff, maybe_write_output,
-    normalize_model_name_with_aliases, read_text_file, resolve_max_output_tokens,
-    resolve_provider_from_registry, resolve_registry_model_id, resolve_response_format, AppContext,
-    ReviewArgs, ReviewCommand, ReviewDiffArgs, ReviewFileArgs,
+    build_review_diff_prompt, build_review_file_prompt, call_model, git_diff, maybe_write_output,
+    normalize_model_name_with_aliases, read_text_file, resolve_max_output_tokens_for_provider,
+    resolve_provider_for_model, resolve_registry_model_id, resolve_response_format,
+    validate_cursor_options, AppContext, ReviewArgs, ReviewCommand, ReviewDiffArgs, ReviewFileArgs,
 };
 use std::path::PathBuf;
 use yoetz_core::bundle::estimate_tokens;
@@ -55,22 +55,29 @@ async fn handle_review_diff(
         .provider
         .clone()
         .or(config.defaults.provider.clone())
-        .or_else(|| {
-            let reg = registry_cache.as_ref()?;
-            resolve_provider_from_registry(&model, reg)
-        })
+        .or_else(|| resolve_provider_for_model(&model, registry_cache.as_ref()))
         .ok_or_else(|| anyhow!("provider is required"))?;
     let registry_id =
         resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
     if let Some(ref reg_id) = registry_id {
         crate::validate_model_or_suggest(reg_id, registry_cache.as_ref(), ctx.allow_unknown)?;
     }
-    let max_output_tokens = resolve_max_output_tokens(
+    let max_output_tokens = resolve_max_output_tokens_for_provider(
+        Some(&provider),
         args.max_output_tokens,
         config,
         registry_cache.as_ref(),
         registry_id.as_deref(),
     );
+    validate_cursor_options(
+        Some(&provider),
+        max_output_tokens,
+        response_format.as_ref(),
+        false,
+        args.temperature,
+        args.max_cost_usd,
+        args.daily_budget_usd,
+    )?;
 
     let mut diff = git_diff(args.staged, &args.paths)?;
     if diff.trim().is_empty() {
@@ -130,8 +137,9 @@ async fn handle_review_diff(
             None,
         )
     } else {
-        let result = call_litellm(
+        let result = call_model(
             &ctx.litellm,
+            ctx.timeout_duration,
             Some(&provider),
             &model,
             &review_prompt,
@@ -256,22 +264,29 @@ async fn handle_review_file(
         .provider
         .clone()
         .or(config.defaults.provider.clone())
-        .or_else(|| {
-            let reg = registry_cache.as_ref()?;
-            resolve_provider_from_registry(&model, reg)
-        })
+        .or_else(|| resolve_provider_for_model(&model, registry_cache.as_ref()))
         .ok_or_else(|| anyhow!("provider is required"))?;
     let registry_id =
         resolve_registry_model_id(Some(&provider), Some(&model), registry_cache.as_ref());
     if let Some(ref reg_id) = registry_id {
         crate::validate_model_or_suggest(reg_id, registry_cache.as_ref(), ctx.allow_unknown)?;
     }
-    let max_output_tokens = resolve_max_output_tokens(
+    let max_output_tokens = resolve_max_output_tokens_for_provider(
+        Some(&provider),
         args.max_output_tokens,
         config,
         registry_cache.as_ref(),
         registry_id.as_deref(),
     );
+    validate_cursor_options(
+        Some(&provider),
+        max_output_tokens,
+        response_format.as_ref(),
+        false,
+        args.temperature,
+        args.max_cost_usd,
+        args.daily_budget_usd,
+    )?;
 
     let max_file_bytes = args.max_file_bytes.unwrap_or(200_000);
     let max_total_bytes = args.max_total_bytes.unwrap_or(max_file_bytes);
@@ -319,8 +334,9 @@ async fn handle_review_file(
             None,
         )
     } else {
-        let result = call_litellm(
+        let result = call_model(
             &ctx.litellm,
+            ctx.timeout_duration,
             Some(&provider),
             &model,
             &review_prompt,

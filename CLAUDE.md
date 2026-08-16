@@ -180,6 +180,12 @@ API keys via environment variables:
 
 Config file: `~/.config/yoetz/config.toml` (optional)
 
+Local CLI backend:
+- `cursor` resolves models from authenticated `cursor-agent models` output and
+  runs text consults in read-only Ask mode inside a temporary Yoetz-owned
+  workspace. Keep this path behind the shared ask/review/council dispatcher;
+  never trust the real repository or pass Cursor force/YOLO/MCP approval flags.
+
 ## litellm-rust (external)
 
 The [`litellm-rust`](https://github.com/avivsinai/litellm-rust) crate (separate repo) provides unified access to multiple LLM providers:

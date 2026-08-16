@@ -3,10 +3,10 @@ use anyhow::{anyhow, Result};
 use crate::notifications;
 use crate::providers::{gemini, openai};
 use crate::{
-    apply_capability_warnings, call_litellm, maybe_write_output, normalize_model_name_with_aliases,
-    parse_media_input, parse_media_inputs, resolve_max_output_tokens, resolve_prompt,
-    resolve_provider_from_registry, resolve_registry_model_id, resolve_response_format, AppContext,
-    AskArgs,
+    apply_capability_warnings, call_model, maybe_write_output, normalize_model_name_with_aliases,
+    parse_media_input, parse_media_inputs, resolve_max_output_tokens_for_provider, resolve_prompt,
+    resolve_provider_for_model, resolve_registry_model_id, resolve_response_format,
+    validate_cursor_options, AppContext, AskArgs,
 };
 use crate::{budget, providers, registry};
 use std::env;
@@ -137,8 +137,7 @@ pub(crate) async fn handle_ask(
     // Auto-resolve provider from registry (e.g. x-ai/grok-4 → openrouter)
     let provider_id = provider_id.or_else(|| {
         let model = model_id.as_deref()?;
-        let reg = registry_cache.as_ref()?;
-        resolve_provider_from_registry(model, reg)
+        resolve_provider_for_model(model, registry_cache.as_ref())
     });
     let registry_model_id = resolve_registry_model_id(
         provider_id.as_deref(),
@@ -148,12 +147,22 @@ pub(crate) async fn handle_ask(
     if let Some(ref reg_id) = registry_model_id {
         crate::validate_model_or_suggest(reg_id, registry_cache.as_ref(), ctx.allow_unknown)?;
     }
-    let max_output_tokens = resolve_max_output_tokens(
+    let max_output_tokens = resolve_max_output_tokens_for_provider(
+        provider_id.as_deref(),
         args.max_output_tokens,
         config,
         registry_cache.as_ref(),
         registry_model_id.as_deref(),
     );
+    validate_cursor_options(
+        provider_id.as_deref(),
+        max_output_tokens,
+        response_format.as_ref(),
+        !image_inputs.is_empty() || video_input.is_some(),
+        args.temperature,
+        args.max_cost_usd,
+        args.daily_budget_usd,
+    )?;
     let input_tokens = bundle
         .as_ref()
         .map(|b| b.stats.estimated_tokens)
@@ -267,8 +276,9 @@ pub(crate) async fn handle_ask(
                 (result.content, result.usage, None, None)
             }
             _ => {
-                let call = call_litellm(
+                let call = call_model(
                     &ctx.litellm,
+                    ctx.timeout_duration,
                     Some(provider),
                     model,
                     &model_prompt,
@@ -289,8 +299,9 @@ pub(crate) async fn handle_ask(
         let model = model_id
             .as_deref()
             .ok_or_else(|| anyhow!("model is required"))?;
-        let result = call_litellm(
+        let result = call_model(
             &ctx.litellm,
+            ctx.timeout_duration,
             Some(provider),
             model,
             &model_prompt,

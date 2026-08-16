@@ -2,11 +2,11 @@ use anyhow::{anyhow, Result};
 
 use crate::notifications;
 use crate::{
-    add_usage, call_litellm, maybe_write_output, normalize_model_name_with_aliases,
-    render_bundle_md, resolve_max_output_tokens, resolve_prompt, resolve_provider_from_registry,
-    resolve_registry_model_id, resolve_response_format, AppContext, CouncilArgs,
-    CouncilModelArtifact, CouncilModelResult, CouncilPricing, CouncilSummary, ModelEstimate,
-    PartialPolicy,
+    add_usage, call_model, maybe_write_output, normalize_model_name_with_aliases, render_bundle_md,
+    resolve_max_output_tokens_for_provider, resolve_prompt, resolve_provider_for_model,
+    resolve_registry_model_id, resolve_response_format, validate_cursor_options, AppContext,
+    CouncilArgs, CouncilModelArtifact, CouncilModelResult, CouncilPricing, CouncilSummary,
+    ModelEstimate, PartialPolicy,
 };
 use crate::{budget, registry};
 use crate::{CouncilModelError, CouncilResult};
@@ -105,10 +105,12 @@ pub(crate) async fn handle_council(
         })
         .collect();
     // Resolve per-model max_output_tokens so each model gets its own limit.
-    let per_model_max_output_tokens: Vec<Option<usize>> = resolved_registry_ids
+    let per_model_max_output_tokens: Vec<Option<usize>> = resolved_models
         .iter()
-        .map(|reg_id| {
-            resolve_max_output_tokens(
+        .zip(&resolved_registry_ids)
+        .map(|((_model, provider), reg_id)| {
+            resolve_max_output_tokens_for_provider(
+                Some(provider),
                 args.max_output_tokens,
                 config,
                 registry_cache.as_ref(),
@@ -116,6 +118,17 @@ pub(crate) async fn handle_council(
             )
         })
         .collect();
+    for (idx, (_model, provider)) in resolved_models.iter().enumerate() {
+        validate_cursor_options(
+            Some(provider),
+            per_model_max_output_tokens[idx],
+            response_format.as_ref(),
+            false,
+            args.temperature,
+            args.max_cost_usd,
+            args.daily_budget_usd,
+        )?;
+    }
 
     let mut per_model = Vec::new();
     let mut per_model_pricing = Vec::new();
@@ -210,6 +223,7 @@ pub(crate) async fn handle_council(
             let prompt = std::sync::Arc::clone(&model_prompt);
             let provider = provider.clone();
             let litellm = ctx.litellm.clone();
+            let cursor_timeout = ctx.timeout_duration;
             let semaphore = std::sync::Arc::clone(&semaphore);
             let temperature = args.temperature;
             let response_format = response_format.clone();
@@ -223,8 +237,9 @@ pub(crate) async fn handle_council(
                         anyhow!("failed to acquire council permit: {err}"),
                     )
                 })?;
-                let call = call_litellm(
+                let call = call_model(
                     &litellm,
+                    cursor_timeout,
                     Some(&provider),
                     &model,
                     prompt.as_str(),
@@ -556,11 +571,10 @@ fn resolve_council_provider(
     default_provider: Option<&str>,
     registry: Option<&yoetz_core::registry::ModelRegistry>,
 ) -> Result<String> {
-    // Prefer registry lookup — it knows that x-ai/grok-4 is openrouter
-    if let Some(reg) = registry {
-        if let Some(provider) = resolve_provider_from_registry(model, reg) {
-            return Ok(provider);
-        }
+    // Prefer local/registry lookup — it knows Cursor locally and that
+    // x-ai/grok-4 is openrouter in the API registry.
+    if let Some(provider) = resolve_provider_for_model(model, registry) {
+        return Ok(provider);
     }
     if let Some(provider) = prefixed_council_provider(model) {
         return Ok(provider);
