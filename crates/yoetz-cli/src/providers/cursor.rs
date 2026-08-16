@@ -168,6 +168,9 @@ async fn run_output(
         Err(error) => return Err(error).context("run Cursor CLI"),
         Ok(child) => child,
     };
+    // `process_group(0)` makes the leader's PID the process-group ID. Capture
+    // it before `wait` can reap the leader and make `child.id()` unavailable.
+    let process_group_id = child.id();
     let stdout = child
         .stdout
         .take()
@@ -182,7 +185,7 @@ async fn run_output(
     .await;
     match collected {
         Err(_) => {
-            terminate_cursor_process(&mut child)
+            terminate_cursor_process(&mut child, process_group_id)
                 .await
                 .context("stop timed-out Cursor CLI process")?;
             Err(anyhow!(
@@ -191,7 +194,7 @@ async fn run_output(
             ))
         }
         Ok(Err(error)) => {
-            let _ = terminate_cursor_process(&mut child).await;
+            let _ = terminate_cursor_process(&mut child, process_group_id).await;
             Err(error).context("collect Cursor CLI output")
         }
         Ok(Ok((status, stdout, stderr))) => Ok(Some(Output {
@@ -202,9 +205,15 @@ async fn run_output(
     }
 }
 
-async fn terminate_cursor_process(child: &mut tokio::process::Child) -> io::Result<()> {
+async fn terminate_cursor_process(
+    child: &mut tokio::process::Child,
+    process_group_id: Option<u32>,
+) -> io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = process_group_id;
+
     #[cfg(unix)]
-    if let Some(pid) = child.id() {
+    if let Some(pid) = process_group_id {
         #[allow(unsafe_code)]
         let result = unsafe { libc::kill(-(pid as libc::pid_t), libc::SIGKILL) };
         if result != 0 {
@@ -476,7 +485,10 @@ printf '%s' '{{"type":"result","subtype":"success","is_error":false,"result":"re
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let child_pid: libc::pid_t = std::fs::read_to_string(child_log).unwrap().parse().unwrap();
-        terminate_cursor_process(&mut child).await.unwrap();
+        let process_group_id = child.id();
+        terminate_cursor_process(&mut child, process_group_id)
+            .await
+            .unwrap();
         for _ in 0..100 {
             #[allow(unsafe_code)]
             let exists = unsafe { libc::kill(child_pid, 0) } == 0
@@ -487,5 +499,62 @@ printf '%s' '{{"type":"result","subtype":"success","is_error":false,"result":"re
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("Cursor CLI descendant {child_pid} survived timeout");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_kills_pipe_holding_descendant_after_leader_exits() {
+        let fixture = tempfile::tempdir().unwrap();
+        let script = fixture.path().join("cursor-with-orphaned-child");
+        let child_log = fixture.path().join("child.log");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nsleep 30 &\nprintf '%s' \"$!\" > '{}'\nexit 0\n",
+                child_log.display()
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+
+        let error = run_output(
+            script.as_os_str(),
+            &[],
+            Duration::from_secs(2),
+            fixture.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        for _ in 0..200 {
+            if child_log.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(child_log.exists(), "fixture did not publish child PID");
+        let child_pid: libc::pid_t = std::fs::read_to_string(child_log).unwrap().parse().unwrap();
+        let mut survived = true;
+        for _ in 0..100 {
+            #[allow(unsafe_code)]
+            let running = unsafe { libc::kill(child_pid, 0) } == 0;
+            if !running {
+                survived = false;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if survived {
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::kill(child_pid, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !survived,
+            "pipe-holding descendant {child_pid} survived timeout"
+        );
     }
 }
