@@ -140,6 +140,7 @@ async fn handle_review_diff(
         let result = call_model(
             &ctx.litellm,
             ctx.timeout_duration,
+            &ctx.cursor_discovery,
             Some(&provider),
             &model,
             &review_prompt,
@@ -337,6 +338,7 @@ async fn handle_review_file(
         let result = call_model(
             &ctx.litellm,
             ctx.timeout_duration,
+            &ctx.cursor_discovery,
             Some(&provider),
             &model,
             &review_prompt,

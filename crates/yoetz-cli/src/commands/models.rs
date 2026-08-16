@@ -109,7 +109,8 @@ fn normalize_cursor_search(value: &str) -> String {
 }
 
 async fn cursor_registry(ctx: &AppContext) -> Result<ModelRegistry> {
-    let models = providers::cursor::list_models(ctx.timeout_duration).await?;
+    let models =
+        providers::cursor::list_models(ctx.timeout_duration, &ctx.cursor_discovery).await?;
     let mut registry = ModelRegistry::default();
     registry.models = models
         .into_iter()

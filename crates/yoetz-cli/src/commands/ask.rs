@@ -279,6 +279,7 @@ pub(crate) async fn handle_ask(
                 let call = call_model(
                     &ctx.litellm,
                     ctx.timeout_duration,
+                    &ctx.cursor_discovery,
                     Some(provider),
                     model,
                     &model_prompt,
@@ -302,6 +303,7 @@ pub(crate) async fn handle_ask(
         let result = call_model(
             &ctx.litellm,
             ctx.timeout_duration,
+            &ctx.cursor_discovery,
             Some(provider),
             model,
             &model_prompt,

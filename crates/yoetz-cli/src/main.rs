@@ -130,6 +130,8 @@ struct AppContext {
     debug: bool,
     allow_unknown: bool,
     timeout_duration: Duration,
+    cursor_discovery:
+        std::sync::Arc<tokio::sync::OnceCell<providers::cursor::CursorDiscoveryOutcome>>,
 }
 
 #[derive(Subcommand)]
@@ -1150,6 +1152,7 @@ async fn main() -> Result<()> {
         debug: cli.debug,
         allow_unknown: cli.allow_unknown,
         timeout_duration: Duration::from_secs(cli.timeout_secs),
+        cursor_discovery: std::sync::Arc::new(tokio::sync::OnceCell::new()),
     };
 
     match cli.command {
@@ -5645,6 +5648,7 @@ mod tests {
             debug: false,
             allow_unknown: false,
             timeout_duration: Duration::from_secs(1),
+            cursor_discovery: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
 
@@ -9151,6 +9155,9 @@ async fn call_litellm(
 async fn call_model(
     litellm: &LiteLLM,
     cursor_timeout: Duration,
+    cursor_discovery: &std::sync::Arc<
+        tokio::sync::OnceCell<providers::cursor::CursorDiscoveryOutcome>,
+    >,
     provider: Option<&str>,
     model: &str,
     prompt: &str,
@@ -9170,7 +9177,8 @@ async fn call_model(
             None,
             None,
         )?;
-        let result = providers::cursor::complete(model, prompt, cursor_timeout).await?;
+        let result =
+            providers::cursor::complete(model, prompt, cursor_timeout, cursor_discovery).await?;
         return Ok(CallResult {
             content: result.content,
             usage: result.usage,
