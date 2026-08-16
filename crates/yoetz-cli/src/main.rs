@@ -85,6 +85,7 @@ use http::send_json;
 /// simple queries when no explicit --max-output-tokens is provided.
 const REGISTRY_OUTPUT_TOKENS_CAP: usize = 16384;
 const DEFAULT_CHATGPT_RECIPE_PROMPT: &str = "Review the attached file and provide your analysis.";
+const DEFAULT_TEMPERATURE: f32 = 0.1;
 
 #[derive(Parser)]
 #[command(
@@ -172,7 +173,7 @@ struct AskArgs {
     #[arg(long)]
     model: Option<String>,
 
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
     temperature: f32,
 
     #[arg(long)]
@@ -621,7 +622,7 @@ struct CouncilArgs {
     #[arg(long)]
     provider: Option<String>,
 
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
     temperature: f32,
 
     #[arg(long)]
@@ -805,7 +806,7 @@ struct ReviewDiffArgs {
     #[arg(long)]
     model: Option<String>,
 
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
     temperature: f32,
 
     #[arg(long)]
@@ -848,7 +849,7 @@ struct ReviewFileArgs {
     #[arg(long)]
     model: Option<String>,
 
-    #[arg(long, default_value = "0.1")]
+    #[arg(long, default_value_t = DEFAULT_TEMPERATURE)]
     temperature: f32,
 
     #[arg(long)]
@@ -8842,19 +8843,39 @@ mod tests {
             None,
             Some(&response_format),
             false,
+            DEFAULT_TEMPERATURE,
             None,
             None,
         )
         .unwrap_err()
         .to_string()
         .contains("response-format"));
-        assert!(
-            validate_cursor_options(Some("cursor"), None, None, false, Some(1.0), None,)
-                .unwrap_err()
-                .to_string()
-                .contains("does not report dollar cost")
-        );
-        validate_cursor_options(Some("cursor"), None, None, false, None, None).unwrap();
+        assert!(validate_cursor_options(
+            Some("cursor"),
+            None,
+            None,
+            false,
+            DEFAULT_TEMPERATURE,
+            Some(1.0),
+            None,
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("does not report dollar cost"));
+        let error = validate_cursor_options(Some("cursor"), None, None, false, 0.2, None, None)
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot honor --temperature"));
+        assert!(error.to_string().contains(&DEFAULT_TEMPERATURE.to_string()));
+        validate_cursor_options(
+            Some("cursor"),
+            None,
+            None,
+            false,
+            DEFAULT_TEMPERATURE,
+            None,
+            None,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -9145,6 +9166,7 @@ async fn call_model(
             max_output_tokens,
             response_format.as_ref(),
             !images.is_empty() || video.is_some(),
+            temperature,
             None,
             None,
         )?;
@@ -9179,6 +9201,7 @@ fn validate_cursor_options(
     max_output_tokens: Option<usize>,
     response_format: Option<&Value>,
     has_media: bool,
+    temperature: f32,
     max_cost_usd: Option<f64>,
     daily_budget_usd: Option<f64>,
 ) -> Result<()> {
@@ -9196,6 +9219,11 @@ fn validate_cursor_options(
     if max_output_tokens.is_some() {
         return Err(anyhow!(
             "Cursor CLI provider does not support --max-output-tokens"
+        ));
+    }
+    if temperature != DEFAULT_TEMPERATURE {
+        return Err(anyhow!(
+            "Cursor CLI provider cannot honor --temperature; only Yoetz's default {DEFAULT_TEMPERATURE} is accepted because omission and explicit {DEFAULT_TEMPERATURE} are indistinguishable"
         ));
     }
     if max_cost_usd.is_some() || daily_budget_usd.is_some() {

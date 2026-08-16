@@ -124,6 +124,7 @@ pub(crate) async fn handle_council(
             per_model_max_output_tokens[idx],
             response_format.as_ref(),
             false,
+            args.temperature,
             args.max_cost_usd,
             args.daily_budget_usd,
         )?;

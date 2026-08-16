@@ -74,6 +74,7 @@ async fn handle_review_diff(
         max_output_tokens,
         response_format.as_ref(),
         false,
+        args.temperature,
         args.max_cost_usd,
         args.daily_budget_usd,
     )?;
@@ -282,6 +283,7 @@ async fn handle_review_file(
         max_output_tokens,
         response_format.as_ref(),
         false,
+        args.temperature,
         args.max_cost_usd,
         args.daily_budget_usd,
     )?;

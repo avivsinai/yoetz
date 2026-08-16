@@ -159,6 +159,7 @@ pub(crate) async fn handle_ask(
         max_output_tokens,
         response_format.as_ref(),
         !image_inputs.is_empty() || video_input.is_some(),
+        args.temperature,
         args.max_cost_usd,
         args.daily_budget_usd,
     )?;

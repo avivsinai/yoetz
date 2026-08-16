@@ -253,7 +253,11 @@ yoetz council -p "Challenge this design" \
 
 Cursor CLI currently supports text only through Yoetz. Media, response schemas,
 explicit output-token limits, and dollar budget flags fail closed because the
-Cursor CLI does not expose equivalent contracts or dollar cost.
+Cursor CLI does not expose equivalent contracts or dollar cost. Yoetz accepts
+only its default temperature sentinel, `0.1`, for Cursor because omission and
+an explicit `--temperature 0.1` are indistinguishable; other values fail closed
+because Yoetz cannot honor them through the Cursor CLI. Cursor may use its own
+default sampling value.
 
 ### Run A Council
 

@@ -228,8 +228,9 @@ results; dollar cost remains unknown.
 
 For councils, prefix the model with `cursor/` so it can be mixed with registry
 models: `--models "cursor/$MODEL_ID,$OTHER_MODEL"`. Cursor does not currently
-support Yoetz media, response schemas, explicit output-token limits, or dollar
-budget flags; those combinations fail before the consult.
+support Yoetz media, response schemas, explicit output-token limits, non-default
+temperature values, or dollar budget flags; those combinations fail before the
+consult.
 
 ## Review
 
