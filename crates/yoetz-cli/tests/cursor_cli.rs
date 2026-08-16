@@ -22,6 +22,7 @@ struct CursorFixture {
     state_dir: PathBuf,
     bin_dir: PathBuf,
     source_path: PathBuf,
+    invocation_log: PathBuf,
 }
 
 impl CursorFixture {
@@ -60,6 +61,7 @@ impl CursorFixture {
         let state_dir = dir.path().join("state");
         let bin_dir = dir.path().join("bin");
         let source_path = dir.path().join("source.rs");
+        let invocation_log = dir.path().join("cursor-invocations.log");
         fs::create_dir(&bin_dir).unwrap();
         fs::write(&source_path, "fn answer() -> u8 { 42 }\n").unwrap();
         fs::write(
@@ -89,6 +91,9 @@ max_output_tokens = 1024
         fs::write(
             &cursor_agent,
             r#"#!/bin/sh
+if [ -n "$CURSOR_INVOCATION_LOG" ]; then
+  printf '%s\n' "$1" >> "$CURSOR_INVOCATION_LOG"
+fi
 if [ "$1" = "models" ]; then
   printf '%s\n' 'Available models' '' 'cursor-grok-4.6-xhigh - Cursor Grok 4.6 Extra High'
   exit 0
@@ -108,6 +113,7 @@ printf '%s' '{"type":"result","subtype":"success","is_error":false,"result":"cur
             state_dir,
             bin_dir,
             source_path,
+            invocation_log,
         }
     }
 
@@ -118,6 +124,7 @@ printf '%s' '{"type":"result","subtype":"success","is_error":false,"result":"cur
             .env("YOETZ_REGISTRY_PATH", &self.registry_path)
             .env("YOETZ_DIR", &self.state_dir)
             .env("PATH", &self.bin_dir)
+            .env("CURSOR_INVOCATION_LOG", &self.invocation_log)
             .env("MOCK_API_KEY", "test-key")
             .env_remove("OPENAI_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")
@@ -126,6 +133,32 @@ printf '%s' '{"type":"result","subtype":"success","is_error":false,"result":"cur
             .env_remove("XAI_API_KEY")
             .args(["--format", "json"]);
         command
+    }
+
+    fn fail_discovery(&self) {
+        let cursor_agent = self.bin_dir.join("cursor-agent");
+        fs::write(
+            &cursor_agent,
+            r#"#!/bin/sh
+if [ -n "$CURSOR_INVOCATION_LOG" ]; then
+  printf '%s\n' "$1" >> "$CURSOR_INVOCATION_LOG"
+fi
+printf '%s\n' 'discovery unavailable' >&2
+exit 23
+"#,
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&cursor_agent).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(cursor_agent, permissions).unwrap();
+    }
+
+    fn invocations(&self) -> Vec<String> {
+        fs::read_to_string(&self.invocation_log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -266,6 +299,71 @@ fn council_routes_cursor_prefixed_model() {
         "cursor/cursor-grok-4.6-xhigh"
     );
     assert_eq!(payload["results"][0]["content"], "cursor answer");
+}
+
+#[test]
+fn council_shares_cursor_discovery_across_members() {
+    let fixture = CursorFixture::new();
+    let output = fixture
+        .command()
+        .args([
+            "council",
+            "--models",
+            "cursor/cursor-grok-4.6-xhigh,cursor/cursor-grok-4.6-xhigh,cursor/cursor-grok-4.6-xhigh",
+            "--prompt",
+            "review this",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let invocations = fixture.invocations();
+    assert_eq!(
+        invocations
+            .iter()
+            .filter(|arg| arg.as_str() == "models")
+            .count(),
+        1,
+        "discovery invocations: {invocations:?}"
+    );
+    assert_eq!(
+        invocations
+            .iter()
+            .filter(|arg| arg.as_str() != "models")
+            .count(),
+        3,
+        "consult invocations: {invocations:?}"
+    );
+}
+
+#[test]
+fn council_caches_cursor_discovery_failure_for_all_members() {
+    let fixture = CursorFixture::new();
+    fixture.fail_discovery();
+    let output = fixture
+        .command()
+        .args([
+            "council",
+            "--models",
+            "cursor/cursor-grok-4.6-xhigh,cursor/cursor-grok-4.6-xhigh,cursor/cursor-grok-4.6-xhigh",
+            "--prompt",
+            "review this",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr
+            .matches("Cursor CLI model discovery failed: discovery unavailable")
+            .count(),
+        3,
+        "stderr: {stderr}"
+    );
+    assert_eq!(fixture.invocations(), vec!["models"]);
 }
 
 #[test]

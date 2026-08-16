@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Cursor model discovery now runs once per Yoetz process and is shared by all
+  council members; a discovery failure fails every Cursor member without
+  re-spawning the CLI.
 - Document agent-facing CLI contracts, browser thread controls, patch apply
   workflow, and the legacy status of the bundled Gemini browser recipe.
 

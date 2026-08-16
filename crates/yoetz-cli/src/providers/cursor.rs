@@ -4,10 +4,12 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::Path;
 use std::process::{Output, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
+use tokio::sync::OnceCell;
 use tokio::time::{timeout, Instant};
 use yoetz_core::types::Usage;
 
@@ -28,6 +30,14 @@ pub(crate) struct CursorCompletion {
     pub response_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct CursorDiscovery {
+    binary: OsString,
+    models: Vec<CursorModel>,
+}
+
+pub(crate) type CursorDiscoveryOutcome = std::result::Result<CursorDiscovery, String>;
+
 #[derive(Debug, Deserialize)]
 struct CursorResponse {
     #[serde(rename = "type")]
@@ -47,21 +57,47 @@ struct CursorUsage {
     output_tokens: Option<u64>,
 }
 
-pub(crate) async fn list_models(timeout_duration: Duration) -> Result<Vec<CursorModel>> {
-    let (_binary, output) = discover_cursor(timeout_duration).await?;
-    parse_models(&String::from_utf8_lossy(&output.stdout))
+pub(crate) async fn list_models(
+    timeout_duration: Duration,
+    discovery: &Arc<OnceCell<CursorDiscoveryOutcome>>,
+) -> Result<Vec<CursorModel>> {
+    Ok(cached_discovery(timeout_duration, discovery)
+        .await?
+        .models
+        .clone())
 }
 
 pub(crate) async fn complete(
     model: &str,
     prompt: &str,
     timeout_duration: Duration,
+    discovery: &Arc<OnceCell<CursorDiscoveryOutcome>>,
 ) -> Result<CursorCompletion> {
     let started = Instant::now();
-    let (binary, models_output) = discover_cursor(timeout_duration).await?;
-    let models = parse_models(&String::from_utf8_lossy(&models_output.stdout))?;
+    let discovery = cached_discovery(timeout_duration, discovery).await?;
     let remaining = remaining_timeout(timeout_duration, started.elapsed())?;
-    complete_with_discovered(&binary, &models, model, prompt, remaining).await
+    complete_with_discovered(
+        &discovery.binary,
+        &discovery.models,
+        model,
+        prompt,
+        remaining,
+    )
+    .await
+}
+
+async fn cached_discovery(
+    timeout_duration: Duration,
+    discovery: &Arc<OnceCell<CursorDiscoveryOutcome>>,
+) -> Result<&CursorDiscovery> {
+    let outcome = discovery
+        .get_or_init(|| async {
+            discover_cursor(timeout_duration)
+                .await
+                .map_err(|error| format!("{error:#}"))
+        })
+        .await;
+    outcome.as_ref().map_err(|error| anyhow!("{error}"))
 }
 
 async fn complete_with_discovered(
@@ -117,7 +153,7 @@ fn completion_args(workspace: &Path, model: &str) -> Vec<OsString> {
     ]
 }
 
-async fn discover_cursor(timeout_duration: Duration) -> Result<(OsString, Output)> {
+async fn discover_cursor(timeout_duration: Duration) -> Result<CursorDiscovery> {
     let workspace = TempDir::new().context("create isolated Cursor discovery workspace")?;
     for candidate in CURSOR_BINARIES {
         let args = [OsString::from("models")];
@@ -130,7 +166,11 @@ async fn discover_cursor(timeout_duration: Duration) -> Result<(OsString, Output
         .await?
         {
             Some(output) if output.status.success() => {
-                return Ok((OsString::from(candidate), output));
+                let models = parse_models(&String::from_utf8_lossy(&output.stdout))?;
+                return Ok(CursorDiscovery {
+                    binary: OsString::from(candidate),
+                    models,
+                });
             }
             Some(output) => {
                 return Err(anyhow!(

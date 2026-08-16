@@ -223,6 +223,7 @@ pub(crate) async fn handle_council(
             let prompt = std::sync::Arc::clone(&model_prompt);
             let provider = provider.clone();
             let litellm = ctx.litellm.clone();
+            let cursor_discovery = std::sync::Arc::clone(&ctx.cursor_discovery);
             let cursor_timeout = ctx.timeout_duration;
             let semaphore = std::sync::Arc::clone(&semaphore);
             let temperature = args.temperature;
@@ -240,6 +241,7 @@ pub(crate) async fn handle_council(
                 let call = call_model(
                     &litellm,
                     cursor_timeout,
+                    &cursor_discovery,
                     Some(&provider),
                     &model,
                     prompt.as_str(),
