@@ -3,6 +3,7 @@ use std::env;
 
 use yoetz_core::config::Config;
 
+pub mod cursor;
 pub mod gemini;
 pub mod openai;
 

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::collections::HashMap;
 
-use crate::fuzzy;
+use crate::{fuzzy, providers};
 use crate::{
     maybe_write_output, registry, AppContext, ModelsArgs, ModelsCommand, ModelsFrontierArgs,
     ModelsListArgs, ModelsResolveArgs,
@@ -16,11 +16,23 @@ pub(crate) async fn handle_models(
 ) -> Result<()> {
     match args.command {
         ModelsCommand::List(list_args) => {
-            let registry = registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
-                .await?
-                .unwrap_or_default()
-                .with_inferred_tiers();
-            let filtered = filter_registry(&registry, &list_args);
+            let cursor_source = list_args
+                .provider
+                .as_deref()
+                .is_some_and(|provider| provider.eq_ignore_ascii_case("cursor"));
+            let registry = if cursor_source {
+                cursor_registry(ctx).await?
+            } else {
+                registry::load_registry_with_auto_sync(&ctx.client, &ctx.config)
+                    .await?
+                    .unwrap_or_default()
+                    .with_inferred_tiers()
+            };
+            let filtered = if cursor_source {
+                filter_cursor_registry(&registry, &list_args)
+            } else {
+                filter_registry(&registry, &list_args)
+            };
             maybe_write_output(ctx, &filtered)?;
             match format {
                 OutputFormat::Json => write_json(&filtered),
@@ -70,6 +82,45 @@ pub(crate) async fn handle_models(
         ModelsCommand::Resolve(resolve_args) => handle_resolve(ctx, resolve_args, format).await,
         ModelsCommand::Frontier(frontier_args) => handle_frontier(ctx, frontier_args, format).await,
     }
+}
+
+fn filter_cursor_registry(registry: &ModelRegistry, args: &ModelsListArgs) -> ModelRegistry {
+    let Some(search) = args.search.as_deref() else {
+        return registry.clone();
+    };
+    let needle = normalize_cursor_search(search);
+    let mut filtered = ModelRegistry::default();
+    filtered.models = registry
+        .models
+        .iter()
+        .filter(|model| normalize_cursor_search(&model.id).contains(&needle))
+        .cloned()
+        .collect();
+    filtered.rebuild_index();
+    filtered
+}
+
+fn normalize_cursor_search(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+async fn cursor_registry(ctx: &AppContext) -> Result<ModelRegistry> {
+    let models = providers::cursor::list_models(ctx.timeout_duration).await?;
+    let mut registry = ModelRegistry::default();
+    registry.models = models
+        .into_iter()
+        .map(|model| yoetz_core::registry::ModelEntry {
+            id: model.id,
+            provider: Some("cursor".to_string()),
+            ..Default::default()
+        })
+        .collect();
+    registry.rebuild_index();
+    Ok(registry)
 }
 
 async fn handle_resolve(
@@ -313,5 +364,28 @@ mod tests {
             frontier_families(&config),
             vec!["openai".to_string(), "anthropic".to_string()]
         );
+    }
+
+    #[test]
+    fn cursor_search_is_predictable_substring_matching() {
+        let mut registry = ModelRegistry::default();
+        registry.models = ["cursor-grok-4.6-xhigh", "cursor-grok-4.5-high", "gpt-5.6"]
+            .into_iter()
+            .map(|id| yoetz_core::registry::ModelEntry {
+                id: id.to_string(),
+                provider: Some("cursor".to_string()),
+                ..Default::default()
+            })
+            .collect();
+        registry.rebuild_index();
+        let args = ModelsListArgs {
+            search: Some("grok 4.6".to_string()),
+            provider: Some("cursor".to_string()),
+        };
+
+        let filtered = filter_cursor_registry(&registry, &args);
+
+        assert_eq!(filtered.models.len(), 1);
+        assert_eq!(filtered.models[0].id, "cursor-grok-4.6-xhigh");
     }
 }
