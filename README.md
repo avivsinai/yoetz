@@ -143,7 +143,8 @@ cp docs/config.example.toml ~/.config/yoetz/config.toml
 Yoetz also supports `YOETZ_CONFIG_PATH`, repo-local `./yoetz.toml`, and profile
 overlays selected with `--config-profile <name>`. See
 [docs/config.example.toml](docs/config.example.toml) for the shape. Global
-`--timeout-secs` controls the HTTP client timeout and defaults to `180`.
+`--timeout-secs` controls provider HTTP calls and local Cursor CLI calls, and
+defaults to `180`.
 `--allow-unknown` permits model IDs that are absent from the registry; reserve
 it for self-hosted models whose IDs cannot be registered.
 
@@ -217,6 +218,42 @@ yoetz apply --patch-file review.patch
 not change files. Inspect the patch before the final command; `yoetz apply`
 invokes `git apply` but does not accept or adjudicate the review findings for
 you.
+
+### Consult Through Cursor CLI
+
+Yoetz can use an authenticated local Cursor CLI as a text backend. Install
+Cursor CLI, run `cursor-agent login` (or `agent login`), then resolve the live
+model ID before calling it:
+
+```bash
+yoetz models list --provider cursor -s "grok 4.6" --format json
+
+CURSOR_MODEL=$(yoetz models list --provider cursor -s "grok 4.6" --format json \
+  | jq -er '.models | map(.id) | map(select(contains("grok-4.6") and endswith("-xhigh"))) | if length == 1 then .[0] else error("expected one Grok 4.6 xhigh model") end')
+test -n "$CURSOR_MODEL"
+
+yoetz ask \
+  -p "Find the root cause in this error path" \
+  -f "crates/**/*.rs" \
+  --provider cursor \
+  --model "$CURSOR_MODEL" \
+  --format json
+```
+
+Cursor runs in read-only Ask mode inside a temporary Yoetz-owned workspace;
+the real repository is never trusted or exposed as its workspace. After
+resolving another API model into `OTHER_MODEL`, prefix the Cursor model so
+mixed-council provider routing stays explicit:
+
+```bash
+yoetz council -p "Challenge this design" \
+  --models "cursor/$CURSOR_MODEL,$OTHER_MODEL" \
+  --format json
+```
+
+Cursor CLI currently supports text only through Yoetz. Media, response schemas,
+explicit output-token limits, and dollar budget flags fail closed because the
+Cursor CLI does not expose equivalent contracts or dollar cost.
 
 ### Run A Council
 
@@ -437,6 +474,7 @@ pinning examples.
 | OpenRouter | Yes | Model-dependent | No | No | No |
 | OpenAI | Yes | Yes | Yes | Yes (Sora) | No |
 | Gemini | Yes | Yes | No | Yes (Veo) | Yes |
+| Cursor CLI | Yes | No | No | No | No |
 | Z.AI | Yes | Model-dependent | No | No | No |
 | LiteLLM-compatible | Yes | Model-dependent | No | No | No |
 
@@ -461,6 +499,9 @@ Bundles are prompt-input artifacts, not trusted control channels. Treat bundled
 repository content, issues, logs, and pasted browser output as untrusted input.
 Keep intent in explicit CLI flags and the user prompt, avoid bundling secrets,
 and review generated changes before applying them.
+Cursor calls add a second boundary: Yoetz copies only the rendered consult into
+an isolated temporary workspace and runs Cursor in Ask + sandbox mode without
+force, YOLO, or MCP auto-approval flags.
 
 Project trust signals:
 

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Cursor CLI is available as a local text backend for `ask`, `review`, and
+  mixed `council` runs, with live model discovery and isolated sandboxed
+  workspaces. The documented consult target is Cursor Grok 4.6 Extra High.
+
 ### Changed
 
 - Document agent-facing CLI contracts, browser thread controls, patch apply

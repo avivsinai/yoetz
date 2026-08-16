@@ -69,8 +69,8 @@ safely.
   The first requests provider-side structured model output for `ask`,
   `council`, or `review`; the second validates the serialized Yoetz CLI result
   envelope before `--output-final` is written.
-- Global `--timeout-secs` controls the HTTP client timeout and defaults to
-  `180`. Use `--config-profile <name>` for a config profile overlay. Use
+- Global `--timeout-secs` controls provider HTTP calls and local Cursor CLI
+  calls, and defaults to `180`. Use `--config-profile <name>` for a config profile overlay. Use
   `--allow-unknown` only for self-hosted model IDs that are absent from the
   registry.
 - `yoetz ask --no-session` (or trusted config `[sessions] no_session = true`)
@@ -119,6 +119,12 @@ Search for models by keyword:
 yoetz models list -s claude --format json
 ```
 
+Cursor CLI models come from the authenticated local installation rather than
+the API registry:
+```bash
+yoetz models list --provider cursor -s "grok 4.6" --format json
+```
+
 ## Quick Reference
 
 | Task | Command |
@@ -127,6 +133,7 @@ yoetz models list -s claude --format json
 | Find frontier model for a provider | `yoetz models frontier --family openai --format json` |
 | Resolve a model ID | `yoetz models resolve "grok" --format json` |
 | Search models | `yoetz models list -s claude --format json` |
+| Search local Cursor models | `yoetz models list --provider cursor -s "grok 4.6" --format json` |
 | Ask single model | `yoetz ask -p "question" -f "src/*.rs" --provider openrouter --model MODEL_ID --format json` |
 | Council vote | `yoetz council -p "question" --models MODEL_ID,MODEL_ID,MODEL_ID --format json` |
 | Review staged diff | `yoetz review diff --staged --format json` |
@@ -199,6 +206,30 @@ yoetz ask -p "Review this" -f "src/*.rs" \
 
 Long-running `ask` runs use the same native completion notification path and
 respect the same mute rules as `council`.
+
+### Cursor CLI (local text backend)
+
+Resolve the exact installed model first, then pass it verbatim:
+
+```bash
+MODEL_ID=$(yoetz models list --provider cursor -s "grok 4.6" --format json \
+  | jq -er '.models | map(.id) | map(select(contains("grok-4.6") and endswith("-xhigh"))) | if length == 1 then .[0] else error("expected one Grok 4.6 xhigh model") end')
+test -n "$MODEL_ID"
+yoetz ask -p "Review this" -f "src/*.rs" \
+  --provider cursor --model "$MODEL_ID" --format json
+```
+
+The backend requires an authenticated `cursor-agent` or `agent` binary. Yoetz
+validates the exact model against `cursor-agent models`, creates a temporary
+workspace containing only `consult.md`, and runs `--print --mode ask --sandbox
+enabled --trust --output-format json`. It never passes `--force`, `--yolo`, or
+`--approve-mcps`. Cursor text responses and token usage map into normal Yoetz
+results; dollar cost remains unknown.
+
+For councils, prefix the model with `cursor/` so it can be mixed with registry
+models: `--models "cursor/$MODEL_ID,$OTHER_MODEL"`. Cursor does not currently
+support Yoetz media, response schemas, explicit output-token limits, or dollar
+budget flags; those combinations fail before the consult.
 
 ## Review
 
@@ -700,6 +731,9 @@ The browser module connects to your running Chrome via CDP (Chrome DevTools Prot
 - `openai` - `OPENAI_API_KEY`
 - `gemini` - `GEMINI_API_KEY`
 - `openrouter` - `OPENROUTER_API_KEY`
+
+**Local CLI backend:**
+- `cursor` - authenticated `cursor-agent` or `agent`; no provider config needed
 
 **Via OpenRouter** (recommended for Anthropic/XAI - no extra config):
 - Resolve Anthropic models with `yoetz models frontier --family anthropic --format json`
