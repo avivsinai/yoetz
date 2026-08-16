@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Document agent-facing CLI contracts, browser thread controls, patch apply
   workflow, and the legacy status of the bundled Gemini browser recipe.
 
+### Security
+
+- CWD dotenv files can no longer override inherited child-process code-loading,
+  dynamic-loader, or TLS-trust settings (`NODE_OPTIONS`, `LD_PRELOAD`,
+  `DYLD_INSERT_LIBRARIES`, and `NODE_EXTRA_CA_CERTS`).
+
 ## [0.5.54] - 2026-08-14
 ### Added
 

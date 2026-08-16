@@ -1040,6 +1040,13 @@ const BASE_PROTECTED_DOTENV_ENV_VARS: &[&str] = &[
     "YOETZ_BROWSER_CDP",
     "YOETZ_BROWSER_TARGET_PATH",
     "YOETZ_BROWSER_PROFILE",
+    // Prevent repo-local dotenv files from injecting code or changing dynamic
+    // loader behavior in inherited child processes.
+    "NODE_OPTIONS",
+    "LD_PRELOAD",
+    "DYLD_INSERT_LIBRARIES",
+    // Prevent a repo-local CA from changing TLS verification for child tools.
+    "NODE_EXTRA_CA_CERTS",
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "GEMINI_API_KEY",
@@ -6264,6 +6271,10 @@ mod tests {
             "YOETZ_BROWSER_CDP",
             "YOETZ_BROWSER_TARGET_PATH",
             "YOETZ_BROWSER_PROFILE",
+            "NODE_OPTIONS",
+            "LD_PRELOAD",
+            "DYLD_INSERT_LIBRARIES",
+            "NODE_EXTRA_CA_CERTS",
             "ZAI_API_KEY",
             "LITELLM_API_KEY",
         ] {
