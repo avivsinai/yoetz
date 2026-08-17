@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.55] - 2026-08-17
 ### Added
 
 - Cursor CLI is available as a local text backend for `ask`, `review`, and
@@ -26,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - CWD dotenv files can no longer override inherited child-process code-loading,
   dynamic-loader, or TLS-trust settings (`NODE_OPTIONS`, `LD_PRELOAD`,
   `DYLD_INSERT_LIBRARIES`, and `NODE_EXTRA_CA_CERTS`).
+
 
 ## [0.5.54] - 2026-08-14
 ### Added

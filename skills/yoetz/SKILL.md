@@ -1,6 +1,6 @@
 ---
 name: yoetz
-version: 0.5.54
+version: 0.5.55
 description: >
   Fast CLI-first LLM council, bundler, and multimodal gateway. Use ONLY when user
   explicitly mentions "yoetz", "yoetz ask", "yoetz council", "yoetz review",
