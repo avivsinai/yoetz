@@ -375,6 +375,11 @@ export async function configureModelState(root, job = {}) {
       available_families: [],
       family_status: "skipped",
       effort_status: "skipped",
+      picker_family_status: "skipped",
+      picker_effort_status: "skipped",
+      closed_pill_family_status: "skipped",
+      closed_pill_effort_status: "skipped",
+      closed_pill_text: pillText ?? "",
       failure_reason: null,
       picker_shape: null,
       surface_trust: null,
@@ -405,6 +410,11 @@ export async function configureModelState(root, job = {}) {
     available_families: selection.available_families ?? [],
     family_status: selection.family_status ?? "unverified",
     effort_status: selection.effort_status ?? "unverified",
+    picker_family_status: selection.picker_family_status ?? "unverified",
+    picker_effort_status: selection.picker_effort_status ?? "unverified",
+    closed_pill_family_status: selection.closed_pill_family_status ?? "skipped",
+    closed_pill_effort_status: selection.closed_pill_effort_status ?? "skipped",
+    closed_pill_text: selection.closed_pill_text ?? selection.pill_text ?? null,
     failure_reason: selection.failure_reason ?? null,
     picker_shape: selection.picker_shape ?? null,
     surface_trust: selection.surface_trust ?? null,
@@ -526,6 +536,11 @@ async function selectSolMaxTierModel(root, options = {}) {
     failure_reason: null,
     family_status: "unverified",
     effort_status: "unverified",
+    picker_family_status: "unverified",
+    picker_effort_status: "unverified",
+    closed_pill_family_status: "skipped",
+    closed_pill_effort_status: "skipped",
+    closed_pill_text: null,
     picker_shape: null,
     effort_control: null,
     effort_move_method: null,
@@ -655,17 +670,14 @@ async function selectSolMaxTierModel(root, options = {}) {
   }
   modelButton = await waitForModelButton(root, options);
   const pillText = modelControlLabel(modelButton);
-  const verifiedEffortLabel = state.shape === "personal"
-    ? state.effort_label
-    : state.shape === "slider"
-      ? sliderEffortSnapshot(state.effort_slider, state.surface)?.display_label
-    : normalizeText(textOf(state.effort_items.find((item) => itemIsChecked(item))));
+  const verifiedEffortLabel = pickerVerifiedEffortLabel(state);
   if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsFamilyLabel(pillText, state.family_label)) {
-    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm GPT-5.6 Sol after closing the slider picker", "family_composer_pill_unverified");
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm GPT-5.6 Sol after closing the slider picker", "family_composer_pill_unverified", { closedPill: true });
   }
   if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel)) {
-    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm the verified maximum tier after closing the slider picker", "effort_composer_pill_unverified");
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm the verified maximum tier after closing the slider picker", "effort_composer_pill_unverified", { closedPill: true });
   }
+  const closedPill = closedPillDiagnostics(pillText, state);
 
   return {
     status: "selected",
@@ -673,6 +685,9 @@ async function selectSolMaxTierModel(root, options = {}) {
     failure_reason: null,
     family_status: "verified",
     effort_status: "verified",
+    picker_family_status: "verified",
+    picker_effort_status: "verified",
+    ...closedPill,
     picker_shape: state.shape,
     surface_trust: state.surface_trust,
     effort_control: effortControlDiagnostics(state),
@@ -1188,12 +1203,23 @@ function effortIsMaxTier(state) {
 function pillConfirmsEffortLabel(pillText, effortLabel) {
   const foldedPill = foldedModelText(pillText).replace(/\s+/g, " ");
   const foldedEffort = foldedModelText(effortLabel).replace(/\s+/g, " ");
-  return foldedPill === foldedEffort || foldedPill.endsWith(` ${foldedEffort}`);
+  if (!foldedEffort) return false;
+  if (foldedPill === foldedEffort || foldedPill.endsWith(` ${foldedEffort}`)) return true;
+  if (CHATGPT_MAX_EFFORT_LABELS.has(foldedEffort)) {
+    return [...CHATGPT_MAX_EFFORT_LABELS].some((label) => foldedPill === label || foldedPill.endsWith(` ${label}`));
+  }
+  return false;
 }
 
 function pillConfirmsFamilyLabel(pillText, familyLabel) {
-  const firstLine = normalizeText(pillText).split("\n", 1)[0];
-  return foldedFamilyLabel(firstLine) === foldedFamilyLabel(familyLabel);
+  const foldedFamily = foldedFamilyLabel(familyLabel);
+  if (!foldedFamily) return false;
+  const lines = normalizeText(pillText).split("\n").map((line) => normalizeText(line)).filter(Boolean);
+  const candidates = lines.length > 0 ? lines : [normalizeText(pillText)];
+  return candidates.some((line) => {
+    const foldedLine = foldedFamilyLabel(line);
+    return foldedLine === foldedFamily || foldedLine.startsWith(`${foldedFamily} `);
+  });
 }
 
 function sliderEffortSnapshot(slider, surface = null) {
@@ -1211,6 +1237,41 @@ function sliderEffortSnapshot(slider, surface = null) {
     return null;
   }
   return { label: foldedModelText(match[1]), display_label: match[1], now, min, max, value_text: nearbyLabel };
+}
+
+function pickerVerifiedEffortLabel(state) {
+  if (!state) return null;
+  if (state.shape === "personal") return state.effort_label || null;
+  if (state.shape === "slider") {
+    return sliderEffortSnapshot(state.effort_slider, state.surface)?.display_label ?? null;
+  }
+  const checked = state.effort_items?.find((item) => itemIsChecked(item));
+  return checked ? (normalizeText(textOf(checked)) || null) : null;
+}
+
+function verificationStatus(ok) {
+  return ok ? "verified" : "unverified";
+}
+
+function closedPillDiagnostics(pillText, state) {
+  const text = pillText ?? "";
+  const familyLabel = state?.family_label ?? null;
+  const effortLabel = pickerVerifiedEffortLabel(state);
+  return {
+    closed_pill_text: text || null,
+    closed_pill_family_status: text && familyLabel
+      ? verificationStatus(pillConfirmsFamilyLabel(text, familyLabel))
+      : "skipped",
+    closed_pill_effort_status: text && effortLabel
+      ? verificationStatus(pillConfirmsEffortLabel(text, effortLabel))
+      : "skipped"
+  };
+}
+
+function combinedVerificationStatus(pickerStatus, closedStatus) {
+  if (pickerStatus === "unverified" || closedStatus === "unverified") return "unverified";
+  if (pickerStatus === "verified") return "verified";
+  return pickerStatus ?? "unverified";
 }
 
 function effortLabelNearSlider(slider, surface) {
@@ -1471,12 +1532,25 @@ function effortDiagnostics(items) {
   return items.map((item) => ({ label: textOf(item), checked: itemIsChecked(item) }));
 }
 
-function selectionFailure(base, modelButton, state, availableFamilies, warning, failureReason) {
+function selectionFailure(base, modelButton, state, availableFamilies, warning, failureReason, options = {}) {
+  const pickerFamily = familyIsSol(state?.family_label) ? "verified" : "unverified";
+  const pickerEffort = effortIsMaxTier(state) ? "verified" : "unverified";
+  const pillText = modelControlLabel(modelButton);
+  const closedPill = options.closedPill
+    ? closedPillDiagnostics(pillText, state)
+    : {
+        closed_pill_text: null,
+        closed_pill_family_status: "skipped",
+        closed_pill_effort_status: "skipped"
+      };
   return {
     ...base,
     failure_reason: failureReason,
-    family_status: familyIsSol(state?.family_label) ? "verified" : "unverified",
-    effort_status: effortIsMaxTier(state) ? "verified" : "unverified",
+    picker_family_status: pickerFamily,
+    picker_effort_status: pickerEffort,
+    family_status: combinedVerificationStatus(pickerFamily, closedPill.closed_pill_family_status),
+    effort_status: combinedVerificationStatus(pickerEffort, closedPill.closed_pill_effort_status),
+    ...closedPill,
     picker_shape: state?.shape ?? null,
     surface_trust: state?.surface_trust ?? null,
     surface_descendants: state?.surface_trust === "aria_controls_structural"
@@ -1488,7 +1562,7 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     family_menu_probe: state?.family_menu_probe ?? null,
     effort_control: effortControlDiagnostics(state),
     effort_move_method: state?.effort_move_method ?? null,
-    pill_text: modelControlLabel(modelButton),
+    pill_text: pillText,
     family_label: state?.family_label ?? null,
     family_label_candidates: state?.family_label_candidates ?? [],
     family_label_source: state?.family_label_source ?? null,

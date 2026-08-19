@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- Native ChatGPT model-selection diagnostics now split picker proof from
+  closed-composer-pill corroboration (`picker_family_status` /
+  `picker_effort_status` vs `closed_pill_family_status` /
+  `closed_pill_effort_status` / `closed_pill_text`). Fail-closed behavior is
+  unchanged; `family_status` no longer reports picker-verified when only the
+  closed pill failed. Closed-pill effort accepts any verified maximum label
+  (`Pro`, `Extra High`, `Max`); family still requires a Sol-bearing line.
+- Native ChatGPT selection now accepts `GPT-5.6 Sol Max` at the site-adapter
+  boundary, matching the personal-picker max-tier contract.
 
 ## [0.5.56] - 2026-08-19
 ### Fixed
