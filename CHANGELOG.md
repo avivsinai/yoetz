@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- ChatGPT native-extension model selection now recognizes the personal-profile
+  simple picker (GPT-5.6 Sol plus Effort `Max` / `Extra High` / `Pro`). The
+  Faster/Smarter power slider is left untouched. Structural trust still applies
+  when the Radix surface is opacity-0 in a background tab, including when
+  `aria-controls` names a wrapper whose inner menu holds `data-state=open`.
+- ChatGPT response extraction now recovers assistant markdown that is a sibling
+  of its final copy-action row while retaining assistant-ownership and citation
+  guards.
 
 ## [0.5.55] - 2026-08-17
 ### Added

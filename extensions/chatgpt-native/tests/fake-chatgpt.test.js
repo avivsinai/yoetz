@@ -611,6 +611,23 @@ test("extractResponse can use ChatGPT markdown assistant content without role ma
   assert.equal(extraction.assistant_count, 1);
 });
 
+test("extractResponse scopes sibling markdown to a later copy control", () => {
+  const user = new FakeElement("article", { "data-message-author-role": "user" }, "Review this bundle");
+  const answer = new FakeElement("div", { class: "markdown prose" }, "Complete answer from the personal profile");
+  const actions = new FakeElement("article", {}, "Copy")
+    .append(new FakeElement("button", { "aria-label": "Copy" }, "Copy"));
+  const conversation = new FakeElement("main", { role: "main" }, "")
+    .append(user, answer, actions);
+  const doc = new FakeDocument(new FakeElement("body", {}, "").append(conversation));
+
+  const extraction = extractResponse(doc);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.text, "Complete answer from the personal profile");
+  assert.equal(extraction.assistant_count, 1);
+  assert.equal(extraction.copy_button_count, 1);
+});
+
 test("extractResponse promotes assistant role marker to enclosing turn content", () => {
   const roleMarker = new FakeElement("div", { "data-message-author-role": "assistant" }, "");
   const markdown = new FakeElement("div", { class: "markdown prose" }, "Sibling markdown answer");
@@ -694,7 +711,7 @@ test("extractResponse ignores ChatGPT model status text when assistant content i
 });
 
 test("extractResponse recognizes new GPT-5.6 picker labels only as whole-line status chrome", () => {
-  for (const status of ["Sol", "Instant", "Medium", "High", "Extra High", "Pro", "GPT-5.6 Sol", "5.6 Pro", "5.5 Extra High"]) {
+  for (const status of ["Sol", "Instant", "Medium", "High", "Extra High", "Pro", "Max", "GPT-5.6 Sol", "5.6 Pro", "5.5 Extra High", "5.6 Sol Max"]) {
     const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, status)
       .append(new FakeElement("button", { "aria-label": "Copy" }, "Copy"));
     const doc = new FakeDocument(new FakeElement("body", {}, status).append(assistant));
@@ -2524,6 +2541,77 @@ test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum",
   assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
+test("GPT-5.6 Sol personal picker verifies Effort Max without moving the power slider", async () => {
+  const fixture = makePersonalPickerFixture();
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "personal");
+  assert.equal(result.surface_trust, "aria_controls_structural");
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.equal(result.effort_control.value_text, "Max");
+  assert.equal(result.effort_move_method, null);
+  assert.deepEqual(fixture.keyAttempts(), []);
+  assert.equal(fixture.sliderValue(), 2);
+  assert.equal(fixture.pickerOpen(), false);
+});
+
+test("GPT-5.6 Sol personal picker trusts a Radix wrapper whose inner menu is open", async () => {
+  const fixture = makePersonalPickerFixture({ wrappedRadix: true, startsOpen: true });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "personal");
+  assert.equal(result.surface_trust, "aria_controls_structural");
+  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.deepEqual(fixture.keyAttempts(), []);
+  assert.equal(fixture.sliderValue(), 2);
+});
+
+test("GPT-5.6 Sol personal picker classifies a visible simple picker", async () => {
+  const fixture = makePersonalPickerFixture({ backgroundFrozen: false });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "personal");
+  assert.equal(result.surface_trust, "visible");
+  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.deepEqual(fixture.keyAttempts(), []);
+});
+
+test("GPT-5.6 Sol personal picker upgrades High effort via the Effort row", async () => {
+  const fixture = makePersonalPickerFixture({
+    effort: "High",
+    effortOptions: ["Standard", "High", "Max"]
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.equal(result.effort_move_method, "effort_row_select");
+  assert.equal(fixture.effortClicks(), 1);
+  assert.deepEqual(fixture.keyAttempts(), []);
+  assert.equal(fixture.sliderValue(), 2);
+});
+
+test("GPT-5.6 Sol personal picker rejects an unknown Effort label", async () => {
+  const fixture = makePersonalPickerFixture({ effort: "Expert" });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_control_not_found");
+  assert.equal(result.effort_control.value_text, "Expert");
+  assert.deepEqual(fixture.keyAttempts(), []);
+  assert.equal(fixture.sliderValue(), 2);
+  assert.equal(fixture.pickerOpen(), false);
+});
+
 test("GPT-5.6 Sol Advanced picker waits for an expanded Radix surface to finish animating", async () => {
   const fixture = makeSolSliderFixture({ keyboardMode: "end", animatedReveal: true });
 
@@ -3202,6 +3290,154 @@ function makeSolSliderFixture({
     panel: () => panel,
     familyClicks: () => familyClickCount,
     familyMenuOpen: () => Boolean(familyMenu)
+  };
+}
+
+function makePersonalPickerFixture({
+  effort = "Max",
+  backgroundFrozen = true,
+  wrappedRadix = false,
+  startsOpen = false,
+  effortOptions = null
+} = {}) {
+  let panel = null;
+  let currentValue = 2;
+  let currentEffort = effort;
+  let effortClicks = 0;
+  let effortMenu = null;
+  const keyAttempts = [];
+  const composer = new FakeElement("div", {
+    id: "prompt-textarea",
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Chat with ChatGPT",
+    class: "ProseMirror"
+  });
+  const form = new FakeElement("form", { class: "group/composer" }, "").append(composer);
+  const body = new FakeElement("body", {}, "").append(form);
+  const pickerText = () => [
+    "Light, 2 of 5.",
+    "Use Left and Right arrow keys to adjust power.",
+    "Reset to default",
+    "Faster",
+    "Smarter",
+    "Consumes usage limits faster",
+    "Model",
+    "GPT-5.6 Sol",
+    "Effort",
+    currentEffort,
+    "Speed",
+    "Standard"
+  ].join("\n");
+  const frozenStyle = backgroundFrozen ? "opacity:0; pointer-events:auto" : "";
+  const closeEffortMenu = () => {
+    if (!effortMenu) return;
+    body.children = body.children.filter((child) => child !== effortMenu);
+    effortMenu.parentElement = null;
+    effortMenu = null;
+  };
+  const closePanel = () => {
+    closeEffortMenu();
+    if (!panel) return;
+    body.children = body.children.filter((child) => child !== panel);
+    panel.parentElement = null;
+    panel = null;
+    pill.setAttribute("aria-expanded", "false");
+    pill.setAttribute("data-state", "closed");
+  };
+  let slider = null;
+  let effortRow = null;
+  const openEffortMenu = () => {
+    closeEffortMenu();
+    if (!effortOptions) return;
+    effortMenu = new FakeElement("div", { id: "effort-picker", role: "menu", "data-state": "open" });
+    for (const label of effortOptions) {
+      effortMenu.append(new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": label === currentEffort ? "true" : "false",
+        onPointerDown: () => {
+          currentEffort = label;
+          effortRow.innerText = `Effort ${label}`;
+          effortRow.textContent = effortRow.innerText;
+          pill.innerText = `5.6 Sol\n${label}`;
+          pill.textContent = pill.innerText;
+          closeEffortMenu();
+        }
+      }, label));
+    }
+    body.append(effortMenu);
+  };
+  const openPanel = () => {
+    closePanel();
+    slider = new FakeElement("span", {
+      role: "slider",
+      "aria-hidden": "true",
+      style: "pointer-events:none",
+      "aria-valuemin": "1",
+      "aria-valuemax": "5",
+      "aria-valuenow": String(currentValue),
+      "aria-valuetext": `Light, ${currentValue} of 5.`,
+      onKeyDown: (event) => {
+        keyAttempts.push(event.key);
+      }
+    });
+    const family = new FakeElement("div", {
+      role: "menuitem",
+      "aria-haspopup": "menu"
+    }, "Model GPT-5.6 Sol").append(
+      new FakeElement("span", {}, "Model"),
+      new FakeElement("span", { "data-state": "checked" }, "GPT-5.6 Sol")
+    );
+    effortRow = new FakeElement("div", {
+      role: "menuitem",
+      ...(effortOptions ? { "aria-haspopup": "menu" } : {}),
+      onPointerDown: () => {
+        effortClicks += 1;
+        openEffortMenu();
+      }
+    }, `Effort ${currentEffort}`);
+    const speedRow = new FakeElement("div", { role: "menuitem" }, "Speed Standard");
+    const menu = new FakeElement("div", {
+      role: "menu",
+      "data-state": "open",
+      style: frozenStyle
+    }, pickerText());
+    menu.append(slider, family, effortRow, speedRow);
+    if (wrappedRadix) {
+      panel = new FakeElement("div", {
+        id: "personal-picker",
+        class: "z-50 popover",
+        style: frozenStyle
+      }, pickerText());
+      panel.append(menu);
+    } else {
+      menu.setAttribute("id", "personal-picker");
+      panel = menu;
+    }
+    body.append(panel);
+    pill.setAttribute("aria-expanded", "true");
+    pill.setAttribute("data-state", "open");
+  };
+  const pill = new FakeElement("button", {
+    class: "__composer-pill __composer-pill--neutral",
+    "aria-haspopup": "menu",
+    "aria-controls": "personal-picker",
+    "aria-expanded": "false",
+    "data-state": "closed",
+    onPointerDown: openPanel,
+    onKeyDown: (event) => {
+      if (event.key === "Escape") closePanel();
+    }
+  }, `5.6 Sol\n${currentEffort}`);
+  form.append(pill);
+  const doc = new FakeDocument(body);
+  if (startsOpen) openPanel();
+  return {
+    doc,
+    keyAttempts: () => [...keyAttempts],
+    sliderValue: () => currentValue,
+    effortClicks: () => effortClicks,
+    pickerOpen: () => Boolean(panel)
   };
 }
 

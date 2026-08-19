@@ -5,7 +5,7 @@ const DEFAULT_WAIT_INTERVAL_MS = 250;
 const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
 const CHATGPT_SOL_EXTRA_HIGH_MODEL = "gpt-5-6-sol-extra-high";
 const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
-const CHATGPT_MAX_EFFORT_LABELS = new Set(["pro", "extra high"]);
+const CHATGPT_MAX_EFFORT_LABELS = new Set(["pro", "extra high", "max"]);
 const MANUAL_HANDOFF_SHELL_SELECTORS = Object.freeze([
   "nav",
   "aside",
@@ -599,7 +599,15 @@ async function selectSolMaxTierModel(root, options = {}) {
   }
 
   if (!effortIsMaxTier(state)) {
-    if (state.shape === "slider") {
+    if (state.shape === "personal") {
+      const selected = await selectPersonalMaxEffort(root, state, options);
+      state = selected.state ?? state;
+      state.effort_move_method = selected.method;
+      if (!selected.ok) {
+        await closeModelPicker(root, modelButton);
+        return selectionFailure(base, modelButton, state, availableFamilies, "Neither Pro, Extra High, nor Max was visible as the GPT-5.6 Sol maximum tier", "effort_control_not_found");
+      }
+    } else if (state.shape === "slider") {
       if (!state.effort_slider) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider was not found in the Advanced picker", "effort_control_not_found");
@@ -612,11 +620,12 @@ async function selectSolMaxTierModel(root, options = {}) {
         return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to a verified maximum tier", "effort_slider_move_failed");
       }
     } else {
-      const maxOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === "extra high")
+      const maxOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === "max")
+        ?? state.effort_items.find((item) => foldedModelText(textOf(item)) === "extra high")
         ?? state.effort_items.find((item) => foldedModelText(textOf(item)) === "pro");
       if (!maxOption) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "Neither Pro nor Extra High was visible as the GPT-5.6 Sol maximum tier", "effort_control_not_found");
+        return selectionFailure(base, modelButton, state, availableFamilies, "Neither Pro, Extra High, nor Max was visible as the GPT-5.6 Sol maximum tier", "effort_control_not_found");
       }
       realClick(maxOption);
       await sleep(Number(options.actionSettleMs ?? 250));
@@ -639,20 +648,22 @@ async function selectSolMaxTierModel(root, options = {}) {
   const effortVerified = effortIsMaxTier(state);
   if (!familyVerified || !effortVerified) {
     await closeModelPicker(root, modelButton);
-    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol at a verified maximum tier (Pro or Extra High) could not be confirmed in one picker pass", "model_selection_verification_failed");
+    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol at a verified maximum tier (Pro, Extra High, or Max) could not be confirmed in one picker pass", "model_selection_verification_failed");
   }
   if (!await closeModelPicker(root, modelButton)) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
   }
   modelButton = await waitForModelButton(root, options);
   const pillText = modelControlLabel(modelButton);
-  const verifiedEffortLabel = state.shape === "slider"
-    ? sliderEffortSnapshot(state.effort_slider, state.surface)?.display_label
+  const verifiedEffortLabel = state.shape === "personal"
+    ? state.effort_label
+    : state.shape === "slider"
+      ? sliderEffortSnapshot(state.effort_slider, state.surface)?.display_label
     : normalizeText(textOf(state.effort_items.find((item) => itemIsChecked(item))));
-  if (state.shape === "slider" && !pillConfirmsFamilyLabel(pillText, state.family_label)) {
+  if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsFamilyLabel(pillText, state.family_label)) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm GPT-5.6 Sol after closing the slider picker", "family_composer_pill_unverified");
   }
-  if (state.shape === "slider" && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel)) {
+  if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel)) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm the verified maximum tier after closing the slider picker", "effort_composer_pill_unverified");
   }
 
@@ -664,7 +675,7 @@ async function selectSolMaxTierModel(root, options = {}) {
     effort_status: "verified",
     picker_shape: state.shape,
     surface_trust: state.surface_trust,
-    effort_control: state.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider, state.surface) : null,
+    effort_control: effortControlDiagnostics(state),
     effort_move_method: state.effort_move_method ?? null,
     pill_text: pillText,
     family_label: state.family_label,
@@ -717,6 +728,9 @@ async function openModelPicker(root, modelButton, options = {}) {
   const openedOrTriggered = () => opened() || modelPickerTriggerIsOpen(modelButton);
   if (opened()) {
     return true;
+  }
+  if (modelPickerTriggerIsOpen(modelButton)) {
+    return Boolean(await waitForPickerState(root, options));
   }
   const activators = [openWithPointerEvents, pressEnter, pressSpace];
   for (const activate of activators) {
@@ -879,6 +893,8 @@ function findPickerState(root) {
   if (menu) return readMenuPickerState(menu, false);
   const slider = readSliderPickerState(root);
   if (slider) return slider;
+  const personal = findPersonalPickerSurface(root);
+  if (personal) return readPersonalPickerState(personal, false);
   const controlledSurface = structurallyOpenControlledSurface(root);
   return controlledSurface ? readStructurallyTrustedPickerState(controlledSurface) : null;
 }
@@ -893,18 +909,122 @@ function structurallyOpenControlledSurfaceForTrigger(root, trigger) {
   const controlledId = trigger?.getAttribute?.("aria-controls");
   if (!controlledId) return null;
   const surface = root.getElementById?.(controlledId);
-  return surface?.getAttribute?.("data-state") === "open" ? surface : null;
+  if (!surface) return null;
+  if (surface.getAttribute?.("data-state") === "open") return surface;
+  const openChild = Array.from(surface.querySelectorAll?.('[role="menu"], [role="dialog"]') ?? [])
+    .find((node) => node.getAttribute?.("data-state") === "open");
+  return openChild ? surface : null;
 }
 
 function readStructurallyTrustedPickerState(surface) {
-  const labels = menuRadioItems(surface, true).map((item) => foldedModelText(textOf(item)));
+  const direct = classifyPickerSurface(surface, true);
+  if (direct) return direct;
+  for (const nested of Array.from(surface.querySelectorAll?.('[role="menu"], [role="dialog"]') ?? [])) {
+    const classified = classifyPickerSurface(nested, true);
+    if (classified) return classified;
+  }
+  return null;
+}
+
+function classifyPickerSurface(surface, structurallyTrusted) {
+  if (!surface) return null;
+  const labels = menuRadioItems(surface, structurallyTrusted).map((item) => foldedModelText(textOf(item)));
   if (labels.includes("medium") && labels.includes("high") && labels.includes("extra high")) {
-    return readMenuPickerState(surface, true);
+    return readMenuPickerState(surface, structurallyTrusted);
   }
   const text = normalizeText(textOf(surface));
   if (/\bAdvanced\b/i.test(text) && /\bEffort\b/i.test(text)
     && surface.querySelectorAll?.('[role="slider"]')?.length > 0) {
-    return readSliderPickerState(surface.ownerDocument, surface);
+    return readSliderPickerState(surface.ownerDocument ?? surface, structurallyTrusted ? surface : null);
+  }
+  if (looksLikePersonalPicker(surface)) {
+    return readPersonalPickerState(surface, structurallyTrusted);
+  }
+  return null;
+}
+
+function looksLikePersonalPicker(node) {
+  const text = normalizeText(textOf(node));
+  return /\bFaster\b/i.test(text)
+    && /\bSmarter\b/i.test(text)
+    && /\bModel\b/i.test(text)
+    && /\bEffort\b/i.test(text)
+    && /\bSpeed\b/i.test(text)
+    && !/\bAdvanced\b/i.test(text);
+}
+
+function findPersonalPickerSurface(root) {
+  const candidates = Array.from(root.querySelectorAll('div, [role="menu"], [role="dialog"]'))
+    .filter((node) => node.getAttribute?.("data-state") !== "closed"
+      && isVisible(node, { allowDisabled: true }) && looksLikePersonalPicker(node));
+  return candidates.sort((left, right) => (
+    left.querySelectorAll?.("*")?.length ?? 0
+  ) - (
+    right.querySelectorAll?.("*")?.length ?? 0
+  ))[0] ?? null;
+}
+
+function readPersonalPickerState(surface, structurallyTrusted = false) {
+  const controls = Array.from(surface.querySelectorAll?.('[role="menuitem"], button') ?? []);
+  let familyEvidence = null;
+  const familyTrigger = controls.find((item) => {
+    const evidence = structuralFamilyEvidence(item);
+    if (evidence.label || evidence.ambiguous) familyEvidence = evidence;
+    return Boolean(evidence.label || evidence.ambiguous);
+  }) ?? controls.find((item) => /\bModel\b/i.test(textOf(item)) && item.getAttribute?.("aria-haspopup") === "menu") ?? null;
+  const effortRow = controls.find((item) => /\bEffort\b/i.test(textOf(item))) ?? null;
+  const effortLabel = labeledRowValue(effortRow, "Effort");
+  const familyLabel = familyEvidence?.label || labeledRowValue(familyTrigger, "Model");
+  if (!familyTrigger || !effortRow || !effortLabel || (!familyLabel && !familyEvidence?.ambiguous)) return null;
+  return {
+    shape: "personal",
+    menu: null,
+    surface,
+    family_trigger: familyTrigger,
+    family_label: familyLabel,
+    family_label_candidates: familyEvidence?.labels ?? (familyLabel ? [familyLabel] : []),
+    family_label_source: familyEvidence?.source ?? (familyLabel ? "labeled_row" : null),
+    family_label_ambiguous: familyEvidence?.ambiguous ?? false,
+    effort_row: effortRow,
+    effort_label: effortLabel,
+    effort_items: [],
+    effort_slider: null,
+    effort_move_method: null,
+    surface_trust: structurallyTrusted ? "aria_controls_structural" : "visible"
+  };
+}
+
+function labeledRowValue(row, label) {
+  const text = normalizeText(textOf(row)).replace(/\s+/g, " ");
+  const match = text.match(new RegExp(`^${label}\\s+(.+)$`, "i"));
+  return normalizeText(match?.[1] ?? "");
+}
+
+async function selectPersonalMaxEffort(root, initialState, options = {}) {
+  const settleMs = Number(options.actionSettleMs ?? 250);
+  if (!initialState?.effort_row) return { ok: false, state: initialState, method: null };
+  realClick(initialState.effort_row);
+  await sleep(settleMs);
+  let state = findPickerState(root) ?? initialState;
+  const maxOption = findPersonalMaxEffortOption(root, state);
+  if (!maxOption) return { ok: false, state, method: null };
+  realClick(maxOption);
+  await sleep(settleMs);
+  state = findPickerState(root) ?? state;
+  return { ok: effortIsMaxTier(state), state, method: "effort_row_select" };
+}
+
+function findPersonalMaxEffortOption(root, state) {
+  const scopes = [];
+  if (state?.surface) scopes.push(state.surface);
+  scopes.push(...Array.from(root.querySelectorAll?.('[role="menu"]') ?? []));
+  for (const scope of uniqueElements(scopes)) {
+    const items = Array.from(scope.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? []);
+    const max = ["max", "extra high", "pro"]
+      .map((label) => items.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === label
+        && !/^effort\b/i.test(normalizeText(textOf(item)))))
+      .find(Boolean);
+    if (max) return max;
   }
   return null;
 }
@@ -1047,6 +1167,9 @@ function familyMenuRadios(menu, structurallyTrusted = false) {
 }
 
 function effortIsMaxTier(state) {
+  if (state?.shape === "personal") {
+    return CHATGPT_MAX_EFFORT_LABELS.has(foldedModelText(state.effort_label).replace(/\s+/g, " "));
+  }
   if (state?.shape === "slider") {
     const snapshot = sliderEffortSnapshot(state.effort_slider, state.surface);
     return Boolean(snapshot && CHATGPT_MAX_EFFORT_LABELS.has(snapshot.label) && snapshot.now === snapshot.max);
@@ -1144,6 +1267,21 @@ function sliderEffortDiagnostics(slider, surface = null) {
     value_min: snapshot.min,
     value_max: snapshot.max
   } : null;
+}
+
+function personalEffortDiagnostics(state) {
+  if (!state?.effort_label) return null;
+  return {
+    role: "menuitem",
+    label: foldedModelText(state.effort_label).replace(/\s+/g, " "),
+    value_text: state.effort_label
+  };
+}
+
+function effortControlDiagnostics(state) {
+  if (state?.shape === "personal") return personalEffortDiagnostics(state);
+  if (state?.shape === "slider") return sliderEffortDiagnostics(state.effort_slider, state.surface);
+  return null;
 }
 
 async function moveEffortSliderToMaxTier(root, initialState, options = {}) {
@@ -1340,7 +1478,7 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     advanced_rows: advancedViewRows(state?.surface),
     checkbox_probe: state?.checkbox_probe ?? null,
     family_menu_probe: state?.family_menu_probe ?? null,
-    effort_control: state?.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider, state.surface) : null,
+    effort_control: effortControlDiagnostics(state),
     effort_move_method: state?.effort_move_method ?? null,
     pill_text: modelControlLabel(modelButton),
     family_label: state?.family_label ?? null,
@@ -1409,9 +1547,10 @@ function classTokens(node) {
 }
 
 function modelPillSummaryMatches(value) {
-  const folded = foldedModelText(value);
-  return /^(instant|medium|high|extra high|pro)$/.test(folded)
-    || /^\d+(?:\.\d+)+ (instant|medium|high|extra high|pro)$/.test(folded)
+  const folded = foldedModelText(value).replace(/\s+/g, " ");
+  const effort = "instant|medium|high|extra high|pro|max";
+  return new RegExp(`^(?:${effort})$`).test(folded)
+    || new RegExp(`^\\d+(?:\\.\\d+)+(?: sol)? (?:${effort})$`).test(folded)
     || /\bgpt[\s.-]*\d/.test(folded);
 }
 
@@ -1587,6 +1726,24 @@ export function extractResponse(root = document) {
     };
   }
 
+  const copyScopedStandalone = latestCopyScopedStandaloneMarkdown(root, userTurns, assistantTurns, copyButtons);
+  if (copyScopedStandalone) {
+    const assistantCount = Math.max(assistantTurns.length, 1);
+    return {
+      method: "copy_scope_dom_fallback",
+      text: copyScopedStandalone.text,
+      is_generating: isResponseGenerating(root),
+      assistant_count: assistantCount,
+      user_count: userTurns.length,
+      preceding_user_count: precedingTurnCount(root, copyScopedStandalone.node, userTurns),
+      copy_button_count: Math.max(copyButtonCount, 1),
+      has_copy_button: true,
+      turn_index: assistantCount - 1,
+      model_slug: messageModelSlug(copyScopedStandalone.node),
+      diagnostics
+    };
+  }
+
   return {
     method: "page_text_fallback",
     text: normalizeText(getPageText(root)),
@@ -1600,6 +1757,35 @@ export function extractResponse(root = document) {
     model_slug: messageModelSlug(latestAssistant),
     diagnostics
   };
+}
+
+function latestCopyScopedStandaloneMarkdown(root, userTurns, assistantTurns, copyButtons) {
+  if (assistantTurns.length === 0) return null;
+  const latestUser = userTurns.at(-1);
+  if (!latestUser) return null;
+  const conversation = conversationScope(latestUser);
+  if (!conversation) return null;
+  const ordered = flattenTree(root.documentElement ?? root.body ?? root);
+  const userIndex = ordered.indexOf(latestUser);
+  if (userIndex < 0) return null;
+  for (const copy of [...copyButtons].reverse()) {
+    if (!isCopyControl(copy) || !containsNode(conversation, copy) || isInsideUserTurn(copy)) continue;
+    const copyIndex = ordered.indexOf(copy);
+    if (copyIndex <= userIndex) continue;
+    const markdown = leafNodes(Array.from(conversation.querySelectorAll?.('[class*="markdown"]') ?? []))
+      .filter((node) => {
+        const nodeIndex = ordered.indexOf(node);
+        return nodeIndex > userIndex && nodeIndex < copyIndex
+          && isVisible(node, { allowDisabled: true, allowNoLayout: true })
+          && !isInsideUserTurn(node) && !isNonConversationChrome(node)
+          && !isCitationSourceAffordance(node);
+      })
+      .at(-1);
+    if (!markdown) continue;
+    const text = cleanAssistantText(markdown, { preserveContentStatusText: true });
+    if (text) return { node: markdown, text };
+  }
+  return null;
 }
 
 function latestTextBearingAssistantTurn(assistantTurns) {
@@ -2016,9 +2202,9 @@ function isAssistantControlLine(line, options = {}) {
 
 function isModelStatusText(text) {
   const value = normalizeText(text);
-  const effort = "instant|medium|high|extra high|pro";
-  return /^(sol|instant|medium|high|extra high|pro|pro thinking|thinking)$/i.test(value)
-    || new RegExp(`^\\d+(?:\\.\\d+)+\\s+(?:${effort})$`, "i").test(value)
+  const effort = "instant|medium|high|extra high|pro|max";
+  return new RegExp(`^(sol|${effort}|pro thinking|thinking)$`, "i").test(value)
+    || new RegExp(`^\\d+(?:\\.\\d+)+(?:\\s+sol)?\\s+(?:${effort})$`, "i").test(value)
     || new RegExp(`^gpt[\\s.-]*\\d+(?:[\\s.-]*\\d+)*(?:\\s+sol)?(?:\\s+(?:${effort}|thinking))?$`, "i").test(value);
 }
 
@@ -2978,7 +3164,7 @@ export function modelSelectionDiagnostics(root = document) {
     family_label: state?.family_label ?? null,
     picker_shape: state?.shape ?? null,
     surface_trust: state?.surface_trust ?? null,
-    effort_control: state?.shape === "slider" ? sliderEffortDiagnostics(state.effort_slider, state.surface) : null,
+    effort_control: effortControlDiagnostics(state),
     model_button: modelButton ? elementSummary(modelButton) : null,
     model_button_wiring: modelButton ? {
       aria_expanded: modelButton.getAttribute?.("aria-expanded") ?? null,
