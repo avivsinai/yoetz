@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.56] - 2026-08-19
 ### Fixed
 
 - ChatGPT native-extension model selection now recognizes the personal-profile
@@ -18,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - ChatGPT response extraction now recovers assistant markdown that is a sibling
   of its final copy-action row while retaining assistant-ownership and citation
   guards.
+
 
 ## [0.5.55] - 2026-08-17
 ### Added
