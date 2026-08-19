@@ -54,7 +54,9 @@ function isExpectedConversationIdAssignment(job, expectedConversationId, current
 
 function modelUsedLooksLikeSolMaximum(value) {
   const folded = String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
-  return folded === "gpt-5.6 sol pro" || folded === "gpt-5.6 sol extra high";
+  return folded === "gpt-5.6 sol pro"
+    || folded === "gpt-5.6 sol extra high"
+    || folded === "gpt-5.6 sol max";
 }
 
 function isAcceptableModelSelection(selection) {

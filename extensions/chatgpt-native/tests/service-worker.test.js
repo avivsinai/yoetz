@@ -1682,6 +1682,11 @@ test("service worker fails closed when GPT-5.6 Sol Extra High is unavailable", a
                 },
                 family_status: "verified",
                 effort_status: "unverified",
+                picker_family_status: "verified",
+                picker_effort_status: "unverified",
+                closed_pill_family_status: "verified",
+                closed_pill_effort_status: "unverified",
+                closed_pill_text: "5.6 Sol\nHigh",
                 warning: "GPT-5.6 Sol was not visible in the family submenu"
               }
             };
@@ -1707,6 +1712,8 @@ test("service worker fails closed when GPT-5.6 Sol Extra High is unavailable", a
     assert.equal(error.payload.model_selection_diagnostics.failure_reason, "effort_slider_move_failed");
     assert.equal(error.payload.model_selection_diagnostics.picker_shape, "slider");
     assert.equal(error.payload.model_selection_diagnostics.effort_control.value_text, "High, 3 of 5");
+    assert.equal(error.payload.model_selection_diagnostics.picker_family_status, "verified");
+    assert.equal(error.payload.model_selection_diagnostics.closed_pill_text, "5.6 Sol\nHigh");
     assert.match(error.payload.message, /reason: effort_slider_move_failed/);
     assert.equal(sentToTabs.includes("yoetz_upload_file"), false);
     assert.equal(sentToTabs.includes("yoetz_send_prompt"), false);

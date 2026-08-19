@@ -2454,6 +2454,8 @@ test("GPT-5.6 Sol picker fails closed when Escape cannot close the menu", async 
   assert.equal(result.status, "unavailable");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
+  assert.equal(result.picker_family_status, "verified");
+  assert.equal(result.closed_pill_family_status, "skipped");
   assert.match(result.warning, /picker remained open/);
   assert.equal(fixture.menusOpen(), 1);
 });
@@ -2541,6 +2543,23 @@ test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum",
   assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
+test("GPT-5.6 Sol personal picker fails closed when the closed pill is effort-only", async () => {
+  const fixture = makePersonalPickerFixture({ pillFamilyLabel: "" });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "family_composer_pill_unverified");
+  assert.equal(result.picker_shape, "personal");
+  assert.equal(result.picker_family_status, "verified");
+  assert.equal(result.picker_effort_status, "verified");
+  assert.equal(result.closed_pill_family_status, "unverified");
+  assert.equal(result.closed_pill_effort_status, "verified");
+  assert.equal(result.family_status, "unverified");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.closed_pill_text, "Max");
+});
+
 test("GPT-5.6 Sol personal picker verifies Effort Max without moving the power slider", async () => {
   const fixture = makePersonalPickerFixture();
 
@@ -2552,6 +2571,9 @@ test("GPT-5.6 Sol personal picker verifies Effort Max without moving the power s
   assert.equal(result.family_label, "GPT-5.6 Sol");
   assert.equal(result.model_used, "GPT-5.6 Sol Max");
   assert.equal(result.effort_control.value_text, "Max");
+  assert.equal(result.picker_family_status, "verified");
+  assert.equal(result.closed_pill_family_status, "verified");
+  assert.equal(result.closed_pill_text, "5.6 Sol\nMax");
   assert.equal(result.effort_move_method, null);
   assert.deepEqual(fixture.keyAttempts(), []);
   assert.equal(fixture.sliderValue(), 2);
@@ -2726,8 +2748,159 @@ test("GPT-5.6 Sol fails closed when the closed composer pill corroborates anothe
 
   assert.equal(result.status, "unavailable");
   assert.equal(result.failure_reason, "family_composer_pill_unverified");
+  assert.equal(result.picker_family_status, "verified");
+  assert.equal(result.picker_effort_status, "verified");
+  assert.equal(result.closed_pill_family_status, "unverified");
+  assert.equal(result.closed_pill_effort_status, "verified");
+  assert.equal(result.family_status, "unverified");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.closed_pill_text, "5.5\nExtra High");
   assert.equal(result.pill_text, "5.5\nExtra High");
 });
+
+test("GPT-5.6 Sol fails closed when a verified picker is followed by an effort-only closed pill", async () => {
+  const fixture = makeSolSliderFixture({
+    animatedReveal: true,
+    backgroundFrozen: true,
+    initialValue: 5,
+    pillFamilyLabel: ""
+  });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "family_composer_pill_unverified");
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.picker_family_status, "verified");
+  assert.equal(result.picker_effort_status, "verified");
+  assert.equal(result.closed_pill_family_status, "unverified");
+  assert.equal(result.closed_pill_effort_status, "verified");
+  assert.equal(result.family_status, "unverified");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.closed_pill_text, "Extra High");
+  assert.equal(result.pill_text, "Extra High");
+});
+
+for (const testCase of [
+  {
+    name: "slider accepts GPT-5.6 Sol family wording on the closed pill",
+    kind: "slider",
+    options: { initialValue: 5, pillFamilyLabel: "GPT-5.6 Sol" },
+    status: "selected",
+    closed_pill_family_status: "verified",
+    closed_pill_effort_status: "verified",
+    closed_pill_text: "GPT-5.6 Sol\nExtra High"
+  },
+  {
+    name: "slider accepts a single-line family-plus-effort closed pill",
+    kind: "slider",
+    options: { initialValue: 5, pillFamilyLabel: "5.6 Sol Extra High", pillEffortLabel: "" },
+    status: "selected",
+    closed_pill_family_status: "verified",
+    closed_pill_effort_status: "verified",
+    closed_pill_text: "5.6 Sol Extra High"
+  },
+  {
+    name: "slider accepts a different max-tier closed-pill effort",
+    kind: "slider",
+    options: { initialValue: 5, pillFamilyLabel: "5.6 Sol", pillEffortLabel: "Pro" },
+    status: "selected",
+    closed_pill_family_status: "verified",
+    closed_pill_effort_status: "verified",
+    closed_pill_text: "5.6 Sol\nPro"
+  },
+  {
+    name: "slider accepts Max on a closed pill after Extra High picker proof",
+    kind: "slider",
+    options: { initialValue: 5, pillFamilyLabel: "5.6 Sol", pillEffortLabel: "Max" },
+    status: "selected",
+    closed_pill_family_status: "verified",
+    closed_pill_effort_status: "verified",
+    closed_pill_text: "5.6 Sol\nMax"
+  },
+  {
+    name: "slider effort-only Pro still fails family while proving max effort",
+    kind: "slider",
+    options: { initialValue: 5, pillFamilyLabel: "", pillEffortLabel: "Pro" },
+    status: "unavailable",
+    failure_reason: "family_composer_pill_unverified",
+    closed_pill_family_status: "unverified",
+    closed_pill_effort_status: "verified",
+    family_status: "unverified",
+    effort_status: "verified",
+    closed_pill_text: "Pro"
+  },
+  {
+    name: "slider effort-only Max still fails family while proving max effort",
+    kind: "slider",
+    options: { initialValue: 5, pillFamilyLabel: "", pillEffortLabel: "Max" },
+    status: "unavailable",
+    failure_reason: "family_composer_pill_unverified",
+    closed_pill_family_status: "unverified",
+    closed_pill_effort_status: "verified",
+    closed_pill_text: "Max"
+  },
+  {
+    name: "slider rejects a non-max closed-pill effort with family present",
+    kind: "slider",
+    options: { initialValue: 5, pillFamilyLabel: "5.6 Sol", pillEffortLabel: "High" },
+    status: "unavailable",
+    failure_reason: "effort_composer_pill_unverified",
+    closed_pill_family_status: "verified",
+    closed_pill_effort_status: "unverified",
+    family_status: "verified",
+    effort_status: "unverified",
+    closed_pill_text: "5.6 Sol\nHigh"
+  },
+  {
+    name: "personal accepts Extra High on a closed pill after Max picker proof",
+    kind: "personal",
+    options: { pillFamilyLabel: "5.6 Sol", pillEffortLabel: "Extra High" },
+    status: "selected",
+    closed_pill_family_status: "verified",
+    closed_pill_effort_status: "verified",
+    closed_pill_text: "5.6 Sol\nExtra High"
+  },
+  {
+    name: "personal accepts Pro on a closed pill after Max picker proof",
+    kind: "personal",
+    options: { pillFamilyLabel: "GPT-5.6 Sol", pillEffortLabel: "Pro" },
+    status: "selected",
+    closed_pill_family_status: "verified",
+    closed_pill_effort_status: "verified",
+    closed_pill_text: "GPT-5.6 Sol\nPro"
+  },
+  {
+    name: "personal effort-only Extra High still fails family while proving max effort",
+    kind: "personal",
+    options: { pillFamilyLabel: "", pillEffortLabel: "Extra High" },
+    status: "unavailable",
+    failure_reason: "family_composer_pill_unverified",
+    closed_pill_family_status: "unverified",
+    closed_pill_effort_status: "verified",
+    closed_pill_text: "Extra High"
+  }
+]) {
+  test(`closed-pill diagnostics: ${testCase.name}`, async () => {
+    const fixture = testCase.kind === "personal"
+      ? makePersonalPickerFixture(testCase.options)
+      : makeSolSliderFixture({
+        animatedReveal: true,
+        backgroundFrozen: true,
+        ...testCase.options
+      });
+    const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
+    assert.equal(result.status, testCase.status, JSON.stringify(result));
+    assert.equal(result.picker_family_status, "verified");
+    assert.equal(result.picker_effort_status, "verified");
+    assert.equal(result.closed_pill_family_status, testCase.closed_pill_family_status);
+    assert.equal(result.closed_pill_effort_status, testCase.closed_pill_effort_status);
+    assert.equal(result.closed_pill_text, testCase.closed_pill_text);
+    if (testCase.failure_reason) assert.equal(result.failure_reason, testCase.failure_reason);
+    if (testCase.family_status) assert.equal(result.family_status, testCase.family_status);
+    if (testCase.effort_status) assert.equal(result.effort_status, testCase.effort_status);
+  });
+}
 
 test("GPT-5.6 Sol fails closed when the structural slider maximum has an unknown label", async () => {
   const fixture = makeSolSliderFixture({
@@ -3110,7 +3283,8 @@ function makeSolSliderFixture({
   familyLabel = "GPT-5.6 Sol",
   familyGhostLabels = [],
   familyValueAttributes = {},
-  pillFamilyLabel = "5.6 Sol"
+  pillFamilyLabel = "5.6 Sol",
+  pillEffortLabel = null
 } = {}) {
   let currentValue = initialValue;
   let panel = null;
@@ -3122,7 +3296,12 @@ function makeSolSliderFixture({
   let familyMenu = null;
   let familyValueNode = null;
   const keyAttemptLog = [];
-  const pillTextForEffort = (label) => pillFamilyLabel ? `${pillFamilyLabel}\n${label}` : label;
+  const pillTextForEffort = (label) => {
+    const effort = pillEffortLabel == null ? label : pillEffortLabel;
+    if (!pillFamilyLabel) return effort;
+    if (!effort) return pillFamilyLabel;
+    return `${pillFamilyLabel}\n${effort}`;
+  };
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
   const body = new FakeElement("body", {}, "Ask anything").append(form);
@@ -3341,7 +3520,9 @@ function makePersonalPickerFixture({
   wrappedRadix = false,
   startsOpen = false,
   retainMountedWrapper = false,
-  effortOptions = null
+  effortOptions = null,
+  pillFamilyLabel = "5.6 Sol",
+  pillEffortLabel = null
 } = {}) {
   let panel = null;
   let menuNode = null;
@@ -3374,6 +3555,12 @@ function makePersonalPickerFixture({
     "Standard"
   ].join("\n");
   const frozenStyle = backgroundFrozen ? "opacity:0; pointer-events:auto" : "";
+  const pillTextForEffort = (label) => {
+    const effort = pillEffortLabel == null ? label : pillEffortLabel;
+    if (!pillFamilyLabel) return effort;
+    if (!effort) return pillFamilyLabel;
+    return `${pillFamilyLabel}\n${effort}`;
+  };
   const closeEffortMenu = () => {
     if (!effortMenu) return;
     body.children = body.children.filter((child) => child !== effortMenu);
@@ -3413,7 +3600,7 @@ function makePersonalPickerFixture({
           currentEffort = label;
           effortRow.innerText = `Effort ${label}`;
           effortRow.textContent = effortRow.innerText;
-          pill.innerText = `5.6 Sol\n${label}`;
+          pill.innerText = pillTextForEffort(label);
           pill.textContent = pill.innerText;
           closeEffortMenu();
         }
@@ -3482,7 +3669,7 @@ function makePersonalPickerFixture({
     onKeyDown: (event) => {
       if (event.key === "Escape") closePanel();
     }
-  }, `5.6 Sol\n${currentEffort}`);
+  }, pillTextForEffort(currentEffort));
   form.append(pill);
   const doc = new FakeDocument(body);
   if (startsOpen) openPanel();
