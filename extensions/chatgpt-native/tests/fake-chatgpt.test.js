@@ -2612,6 +2612,48 @@ test("GPT-5.6 Sol personal picker rejects an unknown Effort label", async () => 
   assert.equal(fixture.pickerOpen(), false);
 });
 
+test("GPT-5.6 Sol personal picker ignores a retained closed menu sibling", async () => {
+  const fixture = makePersonalPickerFixture();
+  const decoy = new FakeElement("div", {
+    role: "menu",
+    "data-state": "closed",
+    style: "opacity:1; pointer-events:auto"
+  }, "Faster\nSmarter\nModel\nGPT-5.6 Sol\nEffort\nExpert\nSpeed\nStandard").append(
+    new FakeElement("div", { role: "menuitem", "aria-haspopup": "menu" }, "Model GPT-5.6 Sol").append(
+      new FakeElement("span", {}, "Model"),
+      new FakeElement("span", { "data-state": "checked" }, "GPT-5.6 Sol")
+    ),
+    new FakeElement("div", { role: "menuitem" }, "Effort Expert"),
+    new FakeElement("div", { role: "menuitem" }, "Speed Standard")
+  );
+  fixture.doc.body.append(decoy);
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "personal");
+  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.equal(result.effort_control.value_text, "Max");
+  assert.equal(modelSelectionDiagnostics(fixture.doc).picker_shape, null);
+});
+
+test("GPT-5.6 Sol personal picker does not rediscover a mounted closed Radix wrapper", async () => {
+  const fixture = makePersonalPickerFixture({
+    wrappedRadix: true,
+    retainMountedWrapper: true
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "personal");
+  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.equal(result.failure_reason, null);
+  assert.equal(fixture.wrapperMounted(), true);
+  assert.equal(fixture.nestedMenuState(), "closed");
+  assert.equal(modelSelectionDiagnostics(fixture.doc).picker_shape, null);
+});
+
 test("GPT-5.6 Sol Advanced picker waits for an expanded Radix surface to finish animating", async () => {
   const fixture = makeSolSliderFixture({ keyboardMode: "end", animatedReveal: true });
 
@@ -3298,9 +3340,11 @@ function makePersonalPickerFixture({
   backgroundFrozen = true,
   wrappedRadix = false,
   startsOpen = false,
+  retainMountedWrapper = false,
   effortOptions = null
 } = {}) {
   let panel = null;
+  let menuNode = null;
   let currentValue = 2;
   let currentEffort = effort;
   let effortClicks = 0;
@@ -3336,12 +3380,22 @@ function makePersonalPickerFixture({
     effortMenu.parentElement = null;
     effortMenu = null;
   };
-  const closePanel = () => {
+  const detachPanel = () => {
     closeEffortMenu();
     if (!panel) return;
     body.children = body.children.filter((child) => child !== panel);
     panel.parentElement = null;
     panel = null;
+    menuNode = null;
+  };
+  const closePanel = () => {
+    closeEffortMenu();
+    if (panel && retainMountedWrapper) {
+      menuNode?.setAttribute("data-state", "closed");
+      panel.setAttribute("style", "opacity:1; pointer-events:auto");
+    } else {
+      detachPanel();
+    }
     pill.setAttribute("aria-expanded", "false");
     pill.setAttribute("data-state", "closed");
   };
@@ -3368,7 +3422,7 @@ function makePersonalPickerFixture({
     body.append(effortMenu);
   };
   const openPanel = () => {
-    closePanel();
+    detachPanel();
     slider = new FakeElement("span", {
       role: "slider",
       "aria-hidden": "true",
@@ -3397,22 +3451,22 @@ function makePersonalPickerFixture({
       }
     }, `Effort ${currentEffort}`);
     const speedRow = new FakeElement("div", { role: "menuitem" }, "Speed Standard");
-    const menu = new FakeElement("div", {
+    menuNode = new FakeElement("div", {
       role: "menu",
       "data-state": "open",
       style: frozenStyle
     }, pickerText());
-    menu.append(slider, family, effortRow, speedRow);
+    menuNode.append(slider, family, effortRow, speedRow);
     if (wrappedRadix) {
       panel = new FakeElement("div", {
         id: "personal-picker",
         class: "z-50 popover",
         style: frozenStyle
       }, pickerText());
-      panel.append(menu);
+      panel.append(menuNode);
     } else {
-      menu.setAttribute("id", "personal-picker");
-      panel = menu;
+      menuNode.setAttribute("id", "personal-picker");
+      panel = menuNode;
     }
     body.append(panel);
     pill.setAttribute("aria-expanded", "true");
@@ -3437,7 +3491,10 @@ function makePersonalPickerFixture({
     keyAttempts: () => [...keyAttempts],
     sliderValue: () => currentValue,
     effortClicks: () => effortClicks,
-    pickerOpen: () => Boolean(panel)
+    pickerOpen: () => menuNode?.getAttribute("data-state") === "open"
+      || panel?.getAttribute("data-state") === "open",
+    wrapperMounted: () => Boolean(panel),
+    nestedMenuState: () => menuNode?.getAttribute("data-state") ?? null
   };
 }
 

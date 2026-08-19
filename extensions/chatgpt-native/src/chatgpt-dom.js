@@ -953,9 +953,17 @@ function looksLikePersonalPicker(node) {
     && !/\bAdvanced\b/i.test(text);
 }
 
+function personalPickerSurfaceIsOpen(node) {
+  const state = node?.getAttribute?.("data-state");
+  if (state === "open") return true;
+  if (state === "closed") return false;
+  return Array.from(node.querySelectorAll?.('[role="menu"], [role="dialog"]') ?? [])
+    .some((child) => child.getAttribute?.("data-state") === "open");
+}
+
 function findPersonalPickerSurface(root) {
   const candidates = Array.from(root.querySelectorAll('div, [role="menu"], [role="dialog"]'))
-    .filter((node) => node.getAttribute?.("data-state") !== "closed"
+    .filter((node) => personalPickerSurfaceIsOpen(node)
       && isVisible(node, { allowDisabled: true }) && looksLikePersonalPicker(node));
   return candidates.sort((left, right) => (
     left.querySelectorAll?.("*")?.length ?? 0

@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Faster/Smarter power slider is left untouched. Structural trust still applies
   when the Radix surface is opacity-0 in a background tab, including when
   `aria-controls` names a wrapper whose inner menu holds `data-state=open`.
+  Closed leftover menus and mounted Radix wrappers whose nested menu is closed
+  are not treated as an open picker.
 - ChatGPT response extraction now recovers assistant markdown that is a sibling
   of its final copy-action row while retaining assistant-ownership and citation
   guards.
