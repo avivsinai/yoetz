@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.57] - 2026-08-20
 ### Fixed
 
 - Native ChatGPT model-selection diagnostics now split picker proof from
@@ -17,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`Pro`, `Extra High`, `Max`); family still requires a Sol-bearing line.
 - Native ChatGPT selection now accepts `GPT-5.6 Sol Max` at the site-adapter
   boundary, matching the personal-picker max-tier contract.
+
 
 ## [0.5.56] - 2026-08-19
 ### Fixed
