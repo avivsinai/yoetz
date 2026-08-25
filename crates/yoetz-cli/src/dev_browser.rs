@@ -2595,13 +2595,13 @@ mod tests {
     fn build_chatgpt_prepare_script_uses_named_page_and_login_check() {
         let script = build_chatgpt_prepare_script(
             "yoetz-chatgpt-test",
-            crate::chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL,
+            crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL,
             crate::chatgpt_recipe::ChatgptModelStrategy::Select,
             "run-123",
         );
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
-        assert!(script.contains("const MODEL = \"gpt-5-6-sol-extra-high\";"));
+        assert!(script.contains("const MODEL = \"gpt-5-6-sol-account-max\";"));
         assert!(script.contains("const MODEL_STRATEGY = \"select\";"));
         assert!(script.contains("const MARKED_URL = \"https://chatgpt.com/?_yoetz=run-123\";"));
         assert!(script.contains("const WINDOW_NAME = \"yoetz:run-123\";"));
@@ -2806,7 +2806,7 @@ mod tests {
     fn parse_script_json_reads_prepare_result() {
         let result: ChatgptPrepareResult = parse_script_json(
             "prepare",
-            r#"{"status":"ready","loggedIn":true,"composerReady":true,"modelUsed":"GPT-5.6 Sol Extra High","modelSelection":{"status":"selected","requested":"gpt-5-6-sol-extra-high","modelUsed":"GPT-5.6 Sol Extra High","familyStatus":"verified","effortStatus":"verified"},"url":"https://chatgpt.com/","title":"ChatGPT","bodyText":"Send a message"}"#,
+            r#"{"status":"ready","loggedIn":true,"composerReady":true,"modelUsed":"GPT-5.6 Sol Extra High","modelSelection":{"status":"selected","requested":"gpt-5-6-sol-account-max","modelUsed":"GPT-5.6 Sol Extra High","familyStatus":"verified","effortStatus":"verified"},"url":"https://chatgpt.com/","title":"ChatGPT","bodyText":"Send a message"}"#,
         )
         .unwrap();
 

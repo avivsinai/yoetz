@@ -3,7 +3,7 @@ import { fetchConversationAnswer } from "./chatgpt-backend.js";
 export * from "../chatgpt-dom.js";
 export { fetchConversationAnswer } from "./chatgpt-backend.js";
 
-const CHATGPT_MODEL = "gpt-5-6-sol-extra-high";
+const CHATGPT_MODEL = "gpt-5-6-sol-account-max";
 const CHATGPT_ORIGIN = "https://chatgpt.com";
 
 function conversationIdFromUrl(value) {

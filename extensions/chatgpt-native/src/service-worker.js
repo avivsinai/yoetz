@@ -764,7 +764,16 @@ async function completeJobWithExtraction(job, extraction) {
       conversation_id: conversationId,
       conversation_url: conversationUrlForJob(job, conversationId),
       model_strategy: job.model_strategy ?? "select",
-      model_used: extraction.model_slug ?? job.model_used ?? null,
+      // The picker-proven label (e.g. "GPT-5.6 Sol Pro") is the authoritative
+      // model identity yoetz already verified before send. The backend
+      // data-message-model-slug (e.g. "gpt-5.6-sol-wm") drifts with ChatGPT's
+      // internal naming, so it must not overwrite a proven label. Keep it as
+      // observability (model_slug) and as the fallback when there was no
+      // picker proof (current/kept_current/unavailable).
+      model_used: job.model_selection_status === "selected" && job.model_used
+        ? job.model_used
+        : (extraction.model_slug ?? job.model_used ?? null),
+      model_slug: extraction.model_slug ?? null,
       model_selection_status: job.model_selection_status ?? "unavailable",
       warnings: completionWarnings({
         jobWarnings: job.warnings,

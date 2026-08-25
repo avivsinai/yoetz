@@ -85,11 +85,20 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 ## Browser Architecture
 
 - The built-in ChatGPT recipe pins GPT-5.6 Sol at the account's verified maximum
-  effort tier: `Pro` for the known Enterprise picker, or `Extra High` / `Max`
-  for the personal picker (`Max` observed on 2026-08-19). Selection remains
-  fail-closed on the family and those exact maximum labels; unknown top tiers
-  are rejected. Speed and the Faster/Smarter power slider stay at the user's
-  default and are never toggled by selection.
+  effort tier. For the personal/Pro picker, the target is the literal `Max` tier;
+  `Extra High` is acceptable proof ONLY when `Max` is absent from the observed
+  ladder. For the Enterprise `Pro` picker, the target is unchanged. `Ultra` is
+  recognized in the ladder but NEVER clicked/selected by the recipe: if `Ultra`
+  is the user's preset selection, accept it as at-or-above-`Max` proof with a
+  diagnostic (do not downgrade an operator's own choice; do not escalate to it).
+  Slider stale-ceiling fall-through: a slider whose ceiling is not `Max`/`Pro` is
+  a stale view; fall through Advanced -> Effort row -> opened ladder -> select
+  `Max` -> re-verify. The requested model id is
+  `gpt-5-6-sol-account-max` (semantic: Sol at account maximum; honest on both
+  Enterprise `Pro` and personal `Max`). Selection remains fail-closed on the
+  family and the literal `Max`/`Pro` tier; unknown top tiers are rejected. Speed
+  and the Faster/Smarter power slider stay at the user's default and are never
+  toggled by selection.
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
 - Extension-free by default. Preferred live-Chrome transport order:

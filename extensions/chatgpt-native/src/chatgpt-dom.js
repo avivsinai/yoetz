@@ -3,9 +3,24 @@ export const OWNERSHIP_ATTR = "data-yoetz-chatgpt-native-job";
 const DEFAULT_WAIT_TIMEOUT_MS = 15000;
 const DEFAULT_WAIT_INTERVAL_MS = 250;
 const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
-const CHATGPT_SOL_EXTRA_HIGH_MODEL = "gpt-5-6-sol-extra-high";
+const CHATGPT_SOL_ACCOUNT_MAX_MODEL = "gpt-5-6-sol-account-max";
 const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
+// Maximum-tier effort labels accepted as at-or-above-Max proof across picker shapes.
+// "pro" is the Enterprise ceiling; "max" is the personal/Pro ceiling; "extra high" is
+// accepted ONLY when Max is absent from the observed ladder (stale-slider fall-through).
+// "ultra" is recognized in the ladder mapping but NEVER selected by the recipe; an
+// Ultra preset is accepted as at-or-above-Max proof with a diagnostic.
 const CHATGPT_MAX_EFFORT_LABELS = new Set(["pro", "extra high", "max"]);
+// The six-tier effort ladder surfaced behind the Advanced -> Effort submenu (proven
+// live 2026-08-25). Ordered weakest -> strongest. Ultra is the top of the ladder but
+// is never clicked/escalated to by the recipe.
+const CHATGPT_EFFORT_LADDER = Object.freeze(["light", "medium", "high", "extra high", "max", "ultra"]);
+const CHATGPT_ULTRA_EFFORT_LABEL = "ultra";
+// Labels that are an acceptable *ceiling* (top rung) for a trusted slider view.
+// A slider whose ceiling is "extra high" is a stale five-tier simple view when the
+// six-tier ladder (with Max) is the real surface; it must fall through to the
+// Advanced -> Effort submenu.
+const CHATGPT_SLIDER_TRUSTED_CEILINGS = new Set(["pro", "max"]);
 const MANUAL_HANDOFF_SHELL_SELECTORS = Object.freeze([
   "nav",
   "aside",
@@ -405,7 +420,7 @@ export async function configureModelState(root, job = {}) {
   return {
     status: selection.status,
     model_used: selection.model_used,
-    requested_model: CHATGPT_SOL_EXTRA_HIGH_MODEL,
+    requested_model: CHATGPT_SOL_ACCOUNT_MAX_MODEL,
     available_options: selection.available_options ?? [],
     available_families: selection.available_families ?? [],
     family_status: selection.family_status ?? "unverified",
@@ -430,6 +445,8 @@ export async function configureModelState(root, job = {}) {
     family_label_candidates: selection.family_label_candidates ?? [],
     family_label_source: selection.family_label_source ?? null,
     effort_options: selection.effort_options ?? [],
+    ultra_preset: selection.ultra_preset === true,
+    ladder_max_absent: selection.ladder_max_absent === true,
     warning: warnings[0] ?? null,
     warnings
   };
@@ -613,6 +630,12 @@ async function selectSolMaxTierModel(root, options = {}) {
     if (ambiguityFailure) return ambiguityFailure;
   }
 
+  // Stamp ladder-aware proof flags from the decision so the success path can
+  // surface an accepted Ultra preset / Max-absent Extra High ceiling even when the
+  // move loop was skipped (the slider Effort row already proved the tier).
+  const initialDecision = effortMaxTierDecision(state);
+  if (initialDecision.ultra_preset) state.ultra_preset = true;
+
   if (!effortIsMaxTier(state)) {
     if (state.shape === "personal") {
       const selected = await selectPersonalMaxEffort(root, state, options);
@@ -620,7 +643,7 @@ async function selectSolMaxTierModel(root, options = {}) {
       state.effort_move_method = selected.method;
       if (!selected.ok) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "Neither Pro, Extra High, nor Max was visible as the GPT-5.6 Sol maximum tier", "effort_control_not_found");
+        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol Max tier was not visible in the personal picker (Extra High is accepted only when Max is absent from the Effort ladder)", "effort_control_not_found");
       }
     } else if (state.shape === "slider") {
       if (!state.effort_slider) {
@@ -632,15 +655,22 @@ async function selectSolMaxTierModel(root, options = {}) {
       state.effort_move_method = moved.method;
       if (!moved.ok) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to a verified maximum tier", "effort_slider_move_failed");
+        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to a verified Max tier (Extra High is accepted only when Max is absent from the Effort ladder)", "effort_slider_move_failed");
       }
     } else {
+      // Menu fallback order (ruling: Max first). Max is the personal/Pro target;
+      // Extra High is accepted only when Max is absent from the observed ladder;
+      // Pro is the Enterprise ceiling. This preserves the legacy Extra High > Pro
+      // preference on the personal picker while never accepting Extra High when
+      // Max is present in the ladder.
+      const labels = state.effort_items.map((item) => foldedModelText(textOf(item)));
+      const maxAbsent = !labels.includes("max");
       const maxOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === "max")
-        ?? state.effort_items.find((item) => foldedModelText(textOf(item)) === "extra high")
+        ?? (maxAbsent ? state.effort_items.find((item) => foldedModelText(textOf(item)) === "extra high") : undefined)
         ?? state.effort_items.find((item) => foldedModelText(textOf(item)) === "pro");
       if (!maxOption) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "Neither Pro, Extra High, nor Max was visible as the GPT-5.6 Sol maximum tier", "effort_control_not_found");
+        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol Max tier was not visible in the effort menu (Extra High is accepted only when Max is absent from the Effort ladder)", "effort_control_not_found");
       }
       realClick(maxOption);
       await sleep(Number(options.actionSettleMs ?? 250));
@@ -663,7 +693,7 @@ async function selectSolMaxTierModel(root, options = {}) {
   const effortVerified = effortIsMaxTier(state);
   if (!familyVerified || !effortVerified) {
     await closeModelPicker(root, modelButton);
-    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol at a verified maximum tier (Pro, Extra High, or Max) could not be confirmed in one picker pass", "model_selection_verification_failed");
+    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol at a verified Max tier could not be confirmed in one picker pass (Extra High is accepted only when Max is absent from the Effort ladder)", "model_selection_verification_failed");
   }
   if (!await closeModelPicker(root, modelButton)) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
@@ -678,6 +708,10 @@ async function selectSolMaxTierModel(root, options = {}) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm the verified maximum tier after closing the slider picker", "effort_composer_pill_unverified", { closedPill: true });
   }
   const closedPill = closedPillDiagnostics(pillText, state);
+  const ultraPreset = Boolean(state.ultra_preset);
+  const warnings = ultraPreset
+    ? ["Ultra is the operator's preset effort; accepted as at-or-above-Max proof without escalating or downgrading (Ultra is never selected by the recipe)"]
+    : [];
 
   return {
     status: "selected",
@@ -698,7 +732,11 @@ async function selectSolMaxTierModel(root, options = {}) {
     family_label_source: state.family_label_source ?? null,
     available_options: state.effort_items.map((item) => textOf(item)).filter(Boolean),
     available_families: availableFamilies,
-    effort_options: effortDiagnostics(state.effort_items)
+    effort_options: effortDiagnostics(state.effort_items),
+    ultra_preset: ultraPreset,
+    ladder_max_absent: state.ladder_max_absent === true,
+    warning: warnings[0] ?? null,
+    warnings
   };
 }
 
@@ -944,7 +982,7 @@ function readStructurallyTrustedPickerState(surface) {
 function classifyPickerSurface(surface, structurallyTrusted) {
   if (!surface) return null;
   const labels = menuRadioItems(surface, structurallyTrusted).map((item) => foldedModelText(textOf(item)));
-  if (labels.includes("medium") && labels.includes("high") && labels.includes("extra high")) {
+  if (isEffortMenuLabels(labels)) {
     return readMenuPickerState(surface, structurallyTrusted);
   }
   const text = normalizeText(textOf(surface));
@@ -1029,11 +1067,30 @@ async function selectPersonalMaxEffort(root, initialState, options = {}) {
   realClick(initialState.effort_row);
   await sleep(settleMs);
   let state = findPickerState(root) ?? initialState;
+  // Inspect the opened Effort submenu ladder before selecting.
+  const submenuItems = Array.from(root.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
+    .filter((item) => !/^effort\b/i.test(normalizeText(textOf(item))));
+  const submenuLabels = submenuItems.map((item) => foldedModelText(textOf(item)).replace(/\s+/g, " "));
+  const maxAbsent = !submenuLabels.includes("max");
+  if (state) state.ladder_max_absent = maxAbsent;
+  // Ultra preset: if the operator's preset is Ultra (checked in the submenu),
+  // accept it as at-or-above-Max proof without clicking/escalating.
+  const ultraChecked = submenuItems.find((item) => itemIsChecked(item) && foldedModelText(textOf(item)) === CHATGPT_ULTRA_EFFORT_LABEL);
+  if (ultraChecked) {
+    if (state) state.ultra_preset = true;
+    // Close the submenu without selecting; the preset is already at-or-above-Max.
+    pressActivationKey(initialState.effort_row, "Escape");
+    await sleep(settleMs);
+    state = findPickerState(root) ?? state;
+    if (state) state.ultra_preset = true;
+    return { ok: true, state, method: "ultra_preset_accepted" };
+  }
   const maxOption = findPersonalMaxEffortOption(root, state);
   if (!maxOption) return { ok: false, state, method: null };
   realClick(maxOption);
   await sleep(settleMs);
   state = findPickerState(root) ?? state;
+  if (state) state.ladder_max_absent = maxAbsent;
   return { ok: effortIsMaxTier(state), state, method: "effort_row_select" };
 }
 
@@ -1042,11 +1099,15 @@ function findPersonalMaxEffortOption(root, state) {
   if (state?.surface) scopes.push(state.surface);
   scopes.push(...Array.from(root.querySelectorAll?.('[role="menu"]') ?? []));
   for (const scope of uniqueElements(scopes)) {
-    const items = Array.from(scope.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? []);
-    const max = ["max", "extra high", "pro"]
-      .map((label) => items.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === label
-        && !/^effort\b/i.test(normalizeText(textOf(item)))))
-      .find(Boolean);
+    const items = Array.from(scope.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
+      .filter((item) => !/^effort\b/i.test(normalizeText(textOf(item))));
+    const labels = items.map((item) => foldedModelText(textOf(item)).replace(/\s+/g, " "));
+    const maxAbsent = !labels.includes("max");
+    // Order (ruling: Max first): Max; Extra High only when Max is absent; Pro is
+    // the Enterprise ceiling. Ultra is never selected by the recipe.
+    const max = items.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === "max")
+      ?? (maxAbsent ? items.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === "extra high") : undefined)
+      ?? items.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === "pro");
     if (max) return max;
   }
   return null;
@@ -1066,10 +1127,24 @@ async function waitForFamilyMenu(root, mainMenu, trigger, options = {}) {
 }
 
 function findMainModelMenu(root) {
-  return visibleMenus(root).find((menu) => {
-    const labels = menuRadioItems(menu).map((item) => foldedModelText(textOf(item)));
-    return labels.includes("medium") && labels.includes("high") && labels.includes("extra high");
-  }) ?? null;
+  return visibleMenus(root).find((menu) => isMainModelMenu(menu)) ?? null;
+}
+
+// A main model effort menu is recognized either by the legacy five-tier labels
+// (medium/high/extra high) or by the six-tier ladder (Light/Medium/High/Extra
+// High/Max/Ultra) proven live 2026-08-25. The six-tier ladder always carries Max
+// (and recognizes Ultra).
+function isEffortMenuLabels(labels) {
+  if (labels.includes("medium") && labels.includes("high") && labels.includes("extra high")) {
+    return true;
+  }
+  const ladderHits = labels.filter((label) => CHATGPT_EFFORT_LADDER.includes(label));
+  return labels.includes("max") && ladderHits.length >= 4;
+}
+
+function isMainModelMenu(menu) {
+  const labels = menuRadioItems(menu).map((item) => foldedModelText(textOf(item)));
+  return isEffortMenuLabels(labels);
 }
 
 function findFamilySubmenu(root, mainMenu) {
@@ -1190,14 +1265,103 @@ function familyMenuRadios(menu, structurallyTrusted = false) {
 }
 
 function effortIsMaxTier(state) {
+  return effortMaxTierDecision(state).ok;
+}
+
+// Ladder-aware maximum-tier decision. Returns { ok, reason, ultra_preset } so callers
+// can surface diagnostics (e.g. an accepted Ultra preset) without re-deriving logic.
+//
+// Ruling (yoetz/chatgpt-max-tier, 2026-08-25):
+//  - Target is the tier literally named "Max" ("Pro" for the Enterprise picker).
+//  - "Extra High" is acceptable proof ONLY when Max is absent from the observed
+//    ladder. For the slider this means a stale five-tier simple view (ceiling
+//    "Extra High") is NOT trusted until the opened Effort submenu proves Max absent
+//    (state.ladder_max_absent). For the menu it means "Extra High" is accepted only
+//    when "max" is not among the effort_items labels.
+//  - "Ultra" is recognized in the ladder mapping but NEVER clicked/selected. If the
+//    preset/checked effort is Ultra, accept it as at-or-above-Max proof with a
+//    diagnostic (do not downgrade an operator's own choice; do not escalate to it).
+function effortMaxTierDecision(state) {
   if (state?.shape === "personal") {
-    return CHATGPT_MAX_EFFORT_LABELS.has(foldedModelText(state.effort_label).replace(/\s+/g, " "));
+    const label = foldedModelText(state.effort_label).replace(/\s+/g, " ");
+    if (label === CHATGPT_ULTRA_EFFORT_LABEL) {
+      return { ok: true, reason: "ultra_preset", ultra_preset: true };
+    }
+    if (label === "max" || label === "pro") {
+      return { ok: true, reason: "ceiling_label", ultra_preset: false };
+    }
+    if (label === "extra high" && state.ladder_max_absent === true) {
+      return { ok: true, reason: "extra_high_max_absent", ultra_preset: false };
+    }
+    return { ok: false, reason: "not_max_tier", ultra_preset: false };
   }
   if (state?.shape === "slider") {
+    // An accepted Ultra preset (verified via the opened Effort submenu) is
+    // at-or-above-Max proof; trust the flag stamped by selectMaxFromEffortSubmenu.
+    if (state.ultra_preset === true) {
+      return { ok: true, reason: "ultra_preset", ultra_preset: true };
+    }
     const snapshot = sliderEffortSnapshot(state.effort_slider, state.surface);
-    return Boolean(snapshot && CHATGPT_MAX_EFFORT_LABELS.has(snapshot.label) && snapshot.now === snapshot.max);
+    if (!snapshot) return { ok: false, reason: "no_slider_snapshot", ultra_preset: false };
+    const label = snapshot.label;
+    if (label === CHATGPT_ULTRA_EFFORT_LABEL) {
+      return { ok: true, reason: "ultra_preset", ultra_preset: true };
+    }
+    if (snapshot.now !== snapshot.max) {
+      return { ok: false, reason: "below_ceiling", ultra_preset: false };
+    }
+    // At the ceiling rung: only Max/Pro are trusted ceilings. An "extra high"
+    // ceiling is a stale five-tier simple view when an Advanced Effort row submenu
+    // exists that could reveal a richer six-tier ladder (with Max). In that case,
+    // return false so moveEffortSliderToMaxTier falls through to driving the
+    // Effort submenu. If there is no Effort row, the slider IS the genuine ladder
+    // and Extra High is the real ceiling (Max truly absent) -> accept it.
+    if (CHATGPT_SLIDER_TRUSTED_CEILINGS.has(label)) {
+      return { ok: true, reason: "ceiling_label", ultra_preset: false };
+    }
+    if (label === "extra high" && state.ladder_max_absent === true) {
+      return { ok: true, reason: "extra_high_max_absent", ultra_preset: false };
+    }
+    if (label === "extra high" && !findSliderEffortRow(state)) {
+      // No Advanced Effort row to drive: the slider is the genuine ladder and
+      // Max is absent, so Extra High is the accepted ceiling.
+      return { ok: true, reason: "extra_high_no_effort_row", ultra_preset: false };
+    }
+    // Stale "extra high" slider ceiling WITH an Effort row: the simple slider is
+    // not authoritative. Do NOT trust the Effort row's static label for an Ultra
+    // preset here — that label can be stale too. Return false so
+    // moveEffortSliderToMaxTier drives the Effort submenu (selectMaxFromEffortSubmenu),
+    // which opens the ladder and verifies a checked Ultra preset against the real
+    // ladder before accepting it with a diagnostic. Max/Pro row labels are trusted
+    // only after the submenu fall-through has selected them.
+    if (label === "extra high") {
+      const rowLabel = sliderEffortRowLabel(state);
+      if (rowLabel === "max" || rowLabel === "pro") {
+        return { ok: true, reason: "effort_row_label", ultra_preset: false };
+      }
+      if (rowLabel === "extra high" && state.ladder_max_absent === true) {
+        return { ok: true, reason: "extra_high_max_absent", ultra_preset: false };
+      }
+    }
+    return { ok: false, reason: "untrusted_ceiling", ultra_preset: false };
   }
-  return state?.effort_items?.some((item) => CHATGPT_MAX_EFFORT_LABELS.has(foldedModelText(textOf(item))) && itemIsChecked(item)) ?? false;
+  // menu shape
+  const items = state?.effort_items ?? [];
+  const labels = items.map((item) => foldedModelText(textOf(item)));
+  const maxAbsent = !labels.includes("max");
+  const checked = items.find((item) => itemIsChecked(item));
+  if (!checked) return { ok: false, reason: "no_checked_effort", ultra_preset: false };
+  const checkedLabel = foldedModelText(textOf(checked));
+  if (checkedLabel === CHATGPT_ULTRA_EFFORT_LABEL) {
+    return { ok: true, reason: "ultra_preset", ultra_preset: true };
+  }
+  if (checkedLabel === "max" || checkedLabel === "pro") {
+    return { ok: true, reason: "ceiling_label", ultra_preset: false };
+  }
+  if (checkedLabel === "extra high" && maxAbsent) {
+    return { ok: true, reason: "extra_high_max_absent", ultra_preset: false };
+  }
+  return { ok: false, reason: "not_max_tier", ultra_preset: false };
 }
 
 function pillConfirmsEffortLabel(pillText, effortLabel) {
@@ -1243,7 +1407,17 @@ function pickerVerifiedEffortLabel(state) {
   if (!state) return null;
   if (state.shape === "personal") return state.effort_label || null;
   if (state.shape === "slider") {
-    return sliderEffortSnapshot(state.effort_slider, state.surface)?.display_label ?? null;
+    const snapshot = sliderEffortSnapshot(state.effort_slider, state.surface);
+    // When the simple slider is a stale "extra high" ceiling, the Advanced view's
+    // Effort row is the authoritative verified label (e.g. "Max" after the submenu
+    // fall-through, or "Ultra" as the operator's preset).
+    if (snapshot && snapshot.now === snapshot.max && snapshot.label === "extra high" && findSliderEffortRow(state)) {
+      const row = findSliderEffortRow(state);
+      const text = normalizeText(textOf(row)).replace(/\s+/g, " ");
+      const match = text.match(/^Effort\s+(.+)$/i);
+      if (match) return normalizeText(match[1]);
+    }
+    return snapshot?.display_label ?? null;
   }
   const checked = state.effort_items?.find((item) => itemIsChecked(item));
   return checked ? (normalizeText(textOf(checked)) || null) : null;
@@ -1353,6 +1527,162 @@ function effortControlDiagnostics(state) {
   return null;
 }
 
+// Find the Effort row inside the Advanced (slider) picker surface. From the live
+// dump the advanced view exposes rows Model / Effort / Speed as `role="menuitem"`.
+function findSliderEffortRow(state) {
+  const surface = state?.surface;
+  if (!surface) return null;
+  return Array.from(surface.querySelectorAll?.('[role="menuitem"], button') ?? [])
+    .find((node) => /^Effort\b/i.test(normalizeText(textOf(node)))) ?? null;
+}
+
+// Read the current Effort value from the Advanced view's Effort row (e.g. "Max",
+// "Extra High", "Ultra"). This is authoritative when the simple slider is a stale
+// five-tier view: the Effort row reflects the real selection after the submenu is
+// driven, while the simple slider ceiling may still read "Extra High".
+function sliderEffortRowLabel(state) {
+  const row = findSliderEffortRow(state);
+  if (!row) return null;
+  const text = normalizeText(textOf(row)).replace(/\s+/g, " ");
+  const match = text.match(/^Effort\s+(.+)$/i);
+  return match ? foldedModelText(match[1]) : null;
+}
+
+// Read the opened Effort submenu ladder (six-tier Light/Medium/High/Extra High/Max/Ultra).
+// Returns the list of menu item nodes in document order. The submenu is a separate
+// `role="menu"` surfaced after opening the Effort row.
+function findEffortSubmenu(root, mainSurface) {
+  return Array.from(root.querySelectorAll?.('[role="menu"]') ?? [])
+    .filter((menu) => menu !== mainSurface && isVisible(menu, { allowDisabled: true }))
+    .find((menu) => {
+      const labels = Array.from(menu.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
+        .map((node) => foldedModelText(textOf(node)));
+      // The six-tier ladder always contains Max (and recognizes Ultra). A submenu
+      // listing at least two of the high tiers is the Effort ladder.
+      const known = labels.filter((label) => CHATGPT_EFFORT_LADDER.includes(label));
+      return known.length >= 2 && labels.includes("max");
+    }) ?? null;
+}
+
+function effortSubmenuLadderLabels(menu) {
+  if (!menu) return [];
+  return Array.from(menu.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
+    .map((node) => foldedModelText(textOf(node)));
+}
+
+// Advanced -> Effort row -> opened ladder -> select Max fall-through.
+// Used when the simple slider ceiling is stale ("Extra High" on a five-tier view)
+// while the real six-tier ladder (with Max) lives behind the Effort row submenu.
+// Returns { ok, state, method, diagnostic }. Re-verifies after selecting.
+async function selectMaxFromEffortSubmenu(root, initialState, options = {}) {
+  const settleMs = Number(options.actionSettleMs ?? 250);
+  let state = initialState;
+  const effortRow = findSliderEffortRow(state);
+  if (!effortRow) {
+    return { ok: false, state, method: null, diagnostic: "effort_row_not_found" };
+  }
+  // Open the Effort submenu. The row may use aria-haspopup/aria-controls (Radix)
+  // or open on activation; mirror the family-menu open paths.
+  const opened = await openEffortSubmenu(root, state, effortRow, options);
+  let submenu = opened.menu;
+  if (!submenu) {
+    // Submenu did not open; cannot prove the ladder. Fail closed (do not trust
+    // the stale slider ceiling).
+    return { ok: false, state, method: null, diagnostic: "effort_submenu_open_failed" };
+  }
+  const labels = effortSubmenuLadderLabels(submenu);
+  const maxAbsent = !labels.includes("max");
+  const checked = Array.from(submenu.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
+    .find((node) => itemIsChecked(node));
+  const checkedLabel = checked ? foldedModelText(textOf(checked)) : null;
+
+  // Ultra preset: if the operator's own preset is Ultra, accept it as
+  // at-or-above-Max proof with a diagnostic. Never click/escalate.
+  if (checkedLabel === CHATGPT_ULTRA_EFFORT_LABEL) {
+    state = findPickerState(root) ?? state;
+    state.ultra_preset = true;
+    state.ladder_max_absent = maxAbsent;
+    state.effort_submenu_labels = labels;
+    await closeEffortSubmenu(root, state, effortRow, options);
+    // closeEffortSubmenu's Escape + settle may cause findPickerState to return a
+    // fresh state object; re-stamp the ladder-aware proof flags so effortIsMaxTier
+    // and the success path still see the verified Ultra preset.
+    state = findPickerState(root) ?? state;
+    state.ultra_preset = true;
+    state.ladder_max_absent = maxAbsent;
+    state.effort_submenu_labels = labels;
+    return { ok: true, state, method: "ultra_preset_accepted", diagnostic: "ultra_preset" };
+  }
+
+  if (maxAbsent) {
+    // Max is absent from the opened Effort ladder: "Extra High" is acceptable
+    // proof. Mark the state so effortIsMaxTier trusts the Extra High ceiling.
+    state = findPickerState(root) ?? state;
+    state.ladder_max_absent = true;
+    state.effort_submenu_labels = labels;
+    await closeEffortSubmenu(root, state, effortRow, options);
+    state = findPickerState(root) ?? state;
+    const ok = effortIsMaxTier(state);
+    return { ok, state, method: ok ? "extra_high_max_absent" : null, diagnostic: ok ? "extra_high_max_absent" : "extra_high_not_at_ceiling" };
+  }
+
+  // Max is present in the ladder: select the Max row, then re-verify.
+  const maxOption = Array.from(submenu.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
+    .find((node) => foldedModelText(textOf(node)) === "max");
+  if (!maxOption) {
+    await closeEffortSubmenu(root, state, effortRow, options);
+    state = findPickerState(root) ?? state;
+    return { ok: false, state, method: null, diagnostic: "max_row_not_found" };
+  }
+  realClick(maxOption);
+  await sleep(settleMs);
+  state = findPickerState(root) ?? state;
+  state.effort_submenu_labels = labels;
+  // Re-verify: re-read the checked effort row + the closed composer pill. The
+  // submenu click should collapse the submenu and update the Effort row/pill.
+  const verified = effortIsMaxTier(state);
+  return { ok: verified, state, method: verified ? "effort_submenu_max_select" : null, diagnostic: verified ? null : "max_select_unverified" };
+}
+
+async function openEffortSubmenu(root, state, effortRow, options = {}) {
+  const settleMs = Number(options.settleMs ?? 150);
+  const mainSurface = state?.surface;
+  const isOpen = () => findEffortSubmenu(root, mainSurface)
+    ?? structurallyOpenControlledSurfaceForTrigger(root, effortRow);
+  if (isOpen()) {
+    return { menu: await waitForEffortSubmenu(root, mainSurface, effortRow, options) };
+  }
+  for (const activate of [openWithPointerEvents, openWithHoverEvents, pressEnter, pressSpace]) {
+    try {
+      if (await activate(effortRow, isOpen, { settleMs })) {
+        return { menu: await waitForEffortSubmenu(root, mainSurface, effortRow, options) };
+      }
+    } catch {
+      // Try the next Radix activation path.
+    }
+  }
+  return { menu: null };
+}
+
+async function waitForEffortSubmenu(root, mainSurface, effortRow, options = {}) {
+  const timeoutMs = Number(options.pickerTimeoutMs ?? 3000);
+  const intervalMs = Number(options.intervalMs ?? 100);
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const menu = findEffortSubmenu(root, mainSurface)
+      ?? structurallyOpenControlledSurfaceForTrigger(root, effortRow);
+    if (menu) return menu;
+    await sleep(intervalMs);
+  }
+  return null;
+}
+
+async function closeEffortSubmenu(root, state, effortRow, options = {}) {
+  const settleMs = Number(options.actionSettleMs ?? 250);
+  pressActivationKey(effortRow, "Escape");
+  await sleep(settleMs);
+}
+
 async function moveEffortSliderToMaxTier(root, initialState, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   let state = initialState;
@@ -1361,7 +1691,11 @@ async function moveEffortSliderToMaxTier(root, initialState, options = {}) {
     if (state?.shape !== "slider" || !state.effort_slider) return null;
     pressActivationKey(state.effort_slider, key);
     await sleep(settleMs);
-    state = findPickerState(root);
+    // findPickerState can transiently return null or a non-slider state when the
+    // picker re-renders during settle; keep the last known slider state so the
+    // loop does not collapse on a stale snapshot. The final fresh re-check below
+    // is the authoritative verification.
+    state = findPickerState(root) ?? state;
     return effortIsMaxTier(state) ? { ok: true, state, method } : null;
   };
 
@@ -1371,6 +1705,35 @@ async function moveEffortSliderToMaxTier(root, initialState, options = {}) {
   const maxSnapshot = sliderEffortSnapshot(state?.effort_slider, state?.surface);
   if (maxSnapshot && originalSnapshot && maxSnapshot.now === maxSnapshot.max) {
     state.max_effort_label = maxSnapshot.display_label;
+    // Stale-slider fall-through (ruling yoetz/chatgpt-max-tier, 2026-08-25): a slider
+    // whose ceiling label is not Max/Pro is an untrusted stale five-tier simple view.
+    // The real six-tier ladder (Light/Medium/High/Extra High/Max/Ultra) lives behind
+    // the Advanced -> Effort row submenu. Drive that submenu: read the opened ladder,
+    // select the Max row (or accept Extra High only when Max is absent), then re-verify.
+    // "Extra High valid only when Max absent" is evaluated against the OPENED Effort
+    // submenu, never the closed slider rows.
+    const ceilingUntrusted = !CHATGPT_SLIDER_TRUSTED_CEILINGS.has(maxSnapshot.label)
+      && maxSnapshot.label !== CHATGPT_ULTRA_EFFORT_LABEL
+      && state.ladder_max_absent !== true;
+      if (ceilingUntrusted) {
+      const submenuResult = await selectMaxFromEffortSubmenu(root, state, options);
+      state = submenuResult.state ?? state;
+      state.max_effort_label = maxSnapshot.display_label;
+      state.effort_submenu_diagnostic = submenuResult.diagnostic ?? null;
+      if (submenuResult.ok) {
+        return { ok: true, state, method: submenuResult.method };
+      }
+      // If the Effort submenu was actually driven (an Effort row existed), the
+      // fall-through is the authoritative path: fail closed now with method null so
+      // the failure names the real cause instead of masking it as a probe. If there
+      // was no Effort row (e.g. an unknown-label ceiling on a legacy fixture with no
+      // Advanced Effort row), continue into the restore/probe diagnostics below so
+      // the rich diagnostics (max_effort_label, checkbox_probe, family_menu_probe)
+      // are still captured.
+      if (submenuResult.diagnostic !== "effort_row_not_found") {
+        return { ok: false, state, method: null };
+      }
+    }
     const restoreSteps = Math.max(0, maxSnapshot.now - originalSnapshot.now);
     for (let step = 0; step < restoreSteps; step += 1) {
       pressActivationKey(state.effort_slider, "ArrowLeft");
@@ -1399,10 +1762,28 @@ async function moveEffortSliderToMaxTier(root, initialState, options = {}) {
   if (state?.shape === "slider" && state.effort_slider) {
     clickSliderTrackMax(state.effort_slider);
     await sleep(settleMs);
-    state = findPickerState(root);
+    state = findPickerState(root) ?? state;
     if (effortIsMaxTier(state)) return { ok: true, state, method: "pointer_max" };
   }
-  return { ok: false, state, method: null };
+  // Guard against a stale in-loop snapshot: the move attempts may have landed
+  // the slider at a verified maximum tier even though a transient findPickerState
+  // read inside the loop returned null or a non-slider shape. Re-read fresh state
+  // once more before declaring failure; if the live slider now verifies, accept it.
+  // This is a guard, not the fix: the root cause is the transient null/non-slider
+  // read inside attemptKey, now hardened with `?? state` above.
+  const finalState = findPickerState(root);
+  if (finalState) {
+    // Propagate ladder-aware proof flags established during the fall-through so a
+    // fresh re-read can still trust an Extra High ceiling proven Max-absent (or an
+    // accepted Ultra preset) without re-deriving the opened submenu ladder.
+    if (state?.ladder_max_absent === true) finalState.ladder_max_absent = true;
+    if (state?.ultra_preset === true) finalState.ultra_preset = true;
+    if (state?.effort_submenu_labels) finalState.effort_submenu_labels = state.effort_submenu_labels;
+  }
+  if (finalState && effortIsMaxTier(finalState)) {
+    return { ok: true, state: finalState, method: "final_fresh_recheck" };
+  }
+  return { ok: false, state: finalState ?? state, method: null };
 }
 
 async function probeFamilyMenu(root, initialState, options = {}) {
@@ -3238,7 +3619,7 @@ export function modelSelectionDiagnostics(root = document) {
   const controlledId = modelButton?.getAttribute?.("aria-controls") ?? null;
   const controlledNode = controlledId ? root.getElementById?.(controlledId) : null;
   return {
-    requested_model: CHATGPT_SOL_EXTRA_HIGH_MODEL,
+    requested_model: CHATGPT_SOL_ACCOUNT_MAX_MODEL,
     current_model_label: modelControlLabel(modelButton),
     current_matches_requested: Boolean(familyIsSol(state?.family_label) && effortIsMaxTier(state)),
     family_status: familyIsSol(state?.family_label) ? "verified" : "unverified",
