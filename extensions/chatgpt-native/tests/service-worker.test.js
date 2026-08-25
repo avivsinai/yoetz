@@ -163,8 +163,16 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.conversation_url,
       "https://chatgpt.com/c/conv-job_a"
     );
+    // When the picker proved selection (status "selected"), the picker-proven
+    // label is the authoritative model identity and must NOT be overwritten by
+    // the backend data-message-model-slug. The slug is captured separately for
+    // observability.
     assert.equal(
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.model_used,
+      "GPT-5.6 Sol Extra High"
+    );
+    assert.equal(
+      port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.model_slug,
       "gpt-5-6-pro"
     );
     assert.equal(sentToTabs.filter((item) => item.message.type === "yoetz_upload_file").length, 2);
@@ -178,7 +186,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     }
     assert.equal(
       sentToTabs.find((item) => item.message.type === "yoetz_configure_model" && item.message.job.job_id === "job_b")?.message.job.model,
-      "gpt-5-6-sol-extra-high"
+      "gpt-5-6-sol-account-max"
     );
   } finally {
     globalThis.chrome = originalChrome;
@@ -1669,7 +1677,7 @@ test("service worker fails closed when GPT-5.6 Sol Extra High is unavailable", a
               payload: {
                 status: "unavailable",
                 model_used: "Default",
-                requested_model: "gpt-5-6-sol-extra-high",
+                requested_model: "gpt-5-6-sol-account-max",
                 available_options: ["Default"],
                 failure_reason: "effort_slider_move_failed",
                 picker_shape: "slider",
@@ -1749,7 +1757,7 @@ test("service worker fails resumed jobs before upload when GPT-5.6 Sol Extra Hig
               payload: {
                 status: "unavailable",
                 model_used: "Default",
-                requested_model: "gpt-5-6-sol-extra-high",
+                requested_model: "gpt-5-6-sol-account-max",
                 family_status: "unverified",
                 effort_status: "unverified",
                 available_options: ["Default"],
@@ -1915,6 +1923,85 @@ test("service worker keeps the current-model warning to one final payload entry"
   }
 });
 
+test("completion falls back to backend model_slug when the picker was not proven", async () => {
+  // When model_selection_status is NOT "selected" (here: "current"), there is no
+  // picker-proven label to trust, so the backend data-message-model-slug is the
+  // only model-identity signal and must be reported as model_used. This is the
+  // symmetric counterpart to preserving the picker label on the "selected" path.
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  let tabId = 0;
+  const sentJobs = new Set();
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: currentSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sentJobs.add(message.job.job_id);
+            return { ok: true, payload: { sent: true, conversation_id: "conv-slug-fallback" } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sentJobs.has(message.job.job_id)
+                ? {
+                    method: "assistant_dom_fallback",
+                    text: "answer",
+                    is_generating: false,
+                    assistant_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: 0,
+                    conversation_id: "conv-slug-fallback",
+                    model_slug: "gpt-5.6-sol-wm"
+                  }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?slug_fallback=${Date.now()}`);
+    port.emit(envelope("job_start", "job_slug_fallback", {
+      prompt: "prompt",
+      model_strategy: "current"
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_progress" && message.payload.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_slug_fallback", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete" && message.job_id === "job_slug_fallback"));
+    const complete = port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_slug_fallback");
+    assert.equal(complete.payload.model_selection_status, "current");
+    // No picker proof => the backend slug is the only signal, so it is reported.
+    assert.equal(complete.payload.model_used, "gpt-5.6-sol-wm");
+    assert.equal(complete.payload.model_slug, "gpt-5.6-sol-wm");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker fails closed when GPT-5.6 Sol Extra High selection fails", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -1954,7 +2041,7 @@ test("service worker fails closed when GPT-5.6 Sol Extra High selection fails", 
     await eventually(() => port.messages.some((message) => message.type === "job_error"));
     const error = port.messages.find((message) => message.type === "job_error");
     assert.equal(error.payload.code, "model_selection_failed");
-    assert.equal(error.payload.requested_model, "gpt-5-6-sol-extra-high");
+    assert.equal(error.payload.requested_model, "gpt-5-6-sol-account-max");
     assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
   } finally {
     globalThis.chrome = originalChrome;
@@ -2034,7 +2121,7 @@ test("service worker accepts only verified GPT-5.6 Sol Extra High selection", as
               payload: {
                 status: "selected",
                 model_used: "GPT-5.6 Sol Extra High",
-                requested_model: "gpt-5-6-sol-extra-high",
+                requested_model: "gpt-5-6-sol-account-max",
                 family_status: "verified",
                 effort_status: "verified"
               }
@@ -6270,7 +6357,7 @@ test("service worker restarts model selection from scratch after persisted bfcac
       ok: true,
       payload: {
         status: "unavailable",
-        requested_model: "gpt-5-6-sol-extra-high",
+        requested_model: "gpt-5-6-sol-account-max",
         failure_reason: "stale_suspended_attempt"
       }
     });
@@ -6473,7 +6560,7 @@ test("service worker keeps the fail-closed model-selection result when bfcache r
   const failedSelection = {
     status: "unavailable",
     model_used: null,
-    requested_model: "gpt-5-6-sol-extra-high",
+    requested_model: "gpt-5-6-sol-account-max",
     family_status: "unverified",
     effort_status: "unverified",
     failure_reason: "model_picker_open_failed",
@@ -6557,7 +6644,7 @@ test("service worker does not resurrect a terminal model selection from a stale 
   const failedSelection = {
     status: "unavailable",
     model_used: null,
-    requested_model: "gpt-5-6-sol-extra-high",
+    requested_model: "gpt-5-6-sol-account-max",
     family_status: "unverified",
     effort_status: "unverified",
     failure_reason: "model_picker_open_failed",
@@ -9468,7 +9555,7 @@ function verifiedSolProSelection() {
   return {
     status: "selected",
     model_used: "GPT-5.6 Sol Extra High",
-    requested_model: "gpt-5-6-sol-extra-high",
+    requested_model: "gpt-5-6-sol-account-max",
     family_status: "verified",
     effort_status: "verified"
   };

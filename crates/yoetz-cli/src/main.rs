@@ -2521,7 +2521,7 @@ fn build_chatgpt_recipe_spec(
         bundle_path: recipe_args.bundle.clone(),
         model: match recipe_args.model_strategy {
             chatgpt_recipe::ChatgptModelStrategy::Select => {
-                chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL.to_string()
+                chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL.to_string()
             }
             chatgpt_recipe::ChatgptModelStrategy::Current => "current".to_string(),
         },
@@ -8014,7 +8014,7 @@ mod tests {
 
         let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
         assert_eq!(spec.bundle_path, Some(PathBuf::from("/tmp/bundle.md")));
-        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL);
+        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL);
         assert_eq!(spec.prompt, "Review this repo");
         assert_eq!(spec.browser_context_id.as_deref(), Some("ctx-123"));
         assert_eq!(spec.profile_email.as_deref(), Some("user@example.com"));
@@ -8273,7 +8273,7 @@ mod tests {
             .expect("build recipe vars");
         let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
 
-        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL);
+        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL);
         assert!(!recipe_vars.contains_key("model"));
         assert!(!recipe_vars.contains_key("extended"));
     }

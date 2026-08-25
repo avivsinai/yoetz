@@ -2099,8 +2099,8 @@ mod tests {
     #[test]
     fn model_selection_script_requires_verified_sol_extra_high_contract() {
         let explicit_script =
-            build_model_selection_script(crate::chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL);
-        assert!(explicit_script.contains(r#"const requested = "gpt-5-6-sol-extra-high";"#));
+            build_model_selection_script(crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL);
+        assert!(explicit_script.contains(r#"const requested = "gpt-5-6-sol-account-max";"#));
         assert!(explicit_script.contains("classList.contains(\"__composer-pill\")"));
         assert!(explicit_script.contains("familyStatus"));
         assert!(explicit_script.contains("effortStatus"));

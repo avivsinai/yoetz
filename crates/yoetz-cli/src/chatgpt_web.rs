@@ -311,11 +311,11 @@ fn is_verified_sol_extra_high_selection(
     requested_model: &str,
 ) -> bool {
     if selection.get("status").and_then(serde_json::Value::as_str) != Some("selected")
-        || requested_model.trim() != crate::chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL
+        || requested_model.trim() != crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL
         || selection
             .get("requested")
             .and_then(serde_json::Value::as_str)
-            != Some(crate::chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL)
+            != Some(crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL)
         || selection
             .get("familyStatus")
             .and_then(serde_json::Value::as_str)
@@ -338,7 +338,7 @@ fn is_verified_sol_extra_high_selection(
             .join(" ")
             .to_ascii_lowercase()
             .as_str(),
-        "gpt-5.6 sol pro" | "gpt-5.6 sol extra high"
+        "gpt-5.6 sol pro" | "gpt-5.6 sol extra high" | "gpt-5.6 sol max" | "gpt-5.6 sol ultra"
     )
 }
 
@@ -386,7 +386,7 @@ pub fn build_model_selection_function(
 async () => {{
   const requested = {requested_model};
   const strategy = {model_strategy};
-  const supported = "gpt-5-6-sol-extra-high";
+  const supported = "gpt-5-6-sol-account-max";
   const MODEL_BUTTON_SELECTOR = {model_button_selector};
   const COMPOSER_SELECTOR = {composer_selector};
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
@@ -578,16 +578,35 @@ async () => {{
   }}
 
   function effortVerified(state) {{
-    return state?.effortItems?.some((item) => ["pro", "extra high"].includes(fold(textOf(item))) && isChecked(item)) || false;
+    // Ladder-aware verification (yz-7p3.3 finding D): mirrors the native extension's
+    // effortMaxTierDecision. Max is the target; Extra High is accepted only when
+    // Max is absent from the visible effortItems; Ultra is accepted as at-or-above-Max
+    // proof and is NEVER clicked (a preset Ultra must not be downgraded).
+    const items = state?.effortItems || [];
+    const labels = items.map((item) => fold(textOf(item)));
+    const maxPresent = labels.includes("max");
+    const checked = items.find((item) => isChecked(item));
+    const checkedLabel = checked ? fold(textOf(checked)) : null;
+    if (checkedLabel === "max" || checkedLabel === "pro") return true;
+    if (checkedLabel === "ultra") return true;
+    if (checkedLabel === "extra high" && !maxPresent) return true;
+    return false;
   }}
 
   function result(status, pill, state, families, warning = null) {{
     const familyIsVerified = familyVerified(state);
     const effortIsVerified = effortVerified(state);
-    const verifiedEffort = state?.effortItems?.find((item) => ["pro", "extra high"].includes(fold(textOf(item))) && isChecked(item));
+    const items = state?.effortItems || [];
+    const checked = items.find((item) => isChecked(item));
+    const checkedLabel = checked ? fold(textOf(checked)) : null;
+    const ultraPreset = checkedLabel === "ultra";
+    const verifiedEffort = checked && ["pro", "extra high", "max", "ultra"].includes(checkedLabel) ? checked : null;
     const modelUsed = status === "current"
       ? (pill ? textOf(pill) : "")
       : (familyIsVerified && effortIsVerified ? `GPT-5.6 Sol ${{textOf(verifiedEffort)}}` : null);
+    const ultraWarning = ultraPreset && effortIsVerified
+      ? "Ultra is the operator's preset effort; accepted as at-or-above-Max proof without escalating or downgrading (Ultra is never selected by the recipe)"
+      : null;
     return {{
       requested,
       status,
@@ -598,7 +617,8 @@ async () => {{
       familyLabel: state?.familyLabel || null,
       availableItems: (state?.effortItems || []).map(textOf).filter(Boolean),
       availableFamilies: families || [],
-      warning,
+      warning: warning || ultraWarning,
+      ultraPreset,
       url: window.location.href || "",
       title: document.title || ""
     }};
@@ -623,7 +643,7 @@ async () => {{
   }}
 
   if (requested !== supported) {{
-    return result("not-found", null, null, [], "this recipe supports only GPT-5.6 Sol at the account maximum tier (Pro or Extra High)");
+    return result("not-found", null, null, [], "this recipe supports only GPT-5.6 Sol at the account maximum tier (Pro, Extra High, or Max)");
   }}
   const legacy = legacyPickerMarkers();
   if (legacy.length > 0) {{
@@ -667,11 +687,12 @@ async () => {{
   }}
 
   if (!effortVerified(state)) {{
-    const maxTier = state.effortItems.find((item) => fold(textOf(item)) === "extra high")
+    const maxTier = state.effortItems.find((item) => fold(textOf(item)) === "max")
+      || state.effortItems.find((item) => fold(textOf(item)) === "extra high")
       || state.effortItems.find((item) => fold(textOf(item)) === "pro") || null;
     if (!maxTier) {{
       await closeMenus(pill);
-      return result("not-found", pill, state, families, "Neither Pro nor Extra High was visible as the GPT-5.6 Sol maximum tier");
+      return result("not-found", pill, state, families, "Neither Pro, Extra High, nor Max was visible as the GPT-5.6 Sol maximum tier");
     }}
     realClick(maxTier);
     await wait(250);
@@ -686,7 +707,7 @@ async () => {{
   const effortIsVerified = effortVerified(state);
   if (!familyIsVerified || !effortIsVerified) {{
     await closeMenus(pill);
-    return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol at a verified maximum tier (Pro or Extra High) could not be confirmed in one picker pass");
+    return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol at a verified maximum tier (Pro, Extra High, or Max) could not be confirmed in one picker pass");
   }}
   if (!await closeMenus(pill)) {{
     return result("selection-mismatch", pill, state, families, "ChatGPT model picker remained open after verification");
@@ -1167,6 +1188,7 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL;
     use base64::Engine;
     use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
     use serde_json::Value;
@@ -1190,38 +1212,60 @@ mod tests {
     fn reported_chatgpt_model_requires_verified_sol_and_extra_high_proofs() {
         let selection = serde_json::json!({
             "status": "selected",
-            "requested": "gpt-5-6-sol-extra-high",
+            "requested": "gpt-5-6-sol-account-max",
             "modelUsed": "GPT-5.6 Sol Extra High",
             "familyStatus": "verified",
             "effortStatus": "verified"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-extra-high"),
+            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-account-max"),
             Some("GPT-5.6 Sol Extra High".to_string())
         );
 
         let enterprise_selection = serde_json::json!({
             "status": "selected",
-            "requested": "gpt-5-6-sol-extra-high",
+            "requested": "gpt-5-6-sol-account-max",
             "modelUsed": "GPT-5.6 Sol Pro",
             "familyStatus": "verified",
             "effortStatus": "verified"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&enterprise_selection, "gpt-5-6-sol-extra-high"),
+            select_reported_chatgpt_model(&enterprise_selection, "gpt-5-6-sol-account-max"),
             Some("GPT-5.6 Sol Pro".to_string())
         );
 
         let unknown_selection = serde_json::json!({
             "status": "selected",
-            "requested": "gpt-5-6-sol-extra-high",
+            "requested": "gpt-5-6-sol-account-max",
             "modelUsed": "GPT-5.6 Sol Expert",
             "familyStatus": "verified",
             "effortStatus": "verified"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&unknown_selection, "gpt-5-6-sol-extra-high"),
+            select_reported_chatgpt_model(&unknown_selection, "gpt-5-6-sol-account-max"),
             None
+        );
+    }
+
+    #[test]
+    fn reported_chatgpt_model_accepts_sol_max_tier() {
+        // The CDP/dev-browser picker must accept the Max effort tier with the same
+        // proof shape as Pro/Extra High (parity with the native extension's
+        // CHATGPT_MAX_EFFORT_LABELS = {pro, extra high, max}).
+        let max_selection = serde_json::json!({
+            "status": "selected",
+            "requested": "gpt-5-6-sol-account-max",
+            "modelUsed": "GPT-5.6 Sol Max",
+            "familyStatus": "verified",
+            "effortStatus": "verified"
+        });
+        assert_eq!(
+            select_reported_chatgpt_model(&max_selection, "gpt-5-6-sol-account-max"),
+            Some("GPT-5.6 Sol Max".to_string())
+        );
+        assert_eq!(
+            chatgpt_model_selection_status(&max_selection, "gpt-5-6-sol-account-max"),
+            ChatgptModelSelectionStatus::Selected
         );
     }
 
@@ -1229,12 +1273,12 @@ mod tests {
     fn reported_chatgpt_model_never_echoes_an_unverified_request() {
         let selection = serde_json::json!({
             "status": "selected",
-            "requested": "gpt-5-6-sol-extra-high",
+            "requested": "gpt-5-6-sol-account-max",
             "modelUsed": "Pro Extended",
             "extendedStatus": "required"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-extra-high"),
+            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-account-max"),
             None
         );
     }
@@ -1260,12 +1304,12 @@ mod tests {
             chatgpt_model_selection_status(
                 &serde_json::json!({
                     "status": "selected",
-                    "requested": "gpt-5-6-sol-extra-high",
+                    "requested": "gpt-5-6-sol-account-max",
                     "modelUsed": "GPT-5.6 Sol Extra High",
                     "familyStatus": "verified",
                     "effortStatus": "verified"
                 }),
-                "gpt-5-6-sol-extra-high"
+                "gpt-5-6-sol-account-max"
             ),
             ChatgptModelSelectionStatus::Selected
         );
@@ -1290,7 +1334,7 @@ mod tests {
                     "modelUsed": "Pro Extended",
                     "extendedStatus": "required"
                 }),
-                "gpt-5-6-sol-extra-high"
+                "gpt-5-6-sol-account-max"
             ),
             ChatgptModelSelectionStatus::Mismatch
         );
@@ -1304,7 +1348,7 @@ mod tests {
         assert_eq!(
             chatgpt_model_selection_status(
                 &serde_json::json!({"status": "selection-mismatch"}),
-                "gpt-5-6-sol-extra-high"
+                "gpt-5-6-sol-account-max"
             ),
             ChatgptModelSelectionStatus::Mismatch
         );
@@ -1336,8 +1380,8 @@ mod tests {
     #[test]
     fn model_selection_function_requires_verified_sol_family_and_known_maximum_effort() {
         let script =
-            build_model_selection_function("gpt-5-6-sol-extra-high", ChatgptModelStrategy::Select);
-        assert!(script.contains(r#"const requested = "gpt-5-6-sol-extra-high";"#));
+            build_model_selection_function("gpt-5-6-sol-account-max", ChatgptModelStrategy::Select);
+        assert!(script.contains(r#"const requested = "gpt-5-6-sol-account-max";"#));
         assert!(script.contains("classList.contains(\"__composer-pill\")"));
         assert!(script.contains(
             "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI"
@@ -1345,7 +1389,23 @@ mod tests {
         assert!(script.contains(r#"familyStatus: familyIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"effortStatus: effortIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"fold(textOf(item)) === "gpt-5.6 sol""#));
-        assert!(script.contains(r#"["pro", "extra high"].includes(fold(textOf(item)))"#));
+        // Ladder-aware effortVerified (yz-7p3.3 finding D): the verified set now
+        // includes Ultra (never clicked) and gates Extra High on Max-absent.
+        assert!(script.contains("checkedLabel === \"max\" || checkedLabel === \"pro\""));
+        assert!(script.contains("checkedLabel === \"ultra\""));
+        assert!(script.contains("checkedLabel === \"extra high\" && !maxPresent"));
+        // The Max tier is the first maxTier fallback, ahead of Extra High and Pro,
+        // matching the native extension's CHATGPT_MAX_EFFORT_LABELS ordering.
+        assert!(script.contains(r#"fold(textOf(item)) === "max""#));
+        assert!(script.contains(
+            "Neither Pro, Extra High, nor Max was visible as the GPT-5.6 Sol maximum tier"
+        ));
+        assert!(script.contains(
+            "GPT-5.6 Sol at a verified maximum tier (Pro, Extra High, or Max) could not be confirmed"
+        ));
+        assert!(script.contains(
+            "this recipe supports only GPT-5.6 Sol at the account maximum tier (Pro, Extra High, or Max)"
+        ));
         assert!(script.contains(r#"/^(?:gpt|o\d)\b/i.test(textOf(item))"#));
         assert!(script.contains("await openFamilyMenu"));
         assert!(script.contains("async function waitForPill()"));
@@ -1360,6 +1420,62 @@ mod tests {
         assert!(!script.contains("if (families.length === 0 && state.familyTrigger)"));
         assert!(script.contains("await closeMenus"));
         assert!(!script.contains("model-switcher-gpt-5-4"));
+    }
+
+    #[test]
+    fn cdp_effort_verified_is_ladder_aware_preset_ultra_never_downgraded() {
+        // yz-7p3.3 finding D: a preset Ultra must verify WITHOUT being clicked.
+        // The emitted effortVerified recognizes a checked "ultra", so the
+        // `if (!effortVerified(state))` click block is skipped entirely and the
+        // Ultra preset is accepted with a diagnostic warning. The maxTier fallback
+        // click path must never run for Ultra.
+        let script = build_model_selection_function(
+            CHATGPT_SOL_ACCOUNT_MAX_MODEL,
+            ChatgptModelStrategy::Select,
+        );
+        // effortVerified accepts a checked Ultra.
+        assert!(script.contains("checkedLabel === \"ultra\""));
+        // The Ultra preset surfaces a diagnostic warning, never a click.
+        assert!(script
+            .contains("Ultra is the operator's preset effort; accepted as at-or-above-Max proof"));
+        // The maxTier fallback explicitly does NOT include ultra as a click target.
+        assert!(script.contains("fold(textOf(item)) === \"max\""));
+        assert!(!script.contains("fold(textOf(item)) === \"ultra\""));
+        // is_verified_sol_extra_high_selection trusts an Ultra modelUsed.
+        let ultra = serde_json::json!({
+            "status": "selected",
+            "requested": CHATGPT_SOL_ACCOUNT_MAX_MODEL,
+            "familyStatus": "verified",
+            "effortStatus": "verified",
+            "modelUsed": "GPT-5.6 Sol Ultra"
+        });
+        assert!(is_verified_sol_extra_high_selection(
+            &ultra,
+            CHATGPT_SOL_ACCOUNT_MAX_MODEL
+        ));
+    }
+
+    #[test]
+    fn cdp_effort_verified_gates_extra_high_on_max_present() {
+        // yz-7p3.3 finding D: a checked Extra High is verified ONLY when Max is
+        // absent from the visible effortItems. With Max present, effortVerified is
+        // false and the maxTier fallback clicks Max (not Extra High).
+        let script = build_model_selection_function(
+            CHATGPT_SOL_ACCOUNT_MAX_MODEL,
+            ChatgptModelStrategy::Select,
+        );
+        assert!(script.contains("checkedLabel === \"extra high\" && !maxPresent"));
+        // Max remains the first fallback tier (ahead of Extra High and Pro).
+        let max_fallback = script
+            .find("const maxTier = state.effortItems.find")
+            .unwrap_or(0);
+        let max_slice = &script[max_fallback..max_fallback + 220];
+        let max_pos = max_slice.find("\"max\"").unwrap();
+        let extra_pos = max_slice.find("\"extra high\"").unwrap();
+        assert!(
+            max_pos < extra_pos,
+            "Max must precede Extra High in the fallback ladder"
+        );
     }
 
     #[test]

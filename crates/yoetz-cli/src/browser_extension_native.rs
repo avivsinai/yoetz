@@ -1559,7 +1559,7 @@ pub fn canary(
         BuiltinWebRecipe::Chatgpt => run_chatgpt_recipe(
             &ChatgptRecipeSpec {
                 bundle_path: Some(bundle_path),
-                model: crate::chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL.to_string(),
+                model: crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL.to_string(),
                 model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
                 prompt: "Reply with exactly OK.".to_string(),
                 browser_context_id: None,
@@ -3005,6 +3005,11 @@ fn parse_recipe_result(envelope: ProtocolEnvelope) -> Result<ExtensionRecipeResu
             .payload
             .get("copy_button_count")
             .and_then(Value::as_u64),
+        model_slug: envelope
+            .payload
+            .get("model_slug")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     };
     Ok(ExtensionRecipeResult {
         response,
@@ -4470,7 +4475,7 @@ mod tests {
         };
         let spec = ChatgptRecipeSpec {
             bundle_path: Some(bundle.path.clone()),
-            model: crate::chatgpt_recipe::CHATGPT_SOL_EXTRA_HIGH_MODEL.to_string(),
+            model: crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL.to_string(),
             model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
             prompt: "continue".to_string(),
             browser_context_id: None,
@@ -4634,6 +4639,7 @@ mod tests {
                 "stable_for_ms": 5000,
                 "assistant_turn_count": 2,
                 "copy_button_count": 1,
+                "model_slug": "gpt-5.6-sol-wm",
             }),
         );
 
@@ -4674,6 +4680,13 @@ mod tests {
         assert_eq!(result.diagnostics.stable_for_ms, Some(5000));
         assert_eq!(result.diagnostics.assistant_turn_count, Some(2));
         assert_eq!(result.diagnostics.copy_button_count, Some(1));
+        // The backend model_slug is captured for observability and must NOT
+        // overwrite the picker-proven model_used label (yz-7p3.2).
+        assert_eq!(
+            result.diagnostics.model_slug.as_deref(),
+            Some("gpt-5.6-sol-wm")
+        );
+        assert_eq!(result.model_used.as_deref(), Some("GPT-5.6 Sol Extra High"));
     }
 
     #[test]

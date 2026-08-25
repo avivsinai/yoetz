@@ -111,7 +111,7 @@ export async function uploadFile(_document, file, options) {
 
 export function configureModelState(_document, job) {
   hooks.configureModelCalls.push(job);
-  return { status: "selected", model_used: "GPT-5.6 Sol Extra High", requested_model: "gpt-5-6-sol-extra-high", family_status: "verified", effort_status: "verified" };
+  return { status: "selected", model_used: "GPT-5.6 Sol Extra High", requested_model: "gpt-5-6-sol-account-max", family_status: "verified", effort_status: "verified" };
 }
 
 export function sendAcceptanceBaseline() {

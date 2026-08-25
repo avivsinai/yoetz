@@ -6,6 +6,48 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Changed
+
+- ChatGPT recipe now targets the literal **Max** effort tier on the personal/Pro
+  picker (previously accepted Extra High as the ceiling). Extra High is accepted
+  only when Max is absent from the opened Effort submenu ladder. Enterprise **Pro**
+  picker is unchanged. Unknown top tiers remain fail-closed.
+- **Ultra** is recognized in the six-tier effort ladder (Light/Medium/High/Extra
+  High/Max/Ultra) but is never clicked/selected by the recipe. If Ultra is the
+  operator's preset selection, it is accepted as at-or-above-Max proof with a
+  diagnostic note (no downgrade, no escalation).
+- A slider whose ceiling is not Max/Pro is treated as a stale five-tier simple
+  view; the recipe falls through Advanced -> Effort row -> opened ladder -> select
+  Max, then re-verifies against the checked effort row and the closed composer pill.
+- Requested model id renamed `gpt-5-6-sol-extra-high` -> `gpt-5-6-sol-account-max`
+  (semantic: Sol at account maximum; honest on both Enterprise Pro and personal
+  Max). Diagnostics no longer imply Extra High is the ceiling.
+
+### Fixed
+
+- `moveEffortSliderToMaxTier` no longer fails on a self-contradictory stale
+  snapshot: the move loop now keeps the last known slider state on a transient
+  `findPickerState` null/non-slider read (`?? state`), and a final fresh re-check
+  rescues a verified maximum that in-loop reads missed. An unknown ceiling label
+  is still fail-closed (the guard only rescues verified Max/Pro/Max-absent tiers).
+- The ChatGPT backend `data-message-model-slug` (e.g. `gpt-5.6-sol-wm`) no longer
+  overwrites the picker-proven `model_used` label when selection was verified; the
+  slug is captured as `model_slug` in diagnostics (extension payload and CLI result)
+  for observability. The `current`/`kept_current` paths (no picker proof) still
+  report the slug as `model_used`.
+- CDP/dev-browser picker now accepts the Sol **Max** effort tier (parity with the
+  native extension), closing the asymmetry where the CDP fallback would fail closed
+  on a personal Max picker that the native path accepted. The CDP `effortVerified`
+  is now ladder-aware (same Max-target / Extra-High-only-when-Max-absent / Ultra-
+  never-clicked policy as the native extension), so a preset Ultra is no longer
+  downgraded to Max on the CDP transport.
+- The closed composer pill no longer corroborates a tier *below* the verified
+  picker tier: a stale "Extra High" pill cannot confirm a selected "Max" when the
+  ladder had Max. Corroboration is directional (pill tier ≥ verified tier).
+- The Effort submenu is recognized by >=2 known ladder labels, not by requiring
+  "max" to be present; a legacy five-tier submenu (Max genuinely absent) is now
+  reachable so Extra High is accepted with `ladder_max_absent` instead of failing
+  closed.
 
 ## [0.5.57] - 2026-08-20
 ### Fixed

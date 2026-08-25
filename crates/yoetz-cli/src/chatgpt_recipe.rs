@@ -10,7 +10,7 @@ pub type ChatgptTransportPhase = web_recipe::WebRecipeTransportPhase;
 pub type ChatgptModelStrategy = web_recipe::WebModelStrategy;
 pub type ChatgptModelSelectionStatus = web_recipe::WebModelSelectionStatus;
 
-pub const CHATGPT_SOL_EXTRA_HIGH_MODEL: &str = "gpt-5-6-sol-extra-high";
+pub const CHATGPT_SOL_ACCOUNT_MAX_MODEL: &str = "gpt-5-6-sol-account-max";
 
 pub(crate) trait AnyhowResultExt<T> {
     fn with_chatgpt_phase(self, phase: ChatgptTransportPhase) -> Result<T, AnyhowError>;
@@ -135,6 +135,10 @@ pub struct ChatgptRecipeDiagnostics {
     pub stable_for_ms: Option<u64>,
     pub assistant_turn_count: Option<u64>,
     pub copy_button_count: Option<u64>,
+    /// Backend `data-message-model-slug` from the assistant turn (e.g.
+    /// `gpt-5.6-sol-wm`). Captured for observability; it must NOT overwrite the
+    /// picker-proven `model_used` label (see service-worker.js completeJobWithExtraction).
+    pub model_slug: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -176,6 +180,7 @@ impl ChatgptRecipeOutput {
             "stable_for_ms": self.diagnostics.stable_for_ms,
             "assistant_turn_count": self.diagnostics.assistant_turn_count,
             "copy_button_count": self.diagnostics.copy_button_count,
+            "model_slug": self.diagnostics.model_slug,
         })
     }
 
@@ -200,6 +205,7 @@ impl ChatgptRecipeOutput {
             "stable_for_ms": self.diagnostics.stable_for_ms,
             "assistant_turn_count": self.diagnostics.assistant_turn_count,
             "copy_button_count": self.diagnostics.copy_button_count,
+            "model_slug": self.diagnostics.model_slug,
         })
     }
 }
@@ -231,6 +237,7 @@ mod tests {
                 stable_for_ms: Some(5000),
                 assistant_turn_count: Some(2),
                 copy_button_count: Some(1),
+                model_slug: None,
             },
         };
 

@@ -2331,7 +2331,7 @@ test("GPT-5.6 Sol picker rejects checked GPT-5.5 Pro Extended as stale", async (
 
   assert.equal(result.status, "selected");
   assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
-  assert.equal(result.requested_model, "gpt-5-6-sol-extra-high");
+  assert.equal(result.requested_model, "gpt-5-6-sol-account-max");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.familyClicks(), 1);
@@ -2420,7 +2420,7 @@ test("GPT-5.6 Sol picker accepts an Enterprise Pro maximum and reports the actua
 
   assert.equal(result.status, "selected");
   assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.requested_model, "gpt-5-6-sol-extra-high");
+  assert.equal(result.requested_model, "gpt-5-6-sol-account-max");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.effortClicks(), 0);
@@ -2528,6 +2528,55 @@ test("GPT-5.6 Sol Advanced picker upgrades the live two-line Light pill", async 
   assert.equal(result.pill_text, "5.6 Sol\nExtra High");
 });
 
+test("GPT-5.6 Sol Advanced picker accepts an already-max Extra High slider without moving (stale-snapshot regression)", async () => {
+  // Reproduces the 2026-08-25 live failure (dump: /tmp/amq-effort-slider-move-failed-diagnostics.txt):
+  // the structural slider is already at 5/5 Extra High (effortIsMaxTier true on fresh read),
+  // but the move loop saw effortIsMaxTier false on every iteration (effort_move_method null)
+  // while selectionFailure recomputed verified on the final state. Under current semantics
+  // this run must PASS as Extra High without entering the move loop at all.
+  const fixture = makeSolSliderFixture({
+    backgroundFrozen: true,
+    initialValue: 5,
+    keyboardMode: "none"
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.effort_move_method, null);
+  assert.equal(result.effort_control.value_now, 4);
+  assert.equal(result.effort_control.value_max, 4);
+  assert.equal(result.effort_control.label, "extra high");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.picker_effort_status, "verified");
+  assert.deepEqual(fixture.keyAttempts(), []);
+  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+});
+
+test("GPT-5.6 Sol structural slider moves from below max to Extra High and verifies (move-loop regression)", async () => {
+  // The 2026-08-25 live failure (dump: /tmp/amq-effort-slider-move-failed-diagnostics.txt) showed
+  // effort_slider_move_failed while the final state verified Extra High. This exercises the move
+  // loop on the structural (backgroundFrozen) path starting below max: End must move the slider to
+  // 5/5 Extra High and the in-loop findPickerState read must recognize the verified max.
+  const fixture = makeSolSliderFixture({
+    backgroundFrozen: true,
+    initialValue: 3,
+    keyboardMode: "end"
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.effort_move_method, "keyboard_end");
+  assert.equal(result.effort_control.label, "extra high");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.picker_effort_status, "verified");
+  assert.deepEqual(fixture.keyAttempts(), ["End"]);
+  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+});
+
 test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum", async () => {
   const fixture = makeSolSliderFixture({
     keyboardMode: "end",
@@ -2538,9 +2587,129 @@ test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum",
 
   assert.equal(result.status, "selected");
   assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.requested_model, "gpt-5-6-sol-extra-high");
+  assert.equal(result.requested_model, "gpt-5-6-sol-account-max");
   assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
   assert.equal(result.pill_text, "5.6 Sol\nPro");
+});
+
+test("GPT-5.6 Sol six-tier ladder: stale Extra High slider falls through Advanced -> Effort submenu and selects Max", async () => {
+  // Fixture 1 (from the 2026-08-25 live dump): the simple slider is stale at 4/4
+  // "Extra High" (five-tier simple view) while the real six-tier ladder
+  // (Light/Medium/High/Extra High/Max/Ultra) lives behind the Advanced -> Effort
+  // row submenu. The recipe must detect the stale ceiling, drive the Effort row,
+  // read the OPENED submenu ladder, select the Max row, and re-verify.
+  const fixture = makeSixTierLadderFixture({});
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.equal(result.requested_model, "gpt-5-6-sol-account-max");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.picker_effort_status, "verified");
+  assert.equal(result.effort_move_method, "effort_submenu_max_select");
+  assert.equal(fixture.effortRowClicks(), 1, "Effort row must be opened once");
+  assert.equal(fixture.maxClicks(), 1, "Max row must be selected");
+  assert.equal(result.pill_text, "5.6 Sol\nMax");
+  assert.equal(fixture.effortMenuOpen(), false, "Effort submenu must close after selecting Max");
+});
+
+test("GPT-5.6 Sol six-tier ladder: accepting a stale Extra High ceiling when Max IS present must fail", async () => {
+  // Negative test (fixture 2): an implementation that accepts the stale slider
+  // ceiling (Extra High when Max IS present in the ladder) must FAIL closed. The
+  // recipe must not accept Extra High here; it must fall through to the Effort
+  // submenu. We simulate Max being present but unverifiable (click does not land)
+  // so the fall-through cannot complete and selection fails closed naming Max.
+  const fixture = makeSixTierLadderFixture({ maxVerifiable: false });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable", JSON.stringify(result));
+  assert.equal(result.failure_reason, "effort_slider_move_failed");
+  assert.equal(result.picker_shape, "slider");
+  // The failure message must name Max, not imply Extra High is the ceiling.
+  assert.match(result.warning ?? "", /Max/i);
+  assert.equal(fixture.effortRowClicks(), 1, "Effort row must be opened in the fall-through");
+  assert.equal(fixture.maxClicks(), 1, "Max row must be attempted");
+});
+
+test("GPT-5.6 Sol six-tier ladder: Max visible but unverifiable fails closed naming Max", async () => {
+  // Fixture 3: the Effort submenu ladder contains Max, the recipe selects the Max
+  // row, but the selection does not verify (Max visible but unverifiable). The
+  // recipe must fail closed and the diagnostics must name Max as the target.
+  const fixture = makeSixTierLadderFixture({ maxVerifiable: false });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable", JSON.stringify(result));
+  assert.equal(result.failure_reason, "effort_slider_move_failed");
+  assert.match(result.warning ?? "", /Max/i);
+  assert.equal(result.effort_move_method ?? null, null);
+});
+
+test("GPT-5.6 Sol six-tier ladder: a preset Ultra effort is accepted as at-or-above-Max proof without clicking", async () => {
+  // Fixture 4 (Ultra policy): Ultra is already the user's preset selection. The
+  // recipe must accept it as at-or-above-Max proof with a diagnostic note, never
+  // click/escalate, and never downgrade. Status selected/verified, no Max click.
+  const fixture = makeSixTierLadderFixture({ presetEffort: "Ultra" });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.picker_effort_status, "verified");
+  assert.equal(result.ultra_preset, true);
+  assert.equal(result.ladder_max_absent, false);
+  assert.ok(result.warnings?.some((w) => /Ultra/i.test(w)), "must carry an Ultra preset diagnostic");
+  assert.equal(fixture.maxClicks(), 0, "must never click Max (no escalation)");
+  assert.equal(fixture.effortRowClicks(), 1, "Effort row opened to read the ladder");
+  assert.equal(result.pill_text, "5.6 Sol\nUltra");
+});
+
+test("GPT-5.6 Sol six-tier ladder: five-tier Effort submenu with Max genuinely absent accepts Extra High (yz-7p3.3 finding A)", async () => {
+  // A legacy five-tier Effort submenu (Max genuinely absent) that is visible but
+  // unlinked (no aria-controls) must still be RECOGNIZED by findEffortSubmenu so
+  // the maxAbsent branch can accept Extra High. findEffortSubmenu must not require
+  // "max" to be present (recognition is >=2 known ladder labels; maxAbsent is
+  // decided AFTER, from the labels).
+  const fixture = makeSixTierLadderFixture({
+    effortLadder: ["Light", "Medium", "High", "Extra High"],
+    presetEffort: "Extra High",
+    sliderCeiling: "Extra High"
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.picker_effort_status, "verified");
+  assert.equal(result.ladder_max_absent, true, "Max must be proven absent from the opened ladder");
+  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+  assert.equal(fixture.maxClicks(), 0, "Max is absent; nothing to click");
+});
+
+test("GPT-5.6 Sol six-tier ladder: openEffortSubmenu returns a resolved menu, not an unawaited Promise (yz-7p3.5 regression guard)", async () => {
+  // Regression guard for the wave-2 worker bug: waitForEffortSubmenu is async and
+  // returns a Promise; an unawaited call used as a truthy menu would make
+  // effortSubmenuLadderLabels(Promise) return [] and silently mis-classify the
+  // ladder. This test asserts the submenu menu node is a real DOM-like object with
+  // querySelectorAll (i.e. await was honored) by driving the fall-through and
+  // checking the ladder labels were actually read (Max present, selected).
+  const fixture = makeSixTierLadderFixture({
+    presetEffort: "Extra High",
+    sliderCeiling: "Extra High"
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  // If the submenu Promise were used unawaited, labels would be [] and the
+  // stale Extra High ceiling would be accepted with ladder_max_absent:true
+  // instead of selecting Max. Asserting Max was selected proves the menu was
+  // resolved before reading labels.
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.ladder_max_absent, false, "Max IS present; an unawaited submenu Promise would wrongly report it absent");
+  assert.equal(fixture.maxClicks(), 1, "Max was selected from the resolved submenu");
 });
 
 test("GPT-5.6 Sol personal picker fails closed when the closed pill is effort-only", async () => {
@@ -2853,12 +3022,13 @@ for (const testCase of [
     closed_pill_text: "5.6 Sol\nHigh"
   },
   {
-    name: "personal accepts Extra High on a closed pill after Max picker proof",
+    name: "personal rejects a stale Extra High closed pill after Max picker proof (yz-7p3.3 finding B)",
     kind: "personal",
     options: { pillFamilyLabel: "5.6 Sol", pillEffortLabel: "Extra High" },
-    status: "selected",
+    status: "unavailable",
+    failure_reason: "effort_composer_pill_unverified",
     closed_pill_family_status: "verified",
-    closed_pill_effort_status: "verified",
+    closed_pill_effort_status: "unverified",
     closed_pill_text: "5.6 Sol\nExtra High"
   },
   {
@@ -2877,7 +3047,7 @@ for (const testCase of [
     status: "unavailable",
     failure_reason: "family_composer_pill_unverified",
     closed_pill_family_status: "unverified",
-    closed_pill_effort_status: "verified",
+    closed_pill_effort_status: "unverified",
     closed_pill_text: "Extra High"
   }
 ]) {
@@ -2918,6 +3088,27 @@ test("GPT-5.6 Sol fails closed when the structural slider maximum has an unknown
   assert.equal(result.effort_control.value_now, 2);
   assert.equal(result.max_effort_label, "Expert");
   assert.deepEqual(fixture.keyAttempts(), ["End", "ArrowLeft", "ArrowLeft"]);
+});
+
+test("GPT-5.6 Sol slider unknown ceiling is not rescued by the final fresh re-check (yz-7p3.4 guard)", async () => {
+  // The final_fresh_recheck guard in moveEffortSliderToMaxTier must only rescue a
+  // VERIFIED maximum tier (Max/Pro, or Extra High when Max is proven absent). An
+  // unknown ceiling label ("Expert") must still fail closed, and the re-check must
+  // NOT report it as verified.
+  const fixture = makeSolSliderFixture({
+    keyboardMode: "end",
+    backgroundFrozen: true,
+    maxLabelOverride: "Expert",
+    initialValue: 3
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable", JSON.stringify(result));
+  assert.equal(result.failure_reason, "effort_slider_move_failed");
+  assert.notEqual(result.effort_move_method, "final_fresh_recheck");
+  assert.equal(result.effort_status, "unverified");
+  assert.equal(result.picker_effort_status, "unverified");
 });
 
 test("GPT-5.6 Sol recognizes volatile effort names, probes max, restores, and fails closed", async () => {
@@ -3511,6 +3702,167 @@ function makeSolSliderFixture({
     panel: () => panel,
     familyClicks: () => familyClickCount,
     familyMenuOpen: () => Boolean(familyMenu)
+  };
+}
+
+// Six-tier ladder fixture built from the 2026-08-25 live dump
+// (/tmp/amq-effort-slider-move-failed-diagnostics.txt). Models the personal/Pro
+// picker whose simple slider is stale at 4/4 "Extra High" (five-tier simple view)
+// while the real six-tier ladder (Light/Medium/High/Extra High/Max/Ultra) lives
+// behind the Advanced -> Effort row submenu. The Advanced view exposes rows
+// Model / Effort / Speed (composer-model-picker-slider-advanced-view).
+//
+// Options:
+//  - effortLadder: the submenu ladder labels (default six-tier with Max+Ultra).
+//  - presetEffort: the checked effort in the submenu (default "Extra High").
+//  - sliderCeiling: the simple-slider ceiling label (default "Extra High").
+//  - maxVerifiable: when false, selecting Max does NOT update the pill/row (unverifiable).
+export function makeSixTierLadderFixture({
+  effortLadder = ["Light", "Medium", "High", "Extra High", "Max", "Ultra"],
+  presetEffort = "Extra High",
+  sliderCeiling = "Extra High",
+  maxVerifiable = true,
+  familyLabel = "GPT-5.6 Sol",
+  pillFamilyLabel = "5.6 Sol"
+} = {}) {
+  let panel = null;
+  let effortMenu = null;
+  let effortRow = null;
+  let effortValueNode = null;
+  let familyValueNode = null;
+  let currentEffort = presetEffort;
+  let effortRowClicks = 0;
+  let maxClicks = 0;
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask anything").append(form);
+  const pillTextForEffort = (label) => `${pillFamilyLabel}\n${label}`;
+  const detachPanel = () => {
+    if (effortMenu) {
+      body.children = body.children.filter((child) => child !== effortMenu);
+      effortMenu.parentElement = null;
+      effortMenu = null;
+    }
+    if (panel) {
+      body.children = body.children.filter((child) => child !== panel);
+      panel.parentElement = null;
+      panel = null;
+    }
+    pill?.setAttribute("aria-expanded", "false");
+    pill?.setAttribute("data-state", "closed");
+  };
+  const closeEffortMenu = () => {
+    if (!effortMenu) return;
+    body.children = body.children.filter((child) => child !== effortMenu);
+    effortMenu.parentElement = null;
+    effortMenu = null;
+    effortRow?.setAttribute("aria-expanded", "false");
+    effortRow?.setAttribute("data-state", "closed");
+  };
+  const openEffortMenu = () => {
+    closeEffortMenu();
+    effortRow?.setAttribute("aria-expanded", "true");
+    effortRow?.setAttribute("data-state", "open");
+    effortMenu = new FakeElement("div", { id: "effort-ladder", role: "menu", "data-state": "open" });
+    for (const label of effortLadder) {
+      const checked = label === currentEffort;
+      effortMenu.append(new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": String(checked),
+        "data-state": checked ? "checked" : "unchecked",
+        onPointerDown: () => {
+          if (label === "Ultra") return; // Ultra is never selected by the recipe
+          if (label === "Max") maxClicks += 1;
+          if (!maxVerifiable && label === "Max") {
+            // Max visible but unverifiable: the click does not land.
+            closeEffortMenu();
+            return;
+          }
+          currentEffort = label;
+          effortValueNode.innerText = label;
+          effortValueNode.textContent = label;
+          effortRow.innerText = `Effort\n${label}`;
+          effortRow.textContent = effortRow.innerText;
+          pill.innerText = pillTextForEffort(label);
+          pill.textContent = pill.innerText;
+          closeEffortMenu();
+        }
+      }, label));
+    }
+    body.append(effortMenu);
+  };
+  const openPanel = () => {
+    detachPanel();
+    panel = new FakeElement("div", { id: "advanced-picker", role: "dialog", "data-state": "open" },
+      "Advanced Faster Smarter Model GPT-5.6 Sol Effort Extra High Speed Standard Consumes usage limits faster");
+    const group = new FakeElement("div", { role: "group", "data-testid": "composer-intelligence-picker-content" });
+    const simple = new FakeElement("div", { "data-testid": "composer-model-picker-slider-simple-view" });
+    const advanced = new FakeElement("div", { "data-testid": "composer-model-picker-slider-advanced-view" });
+    // Stale simple slider: five-tier, ceiling "Extra High", stuck at 4/4.
+    const staleSlider = new FakeElement("span", {
+      role: "slider",
+      "aria-hidden": "true",
+      "aria-label": "Effort",
+      "aria-valuemin": "0",
+      "aria-valuemax": "4",
+      "aria-valuenow": "4",
+      onKeyDown: () => {}
+    });
+    const staleLabel = new FakeElement("span", {}, `${sliderCeiling}, 5 of 5.`);
+    simple.append(staleSlider, staleLabel);
+    // Advanced view rows: Model / Effort / Speed (verbatim from the dump).
+    const familyRow = new FakeElement("div", { role: "menuitem", tabindex: "0", "aria-haspopup": "menu", "aria-expanded": "false", "aria-controls": "family-picker", "data-state": "closed" }, `Model\n${familyLabel}`)
+      .append(new FakeElement("div", {}, "Model"), (familyValueNode = new FakeElement("div", {}, familyLabel)));
+    effortRow = new FakeElement("div", {
+      role: "menuitem",
+      tabindex: "0",
+      "aria-haspopup": "menu",
+      "aria-expanded": "false",
+      "aria-controls": "effort-ladder",
+      "data-state": "closed",
+      onPointerDown: () => {
+        effortRowClicks += 1;
+        openEffortMenu();
+      },
+      onKeyDown: (event) => {
+        if (event.key === "Enter" || event.key === " ") {
+          effortRowClicks += 1;
+          openEffortMenu();
+        }
+        if (event.key === "Escape") closeEffortMenu();
+      }
+    }, `Effort\n${currentEffort}`)
+      .append(new FakeElement("div", {}, "Effort"), (effortValueNode = new FakeElement("div", {}, currentEffort)));
+    const speedRow = new FakeElement("div", { role: "menuitem" }, "Speed Standard")
+      .append(new FakeElement("span", {}, "Speed"), new FakeElement("span", {}, "Standard"));
+    advanced.append(familyRow, effortRow, speedRow);
+    group.append(simple, advanced);
+    panel.append(group);
+    body.append(panel);
+    pill.setAttribute("aria-expanded", "true");
+    pill.setAttribute("data-state", "open");
+  };
+  const pill = new FakeElement("button", {
+    class: "__composer-pill __composer-pill--neutral",
+    "aria-haspopup": "menu",
+    "aria-controls": "advanced-picker",
+    "aria-expanded": "false",
+    "data-state": "closed",
+    onPointerDown: openPanel,
+    onKeyDown: (event) => {
+      if (event.key === "Escape") detachPanel();
+    }
+  }, pillTextForEffort(currentEffort));
+  form.append(pill);
+  const doc = new FakeDocument(body);
+  return {
+    doc,
+    pill,
+    effortRowClicks: () => effortRowClicks,
+    maxClicks: () => maxClicks,
+    effortMenuOpen: () => Boolean(effortMenu),
+    pickerOpen: () => Boolean(panel),
+    currentEffort: () => currentEffort
   };
 }
 
