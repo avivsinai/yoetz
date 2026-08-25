@@ -338,7 +338,7 @@ fn is_verified_sol_extra_high_selection(
             .join(" ")
             .to_ascii_lowercase()
             .as_str(),
-        "gpt-5.6 sol pro" | "gpt-5.6 sol extra high" | "gpt-5.6 sol max"
+        "gpt-5.6 sol pro" | "gpt-5.6 sol extra high" | "gpt-5.6 sol max" | "gpt-5.6 sol ultra"
     )
 }
 
@@ -578,16 +578,35 @@ async () => {{
   }}
 
   function effortVerified(state) {{
-    return state?.effortItems?.some((item) => ["pro", "extra high", "max"].includes(fold(textOf(item))) && isChecked(item)) || false;
+    // Ladder-aware verification (yz-7p3.3 finding D): mirrors the native extension's
+    // effortMaxTierDecision. Max is the target; Extra High is accepted only when
+    // Max is absent from the visible effortItems; Ultra is accepted as at-or-above-Max
+    // proof and is NEVER clicked (a preset Ultra must not be downgraded).
+    const items = state?.effortItems || [];
+    const labels = items.map((item) => fold(textOf(item)));
+    const maxPresent = labels.includes("max");
+    const checked = items.find((item) => isChecked(item));
+    const checkedLabel = checked ? fold(textOf(checked)) : null;
+    if (checkedLabel === "max" || checkedLabel === "pro") return true;
+    if (checkedLabel === "ultra") return true;
+    if (checkedLabel === "extra high" && !maxPresent) return true;
+    return false;
   }}
 
   function result(status, pill, state, families, warning = null) {{
     const familyIsVerified = familyVerified(state);
     const effortIsVerified = effortVerified(state);
-    const verifiedEffort = state?.effortItems?.find((item) => ["pro", "extra high", "max"].includes(fold(textOf(item))) && isChecked(item));
+    const items = state?.effortItems || [];
+    const checked = items.find((item) => isChecked(item));
+    const checkedLabel = checked ? fold(textOf(checked)) : null;
+    const ultraPreset = checkedLabel === "ultra";
+    const verifiedEffort = checked && ["pro", "extra high", "max", "ultra"].includes(checkedLabel) ? checked : null;
     const modelUsed = status === "current"
       ? (pill ? textOf(pill) : "")
       : (familyIsVerified && effortIsVerified ? `GPT-5.6 Sol ${{textOf(verifiedEffort)}}` : null);
+    const ultraWarning = ultraPreset && effortIsVerified
+      ? "Ultra is the operator's preset effort; accepted as at-or-above-Max proof without escalating or downgrading (Ultra is never selected by the recipe)"
+      : null;
     return {{
       requested,
       status,
@@ -598,7 +617,8 @@ async () => {{
       familyLabel: state?.familyLabel || null,
       availableItems: (state?.effortItems || []).map(textOf).filter(Boolean),
       availableFamilies: families || [],
-      warning,
+      warning: warning || ultraWarning,
+      ultraPreset,
       url: window.location.href || "",
       title: document.title || ""
     }};
@@ -1168,6 +1188,7 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL;
     use base64::Engine;
     use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
     use serde_json::Value;
@@ -1368,7 +1389,11 @@ mod tests {
         assert!(script.contains(r#"familyStatus: familyIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"effortStatus: effortIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"fold(textOf(item)) === "gpt-5.6 sol""#));
-        assert!(script.contains(r#"["pro", "extra high", "max"].includes(fold(textOf(item)))"#));
+        // Ladder-aware effortVerified (yz-7p3.3 finding D): the verified set now
+        // includes Ultra (never clicked) and gates Extra High on Max-absent.
+        assert!(script.contains("checkedLabel === \"max\" || checkedLabel === \"pro\""));
+        assert!(script.contains("checkedLabel === \"ultra\""));
+        assert!(script.contains("checkedLabel === \"extra high\" && !maxPresent"));
         // The Max tier is the first maxTier fallback, ahead of Extra High and Pro,
         // matching the native extension's CHATGPT_MAX_EFFORT_LABELS ordering.
         assert!(script.contains(r#"fold(textOf(item)) === "max""#));
@@ -1395,6 +1420,62 @@ mod tests {
         assert!(!script.contains("if (families.length === 0 && state.familyTrigger)"));
         assert!(script.contains("await closeMenus"));
         assert!(!script.contains("model-switcher-gpt-5-4"));
+    }
+
+    #[test]
+    fn cdp_effort_verified_is_ladder_aware_preset_ultra_never_downgraded() {
+        // yz-7p3.3 finding D: a preset Ultra must verify WITHOUT being clicked.
+        // The emitted effortVerified recognizes a checked "ultra", so the
+        // `if (!effortVerified(state))` click block is skipped entirely and the
+        // Ultra preset is accepted with a diagnostic warning. The maxTier fallback
+        // click path must never run for Ultra.
+        let script = build_model_selection_function(
+            CHATGPT_SOL_ACCOUNT_MAX_MODEL,
+            ChatgptModelStrategy::Select,
+        );
+        // effortVerified accepts a checked Ultra.
+        assert!(script.contains("checkedLabel === \"ultra\""));
+        // The Ultra preset surfaces a diagnostic warning, never a click.
+        assert!(script
+            .contains("Ultra is the operator's preset effort; accepted as at-or-above-Max proof"));
+        // The maxTier fallback explicitly does NOT include ultra as a click target.
+        assert!(script.contains("fold(textOf(item)) === \"max\""));
+        assert!(!script.contains("fold(textOf(item)) === \"ultra\""));
+        // is_verified_sol_extra_high_selection trusts an Ultra modelUsed.
+        let ultra = serde_json::json!({
+            "status": "selected",
+            "requested": CHATGPT_SOL_ACCOUNT_MAX_MODEL,
+            "familyStatus": "verified",
+            "effortStatus": "verified",
+            "modelUsed": "GPT-5.6 Sol Ultra"
+        });
+        assert!(is_verified_sol_extra_high_selection(
+            &ultra,
+            CHATGPT_SOL_ACCOUNT_MAX_MODEL
+        ));
+    }
+
+    #[test]
+    fn cdp_effort_verified_gates_extra_high_on_max_present() {
+        // yz-7p3.3 finding D: a checked Extra High is verified ONLY when Max is
+        // absent from the visible effortItems. With Max present, effortVerified is
+        // false and the maxTier fallback clicks Max (not Extra High).
+        let script = build_model_selection_function(
+            CHATGPT_SOL_ACCOUNT_MAX_MODEL,
+            ChatgptModelStrategy::Select,
+        );
+        assert!(script.contains("checkedLabel === \"extra high\" && !maxPresent"));
+        // Max remains the first fallback tier (ahead of Extra High and Pro).
+        let max_fallback = script
+            .find("const maxTier = state.effortItems.find")
+            .unwrap_or(0);
+        let max_slice = &script[max_fallback..max_fallback + 220];
+        let max_pos = max_slice.find("\"max\"").unwrap();
+        let extra_pos = max_slice.find("\"extra high\"").unwrap();
+        assert!(
+            max_pos < extra_pos,
+            "Max must precede Extra High in the fallback ladder"
+        );
     }
 
     #[test]

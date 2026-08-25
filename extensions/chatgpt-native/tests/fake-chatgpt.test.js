@@ -2667,6 +2667,51 @@ test("GPT-5.6 Sol six-tier ladder: a preset Ultra effort is accepted as at-or-ab
   assert.equal(result.pill_text, "5.6 Sol\nUltra");
 });
 
+test("GPT-5.6 Sol six-tier ladder: five-tier Effort submenu with Max genuinely absent accepts Extra High (yz-7p3.3 finding A)", async () => {
+  // A legacy five-tier Effort submenu (Max genuinely absent) that is visible but
+  // unlinked (no aria-controls) must still be RECOGNIZED by findEffortSubmenu so
+  // the maxAbsent branch can accept Extra High. findEffortSubmenu must not require
+  // "max" to be present (recognition is >=2 known ladder labels; maxAbsent is
+  // decided AFTER, from the labels).
+  const fixture = makeSixTierLadderFixture({
+    effortLadder: ["Light", "Medium", "High", "Extra High"],
+    presetEffort: "Extra High",
+    sliderCeiling: "Extra High"
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.picker_effort_status, "verified");
+  assert.equal(result.ladder_max_absent, true, "Max must be proven absent from the opened ladder");
+  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+  assert.equal(fixture.maxClicks(), 0, "Max is absent; nothing to click");
+});
+
+test("GPT-5.6 Sol six-tier ladder: openEffortSubmenu returns a resolved menu, not an unawaited Promise (yz-7p3.5 regression guard)", async () => {
+  // Regression guard for the wave-2 worker bug: waitForEffortSubmenu is async and
+  // returns a Promise; an unawaited call used as a truthy menu would make
+  // effortSubmenuLadderLabels(Promise) return [] and silently mis-classify the
+  // ladder. This test asserts the submenu menu node is a real DOM-like object with
+  // querySelectorAll (i.e. await was honored) by driving the fall-through and
+  // checking the ladder labels were actually read (Max present, selected).
+  const fixture = makeSixTierLadderFixture({
+    presetEffort: "Extra High",
+    sliderCeiling: "Extra High"
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  // If the submenu Promise were used unawaited, labels would be [] and the
+  // stale Extra High ceiling would be accepted with ladder_max_absent:true
+  // instead of selecting Max. Asserting Max was selected proves the menu was
+  // resolved before reading labels.
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.ladder_max_absent, false, "Max IS present; an unawaited submenu Promise would wrongly report it absent");
+  assert.equal(fixture.maxClicks(), 1, "Max was selected from the resolved submenu");
+});
+
 test("GPT-5.6 Sol personal picker fails closed when the closed pill is effort-only", async () => {
   const fixture = makePersonalPickerFixture({ pillFamilyLabel: "" });
 
@@ -2977,12 +3022,13 @@ for (const testCase of [
     closed_pill_text: "5.6 Sol\nHigh"
   },
   {
-    name: "personal accepts Extra High on a closed pill after Max picker proof",
+    name: "personal rejects a stale Extra High closed pill after Max picker proof (yz-7p3.3 finding B)",
     kind: "personal",
     options: { pillFamilyLabel: "5.6 Sol", pillEffortLabel: "Extra High" },
-    status: "selected",
+    status: "unavailable",
+    failure_reason: "effort_composer_pill_unverified",
     closed_pill_family_status: "verified",
-    closed_pill_effort_status: "verified",
+    closed_pill_effort_status: "unverified",
     closed_pill_text: "5.6 Sol\nExtra High"
   },
   {
@@ -3001,7 +3047,7 @@ for (const testCase of [
     status: "unavailable",
     failure_reason: "family_composer_pill_unverified",
     closed_pill_family_status: "unverified",
-    closed_pill_effort_status: "verified",
+    closed_pill_effort_status: "unverified",
     closed_pill_text: "Extra High"
   }
 ]) {

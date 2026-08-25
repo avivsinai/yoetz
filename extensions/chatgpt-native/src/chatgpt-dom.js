@@ -704,7 +704,7 @@ async function selectSolMaxTierModel(root, options = {}) {
   if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsFamilyLabel(pillText, state.family_label)) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm GPT-5.6 Sol after closing the slider picker", "family_composer_pill_unverified", { closedPill: true });
   }
-  if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel)) {
+  if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel, { ladderMaxAbsent: state.ladder_max_absent === true, ultraPreset: state.ultra_preset === true })) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm the verified maximum tier after closing the slider picker", "effort_composer_pill_unverified", { closedPill: true });
   }
   const closedPill = closedPillDiagnostics(pillText, state);
@@ -1328,12 +1328,14 @@ function effortMaxTierDecision(state) {
       return { ok: true, reason: "extra_high_no_effort_row", ultra_preset: false };
     }
     // Stale "extra high" slider ceiling WITH an Effort row: the simple slider is
-    // not authoritative. Do NOT trust the Effort row's static label for an Ultra
-    // preset here — that label can be stale too. Return false so
+    // not authoritative. The Effort row's static label is a corroboration signal
+    // only — a preset Max/Pro row label is accepted here because the closed
+    // composer pill corroborates it downstream (finding B tightens that corroboration:
+    // an Extra High pill cannot confirm a Max). For Ultra, do NOT trust the row's
+    // static label here — that label can be stale too. Return false so
     // moveEffortSliderToMaxTier drives the Effort submenu (selectMaxFromEffortSubmenu),
     // which opens the ladder and verifies a checked Ultra preset against the real
-    // ladder before accepting it with a diagnostic. Max/Pro row labels are trusted
-    // only after the submenu fall-through has selected them.
+    // ladder before accepting it with a diagnostic.
     if (label === "extra high") {
       const rowLabel = sliderEffortRowLabel(state);
       if (rowLabel === "max" || rowLabel === "pro") {
@@ -1364,15 +1366,30 @@ function effortMaxTierDecision(state) {
   return { ok: false, reason: "not_max_tier", ultra_preset: false };
 }
 
-function pillConfirmsEffortLabel(pillText, effortLabel) {
+function pillConfirmsEffortLabel(pillText, effortLabel, options = {}) {
   const foldedPill = foldedModelText(pillText).replace(/\s+/g, " ");
   const foldedEffort = foldedModelText(effortLabel).replace(/\s+/g, " ");
   if (!foldedEffort) return false;
   if (foldedPill === foldedEffort || foldedPill.endsWith(` ${foldedEffort}`)) return true;
-  if (CHATGPT_MAX_EFFORT_LABELS.has(foldedEffort)) {
-    return [...CHATGPT_MAX_EFFORT_LABELS].some((label) => foldedPill === label || foldedPill.endsWith(` ${label}`));
+  // Closed-pill corroboration is directional (yz-7p3.3 finding B): the pill tier
+  // must be at or above the verified picker tier. A pill reading "Extra High"
+  // must NOT confirm a selected "Max" when the ladder had Max (the stale-pill
+  // scenario this epic is about). Going UP is fine (picker Extra High as the
+  // genuine ceiling, pill Max/Pro). Ladder order: light<medium<high<extra high<
+  // max<ultra; Pro is the Enterprise ceiling, ranked with Max.
+  const rank = { light: 0, medium: 1, high: 2, "extra high": 3, max: 4, pro: 4, ultra: 5 };
+  const expectedRank = rank[foldedEffort];
+  if (expectedRank === undefined) {
+    if (CHATGPT_MAX_EFFORT_LABELS.has(foldedEffort)) {
+      return [...CHATGPT_MAX_EFFORT_LABELS].some((label) => foldedPill === label || foldedPill.endsWith(` ${label}`));
+    }
+    return false;
   }
-  return false;
+  // Extract the pill's effort token (last line of the folded pill text).
+  const pillToken = foldedPill.split(" ").pop() || "";
+  const pillRank = rank[pillToken];
+  if (pillRank === undefined) return false;
+  return pillRank >= expectedRank;
 }
 
 function pillConfirmsFamilyLabel(pillText, familyLabel) {
@@ -1437,7 +1454,7 @@ function closedPillDiagnostics(pillText, state) {
       ? verificationStatus(pillConfirmsFamilyLabel(text, familyLabel))
       : "skipped",
     closed_pill_effort_status: text && effortLabel
-      ? verificationStatus(pillConfirmsEffortLabel(text, effortLabel))
+      ? verificationStatus(pillConfirmsEffortLabel(text, effortLabel, { ladderMaxAbsent: state.ladder_max_absent === true, ultraPreset: state.ultra_preset === true }))
       : "skipped"
   };
 }
@@ -1557,10 +1574,13 @@ function findEffortSubmenu(root, mainSurface) {
     .find((menu) => {
       const labels = Array.from(menu.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
         .map((node) => foldedModelText(textOf(node)));
-      // The six-tier ladder always contains Max (and recognizes Ultra). A submenu
-      // listing at least two of the high tiers is the Effort ladder.
+      // Recognize the Effort ladder by at least two known ladder labels. Do NOT
+      // require "max" to be present (yz-7p3.3 finding A): a legacy five-tier
+      // submenu where Max is genuinely absent must still be recognized so the
+      // maxAbsent branch can accept Extra High. Whether Max is absent is decided
+      // AFTER, from the labels, by selectMaxFromEffortSubmenu.
       const known = labels.filter((label) => CHATGPT_EFFORT_LADDER.includes(label));
-      return known.length >= 2 && labels.includes("max");
+      return known.length >= 2;
     }) ?? null;
 }
 
@@ -1621,7 +1641,12 @@ async function selectMaxFromEffortSubmenu(root, initialState, options = {}) {
     state.ladder_max_absent = true;
     state.effort_submenu_labels = labels;
     await closeEffortSubmenu(root, state, effortRow, options);
+    // closeEffortSubmenu's Escape + settle may cause findPickerState to return a
+    // fresh state object; re-stamp the ladder-aware proof flags so effortIsMaxTier
+    // still sees the proven Max-absent Extra High ceiling.
     state = findPickerState(root) ?? state;
+    state.ladder_max_absent = true;
+    state.effort_submenu_labels = labels;
     const ok = effortIsMaxTier(state);
     return { ok, state, method: ok ? "extra_high_max_absent" : null, diagnostic: ok ? "extra_high_max_absent" : "extra_high_not_at_ceiling" };
   }

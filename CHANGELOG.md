@@ -37,7 +37,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   report the slug as `model_used`.
 - CDP/dev-browser picker now accepts the Sol **Max** effort tier (parity with the
   native extension), closing the asymmetry where the CDP fallback would fail closed
-  on a personal Max picker that the native path accepted.
+  on a personal Max picker that the native path accepted. The CDP `effortVerified`
+  is now ladder-aware (same Max-target / Extra-High-only-when-Max-absent / Ultra-
+  never-clicked policy as the native extension), so a preset Ultra is no longer
+  downgraded to Max on the CDP transport.
+- The closed composer pill no longer corroborates a tier *below* the verified
+  picker tier: a stale "Extra High" pill cannot confirm a selected "Max" when the
+  ladder had Max. Corroboration is directional (pill tier ≥ verified tier).
+- The Effort submenu is recognized by >=2 known ladder labels, not by requiring
+  "max" to be present; a legacy five-tier submenu (Max genuinely absent) is now
+  reachable so Extra High is accepted with `ladder_max_absent` instead of failing
+  closed.
 
 ## [0.5.57] - 2026-08-20
 ### Fixed
