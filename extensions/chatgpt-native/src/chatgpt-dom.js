@@ -704,7 +704,7 @@ async function selectSolMaxTierModel(root, options = {}) {
   if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsFamilyLabel(pillText, state.family_label)) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm GPT-5.6 Sol after closing the slider picker", "family_composer_pill_unverified", { closedPill: true });
   }
-  if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel, { ladderMaxAbsent: state.ladder_max_absent === true, ultraPreset: state.ultra_preset === true })) {
+  if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel)) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm the verified maximum tier after closing the slider picker", "effort_composer_pill_unverified", { closedPill: true });
   }
   const closedPill = closedPillDiagnostics(pillText, state);
@@ -1366,7 +1366,7 @@ function effortMaxTierDecision(state) {
   return { ok: false, reason: "not_max_tier", ultra_preset: false };
 }
 
-function pillConfirmsEffortLabel(pillText, effortLabel, options = {}) {
+function pillConfirmsEffortLabel(pillText, effortLabel) {
   const foldedPill = foldedModelText(pillText).replace(/\s+/g, " ");
   const foldedEffort = foldedModelText(effortLabel).replace(/\s+/g, " ");
   if (!foldedEffort) return false;
@@ -1385,9 +1385,12 @@ function pillConfirmsEffortLabel(pillText, effortLabel, options = {}) {
     }
     return false;
   }
-  // Extract the pill's effort token (last line of the folded pill text).
-  const pillToken = foldedPill.split(" ").pop() || "";
-  const pillRank = rank[pillToken];
+  // Extract the pill's effort tier by matching a known ladder label as a suffix.
+  // Do NOT use the last whitespace word — "extra high" would split into "high"
+  // (rank 2, not 3), a latent mis-rank trap for any two-word tier.
+  const orderedLabels = ["ultra", "extra high", "medium", "light", "high", "max", "pro"];
+  const pillToken = orderedLabels.find((label) => foldedPill === label || foldedPill.endsWith(` ${label}`));
+  const pillRank = pillToken ? rank[pillToken] : undefined;
   if (pillRank === undefined) return false;
   return pillRank >= expectedRank;
 }
@@ -1454,7 +1457,7 @@ function closedPillDiagnostics(pillText, state) {
       ? verificationStatus(pillConfirmsFamilyLabel(text, familyLabel))
       : "skipped",
     closed_pill_effort_status: text && effortLabel
-      ? verificationStatus(pillConfirmsEffortLabel(text, effortLabel, { ladderMaxAbsent: state.ladder_max_absent === true, ultraPreset: state.ultra_preset === true }))
+      ? verificationStatus(pillConfirmsEffortLabel(text, effortLabel))
       : "skipped"
   };
 }
