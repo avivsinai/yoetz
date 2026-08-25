@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.58] - 2026-08-25
 ### Changed
 
 - ChatGPT recipe now targets the literal **Max** effort tier on the personal/Pro
@@ -48,6 +50,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   "max" to be present; a legacy five-tier submenu (Max genuinely absent) is now
   reachable so Extra High is accepted with `ladder_max_absent` instead of failing
   closed.
+
 
 ## [0.5.57] - 2026-08-20
 ### Fixed
