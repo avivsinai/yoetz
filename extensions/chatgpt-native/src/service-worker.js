@@ -560,7 +560,6 @@ function modelSelectionFailureDiagnostics(selection) {
     "effort_control",
     "effort_move_method",
     "picker_close_method",
-    "picker_close_methods",
     "picker_close_verification",
     "family_status",
     "effort_status",

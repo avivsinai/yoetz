@@ -716,7 +716,7 @@ async () => {{
     return verification;
   }}
 
-  let pickerCloseMethods = [];
+  let pickerCloseMethod = null;
   let pickerCloseVerification = null;
   async function closeMenus(pill, state = null, options = {{}}) {{
     const methods = [];
@@ -746,7 +746,7 @@ async () => {{
       if (neutral) await tryMethod("neutral_click", () => realClick(neutral));
     }}
 
-    pickerCloseMethods = methods;
+    pickerCloseMethod = methods.length > 0 ? methods.join("+") : null;
     pickerCloseVerification = verification;
     return verification.ok;
   }}
@@ -847,8 +847,7 @@ async () => {{
       familyStatus: familyIsVerified ? "verified" : "unverified",
       effortStatus: effortIsVerified ? "verified" : "unverified",
       ...closedPill,
-      pickerCloseMethod: pickerCloseMethods.length > 0 ? pickerCloseMethods.join("+") : null,
-      pickerCloseMethods,
+      pickerCloseMethod,
       pickerCloseVerification,
       pillText: textOf(pill),
       familyLabel: state?.familyLabel || null,

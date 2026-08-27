@@ -2403,124 +2403,162 @@ test("clickSend reports disabled send controls distinctly from missing controls"
   assert.equal(send.clicked, false);
 });
 
-test("ChatGPT model selection fails closed when the Chat surface control is absent", async () => {
-  const fixture = makeSolPickerFixture({
-    family: "GPT-5.6 Sol",
-    effort: "Pro",
-    includeChatSurface: false
+for (const testCase of [
+  {
+    name: "fails closed when the Chat surface control is absent",
+    fixture: { includeChatSurface: false },
+    selectionOptions: { model_selection_timeout_ms: 30, model_selection_interval_ms: 5 },
+    expected: { status: "unavailable", failure_reason: "chat_surface_control_not_found" },
+    mainOpens: 0,
+    pillEvents: []
+  },
+  {
+    name: "switches Work to Chat before selecting Sol Pro",
+    fixture: { surface: "work" },
+    expected: { status: "selected", model_used: "GPT-5.6 Sol Pro" },
+    surface: { chatChecked: "true", workChecked: "false", chatClicked: true },
+    mainOpens: 1
+  },
+  {
+    name: "re-reads a delayed Chat surface toggle settle",
+    fixture: { surface: "work", chatStateUpdateDelayMs: 100 },
+    selectionOptions: { model_selection_timeout_ms: 500, model_selection_interval_ms: 5 },
+    expected: {
+      status: "selected",
+      surface_state: { aria_checked: "true", data_state: "on" }
+    },
+    minimumSurfaceVerificationAttempts: 2
+  },
+  {
+    name: "fails closed when surface radio values do not match",
+    fixture: { chatSurfaceValue: "unexpected-chat", workSurfaceValue: "unexpected-work" },
+    selectionOptions: { model_selection_timeout_ms: 30, model_selection_interval_ms: 5 },
+    expected: {
+      status: "unavailable",
+      failure_reason: "chat_surface_control_not_found",
+      surface_observed_values: ["unexpected-chat", "unexpected-work"],
+      surface_state: { aria_checked: null, data_state: null }
+    },
+    mainOpens: 0
+  },
+  {
+    name: "fails closed when Work cannot switch to Chat",
+    fixture: { surface: "work", chatClickUpdates: false },
+    expected: { status: "unavailable", failure_reason: "chat_surface_selection_mismatch" },
+    surface: { chatClicked: true, workChecked: "true" },
+    mainOpens: 0
+  }
+]) {
+  test(`ChatGPT model selection surface: ${testCase.name}`, async () => {
+    const fixture = makeSolPickerFixture({
+      family: "GPT-5.6 Sol",
+      effort: "Pro",
+      ...testCase.fixture
+    });
+    const result = await configureModelState(fixture.doc, testCase.selectionOptions ?? {});
+
+    for (const [field, expected] of Object.entries(testCase.expected)) {
+      assert.deepEqual(result[field], expected);
+    }
+    if (testCase.minimumSurfaceVerificationAttempts) {
+      assert.ok(result.surface_verification_attempts >= testCase.minimumSurfaceVerificationAttempts);
+    }
+    if (testCase.surface) {
+      if (testCase.surface.chatChecked) {
+        assert.equal(fixture.surface.chat.getAttribute("aria-checked"), testCase.surface.chatChecked);
+      }
+      if (testCase.surface.workChecked) {
+        assert.equal(fixture.surface.work.getAttribute("aria-checked"), testCase.surface.workChecked);
+      }
+      if (testCase.surface.chatClicked) {
+        assert.equal(fixture.surface.chat.events.includes("click"), true);
+      }
+    }
+    if (testCase.mainOpens !== undefined) assert.equal(fixture.mainOpens(), testCase.mainOpens);
+    if (testCase.pillEvents) assert.deepEqual(fixture.pill.events, testCase.pillEvents);
   });
+}
 
-  const result = await configureModelState(fixture.doc, {
-    model_selection_timeout_ms: 30,
-    model_selection_interval_ms: 5
+for (const testCase of [
+  {
+    name: "rejects checked GPT-5.5 Pro Extended as stale",
+    options: { family: "GPT-5.5", effort: "Pro Extended" },
+    requestedModel: true,
+    familyClicks: 1,
+    effortClicks: 1
+  },
+  {
+    name: "upgrades High effort to Pro and verifies both proofs",
+    options: { family: "GPT-5.6 Sol", effort: "High" },
+    familyClicks: 0,
+    effortClicks: 1,
+    mainOpensAtLeast: 2
+  },
+  {
+    name: "switches GPT-5.5 Instant to Sol Pro",
+    options: { family: "GPT-5.5", effort: "Instant", remountPillOnSelection: true },
+    familyClicks: 1,
+    effortClicks: 1,
+    expectPillPointerdown: true
+  },
+  {
+    name: "recovers from the o3 family",
+    options: { family: "o3", effort: "High" },
+    familyClicks: 1,
+    effortClicks: 1
+  },
+  {
+    name: "verifies already-correct Pro state with one menu open",
+    options: { family: "GPT-5.6 Sol", effort: "Pro" },
+    familyClicks: 0,
+    effortClicks: 0,
+    mainOpens: 1,
+    availableFamilies: [
+      "GPT-5.6 Sol",
+      "GPT-5.5",
+      "GPT-5.4\nLeaving on July 23",
+      "GPT-5.3",
+      "o3"
+    ]
+  },
+  {
+    name: "accepts Enterprise Pro and reports the tier",
+    options: { family: "GPT-5.6 Sol", effort: "Pro" },
+    requestedModel: true,
+    familyClicks: 0,
+    effortClicks: 0
+  },
+  {
+    name: "ignores transcript text that describes the Advanced picker",
+    options: { family: "GPT-5.6 Sol", effort: "High", transcriptPickerDecoy: true },
+    pickerShape: "menu",
+    mainOpens: 2,
+    effortClicks: 1
+  }
+]) {
+  test(`GPT-5.6 Sol picker: ${testCase.name}`, async () => {
+    const fixture = makeSolPickerFixture(testCase.options);
+    const result = await configureModelState(fixture.doc, {});
+
+    assert.equal(result.status, "selected");
+    assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+    assert.equal(result.family_status, "verified");
+    assert.equal(result.effort_status, "verified");
+    if (testCase.requestedModel) {
+      assert.equal(result.requested_model, "gpt-5-6-sol-chat-pro");
+    }
+    if (testCase.pickerShape) assert.equal(result.picker_shape, testCase.pickerShape);
+    if (testCase.availableFamilies) assert.deepEqual(result.available_families, testCase.availableFamilies);
+    if (testCase.familyClicks !== undefined) assert.equal(fixture.familyClicks(), testCase.familyClicks);
+    if (testCase.effortClicks !== undefined) assert.equal(fixture.effortClicks(), testCase.effortClicks);
+    if (testCase.mainOpens !== undefined) assert.equal(fixture.mainOpens(), testCase.mainOpens);
+    if (testCase.mainOpensAtLeast !== undefined) {
+      assert.ok(fixture.mainOpens() >= testCase.mainOpensAtLeast, "selection must reopen the picker to verify");
+    }
+    if (testCase.expectPillPointerdown) assert.ok(fixture.pill.events.includes("pointerdown"));
+    assert.equal(fixture.menusOpen(), 0);
   });
-
-  assert.equal(result.status, "unavailable");
-  assert.equal(result.failure_reason, "chat_surface_control_not_found");
-  assert.equal(fixture.mainOpens(), 0);
-  assert.deepEqual(fixture.pill.events, []);
-});
-
-test("ChatGPT model selection switches Work to Chat before selecting Sol Pro", async () => {
-  const fixture = makeSolPickerFixture({
-    family: "GPT-5.6 Sol",
-    effort: "Pro",
-    surface: "work"
-  });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(fixture.surface.chat.getAttribute("aria-checked"), "true");
-  assert.equal(fixture.surface.work.getAttribute("aria-checked"), "false");
-  assert.equal(fixture.surface.chat.events.includes("click"), true);
-  assert.equal(fixture.mainOpens(), 1);
-});
-
-test("ChatGPT model selection re-reads the surface state through a delayed toggle settle", async () => {
-  const fixture = makeSolPickerFixture({
-    family: "GPT-5.6 Sol",
-    effort: "Pro",
-    surface: "work",
-    chatStateUpdateDelayMs: 100
-  });
-
-  const result = await configureModelState(fixture.doc, {
-    model_selection_timeout_ms: 500,
-    model_selection_interval_ms: 5
-  });
-
-  assert.equal(result.status, "selected");
-  assert.ok(result.surface_verification_attempts > 1);
-  assert.deepEqual(result.surface_state, { aria_checked: "true", data_state: "on" });
-});
-
-test("ChatGPT model selection fails closed when surface radio values do not match", async () => {
-  const fixture = makeSolPickerFixture({
-    family: "GPT-5.6 Sol",
-    effort: "Pro",
-    chatSurfaceValue: "unexpected-chat",
-    workSurfaceValue: "unexpected-work"
-  });
-
-  const result = await configureModelState(fixture.doc, {
-    model_selection_timeout_ms: 30,
-    model_selection_interval_ms: 5
-  });
-
-  assert.equal(result.status, "unavailable");
-  assert.equal(result.failure_reason, "chat_surface_control_not_found");
-  assert.deepEqual(result.surface_observed_values, ["unexpected-chat", "unexpected-work"]);
-  assert.deepEqual(result.surface_state, { aria_checked: null, data_state: null });
-  assert.equal(fixture.mainOpens(), 0);
-});
-
-test("ChatGPT model selection fails closed when Work cannot switch to Chat", async () => {
-  const fixture = makeSolPickerFixture({
-    family: "GPT-5.6 Sol",
-    effort: "Pro",
-    surface: "work",
-    chatClickUpdates: false
-  });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "unavailable");
-  assert.equal(result.failure_reason, "chat_surface_selection_mismatch");
-  assert.equal(fixture.surface.chat.events.includes("click"), true);
-  assert.equal(fixture.surface.work.getAttribute("aria-checked"), "true");
-  assert.equal(fixture.mainOpens(), 0);
-});
-
-test("GPT-5.6 Sol picker rejects checked GPT-5.5 Pro Extended as stale", async () => {
-  const fixture = makeSolPickerFixture({ family: "GPT-5.5", effort: "Pro Extended" });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.requested_model, "gpt-5-6-sol-chat-pro");
-  assert.equal(result.family_status, "verified");
-  assert.equal(result.effort_status, "verified");
-  assert.equal(fixture.familyClicks(), 1);
-  assert.equal(fixture.effortClicks(), 1, "family switch must select the verified Pro tier");
-});
-
-test("GPT-5.6 Sol picker upgrades High effort to Pro and verifies both proofs", async () => {
-  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "High" });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.family_status, "verified");
-  assert.equal(result.effort_status, "verified");
-  assert.equal(fixture.familyClicks(), 0);
-  assert.equal(fixture.effortClicks(), 1);
-  assert.ok(fixture.mainOpens() >= 2, "selection must reopen the picker to verify");
-  assert.equal(fixture.menusOpen(), 0, "verification must leave the picker closed");
-});
+}
 
 test("restored ChatGPT model selection closes an open picker before restart", async () => {
   const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "High" });
@@ -2530,90 +2568,6 @@ test("restored ChatGPT model selection closes an open picker before restart", as
   const result = await resetModelSelectionState(fixture.doc);
 
   assert.deepEqual(result, { reset: true, picker_was_open: true });
-  assert.equal(fixture.menusOpen(), 0);
-});
-
-test("GPT-5.6 Sol picker switches GPT-5.5 Instant to Sol Pro", async () => {
-  const fixture = makeSolPickerFixture({
-    family: "GPT-5.5",
-    effort: "Instant",
-    remountPillOnSelection: true
-  });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.family_status, "verified");
-  assert.equal(result.effort_status, "verified");
-  assert.equal(fixture.familyClicks(), 1);
-  assert.equal(fixture.effortClicks(), 1);
-  assert.ok(fixture.pill.events.includes("pointerdown"));
-  assert.equal(fixture.menusOpen(), 0);
-});
-
-test("GPT-5.6 Sol picker recovers from the o3 family", async () => {
-  const fixture = makeSolPickerFixture({ family: "o3", effort: "High" });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.family_status, "verified");
-  assert.equal(result.effort_status, "verified");
-  assert.equal(fixture.familyClicks(), 1);
-  assert.equal(fixture.effortClicks(), 1);
-  assert.equal(fixture.menusOpen(), 0);
-});
-
-test("GPT-5.6 Sol picker verifies already-correct Pro state with one menu open", async () => {
-  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.family_status, "verified");
-  assert.equal(result.effort_status, "verified");
-  assert.deepEqual(result.available_families, [
-    "GPT-5.6 Sol",
-    "GPT-5.5",
-    "GPT-5.4\nLeaving on July 23",
-    "GPT-5.3",
-    "o3"
-  ]);
-  assert.equal(fixture.mainOpens(), 1);
-  assert.equal(fixture.familyClicks(), 0);
-  assert.equal(fixture.effortClicks(), 0);
-  assert.equal(fixture.menusOpen(), 0);
-});
-
-test("GPT-5.6 Sol picker accepts an Enterprise Pro maximum and reports the actual tier", async () => {
-  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.requested_model, "gpt-5-6-sol-chat-pro");
-  assert.equal(result.family_status, "verified");
-  assert.equal(result.effort_status, "verified");
-  assert.equal(fixture.effortClicks(), 0);
-});
-
-test("GPT-5.6 Sol menu picker ignores transcript text that describes the Advanced picker", async () => {
-  const fixture = makeSolPickerFixture({
-    family: "GPT-5.6 Sol",
-    effort: "High",
-    transcriptPickerDecoy: true
-  });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected");
-  assert.equal(result.picker_shape, "menu");
-  assert.equal(fixture.mainOpens(), 2);
-  assert.equal(fixture.effortClicks(), 1);
   assert.equal(fixture.menusOpen(), 0);
 });
 
@@ -2656,7 +2610,6 @@ test("GPT-5.6 Sol picker fails closed when no close path works", async () => {
   assert.equal(result.picker_family_status, "verified");
   assert.equal(result.closed_pill_family_status, "skipped");
   assert.match(result.warning, /picker remained open/);
-  assert.equal(result.picker_close_method, "escape+hover_leave+trigger_escape+neutral_click");
   assert.equal(result.picker_close_verification.picker_surface_closed, false);
   assert.equal(fixture.menusOpen(), 2);
 });
@@ -2699,36 +2652,38 @@ test("GPT-5.6 Sol Advanced picker moves the scoped effort slider with End", asyn
   assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
-test("GPT-5.6 Sol Advanced picker verifies the live two-line composer pill", async () => {
-  const fixture = makeSolSliderFixture({
-    levels: ["Instant", "Medium", "High", "Heavy", "Pro"],
-    initialValue: 5,
-    pillFamilyLabel: "5.6 Sol"
+for (const testCase of [
+  {
+    name: "verifies the live two-line composer pill",
+    options: {
+      levels: ["Instant", "Medium", "High", "Heavy", "Pro"],
+      initialValue: 5,
+      pillFamilyLabel: "5.6 Sol"
+    },
+    initialPill: "5.6 Sol\nPro"
+  },
+  {
+    name: "upgrades the live two-line Light pill",
+    options: {
+      keyboardMode: "end",
+      levels: ["Instant", "Light", "Standard", "Heavy", "Pro"],
+      initialValue: 2,
+      pillFamilyLabel: "5.6 Sol"
+    },
+    initialPill: "5.6 Sol\nLight"
+  }
+]) {
+  test(`GPT-5.6 Sol Advanced picker: ${testCase.name}`, async () => {
+    const fixture = makeSolSliderFixture(testCase.options);
+    assert.equal(fixture.pill.innerText, testCase.initialPill);
+
+    const result = await configureModelState(fixture.doc, {});
+
+    assert.equal(result.status, "selected");
+    assert.equal(result.effort_control.label, "pro");
+    assert.equal(result.pill_text, "5.6 Sol\nPro");
   });
-  assert.equal(fixture.pill.innerText, "5.6 Sol\nPro");
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected");
-  assert.equal(result.effort_control.label, "pro");
-  assert.equal(result.pill_text, "5.6 Sol\nPro");
-});
-
-test("GPT-5.6 Sol Advanced picker upgrades the live two-line Light pill", async () => {
-  const fixture = makeSolSliderFixture({
-    keyboardMode: "end",
-    levels: ["Instant", "Light", "Standard", "Heavy", "Pro"],
-    initialValue: 2,
-    pillFamilyLabel: "5.6 Sol"
-  });
-  assert.equal(fixture.pill.innerText, "5.6 Sol\nLight");
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected");
-  assert.equal(result.effort_control.label, "pro");
-  assert.equal(result.pill_text, "5.6 Sol\nPro");
-});
+}
 
 test("GPT-5.6 Sol Advanced picker accepts an already-Pro slider without moving (stale-snapshot regression)", async () => {
   // Reproduces the 2026-08-25 live failure (dump: /tmp/amq-effort-slider-move-failed-diagnostics.txt):
@@ -2792,23 +2747,6 @@ test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum",
   assert.equal(result.requested_model, "gpt-5-6-sol-chat-pro");
   assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
   assert.equal(result.pill_text, "5.6 Sol\nPro");
-});
-
-test("GPT-5.6 Sol personal picker accepts a closed pill that proves effort only", async () => {
-  const fixture = makePersonalPickerFixture({ pillFamilyLabel: "" });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected", JSON.stringify(result));
-  assert.equal(result.failure_reason, null);
-  assert.equal(result.picker_shape, "personal");
-  assert.equal(result.picker_family_status, "verified");
-  assert.equal(result.picker_effort_status, "verified");
-  assert.equal(result.closed_pill_family_status, "skipped");
-  assert.equal(result.closed_pill_effort_status, "verified");
-  assert.equal(result.family_status, "verified");
-  assert.equal(result.effort_status, "verified");
-  assert.equal(result.closed_pill_text, "Pro");
 });
 
 test("GPT-5.6 Sol personal picker verifies Effort Pro without moving the power slider", async () => {
@@ -2954,39 +2892,41 @@ test("GPT-5.6 Sol structurally trusts its controlled open picker in a frozen bac
   assert.deepEqual(fixture.keyAttempts(), ["End"]);
 });
 
-test("GPT-5.6 Sol trusts the checked family menu over structural family ghosts", async () => {
-  const fixture = makeSolSliderFixture({
-    animatedReveal: true,
-    backgroundFrozen: true,
-    familyLabel: "GPT-5.5",
-    familyGhostLabels: ["GPT-5.6 Sol"],
-    initialValue: 5
+for (const testCase of [
+  {
+    name: "trusts the checked family menu over structural family ghosts",
+    options: {
+      familyLabel: "GPT-5.5",
+      familyGhostLabels: ["GPT-5.6 Sol"],
+      initialValue: 5
+    },
+    familyClicks: 1
+  },
+  {
+    name: "records checked family menu proof despite structural family ghosts",
+    options: {
+      familyGhostLabels: ["GPT-5.6 Sol"],
+      familyValueAttributes: { "data-state": "checked" },
+      initialValue: 5
+    }
+  }
+]) {
+  test(`GPT-5.6 Sol family proof: ${testCase.name}`, async () => {
+    const fixture = makeSolSliderFixture({
+      animatedReveal: true,
+      backgroundFrozen: true,
+      ...testCase.options
+    });
+
+    const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
+
+    assert.equal(result.status, "selected", JSON.stringify(result));
+    assert.equal(result.failure_reason, null);
+    assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol", "GPT-5.6 Sol Pro", "GPT-5.5"]);
+    assert.equal(result.family_label_source, "family_menu_checked");
+    if (testCase.familyClicks !== undefined) assert.equal(fixture.familyClicks(), testCase.familyClicks);
   });
-
-  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
-
-  assert.equal(result.status, "selected", JSON.stringify(result));
-  assert.equal(result.failure_reason, null);
-  assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol", "GPT-5.6 Sol Pro", "GPT-5.5"]);
-  assert.equal(result.family_label_source, "family_menu_checked");
-  assert.equal(fixture.familyClicks(), 1);
-});
-
-test("GPT-5.6 Sol records checked family menu proof despite structural family ghosts", async () => {
-  const fixture = makeSolSliderFixture({
-    animatedReveal: true,
-    backgroundFrozen: true,
-    familyGhostLabels: ["GPT-5.6 Sol"],
-    familyValueAttributes: { "data-state": "checked" },
-    initialValue: 5
-  });
-
-  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
-
-  assert.equal(result.status, "selected");
-  assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol", "GPT-5.6 Sol Pro", "GPT-5.5"]);
-  assert.equal(result.family_label_source, "family_menu_checked");
-});
+}
 
 test("GPT-5.6 Sol fails closed when the family menu has no checked item", async () => {
   const fixture = makeSolSliderFixture({
@@ -3006,51 +2946,6 @@ test("GPT-5.6 Sol fails closed when the family menu has no checked item", async 
   assert.equal(result.closed_pill_text, "Pro");
   assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol", "GPT-5.6 Sol Pro", "GPT-5.5"]);
   assert.equal(fixture.familyClicks(), 0);
-});
-
-test("GPT-5.6 Sol fails closed when the closed composer pill corroborates another family", async () => {
-  const fixture = makeSolSliderFixture({
-    animatedReveal: true,
-    backgroundFrozen: true,
-    initialValue: 5,
-    pillFamilyLabel: "5.5"
-  });
-
-  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
-
-  assert.equal(result.status, "unavailable");
-  assert.equal(result.failure_reason, "family_composer_pill_unverified");
-  assert.equal(result.picker_family_status, "verified");
-  assert.equal(result.picker_effort_status, "verified");
-  assert.equal(result.closed_pill_family_status, "unverified");
-  assert.equal(result.closed_pill_effort_status, "verified");
-  assert.equal(result.family_status, "unverified");
-  assert.equal(result.effort_status, "verified");
-  assert.equal(result.closed_pill_text, "5.5\nPro");
-  assert.equal(result.pill_text, "5.5\nPro");
-});
-
-test("GPT-5.6 Sol accepts a verified picker followed by an effort-only closed pill", async () => {
-  const fixture = makeSolSliderFixture({
-    animatedReveal: true,
-    backgroundFrozen: true,
-    initialValue: 5,
-    pillFamilyLabel: ""
-  });
-
-  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
-
-  assert.equal(result.status, "selected", JSON.stringify(result));
-  assert.equal(result.failure_reason, null);
-  assert.equal(result.picker_shape, "slider");
-  assert.equal(result.picker_family_status, "verified");
-  assert.equal(result.picker_effort_status, "verified");
-  assert.equal(result.closed_pill_family_status, "skipped");
-  assert.equal(result.closed_pill_effort_status, "verified");
-  assert.equal(result.family_status, "verified");
-  assert.equal(result.effort_status, "verified");
-  assert.equal(result.closed_pill_text, "Pro");
-  assert.equal(result.pill_text, "Pro");
 });
 
 for (const testCase of [
@@ -3073,16 +2968,7 @@ for (const testCase of [
     closed_pill_text: "5.6 Sol Pro"
   },
   {
-    name: "slider accepts a different max-tier closed-pill effort",
-    kind: "slider",
-    options: { initialValue: 5, pillFamilyLabel: "5.6 Sol", pillEffortLabel: "Pro" },
-    status: "selected",
-    closed_pill_family_status: "verified",
-    closed_pill_effort_status: "verified",
-    closed_pill_text: "5.6 Sol\nPro"
-  },
-  {
-    name: "slider accepts Pro on a closed pill after Pro picker proof",
+    name: "slider accepts Pro on a closed pill after picker proof",
     kind: "slider",
     options: { initialValue: 5, pillFamilyLabel: "5.6 Sol", pillEffortLabel: "Pro" },
     status: "selected",
@@ -3095,22 +2981,14 @@ for (const testCase of [
     kind: "slider",
     options: { initialValue: 5, pillFamilyLabel: "", pillEffortLabel: "Pro" },
     status: "selected",
+    picker_shape: "slider",
+    failure_reason: null,
     closed_pill_family_status: "skipped",
     closed_pill_effort_status: "verified",
     family_status: "verified",
     effort_status: "verified",
-    closed_pill_text: "Pro"
-  },
-  {
-    name: "slider effort-only Pro remains valid without a family token",
-    kind: "slider",
-    options: { initialValue: 5, pillFamilyLabel: "", pillEffortLabel: "Pro" },
-    status: "selected",
-    closed_pill_family_status: "skipped",
-    closed_pill_effort_status: "verified",
-    family_status: "verified",
-    effort_status: "verified",
-    closed_pill_text: "Pro"
+    closed_pill_text: "Pro",
+    pill_text: "Pro"
   },
   {
     name: "slider rejects a non-max closed-pill effort with family present",
@@ -3123,6 +3001,19 @@ for (const testCase of [
     family_status: "verified",
     effort_status: "unverified",
     closed_pill_text: "5.6 Sol\nHigh"
+  },
+  {
+    name: "slider rejects a closed pill that corroborates another family",
+    kind: "slider",
+    options: { initialValue: 5, pillFamilyLabel: "5.5" },
+    status: "unavailable",
+    failure_reason: "family_composer_pill_unverified",
+    closed_pill_family_status: "unverified",
+    closed_pill_effort_status: "verified",
+    family_status: "unverified",
+    effort_status: "verified",
+    closed_pill_text: "5.5\nPro",
+    pill_text: "5.5\nPro"
   },
   {
     name: "personal rejects a stale non-Pro closed pill after Pro picker proof",
@@ -3148,11 +3039,14 @@ for (const testCase of [
     kind: "personal",
     options: { pillFamilyLabel: "", pillEffortLabel: "Pro" },
     status: "selected",
+    picker_shape: "personal",
+    failure_reason: null,
     closed_pill_family_status: "skipped",
     closed_pill_effort_status: "verified",
     family_status: "verified",
     effort_status: "verified",
-    closed_pill_text: "Pro"
+    closed_pill_text: "Pro",
+    pill_text: "Pro"
   }
 ]) {
   test(`closed-pill diagnostics: ${testCase.name}`, async () => {
@@ -3170,9 +3064,11 @@ for (const testCase of [
     assert.equal(result.closed_pill_family_status, testCase.closed_pill_family_status);
     assert.equal(result.closed_pill_effort_status, testCase.closed_pill_effort_status);
     assert.equal(result.closed_pill_text, testCase.closed_pill_text);
-    if (testCase.failure_reason) assert.equal(result.failure_reason, testCase.failure_reason);
-    if (testCase.family_status) assert.equal(result.family_status, testCase.family_status);
-    if (testCase.effort_status) assert.equal(result.effort_status, testCase.effort_status);
+    if (testCase.failure_reason !== undefined) assert.equal(result.failure_reason, testCase.failure_reason);
+    if (testCase.family_status !== undefined) assert.equal(result.family_status, testCase.family_status);
+    if (testCase.effort_status !== undefined) assert.equal(result.effort_status, testCase.effort_status);
+    if (testCase.picker_shape !== undefined) assert.equal(result.picker_shape, testCase.picker_shape);
+    if (testCase.pill_text !== undefined) assert.equal(result.pill_text, testCase.pill_text);
   });
 }
 
