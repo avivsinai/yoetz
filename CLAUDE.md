@@ -86,12 +86,15 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 
 - The built-in ChatGPT recipe pins GPT-5.6 Sol at Chat effort Pro. The recipe
   first verifies `role=radiogroup[aria-label="Select chat surface"]`
-  and forces the `Chat` radio (`data-tpp-toggle-value="chat"`), then selects
-  `GPT-5.6 Sol` with the literal `Pro` effort tier. Every click is followed by a
-  fresh `aria-checked` read for the surface, model, and effort; missing controls,
-  Work mode, another family, or another effort tier fail closed. The requested
-  model id is `gpt-5-6-sol-chat-pro`, and `model_used` is the verified
-  `GPT-5.6 Sol Pro` label. Speed and the Faster/Smarter power slider stay at the
+  and forces the `Chat` radio (`data-tpp-toggle-value="chatgpt"`), then selects
+  `GPT-5.6 Sol` with the literal `Pro` effort tier. Family proof comes from a
+  freshly re-read checked `GPT-5.6 Sol` `menuitemradio` in the Model submenu;
+  the closed composer pill corroborates only the `Pro` effort (`Pro` or a
+  family-plus-`Pro` suffix). Missing controls, Work mode, another family, or
+  another effort tier fail closed, and family is never inferred from the pill
+  or slider text. The requested model id is `gpt-5-6-sol-chat-pro`, and
+  `model_used` is composed from the verified picker family and effort as
+  `GPT-5.6 Sol Pro`. Speed and the Faster/Smarter power slider stay at the
   user's default and are never toggled by selection.
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.

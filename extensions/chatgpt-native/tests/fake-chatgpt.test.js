@@ -35,11 +35,19 @@ class FakeElement {
     this.innerText = text;
     this.onClick = attrs.onClick;
     this.onPointerDown = attrs.onPointerDown;
+    this.onPointerLeave = attrs.onPointerLeave;
+    this.onMouseLeave = attrs.onMouseLeave;
+    this.onPointerMove = attrs.onPointerMove;
+    this.onMouseMove = attrs.onMouseMove;
     this.onKeyDown = attrs.onKeyDown;
     this.hidden = Boolean(attrs.hidden);
     this.onChange = attrs.onChange;
     delete this.attrs.onClick;
     delete this.attrs.onPointerDown;
+    delete this.attrs.onPointerLeave;
+    delete this.attrs.onMouseLeave;
+    delete this.attrs.onPointerMove;
+    delete this.attrs.onMouseMove;
     delete this.attrs.onKeyDown;
     delete this.attrs.onChange;
   }
@@ -82,6 +90,18 @@ class FakeElement {
     this.events.push(event.type);
     if (event.type === "pointerdown") {
       this.onPointerDown?.(event);
+    }
+    if (event.type === "pointerleave") {
+      this.onPointerLeave?.(event);
+    }
+    if (event.type === "mouseleave") {
+      this.onMouseLeave?.(event);
+    }
+    if (event.type === "pointermove") {
+      this.onPointerMove?.(event);
+    }
+    if (event.type === "mousemove") {
+      this.onMouseMove?.(event);
     }
     if (event.type === "click") {
       this.recordClick();
@@ -206,31 +226,55 @@ class FakeDocument {
   }
 }
 
-function appendChatSurfaceToggle(body, { surface = "chat", chatClickUpdates = true } = {}) {
+function appendChatSurfaceToggle(body, {
+  surface = "chat",
+  chatClickUpdates = true,
+  chatStateUpdateDelayMs = 0,
+  chatSurfaceValue = "chatgpt",
+  workSurfaceValue = "work"
+} = {}) {
+  const setSurface = (selected) => {
+    const chatSelected = selected === "chat" || selected === "chatgpt";
+    chat.setAttribute("aria-checked", String(chatSelected));
+    chat.setAttribute("data-state", chatSelected ? "on" : "off");
+    work.setAttribute("aria-checked", String(selected === "work"));
+    work.setAttribute("data-state", selected === "work" ? "on" : "off");
+  };
   const chat = new FakeElement("button", {
     role: "radio",
-    "data-tpp-toggle-value": "chat",
-    "aria-checked": String(surface === "chat"),
+    "data-tpp-toggle-value": chatSurfaceValue,
+    "aria-checked": String(surface === "chat" || surface === "chatgpt"),
+    "data-state": surface === "chat" || surface === "chatgpt" ? "on" : "off",
+    class: "box-border flex h-full w-full items-center justify-center rounded-[inherit] py-2 text-sm transition-colors duration-150 motion-reduce:transition-none ps-11 pe-9",
     onClick: () => {
       if (!chatClickUpdates) return;
-      chat.setAttribute("aria-checked", "true");
-      work.setAttribute("aria-checked", "false");
+      if (chatStateUpdateDelayMs > 0) {
+        setTimeout(() => setSurface("chatgpt"), chatStateUpdateDelayMs);
+      } else {
+        setSurface("chatgpt");
+      }
     }
   }, "Chat");
   const work = new FakeElement("button", {
     role: "radio",
-    "data-tpp-toggle-value": "work",
+    "data-tpp-toggle-value": workSurfaceValue,
     "aria-checked": String(surface === "work"),
+    "data-state": surface === "work" ? "on" : "off",
+    class: "box-border flex h-full w-full items-center justify-center rounded-[inherit] py-2 text-sm transition-colors duration-150 motion-reduce:transition-none ps-9 pe-11",
     onClick: () => {
-      chat.setAttribute("aria-checked", "false");
-      work.setAttribute("aria-checked", "true");
+      setSurface("work");
     }
   }, "Work");
-  body.append(new FakeElement("div", {
+  const track = new FakeElement("div", {
+    class: "relative z-10 grid h-full grid-cols-2"
+  }).append(chat, work);
+  const group = new FakeElement("div", {
     role: "radiogroup",
-    "aria-label": "Select chat surface"
-  }).append(chat, work));
-  return { chat, work };
+    "aria-label": "Select chat surface",
+    class: "bg-token-bg-primary relative h-9 rounded-full p-0 select-none group/tpp-toggle touch-pan-y [&_*]:cursor-pointer cursor-pointer"
+  }).append(track);
+  body.append(group);
+  return { chat, work, group, track };
 }
 
 class FakeDataTransfer {
@@ -2394,6 +2438,44 @@ test("ChatGPT model selection switches Work to Chat before selecting Sol Pro", a
   assert.equal(fixture.mainOpens(), 1);
 });
 
+test("ChatGPT model selection re-reads the surface state through a delayed toggle settle", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    surface: "work",
+    chatStateUpdateDelayMs: 100
+  });
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 500,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "selected");
+  assert.ok(result.surface_verification_attempts > 1);
+  assert.deepEqual(result.surface_state, { aria_checked: "true", data_state: "on" });
+});
+
+test("ChatGPT model selection fails closed when surface radio values do not match", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    chatSurfaceValue: "unexpected-chat",
+    workSurfaceValue: "unexpected-work"
+  });
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.deepEqual(result.surface_observed_values, ["unexpected-chat", "unexpected-work"]);
+  assert.deepEqual(result.surface_state, { aria_checked: null, data_state: null });
+  assert.equal(fixture.mainOpens(), 0);
+});
+
 test("ChatGPT model selection fails closed when Work cannot switch to Chat", async () => {
   const fixture = makeSolPickerFixture({
     family: "GPT-5.6 Sol",
@@ -2493,7 +2575,13 @@ test("GPT-5.6 Sol picker verifies already-correct Pro state with one menu open",
   assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
-  assert.deepEqual(result.available_families, []);
+  assert.deepEqual(result.available_families, [
+    "GPT-5.6 Sol",
+    "GPT-5.5",
+    "GPT-5.4\nLeaving on July 23",
+    "GPT-5.3",
+    "o3"
+  ]);
   assert.equal(fixture.mainOpens(), 1);
   assert.equal(fixture.familyClicks(), 0);
   assert.equal(fixture.effortClicks(), 0);
@@ -2529,11 +2617,35 @@ test("GPT-5.6 Sol menu picker ignores transcript text that describes the Advance
   assert.equal(fixture.menusOpen(), 0);
 });
 
-test("GPT-5.6 Sol picker fails closed when Escape cannot close the menu", async () => {
+test("GPT-5.6 Sol picker closes a hover submenu before the final neutral click", async () => {
   const fixture = makeSolPickerFixture({
     family: "GPT-5.6 Sol",
     effort: "Pro",
-    escapeCloses: false
+    escapeCloses: false,
+    familyEscapeCloses: false,
+    hoverLeaveCloses: true,
+    neutralClickCloses: true
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.picker_close_method, "escape+hover_leave+trigger_escape+neutral_click");
+  assert.equal(result.picker_close_verification.family_trigger_closed, true);
+  assert.equal(result.picker_close_verification.picker_surface_closed, true);
+  assert.equal(result.picker_close_verification.closed_pill_pro, true);
+  assert.equal(fixture.menusOpen(), 0);
+});
+
+test("GPT-5.6 Sol picker fails closed when no close path works", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    escapeCloses: false,
+    familyEscapeCloses: false,
+    hoverLeaveCloses: false,
+    neutralClickCloses: false
   });
 
   const result = await configureModelState(fixture.doc, {});
@@ -2544,7 +2656,9 @@ test("GPT-5.6 Sol picker fails closed when Escape cannot close the menu", async 
   assert.equal(result.picker_family_status, "verified");
   assert.equal(result.closed_pill_family_status, "skipped");
   assert.match(result.warning, /picker remained open/);
-  assert.equal(fixture.menusOpen(), 1);
+  assert.equal(result.picker_close_method, "escape+hover_leave+trigger_escape+neutral_click");
+  assert.equal(result.picker_close_verification.picker_surface_closed, false);
+  assert.equal(fixture.menusOpen(), 2);
 });
 
 test("GPT-5.6 Sol picker fails loudly on the legacy model-switcher DOM", async () => {
@@ -2680,19 +2794,19 @@ test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum",
   assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
- test("GPT-5.6 Sol personal picker fails closed when the closed pill is effort-only", async () => {
+test("GPT-5.6 Sol personal picker accepts a closed pill that proves effort only", async () => {
   const fixture = makePersonalPickerFixture({ pillFamilyLabel: "" });
 
   const result = await configureModelState(fixture.doc, {});
 
-  assert.equal(result.status, "unavailable");
-  assert.equal(result.failure_reason, "family_composer_pill_unverified");
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.failure_reason, null);
   assert.equal(result.picker_shape, "personal");
   assert.equal(result.picker_family_status, "verified");
   assert.equal(result.picker_effort_status, "verified");
-  assert.equal(result.closed_pill_family_status, "unverified");
+  assert.equal(result.closed_pill_family_status, "skipped");
   assert.equal(result.closed_pill_effort_status, "verified");
-  assert.equal(result.family_status, "unverified");
+  assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(result.closed_pill_text, "Pro");
 });
@@ -2836,11 +2950,11 @@ test("GPT-5.6 Sol structurally trusts its controlled open picker in a frozen bac
   assert.equal(result.status, "selected");
   assert.equal(result.surface_trust, "aria_controls_structural");
   assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
-  assert.equal(result.family_label_source, "deepest_unique");
+  assert.equal(result.family_label_source, "family_menu_checked");
   assert.deepEqual(fixture.keyAttempts(), ["End"]);
 });
 
-test("GPT-5.6 Sol rejects differing structural family descendants as ambiguous", async () => {
+test("GPT-5.6 Sol trusts the checked family menu over structural family ghosts", async () => {
   const fixture = makeSolSliderFixture({
     animatedReveal: true,
     backgroundFrozen: true,
@@ -2851,13 +2965,14 @@ test("GPT-5.6 Sol rejects differing structural family descendants as ambiguous",
 
   const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
 
-  assert.equal(result.status, "unavailable");
-  assert.equal(result.failure_reason, "family_label_ambiguous");
-  assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol", "GPT-5.5"]);
-  assert.equal(fixture.familyClicks(), 0);
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.failure_reason, null);
+  assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol", "GPT-5.6 Sol Pro", "GPT-5.5"]);
+  assert.equal(result.family_label_source, "family_menu_checked");
+  assert.equal(fixture.familyClicks(), 1);
 });
 
-test("GPT-5.6 Sol accepts identical structural family ghosts and prefers the checked value node", async () => {
+test("GPT-5.6 Sol records checked family menu proof despite structural family ghosts", async () => {
   const fixture = makeSolSliderFixture({
     animatedReveal: true,
     backgroundFrozen: true,
@@ -2869,8 +2984,28 @@ test("GPT-5.6 Sol accepts identical structural family ghosts and prefers the che
   const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
 
   assert.equal(result.status, "selected");
-  assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol"]);
-  assert.equal(result.family_label_source, "data_state_checked");
+  assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol", "GPT-5.6 Sol Pro", "GPT-5.5"]);
+  assert.equal(result.family_label_source, "family_menu_checked");
+});
+
+test("GPT-5.6 Sol fails closed when the family menu has no checked item", async () => {
+  const fixture = makeSolSliderFixture({
+    animatedReveal: true,
+    backgroundFrozen: true,
+    familyMenuChecked: false,
+    initialValue: 5,
+    pillFamilyLabel: ""
+  });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_family_menu_unverified");
+  assert.equal(result.picker_family_status, "unverified");
+  assert.equal(result.picker_effort_status, "verified");
+  assert.equal(result.closed_pill_text, "Pro");
+  assert.deepEqual(result.family_label_candidates, ["GPT-5.6 Sol", "GPT-5.6 Sol Pro", "GPT-5.5"]);
+  assert.equal(fixture.familyClicks(), 0);
 });
 
 test("GPT-5.6 Sol fails closed when the closed composer pill corroborates another family", async () => {
@@ -2895,7 +3030,7 @@ test("GPT-5.6 Sol fails closed when the closed composer pill corroborates anothe
   assert.equal(result.pill_text, "5.5\nPro");
 });
 
-test("GPT-5.6 Sol fails closed when a verified picker is followed by an effort-only closed pill", async () => {
+test("GPT-5.6 Sol accepts a verified picker followed by an effort-only closed pill", async () => {
   const fixture = makeSolSliderFixture({
     animatedReveal: true,
     backgroundFrozen: true,
@@ -2905,14 +3040,14 @@ test("GPT-5.6 Sol fails closed when a verified picker is followed by an effort-o
 
   const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 200, intervalMs: 25 });
 
-  assert.equal(result.status, "unavailable");
-  assert.equal(result.failure_reason, "family_composer_pill_unverified");
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.failure_reason, null);
   assert.equal(result.picker_shape, "slider");
   assert.equal(result.picker_family_status, "verified");
   assert.equal(result.picker_effort_status, "verified");
-  assert.equal(result.closed_pill_family_status, "unverified");
+  assert.equal(result.closed_pill_family_status, "skipped");
   assert.equal(result.closed_pill_effort_status, "verified");
-  assert.equal(result.family_status, "unverified");
+  assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(result.closed_pill_text, "Pro");
   assert.equal(result.pill_text, "Pro");
@@ -2956,25 +3091,25 @@ for (const testCase of [
     closed_pill_text: "5.6 Sol\nPro"
   },
   {
-    name: "slider effort-only Pro still fails family while proving Pro effort",
+    name: "slider effort-only Pro relies on the fresh picker family proof",
     kind: "slider",
     options: { initialValue: 5, pillFamilyLabel: "", pillEffortLabel: "Pro" },
-    status: "unavailable",
-    failure_reason: "family_composer_pill_unverified",
-    closed_pill_family_status: "unverified",
+    status: "selected",
+    closed_pill_family_status: "skipped",
     closed_pill_effort_status: "verified",
-    family_status: "unverified",
+    family_status: "verified",
     effort_status: "verified",
     closed_pill_text: "Pro"
   },
   {
-    name: "slider effort-only non-family still fails family while proving Pro effort",
+    name: "slider effort-only Pro remains valid without a family token",
     kind: "slider",
     options: { initialValue: 5, pillFamilyLabel: "", pillEffortLabel: "Pro" },
-    status: "unavailable",
-    failure_reason: "family_composer_pill_unverified",
-    closed_pill_family_status: "unverified",
+    status: "selected",
+    closed_pill_family_status: "skipped",
     closed_pill_effort_status: "verified",
+    family_status: "verified",
+    effort_status: "verified",
     closed_pill_text: "Pro"
   },
   {
@@ -3009,13 +3144,14 @@ for (const testCase of [
     closed_pill_text: "GPT-5.6 Sol\nPro"
   },
   {
-    name: "personal effort-only Pro still fails family while proving Pro effort",
+    name: "personal effort-only Pro relies on the fresh picker family proof",
     kind: "personal",
     options: { pillFamilyLabel: "", pillEffortLabel: "Pro" },
-    status: "unavailable",
-    failure_reason: "family_composer_pill_unverified",
-    closed_pill_family_status: "unverified",
+    status: "selected",
+    closed_pill_family_status: "skipped",
     closed_pill_effort_status: "verified",
+    family_status: "verified",
+    effort_status: "verified",
     closed_pill_text: "Pro"
   }
 ]) {
@@ -3273,11 +3409,17 @@ function makeSolPickerFixture({
   family,
   effort,
   escapeCloses = true,
+  familyEscapeCloses = escapeCloses,
+  hoverLeaveCloses = false,
+  neutralClickCloses = false,
   remountPillOnSelection = false,
   transcriptPickerDecoy = false,
   includeChatSurface = true,
   surface = "chat",
-  chatClickUpdates = true
+  chatClickUpdates = true,
+  chatStateUpdateDelayMs = 0,
+  chatSurfaceValue = "chatgpt",
+  workSurfaceValue = "work"
 }) {
   let currentFamily = family;
   let currentEffort = effort;
@@ -3287,13 +3429,20 @@ function makeSolPickerFixture({
   let mainMenu = null;
   let familyMenu = null;
   let pill = null;
+  let familyTrigger = null;
 
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
   const body = new FakeElement("body", {}, "Ask anything").append(form);
   const chatSurface = includeChatSurface
-    ? appendChatSurfaceToggle(body, { surface, chatClickUpdates })
-    : null;
+    ? appendChatSurfaceToggle(body, {
+      surface,
+      chatClickUpdates,
+      chatStateUpdateDelayMs,
+      chatSurfaceValue,
+      workSurfaceValue
+    })
+    : { chat: null, work: null, group: null, track: null };
   if (transcriptPickerDecoy) {
     body.append(new FakeElement(
       "div",
@@ -3312,6 +3461,8 @@ function makeSolPickerFixture({
     removeMenu(familyMenu);
     mainMenu = null;
     familyMenu = null;
+    familyTrigger?.setAttribute("aria-expanded", "false");
+    familyTrigger?.setAttribute("data-state", "closed");
   };
   const updatePill = (remount = false) => {
     const pillEffort = currentEffort === "Pro Extended" ? "Pro" : currentEffort;
@@ -3334,6 +3485,8 @@ function makeSolPickerFixture({
   const openFamilyMenu = () => {
     removeMenu(familyMenu);
     familyMenu = new FakeElement("div", { role: "menu", "data-radix-menu-content": "" });
+    familyTrigger?.setAttribute("aria-expanded", "true");
+    familyTrigger?.setAttribute("data-state", "open");
     for (const label of ["GPT-5.6 Sol", "GPT-5.5", "GPT-5.4\nLeaving on July 23", "GPT-5.3", "o3"]) {
       const radio = new FakeElement("div", {
         role: "menuitemradio",
@@ -3383,11 +3536,32 @@ function makeSolPickerFixture({
       }, label);
       mainMenu.append(radio);
     }
-    mainMenu.append(new FakeElement("div", {
+    familyTrigger = new FakeElement("div", {
       role: "menuitem",
       "aria-haspopup": "menu",
-      onPointerDown: openFamilyMenu
-    }, currentFamily));
+      onPointerDown: openFamilyMenu,
+      onKeyDown: (event) => {
+        if (event.key === "Escape" && familyEscapeCloses) {
+          removeMenu(familyMenu);
+          familyMenu = null;
+          familyTrigger.setAttribute("aria-expanded", "false");
+          familyTrigger.setAttribute("data-state", "closed");
+        }
+      }
+    }, currentFamily);
+    if (hoverLeaveCloses) {
+      const closeFamilyOnHoverLeave = () => {
+        removeMenu(familyMenu);
+        familyMenu = null;
+        familyTrigger.setAttribute("aria-expanded", "false");
+        familyTrigger.setAttribute("data-state", "closed");
+      };
+      familyTrigger.onPointerLeave = closeFamilyOnHoverLeave;
+      familyTrigger.onMouseLeave = closeFamilyOnHoverLeave;
+      familyTrigger.onPointerMove = closeFamilyOnHoverLeave;
+      familyTrigger.onMouseMove = closeFamilyOnHoverLeave;
+    }
+    mainMenu.append(familyTrigger);
     mainMenu.append(new FakeElement("div", { role: "menuitem", "aria-haspopup": "menu" }, ""));
     body.append(mainMenu);
   };
@@ -3402,6 +3576,7 @@ function makeSolPickerFixture({
   });
   pill = createPill();
   form.append(pill);
+  if (neutralClickCloses) composer.onPointerDown = closeMenus;
   updatePill();
   const doc = new FakeDocument(body);
 
@@ -3433,9 +3608,11 @@ function makeSolSliderFixture({
   familyLabel = "GPT-5.6 Sol",
   familyGhostLabels = [],
   familyValueAttributes = {},
+  familyMenuChecked = null,
   pillFamilyLabel = "5.6 Sol",
   pillEffortLabel = null
 } = {}) {
+  let currentFamily = familyLabel;
   let currentValue = initialValue;
   let panel = null;
   let effortSlider = null;
@@ -3515,7 +3692,7 @@ function makeSolSliderFixture({
     panel = new FakeElement(
       "div",
       { id: "advanced-picker", role: "dialog", ...(backgroundFrozen ? { "data-state": "open" } : {}), ...(animatedReveal ? { style: "opacity:0; pointer-events:none" } : {}) },
-      "Advanced Faster Smarter Model GPT-5.6 Sol Effort High 3 of 5"
+      `Advanced Faster Smarter Model ${currentFamily} Effort High 3 of 5`
     );
     const masterSlider = new FakeElement("div", {
       role: "slider",
@@ -3528,16 +3705,31 @@ function makeSolSliderFixture({
     const openFamilyMenu = () => {
       family.setAttribute("aria-expanded", "true");
       family.setAttribute("data-state", "open");
-      familyMenu = new FakeElement("div", { id: "family-picker", role: "menu", "data-state": "open", style: "opacity:0" });
-      const oldFamily = new FakeElement("div", { role: "menuitemradio", "aria-checked": familyLabel === "GPT-5.5" ? "true" : "false" }, "GPT-5.5");
+      familyMenu = new FakeElement("div", {
+        id: "family-picker",
+        role: "menu",
+        "data-state": "open",
+        style: backgroundFrozen ? "opacity:0" : ""
+      });
+      const oldFamily = new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": familyMenuChecked === null ? String(currentFamily === "GPT-5.5") : "false"
+      }, "GPT-5.5");
       const proFamily = new FakeElement("div", { role: "menuitemradio", "aria-checked": "false" }, "GPT-5.6 Sol Pro");
       const solFamily = new FakeElement("div", {
         role: "menuitemradio",
-        "aria-checked": familyLabel === "GPT-5.6 Sol" ? "true" : "false",
+        "aria-checked": String(familyMenuChecked === null ? currentFamily === "GPT-5.6 Sol" : familyMenuChecked),
+        ...(familyMenuChecked === false ? { "data-state": "checked" } : {}),
         onClick: () => {
+          currentFamily = "GPT-5.6 Sol";
           familyClickCount += 1;
-          familyValueNode.innerText = "GPT-5.6 Sol";
-          familyValueNode.textContent = "GPT-5.6 Sol";
+          oldFamily.setAttribute("aria-checked", "false");
+          proFamily.setAttribute("aria-checked", "false");
+          solFamily.setAttribute("aria-checked", "true");
+          if (familyValueNode) {
+            familyValueNode.innerText = "GPT-5.6 Sol";
+            familyValueNode.textContent = "GPT-5.6 Sol";
+          }
           family.innerText = "Model\nGPT-5.6 Sol";
           family.textContent = family.innerText;
           family.setAttribute("aria-expanded", "false");
@@ -3559,13 +3751,22 @@ function makeSolSliderFixture({
           familyMenu.parentElement = null;
           familyMenu = null;
         }
-      } }, `Model\n${familyLabel}`)
+      } }, `Model\n${currentFamily}`)
         .append(
           new FakeElement("div", {}, "Model"),
           ...familyGhostLabels.map((label) => new FakeElement("div", {}, label)),
-          (familyValueNode = new FakeElement("div", familyValueAttributes, familyLabel))
+          (familyValueNode = new FakeElement("div", familyValueAttributes, currentFamily))
         )
-      : new FakeElement("button", { "aria-haspopup": "menu" }, "GPT-5.6 Sol");
+      : new FakeElement("button", {
+        "aria-haspopup": "menu",
+        onPointerDown: openFamilyMenu,
+        onKeyDown: (event) => {
+          if (event.key === "Escape") {
+            body.children = body.children.filter((child) => child !== familyMenu);
+            familyMenu = null;
+          }
+        }
+      }, currentFamily);
     if (backgroundFrozen) {
       const group = new FakeElement("div", { role: "group", "data-testid": "composer-intelligence-picker-content" });
       const simple = new FakeElement("div", { "data-testid": "composer-model-picker-slider-simple-view" });
@@ -3673,7 +3874,8 @@ function makePersonalPickerFixture({
   retainMountedWrapper = false,
   effortOptions = null,
   pillFamilyLabel = "5.6 Sol",
-  pillEffortLabel = null
+  pillEffortLabel = null,
+  familyMenuChecked = true
 } = {}) {
   let panel = null;
   let menuNode = null;
@@ -3681,6 +3883,8 @@ function makePersonalPickerFixture({
   let currentEffort = effort;
   let effortClicks = 0;
   let effortMenu = null;
+  let familyMenu = null;
+  let familyValueNode = null;
   const keyAttempts = [];
   const composer = new FakeElement("div", {
     id: "prompt-textarea",
@@ -3719,8 +3923,15 @@ function makePersonalPickerFixture({
     effortMenu.parentElement = null;
     effortMenu = null;
   };
+  const closeFamilyMenu = () => {
+    if (!familyMenu) return;
+    body.children = body.children.filter((child) => child !== familyMenu);
+    familyMenu.parentElement = null;
+    familyMenu = null;
+  };
   const detachPanel = () => {
     closeEffortMenu();
+    closeFamilyMenu();
     if (!panel) return;
     body.children = body.children.filter((child) => child !== panel);
     panel.parentElement = null;
@@ -3774,12 +3985,50 @@ function makePersonalPickerFixture({
         keyAttempts.push(event.key);
       }
     });
+    const openFamilyMenu = () => {
+      closeFamilyMenu();
+      const oldFamily = new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": "false"
+      }, "GPT-5.5");
+      const solFamily = new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": String(familyMenuChecked),
+        onClick: () => {
+          oldFamily.setAttribute("aria-checked", "false");
+          solFamily.setAttribute("aria-checked", "true");
+          familyValueNode.innerText = "GPT-5.6 Sol";
+          familyValueNode.textContent = "GPT-5.6 Sol";
+          family.setAttribute("aria-expanded", "false");
+          family.setAttribute("data-state", "closed");
+          closeFamilyMenu();
+        }
+      }, "GPT-5.6 Sol");
+      familyMenu = new FakeElement("div", {
+        id: "personal-family-picker",
+        role: "menu",
+        "data-state": "open"
+      }).append(solFamily, oldFamily);
+      body.append(familyMenu);
+      family.setAttribute("aria-expanded", "true");
+      family.setAttribute("data-state", "open");
+    };
     const family = new FakeElement("div", {
       role: "menuitem",
-      "aria-haspopup": "menu"
+      "aria-haspopup": "menu",
+      "aria-expanded": "false",
+      "data-state": "closed",
+      onPointerDown: openFamilyMenu,
+      onKeyDown: (event) => {
+        if (event.key === "Escape") {
+          closeFamilyMenu();
+          family.setAttribute("aria-expanded", "false");
+          family.setAttribute("data-state", "closed");
+        }
+      }
     }, "Model GPT-5.6 Sol").append(
       new FakeElement("span", {}, "Model"),
-      new FakeElement("span", { "data-state": "checked" }, "GPT-5.6 Sol")
+      (familyValueNode = new FakeElement("span", { "data-state": "checked" }, "GPT-5.6 Sol"))
     );
     effortRow = new FakeElement("div", {
       role: "menuitem",
@@ -4011,11 +4260,17 @@ function matchesSimpleSelector(element, selector) {
   if (selector === '[role="radiogroup"][aria-label="Select chat surface"]') {
     return attr("role") === "radiogroup" && attr("aria-label") === "Select chat surface";
   }
-  if (selector === '[role="radio"][data-tpp-toggle-value="chat"]') {
-    return attr("role") === "radio" && attr("data-tpp-toggle-value") === "chat";
+  if (selector === '[role="radio"][data-tpp-toggle-value="chatgpt"]') {
+    return attr("role") === "radio" && attr("data-tpp-toggle-value") === "chatgpt";
   }
   if (selector === '[role="radio"][data-tpp-toggle-value="work"]') {
     return attr("role") === "radio" && attr("data-tpp-toggle-value") === "work";
+  }
+  if (selector === '[role="radio"][data-tpp-toggle-value]') {
+    return attr("role") === "radio" && attr("data-tpp-toggle-value") != null;
+  }
+  if (selector === '[data-tpp-toggle-value]') {
+    return attr("data-tpp-toggle-value") != null;
   }
   if (selector.includes('button[type="submit"]')) {
     return tag === "button" && attr("type") === "submit" && !element.disabled;

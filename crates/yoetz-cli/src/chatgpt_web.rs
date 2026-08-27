@@ -389,23 +389,97 @@ async () => {{
   const supported = "gpt-5-6-sol-chat-pro";
   const MODEL_BUTTON_SELECTOR = {model_button_selector};
   const COMPOSER_SELECTOR = {composer_selector};
+  const SURFACE_SETTLE_TIMEOUT_MS = 1000;
+  const SURFACE_SETTLE_INTERVAL_MS = 50;
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const fold = (value) => normalize(value).toLowerCase();
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const textOf = (node) => normalize(node?.innerText || node?.textContent || "");
 {visibility_helpers}
 
-  async function ensureChatSurface() {{
+  function surfaceControls() {{
     const group = document.querySelector('[role="radiogroup"][aria-label="Select chat surface"]');
-    const chat = group?.querySelector('[role="radio"][data-tpp-toggle-value="chat"]');
+    const chat = group?.querySelector('[role="radio"][data-tpp-toggle-value="chatgpt"]');
     const work = group?.querySelector('[role="radio"][data-tpp-toggle-value="work"]');
-    if (!chat || !work) return {{ ok: false, warning: "ChatGPT Chat surface toggle not found or could not be read" }};
-    if (chat.getAttribute("aria-checked") !== "true") realClick(chat);
-    await wait(250);
-    const verified = group.querySelector('[role="radio"][data-tpp-toggle-value="chat"]');
-    return verified?.getAttribute("aria-checked") === "true"
-      ? {{ ok: true }}
-      : {{ ok: false, warning: "ChatGPT Chat surface could not be verified after selection" }};
+    return chat && work ? {{ group, chat, work }} : null;
+  }}
+
+  function surfaceState(node) {{
+    return {{
+      ariaChecked: node?.getAttribute("aria-checked") || null,
+      dataState: node?.getAttribute("data-state") || null
+    }};
+  }}
+
+  function surfaceObservedValues() {{
+    const group = document.querySelector('[role="radiogroup"][aria-label="Select chat surface"]');
+    return Array.from(group?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]') || [])
+      .map((node) => node.getAttribute("data-tpp-toggle-value"))
+      .filter(Boolean)
+      .filter((value, index, values) => values.indexOf(value) === index)
+      .slice(0, 10);
+  }}
+
+  async function ensureChatSurface() {{
+    const startedAt = Date.now();
+    const controls = surfaceControls();
+    let state = surfaceState(controls?.chat);
+    let observedValues = surfaceObservedValues();
+    if (!controls) {{
+      return {{
+        ok: false,
+        warning: "ChatGPT Chat surface toggle not found or could not be read",
+        failureReason: "chat_surface_control_not_found",
+        elapsedMs: Date.now() - startedAt,
+        attempts: 1,
+        verificationAttempts: 0,
+        state,
+        observedValues
+      }};
+    }}
+    if (state.ariaChecked === "true") {{
+      return {{
+        ok: true,
+        elapsedMs: Date.now() - startedAt,
+        attempts: 1,
+        verificationAttempts: 0,
+        state,
+        observedValues
+      }};
+    }}
+
+    realClick(controls.chat);
+    const settleStartedAt = Date.now();
+    let verificationAttempts = 0;
+    while (Date.now() - settleStartedAt < SURFACE_SETTLE_TIMEOUT_MS) {{
+      verificationAttempts += 1;
+      const verified = surfaceControls();
+      state = surfaceState(verified?.chat);
+      observedValues = surfaceObservedValues();
+      if (state.ariaChecked === "true") {{
+        return {{
+          ok: true,
+          elapsedMs: Date.now() - startedAt,
+          attempts: 1 + verificationAttempts,
+          verificationAttempts,
+          state,
+          observedValues
+        }};
+      }}
+      const remainingMs = SURFACE_SETTLE_TIMEOUT_MS - (Date.now() - settleStartedAt);
+      if (remainingMs <= 0) break;
+      await wait(Math.min(SURFACE_SETTLE_INTERVAL_MS, remainingMs));
+    }}
+    return {{
+      ok: false,
+      warning: "ChatGPT Chat surface could not be verified after selection",
+      failureReason: "chat_surface_selection_mismatch",
+      elapsedMs: Date.now() - startedAt,
+      attempts: 1 + verificationAttempts,
+      verificationAttempts,
+      state,
+      observedValues
+    }};
   }}
 
   function classTokens(node) {{
@@ -496,8 +570,9 @@ async () => {{
   function readState(menu) {{
     const effortItems = radios(menu);
     const familyTrigger = Array.from(menu?.querySelectorAll?.("[role='menuitem']") || [])
-      .find((item) => item.getAttribute("aria-haspopup") === "menu" && /^(?:gpt|o\d)\b/i.test(textOf(item))) || null;
-    return {{ menu, effortItems, familyTrigger, familyLabel: textOf(familyTrigger) }};
+      .find((item) => item.getAttribute("aria-haspopup") === "menu"
+        && (/^(?:gpt|o\d)\b/i.test(textOf(item)) || /\bModel\b/i.test(textOf(item)))) || null;
+    return {{ menu, effortItems, familyTrigger, familyLabel: textOf(familyTrigger), familyProof: false }};
   }}
 
   function dispatch(element, type, kind, init = {{}}) {{
@@ -578,16 +653,126 @@ async () => {{
     return null;
   }}
 
-  async function closeMenus(pill) {{
-    for (let attempt = 0; attempt < 3 && visibleMenus().length > 0; attempt += 1) {{
-      keyPress(pill, "Escape", "Escape");
-      await wait(100);
+  function mounted(node) {{
+    return Boolean(node && (node.isConnected || document.documentElement?.contains?.(node)));
+  }}
+
+  function pickerDialog() {{
+    return Array.from(document.querySelectorAll("[role='dialog'], [data-testid='composer-intelligence-picker-content']"))
+      .filter(isVisible)
+      .find((node) => /\bModel\b/i.test(textOf(node)) && /\bEffort\b/i.test(textOf(node))) || null;
+  }}
+
+  function readPickerCloseVerification(pill, state, options = {{}}) {{
+    const familyTrigger = state?.familyTrigger;
+    const familyOpen = mounted(familyTrigger)
+      && (familyTrigger.getAttribute("aria-expanded") === "true"
+        || familyTrigger.getAttribute("data-state") === "open");
+    const familySurface = familyMenu(state?.menu);
+    const pickerOpen = Boolean(mainMenu())
+      || Boolean(familySurface)
+      || Boolean(pickerDialog())
+      || familyOpen
+      || (mounted(pill) && (pill.getAttribute("aria-expanded") === "true"
+        || pill.getAttribute("data-state") === "open"));
+    const pillText = pill ? textOf(pill) : "";
+    const closedPillPro = options.requireProPill !== true || pillConfirmsEffortLabel(pillText, "Pro");
+    return {{
+      familyTriggerClosed: !familyOpen,
+      pickerSurfaceClosed: !pickerOpen,
+      modelTriggerClosed: !pickerOpen,
+      closedPillPro,
+      closedPillText: pillText || null,
+      ok: !familyOpen && !pickerOpen
+    }};
+  }}
+
+  function neutralComposerArea(pill) {{
+    const composer = document.querySelector(COMPOSER_SELECTOR);
+    if (composer && composer !== pill) return composer;
+    return composerScopes()[0] || null;
+  }}
+
+  function dispatchHoverLeaveEvents(element, relatedTarget) {{
+    const rect = relatedTarget?.getBoundingClientRect?.() || {{ left: 0, top: 0, width: 1, height: 1 }};
+    const clientX = Number(rect.left || 0) + Math.max(1, Number(rect.width || 1) / 2);
+    const clientY = Number(rect.top || 0) + Math.max(1, Number(rect.height || 1) / 2);
+    for (const [type, kind, init] of [
+      ["pointerleave", "PointerEvent", {{ pointerId: 1, pointerType: "mouse", isPrimary: true, relatedTarget, clientX, clientY }}],
+      ["mouseleave", "MouseEvent", {{ relatedTarget, clientX, clientY }}],
+      ["pointermove", "PointerEvent", {{ pointerId: 1, pointerType: "mouse", isPrimary: true, relatedTarget, clientX, clientY }}],
+      ["mousemove", "MouseEvent", {{ relatedTarget, clientX, clientY }}]
+    ]) {{
+      dispatch(element, type, kind, init);
     }}
-    return visibleMenus().length === 0;
+  }}
+
+  async function waitForPickerClose(pill, state, options) {{
+    let verification = readPickerCloseVerification(pill, state, options);
+    for (let attempt = 0; attempt < 3 && !verification.ok; attempt += 1) {{
+      await wait(50);
+      verification = readPickerCloseVerification(pill, state, options);
+    }}
+    return verification;
+  }}
+
+  let pickerCloseMethods = [];
+  let pickerCloseVerification = null;
+  async function closeMenus(pill, state = null, options = {{}}) {{
+    const methods = [];
+    let verification = readPickerCloseVerification(pill, state, options);
+    const tryMethod = async (method, action) => {{
+      methods.push(method);
+      try {{
+        await action();
+      }} catch {{
+        // Continue to the next bounded close path and fail closed if needed.
+      }}
+      verification = await waitForPickerClose(pill, state, options);
+    }};
+
+    if (!verification.ok) {{
+      await tryMethod("escape", () => keyPress(pill, "Escape", "Escape"));
+    }}
+    if (!verification.ok && !verification.pickerSurfaceClosed && state?.familyTrigger) {{
+      const neutral = neutralComposerArea(pill);
+      await tryMethod("hover_leave", () => dispatchHoverLeaveEvents(state.familyTrigger, neutral));
+      if (!verification.ok && !verification.pickerSurfaceClosed) {{
+        await tryMethod("trigger_escape", () => keyPress(state.familyTrigger, "Escape", "Escape"));
+      }}
+    }}
+    if (!verification.ok && !verification.pickerSurfaceClosed) {{
+      const neutral = neutralComposerArea(pill);
+      if (neutral) await tryMethod("neutral_click", () => realClick(neutral));
+    }}
+
+    pickerCloseMethods = methods;
+    pickerCloseVerification = verification;
+    return verification.ok;
+  }}
+
+  async function readFamilyProof(state) {{
+    const submenu = await openFamilyMenu(state);
+    const familyItems = radios(submenu);
+    const checkedItems = familyItems.filter((item) => item.getAttribute("aria-checked") === "true");
+    const families = familyItems.map(textOf).filter(Boolean);
+    const checkedFamily = checkedItems.length === 1 ? textOf(checkedItems[0]) : "";
+    state.familyLabel = checkedFamily;
+    state.familyProof = checkedItems.length === 1 && fold(checkedFamily) === "gpt-5.6 sol";
+    state.familyItems = familyItems;
+    state.familyCheckedItems = checkedItems;
+    return {{
+      ok: state.familyProof,
+      submenu,
+      familyItems,
+      checkedItems,
+      families,
+      sol: familyItems.find((item) => fold(textOf(item)) === "gpt-5.6 sol") || null
+    }};
   }}
 
   function familyVerified(state) {{
-    return fold(state?.familyLabel) === "gpt-5.6 sol";
+    return state?.familyProof === true && fold(state?.familyLabel) === "gpt-5.6 sol";
   }}
 
   function effortVerified(state) {{
@@ -597,33 +782,97 @@ async () => {{
     return checkedLabel === "pro";
   }}
 
+  function pillConfirmsEffortLabel(pillText, effortLabel) {{
+    const foldedPill = fold(pillText).replace(/\s+/g, " ");
+    const foldedEffort = fold(effortLabel).replace(/\s+/g, " ");
+    return foldedEffort === "pro" && (foldedPill === "pro" || foldedPill.endsWith(" pro"));
+  }}
+
+  function foldFamilyLabel(value) {{
+    return fold(value).replace(/^gpt[\s-]*/, "").replace(/\s+/g, " ");
+  }}
+
+  function pillConfirmsFamilyLabel(pillText, familyLabel) {{
+    const foldedFamily = foldFamilyLabel(familyLabel);
+    if (!foldedFamily) return false;
+    return fold(pillText).split(/\n+/).some((line) => {{
+      const foldedLine = foldFamilyLabel(line);
+      return foldedLine === foldedFamily || foldedLine.startsWith(`${{foldedFamily}} `);
+    }});
+  }}
+
+  function pillHasModelFamilyToken(pillText) {{
+    const foldedPill = fold(pillText).replace(/\s+/g, " ");
+    return /\bgpt[\s.-]*\d/.test(foldedPill)
+      || /\bo\d(?:[\s.-]*\d)?\b/.test(foldedPill)
+      || /\b\d+(?:\.\d+)+\b/.test(foldedPill);
+  }}
+
+  function closedPillDiagnostics(pill, state) {{
+    const pillText = pill ? textOf(pill) : "";
+    const familyLabel = state?.familyLabel || "";
+    const effortLabel = state?.effortItems?.find((item) => fold(textOf(item)) === "pro");
+    const closedPillFamilyStatus = pillText && familyLabel
+      ? pillConfirmsFamilyLabel(pillText, familyLabel)
+        ? "verified"
+        : pillHasModelFamilyToken(pillText) ? "unverified" : "skipped"
+      : "skipped";
+    const closedPillEffortStatus = pillText && effortLabel
+      ? pillConfirmsEffortLabel(pillText, textOf(effortLabel)) ? "verified" : "unverified"
+      : "skipped";
+    return {{
+      closedPillText: pillText,
+      closedPillFamilyStatus,
+      closedPillEffortStatus
+    }};
+  }}
+
   function result(status, pill, state, families, warning = null) {{
-    const familyIsVerified = familyVerified(state);
-    const effortIsVerified = effortVerified(state);
+    const closedPill = closedPillDiagnostics(pill, state);
+    const pickerFamilyIsVerified = familyVerified(state);
+    const pickerEffortIsVerified = effortVerified(state);
+    const familyIsVerified = pickerFamilyIsVerified && closedPill.closedPillFamilyStatus !== "unverified";
+    const effortIsVerified = pickerEffortIsVerified && closedPill.closedPillEffortStatus !== "unverified";
     const items = state?.effortItems || [];
     const checked = items.find((item) => isChecked(item));
     const checkedLabel = checked ? fold(textOf(checked)) : null;
     const verifiedEffort = checked && checkedLabel === "pro" ? checked : null;
     const modelUsed = status === "current"
       ? (pill ? textOf(pill) : "")
-      : (familyIsVerified && effortIsVerified ? `GPT-5.6 Sol ${{textOf(verifiedEffort)}}` : null);
+      : (status === "selected" && pickerFamilyIsVerified && pickerEffortIsVerified ? `GPT-5.6 Sol ${{textOf(verifiedEffort)}}` : null);
     return {{
       requested,
       status,
       modelUsed,
       familyStatus: familyIsVerified ? "verified" : "unverified",
       effortStatus: effortIsVerified ? "verified" : "unverified",
+      ...closedPill,
+      pickerCloseMethod: pickerCloseMethods.length > 0 ? pickerCloseMethods.join("+") : null,
+      pickerCloseMethods,
+      pickerCloseVerification,
       pillText: textOf(pill),
       familyLabel: state?.familyLabel || null,
       availableItems: (state?.effortItems || []).map(textOf).filter(Boolean),
       availableFamilies: families || [],
       warning,
+      ...surfaceFields(),
       url: window.location.href || "",
       title: document.title || ""
     }};
   }}
 
-  const surface = await ensureChatSurface();
+  let surface = null;
+  function surfaceFields() {{
+    return {{
+      surfaceElapsedMs: surface?.elapsedMs ?? null,
+      surfaceAttempts: surface?.attempts ?? 0,
+      surfaceVerificationAttempts: surface?.verificationAttempts ?? 0,
+      surfaceState: surface?.state ?? surfaceState(null),
+      surfaceObservedValues: surface?.observedValues ?? []
+    }};
+  }}
+
+  surface = await ensureChatSurface();
   if (!surface.ok) return result("not-found", null, null, [], surface.warning);
   if (strategy === "current") {{
     const pill = await waitForPill();
@@ -638,6 +887,7 @@ async () => {{
       availableItems: [],
       availableFamilies: [],
       warning: "model pinning bypassed — answer may come from any model",
+      ...surfaceFields(),
       url: window.location.href || "",
       title: document.title || ""
     }};
@@ -669,24 +919,35 @@ async () => {{
   let families = [];
   if (!state) return result("not-found", pill, null, families, "ChatGPT GPT-5.6 model picker did not open");
 
-  if (!familyVerified(state)) {{
-    const submenu = await openFamilyMenu(state);
-    const familyItems = radios(submenu);
-    families = familyItems.map(textOf).filter(Boolean);
-    const sol = familyItems.find((item) => fold(textOf(item)) === "gpt-5.6 sol") || null;
-    if (!sol) {{
+  let familyProof = await readFamilyProof(state);
+  families = familyProof.families;
+  if (!familyProof.ok) {{
+    if (familyProof.checkedItems.length !== 1 || !familyProof.sol) {{
       await closeMenus(pill);
-      return result("not-found", pill, state, families, "GPT-5.6 Sol was not visible in the family submenu");
+      return result(
+        "not-found",
+        pill,
+        state,
+        families,
+        familyProof.checkedItems.length === 1
+          ? "GPT-5.6 Sol was not visible in the family submenu"
+          : "GPT-5.6 Sol family menu did not expose one checked model"
+      );
     }}
-    realClick(sol);
+    realClick(familyProof.sol);
     await wait(250);
     pill = await waitForPill();
     if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol");
     menu = await openMain(pill);
     state = menu ? readState(menu) : null;
     if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting GPT-5.6 Sol");
+    familyProof = await readFamilyProof(state);
+    families = familyProof.families.length > 0 ? familyProof.families : families;
+    if (!familyProof.ok) {{
+      await closeMenus(pill);
+      return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol family menu selection could not be verified");
+    }}
   }}
-
   if (!effortVerified(state)) {{
     const proTier = state.effortItems.find((item) => fold(textOf(item)) === "pro") || null;
     if (!proTier) {{
@@ -702,14 +963,27 @@ async () => {{
     if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting Pro effort");
   }}
 
+  familyProof = await readFamilyProof(state);
+  families = familyProof.families.length > 0 ? familyProof.families : families;
+  if (!familyProof.ok) {{
+    await closeMenus(pill);
+    return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol family menu could not be re-verified after effort selection");
+  }}
   const familyIsVerified = familyVerified(state);
   const effortIsVerified = effortVerified(state);
   if (!familyIsVerified || !effortIsVerified) {{
     await closeMenus(pill);
     return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol at verified Pro effort could not be confirmed in one picker pass");
   }}
-  if (!await closeMenus(pill)) {{
+  if (!await closeMenus(pill, state, {{ requireProPill: true }})) {{
     return result("selection-mismatch", pill, state, families, "ChatGPT model picker remained open after verification");
+  }}
+  const closedPill = closedPillDiagnostics(pill, state);
+  if (closedPill.closedPillFamilyStatus === "unverified") {{
+    return result("selection-mismatch", pill, state, families, "ChatGPT composer model pill reported another model family after closing the picker");
+  }}
+  if (closedPill.closedPillEffortStatus !== "verified") {{
+    return result("selection-mismatch", pill, state, families, "ChatGPT composer model pill did not confirm verified Pro effort");
   }}
   return result("selected", pill, state, families);
 }}
@@ -1379,20 +1653,37 @@ mod tests {
         assert!(script.contains(r#"const requested = "gpt-5-6-sol-chat-pro";"#));
         assert!(script.contains("classList.contains(\"__composer-pill\")"));
         assert!(script.contains(r#"[role="radiogroup"][aria-label="Select chat surface"]"#));
-        assert!(script.contains(r#"[role="radio"][data-tpp-toggle-value="chat"]"#));
+        assert!(script.contains(r#"[role="radio"][data-tpp-toggle-value="chatgpt"]"#));
         let surface_guard = script
-            .find("const surface = await ensureChatSurface();")
+            .find("surface = await ensureChatSurface();")
             .expect("generated picker includes the Chat surface guard");
         let family_picker = script
-            .find("if (!familyVerified(state))")
+            .find("let familyProof = await readFamilyProof(state);")
             .expect("generated picker includes family selection logic");
         assert!(surface_guard < family_picker);
+        assert!(script.contains("const SURFACE_SETTLE_TIMEOUT_MS = 1000;"));
+        assert!(script.contains("function surfaceObservedValues()"));
+        assert!(script.contains("surfaceVerificationAttempts"));
+        assert!(script.contains("surfaceObservedValues"));
+        assert!(script.contains("ariaChecked"));
+        assert!(script.contains("dataState"));
+        assert!(!script.contains("surfacePollTimeline"));
+        assert!(!script.contains("surfaceEnvironment"));
         assert!(script.contains(
             "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI"
         ));
         assert!(script.contains(r#"familyStatus: familyIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"effortStatus: effortIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"fold(textOf(item)) === "gpt-5.6 sol""#));
+        assert!(script.contains("async function readFamilyProof(state)"));
+        assert!(script.contains("item.getAttribute(\"aria-checked\") === \"true\""));
+        assert!(script.contains("state.familyProof = checkedItems.length === 1"));
+        assert!(script.contains("async function closeMenus(pill, state = null"));
+        assert!(script.contains("dispatchHoverLeaveEvents"));
+        assert!(script.contains("pickerCloseMethod"));
+        assert!(script.contains("function closedPillDiagnostics(pill, state)"));
+        assert!(script.contains("closedPillFamilyStatus"));
+        assert!(script.contains("closedPillEffortStatus"));
         // Ladder-aware effortVerified (yz-7p3.3 finding D): the verified set now
         // requires the visible Pro effort tier.
         assert!(script.contains("return checkedLabel === \"pro\";"));
@@ -1408,8 +1699,8 @@ mod tests {
             .contains("ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol"));
         assert!(script
             .contains("ChatGPT composer model pill did not remount after selecting Pro effort"));
-        assert!(script.contains("return visibleMenus().length === 0;"));
-        assert!(script.contains("if (!await closeMenus(pill))"));
+        assert!(script.contains("return verification.ok;"));
+        assert!(script.contains("if (!await closeMenus(pill, state"));
         assert!(!script.contains("if (families.length === 0 && state.familyTrigger)"));
         assert!(script.contains("await closeMenus"));
         assert!(!script.contains("model-switcher-gpt-5-4"));

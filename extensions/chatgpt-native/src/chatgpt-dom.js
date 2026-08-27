@@ -3,8 +3,13 @@ export const OWNERSHIP_ATTR = "data-yoetz-chatgpt-native-job";
 const DEFAULT_WAIT_TIMEOUT_MS = 15000;
 const DEFAULT_WAIT_INTERVAL_MS = 250;
 const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
+const DEFAULT_SURFACE_SETTLE_TIMEOUT_MS = 1000;
+const DEFAULT_SURFACE_SETTLE_INTERVAL_MS = 50;
 const CHATGPT_SOL_CHAT_PRO_MODEL = "gpt-5-6-sol-chat-pro";
 const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
+const CHAT_SURFACE_GROUP_SELECTOR = '[role="radiogroup"][aria-label="Select chat surface"]';
+const CHAT_SURFACE_CHAT_SELECTOR = '[role="radio"][data-tpp-toggle-value="chatgpt"]';
+const CHAT_SURFACE_WORK_SELECTOR = '[role="radio"][data-tpp-toggle-value="work"]';
 const MANUAL_HANDOFF_SHELL_SELECTORS = Object.freeze([
   "nav",
   "aside",
@@ -380,7 +385,8 @@ export async function configureModelState(root, job = {}) {
       closed_pill_text: null,
       failure_reason: surface.failure_reason,
       warning: surface.warning,
-      warnings: []
+      warnings: [],
+      ...surfaceResultFields(surface)
     };
   }
   if (modelSelectionStrategyForJob(job) === "current") {
@@ -413,9 +419,13 @@ export async function configureModelState(root, job = {}) {
       family_label: null,
       family_label_candidates: [],
       family_label_source: null,
+      picker_close_method: null,
+      picker_close_methods: [],
+      picker_close_verification: null,
       effort_options: [],
       warning: "model pinning bypassed — answer may come from any model",
-      warnings: []
+      warnings: [],
+      ...surfaceResultFields(surface)
     };
   }
 
@@ -448,40 +458,72 @@ export async function configureModelState(root, job = {}) {
     family_label: selection.family_label ?? null,
     family_label_candidates: selection.family_label_candidates ?? [],
     family_label_source: selection.family_label_source ?? null,
+    picker_close_method: selection.picker_close_method ?? null,
+    picker_close_methods: selection.picker_close_methods ?? [],
+    picker_close_verification: selection.picker_close_verification ?? null,
     effort_options: selection.effort_options ?? [],
     warning: warnings[0] ?? null,
-    warnings
+    warnings,
+    ...surfaceResultFields(surface)
   };
 }
 
 async function ensureChatSurface(root, options = {}) {
-  const timeoutMs = Number(options.timeoutMs ?? 30000);
+  const timing = surfaceTiming(options);
   const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const group = root.querySelector('[role="radiogroup"][aria-label="Select chat surface"]');
-    const chat = group?.querySelector('[role="radio"][data-tpp-toggle-value="chat"]');
-    const work = group?.querySelector('[role="radio"][data-tpp-toggle-value="work"]');
-    if (chat && work) {
-      if (chat.getAttribute("aria-checked") !== "true") {
-        realClick(chat);
-        await sleep(Number(options.actionSettleMs ?? 250));
+  let attempts = 0;
+  let observedValues = [];
+  while (Date.now() - startedAt < timing.timeoutMs) {
+    attempts += 1;
+    const controls = findChatSurfaceControls(root);
+    observedValues = observedSurfaceToggleValues(root);
+    if (controls) {
+      const state = surfaceSelectionState(controls.chat);
+      if (state.aria_checked === "true") {
+        return {
+          ok: true,
+          elapsed_ms: Math.max(0, Date.now() - startedAt),
+          attempts,
+          timeout_ms: timing.timeoutMs,
+          interval_ms: timing.intervalMs,
+          settle_timeout_ms: timing.settleTimeoutMs,
+          settle_interval_ms: timing.settleIntervalMs,
+          verification_attempts: 0,
+          state,
+          observed_values: observedValues
+        };
       }
-      const verified = group.querySelector('[role="radio"][data-tpp-toggle-value="chat"]');
-      if (verified?.getAttribute("aria-checked") === "true") {
-        return { ok: true, chat, work };
-      }
+
+      realClick(controls.chat);
+      const verification = await waitForChatSurfaceSelection(root, timing, startedAt);
       return {
-        ok: false,
-        failure_reason: "chat_surface_selection_mismatch",
-        warning: "ChatGPT Chat surface could not be verified after selection"
+        ...verification,
+        failure_reason: verification.ok ? undefined : "chat_surface_selection_mismatch",
+        warning: verification.ok ? undefined : "ChatGPT Chat surface could not be verified after selection",
+        elapsed_ms: Math.max(0, Date.now() - startedAt),
+        attempts: attempts + verification.attempts,
+        timeout_ms: timing.timeoutMs,
+        interval_ms: timing.intervalMs,
+        observed_values: verification.observed_values ?? observedValues
       };
     }
-    await sleep(Number(options.intervalMs ?? 250));
+    const remainingMs = timing.timeoutMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(timing.intervalMs, remainingMs));
   }
   return {
     ok: false,
     failure_reason: "chat_surface_control_not_found",
-    warning: 'ChatGPT Chat surface toggle not found or could not be read'
+    warning: 'ChatGPT Chat surface toggle not found or could not be read',
+    elapsed_ms: Math.max(0, Date.now() - startedAt),
+    attempts,
+    timeout_ms: timing.timeoutMs,
+    interval_ms: timing.intervalMs,
+    settle_timeout_ms: timing.settleTimeoutMs,
+    settle_interval_ms: timing.settleIntervalMs,
+    verification_attempts: 0,
+    state: surfaceSelectionState(null),
+    observed_values: observedValues
   };
 }
 
@@ -511,6 +553,95 @@ function modelSelectionOptionsForJob(job = {}) {
     options.intervalMs = intervalMs;
   }
   return options;
+}
+
+function surfaceTiming(options = {}) {
+  return {
+    timeoutMs: positiveMs(options.timeoutMs, 30000),
+    intervalMs: positiveMs(options.intervalMs, 250),
+    settleTimeoutMs: positiveMs(options.settleTimeoutMs, DEFAULT_SURFACE_SETTLE_TIMEOUT_MS),
+    settleIntervalMs: positiveMs(options.settleIntervalMs, DEFAULT_SURFACE_SETTLE_INTERVAL_MS)
+  };
+}
+
+function positiveMs(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function findChatSurfaceControls(root) {
+  const group = root?.querySelector?.(CHAT_SURFACE_GROUP_SELECTOR);
+  if (!group) return null;
+  const chat = group.querySelector(CHAT_SURFACE_CHAT_SELECTOR);
+  const work = group.querySelector(CHAT_SURFACE_WORK_SELECTOR);
+  return chat && work ? { group, chat, work } : null;
+}
+
+function observedSurfaceToggleValues(root) {
+  const group = root?.querySelector?.(CHAT_SURFACE_GROUP_SELECTOR);
+  const scope = group ?? root;
+  return Array.from(scope?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]') ?? [])
+    .map((node) => node?.getAttribute?.("data-tpp-toggle-value"))
+    .filter(Boolean)
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .slice(0, 10);
+}
+
+function surfaceSelectionState(node) {
+  return {
+    aria_checked: node?.getAttribute?.("aria-checked") ?? null,
+    data_state: node?.getAttribute?.("data-state") ?? null
+  };
+}
+
+async function waitForChatSurfaceSelection(root, timing, startedAt) {
+  const settleStartedAt = Date.now();
+  const remainingSelectionMs = Math.max(1, timing.timeoutMs - (settleStartedAt - startedAt));
+  const settleTimeoutMs = Math.min(timing.settleTimeoutMs, remainingSelectionMs);
+  let attempts = 0;
+  let controls = null;
+  let state = surfaceSelectionState(null);
+  let observedValues = [];
+  while (Date.now() - settleStartedAt < settleTimeoutMs) {
+    attempts += 1;
+    controls = findChatSurfaceControls(root);
+    state = surfaceSelectionState(controls?.chat);
+    observedValues = observedSurfaceToggleValues(root);
+    if (state.aria_checked === "true") {
+      return {
+        ok: true,
+        ...controls,
+        attempts,
+        verification_attempts: attempts,
+        state,
+        settle_timeout_ms: timing.settleTimeoutMs,
+        settle_interval_ms: timing.settleIntervalMs,
+        observed_values: observedValues
+      };
+    }
+    const remainingMs = settleTimeoutMs - (Date.now() - settleStartedAt);
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(timing.settleIntervalMs, remainingMs));
+  }
+  return {
+    ok: false,
+    attempts,
+    verification_attempts: attempts,
+    state,
+    settle_timeout_ms: timing.settleTimeoutMs,
+    settle_interval_ms: timing.settleIntervalMs,
+    observed_values: observedValues
+  };
+}
+
+function surfaceResultFields(surface) {
+  return {
+    surface_elapsed_ms: surface?.elapsed_ms ?? null,
+    surface_attempts: surface?.attempts ?? 0,
+    surface_verification_attempts: surface?.verification_attempts ?? 0,
+    surface_state: surface?.state ?? surfaceSelectionState(null),
+    surface_observed_values: surface?.observed_values ?? []
+  };
 }
 
 function modelSelectionStrategyForJob(job = {}) {
@@ -636,20 +767,23 @@ async function selectSolChatProModel(root, options = {}) {
       warning: "ChatGPT GPT-5.6 model picker did not open"
     };
   }
-  let ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
-  if (ambiguityFailure) return ambiguityFailure;
-
-  if (!familyIsSol(state.family_label)) {
-    const familyMenu = await openFamilyPicker(root, state.menu ?? state.surface, state.family_trigger, options);
-    const structuralFamilyMenu = familyMenu === structurallyOpenControlledSurfaceForTrigger(root, state.family_trigger);
-    availableFamilies = familyMenu ? familyMenuRadios(familyMenu, structuralFamilyMenu).map((item) => textOf(item)).filter(Boolean) : [];
-    const solOption = familyMenuRadios(familyMenu, structuralFamilyMenu)
-      .find((item) => foldedModelText(textOf(item)) === foldedModelText(CHATGPT_SOL_FAMILY_LABEL));
-    if (!solOption) {
+  let familyProof = await readCheckedSolFamily(root, state, options);
+  availableFamilies = familyProof.available_families;
+  if (!familyProof.ok) {
+    if (familyProof.checked_items.length !== 1 || !familyProof.sol_option) {
       await closeModelPicker(root, modelButton);
-      return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol was not visible in the family submenu", "model_family_not_found");
+      return selectionFailure(
+        base,
+        modelButton,
+        familyProof.state,
+        availableFamilies,
+        familyProof.checked_items.length === 1
+          ? "GPT-5.6 Sol was not visible in the family submenu"
+          : "GPT-5.6 Sol family menu did not expose one checked model",
+        familyProof.checked_items.length === 1 ? "model_family_not_found" : "model_family_menu_unverified"
+      );
     }
-    realClick(solOption);
+    realClick(familyProof.sol_option);
     await sleep(Number(options.actionSettleMs ?? 250));
     modelButton = await waitForModelButton(root, options);
     if (!modelButton) {
@@ -659,9 +793,14 @@ async function selectSolChatProModel(root, options = {}) {
     if (!state) {
       return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting GPT-5.6 Sol", "model_picker_reopen_failed");
     }
-    ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
-    if (ambiguityFailure) return ambiguityFailure;
+    familyProof = await readCheckedSolFamily(root, state, options);
+    availableFamilies = familyProof.available_families;
+    if (!familyProof.ok) {
+      await closeModelPicker(root, modelButton);
+      return selectionFailure(base, modelButton, familyProof.state, availableFamilies, "GPT-5.6 Sol family menu selection could not be verified", "model_family_selection_unverified");
+    }
   }
+  state = familyProof.state;
 
   if (!effortIsChatProTier(state)) {
     if (state.shape === "personal") {
@@ -700,32 +839,44 @@ async function selectSolChatProModel(root, options = {}) {
       if (!state) {
         return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting Pro effort", "model_picker_reopen_failed");
       }
-      ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
-      if (ambiguityFailure) return ambiguityFailure;
     }
   }
 
-  ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
-  if (ambiguityFailure) return ambiguityFailure;
+  familyProof = await readCheckedSolFamily(root, state, options);
+  availableFamilies = familyProof.available_families.length > 0 ? familyProof.available_families : availableFamilies;
+  if (!familyProof.ok) {
+    await closeModelPicker(root, modelButton);
+    return selectionFailure(base, modelButton, familyProof.state, availableFamilies, "GPT-5.6 Sol family menu could not be re-verified after effort selection", "model_family_selection_unverified");
+  }
+  state = familyProof.state;
   const familyVerified = familyIsSol(state.family_label);
   const effortVerified = effortIsChatProTier(state);
   if (!familyVerified || !effortVerified) {
     await closeModelPicker(root, modelButton);
     return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol at verified Pro effort could not be confirmed in one picker pass", "model_selection_verification_failed");
   }
-  if (!await closeModelPicker(root, modelButton)) {
+  const closeResult = await closeModelPickerResult(root, modelButton, state, { requireProPill: true });
+  state.picker_close_method = closeResult.method;
+  state.picker_close_methods = closeResult.methods;
+  state.picker_close_verification = closeResult.verification;
+  const closedPillOnlyFailure = closeResult.verification.picker_surface_closed
+    && closeResult.verification.family_trigger_closed
+    && !closeResult.verification.closed_pill_pro;
+  if (!closeResult.ok && !closedPillOnlyFailure) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
   }
   modelButton = await waitForModelButton(root, options);
   const pillText = modelControlLabel(modelButton);
   const verifiedEffortLabel = pickerVerifiedEffortLabel(state);
-  if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsFamilyLabel(pillText, state.family_label)) {
-    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm GPT-5.6 Sol after closing the slider picker", "family_composer_pill_unverified", { closedPill: true });
-  }
-  if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel)) {
-        return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", { closedPill: true });
-  }
   const closedPill = closedPillDiagnostics(pillText, state);
+  if ((state.shape === "slider" || state.shape === "personal")
+    && closedPill.closed_pill_family_status === "unverified") {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill reported another model family after closing the picker", "family_composer_pill_unverified", { closedPill: true });
+  }
+  if ((state.shape === "slider" || state.shape === "personal")
+    && closedPill.closed_pill_effort_status !== "verified") {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", { closedPill: true });
+  }
   const warnings = [];
 
   return {
@@ -745,25 +896,15 @@ async function selectSolChatProModel(root, options = {}) {
     family_label: state.family_label,
     family_label_candidates: state.family_label_candidates ?? [],
     family_label_source: state.family_label_source ?? null,
+    picker_close_method: closeResult.method,
+    picker_close_methods: closeResult.methods,
+    picker_close_verification: closeResult.verification,
     available_options: state.effort_items.map((item) => textOf(item)).filter(Boolean),
     available_families: availableFamilies,
     effort_options: effortDiagnostics(state.effort_items),
     warning: warnings[0] ?? null,
     warnings
   };
-}
-
-async function familyAmbiguityFailure(root, base, modelButton, state, availableFamilies) {
-  if (!state?.family_label_ambiguous) return null;
-  await closeModelPicker(root, modelButton);
-  return selectionFailure(
-    base,
-    modelButton,
-    state,
-    availableFamilies,
-    "ChatGPT family control exposed conflicting current-model labels",
-    "family_label_ambiguous"
-  );
 }
 
 async function waitForModelButton(root, options = {}) {
@@ -834,6 +975,28 @@ async function openFamilyPicker(root, mainMenu, trigger, options = {}) {
     }
   }
   return null;
+}
+
+async function readCheckedSolFamily(root, state, options = {}) {
+  const familyMenu = await openFamilyPicker(root, state?.menu ?? state?.surface, state?.family_trigger, options);
+  const structurallyTrusted = familyMenu === structurallyOpenControlledSurfaceForTrigger(root, state?.family_trigger);
+  const items = familyMenuRadios(familyMenu, structurallyTrusted);
+  const checkedItems = items.filter((item) => item.getAttribute?.("aria-checked") === "true");
+  const availableFamilies = items.map((item) => textOf(item)).filter(Boolean);
+  const checkedLabel = checkedItems.length === 1 ? normalizeText(textOf(checkedItems[0])) : "";
+  return {
+    ok: checkedItems.length === 1 && familyIsSol(checkedLabel),
+    state: {
+      ...state,
+      family_label: checkedLabel,
+      family_label_candidates: availableFamilies,
+      family_label_source: checkedItems.length === 1 ? "family_menu_checked" : null,
+      family_label_ambiguous: checkedItems.length > 1
+    },
+    sol_option: items.find((item) => familyIsSol(textOf(item))) ?? null,
+    checked_items: checkedItems,
+    available_families: availableFamilies
+  };
 }
 
 async function openWithHoverEvents(element, isOpen, options = {}) {
@@ -935,11 +1098,129 @@ function pressActivationKey(element, key) {
 }
 
 async function closeModelPicker(root, modelButton) {
-  for (let attempt = 0; attempt < 3 && findPickerState(root); attempt += 1) {
-    pressActivationKey(modelButton, "Escape");
-    await sleep(50);
+  return (await closeModelPickerResult(root, modelButton)).ok;
+}
+
+async function closeModelPickerResult(root, modelButton, state = null, options = {}) {
+  const methods = [];
+  let verification = pickerCloseVerification(root, modelButton, state, options);
+  const tryMethod = async (method, action) => {
+    methods.push(method);
+    try {
+      await action();
+    } catch {
+      // Continue to the next bounded close path and fail closed if needed.
+    }
+    verification = await waitForPickerClose(root, modelButton, state, options);
+    return verification;
+  };
+
+  if (!verification.ok) {
+    const currentButton = findModelButton(root) ?? modelButton;
+    verification = await tryMethod("escape", () => pressActivationKey(currentButton, "Escape"));
   }
-  return !findPickerState(root);
+
+  if (!verification.ok && !verification.picker_surface_closed) {
+    const familyTrigger = familyTriggerForPicker(root, state);
+    if (familyTrigger) {
+      const neutral = neutralComposerArea(root, modelButton);
+      verification = await tryMethod("hover_leave", () => dispatchHoverLeaveEvents(familyTrigger, neutral));
+      if (!verification.ok && !verification.picker_surface_closed) {
+        verification = await tryMethod("trigger_escape", () => pressActivationKey(familyTrigger, "Escape"));
+      }
+    }
+  }
+
+  if (!verification.ok && !verification.picker_surface_closed) {
+    const neutral = neutralComposerArea(root, modelButton);
+    if (neutral) {
+      verification = await tryMethod("neutral_click", () => realClick(neutral));
+    }
+  }
+
+  return {
+    ok: verification.ok,
+    method: methods.join("+") || "already_closed",
+    methods,
+    verification
+  };
+}
+
+async function waitForPickerClose(root, modelButton, state, options) {
+  let verification = pickerCloseVerification(root, modelButton, state, options);
+  const settleMs = Number(options.closeSettleMs ?? 50);
+  for (let attempt = 0; attempt < 3 && !verification.ok; attempt += 1) {
+    await sleep(settleMs);
+    verification = pickerCloseVerification(root, modelButton, state, options);
+  }
+  return verification;
+}
+
+function pickerCloseVerification(root, modelButton, state, options = {}) {
+  const currentButton = findModelButton(root) ?? (isMountedInRoot(root, modelButton) ? modelButton : null);
+  const familyTrigger = familyTriggerForPicker(root, state);
+  const familySurface = familySurfaceForPicker(root, state, familyTrigger);
+  const pickerState = findPickerState(root);
+  const familyTriggerOpen = isMountedInRoot(root, familyTrigger)
+    && (familyTrigger.getAttribute?.("aria-expanded") === "true"
+      || familyTrigger.getAttribute?.("data-state") === "open");
+  const modelTriggerOpen = isMountedInRoot(root, currentButton) && modelPickerTriggerIsOpen(currentButton);
+  const pickerSurfaceOpen = Boolean(pickerState) || Boolean(familySurface);
+  const pillText = modelControlLabel(currentButton);
+  const closedPillPro = options.requireProPill !== true || pillConfirmsEffortLabel(pillText, "Pro");
+  return {
+    family_trigger_closed: !familyTriggerOpen,
+    picker_surface_closed: !pickerSurfaceOpen,
+    model_trigger_closed: !modelTriggerOpen,
+    closed_pill_pro: closedPillPro,
+    closed_pill_text: pillText || null,
+    ok: !familyTriggerOpen && !pickerSurfaceOpen && !modelTriggerOpen && closedPillPro
+  };
+}
+
+function familyTriggerForPicker(root, state) {
+  const liveState = findPickerState(root);
+  const surface = liveState?.surface ?? liveState?.menu ?? state?.surface ?? state?.menu;
+  const candidate = Array.from(surface?.querySelectorAll?.('[role="menuitem"], button') ?? [])
+    .find((item) => item.getAttribute?.("aria-haspopup") === "menu"
+      && (/\bModel\b/i.test(textOf(item)) || /^(?:gpt|o\d)\b/i.test(normalizeText(textOf(item)))));
+  return candidate ?? liveState?.family_trigger ?? state?.family_trigger ?? null;
+}
+
+function familySurfaceForPicker(root, state, familyTrigger) {
+  const mainSurface = state?.menu ?? state?.surface;
+  const surface = findFamilySubmenu(root, mainSurface)
+    ?? structurallyOpenControlledSurfaceForTrigger(root, familyTrigger);
+  return isMountedInRoot(root, surface) ? surface : null;
+}
+
+function neutralComposerArea(root, modelButton) {
+  const composer = findComposer(root);
+  if (composer && composer !== modelButton) return composer;
+  return root.querySelector?.('[data-testid="composer"], form') ?? null;
+}
+
+function dispatchHoverLeaveEvents(element, relatedTarget) {
+  const rect = relatedTarget?.getBoundingClientRect?.() ?? { left: 0, top: 0, width: 1, height: 1 };
+  const clientX = Number(rect.left ?? 0) + Math.max(1, Number(rect.width ?? 1) / 2);
+  const clientY = Number(rect.top ?? 0) + Math.max(1, Number(rect.height ?? 1) / 2);
+  for (const [type, constructorName, init] of [
+    ["pointerleave", "PointerEvent", { pointerId: 1, pointerType: "mouse", isPrimary: true, relatedTarget, clientX, clientY }],
+    ["mouseleave", "MouseEvent", { relatedTarget, clientX, clientY }],
+    ["pointermove", "PointerEvent", { pointerId: 1, pointerType: "mouse", isPrimary: true, relatedTarget, clientX, clientY }],
+    ["mousemove", "MouseEvent", { relatedTarget, clientX, clientY }]
+  ]) {
+    dispatchSyntheticEvent(element, type, constructorName, init);
+  }
+}
+
+function isMountedInRoot(root, node) {
+  if (!node) return false;
+  if (node === root || node === root.body || node === root.documentElement) return true;
+  for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    if (ancestor === root || ancestor === root.body || ancestor === root.documentElement) return true;
+  }
+  return false;
 }
 
 async function waitForPickerState(root, options = {}) {
@@ -1157,6 +1438,9 @@ function readSliderPickerState(root, structurallyTrustedSurface = null) {
       const evidence = structurallyTrusted ? structuralFamilyEvidence(item) : null;
       const label = evidence?.label ?? normalizeText(textOf(item));
       if (evidence?.label || evidence?.ambiguous) familyEvidence = evidence;
+      if (item.getAttribute?.("aria-haspopup") === "menu" && /\bModel\b/i.test(textOf(item))) {
+        return structurallyTrusted || isVisible(item, { allowDisabled: true });
+      }
       return (evidence?.ambiguous || (Boolean(label) && /^(?:gpt|o\d)\b/i.test(label)))
         && (structurallyTrusted || isVisible(item, { allowDisabled: true }));
     });
@@ -1265,6 +1549,13 @@ function pillConfirmsFamilyLabel(pillText, familyLabel) {
   });
 }
 
+function pillHasModelFamilyToken(pillText) {
+  const foldedPill = foldedModelText(pillText).replace(/\s+/g, " ");
+  return /\bgpt[\s.-]*\d/.test(foldedPill)
+    || /\bo\d(?:[\s.-]*\d)?\b/.test(foldedPill)
+    || /\b\d+(?:\.\d+)+\b/.test(foldedPill);
+}
+
 function sliderEffortSnapshot(slider, surface = null) {
   if (!slider) return null;
   const valueText = normalizeText(slider.getAttribute?.("aria-valuetext") ?? "");
@@ -1301,11 +1592,14 @@ function closedPillDiagnostics(pillText, state) {
   const text = pillText ?? "";
   const familyLabel = state?.family_label ?? null;
   const effortLabel = pickerVerifiedEffortLabel(state);
+  const familyStatus = text && familyLabel
+    ? pillConfirmsFamilyLabel(text, familyLabel)
+      ? "verified"
+      : pillHasModelFamilyToken(text) ? "unverified" : "skipped"
+    : "skipped";
   return {
     closed_pill_text: text || null,
-    closed_pill_family_status: text && familyLabel
-      ? verificationStatus(pillConfirmsFamilyLabel(text, familyLabel))
-      : "skipped",
+    closed_pill_family_status: familyStatus,
     closed_pill_effort_status: text && effortLabel
       ? verificationStatus(pillConfirmsEffortLabel(text, effortLabel))
       : "skipped"
@@ -1529,6 +1823,9 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     family_menu_probe: state?.family_menu_probe ?? null,
     effort_control: effortControlDiagnostics(state),
     effort_move_method: state?.effort_move_method ?? null,
+    picker_close_method: state?.picker_close_method ?? null,
+    picker_close_methods: state?.picker_close_methods ?? [],
+    picker_close_verification: state?.picker_close_verification ?? null,
     pill_text: pillText,
     family_label: state?.family_label ?? null,
     family_label_candidates: state?.family_label_candidates ?? [],
