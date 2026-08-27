@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.59] - 2026-08-27
 ### Changed
 
 - ChatGPT recipes now force Chat mode and verify GPT-5.6 Sol with the literal Pro
@@ -18,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - Live browser recipes now use stable agent-browser tab ids and open marked tabs
   without navigating a user-owned tab.
+
 
 ## [0.5.58] - 2026-08-25
 ### Changed
