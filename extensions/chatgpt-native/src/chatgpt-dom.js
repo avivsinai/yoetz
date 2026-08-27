@@ -420,7 +420,6 @@ export async function configureModelState(root, job = {}) {
       family_label_candidates: [],
       family_label_source: null,
       picker_close_method: null,
-      picker_close_methods: [],
       picker_close_verification: null,
       effort_options: [],
       warning: "model pinning bypassed — answer may come from any model",
@@ -459,7 +458,6 @@ export async function configureModelState(root, job = {}) {
     family_label_candidates: selection.family_label_candidates ?? [],
     family_label_source: selection.family_label_source ?? null,
     picker_close_method: selection.picker_close_method ?? null,
-    picker_close_methods: selection.picker_close_methods ?? [],
     picker_close_verification: selection.picker_close_verification ?? null,
     effort_options: selection.effort_options ?? [],
     warning: warnings[0] ?? null,
@@ -857,7 +855,6 @@ async function selectSolChatProModel(root, options = {}) {
   }
   const closeResult = await closeModelPickerResult(root, modelButton, state, { requireProPill: true });
   state.picker_close_method = closeResult.method;
-  state.picker_close_methods = closeResult.methods;
   state.picker_close_verification = closeResult.verification;
   const closedPillOnlyFailure = closeResult.verification.picker_surface_closed
     && closeResult.verification.family_trigger_closed
@@ -897,7 +894,6 @@ async function selectSolChatProModel(root, options = {}) {
     family_label_candidates: state.family_label_candidates ?? [],
     family_label_source: state.family_label_source ?? null,
     picker_close_method: closeResult.method,
-    picker_close_methods: closeResult.methods,
     picker_close_verification: closeResult.verification,
     available_options: state.effort_items.map((item) => textOf(item)).filter(Boolean),
     available_families: availableFamilies,
@@ -1141,7 +1137,6 @@ async function closeModelPickerResult(root, modelButton, state = null, options =
   return {
     ok: verification.ok,
     method: methods.join("+") || "already_closed",
-    methods,
     verification
   };
 }
@@ -1824,7 +1819,6 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     effort_control: effortControlDiagnostics(state),
     effort_move_method: state?.effort_move_method ?? null,
     picker_close_method: state?.picker_close_method ?? null,
-    picker_close_methods: state?.picker_close_methods ?? [],
     picker_close_verification: state?.picker_close_verification ?? null,
     pill_text: pillText,
     family_label: state?.family_label ?? null,
