@@ -1984,7 +1984,7 @@ fn run_chatgpt_select_model(
     use_stealth: bool,
     headed: bool,
 ) -> Result<String> {
-    let requested_model = crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL;
+    let requested_model = crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL;
     let function = chatgpt_web::build_model_selection_function(
         requested_model,
         chatgpt_recipe::ChatgptModelStrategy::Select,
@@ -6031,7 +6031,7 @@ mod tests {
             warnings: Vec::new(),
             vars: BTreeMap::from([(
                 "model".to_string(),
-                crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL.to_string(),
+                crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL.to_string(),
             )]),
         }
     }
@@ -6179,7 +6179,7 @@ case "$*" in
     count=$((count + 1))
     printf '%s' "$count" > "$EVAL_COUNT_PATH"
     if [ "$count" = "1" ]; then
-      printf '{"status":"selected","requested":"gpt-5-6-sol-account-max","modelUsed":"GPT-5.6 Sol Extra High","familyStatus":"verified","effortStatus":"verified"}'
+      printf '{"status":"selected","requested":"gpt-5-6-sol-chat-pro","modelUsed":"GPT-5.6 Sol Pro","familyStatus":"verified","effortStatus":"verified"}'
     elif [ "$count" = "2" ]; then
       printf '{"status":"marked"}'
     else
@@ -6210,7 +6210,7 @@ if %errorlevel%==0 (
   set /a count=count+1
   > "%EVAL_COUNT_PATH%" echo !count!
   if "!count!"=="1" (
-    echo {"status":"selected","requested":"gpt-5-6-sol-account-max","modelUsed":"GPT-5.6 Sol Extra High","familyStatus":"verified","effortStatus":"verified"}
+    echo {"status":"selected","requested":"gpt-5-6-sol-chat-pro","modelUsed":"GPT-5.6 Sol Pro","familyStatus":"verified","effortStatus":"verified"}
   ) else if "!count!"=="2" (
     echo {"status":"marked"}
   ) else (
@@ -7109,7 +7109,7 @@ browser_cdp = "http://evil.example.com:9222"
     fn interpolate_replaces_bundle_and_recipe_vars() {
         let ctx = recipe_context();
         let value = interpolate("open {{bundle_path}} {{model}}", &ctx, Some("ignored")).unwrap();
-        assert_eq!(value, "open /tmp/bundle.md gpt-5-6-sol-account-max");
+        assert_eq!(value, "open /tmp/bundle.md gpt-5-6-sol-chat-pro");
     }
 
     #[test]
@@ -8075,7 +8075,7 @@ steps:
                 "action": CHATGPT_SELECT_MODEL_ACTION,
                 "stdout": {
                     "status": "ok",
-                    "model_used": "GPT-5.6 Sol Extra High",
+                    "model_used": "GPT-5.6 Sol Pro",
                     "model_selection_status": "selected"
                 }
             }),
@@ -8094,7 +8094,7 @@ steps:
         assert_eq!(payload["transport"], "agent-browser");
         assert_eq!(payload["backend"], "agent-browser");
         assert_eq!(payload["response"], "final answer");
-        assert_eq!(payload["model_used"], "GPT-5.6 Sol Extra High");
+        assert_eq!(payload["model_used"], "GPT-5.6 Sol Pro");
         assert_eq!(payload["model_selection_status"], "selected");
         assert_eq!(payload["fallback_used"], true);
         assert_eq!(payload["warnings"], json!(["used paste fallback"]));

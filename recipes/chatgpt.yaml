@@ -51,10 +51,10 @@ name: chatgpt
 # transports connect directly to Chrome via CDP.
 #
 # Variables:
-#   This recipe supports exactly one ChatGPT target: GPT-5.6 Sol at the account maximum tier.
+#   This recipe supports exactly one ChatGPT target: GPT-5.6 Sol at Chat effort Pro.
 #   `model` and `extended` overrides are intentionally unsupported.
 #   Selection is fail-closed unless the picker proves both the GPT-5.6 Sol
-#              family and a known max-tier label (Pro or Extra High) in one verification pass.
+#              family and the literal Pro effort tier in one verification pass.
 #              model-switcher DOM is rejected with a diagnostic breadcrumb.
 #   prompt   — prompt text to send with the attachment. For Yoetz bundle
 #              sessions, typed ChatGPT transports default this to bundle.json's

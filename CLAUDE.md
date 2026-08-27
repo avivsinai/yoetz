@@ -84,21 +84,15 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 
 ## Browser Architecture
 
-- The built-in ChatGPT recipe pins GPT-5.6 Sol at the account's verified maximum
-  effort tier. For the personal/Pro picker, the target is the literal `Max` tier;
-  `Extra High` is acceptable proof ONLY when `Max` is absent from the observed
-  ladder. For the Enterprise `Pro` picker, the target is unchanged. `Ultra` is
-  recognized in the ladder but NEVER clicked/selected by the recipe: if `Ultra`
-  is the user's preset selection, accept it as at-or-above-`Max` proof with a
-  diagnostic (do not downgrade an operator's own choice; do not escalate to it).
-  Slider stale-ceiling fall-through: a slider whose ceiling is not `Max`/`Pro` is
-  a stale view; fall through Advanced -> Effort row -> opened ladder -> select
-  `Max` -> re-verify. The requested model id is
-  `gpt-5-6-sol-account-max` (semantic: Sol at account maximum; honest on both
-  Enterprise `Pro` and personal `Max`). Selection remains fail-closed on the
-  family and the literal `Max`/`Pro` tier; unknown top tiers are rejected. Speed
-  and the Faster/Smarter power slider stay at the user's default and are never
-  toggled by selection.
+- The built-in ChatGPT recipe pins GPT-5.6 Sol at Chat effort Pro. The recipe
+  first verifies `role=radiogroup[aria-label="Select chat surface"]`
+  and forces the `Chat` radio (`data-tpp-toggle-value="chat"`), then selects
+  `GPT-5.6 Sol` with the literal `Pro` effort tier. Every click is followed by a
+  fresh `aria-checked` read for the surface, model, and effort; missing controls,
+  Work mode, another family, or another effort tier fail closed. The requested
+  model id is `gpt-5-6-sol-chat-pro`, and `model_used` is the verified
+  `GPT-5.6 Sol Pro` label. Speed and the Faster/Smarter power slider stay at the
+  user's default and are never toggled by selection.
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
 - Extension-free by default. Preferred live-Chrome transport order:

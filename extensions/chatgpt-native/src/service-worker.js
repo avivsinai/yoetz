@@ -554,7 +554,6 @@ function modelSelectionFailureDiagnostics(selection) {
     "picker_shape",
     "surface_trust",
     "surface_descendants",
-    "max_effort_label",
     "advanced_rows",
     "checkbox_probe",
     "family_menu_probe",

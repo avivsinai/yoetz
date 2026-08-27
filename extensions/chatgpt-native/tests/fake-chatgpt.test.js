@@ -125,6 +125,10 @@ class FakeElement {
     return flatten(this).filter((element) => element !== this && matchesSelector(element, selector));
   }
 
+  querySelector(selector) {
+    return this.querySelectorAll(selector)[0] ?? null;
+  }
+
   closest(selector) {
     let current = this;
     while (current) {
@@ -193,9 +197,40 @@ class FakeDocument {
     return this.documentElement.querySelectorAll(selector);
   }
 
+  querySelector(selector) {
+    return this.documentElement.querySelector(selector);
+  }
+
   getElementById(id) {
     return flatten(this.documentElement).find((element) => element.getAttribute?.("id") === id) ?? null;
   }
+}
+
+function appendChatSurfaceToggle(body, { surface = "chat", chatClickUpdates = true } = {}) {
+  const chat = new FakeElement("button", {
+    role: "radio",
+    "data-tpp-toggle-value": "chat",
+    "aria-checked": String(surface === "chat"),
+    onClick: () => {
+      if (!chatClickUpdates) return;
+      chat.setAttribute("aria-checked", "true");
+      work.setAttribute("aria-checked", "false");
+    }
+  }, "Chat");
+  const work = new FakeElement("button", {
+    role: "radio",
+    "data-tpp-toggle-value": "work",
+    "aria-checked": String(surface === "work"),
+    onClick: () => {
+      chat.setAttribute("aria-checked", "false");
+      work.setAttribute("aria-checked", "true");
+    }
+  }, "Work");
+  body.append(new FakeElement("div", {
+    role: "radiogroup",
+    "aria-label": "Select chat surface"
+  }).append(chat, work));
+  return { chat, work };
 }
 
 class FakeDataTransfer {
@@ -711,7 +746,7 @@ test("extractResponse ignores ChatGPT model status text when assistant content i
 });
 
 test("extractResponse recognizes new GPT-5.6 picker labels only as whole-line status chrome", () => {
-  for (const status of ["Sol", "Instant", "Medium", "High", "Extra High", "Pro", "Max", "GPT-5.6 Sol", "5.6 Pro", "5.5 Extra High", "5.6 Sol Max"]) {
+  for (const status of ["Sol", "Instant", "Medium", "High", "Pro", "GPT-5.6 Sol", "5.6 Pro", "5.5 High"]) {
     const assistant = new FakeElement("article", { "data-message-author-role": "assistant" }, status)
       .append(new FakeElement("button", { "aria-label": "Copy" }, "Copy"));
     const doc = new FakeDocument(new FakeElement("body", {}, status).append(assistant));
@@ -2324,27 +2359,79 @@ test("clickSend reports disabled send controls distinctly from missing controls"
   assert.equal(send.clicked, false);
 });
 
+test("ChatGPT model selection fails closed when the Chat surface control is absent", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    includeChatSurface: false
+  });
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(fixture.mainOpens(), 0);
+  assert.deepEqual(fixture.pill.events, []);
+});
+
+test("ChatGPT model selection switches Work to Chat before selecting Sol Pro", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    surface: "work"
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(fixture.surface.chat.getAttribute("aria-checked"), "true");
+  assert.equal(fixture.surface.work.getAttribute("aria-checked"), "false");
+  assert.equal(fixture.surface.chat.events.includes("click"), true);
+  assert.equal(fixture.mainOpens(), 1);
+});
+
+test("ChatGPT model selection fails closed when Work cannot switch to Chat", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    surface: "work",
+    chatClickUpdates: false
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "chat_surface_selection_mismatch");
+  assert.equal(fixture.surface.chat.events.includes("click"), true);
+  assert.equal(fixture.surface.work.getAttribute("aria-checked"), "true");
+  assert.equal(fixture.mainOpens(), 0);
+});
+
 test("GPT-5.6 Sol picker rejects checked GPT-5.5 Pro Extended as stale", async () => {
   const fixture = makeSolPickerFixture({ family: "GPT-5.5", effort: "Pro Extended" });
 
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
-  assert.equal(result.requested_model, "gpt-5-6-sol-account-max");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.requested_model, "gpt-5-6-sol-chat-pro");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.familyClicks(), 1);
-  assert.equal(fixture.effortClicks(), 0, "family switch should preserve the Extra High tier");
+  assert.equal(fixture.effortClicks(), 1, "family switch must select the verified Pro tier");
 });
 
-test("GPT-5.6 Sol picker upgrades High effort to Extra High and verifies both proofs", async () => {
+test("GPT-5.6 Sol picker upgrades High effort to Pro and verifies both proofs", async () => {
   const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "High" });
 
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.familyClicks(), 0);
@@ -2364,7 +2451,7 @@ test("restored ChatGPT model selection closes an open picker before restart", as
   assert.equal(fixture.menusOpen(), 0);
 });
 
-test("GPT-5.6 Sol picker switches GPT-5.5 Instant to Sol Extra High", async () => {
+test("GPT-5.6 Sol picker switches GPT-5.5 Instant to Sol Pro", async () => {
   const fixture = makeSolPickerFixture({
     family: "GPT-5.5",
     effort: "Instant",
@@ -2374,7 +2461,7 @@ test("GPT-5.6 Sol picker switches GPT-5.5 Instant to Sol Extra High", async () =
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.familyClicks(), 1);
@@ -2389,7 +2476,7 @@ test("GPT-5.6 Sol picker recovers from the o3 family", async () => {
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.familyClicks(), 1);
@@ -2397,13 +2484,13 @@ test("GPT-5.6 Sol picker recovers from the o3 family", async () => {
   assert.equal(fixture.menusOpen(), 0);
 });
 
-test("GPT-5.6 Sol picker verifies already-correct state with one menu open", async () => {
-  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Extra High" });
+test("GPT-5.6 Sol picker verifies already-correct Pro state with one menu open", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
 
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.model_used, "GPT-5.6 Sol Extra High");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.deepEqual(result.available_families, []);
@@ -2420,7 +2507,7 @@ test("GPT-5.6 Sol picker accepts an Enterprise Pro maximum and reports the actua
 
   assert.equal(result.status, "selected");
   assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.requested_model, "gpt-5-6-sol-account-max");
+  assert.equal(result.requested_model, "gpt-5-6-sol-chat-pro");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(fixture.effortClicks(), 0);
@@ -2468,6 +2555,7 @@ test("GPT-5.6 Sol picker fails loudly on the legacy model-switcher DOM", async (
   }, "Pro Extended");
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
   const body = new FakeElement("body", {}, "Ask anything Pro Extended").append(form, legacyButton);
+  appendChatSurfaceToggle(body);
   const doc = new FakeDocument(body);
 
   const result = await configureModelState(doc, {
@@ -2490,32 +2578,32 @@ test("GPT-5.6 Sol Advanced picker moves the scoped effort slider with End", asyn
   assert.equal(result.status, "selected");
   assert.equal(result.picker_shape, "slider");
   assert.equal(result.effort_move_method, "keyboard_end");
-  assert.equal(result.effort_control.value_text, "Extra High, 5 of 5");
+  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
   assert.deepEqual(fixture.keyAttempts(), ["End"]);
   assert.equal(fixture.pointerAttempts(), 0);
   assert.equal(fixture.pickerOpen(), false);
-  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+  assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
 test("GPT-5.6 Sol Advanced picker verifies the live two-line composer pill", async () => {
   const fixture = makeSolSliderFixture({
-    levels: ["Instant", "Medium", "High", "Heavy", "Extra High"],
+    levels: ["Instant", "Medium", "High", "Heavy", "Pro"],
     initialValue: 5,
     pillFamilyLabel: "5.6 Sol"
   });
-  assert.equal(fixture.pill.innerText, "5.6 Sol\nExtra High");
+  assert.equal(fixture.pill.innerText, "5.6 Sol\nPro");
 
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.effort_control.label, "extra high");
-  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+  assert.equal(result.effort_control.label, "pro");
+  assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
 test("GPT-5.6 Sol Advanced picker upgrades the live two-line Light pill", async () => {
   const fixture = makeSolSliderFixture({
     keyboardMode: "end",
-    levels: ["Instant", "Light", "Standard", "Heavy", "Extra High"],
+    levels: ["Instant", "Light", "Standard", "Heavy", "Pro"],
     initialValue: 2,
     pillFamilyLabel: "5.6 Sol"
   });
@@ -2524,16 +2612,16 @@ test("GPT-5.6 Sol Advanced picker upgrades the live two-line Light pill", async 
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.effort_control.label, "extra high");
-  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+  assert.equal(result.effort_control.label, "pro");
+  assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
-test("GPT-5.6 Sol Advanced picker accepts an already-max Extra High slider without moving (stale-snapshot regression)", async () => {
+test("GPT-5.6 Sol Advanced picker accepts an already-Pro slider without moving (stale-snapshot regression)", async () => {
   // Reproduces the 2026-08-25 live failure (dump: /tmp/amq-effort-slider-move-failed-diagnostics.txt):
-  // the structural slider is already at 5/5 Extra High (effortIsMaxTier true on fresh read),
-  // but the move loop saw effortIsMaxTier false on every iteration (effort_move_method null)
+  // the structural slider is already at 5/5 Pro on a fresh read, but the move
+  // loop used to miss that state and report no movement method.
   // while selectionFailure recomputed verified on the final state. Under current semantics
-  // this run must PASS as Extra High without entering the move loop at all.
+  // this run must pass as Pro without entering the move loop at all.
   const fixture = makeSolSliderFixture({
     backgroundFrozen: true,
     initialValue: 5,
@@ -2547,18 +2635,18 @@ test("GPT-5.6 Sol Advanced picker accepts an already-max Extra High slider witho
   assert.equal(result.effort_move_method, null);
   assert.equal(result.effort_control.value_now, 4);
   assert.equal(result.effort_control.value_max, 4);
-  assert.equal(result.effort_control.label, "extra high");
+  assert.equal(result.effort_control.label, "pro");
   assert.equal(result.effort_status, "verified");
   assert.equal(result.picker_effort_status, "verified");
   assert.deepEqual(fixture.keyAttempts(), []);
-  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+  assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
-test("GPT-5.6 Sol structural slider moves from below max to Extra High and verifies (move-loop regression)", async () => {
+test("GPT-5.6 Sol structural slider moves from below max to Pro and verifies (move-loop regression)", async () => {
   // The 2026-08-25 live failure (dump: /tmp/amq-effort-slider-move-failed-diagnostics.txt) showed
-  // effort_slider_move_failed while the final state verified Extra High. This exercises the move
+  // effort_slider_move_failed while the final state verified Pro. This exercises the move
   // loop on the structural (backgroundFrozen) path starting below max: End must move the slider to
-  // 5/5 Extra High and the in-loop findPickerState read must recognize the verified max.
+  // 5/5 Pro and the in-loop findPickerState read must recognize the verified target.
   const fixture = makeSolSliderFixture({
     backgroundFrozen: true,
     initialValue: 3,
@@ -2570,11 +2658,11 @@ test("GPT-5.6 Sol structural slider moves from below max to Extra High and verif
   assert.equal(result.status, "selected", JSON.stringify(result));
   assert.equal(result.picker_shape, "slider");
   assert.equal(result.effort_move_method, "keyboard_end");
-  assert.equal(result.effort_control.label, "extra high");
+  assert.equal(result.effort_control.label, "pro");
   assert.equal(result.effort_status, "verified");
   assert.equal(result.picker_effort_status, "verified");
   assert.deepEqual(fixture.keyAttempts(), ["End"]);
-  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
+  assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
 test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum", async () => {
@@ -2587,132 +2675,12 @@ test("GPT-5.6 Sol Advanced picker accepts Pro at the Enterprise slider maximum",
 
   assert.equal(result.status, "selected");
   assert.equal(result.model_used, "GPT-5.6 Sol Pro");
-  assert.equal(result.requested_model, "gpt-5-6-sol-account-max");
+  assert.equal(result.requested_model, "gpt-5-6-sol-chat-pro");
   assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
   assert.equal(result.pill_text, "5.6 Sol\nPro");
 });
 
-test("GPT-5.6 Sol six-tier ladder: stale Extra High slider falls through Advanced -> Effort submenu and selects Max", async () => {
-  // Fixture 1 (from the 2026-08-25 live dump): the simple slider is stale at 4/4
-  // "Extra High" (five-tier simple view) while the real six-tier ladder
-  // (Light/Medium/High/Extra High/Max/Ultra) lives behind the Advanced -> Effort
-  // row submenu. The recipe must detect the stale ceiling, drive the Effort row,
-  // read the OPENED submenu ladder, select the Max row, and re-verify.
-  const fixture = makeSixTierLadderFixture({});
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected", JSON.stringify(result));
-  assert.equal(result.picker_shape, "slider");
-  assert.equal(result.model_used, "GPT-5.6 Sol Max");
-  assert.equal(result.requested_model, "gpt-5-6-sol-account-max");
-  assert.equal(result.effort_status, "verified");
-  assert.equal(result.picker_effort_status, "verified");
-  assert.equal(result.effort_move_method, "effort_submenu_max_select");
-  assert.equal(fixture.effortRowClicks(), 1, "Effort row must be opened once");
-  assert.equal(fixture.maxClicks(), 1, "Max row must be selected");
-  assert.equal(result.pill_text, "5.6 Sol\nMax");
-  assert.equal(fixture.effortMenuOpen(), false, "Effort submenu must close after selecting Max");
-});
-
-test("GPT-5.6 Sol six-tier ladder: accepting a stale Extra High ceiling when Max IS present must fail", async () => {
-  // Negative test (fixture 2): an implementation that accepts the stale slider
-  // ceiling (Extra High when Max IS present in the ladder) must FAIL closed. The
-  // recipe must not accept Extra High here; it must fall through to the Effort
-  // submenu. We simulate Max being present but unverifiable (click does not land)
-  // so the fall-through cannot complete and selection fails closed naming Max.
-  const fixture = makeSixTierLadderFixture({ maxVerifiable: false });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "unavailable", JSON.stringify(result));
-  assert.equal(result.failure_reason, "effort_slider_move_failed");
-  assert.equal(result.picker_shape, "slider");
-  // The failure message must name Max, not imply Extra High is the ceiling.
-  assert.match(result.warning ?? "", /Max/i);
-  assert.equal(fixture.effortRowClicks(), 1, "Effort row must be opened in the fall-through");
-  assert.equal(fixture.maxClicks(), 1, "Max row must be attempted");
-});
-
-test("GPT-5.6 Sol six-tier ladder: Max visible but unverifiable fails closed naming Max", async () => {
-  // Fixture 3: the Effort submenu ladder contains Max, the recipe selects the Max
-  // row, but the selection does not verify (Max visible but unverifiable). The
-  // recipe must fail closed and the diagnostics must name Max as the target.
-  const fixture = makeSixTierLadderFixture({ maxVerifiable: false });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "unavailable", JSON.stringify(result));
-  assert.equal(result.failure_reason, "effort_slider_move_failed");
-  assert.match(result.warning ?? "", /Max/i);
-  assert.equal(result.effort_move_method ?? null, null);
-});
-
-test("GPT-5.6 Sol six-tier ladder: a preset Ultra effort is accepted as at-or-above-Max proof without clicking", async () => {
-  // Fixture 4 (Ultra policy): Ultra is already the user's preset selection. The
-  // recipe must accept it as at-or-above-Max proof with a diagnostic note, never
-  // click/escalate, and never downgrade. Status selected/verified, no Max click.
-  const fixture = makeSixTierLadderFixture({ presetEffort: "Ultra" });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected", JSON.stringify(result));
-  assert.equal(result.effort_status, "verified");
-  assert.equal(result.picker_effort_status, "verified");
-  assert.equal(result.ultra_preset, true);
-  assert.equal(result.ladder_max_absent, false);
-  assert.ok(result.warnings?.some((w) => /Ultra/i.test(w)), "must carry an Ultra preset diagnostic");
-  assert.equal(fixture.maxClicks(), 0, "must never click Max (no escalation)");
-  assert.equal(fixture.effortRowClicks(), 1, "Effort row opened to read the ladder");
-  assert.equal(result.pill_text, "5.6 Sol\nUltra");
-});
-
-test("GPT-5.6 Sol six-tier ladder: five-tier Effort submenu with Max genuinely absent accepts Extra High (yz-7p3.3 finding A)", async () => {
-  // A legacy five-tier Effort submenu (Max genuinely absent) that is visible but
-  // unlinked (no aria-controls) must still be RECOGNIZED by findEffortSubmenu so
-  // the maxAbsent branch can accept Extra High. findEffortSubmenu must not require
-  // "max" to be present (recognition is >=2 known ladder labels; maxAbsent is
-  // decided AFTER, from the labels).
-  const fixture = makeSixTierLadderFixture({
-    effortLadder: ["Light", "Medium", "High", "Extra High"],
-    presetEffort: "Extra High",
-    sliderCeiling: "Extra High"
-  });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  assert.equal(result.status, "selected", JSON.stringify(result));
-  assert.equal(result.effort_status, "verified");
-  assert.equal(result.picker_effort_status, "verified");
-  assert.equal(result.ladder_max_absent, true, "Max must be proven absent from the opened ladder");
-  assert.equal(result.pill_text, "5.6 Sol\nExtra High");
-  assert.equal(fixture.maxClicks(), 0, "Max is absent; nothing to click");
-});
-
-test("GPT-5.6 Sol six-tier ladder: openEffortSubmenu returns a resolved menu, not an unawaited Promise (yz-7p3.5 regression guard)", async () => {
-  // Regression guard for the wave-2 worker bug: waitForEffortSubmenu is async and
-  // returns a Promise; an unawaited call used as a truthy menu would make
-  // effortSubmenuLadderLabels(Promise) return [] and silently mis-classify the
-  // ladder. This test asserts the submenu menu node is a real DOM-like object with
-  // querySelectorAll (i.e. await was honored) by driving the fall-through and
-  // checking the ladder labels were actually read (Max present, selected).
-  const fixture = makeSixTierLadderFixture({
-    presetEffort: "Extra High",
-    sliderCeiling: "Extra High"
-  });
-
-  const result = await configureModelState(fixture.doc, {});
-
-  // If the submenu Promise were used unawaited, labels would be [] and the
-  // stale Extra High ceiling would be accepted with ladder_max_absent:true
-  // instead of selecting Max. Asserting Max was selected proves the menu was
-  // resolved before reading labels.
-  assert.equal(result.status, "selected", JSON.stringify(result));
-  assert.equal(result.ladder_max_absent, false, "Max IS present; an unawaited submenu Promise would wrongly report it absent");
-  assert.equal(fixture.maxClicks(), 1, "Max was selected from the resolved submenu");
-});
-
-test("GPT-5.6 Sol personal picker fails closed when the closed pill is effort-only", async () => {
+ test("GPT-5.6 Sol personal picker fails closed when the closed pill is effort-only", async () => {
   const fixture = makePersonalPickerFixture({ pillFamilyLabel: "" });
 
   const result = await configureModelState(fixture.doc, {});
@@ -2726,10 +2694,10 @@ test("GPT-5.6 Sol personal picker fails closed when the closed pill is effort-on
   assert.equal(result.closed_pill_effort_status, "verified");
   assert.equal(result.family_status, "unverified");
   assert.equal(result.effort_status, "verified");
-  assert.equal(result.closed_pill_text, "Max");
+  assert.equal(result.closed_pill_text, "Pro");
 });
 
-test("GPT-5.6 Sol personal picker verifies Effort Max without moving the power slider", async () => {
+test("GPT-5.6 Sol personal picker verifies Effort Pro without moving the power slider", async () => {
   const fixture = makePersonalPickerFixture();
 
   const result = await configureModelState(fixture.doc, {});
@@ -2738,11 +2706,11 @@ test("GPT-5.6 Sol personal picker verifies Effort Max without moving the power s
   assert.equal(result.picker_shape, "personal");
   assert.equal(result.surface_trust, "aria_controls_structural");
   assert.equal(result.family_label, "GPT-5.6 Sol");
-  assert.equal(result.model_used, "GPT-5.6 Sol Max");
-  assert.equal(result.effort_control.value_text, "Max");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.effort_control.value_text, "Pro");
   assert.equal(result.picker_family_status, "verified");
   assert.equal(result.closed_pill_family_status, "verified");
-  assert.equal(result.closed_pill_text, "5.6 Sol\nMax");
+  assert.equal(result.closed_pill_text, "5.6 Sol\nPro");
   assert.equal(result.effort_move_method, null);
   assert.deepEqual(fixture.keyAttempts(), []);
   assert.equal(fixture.sliderValue(), 2);
@@ -2757,7 +2725,7 @@ test("GPT-5.6 Sol personal picker trusts a Radix wrapper whose inner menu is ope
   assert.equal(result.status, "selected", JSON.stringify(result));
   assert.equal(result.picker_shape, "personal");
   assert.equal(result.surface_trust, "aria_controls_structural");
-  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.deepEqual(fixture.keyAttempts(), []);
   assert.equal(fixture.sliderValue(), 2);
 });
@@ -2770,20 +2738,20 @@ test("GPT-5.6 Sol personal picker classifies a visible simple picker", async () 
   assert.equal(result.status, "selected", JSON.stringify(result));
   assert.equal(result.picker_shape, "personal");
   assert.equal(result.surface_trust, "visible");
-  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.deepEqual(fixture.keyAttempts(), []);
 });
 
 test("GPT-5.6 Sol personal picker upgrades High effort via the Effort row", async () => {
   const fixture = makePersonalPickerFixture({
     effort: "High",
-    effortOptions: ["Standard", "High", "Max"]
+    effortOptions: ["Standard", "High", "Pro"]
   });
 
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected", JSON.stringify(result));
-  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.effort_move_method, "effort_row_select");
   assert.equal(fixture.effortClicks(), 1);
   assert.deepEqual(fixture.keyAttempts(), []);
@@ -2823,8 +2791,8 @@ test("GPT-5.6 Sol personal picker ignores a retained closed menu sibling", async
 
   assert.equal(result.status, "selected", JSON.stringify(result));
   assert.equal(result.picker_shape, "personal");
-  assert.equal(result.model_used, "GPT-5.6 Sol Max");
-  assert.equal(result.effort_control.value_text, "Max");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.effort_control.value_text, "Pro");
   assert.equal(modelSelectionDiagnostics(fixture.doc).picker_shape, null);
 });
 
@@ -2838,7 +2806,7 @@ test("GPT-5.6 Sol personal picker does not rediscover a mounted closed Radix wra
 
   assert.equal(result.status, "selected", JSON.stringify(result));
   assert.equal(result.picker_shape, "personal");
-  assert.equal(result.model_used, "GPT-5.6 Sol Max");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.failure_reason, null);
   assert.equal(fixture.wrapperMounted(), true);
   assert.equal(fixture.nestedMenuState(), "closed");
@@ -2856,7 +2824,7 @@ test("GPT-5.6 Sol Advanced picker waits for an expanded Radix surface to finish 
   assert.equal(result.status, "selected");
   assert.equal(result.picker_shape, "slider");
   assert.equal(result.effort_move_method, "keyboard_end");
-  assert.equal(result.effort_control.value_text, "Extra High, 5 of 5");
+  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
   assert.equal(fixture.pickerOpen(), false);
 });
 
@@ -2867,7 +2835,7 @@ test("GPT-5.6 Sol structurally trusts its controlled open picker in a frozen bac
 
   assert.equal(result.status, "selected");
   assert.equal(result.surface_trust, "aria_controls_structural");
-  assert.equal(result.effort_control.value_text, "Extra High, 5 of 5");
+  assert.equal(result.effort_control.value_text, "Pro, 5 of 5");
   assert.equal(result.family_label_source, "deepest_unique");
   assert.deepEqual(fixture.keyAttempts(), ["End"]);
 });
@@ -2923,8 +2891,8 @@ test("GPT-5.6 Sol fails closed when the closed composer pill corroborates anothe
   assert.equal(result.closed_pill_effort_status, "verified");
   assert.equal(result.family_status, "unverified");
   assert.equal(result.effort_status, "verified");
-  assert.equal(result.closed_pill_text, "5.5\nExtra High");
-  assert.equal(result.pill_text, "5.5\nExtra High");
+  assert.equal(result.closed_pill_text, "5.5\nPro");
+  assert.equal(result.pill_text, "5.5\nPro");
 });
 
 test("GPT-5.6 Sol fails closed when a verified picker is followed by an effort-only closed pill", async () => {
@@ -2946,8 +2914,8 @@ test("GPT-5.6 Sol fails closed when a verified picker is followed by an effort-o
   assert.equal(result.closed_pill_effort_status, "verified");
   assert.equal(result.family_status, "unverified");
   assert.equal(result.effort_status, "verified");
-  assert.equal(result.closed_pill_text, "Extra High");
-  assert.equal(result.pill_text, "Extra High");
+  assert.equal(result.closed_pill_text, "Pro");
+  assert.equal(result.pill_text, "Pro");
 });
 
 for (const testCase of [
@@ -2958,16 +2926,16 @@ for (const testCase of [
     status: "selected",
     closed_pill_family_status: "verified",
     closed_pill_effort_status: "verified",
-    closed_pill_text: "GPT-5.6 Sol\nExtra High"
+    closed_pill_text: "GPT-5.6 Sol\nPro"
   },
   {
     name: "slider accepts a single-line family-plus-effort closed pill",
     kind: "slider",
-    options: { initialValue: 5, pillFamilyLabel: "5.6 Sol Extra High", pillEffortLabel: "" },
+    options: { initialValue: 5, pillFamilyLabel: "5.6 Sol Pro", pillEffortLabel: "" },
     status: "selected",
     closed_pill_family_status: "verified",
     closed_pill_effort_status: "verified",
-    closed_pill_text: "5.6 Sol Extra High"
+    closed_pill_text: "5.6 Sol Pro"
   },
   {
     name: "slider accepts a different max-tier closed-pill effort",
@@ -2979,16 +2947,16 @@ for (const testCase of [
     closed_pill_text: "5.6 Sol\nPro"
   },
   {
-    name: "slider accepts Max on a closed pill after Extra High picker proof",
+    name: "slider accepts Pro on a closed pill after Pro picker proof",
     kind: "slider",
-    options: { initialValue: 5, pillFamilyLabel: "5.6 Sol", pillEffortLabel: "Max" },
+    options: { initialValue: 5, pillFamilyLabel: "5.6 Sol", pillEffortLabel: "Pro" },
     status: "selected",
     closed_pill_family_status: "verified",
     closed_pill_effort_status: "verified",
-    closed_pill_text: "5.6 Sol\nMax"
+    closed_pill_text: "5.6 Sol\nPro"
   },
   {
-    name: "slider effort-only Pro still fails family while proving max effort",
+    name: "slider effort-only Pro still fails family while proving Pro effort",
     kind: "slider",
     options: { initialValue: 5, pillFamilyLabel: "", pillEffortLabel: "Pro" },
     status: "unavailable",
@@ -3000,14 +2968,14 @@ for (const testCase of [
     closed_pill_text: "Pro"
   },
   {
-    name: "slider effort-only Max still fails family while proving max effort",
+    name: "slider effort-only non-family still fails family while proving Pro effort",
     kind: "slider",
-    options: { initialValue: 5, pillFamilyLabel: "", pillEffortLabel: "Max" },
+    options: { initialValue: 5, pillFamilyLabel: "", pillEffortLabel: "Pro" },
     status: "unavailable",
     failure_reason: "family_composer_pill_unverified",
     closed_pill_family_status: "unverified",
     closed_pill_effort_status: "verified",
-    closed_pill_text: "Max"
+    closed_pill_text: "Pro"
   },
   {
     name: "slider rejects a non-max closed-pill effort with family present",
@@ -3022,17 +2990,17 @@ for (const testCase of [
     closed_pill_text: "5.6 Sol\nHigh"
   },
   {
-    name: "personal rejects a stale Extra High closed pill after Max picker proof (yz-7p3.3 finding B)",
+    name: "personal rejects a stale non-Pro closed pill after Pro picker proof",
     kind: "personal",
-    options: { pillFamilyLabel: "5.6 Sol", pillEffortLabel: "Extra High" },
+    options: { pillFamilyLabel: "5.6 Sol", pillEffortLabel: "High" },
     status: "unavailable",
     failure_reason: "effort_composer_pill_unverified",
     closed_pill_family_status: "verified",
     closed_pill_effort_status: "unverified",
-    closed_pill_text: "5.6 Sol\nExtra High"
+    closed_pill_text: "5.6 Sol\nHigh"
   },
   {
-    name: "personal accepts Pro on a closed pill after Max picker proof",
+    name: "personal accepts Pro on a closed pill after Pro picker proof",
     kind: "personal",
     options: { pillFamilyLabel: "GPT-5.6 Sol", pillEffortLabel: "Pro" },
     status: "selected",
@@ -3041,14 +3009,14 @@ for (const testCase of [
     closed_pill_text: "GPT-5.6 Sol\nPro"
   },
   {
-    name: "personal effort-only Extra High still fails family while proving max effort",
+    name: "personal effort-only Pro still fails family while proving Pro effort",
     kind: "personal",
-    options: { pillFamilyLabel: "", pillEffortLabel: "Extra High" },
+    options: { pillFamilyLabel: "", pillEffortLabel: "Pro" },
     status: "unavailable",
     failure_reason: "family_composer_pill_unverified",
     closed_pill_family_status: "unverified",
-    closed_pill_effort_status: "unverified",
-    closed_pill_text: "Extra High"
+    closed_pill_effort_status: "verified",
+    closed_pill_text: "Pro"
   }
 ]) {
   test(`closed-pill diagnostics: ${testCase.name}`, async () => {
@@ -3085,15 +3053,13 @@ test("GPT-5.6 Sol fails closed when the structural slider maximum has an unknown
 
   assert.equal(result.status, "unavailable");
   assert.equal(result.failure_reason, "effort_slider_move_failed");
-  assert.equal(result.effort_control.value_now, 2);
-  assert.equal(result.max_effort_label, "Expert");
-  assert.deepEqual(fixture.keyAttempts(), ["End", "ArrowLeft", "ArrowLeft"]);
+  assert.equal(result.effort_control.value_now, 4);
+  assert.deepEqual(fixture.keyAttempts(), ["End", "ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight"]);
 });
 
 test("GPT-5.6 Sol slider unknown ceiling is not rescued by the final fresh re-check (yz-7p3.4 guard)", async () => {
-  // The final_fresh_recheck guard in moveEffortSliderToMaxTier must only rescue a
-  // VERIFIED maximum tier (Max/Pro, or Extra High when Max is proven absent). An
-  // unknown ceiling label ("Expert") must still fail closed, and the re-check must
+  // The final_fresh_recheck guard in moveEffortSliderToProTier must only rescue a
+  // VERIFIED Pro tier. An unknown ceiling label ("Expert") must still fail closed, and the re-check must
   // NOT report it as verified.
   const fixture = makeSolSliderFixture({
     keyboardMode: "end",
@@ -3111,7 +3077,7 @@ test("GPT-5.6 Sol slider unknown ceiling is not rescued by the final fresh re-ch
   assert.equal(result.picker_effort_status, "unverified");
 });
 
-test("GPT-5.6 Sol recognizes volatile effort names, probes max, restores, and fails closed", async () => {
+test("GPT-5.6 Sol fails closed on an unknown effort label", async () => {
   const fixture = makeSolSliderFixture({
     keyboardMode: "end",
     backgroundFrozen: true,
@@ -3124,22 +3090,9 @@ test("GPT-5.6 Sol recognizes volatile effort names, probes max, restores, and fa
 
   assert.equal(result.status, "unavailable");
   assert.equal(result.failure_reason, "effort_slider_move_failed");
-  assert.equal(result.max_effort_label, "Expert");
-  assert.equal(result.effort_control.label, "light");
-  assert.equal(result.effort_control.value_now, 1);
-  assert.deepEqual(fixture.keyAttempts(), ["End", "ArrowLeft", "ArrowLeft", "ArrowLeft"]);
-  assert.equal(result.effort_move_method, "family_menu_probe");
-  assert.equal(result.checkbox_probe.before.checked, "false");
-  assert.equal(result.checkbox_probe.enabled.checked, "true");
-  assert.equal(result.checkbox_probe.restored.checked, "false");
-  assert.equal(result.checkbox_probe.restore_verified, true);
-  assert.deepEqual(result.family_menu_probe.family_radio_labels, ["GPT-5.6 Sol", "GPT-5.6 Sol Pro", "GPT-5.5"]);
-  assert.equal(result.family_menu_probe.family_options.some((option) => option.label === "GPT-5.6 Sol" && option.checked === "true"), true);
-  assert.equal(result.family_menu_probe.family_options.some((option) => option.label === "GPT-5.6 Sol Pro" && option.checked === "false"), true);
-  assert.equal(result.family_menu_probe.close_verified, true);
-  assert.equal(fixture.familyMenuOpen(), false);
-  assert.equal(result.advanced_rows.some((row) => row.label === "Speed" && row.value === "Standard"), true);
-  assert.equal(result.advanced_rows.some((row) => row.role === "menuitemcheckbox" && row.checked === "false"), true);
+  assert.equal(result.effort_control.label, "expert");
+  assert.equal(result.effort_control.value_now, 4);
+  assert.deepEqual(fixture.keyAttempts(), ["End", "ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight", "ArrowRight"]);
 });
 
 test("GPT-5.6 Sol rejects an identical hidden picker without trigger ownership", async () => {
@@ -3186,7 +3139,7 @@ test("structural picker failures capture bounded failure-time descendant topolog
   assert.equal(result.status, "unavailable");
   assert.equal(result.failure_reason, "effort_slider_move_failed");
   assert.equal(result.surface_trust, "aria_controls_structural");
-  assert.equal(result.surface_descendants.some((node) => node.role === "slider" && node.aria_valuenow === "2"), true);
+  assert.equal(result.surface_descendants.some((node) => node.role === "slider" && node.aria_valuenow === "4"), true);
   assert.equal(result.surface_descendants.some((node) => node.role === "menuitem" && node.aria_haspopup === "menu"), true);
 });
 
@@ -3225,7 +3178,7 @@ test("GPT-5.6 Sol Advanced picker accepts trailing punctuation in aria-valuetext
 
   assert.equal(result.status, "selected");
   assert.equal(result.effort_move_method, "keyboard_end");
-  assert.equal(result.effort_control.value_text, "Extra High, 5 of 5.");
+  assert.equal(result.effort_control.value_text, "Pro, 5 of 5.");
 });
 
 test("GPT-5.6 Sol Advanced picker falls through End to bounded ArrowRight steps", async () => {
@@ -3245,7 +3198,7 @@ test("GPT-5.6 Sol Advanced picker uses a max-track pointer fallback after keyboa
   const result = await configureModelState(fixture.doc, {});
 
   assert.equal(result.status, "selected");
-  assert.equal(result.effort_move_method, "pointer_max");
+  assert.equal(result.effort_move_method, "pointer_pro");
   assert.equal(fixture.keyAttempts()[0], "End");
   assert.ok(fixture.keyAttempts().includes("ArrowRight"));
   assert.equal(fixture.pointerAttempts(), 1);
@@ -3295,6 +3248,7 @@ test("current model strategy waits briefly for the pill and reads it without pic
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
   const body = new FakeElement("body", {}, "Ask anything").append(form);
+  appendChatSurfaceToggle(body);
   const doc = new FakeDocument(body);
   const pill = new FakeElement("button", { "aria-haspopup": "menu", class: "__composer-pill" }, "5.5\nInstant");
 
@@ -3320,7 +3274,10 @@ function makeSolPickerFixture({
   effort,
   escapeCloses = true,
   remountPillOnSelection = false,
-  transcriptPickerDecoy = false
+  transcriptPickerDecoy = false,
+  includeChatSurface = true,
+  surface = "chat",
+  chatClickUpdates = true
 }) {
   let currentFamily = family;
   let currentEffort = effort;
@@ -3334,6 +3291,9 @@ function makeSolPickerFixture({
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
   const body = new FakeElement("body", {}, "Ask anything").append(form);
+  const chatSurface = includeChatSurface
+    ? appendChatSurfaceToggle(body, { surface, chatClickUpdates })
+    : null;
   if (transcriptPickerDecoy) {
     body.append(new FakeElement(
       "div",
@@ -3354,7 +3314,7 @@ function makeSolPickerFixture({
     familyMenu = null;
   };
   const updatePill = (remount = false) => {
-    const pillEffort = currentEffort === "Pro Extended" ? "Extra High" : currentEffort;
+    const pillEffort = currentEffort === "Pro Extended" ? "Pro" : currentEffort;
     const label = currentFamily === "GPT-5.6 Sol" ? pillEffort : `5.5\n${pillEffort}`;
     if (remount && remountPillOnSelection) {
       const previousPill = pill;
@@ -3370,9 +3330,7 @@ function makeSolPickerFixture({
     pill.innerText = label;
     pill.textContent = label;
   };
-  const effortLabels = () => currentFamily === "GPT-5.6 Sol"
-    ? ["Instant\n5.5", "Medium", "High", "Extra High", "Pro"]
-    : ["Instant", "Medium", "High", "Extra High", "Pro Extended"];
+  const effortLabels = () => ["Instant\n5.5", "Medium", "High", "Extra High", "Pro"];
   const openFamilyMenu = () => {
     removeMenu(familyMenu);
     familyMenu = new FakeElement("div", { role: "menu", "data-radix-menu-content": "" });
@@ -3385,8 +3343,8 @@ function makeSolPickerFixture({
           if (label === "GPT-5.6 Sol" || label === "GPT-5.5") {
             currentFamily = label;
             if (currentFamily === "GPT-5.6 Sol") {
-              currentEffort = currentEffort === "Pro Extended" ? "Extra High" : currentEffort === "Instant" ? "Medium" : currentEffort;
-            } else if (currentEffort === "Extra High") {
+              currentEffort = currentEffort === "Pro Extended" || currentEffort === "Instant" ? "Medium" : currentEffort;
+            } else if (currentEffort === "Pro") {
               currentEffort = "Pro Extended";
             }
             familyClickCount += 1;
@@ -3453,7 +3411,8 @@ function makeSolPickerFixture({
     mainOpens: () => mainOpenCount,
     familyClicks: () => familyClickCount,
     effortClicks: () => effortClickCount,
-    menusOpen: () => [mainMenu, familyMenu].filter(Boolean).length
+    menusOpen: () => [mainMenu, familyMenu].filter(Boolean).length,
+    surface: chatSurface
   };
 }
 
@@ -3467,7 +3426,7 @@ function makeSolSliderFixture({
   backgroundFrozen = false,
   disconnectedTrigger = false,
   maxLabelOverride = null,
-  levels = ["Instant", "Medium", "High", "Heavy", "Extra High"],
+  levels = ["Instant", "Medium", "High", "Heavy", "Pro"],
   initialValue = 3,
   includeSpeedRows = false,
   transcriptEffortDecoy = null,
@@ -3496,6 +3455,7 @@ function makeSolSliderFixture({
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
   const body = new FakeElement("body", {}, "Ask anything").append(form);
+  appendChatSurfaceToggle(body);
   if (transcriptEffortDecoy) {
     body.append(new FakeElement("div", { "data-message-author-role": "user" }, transcriptEffortDecoy));
   }
@@ -3705,169 +3665,8 @@ function makeSolSliderFixture({
   };
 }
 
-// Six-tier ladder fixture built from the 2026-08-25 live dump
-// (/tmp/amq-effort-slider-move-failed-diagnostics.txt). Models the personal/Pro
-// picker whose simple slider is stale at 4/4 "Extra High" (five-tier simple view)
-// while the real six-tier ladder (Light/Medium/High/Extra High/Max/Ultra) lives
-// behind the Advanced -> Effort row submenu. The Advanced view exposes rows
-// Model / Effort / Speed (composer-model-picker-slider-advanced-view).
-//
-// Options:
-//  - effortLadder: the submenu ladder labels (default six-tier with Max+Ultra).
-//  - presetEffort: the checked effort in the submenu (default "Extra High").
-//  - sliderCeiling: the simple-slider ceiling label (default "Extra High").
-//  - maxVerifiable: when false, selecting Max does NOT update the pill/row (unverifiable).
-export function makeSixTierLadderFixture({
-  effortLadder = ["Light", "Medium", "High", "Extra High", "Max", "Ultra"],
-  presetEffort = "Extra High",
-  sliderCeiling = "Extra High",
-  maxVerifiable = true,
-  familyLabel = "GPT-5.6 Sol",
-  pillFamilyLabel = "5.6 Sol"
-} = {}) {
-  let panel = null;
-  let effortMenu = null;
-  let effortRow = null;
-  let effortValueNode = null;
-  let familyValueNode = null;
-  let currentEffort = presetEffort;
-  let effortRowClicks = 0;
-  let maxClicks = 0;
-  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
-  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
-  const body = new FakeElement("body", {}, "Ask anything").append(form);
-  const pillTextForEffort = (label) => `${pillFamilyLabel}\n${label}`;
-  const detachPanel = () => {
-    if (effortMenu) {
-      body.children = body.children.filter((child) => child !== effortMenu);
-      effortMenu.parentElement = null;
-      effortMenu = null;
-    }
-    if (panel) {
-      body.children = body.children.filter((child) => child !== panel);
-      panel.parentElement = null;
-      panel = null;
-    }
-    pill?.setAttribute("aria-expanded", "false");
-    pill?.setAttribute("data-state", "closed");
-  };
-  const closeEffortMenu = () => {
-    if (!effortMenu) return;
-    body.children = body.children.filter((child) => child !== effortMenu);
-    effortMenu.parentElement = null;
-    effortMenu = null;
-    effortRow?.setAttribute("aria-expanded", "false");
-    effortRow?.setAttribute("data-state", "closed");
-  };
-  const openEffortMenu = () => {
-    closeEffortMenu();
-    effortRow?.setAttribute("aria-expanded", "true");
-    effortRow?.setAttribute("data-state", "open");
-    effortMenu = new FakeElement("div", { id: "effort-ladder", role: "menu", "data-state": "open" });
-    for (const label of effortLadder) {
-      const checked = label === currentEffort;
-      effortMenu.append(new FakeElement("div", {
-        role: "menuitemradio",
-        "aria-checked": String(checked),
-        "data-state": checked ? "checked" : "unchecked",
-        onPointerDown: () => {
-          if (label === "Ultra") return; // Ultra is never selected by the recipe
-          if (label === "Max") maxClicks += 1;
-          if (!maxVerifiable && label === "Max") {
-            // Max visible but unverifiable: the click does not land.
-            closeEffortMenu();
-            return;
-          }
-          currentEffort = label;
-          effortValueNode.innerText = label;
-          effortValueNode.textContent = label;
-          effortRow.innerText = `Effort\n${label}`;
-          effortRow.textContent = effortRow.innerText;
-          pill.innerText = pillTextForEffort(label);
-          pill.textContent = pill.innerText;
-          closeEffortMenu();
-        }
-      }, label));
-    }
-    body.append(effortMenu);
-  };
-  const openPanel = () => {
-    detachPanel();
-    panel = new FakeElement("div", { id: "advanced-picker", role: "dialog", "data-state": "open" },
-      "Advanced Faster Smarter Model GPT-5.6 Sol Effort Extra High Speed Standard Consumes usage limits faster");
-    const group = new FakeElement("div", { role: "group", "data-testid": "composer-intelligence-picker-content" });
-    const simple = new FakeElement("div", { "data-testid": "composer-model-picker-slider-simple-view" });
-    const advanced = new FakeElement("div", { "data-testid": "composer-model-picker-slider-advanced-view" });
-    // Stale simple slider: five-tier, ceiling "Extra High", stuck at 4/4.
-    const staleSlider = new FakeElement("span", {
-      role: "slider",
-      "aria-hidden": "true",
-      "aria-label": "Effort",
-      "aria-valuemin": "0",
-      "aria-valuemax": "4",
-      "aria-valuenow": "4",
-      onKeyDown: () => {}
-    });
-    const staleLabel = new FakeElement("span", {}, `${sliderCeiling}, 5 of 5.`);
-    simple.append(staleSlider, staleLabel);
-    // Advanced view rows: Model / Effort / Speed (verbatim from the dump).
-    const familyRow = new FakeElement("div", { role: "menuitem", tabindex: "0", "aria-haspopup": "menu", "aria-expanded": "false", "aria-controls": "family-picker", "data-state": "closed" }, `Model\n${familyLabel}`)
-      .append(new FakeElement("div", {}, "Model"), (familyValueNode = new FakeElement("div", {}, familyLabel)));
-    effortRow = new FakeElement("div", {
-      role: "menuitem",
-      tabindex: "0",
-      "aria-haspopup": "menu",
-      "aria-expanded": "false",
-      "aria-controls": "effort-ladder",
-      "data-state": "closed",
-      onPointerDown: () => {
-        effortRowClicks += 1;
-        openEffortMenu();
-      },
-      onKeyDown: (event) => {
-        if (event.key === "Enter" || event.key === " ") {
-          effortRowClicks += 1;
-          openEffortMenu();
-        }
-        if (event.key === "Escape") closeEffortMenu();
-      }
-    }, `Effort\n${currentEffort}`)
-      .append(new FakeElement("div", {}, "Effort"), (effortValueNode = new FakeElement("div", {}, currentEffort)));
-    const speedRow = new FakeElement("div", { role: "menuitem" }, "Speed Standard")
-      .append(new FakeElement("span", {}, "Speed"), new FakeElement("span", {}, "Standard"));
-    advanced.append(familyRow, effortRow, speedRow);
-    group.append(simple, advanced);
-    panel.append(group);
-    body.append(panel);
-    pill.setAttribute("aria-expanded", "true");
-    pill.setAttribute("data-state", "open");
-  };
-  const pill = new FakeElement("button", {
-    class: "__composer-pill __composer-pill--neutral",
-    "aria-haspopup": "menu",
-    "aria-controls": "advanced-picker",
-    "aria-expanded": "false",
-    "data-state": "closed",
-    onPointerDown: openPanel,
-    onKeyDown: (event) => {
-      if (event.key === "Escape") detachPanel();
-    }
-  }, pillTextForEffort(currentEffort));
-  form.append(pill);
-  const doc = new FakeDocument(body);
-  return {
-    doc,
-    pill,
-    effortRowClicks: () => effortRowClicks,
-    maxClicks: () => maxClicks,
-    effortMenuOpen: () => Boolean(effortMenu),
-    pickerOpen: () => Boolean(panel),
-    currentEffort: () => currentEffort
-  };
-}
-
 function makePersonalPickerFixture({
-  effort = "Max",
+  effort = "Pro",
   backgroundFrozen = true,
   wrappedRadix = false,
   startsOpen = false,
@@ -3892,6 +3691,7 @@ function makePersonalPickerFixture({
   });
   const form = new FakeElement("form", { class: "group/composer" }, "").append(composer);
   const body = new FakeElement("body", {}, "").append(form);
+  appendChatSurfaceToggle(body);
   const pickerText = () => [
     "Light, 2 of 5.",
     "Use Left and Right arrow keys to adjust power.",
@@ -4207,6 +4007,15 @@ function matchesSimpleSelector(element, selector) {
   }
   if (selector.includes('[data-testid="fruitjuice-send-button"]')) {
     return tag === "button" && attr("data-testid") === "fruitjuice-send-button" && !element.disabled;
+  }
+  if (selector === '[role="radiogroup"][aria-label="Select chat surface"]') {
+    return attr("role") === "radiogroup" && attr("aria-label") === "Select chat surface";
+  }
+  if (selector === '[role="radio"][data-tpp-toggle-value="chat"]') {
+    return attr("role") === "radio" && attr("data-tpp-toggle-value") === "chat";
+  }
+  if (selector === '[role="radio"][data-tpp-toggle-value="work"]') {
+    return attr("role") === "radio" && attr("data-tpp-toggle-value") === "work";
   }
   if (selector.includes('button[type="submit"]')) {
     return tag === "button" && attr("type") === "submit" && !element.disabled;

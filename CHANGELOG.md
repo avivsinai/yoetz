@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- ChatGPT recipes now force Chat mode and verify GPT-5.6 Sol with the literal Pro
+  effort tier. Work mode and non-Pro effort selections are rejected.
+- Renamed the requested model id to `gpt-5-6-sol-chat-pro`.
+
 ### Fixed
 
 - Live browser recipes now use stable agent-browser tab ids and open marked tabs
