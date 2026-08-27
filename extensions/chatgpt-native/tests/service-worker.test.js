@@ -169,7 +169,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     // observability.
     assert.equal(
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.model_used,
-      "GPT-5.6 Sol Extra High"
+      "GPT-5.6 Sol Pro"
     );
     assert.equal(
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.model_slug,
@@ -186,7 +186,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     }
     assert.equal(
       sentToTabs.find((item) => item.message.type === "yoetz_configure_model" && item.message.job.job_id === "job_b")?.message.job.model,
-      "gpt-5-6-sol-account-max"
+      "gpt-5-6-sol-chat-pro"
     );
   } finally {
     globalThis.chrome = originalChrome;
@@ -1654,7 +1654,7 @@ test("service worker fails fast on metadata manual handoff detected while waitin
   }
 });
 
-test("service worker fails closed when GPT-5.6 Sol Extra High is unavailable", async () => {
+test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
@@ -1677,7 +1677,7 @@ test("service worker fails closed when GPT-5.6 Sol Extra High is unavailable", a
               payload: {
                 status: "unavailable",
                 model_used: "Default",
-                requested_model: "gpt-5-6-sol-account-max",
+                requested_model: "gpt-5-6-sol-chat-pro",
                 available_options: ["Default"],
                 failure_reason: "effort_slider_move_failed",
                 picker_shape: "slider",
@@ -1730,7 +1730,7 @@ test("service worker fails closed when GPT-5.6 Sol Extra High is unavailable", a
   }
 });
 
-test("service worker fails resumed jobs before upload when GPT-5.6 Sol Extra High is unavailable", async () => {
+test("service worker fails resumed jobs before upload when GPT-5.6 Sol Pro is unavailable", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const createdTabs = [];
@@ -1757,7 +1757,7 @@ test("service worker fails resumed jobs before upload when GPT-5.6 Sol Extra Hig
               payload: {
                 status: "unavailable",
                 model_used: "Default",
-                requested_model: "gpt-5-6-sol-account-max",
+                requested_model: "gpt-5-6-sol-chat-pro",
                 family_status: "unverified",
                 effort_status: "unverified",
                 available_options: ["Default"],
@@ -1795,7 +1795,7 @@ test("service worker fails resumed jobs before upload when GPT-5.6 Sol Extra Hig
   }
 });
 
-test("service worker fails closed when GPT-5.6 Sol Extra High selection is only kept_current", async () => {
+test("service worker fails closed when GPT-5.6 Sol Pro selection is only kept_current", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
@@ -2002,7 +2002,7 @@ test("completion falls back to backend model_slug when the picker was not proven
   }
 });
 
-test("service worker fails closed when GPT-5.6 Sol Extra High selection fails", async () => {
+test("service worker fails closed when GPT-5.6 Sol Pro selection fails", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -2041,7 +2041,7 @@ test("service worker fails closed when GPT-5.6 Sol Extra High selection fails", 
     await eventually(() => port.messages.some((message) => message.type === "job_error"));
     const error = port.messages.find((message) => message.type === "job_error");
     assert.equal(error.payload.code, "model_selection_failed");
-    assert.equal(error.payload.requested_model, "gpt-5-6-sol-account-max");
+    assert.equal(error.payload.requested_model, "gpt-5-6-sol-chat-pro");
     assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
   } finally {
     globalThis.chrome = originalChrome;
@@ -2100,7 +2100,7 @@ test("service worker rejects the legacy extended_status selection proof", async 
   }
 });
 
-test("service worker accepts only verified GPT-5.6 Sol Extra High selection", async () => {
+test("service worker accepts only verified GPT-5.6 Sol Pro selection", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -2120,8 +2120,8 @@ test("service worker accepts only verified GPT-5.6 Sol Extra High selection", as
               ok: true,
               payload: {
                 status: "selected",
-                model_used: "GPT-5.6 Sol Extra High",
-                requested_model: "gpt-5-6-sol-account-max",
+                model_used: "GPT-5.6 Sol Pro",
+                requested_model: "gpt-5-6-sol-chat-pro",
                 family_status: "verified",
                 effort_status: "verified"
               }
@@ -2856,7 +2856,7 @@ test("service worker classifies final affordance without scoped assistant text",
               payload: sent
                 ? {
                     method: "page_text_fallback",
-                    text: "Skip to content\nbundle.md\nFile\nReview the attached file and provide your analysis.\n\nI\n\nGPT-5.6 Sol Extra High",
+                    text: "Skip to content\nbundle.md\nFile\nReview the attached file and provide your analysis.\n\nI\n\nGPT-5.6 Sol Pro",
                     is_generating: false,
                     assistant_count: 1,
                     user_count: 1,
@@ -6357,7 +6357,7 @@ test("service worker restarts model selection from scratch after persisted bfcac
       ok: true,
       payload: {
         status: "unavailable",
-        requested_model: "gpt-5-6-sol-account-max",
+        requested_model: "gpt-5-6-sol-chat-pro",
         failure_reason: "stale_suspended_attempt"
       }
     });
@@ -6560,7 +6560,7 @@ test("service worker keeps the fail-closed model-selection result when bfcache r
   const failedSelection = {
     status: "unavailable",
     model_used: null,
-    requested_model: "gpt-5-6-sol-account-max",
+    requested_model: "gpt-5-6-sol-chat-pro",
     family_status: "unverified",
     effort_status: "unverified",
     failure_reason: "model_picker_open_failed",
@@ -6644,7 +6644,7 @@ test("service worker does not resurrect a terminal model selection from a stale 
   const failedSelection = {
     status: "unavailable",
     model_used: null,
-    requested_model: "gpt-5-6-sol-account-max",
+    requested_model: "gpt-5-6-sol-chat-pro",
     family_status: "unverified",
     effort_status: "unverified",
     failure_reason: "model_picker_open_failed",
@@ -9554,8 +9554,8 @@ async function runSuccessfulCompletionCase({
 function verifiedSolProSelection() {
   return {
     status: "selected",
-    model_used: "GPT-5.6 Sol Extra High",
-    requested_model: "gpt-5-6-sol-account-max",
+    model_used: "GPT-5.6 Sol Pro",
+    requested_model: "gpt-5-6-sol-chat-pro",
     family_status: "verified",
     effort_status: "verified"
   };

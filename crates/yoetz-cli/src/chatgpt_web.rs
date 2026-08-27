@@ -257,7 +257,7 @@ pub fn select_reported_chatgpt_model(
     requested_model: &str,
 ) -> Option<String> {
     if is_current_model_selection(selection, requested_model)
-        || is_verified_sol_extra_high_selection(selection, requested_model)
+        || is_verified_sol_chat_pro_selection(selection, requested_model)
     {
         return selection
             .get("modelUsed")
@@ -276,7 +276,7 @@ pub(crate) fn chatgpt_model_selection_status(
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
     match status {
-        "selected" if is_verified_sol_extra_high_selection(selection, requested_model) => {
+        "selected" if is_verified_sol_chat_pro_selection(selection, requested_model) => {
             ChatgptModelSelectionStatus::Selected
         }
         "selected" | "selection-mismatch" => ChatgptModelSelectionStatus::Mismatch,
@@ -306,16 +306,16 @@ fn is_current_model_selection(selection: &serde_json::Value, requested_model: &s
             == Some("skipped")
 }
 
-fn is_verified_sol_extra_high_selection(
+fn is_verified_sol_chat_pro_selection(
     selection: &serde_json::Value,
     requested_model: &str,
 ) -> bool {
     if selection.get("status").and_then(serde_json::Value::as_str) != Some("selected")
-        || requested_model.trim() != crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL
+        || requested_model.trim() != crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL
         || selection
             .get("requested")
             .and_then(serde_json::Value::as_str)
-            != Some(crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL)
+            != Some(crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL)
         || selection
             .get("familyStatus")
             .and_then(serde_json::Value::as_str)
@@ -338,7 +338,7 @@ fn is_verified_sol_extra_high_selection(
             .join(" ")
             .to_ascii_lowercase()
             .as_str(),
-        "gpt-5.6 sol pro" | "gpt-5.6 sol extra high" | "gpt-5.6 sol max" | "gpt-5.6 sol ultra"
+        "gpt-5.6 sol pro"
     )
 }
 
@@ -386,14 +386,101 @@ pub fn build_model_selection_function(
 async () => {{
   const requested = {requested_model};
   const strategy = {model_strategy};
-  const supported = "gpt-5-6-sol-account-max";
+  const supported = "gpt-5-6-sol-chat-pro";
   const MODEL_BUTTON_SELECTOR = {model_button_selector};
   const COMPOSER_SELECTOR = {composer_selector};
+  const SURFACE_SETTLE_TIMEOUT_MS = 1000;
+  const SURFACE_SETTLE_INTERVAL_MS = 50;
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const fold = (value) => normalize(value).toLowerCase();
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const textOf = (node) => normalize(node?.innerText || node?.textContent || "");
 {visibility_helpers}
+
+  function surfaceControls() {{
+    const group = document.querySelector('[role="radiogroup"][aria-label="Select chat surface"]');
+    const chat = group?.querySelector('[role="radio"][data-tpp-toggle-value="chatgpt"]');
+    const work = group?.querySelector('[role="radio"][data-tpp-toggle-value="work"]');
+    return chat && work ? {{ group, chat, work }} : null;
+  }}
+
+  function surfaceState(node) {{
+    return {{
+      ariaChecked: node?.getAttribute("aria-checked") || null,
+      dataState: node?.getAttribute("data-state") || null
+    }};
+  }}
+
+  function surfaceObservedValues() {{
+    const group = document.querySelector('[role="radiogroup"][aria-label="Select chat surface"]');
+    return Array.from(group?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]') || [])
+      .map((node) => node.getAttribute("data-tpp-toggle-value"))
+      .filter(Boolean)
+      .filter((value, index, values) => values.indexOf(value) === index)
+      .slice(0, 10);
+  }}
+
+  async function ensureChatSurface() {{
+    const startedAt = Date.now();
+    const controls = surfaceControls();
+    let state = surfaceState(controls?.chat);
+    let observedValues = surfaceObservedValues();
+    if (!controls) {{
+      return {{
+        ok: false,
+        warning: "ChatGPT Chat surface toggle not found or could not be read",
+        failureReason: "chat_surface_control_not_found",
+        elapsedMs: Date.now() - startedAt,
+        attempts: 1,
+        verificationAttempts: 0,
+        state,
+        observedValues
+      }};
+    }}
+    if (state.ariaChecked === "true") {{
+      return {{
+        ok: true,
+        elapsedMs: Date.now() - startedAt,
+        attempts: 1,
+        verificationAttempts: 0,
+        state,
+        observedValues
+      }};
+    }}
+
+    realClick(controls.chat);
+    const settleStartedAt = Date.now();
+    let verificationAttempts = 0;
+    while (Date.now() - settleStartedAt < SURFACE_SETTLE_TIMEOUT_MS) {{
+      verificationAttempts += 1;
+      const verified = surfaceControls();
+      state = surfaceState(verified?.chat);
+      observedValues = surfaceObservedValues();
+      if (state.ariaChecked === "true") {{
+        return {{
+          ok: true,
+          elapsedMs: Date.now() - startedAt,
+          attempts: 1 + verificationAttempts,
+          verificationAttempts,
+          state,
+          observedValues
+        }};
+      }}
+      const remainingMs = SURFACE_SETTLE_TIMEOUT_MS - (Date.now() - settleStartedAt);
+      if (remainingMs <= 0) break;
+      await wait(Math.min(SURFACE_SETTLE_INTERVAL_MS, remainingMs));
+    }}
+    return {{
+      ok: false,
+      warning: "ChatGPT Chat surface could not be verified after selection",
+      failureReason: "chat_surface_selection_mismatch",
+      elapsedMs: Date.now() - startedAt,
+      attempts: 1 + verificationAttempts,
+      verificationAttempts,
+      state,
+      observedValues
+    }};
+  }}
 
   function classTokens(node) {{
     return normalize(node?.getAttribute?.("class") || "").split(" ").filter(Boolean);
@@ -471,7 +558,7 @@ async () => {{
     return visibleMenus().find((menu) => {{
       const labels = radios(menu).map((item) => fold(textOf(item)));
       return labels.includes("medium") && labels.includes("high")
-        && (labels.includes("pro") || labels.includes("pro extended"));
+        && (labels.includes("pro"));
     }}) || null;
   }}
 
@@ -483,8 +570,9 @@ async () => {{
   function readState(menu) {{
     const effortItems = radios(menu);
     const familyTrigger = Array.from(menu?.querySelectorAll?.("[role='menuitem']") || [])
-      .find((item) => item.getAttribute("aria-haspopup") === "menu" && /^(?:gpt|o\d)\b/i.test(textOf(item))) || null;
-    return {{ menu, effortItems, familyTrigger, familyLabel: textOf(familyTrigger) }};
+      .find((item) => item.getAttribute("aria-haspopup") === "menu"
+        && (/^(?:gpt|o\d)\b/i.test(textOf(item)) || /\bModel\b/i.test(textOf(item)))) || null;
+    return {{ menu, effortItems, familyTrigger, familyLabel: textOf(familyTrigger), familyProof: false }};
   }}
 
   function dispatch(element, type, kind, init = {{}}) {{
@@ -565,65 +653,227 @@ async () => {{
     return null;
   }}
 
-  async function closeMenus(pill) {{
-    for (let attempt = 0; attempt < 3 && visibleMenus().length > 0; attempt += 1) {{
-      keyPress(pill, "Escape", "Escape");
-      await wait(100);
+  function mounted(node) {{
+    return Boolean(node && (node.isConnected || document.documentElement?.contains?.(node)));
+  }}
+
+  function pickerDialog() {{
+    return Array.from(document.querySelectorAll("[role='dialog'], [data-testid='composer-intelligence-picker-content']"))
+      .filter(isVisible)
+      .find((node) => /\bModel\b/i.test(textOf(node)) && /\bEffort\b/i.test(textOf(node))) || null;
+  }}
+
+  function readPickerCloseVerification(pill, state, options = {{}}) {{
+    const familyTrigger = state?.familyTrigger;
+    const familyOpen = mounted(familyTrigger)
+      && (familyTrigger.getAttribute("aria-expanded") === "true"
+        || familyTrigger.getAttribute("data-state") === "open");
+    const familySurface = familyMenu(state?.menu);
+    const pickerOpen = Boolean(mainMenu())
+      || Boolean(familySurface)
+      || Boolean(pickerDialog())
+      || familyOpen
+      || (mounted(pill) && (pill.getAttribute("aria-expanded") === "true"
+        || pill.getAttribute("data-state") === "open"));
+    const pillText = pill ? textOf(pill) : "";
+    const closedPillPro = options.requireProPill !== true || pillConfirmsEffortLabel(pillText, "Pro");
+    return {{
+      familyTriggerClosed: !familyOpen,
+      pickerSurfaceClosed: !pickerOpen,
+      modelTriggerClosed: !pickerOpen,
+      closedPillPro,
+      closedPillText: pillText || null,
+      ok: !familyOpen && !pickerOpen
+    }};
+  }}
+
+  function neutralComposerArea(pill) {{
+    const composer = document.querySelector(COMPOSER_SELECTOR);
+    if (composer && composer !== pill) return composer;
+    return composerScopes()[0] || null;
+  }}
+
+  function dispatchHoverLeaveEvents(element, relatedTarget) {{
+    const rect = relatedTarget?.getBoundingClientRect?.() || {{ left: 0, top: 0, width: 1, height: 1 }};
+    const clientX = Number(rect.left || 0) + Math.max(1, Number(rect.width || 1) / 2);
+    const clientY = Number(rect.top || 0) + Math.max(1, Number(rect.height || 1) / 2);
+    for (const [type, kind, init] of [
+      ["pointerleave", "PointerEvent", {{ pointerId: 1, pointerType: "mouse", isPrimary: true, relatedTarget, clientX, clientY }}],
+      ["mouseleave", "MouseEvent", {{ relatedTarget, clientX, clientY }}],
+      ["pointermove", "PointerEvent", {{ pointerId: 1, pointerType: "mouse", isPrimary: true, relatedTarget, clientX, clientY }}],
+      ["mousemove", "MouseEvent", {{ relatedTarget, clientX, clientY }}]
+    ]) {{
+      dispatch(element, type, kind, init);
     }}
-    return visibleMenus().length === 0;
+  }}
+
+  async function waitForPickerClose(pill, state, options) {{
+    let verification = readPickerCloseVerification(pill, state, options);
+    for (let attempt = 0; attempt < 3 && !verification.ok; attempt += 1) {{
+      await wait(50);
+      verification = readPickerCloseVerification(pill, state, options);
+    }}
+    return verification;
+  }}
+
+  let pickerCloseMethods = [];
+  let pickerCloseVerification = null;
+  async function closeMenus(pill, state = null, options = {{}}) {{
+    const methods = [];
+    let verification = readPickerCloseVerification(pill, state, options);
+    const tryMethod = async (method, action) => {{
+      methods.push(method);
+      try {{
+        await action();
+      }} catch {{
+        // Continue to the next bounded close path and fail closed if needed.
+      }}
+      verification = await waitForPickerClose(pill, state, options);
+    }};
+
+    if (!verification.ok) {{
+      await tryMethod("escape", () => keyPress(pill, "Escape", "Escape"));
+    }}
+    if (!verification.ok && !verification.pickerSurfaceClosed && state?.familyTrigger) {{
+      const neutral = neutralComposerArea(pill);
+      await tryMethod("hover_leave", () => dispatchHoverLeaveEvents(state.familyTrigger, neutral));
+      if (!verification.ok && !verification.pickerSurfaceClosed) {{
+        await tryMethod("trigger_escape", () => keyPress(state.familyTrigger, "Escape", "Escape"));
+      }}
+    }}
+    if (!verification.ok && !verification.pickerSurfaceClosed) {{
+      const neutral = neutralComposerArea(pill);
+      if (neutral) await tryMethod("neutral_click", () => realClick(neutral));
+    }}
+
+    pickerCloseMethods = methods;
+    pickerCloseVerification = verification;
+    return verification.ok;
+  }}
+
+  async function readFamilyProof(state) {{
+    const submenu = await openFamilyMenu(state);
+    const familyItems = radios(submenu);
+    const checkedItems = familyItems.filter((item) => item.getAttribute("aria-checked") === "true");
+    const families = familyItems.map(textOf).filter(Boolean);
+    const checkedFamily = checkedItems.length === 1 ? textOf(checkedItems[0]) : "";
+    state.familyLabel = checkedFamily;
+    state.familyProof = checkedItems.length === 1 && fold(checkedFamily) === "gpt-5.6 sol";
+    state.familyItems = familyItems;
+    state.familyCheckedItems = checkedItems;
+    return {{
+      ok: state.familyProof,
+      submenu,
+      familyItems,
+      checkedItems,
+      families,
+      sol: familyItems.find((item) => fold(textOf(item)) === "gpt-5.6 sol") || null
+    }};
   }}
 
   function familyVerified(state) {{
-    return fold(state?.familyLabel) === "gpt-5.6 sol";
+    return state?.familyProof === true && fold(state?.familyLabel) === "gpt-5.6 sol";
   }}
 
   function effortVerified(state) {{
-    // Ladder-aware verification (yz-7p3.3 finding D): mirrors the native extension's
-    // effortMaxTierDecision. Max is the target; Extra High is accepted only when
-    // Max is absent from the visible effortItems; Ultra is accepted as at-or-above-Max
-    // proof and is NEVER clicked (a preset Ultra must not be downgraded).
     const items = state?.effortItems || [];
-    const labels = items.map((item) => fold(textOf(item)));
-    const maxPresent = labels.includes("max");
     const checked = items.find((item) => isChecked(item));
     const checkedLabel = checked ? fold(textOf(checked)) : null;
-    if (checkedLabel === "max" || checkedLabel === "pro") return true;
-    if (checkedLabel === "ultra") return true;
-    if (checkedLabel === "extra high" && !maxPresent) return true;
-    return false;
+    return checkedLabel === "pro";
+  }}
+
+  function pillConfirmsEffortLabel(pillText, effortLabel) {{
+    const foldedPill = fold(pillText).replace(/\s+/g, " ");
+    const foldedEffort = fold(effortLabel).replace(/\s+/g, " ");
+    return foldedEffort === "pro" && (foldedPill === "pro" || foldedPill.endsWith(" pro"));
+  }}
+
+  function foldFamilyLabel(value) {{
+    return fold(value).replace(/^gpt[\s-]*/, "").replace(/\s+/g, " ");
+  }}
+
+  function pillConfirmsFamilyLabel(pillText, familyLabel) {{
+    const foldedFamily = foldFamilyLabel(familyLabel);
+    if (!foldedFamily) return false;
+    return fold(pillText).split(/\n+/).some((line) => {{
+      const foldedLine = foldFamilyLabel(line);
+      return foldedLine === foldedFamily || foldedLine.startsWith(`${{foldedFamily}} `);
+    }});
+  }}
+
+  function pillHasModelFamilyToken(pillText) {{
+    const foldedPill = fold(pillText).replace(/\s+/g, " ");
+    return /\bgpt[\s.-]*\d/.test(foldedPill)
+      || /\bo\d(?:[\s.-]*\d)?\b/.test(foldedPill)
+      || /\b\d+(?:\.\d+)+\b/.test(foldedPill);
+  }}
+
+  function closedPillDiagnostics(pill, state) {{
+    const pillText = pill ? textOf(pill) : "";
+    const familyLabel = state?.familyLabel || "";
+    const effortLabel = state?.effortItems?.find((item) => fold(textOf(item)) === "pro");
+    const closedPillFamilyStatus = pillText && familyLabel
+      ? pillConfirmsFamilyLabel(pillText, familyLabel)
+        ? "verified"
+        : pillHasModelFamilyToken(pillText) ? "unverified" : "skipped"
+      : "skipped";
+    const closedPillEffortStatus = pillText && effortLabel
+      ? pillConfirmsEffortLabel(pillText, textOf(effortLabel)) ? "verified" : "unverified"
+      : "skipped";
+    return {{
+      closedPillText: pillText,
+      closedPillFamilyStatus,
+      closedPillEffortStatus
+    }};
   }}
 
   function result(status, pill, state, families, warning = null) {{
-    const familyIsVerified = familyVerified(state);
-    const effortIsVerified = effortVerified(state);
+    const closedPill = closedPillDiagnostics(pill, state);
+    const pickerFamilyIsVerified = familyVerified(state);
+    const pickerEffortIsVerified = effortVerified(state);
+    const familyIsVerified = pickerFamilyIsVerified && closedPill.closedPillFamilyStatus !== "unverified";
+    const effortIsVerified = pickerEffortIsVerified && closedPill.closedPillEffortStatus !== "unverified";
     const items = state?.effortItems || [];
     const checked = items.find((item) => isChecked(item));
     const checkedLabel = checked ? fold(textOf(checked)) : null;
-    const ultraPreset = checkedLabel === "ultra";
-    const verifiedEffort = checked && ["pro", "extra high", "max", "ultra"].includes(checkedLabel) ? checked : null;
+    const verifiedEffort = checked && checkedLabel === "pro" ? checked : null;
     const modelUsed = status === "current"
       ? (pill ? textOf(pill) : "")
-      : (familyIsVerified && effortIsVerified ? `GPT-5.6 Sol ${{textOf(verifiedEffort)}}` : null);
-    const ultraWarning = ultraPreset && effortIsVerified
-      ? "Ultra is the operator's preset effort; accepted as at-or-above-Max proof without escalating or downgrading (Ultra is never selected by the recipe)"
-      : null;
+      : (status === "selected" && pickerFamilyIsVerified && pickerEffortIsVerified ? `GPT-5.6 Sol ${{textOf(verifiedEffort)}}` : null);
     return {{
       requested,
       status,
       modelUsed,
       familyStatus: familyIsVerified ? "verified" : "unverified",
       effortStatus: effortIsVerified ? "verified" : "unverified",
+      ...closedPill,
+      pickerCloseMethod: pickerCloseMethods.length > 0 ? pickerCloseMethods.join("+") : null,
+      pickerCloseMethods,
+      pickerCloseVerification,
       pillText: textOf(pill),
       familyLabel: state?.familyLabel || null,
       availableItems: (state?.effortItems || []).map(textOf).filter(Boolean),
       availableFamilies: families || [],
-      warning: warning || ultraWarning,
-      ultraPreset,
+      warning,
+      ...surfaceFields(),
       url: window.location.href || "",
       title: document.title || ""
     }};
   }}
 
+  let surface = null;
+  function surfaceFields() {{
+    return {{
+      surfaceElapsedMs: surface?.elapsedMs ?? null,
+      surfaceAttempts: surface?.attempts ?? 0,
+      surfaceVerificationAttempts: surface?.verificationAttempts ?? 0,
+      surfaceState: surface?.state ?? surfaceState(null),
+      surfaceObservedValues: surface?.observedValues ?? []
+    }};
+  }}
+
+  surface = await ensureChatSurface();
+  if (!surface.ok) return result("not-found", null, null, [], surface.warning);
   if (strategy === "current") {{
     const pill = await waitForPill();
     return {{
@@ -637,13 +887,14 @@ async () => {{
       availableItems: [],
       availableFamilies: [],
       warning: "model pinning bypassed — answer may come from any model",
+      ...surfaceFields(),
       url: window.location.href || "",
       title: document.title || ""
     }};
   }}
 
   if (requested !== supported) {{
-    return result("not-found", null, null, [], "this recipe supports only GPT-5.6 Sol at the account maximum tier (Pro, Extra High, or Max)");
+    return result("not-found", null, null, [], "this recipe supports only GPT-5.6 Sol at Chat effort Pro");
   }}
   const legacy = legacyPickerMarkers();
   if (legacy.length > 0) {{
@@ -668,49 +919,71 @@ async () => {{
   let families = [];
   if (!state) return result("not-found", pill, null, families, "ChatGPT GPT-5.6 model picker did not open");
 
-  if (!familyVerified(state)) {{
-    const submenu = await openFamilyMenu(state);
-    const familyItems = radios(submenu);
-    families = familyItems.map(textOf).filter(Boolean);
-    const sol = familyItems.find((item) => fold(textOf(item)) === "gpt-5.6 sol") || null;
-    if (!sol) {{
+  let familyProof = await readFamilyProof(state);
+  families = familyProof.families;
+  if (!familyProof.ok) {{
+    if (familyProof.checkedItems.length !== 1 || !familyProof.sol) {{
       await closeMenus(pill);
-      return result("not-found", pill, state, families, "GPT-5.6 Sol was not visible in the family submenu");
+      return result(
+        "not-found",
+        pill,
+        state,
+        families,
+        familyProof.checkedItems.length === 1
+          ? "GPT-5.6 Sol was not visible in the family submenu"
+          : "GPT-5.6 Sol family menu did not expose one checked model"
+      );
     }}
-    realClick(sol);
+    realClick(familyProof.sol);
     await wait(250);
     pill = await waitForPill();
     if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol");
     menu = await openMain(pill);
     state = menu ? readState(menu) : null;
     if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting GPT-5.6 Sol");
-  }}
-
-  if (!effortVerified(state)) {{
-    const maxTier = state.effortItems.find((item) => fold(textOf(item)) === "max")
-      || state.effortItems.find((item) => fold(textOf(item)) === "extra high")
-      || state.effortItems.find((item) => fold(textOf(item)) === "pro") || null;
-    if (!maxTier) {{
+    familyProof = await readFamilyProof(state);
+    families = familyProof.families.length > 0 ? familyProof.families : families;
+    if (!familyProof.ok) {{
       await closeMenus(pill);
-      return result("not-found", pill, state, families, "Neither Pro, Extra High, nor Max was visible as the GPT-5.6 Sol maximum tier");
+      return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol family menu selection could not be verified");
     }}
-    realClick(maxTier);
+  }}
+  if (!effortVerified(state)) {{
+    const proTier = state.effortItems.find((item) => fold(textOf(item)) === "pro") || null;
+    if (!proTier) {{
+      await closeMenus(pill);
+      return result("not-found", pill, state, families, "Pro was not visible as a GPT-5.6 Sol effort tier");
+    }}
+    realClick(proTier);
     await wait(250);
     pill = await waitForPill();
-    if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting the maximum effort tier");
+    if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting Pro effort");
     menu = await openMain(pill);
     state = menu ? readState(menu) : null;
-    if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting the maximum effort tier");
+    if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting Pro effort");
   }}
 
+  familyProof = await readFamilyProof(state);
+  families = familyProof.families.length > 0 ? familyProof.families : families;
+  if (!familyProof.ok) {{
+    await closeMenus(pill);
+    return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol family menu could not be re-verified after effort selection");
+  }}
   const familyIsVerified = familyVerified(state);
   const effortIsVerified = effortVerified(state);
   if (!familyIsVerified || !effortIsVerified) {{
     await closeMenus(pill);
-    return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol at a verified maximum tier (Pro, Extra High, or Max) could not be confirmed in one picker pass");
+    return result("selection-mismatch", pill, state, families, "GPT-5.6 Sol at verified Pro effort could not be confirmed in one picker pass");
   }}
-  if (!await closeMenus(pill)) {{
+  if (!await closeMenus(pill, state, {{ requireProPill: true }})) {{
     return result("selection-mismatch", pill, state, families, "ChatGPT model picker remained open after verification");
+  }}
+  const closedPill = closedPillDiagnostics(pill, state);
+  if (closedPill.closedPillFamilyStatus === "unverified") {{
+    return result("selection-mismatch", pill, state, families, "ChatGPT composer model pill reported another model family after closing the picker");
+  }}
+  if (closedPill.closedPillEffortStatus !== "verified") {{
+    return result("selection-mismatch", pill, state, families, "ChatGPT composer model pill did not confirm verified Pro effort");
   }}
   return result("selected", pill, state, families);
 }}
@@ -1188,7 +1461,6 @@ fn contains_any(haystack: &str, needles: &[&str]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL;
     use base64::Engine;
     use headless_chrome::{Browser, LaunchOptionsBuilder, Tab};
     use serde_json::Value;
@@ -1209,62 +1481,59 @@ mod tests {
     }
 
     #[test]
-    fn reported_chatgpt_model_requires_verified_sol_and_extra_high_proofs() {
+    fn reported_chatgpt_model_requires_verified_sol_and_pro_effort() {
         let selection = serde_json::json!({
             "status": "selected",
-            "requested": "gpt-5-6-sol-account-max",
-            "modelUsed": "GPT-5.6 Sol Extra High",
-            "familyStatus": "verified",
-            "effortStatus": "verified"
-        });
-        assert_eq!(
-            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-account-max"),
-            Some("GPT-5.6 Sol Extra High".to_string())
-        );
-
-        let enterprise_selection = serde_json::json!({
-            "status": "selected",
-            "requested": "gpt-5-6-sol-account-max",
+            "requested": "gpt-5-6-sol-chat-pro",
             "modelUsed": "GPT-5.6 Sol Pro",
             "familyStatus": "verified",
             "effortStatus": "verified"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&enterprise_selection, "gpt-5-6-sol-account-max"),
+            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-chat-pro"),
+            Some("GPT-5.6 Sol Pro".to_string())
+        );
+
+        let enterprise_selection = serde_json::json!({
+            "status": "selected",
+            "requested": "gpt-5-6-sol-chat-pro",
+            "modelUsed": "GPT-5.6 Sol Pro",
+            "familyStatus": "verified",
+            "effortStatus": "verified"
+        });
+        assert_eq!(
+            select_reported_chatgpt_model(&enterprise_selection, "gpt-5-6-sol-chat-pro"),
             Some("GPT-5.6 Sol Pro".to_string())
         );
 
         let unknown_selection = serde_json::json!({
             "status": "selected",
-            "requested": "gpt-5-6-sol-account-max",
+            "requested": "gpt-5-6-sol-chat-pro",
             "modelUsed": "GPT-5.6 Sol Expert",
             "familyStatus": "verified",
             "effortStatus": "verified"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&unknown_selection, "gpt-5-6-sol-account-max"),
+            select_reported_chatgpt_model(&unknown_selection, "gpt-5-6-sol-chat-pro"),
             None
         );
     }
 
     #[test]
-    fn reported_chatgpt_model_accepts_sol_max_tier() {
-        // The CDP/dev-browser picker must accept the Max effort tier with the same
-        // proof shape as Pro/Extra High (parity with the native extension's
-        // CHATGPT_MAX_EFFORT_LABELS = {pro, extra high, max}).
-        let max_selection = serde_json::json!({
+    fn reported_chatgpt_model_accepts_sol_pro_tier() {
+        let pro_selection = serde_json::json!({
             "status": "selected",
-            "requested": "gpt-5-6-sol-account-max",
-            "modelUsed": "GPT-5.6 Sol Max",
+            "requested": "gpt-5-6-sol-chat-pro",
+            "modelUsed": "GPT-5.6 Sol Pro",
             "familyStatus": "verified",
             "effortStatus": "verified"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&max_selection, "gpt-5-6-sol-account-max"),
-            Some("GPT-5.6 Sol Max".to_string())
+            select_reported_chatgpt_model(&pro_selection, "gpt-5-6-sol-chat-pro"),
+            Some("GPT-5.6 Sol Pro".to_string())
         );
         assert_eq!(
-            chatgpt_model_selection_status(&max_selection, "gpt-5-6-sol-account-max"),
+            chatgpt_model_selection_status(&pro_selection, "gpt-5-6-sol-chat-pro"),
             ChatgptModelSelectionStatus::Selected
         );
     }
@@ -1273,12 +1542,12 @@ mod tests {
     fn reported_chatgpt_model_never_echoes_an_unverified_request() {
         let selection = serde_json::json!({
             "status": "selected",
-            "requested": "gpt-5-6-sol-account-max",
+            "requested": "gpt-5-6-sol-chat-pro",
             "modelUsed": "Pro Extended",
             "extendedStatus": "required"
         });
         assert_eq!(
-            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-account-max"),
+            select_reported_chatgpt_model(&selection, "gpt-5-6-sol-chat-pro"),
             None
         );
     }
@@ -1304,12 +1573,12 @@ mod tests {
             chatgpt_model_selection_status(
                 &serde_json::json!({
                     "status": "selected",
-                    "requested": "gpt-5-6-sol-account-max",
-                    "modelUsed": "GPT-5.6 Sol Extra High",
+                    "requested": "gpt-5-6-sol-chat-pro",
+                    "modelUsed": "GPT-5.6 Sol Pro",
                     "familyStatus": "verified",
                     "effortStatus": "verified"
                 }),
-                "gpt-5-6-sol-account-max"
+                "gpt-5-6-sol-chat-pro"
             ),
             ChatgptModelSelectionStatus::Selected
         );
@@ -1334,7 +1603,7 @@ mod tests {
                     "modelUsed": "Pro Extended",
                     "extendedStatus": "required"
                 }),
-                "gpt-5-6-sol-account-max"
+                "gpt-5-6-sol-chat-pro"
             ),
             ChatgptModelSelectionStatus::Mismatch
         );
@@ -1348,7 +1617,7 @@ mod tests {
         assert_eq!(
             chatgpt_model_selection_status(
                 &serde_json::json!({"status": "selection-mismatch"}),
-                "gpt-5-6-sol-account-max"
+                "gpt-5-6-sol-chat-pro"
             ),
             ChatgptModelSelectionStatus::Mismatch
         );
@@ -1378,104 +1647,63 @@ mod tests {
     }
 
     #[test]
-    fn model_selection_function_requires_verified_sol_family_and_known_maximum_effort() {
+    fn model_selection_function_requires_verified_sol_family_and_pro_effort() {
         let script =
-            build_model_selection_function("gpt-5-6-sol-account-max", ChatgptModelStrategy::Select);
-        assert!(script.contains(r#"const requested = "gpt-5-6-sol-account-max";"#));
+            build_model_selection_function("gpt-5-6-sol-chat-pro", ChatgptModelStrategy::Select);
+        assert!(script.contains(r#"const requested = "gpt-5-6-sol-chat-pro";"#));
         assert!(script.contains("classList.contains(\"__composer-pill\")"));
+        assert!(script.contains(r#"[role="radiogroup"][aria-label="Select chat surface"]"#));
+        assert!(script.contains(r#"[role="radio"][data-tpp-toggle-value="chatgpt"]"#));
+        let surface_guard = script
+            .find("surface = await ensureChatSurface();")
+            .expect("generated picker includes the Chat surface guard");
+        let family_picker = script
+            .find("let familyProof = await readFamilyProof(state);")
+            .expect("generated picker includes family selection logic");
+        assert!(surface_guard < family_picker);
+        assert!(script.contains("const SURFACE_SETTLE_TIMEOUT_MS = 1000;"));
+        assert!(script.contains("function surfaceObservedValues()"));
+        assert!(script.contains("surfaceVerificationAttempts"));
+        assert!(script.contains("surfaceObservedValues"));
+        assert!(script.contains("ariaChecked"));
+        assert!(script.contains("dataState"));
+        assert!(!script.contains("surfacePollTimeline"));
+        assert!(!script.contains("surfaceEnvironment"));
         assert!(script.contains(
             "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI"
         ));
         assert!(script.contains(r#"familyStatus: familyIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"effortStatus: effortIsVerified ? "verified" : "unverified""#));
         assert!(script.contains(r#"fold(textOf(item)) === "gpt-5.6 sol""#));
+        assert!(script.contains("async function readFamilyProof(state)"));
+        assert!(script.contains("item.getAttribute(\"aria-checked\") === \"true\""));
+        assert!(script.contains("state.familyProof = checkedItems.length === 1"));
+        assert!(script.contains("async function closeMenus(pill, state = null"));
+        assert!(script.contains("dispatchHoverLeaveEvents"));
+        assert!(script.contains("pickerCloseMethod"));
+        assert!(script.contains("function closedPillDiagnostics(pill, state)"));
+        assert!(script.contains("closedPillFamilyStatus"));
+        assert!(script.contains("closedPillEffortStatus"));
         // Ladder-aware effortVerified (yz-7p3.3 finding D): the verified set now
-        // includes Ultra (never clicked) and gates Extra High on Max-absent.
-        assert!(script.contains("checkedLabel === \"max\" || checkedLabel === \"pro\""));
-        assert!(script.contains("checkedLabel === \"ultra\""));
-        assert!(script.contains("checkedLabel === \"extra high\" && !maxPresent"));
-        // The Max tier is the first maxTier fallback, ahead of Extra High and Pro,
-        // matching the native extension's CHATGPT_MAX_EFFORT_LABELS ordering.
-        assert!(script.contains(r#"fold(textOf(item)) === "max""#));
-        assert!(script.contains(
-            "Neither Pro, Extra High, nor Max was visible as the GPT-5.6 Sol maximum tier"
-        ));
-        assert!(script.contains(
-            "GPT-5.6 Sol at a verified maximum tier (Pro, Extra High, or Max) could not be confirmed"
-        ));
-        assert!(script.contains(
-            "this recipe supports only GPT-5.6 Sol at the account maximum tier (Pro, Extra High, or Max)"
-        ));
+        // requires the visible Pro effort tier.
+        assert!(script.contains("return checkedLabel === \"pro\";"));
+        assert!(!script.contains(r#"fold(textOf(item)) === "max""#));
+        assert!(script.contains("Pro was not visible as a GPT-5.6 Sol effort tier"));
+        assert!(script.contains("GPT-5.6 Sol at verified Pro effort could not be confirmed"));
+        assert!(script.contains("this recipe supports only GPT-5.6 Sol at Chat effort Pro"));
         assert!(script.contains(r#"/^(?:gpt|o\d)\b/i.test(textOf(item))"#));
         assert!(script.contains("await openFamilyMenu"));
         assert!(script.contains("async function waitForPill()"));
         assert!(script.contains("pill = await waitForPill();"));
         assert!(script
             .contains("ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol"));
-        assert!(script.contains(
-            "ChatGPT composer model pill did not remount after selecting the maximum effort tier"
-        ));
-        assert!(script.contains("return visibleMenus().length === 0;"));
-        assert!(script.contains("if (!await closeMenus(pill))"));
+        assert!(script
+            .contains("ChatGPT composer model pill did not remount after selecting Pro effort"));
+        assert!(script.contains("return verification.ok;"));
+        assert!(script.contains("if (!await closeMenus(pill, state"));
         assert!(!script.contains("if (families.length === 0 && state.familyTrigger)"));
         assert!(script.contains("await closeMenus"));
         assert!(!script.contains("model-switcher-gpt-5-4"));
-    }
-
-    #[test]
-    fn cdp_effort_verified_is_ladder_aware_preset_ultra_never_downgraded() {
-        // yz-7p3.3 finding D: a preset Ultra must verify WITHOUT being clicked.
-        // The emitted effortVerified recognizes a checked "ultra", so the
-        // `if (!effortVerified(state))` click block is skipped entirely and the
-        // Ultra preset is accepted with a diagnostic warning. The maxTier fallback
-        // click path must never run for Ultra.
-        let script = build_model_selection_function(
-            CHATGPT_SOL_ACCOUNT_MAX_MODEL,
-            ChatgptModelStrategy::Select,
-        );
-        // effortVerified accepts a checked Ultra.
-        assert!(script.contains("checkedLabel === \"ultra\""));
-        // The Ultra preset surfaces a diagnostic warning, never a click.
-        assert!(script
-            .contains("Ultra is the operator's preset effort; accepted as at-or-above-Max proof"));
-        // The maxTier fallback explicitly does NOT include ultra as a click target.
-        assert!(script.contains("fold(textOf(item)) === \"max\""));
-        assert!(!script.contains("fold(textOf(item)) === \"ultra\""));
-        // is_verified_sol_extra_high_selection trusts an Ultra modelUsed.
-        let ultra = serde_json::json!({
-            "status": "selected",
-            "requested": CHATGPT_SOL_ACCOUNT_MAX_MODEL,
-            "familyStatus": "verified",
-            "effortStatus": "verified",
-            "modelUsed": "GPT-5.6 Sol Ultra"
-        });
-        assert!(is_verified_sol_extra_high_selection(
-            &ultra,
-            CHATGPT_SOL_ACCOUNT_MAX_MODEL
-        ));
-    }
-
-    #[test]
-    fn cdp_effort_verified_gates_extra_high_on_max_present() {
-        // yz-7p3.3 finding D: a checked Extra High is verified ONLY when Max is
-        // absent from the visible effortItems. With Max present, effortVerified is
-        // false and the maxTier fallback clicks Max (not Extra High).
-        let script = build_model_selection_function(
-            CHATGPT_SOL_ACCOUNT_MAX_MODEL,
-            ChatgptModelStrategy::Select,
-        );
-        assert!(script.contains("checkedLabel === \"extra high\" && !maxPresent"));
-        // Max remains the first fallback tier (ahead of Extra High and Pro).
-        let max_fallback = script
-            .find("const maxTier = state.effortItems.find")
-            .unwrap_or(0);
-        let max_slice = &script[max_fallback..max_fallback + 220];
-        let max_pos = max_slice.find("\"max\"").unwrap();
-        let extra_pos = max_slice.find("\"extra high\"").unwrap();
-        assert!(
-            max_pos < extra_pos,
-            "Max must precede Extra High in the fallback ladder"
-        );
     }
 
     #[test]

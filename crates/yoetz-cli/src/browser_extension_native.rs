@@ -1559,7 +1559,7 @@ pub fn canary(
         BuiltinWebRecipe::Chatgpt => run_chatgpt_recipe(
             &ChatgptRecipeSpec {
                 bundle_path: Some(bundle_path),
-                model: crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL.to_string(),
+                model: crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL.to_string(),
                 model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
                 prompt: "Reply with exactly OK.".to_string(),
                 browser_context_id: None,
@@ -4475,7 +4475,7 @@ mod tests {
         };
         let spec = ChatgptRecipeSpec {
             bundle_path: Some(bundle.path.clone()),
-            model: crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL.to_string(),
+            model: crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL.to_string(),
             model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
             prompt: "continue".to_string(),
             browser_context_id: None,
@@ -4621,7 +4621,7 @@ mod tests {
             Some("run_1".to_string()),
             json!({
                 "response": "done",
-                "model_used": "GPT-5.6 Sol Extra High",
+                "model_used": "GPT-5.6 Sol Pro",
                 "model_selection_status": "selected",
                 "warnings": [
                     "kept current",
@@ -4646,7 +4646,7 @@ mod tests {
         let result = parse_recipe_result(envelope).unwrap();
 
         assert_eq!(result.response, "done");
-        assert_eq!(result.model_used.as_deref(), Some("GPT-5.6 Sol Extra High"));
+        assert_eq!(result.model_used.as_deref(), Some("GPT-5.6 Sol Pro"));
         assert_eq!(
             result.model_selection_status,
             ChatgptModelSelectionStatus::Selected
@@ -4686,7 +4686,7 @@ mod tests {
             result.diagnostics.model_slug.as_deref(),
             Some("gpt-5.6-sol-wm")
         );
-        assert_eq!(result.model_used.as_deref(), Some("GPT-5.6 Sol Extra High"));
+        assert_eq!(result.model_used.as_deref(), Some("GPT-5.6 Sol Pro"));
     }
 
     #[test]

@@ -980,7 +980,7 @@ fn run_recipe_with_connection(
         let claude_action_terminal_phase = is_claude_recipe
             .then(|| claude_stage.terminal_phase(action))
             .flatten();
-        let commands = expand_step(action, step.args.as_deref(), &ctx)
+        let commands = expand_step_for_connection(action, step.args.as_deref(), &ctx, connection)
             .map_err(|err| mark_chatgpt_error_after_side_effect(err, action_terminal_phase))
             .map_err(|err| mark_claude_error_after_side_effect(err, claude_action_terminal_phase))
             .with_context(|| format!("recipe step {idx} ({action}) expand failed"))?;
@@ -1491,13 +1491,36 @@ enum CompletionVerdict {
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 struct AgentBrowserTab {
+    // Older agent-browser releases exposed a numeric index. Keep accepting it
+    // for compatibility, but prefer the stable tabId used by current releases.
+    #[serde(default)]
     index: usize,
+    #[serde(rename = "tabId", default)]
+    tab_id: Option<String>,
     #[serde(default)]
     active: bool,
     #[serde(default)]
     title: String,
     #[serde(default)]
     url: String,
+}
+
+impl AgentBrowserTab {
+    fn selector(&self) -> String {
+        self.tab_id
+            .as_deref()
+            .filter(|tab_id| !tab_id.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.index.to_string())
+    }
+
+    fn order(&self) -> usize {
+        self.tab_id
+            .as_deref()
+            .and_then(|tab_id| tab_id.strip_prefix('t'))
+            .and_then(|suffix| suffix.parse::<usize>().ok())
+            .unwrap_or(self.index)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1783,7 +1806,7 @@ fn chatgpt_wait_probe_delay(
 #[derive(Debug, Default)]
 struct ChatgptRunTabFocusCache {
     run_id: Option<String>,
-    tab_index: Option<usize>,
+    tab_selector: Option<String>,
 }
 
 fn focus_chatgpt_run_tab_for_live_attach_cached(
@@ -1808,8 +1831,8 @@ fn focus_chatgpt_run_tab_for_live_attach_cached(
 
     if let Some(cache_ref) = cache.as_deref_mut() {
         if cache_ref.run_id.as_deref() == Some(run_id) {
-            if let Some(index) = cache_ref.tab_index {
-                if select_live_attach_tab(connection, index, use_stealth, headed, timeout_ms)
+            if let Some(selector) = cache_ref.tab_selector.clone() {
+                if select_live_attach_tab(connection, &selector, use_stealth, headed, timeout_ms)
                     .is_ok()
                 {
                     let identity = inspect_current_live_attach_tab_identity(
@@ -1822,11 +1845,11 @@ fn focus_chatgpt_run_tab_for_live_attach_cached(
                         return Ok(());
                     }
                 }
-                cache_ref.tab_index = None;
+                cache_ref.tab_selector = None;
             }
         } else {
             cache_ref.run_id = Some(run_id.to_string());
-            cache_ref.tab_index = None;
+            cache_ref.tab_selector = None;
         }
     }
 
@@ -1838,27 +1861,29 @@ fn focus_chatgpt_run_tab_for_live_attach_cached(
     {
         if let Some(cache_ref) = cache.as_deref_mut() {
             cache_ref.run_id = Some(run_id.to_string());
-            cache_ref.tab_index = Some(tab.index);
+            cache_ref.tab_selector = Some(tab.selector());
         }
         return Ok(());
     }
     if let Some(tab) = tabs.iter().find(|tab| url_has_run_marker(&tab.url)) {
-        select_live_attach_tab(connection, tab.index, use_stealth, headed, timeout_ms)?;
+        let selector = tab.selector();
+        select_live_attach_tab(connection, &selector, use_stealth, headed, timeout_ms)?;
         if let Some(cache_ref) = cache.as_deref_mut() {
             cache_ref.run_id = Some(run_id.to_string());
-            cache_ref.tab_index = Some(tab.index);
+            cache_ref.tab_selector = Some(selector);
         }
         return Ok(());
     }
 
     for tab in chatgpt_run_tab_candidates(&tabs) {
-        select_live_attach_tab(connection, tab.index, use_stealth, headed, timeout_ms)?;
+        let selector = tab.selector();
+        select_live_attach_tab(connection, &selector, use_stealth, headed, timeout_ms)?;
         let identity =
             inspect_current_live_attach_tab_identity(connection, use_stealth, headed, timeout_ms)?;
         if identity.window_name == run_marker || url_has_run_marker(&identity.url) {
             if let Some(cache_ref) = cache.as_deref_mut() {
                 cache_ref.run_id = Some(run_id.to_string());
-                cache_ref.tab_index = Some(tab.index);
+                cache_ref.tab_selector = Some(selector);
             }
             return Ok(());
         }
@@ -1871,13 +1896,13 @@ fn focus_chatgpt_run_tab_for_live_attach_cached(
 
 fn select_live_attach_tab(
     connection: &BrowserConnection,
-    index: usize,
+    selector: &str,
     use_stealth: bool,
     headed: bool,
     timeout_ms: u64,
 ) -> Result<()> {
     run_agent_browser_with_connection_timeout(
-        vec!["tab".to_string(), index.to_string()],
+        vec!["tab".to_string(), selector.to_string()],
         OutputFormat::Text,
         Some(connection),
         use_stealth,
@@ -1892,7 +1917,7 @@ fn chatgpt_run_tab_candidates(tabs: &[AgentBrowserTab]) -> Vec<&AgentBrowserTab>
         .iter()
         .filter(|tab| is_chatgpt_tab(tab))
         .collect::<Vec<_>>();
-    candidates.sort_by_key(|tab| (!tab.active, tab.index));
+    candidates.sort_by_key(|tab| (!tab.active, tab.order()));
     candidates
 }
 
@@ -1959,7 +1984,7 @@ fn run_chatgpt_select_model(
     use_stealth: bool,
     headed: bool,
 ) -> Result<String> {
-    let requested_model = crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL;
+    let requested_model = crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL;
     let function = chatgpt_web::build_model_selection_function(
         requested_model,
         chatgpt_recipe::ChatgptModelStrategy::Select,
@@ -4358,7 +4383,9 @@ fn browser_doctor_report_with_discovery(
                 };
                 lines.push(format!(
                     "    {marker} tab {}: {} ({})",
-                    tab.index, title, tab.url
+                    tab.selector(),
+                    title,
+                    tab.url
                 ));
             }
         }
@@ -5162,9 +5189,9 @@ pub struct LiveAttachProbeHandle {
     /// Marker value embedded in the probe tab URL as
     /// `?_yoetz_probe=<marker>` or `&_yoetz_probe=<marker>`.
     marker: String,
-    /// Index the probe tab occupied on creation — kept only as a hint for
+    /// Stable selector the probe tab had on creation — kept only as a hint for
     /// logging; close still re-resolves by marker before touching Chrome.
-    last_known_index: Option<usize>,
+    last_known_selector: Option<String>,
 }
 
 fn generate_probe_marker() -> String {
@@ -5191,14 +5218,14 @@ pub(crate) fn mark_probe_url(target_url: &str, marker: &str) -> String {
     format!("{trimmed}{separator}{YOETZ_PROBE_MARKER_PARAM}={marker}")
 }
 
-fn find_probe_tab(tabs: &[AgentBrowserTab], marker: &str) -> Option<usize> {
+fn find_probe_tab(tabs: &[AgentBrowserTab], marker: &str) -> Option<String> {
     if marker.is_empty() {
         return None;
     }
     let needle = format!("{YOETZ_PROBE_MARKER_PARAM}={marker}");
     tabs.iter()
         .find(|tab| tab.url.contains(&needle))
-        .map(|tab| tab.index)
+        .map(AgentBrowserTab::selector)
 }
 
 fn open_live_attach_verification_tab(
@@ -5222,7 +5249,7 @@ fn open_live_attach_verification_tab(
     // don't fail the whole auth check — the close path will re-try the list
     // and either resolve the probe by marker or warn again). This is the
     // review-finding-#6 requirement: stop the silent `.ok()` pattern.
-    let last_known_index = match list_live_attach_tabs(
+    let last_known_selector = match list_live_attach_tabs(
         connection,
         use_stealth,
         headed,
@@ -5238,7 +5265,7 @@ fn open_live_attach_verification_tab(
     };
     Ok(Some(LiveAttachProbeHandle {
         marker,
-        last_known_index,
+        last_known_selector,
     }))
 }
 
@@ -5267,17 +5294,17 @@ fn close_live_attach_verification_tab(
             return;
         }
     };
-    let Some(index) = find_probe_tab(&tabs, &handle.marker) else {
-        if let Some(hint) = handle.last_known_index {
+    let Some(selector) = find_probe_tab(&tabs, &handle.marker) else {
+        if let Some(hint) = &handle.last_known_selector {
             eprintln!(
-                "warn: yoetz auth probe tab (marker `{}`, last known at index {hint}) was not found; it may have already been closed by the user",
+                "warn: yoetz auth probe tab (marker `{}`, last known selector {hint}) was not found; it may have already been closed by the user",
                 handle.marker
             );
         }
         return;
     };
     if run_agent_browser_with_connection_timeout(
-        vec!["tab".to_string(), index.to_string()],
+        vec!["tab".to_string(), selector],
         OutputFormat::Text,
         Some(connection),
         use_stealth,
@@ -5351,7 +5378,7 @@ fn maybe_select_live_attach_profile_tab(
     )?;
     let selected = select_live_attach_profile_tab(&tabs, &requested_email)?;
     run_agent_browser_with_connection_timeout(
-        vec!["tab".to_string(), selected.index.to_string()],
+        vec!["tab".to_string(), selected.selector()],
         OutputFormat::Text,
         Some(connection),
         ctx.use_stealth,
@@ -5557,6 +5584,32 @@ fn expand_step(
         command.push(interpolate(arg, ctx, None)?);
     }
     Ok(vec![command])
+}
+
+fn expand_step_for_connection(
+    action: &str,
+    args: Option<&[String]>,
+    ctx: &RecipeContext,
+    connection: Option<&BrowserConnection>,
+) -> Result<Vec<Vec<String>>> {
+    let commands = expand_step(action, args, ctx)?;
+    if action != "open" || !connection.is_some_and(BrowserConnection::is_live_attach) {
+        return Ok(commands);
+    }
+
+    // `agent-browser open` navigates the active tab. Live recipe runs must
+    // create a marked tab first so a user-owned tab cannot be repurposed.
+    commands
+        .into_iter()
+        .map(|mut command| {
+            if command.len() < 2 {
+                return Err(anyhow!("live browser open step requires a target URL"));
+            }
+            command[0] = "tab".to_string();
+            command.insert(1, "new".to_string());
+            Ok(command)
+        })
+        .collect()
 }
 
 fn expand_bundle_text_step(
@@ -5885,24 +5938,27 @@ mod tests {
         let tabs = vec![
             AgentBrowserTab {
                 index: 2,
+                tab_id: None,
                 active: true,
                 title: "Inbox".to_string(),
                 url: "https://mail.google.com/".to_string(),
             },
             AgentBrowserTab {
                 index: 7,
+                tab_id: Some("t7".to_string()),
                 active: false,
                 title: "ChatGPT probe".to_string(),
                 url: "https://chatgpt.com/?_yoetz_probe=run-abc".to_string(),
             },
             AgentBrowserTab {
                 index: 0,
+                tab_id: None,
                 active: false,
                 title: "ChatGPT real".to_string(),
                 url: "https://chatgpt.com/c/old".to_string(),
             },
         ];
-        assert_eq!(find_probe_tab(&tabs, "run-abc"), Some(7));
+        assert_eq!(find_probe_tab(&tabs, "run-abc"), Some("t7".to_string()));
         // A different marker must never resolve to a user-owned ChatGPT tab
         // (review finding #6: identity must be certain before closing).
         assert_eq!(find_probe_tab(&tabs, "other-run"), None);
@@ -5917,18 +5973,48 @@ mod tests {
         let tabs_before_close = vec![
             AgentBrowserTab {
                 index: 1,
+                tab_id: None,
                 active: false,
                 title: "ChatGPT probe".to_string(),
                 url: "https://chatgpt.com/?_yoetz_probe=run-xyz".to_string(),
             },
             AgentBrowserTab {
                 index: 3,
+                tab_id: None,
                 active: true,
                 title: "Important Doc".to_string(),
                 url: "https://docs.google.com/".to_string(),
             },
         ];
-        assert_eq!(find_probe_tab(&tabs_before_close, "run-xyz"), Some(1));
+        assert_eq!(
+            find_probe_tab(&tabs_before_close, "run-xyz"),
+            Some("1".to_string())
+        );
+    }
+
+    #[test]
+    fn agent_browser_tab_list_accepts_stable_tab_ids() {
+        let envelope: AgentBrowserTabListEnvelope = serde_json::from_str(
+            r#"{
+                "success": true,
+                "data": {
+                    "tabs": [{
+                        "active": true,
+                        "label": null,
+                        "tabId": "t12",
+                        "targetId": "ABC123",
+                        "title": "ChatGPT",
+                        "type": "page",
+                        "url": "https://chatgpt.com/"
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let tab = &envelope.data.tabs[0];
+        assert_eq!(tab.selector(), "t12");
+        assert_eq!(tab.order(), 12);
     }
 
     fn recipe_context() -> RecipeContext {
@@ -5945,7 +6031,7 @@ mod tests {
             warnings: Vec::new(),
             vars: BTreeMap::from([(
                 "model".to_string(),
-                crate::chatgpt_recipe::CHATGPT_SOL_ACCOUNT_MAX_MODEL.to_string(),
+                crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL.to_string(),
             )]),
         }
     }
@@ -6093,7 +6179,7 @@ case "$*" in
     count=$((count + 1))
     printf '%s' "$count" > "$EVAL_COUNT_PATH"
     if [ "$count" = "1" ]; then
-      printf '{"status":"selected","requested":"gpt-5-6-sol-account-max","modelUsed":"GPT-5.6 Sol Extra High","familyStatus":"verified","effortStatus":"verified"}'
+      printf '{"status":"selected","requested":"gpt-5-6-sol-chat-pro","modelUsed":"GPT-5.6 Sol Pro","familyStatus":"verified","effortStatus":"verified"}'
     elif [ "$count" = "2" ]; then
       printf '{"status":"marked"}'
     else
@@ -6124,7 +6210,7 @@ if %errorlevel%==0 (
   set /a count=count+1
   > "%EVAL_COUNT_PATH%" echo !count!
   if "!count!"=="1" (
-    echo {"status":"selected","requested":"gpt-5-6-sol-account-max","modelUsed":"GPT-5.6 Sol Extra High","familyStatus":"verified","effortStatus":"verified"}
+    echo {"status":"selected","requested":"gpt-5-6-sol-chat-pro","modelUsed":"GPT-5.6 Sol Pro","familyStatus":"verified","effortStatus":"verified"}
   ) else if "!count!"=="2" (
     echo {"status":"marked"}
   ) else (
@@ -6566,12 +6652,14 @@ browser_cdp = "http://evil.example.com:9222"
             &AutoConnectDoctorStatus::Reachable(vec![
                 AgentBrowserTab {
                     index: 3,
+                    tab_id: None,
                     active: true,
                     title: "ChatGPT".to_string(),
                     url: "https://chatgpt.com/".to_string(),
                 },
                 AgentBrowserTab {
                     index: 1,
+                    tab_id: None,
                     active: false,
                     title: "Inbox".to_string(),
                     url: "https://mail.google.com/".to_string(),
@@ -6601,6 +6689,7 @@ browser_cdp = "http://evil.example.com:9222"
             &[],
             &AutoConnectDoctorStatus::Reachable(vec![AgentBrowserTab {
                 index: 9,
+                tab_id: None,
                 active: true,
                 title: "<untitled>".to_string(),
                 url: "about:blank".to_string(),
@@ -6629,12 +6718,14 @@ browser_cdp = "http://evil.example.com:9222"
             &AutoConnectDoctorStatus::Reachable(vec![
                 AgentBrowserTab {
                     index: 0,
+                    tab_id: None,
                     active: false,
                     title: "Inbox (43,617) - personal@example.com - Gmail".to_string(),
                     url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
                 },
                 AgentBrowserTab {
                     index: 1,
+                    tab_id: None,
                     active: false,
                     title: "Inbox (6,096) - work@example.com - Work Mail".to_string(),
                     url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
@@ -6876,12 +6967,14 @@ browser_cdp = "http://evil.example.com:9222"
         let tabs = vec![
             AgentBrowserTab {
                 index: 1,
+                tab_id: None,
                 active: true,
                 title: "Inbox (43,617) - personal@example.com - Gmail".to_string(),
                 url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
             },
             AgentBrowserTab {
                 index: 4,
+                tab_id: None,
                 active: false,
                 title: "Personal Pro OK".to_string(),
                 url: "https://chatgpt.com/c/abc".to_string(),
@@ -6896,6 +6989,7 @@ browser_cdp = "http://evil.example.com:9222"
     fn select_live_attach_profile_tab_errors_when_email_not_visible() {
         let tabs = vec![AgentBrowserTab {
             index: 2,
+            tab_id: None,
             active: true,
             title: "Inbox (6,096) - work@example.com - Work Mail".to_string(),
             url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
@@ -6912,12 +7006,14 @@ browser_cdp = "http://evil.example.com:9222"
         let tabs = vec![
             AgentBrowserTab {
                 index: 1,
+                tab_id: None,
                 active: true,
                 title: "Inbox (43,617) - personal@example.com - Gmail".to_string(),
                 url: "https://mail.google.com/mail/u/0/#inbox".to_string(),
             },
             AgentBrowserTab {
                 index: 2,
+                tab_id: None,
                 active: false,
                 title: "Drafts - personal@example.com - Gmail".to_string(),
                 url: "https://mail.google.com/mail/u/1/#drafts".to_string(),
@@ -6934,18 +7030,21 @@ browser_cdp = "http://evil.example.com:9222"
     fn is_chatgpt_tab_matches_url_or_title() {
         assert!(is_chatgpt_tab(&AgentBrowserTab {
             index: 1,
+            tab_id: None,
             active: false,
             title: "Workspace".to_string(),
             url: "https://chatgpt.com/c/abc".to_string(),
         }));
         assert!(is_chatgpt_tab(&AgentBrowserTab {
             index: 2,
+            tab_id: None,
             active: false,
             title: "ChatGPT".to_string(),
             url: "https://example.com/".to_string(),
         }));
         assert!(!is_chatgpt_tab(&AgentBrowserTab {
             index: 3,
+            tab_id: None,
             active: true,
             title: "Workspace".to_string(),
             url: "https://example.com/".to_string(),
@@ -6957,18 +7056,21 @@ browser_cdp = "http://evil.example.com:9222"
         let tabs = vec![
             AgentBrowserTab {
                 index: 9,
+                tab_id: None,
                 active: true,
                 title: "Workspace".to_string(),
                 url: "https://example.com/".to_string(),
             },
             AgentBrowserTab {
                 index: 7,
+                tab_id: None,
                 active: false,
                 title: "ChatGPT".to_string(),
                 url: "https://chatgpt.com/c/older".to_string(),
             },
             AgentBrowserTab {
                 index: 5,
+                tab_id: None,
                 active: true,
                 title: "ChatGPT".to_string(),
                 url: "https://chatgpt.com/c/current".to_string(),
@@ -7007,7 +7109,7 @@ browser_cdp = "http://evil.example.com:9222"
     fn interpolate_replaces_bundle_and_recipe_vars() {
         let ctx = recipe_context();
         let value = interpolate("open {{bundle_path}} {{model}}", &ctx, Some("ignored")).unwrap();
-        assert_eq!(value, "open /tmp/bundle.md gpt-5-6-sol-account-max");
+        assert_eq!(value, "open /tmp/bundle.md gpt-5-6-sol-chat-pro");
     }
 
     #[test]
@@ -7203,6 +7305,23 @@ browser_cdp = "http://evil.example.com:9222"
     }
 
     #[test]
+    fn live_attach_open_step_creates_a_new_tab_without_changing_managed_steps() {
+        let ctx = recipe_context();
+        let args = [CHATGPT_URL.to_string()];
+        let live = expand_step_for_connection(
+            "open",
+            Some(&args),
+            &ctx,
+            Some(&BrowserConnection::AutoConnect),
+        )
+        .unwrap();
+        assert_eq!(live, vec![vec!["tab", "new", CHATGPT_URL]]);
+
+        let managed = expand_step_for_connection("open", Some(&args), &ctx, None).unwrap();
+        assert_eq!(managed, vec![vec!["open", CHATGPT_URL]]);
+    }
+
+    #[test]
     #[allow(unsafe_code)]
     fn live_attach_chatgpt_steps_focus_run_tab_before_built_in_and_generic_actions() {
         fn assert_action_was_focused(lines: &[&str], needle: &str) {
@@ -7255,6 +7374,10 @@ steps:
             assert!(
                 logged.contains(expected_connection_arg),
                 "expected `{expected_connection_arg}` in log:\n{logged}"
+            );
+            assert!(
+                logged.contains(" tab new https://chatgpt.com/?_yoetz=run-focus"),
+                "live recipe should open a new marked tab, got:\n{logged}"
             );
             let lines = logged.lines().collect::<Vec<_>>();
             let eval_indices = lines
@@ -7952,7 +8075,7 @@ steps:
                 "action": CHATGPT_SELECT_MODEL_ACTION,
                 "stdout": {
                     "status": "ok",
-                    "model_used": "GPT-5.6 Sol Extra High",
+                    "model_used": "GPT-5.6 Sol Pro",
                     "model_selection_status": "selected"
                 }
             }),
@@ -7971,7 +8094,7 @@ steps:
         assert_eq!(payload["transport"], "agent-browser");
         assert_eq!(payload["backend"], "agent-browser");
         assert_eq!(payload["response"], "final answer");
-        assert_eq!(payload["model_used"], "GPT-5.6 Sol Extra High");
+        assert_eq!(payload["model_used"], "GPT-5.6 Sol Pro");
         assert_eq!(payload["model_selection_status"], "selected");
         assert_eq!(payload["fallback_used"], true);
         assert_eq!(payload["warnings"], json!(["used paste fallback"]));
@@ -8571,7 +8694,7 @@ steps:
 
         let logged = fs::read_to_string(&log_path).unwrap_or_default();
         assert!(
-            logged.contains("open https://chatgpt.com/"),
+            logged.contains("tab new https://chatgpt.com/"),
             "expected the action to run after sleep, got `{logged}`"
         );
     }

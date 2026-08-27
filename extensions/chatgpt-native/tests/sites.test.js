@@ -109,35 +109,35 @@ test("ChatGPT adapter owns conversation and model policy", () => {
   }, provisionalConversationId, assignedConversationId), false);
   assert.equal(adapter.isAcceptableModelSelection({
     status: "selected",
-    requested_model: "gpt-5-6-sol-account-max",
-    family_status: "verified",
-    effort_status: "verified",
-    model_used: "GPT-5.6 Sol Extra High"
-  }), true);
-  assert.equal(adapter.isAcceptableModelSelection({
-    status: "selected",
-    requested_model: "gpt-5-6-sol-account-max",
+    requested_model: "gpt-5-6-sol-chat-pro",
     family_status: "verified",
     effort_status: "verified",
     model_used: "GPT-5.6 Sol Pro"
   }), true);
   assert.equal(adapter.isAcceptableModelSelection({
     status: "selected",
-    requested_model: "gpt-5-6-sol-account-max",
+    requested_model: "gpt-5-6-sol-chat-pro",
     family_status: "verified",
     effort_status: "verified",
-    model_used: "GPT-5.6 Sol Max"
+    model_used: "GPT-5.6 Sol Pro"
   }), true);
   assert.equal(adapter.isAcceptableModelSelection({
     status: "selected",
-    requested_model: "gpt-5-6-sol-account-max",
+    requested_model: "gpt-5-6-sol-chat-pro",
     family_status: "verified",
     effort_status: "verified",
     model_used: "GPT-5.6 Sol Expert"
   }), false);
   assert.equal(adapter.isAcceptableModelSelection({
     status: "selected",
-    requested_model: "gpt-5-6-sol-account-max",
+    requested_model: "gpt-5-6-sol-chat-pro",
+    family_status: "verified",
+    effort_status: "verified",
+    model_used: "GPT-5.6 Sol Expert"
+  }), false);
+  assert.equal(adapter.isAcceptableModelSelection({
+    status: "selected",
+    requested_model: "gpt-5-6-sol-chat-pro",
     family_status: "verified",
     effort_status: "verified",
     model_used: "GPT-5.6 Instant"

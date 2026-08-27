@@ -3,24 +3,13 @@ export const OWNERSHIP_ATTR = "data-yoetz-chatgpt-native-job";
 const DEFAULT_WAIT_TIMEOUT_MS = 15000;
 const DEFAULT_WAIT_INTERVAL_MS = 250;
 const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
-const CHATGPT_SOL_ACCOUNT_MAX_MODEL = "gpt-5-6-sol-account-max";
+const DEFAULT_SURFACE_SETTLE_TIMEOUT_MS = 1000;
+const DEFAULT_SURFACE_SETTLE_INTERVAL_MS = 50;
+const CHATGPT_SOL_CHAT_PRO_MODEL = "gpt-5-6-sol-chat-pro";
 const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
-// Maximum-tier effort labels accepted as at-or-above-Max proof across picker shapes.
-// "pro" is the Enterprise ceiling; "max" is the personal/Pro ceiling; "extra high" is
-// accepted ONLY when Max is absent from the observed ladder (stale-slider fall-through).
-// "ultra" is recognized in the ladder mapping but NEVER selected by the recipe; an
-// Ultra preset is accepted as at-or-above-Max proof with a diagnostic.
-const CHATGPT_MAX_EFFORT_LABELS = new Set(["pro", "extra high", "max"]);
-// The six-tier effort ladder surfaced behind the Advanced -> Effort submenu (proven
-// live 2026-08-25). Ordered weakest -> strongest. Ultra is the top of the ladder but
-// is never clicked/escalated to by the recipe.
-const CHATGPT_EFFORT_LADDER = Object.freeze(["light", "medium", "high", "extra high", "max", "ultra"]);
-const CHATGPT_ULTRA_EFFORT_LABEL = "ultra";
-// Labels that are an acceptable *ceiling* (top rung) for a trusted slider view.
-// A slider whose ceiling is "extra high" is a stale five-tier simple view when the
-// six-tier ladder (with Max) is the real surface; it must fall through to the
-// Advanced -> Effort submenu.
-const CHATGPT_SLIDER_TRUSTED_CEILINGS = new Set(["pro", "max"]);
+const CHAT_SURFACE_GROUP_SELECTOR = '[role="radiogroup"][aria-label="Select chat surface"]';
+const CHAT_SURFACE_CHAT_SELECTOR = '[role="radio"][data-tpp-toggle-value="chatgpt"]';
+const CHAT_SURFACE_WORK_SELECTOR = '[role="radio"][data-tpp-toggle-value="work"]';
 const MANUAL_HANDOFF_SHELL_SELECTORS = Object.freeze([
   "nav",
   "aside",
@@ -379,6 +368,27 @@ function conversationUnavailableError(conversationId, currentConversationId, win
 }
 
 export async function configureModelState(root, job = {}) {
+  const surface = await ensureChatSurface(root, modelSelectionOptionsForJob(job));
+  if (!surface.ok) {
+    return {
+      status: "unavailable",
+      model_used: null,
+      requested_model: CHATGPT_SOL_CHAT_PRO_MODEL,
+      available_options: [],
+      available_families: [],
+      family_status: "unverified",
+      effort_status: "unverified",
+      picker_family_status: "unverified",
+      picker_effort_status: "unverified",
+      closed_pill_family_status: "skipped",
+      closed_pill_effort_status: "skipped",
+      closed_pill_text: null,
+      failure_reason: surface.failure_reason,
+      warning: surface.warning,
+      warnings: [],
+      ...surfaceResultFields(surface)
+    };
+  }
   if (modelSelectionStrategyForJob(job) === "current") {
     const modelButton = await waitForModelButton(root, { timeoutMs: 1500, intervalMs: 250 });
     const pillText = modelControlLabel(modelButton);
@@ -399,7 +409,7 @@ export async function configureModelState(root, job = {}) {
       picker_shape: null,
       surface_trust: null,
       surface_descendants: [],
-      max_effort_label: null,
+      effort_ceiling_label: null,
       advanced_rows: [],
       checkbox_probe: null,
       family_menu_probe: null,
@@ -409,18 +419,22 @@ export async function configureModelState(root, job = {}) {
       family_label: null,
       family_label_candidates: [],
       family_label_source: null,
+      picker_close_method: null,
+      picker_close_methods: [],
+      picker_close_verification: null,
       effort_options: [],
       warning: "model pinning bypassed — answer may come from any model",
-      warnings: []
+      warnings: [],
+      ...surfaceResultFields(surface)
     };
   }
 
-  const selection = await selectSolMaxTierModel(root, modelSelectionOptionsForJob(job));
+  const selection = await selectSolChatProModel(root, modelSelectionOptionsForJob(job));
   const warnings = selection.warning ? [selection.warning] : [];
   return {
     status: selection.status,
     model_used: selection.model_used,
-    requested_model: CHATGPT_SOL_ACCOUNT_MAX_MODEL,
+    requested_model: CHATGPT_SOL_CHAT_PRO_MODEL,
     available_options: selection.available_options ?? [],
     available_families: selection.available_families ?? [],
     family_status: selection.family_status ?? "unverified",
@@ -434,7 +448,7 @@ export async function configureModelState(root, job = {}) {
     picker_shape: selection.picker_shape ?? null,
     surface_trust: selection.surface_trust ?? null,
     surface_descendants: selection.surface_descendants ?? [],
-    max_effort_label: selection.max_effort_label ?? null,
+    effort_ceiling_label: selection.effort_ceiling_label ?? null,
     advanced_rows: selection.advanced_rows ?? [],
     checkbox_probe: selection.checkbox_probe ?? null,
     family_menu_probe: selection.family_menu_probe ?? null,
@@ -444,11 +458,72 @@ export async function configureModelState(root, job = {}) {
     family_label: selection.family_label ?? null,
     family_label_candidates: selection.family_label_candidates ?? [],
     family_label_source: selection.family_label_source ?? null,
+    picker_close_method: selection.picker_close_method ?? null,
+    picker_close_methods: selection.picker_close_methods ?? [],
+    picker_close_verification: selection.picker_close_verification ?? null,
     effort_options: selection.effort_options ?? [],
-    ultra_preset: selection.ultra_preset === true,
-    ladder_max_absent: selection.ladder_max_absent === true,
     warning: warnings[0] ?? null,
-    warnings
+    warnings,
+    ...surfaceResultFields(surface)
+  };
+}
+
+async function ensureChatSurface(root, options = {}) {
+  const timing = surfaceTiming(options);
+  const startedAt = Date.now();
+  let attempts = 0;
+  let observedValues = [];
+  while (Date.now() - startedAt < timing.timeoutMs) {
+    attempts += 1;
+    const controls = findChatSurfaceControls(root);
+    observedValues = observedSurfaceToggleValues(root);
+    if (controls) {
+      const state = surfaceSelectionState(controls.chat);
+      if (state.aria_checked === "true") {
+        return {
+          ok: true,
+          elapsed_ms: Math.max(0, Date.now() - startedAt),
+          attempts,
+          timeout_ms: timing.timeoutMs,
+          interval_ms: timing.intervalMs,
+          settle_timeout_ms: timing.settleTimeoutMs,
+          settle_interval_ms: timing.settleIntervalMs,
+          verification_attempts: 0,
+          state,
+          observed_values: observedValues
+        };
+      }
+
+      realClick(controls.chat);
+      const verification = await waitForChatSurfaceSelection(root, timing, startedAt);
+      return {
+        ...verification,
+        failure_reason: verification.ok ? undefined : "chat_surface_selection_mismatch",
+        warning: verification.ok ? undefined : "ChatGPT Chat surface could not be verified after selection",
+        elapsed_ms: Math.max(0, Date.now() - startedAt),
+        attempts: attempts + verification.attempts,
+        timeout_ms: timing.timeoutMs,
+        interval_ms: timing.intervalMs,
+        observed_values: verification.observed_values ?? observedValues
+      };
+    }
+    const remainingMs = timing.timeoutMs - (Date.now() - startedAt);
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(timing.intervalMs, remainingMs));
+  }
+  return {
+    ok: false,
+    failure_reason: "chat_surface_control_not_found",
+    warning: 'ChatGPT Chat surface toggle not found or could not be read',
+    elapsed_ms: Math.max(0, Date.now() - startedAt),
+    attempts,
+    timeout_ms: timing.timeoutMs,
+    interval_ms: timing.intervalMs,
+    settle_timeout_ms: timing.settleTimeoutMs,
+    settle_interval_ms: timing.settleIntervalMs,
+    verification_attempts: 0,
+    state: surfaceSelectionState(null),
+    observed_values: observedValues
   };
 }
 
@@ -478,6 +553,95 @@ function modelSelectionOptionsForJob(job = {}) {
     options.intervalMs = intervalMs;
   }
   return options;
+}
+
+function surfaceTiming(options = {}) {
+  return {
+    timeoutMs: positiveMs(options.timeoutMs, 30000),
+    intervalMs: positiveMs(options.intervalMs, 250),
+    settleTimeoutMs: positiveMs(options.settleTimeoutMs, DEFAULT_SURFACE_SETTLE_TIMEOUT_MS),
+    settleIntervalMs: positiveMs(options.settleIntervalMs, DEFAULT_SURFACE_SETTLE_INTERVAL_MS)
+  };
+}
+
+function positiveMs(value, fallback) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? number : fallback;
+}
+
+function findChatSurfaceControls(root) {
+  const group = root?.querySelector?.(CHAT_SURFACE_GROUP_SELECTOR);
+  if (!group) return null;
+  const chat = group.querySelector(CHAT_SURFACE_CHAT_SELECTOR);
+  const work = group.querySelector(CHAT_SURFACE_WORK_SELECTOR);
+  return chat && work ? { group, chat, work } : null;
+}
+
+function observedSurfaceToggleValues(root) {
+  const group = root?.querySelector?.(CHAT_SURFACE_GROUP_SELECTOR);
+  const scope = group ?? root;
+  return Array.from(scope?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]') ?? [])
+    .map((node) => node?.getAttribute?.("data-tpp-toggle-value"))
+    .filter(Boolean)
+    .filter((value, index, values) => values.indexOf(value) === index)
+    .slice(0, 10);
+}
+
+function surfaceSelectionState(node) {
+  return {
+    aria_checked: node?.getAttribute?.("aria-checked") ?? null,
+    data_state: node?.getAttribute?.("data-state") ?? null
+  };
+}
+
+async function waitForChatSurfaceSelection(root, timing, startedAt) {
+  const settleStartedAt = Date.now();
+  const remainingSelectionMs = Math.max(1, timing.timeoutMs - (settleStartedAt - startedAt));
+  const settleTimeoutMs = Math.min(timing.settleTimeoutMs, remainingSelectionMs);
+  let attempts = 0;
+  let controls = null;
+  let state = surfaceSelectionState(null);
+  let observedValues = [];
+  while (Date.now() - settleStartedAt < settleTimeoutMs) {
+    attempts += 1;
+    controls = findChatSurfaceControls(root);
+    state = surfaceSelectionState(controls?.chat);
+    observedValues = observedSurfaceToggleValues(root);
+    if (state.aria_checked === "true") {
+      return {
+        ok: true,
+        ...controls,
+        attempts,
+        verification_attempts: attempts,
+        state,
+        settle_timeout_ms: timing.settleTimeoutMs,
+        settle_interval_ms: timing.settleIntervalMs,
+        observed_values: observedValues
+      };
+    }
+    const remainingMs = settleTimeoutMs - (Date.now() - settleStartedAt);
+    if (remainingMs <= 0) break;
+    await sleep(Math.min(timing.settleIntervalMs, remainingMs));
+  }
+  return {
+    ok: false,
+    attempts,
+    verification_attempts: attempts,
+    state,
+    settle_timeout_ms: timing.settleTimeoutMs,
+    settle_interval_ms: timing.settleIntervalMs,
+    observed_values: observedValues
+  };
+}
+
+function surfaceResultFields(surface) {
+  return {
+    surface_elapsed_ms: surface?.elapsed_ms ?? null,
+    surface_attempts: surface?.attempts ?? 0,
+    surface_verification_attempts: surface?.verification_attempts ?? 0,
+    surface_state: surface?.state ?? surfaceSelectionState(null),
+    surface_observed_values: surface?.observed_values ?? []
+  };
 }
 
 function modelSelectionStrategyForJob(job = {}) {
@@ -546,7 +710,7 @@ function modelControlLabel(node) {
   ].filter(Boolean).join(" "));
 }
 
-async function selectSolMaxTierModel(root, options = {}) {
+async function selectSolChatProModel(root, options = {}) {
   const base = {
     status: "unavailable",
     model_used: null,
@@ -603,20 +767,23 @@ async function selectSolMaxTierModel(root, options = {}) {
       warning: "ChatGPT GPT-5.6 model picker did not open"
     };
   }
-  let ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
-  if (ambiguityFailure) return ambiguityFailure;
-
-  if (!familyIsSol(state.family_label)) {
-    const familyMenu = await openFamilyPicker(root, state.menu ?? state.surface, state.family_trigger, options);
-    const structuralFamilyMenu = familyMenu === structurallyOpenControlledSurfaceForTrigger(root, state.family_trigger);
-    availableFamilies = familyMenu ? familyMenuRadios(familyMenu, structuralFamilyMenu).map((item) => textOf(item)).filter(Boolean) : [];
-    const solOption = familyMenuRadios(familyMenu, structuralFamilyMenu)
-      .find((item) => foldedModelText(textOf(item)) === foldedModelText(CHATGPT_SOL_FAMILY_LABEL));
-    if (!solOption) {
+  let familyProof = await readCheckedSolFamily(root, state, options);
+  availableFamilies = familyProof.available_families;
+  if (!familyProof.ok) {
+    if (familyProof.checked_items.length !== 1 || !familyProof.sol_option) {
       await closeModelPicker(root, modelButton);
-      return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol was not visible in the family submenu", "model_family_not_found");
+      return selectionFailure(
+        base,
+        modelButton,
+        familyProof.state,
+        availableFamilies,
+        familyProof.checked_items.length === 1
+          ? "GPT-5.6 Sol was not visible in the family submenu"
+          : "GPT-5.6 Sol family menu did not expose one checked model",
+        familyProof.checked_items.length === 1 ? "model_family_not_found" : "model_family_menu_unverified"
+      );
     }
-    realClick(solOption);
+    realClick(familyProof.sol_option);
     await sleep(Number(options.actionSettleMs ?? 250));
     modelButton = await waitForModelButton(root, options);
     if (!modelButton) {
@@ -626,92 +793,91 @@ async function selectSolMaxTierModel(root, options = {}) {
     if (!state) {
       return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting GPT-5.6 Sol", "model_picker_reopen_failed");
     }
-    ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
-    if (ambiguityFailure) return ambiguityFailure;
+    familyProof = await readCheckedSolFamily(root, state, options);
+    availableFamilies = familyProof.available_families;
+    if (!familyProof.ok) {
+      await closeModelPicker(root, modelButton);
+      return selectionFailure(base, modelButton, familyProof.state, availableFamilies, "GPT-5.6 Sol family menu selection could not be verified", "model_family_selection_unverified");
+    }
   }
+  state = familyProof.state;
 
-  // Stamp ladder-aware proof flags from the decision so the success path can
-  // surface an accepted Ultra preset / Max-absent Extra High ceiling even when the
-  // move loop was skipped (the slider Effort row already proved the tier).
-  const initialDecision = effortMaxTierDecision(state);
-  if (initialDecision.ultra_preset) state.ultra_preset = true;
-
-  if (!effortIsMaxTier(state)) {
+  if (!effortIsChatProTier(state)) {
     if (state.shape === "personal") {
-      const selected = await selectPersonalMaxEffort(root, state, options);
+      const selected = await selectPersonalChatProEffort(root, state, options);
       state = selected.state ?? state;
       state.effort_move_method = selected.method;
       if (!selected.ok) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol Max tier was not visible in the personal picker (Extra High is accepted only when Max is absent from the Effort ladder)", "effort_control_not_found");
+        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol Pro effort was not visible in the personal picker", "effort_control_not_found");
       }
     } else if (state.shape === "slider") {
       if (!state.effort_slider) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider was not found in the Advanced picker", "effort_control_not_found");
       }
-      const moved = await moveEffortSliderToMaxTier(root, state, options);
+      const moved = await moveEffortSliderToProTier(root, state, options);
       state = moved.state ?? state;
       state.effort_move_method = moved.method;
       if (!moved.ok) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to a verified Max tier (Extra High is accepted only when Max is absent from the Effort ladder)", "effort_slider_move_failed");
+        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to verified Pro", "effort_slider_move_failed");
       }
     } else {
-      // Menu fallback order (ruling: Max first). Max is the personal/Pro target;
-      // Extra High is accepted only when Max is absent from the observed ladder;
-      // Pro is the Enterprise ceiling. This preserves the legacy Extra High > Pro
-      // preference on the personal picker while never accepting Extra High when
-      // Max is present in the ladder.
-      const labels = state.effort_items.map((item) => foldedModelText(textOf(item)));
-      const maxAbsent = !labels.includes("max");
-      const maxOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === "max")
-        ?? (maxAbsent ? state.effort_items.find((item) => foldedModelText(textOf(item)) === "extra high") : undefined)
-        ?? state.effort_items.find((item) => foldedModelText(textOf(item)) === "pro");
-      if (!maxOption) {
+      const proOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === "pro");
+      if (!proOption) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol Max tier was not visible in the effort menu (Extra High is accepted only when Max is absent from the Effort ladder)", "effort_control_not_found");
+        return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol Pro effort was not visible in the effort menu", "effort_control_not_found");
       }
-      realClick(maxOption);
+      realClick(proOption);
       await sleep(Number(options.actionSettleMs ?? 250));
       modelButton = await waitForModelButton(root, options);
       if (!modelButton) {
-        return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting the maximum effort tier", "effort_control_remount_failed");
+        return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting Pro effort", "effort_control_remount_failed");
       }
       state = await openAndReadModelPicker(root, modelButton, options);
       if (!state) {
-        return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting the maximum effort tier", "model_picker_reopen_failed");
+        return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting Pro effort", "model_picker_reopen_failed");
       }
-      ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
-      if (ambiguityFailure) return ambiguityFailure;
     }
   }
 
-  ambiguityFailure = await familyAmbiguityFailure(root, base, modelButton, state, availableFamilies);
-  if (ambiguityFailure) return ambiguityFailure;
+  familyProof = await readCheckedSolFamily(root, state, options);
+  availableFamilies = familyProof.available_families.length > 0 ? familyProof.available_families : availableFamilies;
+  if (!familyProof.ok) {
+    await closeModelPicker(root, modelButton);
+    return selectionFailure(base, modelButton, familyProof.state, availableFamilies, "GPT-5.6 Sol family menu could not be re-verified after effort selection", "model_family_selection_unverified");
+  }
+  state = familyProof.state;
   const familyVerified = familyIsSol(state.family_label);
-  const effortVerified = effortIsMaxTier(state);
+  const effortVerified = effortIsChatProTier(state);
   if (!familyVerified || !effortVerified) {
     await closeModelPicker(root, modelButton);
-    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol at a verified Max tier could not be confirmed in one picker pass (Extra High is accepted only when Max is absent from the Effort ladder)", "model_selection_verification_failed");
+    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol at verified Pro effort could not be confirmed in one picker pass", "model_selection_verification_failed");
   }
-  if (!await closeModelPicker(root, modelButton)) {
+  const closeResult = await closeModelPickerResult(root, modelButton, state, { requireProPill: true });
+  state.picker_close_method = closeResult.method;
+  state.picker_close_methods = closeResult.methods;
+  state.picker_close_verification = closeResult.verification;
+  const closedPillOnlyFailure = closeResult.verification.picker_surface_closed
+    && closeResult.verification.family_trigger_closed
+    && !closeResult.verification.closed_pill_pro;
+  if (!closeResult.ok && !closedPillOnlyFailure) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
   }
   modelButton = await waitForModelButton(root, options);
   const pillText = modelControlLabel(modelButton);
   const verifiedEffortLabel = pickerVerifiedEffortLabel(state);
-  if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsFamilyLabel(pillText, state.family_label)) {
-    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm GPT-5.6 Sol after closing the slider picker", "family_composer_pill_unverified", { closedPill: true });
-  }
-  if ((state.shape === "slider" || state.shape === "personal") && !pillConfirmsEffortLabel(pillText, verifiedEffortLabel)) {
-    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm the verified maximum tier after closing the slider picker", "effort_composer_pill_unverified", { closedPill: true });
-  }
   const closedPill = closedPillDiagnostics(pillText, state);
-  const ultraPreset = Boolean(state.ultra_preset);
-  const warnings = ultraPreset
-    ? ["Ultra is the operator's preset effort; accepted as at-or-above-Max proof without escalating or downgrading (Ultra is never selected by the recipe)"]
-    : [];
+  if ((state.shape === "slider" || state.shape === "personal")
+    && closedPill.closed_pill_family_status === "unverified") {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill reported another model family after closing the picker", "family_composer_pill_unverified", { closedPill: true });
+  }
+  if ((state.shape === "slider" || state.shape === "personal")
+    && closedPill.closed_pill_effort_status !== "verified") {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", { closedPill: true });
+  }
+  const warnings = [];
 
   return {
     status: "selected",
@@ -730,27 +896,15 @@ async function selectSolMaxTierModel(root, options = {}) {
     family_label: state.family_label,
     family_label_candidates: state.family_label_candidates ?? [],
     family_label_source: state.family_label_source ?? null,
+    picker_close_method: closeResult.method,
+    picker_close_methods: closeResult.methods,
+    picker_close_verification: closeResult.verification,
     available_options: state.effort_items.map((item) => textOf(item)).filter(Boolean),
     available_families: availableFamilies,
     effort_options: effortDiagnostics(state.effort_items),
-    ultra_preset: ultraPreset,
-    ladder_max_absent: state.ladder_max_absent === true,
     warning: warnings[0] ?? null,
     warnings
   };
-}
-
-async function familyAmbiguityFailure(root, base, modelButton, state, availableFamilies) {
-  if (!state?.family_label_ambiguous) return null;
-  await closeModelPicker(root, modelButton);
-  return selectionFailure(
-    base,
-    modelButton,
-    state,
-    availableFamilies,
-    "ChatGPT family control exposed conflicting current-model labels",
-    "family_label_ambiguous"
-  );
 }
 
 async function waitForModelButton(root, options = {}) {
@@ -821,6 +975,28 @@ async function openFamilyPicker(root, mainMenu, trigger, options = {}) {
     }
   }
   return null;
+}
+
+async function readCheckedSolFamily(root, state, options = {}) {
+  const familyMenu = await openFamilyPicker(root, state?.menu ?? state?.surface, state?.family_trigger, options);
+  const structurallyTrusted = familyMenu === structurallyOpenControlledSurfaceForTrigger(root, state?.family_trigger);
+  const items = familyMenuRadios(familyMenu, structurallyTrusted);
+  const checkedItems = items.filter((item) => item.getAttribute?.("aria-checked") === "true");
+  const availableFamilies = items.map((item) => textOf(item)).filter(Boolean);
+  const checkedLabel = checkedItems.length === 1 ? normalizeText(textOf(checkedItems[0])) : "";
+  return {
+    ok: checkedItems.length === 1 && familyIsSol(checkedLabel),
+    state: {
+      ...state,
+      family_label: checkedLabel,
+      family_label_candidates: availableFamilies,
+      family_label_source: checkedItems.length === 1 ? "family_menu_checked" : null,
+      family_label_ambiguous: checkedItems.length > 1
+    },
+    sol_option: items.find((item) => familyIsSol(textOf(item))) ?? null,
+    checked_items: checkedItems,
+    available_families: availableFamilies
+  };
 }
 
 async function openWithHoverEvents(element, isOpen, options = {}) {
@@ -922,11 +1098,129 @@ function pressActivationKey(element, key) {
 }
 
 async function closeModelPicker(root, modelButton) {
-  for (let attempt = 0; attempt < 3 && findPickerState(root); attempt += 1) {
-    pressActivationKey(modelButton, "Escape");
-    await sleep(50);
+  return (await closeModelPickerResult(root, modelButton)).ok;
+}
+
+async function closeModelPickerResult(root, modelButton, state = null, options = {}) {
+  const methods = [];
+  let verification = pickerCloseVerification(root, modelButton, state, options);
+  const tryMethod = async (method, action) => {
+    methods.push(method);
+    try {
+      await action();
+    } catch {
+      // Continue to the next bounded close path and fail closed if needed.
+    }
+    verification = await waitForPickerClose(root, modelButton, state, options);
+    return verification;
+  };
+
+  if (!verification.ok) {
+    const currentButton = findModelButton(root) ?? modelButton;
+    verification = await tryMethod("escape", () => pressActivationKey(currentButton, "Escape"));
   }
-  return !findPickerState(root);
+
+  if (!verification.ok && !verification.picker_surface_closed) {
+    const familyTrigger = familyTriggerForPicker(root, state);
+    if (familyTrigger) {
+      const neutral = neutralComposerArea(root, modelButton);
+      verification = await tryMethod("hover_leave", () => dispatchHoverLeaveEvents(familyTrigger, neutral));
+      if (!verification.ok && !verification.picker_surface_closed) {
+        verification = await tryMethod("trigger_escape", () => pressActivationKey(familyTrigger, "Escape"));
+      }
+    }
+  }
+
+  if (!verification.ok && !verification.picker_surface_closed) {
+    const neutral = neutralComposerArea(root, modelButton);
+    if (neutral) {
+      verification = await tryMethod("neutral_click", () => realClick(neutral));
+    }
+  }
+
+  return {
+    ok: verification.ok,
+    method: methods.join("+") || "already_closed",
+    methods,
+    verification
+  };
+}
+
+async function waitForPickerClose(root, modelButton, state, options) {
+  let verification = pickerCloseVerification(root, modelButton, state, options);
+  const settleMs = Number(options.closeSettleMs ?? 50);
+  for (let attempt = 0; attempt < 3 && !verification.ok; attempt += 1) {
+    await sleep(settleMs);
+    verification = pickerCloseVerification(root, modelButton, state, options);
+  }
+  return verification;
+}
+
+function pickerCloseVerification(root, modelButton, state, options = {}) {
+  const currentButton = findModelButton(root) ?? (isMountedInRoot(root, modelButton) ? modelButton : null);
+  const familyTrigger = familyTriggerForPicker(root, state);
+  const familySurface = familySurfaceForPicker(root, state, familyTrigger);
+  const pickerState = findPickerState(root);
+  const familyTriggerOpen = isMountedInRoot(root, familyTrigger)
+    && (familyTrigger.getAttribute?.("aria-expanded") === "true"
+      || familyTrigger.getAttribute?.("data-state") === "open");
+  const modelTriggerOpen = isMountedInRoot(root, currentButton) && modelPickerTriggerIsOpen(currentButton);
+  const pickerSurfaceOpen = Boolean(pickerState) || Boolean(familySurface);
+  const pillText = modelControlLabel(currentButton);
+  const closedPillPro = options.requireProPill !== true || pillConfirmsEffortLabel(pillText, "Pro");
+  return {
+    family_trigger_closed: !familyTriggerOpen,
+    picker_surface_closed: !pickerSurfaceOpen,
+    model_trigger_closed: !modelTriggerOpen,
+    closed_pill_pro: closedPillPro,
+    closed_pill_text: pillText || null,
+    ok: !familyTriggerOpen && !pickerSurfaceOpen && !modelTriggerOpen && closedPillPro
+  };
+}
+
+function familyTriggerForPicker(root, state) {
+  const liveState = findPickerState(root);
+  const surface = liveState?.surface ?? liveState?.menu ?? state?.surface ?? state?.menu;
+  const candidate = Array.from(surface?.querySelectorAll?.('[role="menuitem"], button') ?? [])
+    .find((item) => item.getAttribute?.("aria-haspopup") === "menu"
+      && (/\bModel\b/i.test(textOf(item)) || /^(?:gpt|o\d)\b/i.test(normalizeText(textOf(item)))));
+  return candidate ?? liveState?.family_trigger ?? state?.family_trigger ?? null;
+}
+
+function familySurfaceForPicker(root, state, familyTrigger) {
+  const mainSurface = state?.menu ?? state?.surface;
+  const surface = findFamilySubmenu(root, mainSurface)
+    ?? structurallyOpenControlledSurfaceForTrigger(root, familyTrigger);
+  return isMountedInRoot(root, surface) ? surface : null;
+}
+
+function neutralComposerArea(root, modelButton) {
+  const composer = findComposer(root);
+  if (composer && composer !== modelButton) return composer;
+  return root.querySelector?.('[data-testid="composer"], form') ?? null;
+}
+
+function dispatchHoverLeaveEvents(element, relatedTarget) {
+  const rect = relatedTarget?.getBoundingClientRect?.() ?? { left: 0, top: 0, width: 1, height: 1 };
+  const clientX = Number(rect.left ?? 0) + Math.max(1, Number(rect.width ?? 1) / 2);
+  const clientY = Number(rect.top ?? 0) + Math.max(1, Number(rect.height ?? 1) / 2);
+  for (const [type, constructorName, init] of [
+    ["pointerleave", "PointerEvent", { pointerId: 1, pointerType: "mouse", isPrimary: true, relatedTarget, clientX, clientY }],
+    ["mouseleave", "MouseEvent", { relatedTarget, clientX, clientY }],
+    ["pointermove", "PointerEvent", { pointerId: 1, pointerType: "mouse", isPrimary: true, relatedTarget, clientX, clientY }],
+    ["mousemove", "MouseEvent", { relatedTarget, clientX, clientY }]
+  ]) {
+    dispatchSyntheticEvent(element, type, constructorName, init);
+  }
+}
+
+function isMountedInRoot(root, node) {
+  if (!node) return false;
+  if (node === root || node === root.body || node === root.documentElement) return true;
+  for (let ancestor = node.parentElement; ancestor; ancestor = ancestor.parentElement) {
+    if (ancestor === root || ancestor === root.body || ancestor === root.documentElement) return true;
+  }
+  return false;
 }
 
 async function waitForPickerState(root, options = {}) {
@@ -1061,7 +1355,7 @@ function labeledRowValue(row, label) {
   return normalizeText(match?.[1] ?? "");
 }
 
-async function selectPersonalMaxEffort(root, initialState, options = {}) {
+async function selectPersonalChatProEffort(root, initialState, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   if (!initialState?.effort_row) return { ok: false, state: initialState, method: null };
   realClick(initialState.effort_row);
@@ -1070,47 +1364,12 @@ async function selectPersonalMaxEffort(root, initialState, options = {}) {
   // Inspect the opened Effort submenu ladder before selecting.
   const submenuItems = Array.from(root.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
     .filter((item) => !/^effort\b/i.test(normalizeText(textOf(item))));
-  const submenuLabels = submenuItems.map((item) => foldedModelText(textOf(item)).replace(/\s+/g, " "));
-  const maxAbsent = !submenuLabels.includes("max");
-  if (state) state.ladder_max_absent = maxAbsent;
-  // Ultra preset: if the operator's preset is Ultra (checked in the submenu),
-  // accept it as at-or-above-Max proof without clicking/escalating.
-  const ultraChecked = submenuItems.find((item) => itemIsChecked(item) && foldedModelText(textOf(item)) === CHATGPT_ULTRA_EFFORT_LABEL);
-  if (ultraChecked) {
-    if (state) state.ultra_preset = true;
-    // Close the submenu without selecting; the preset is already at-or-above-Max.
-    pressActivationKey(initialState.effort_row, "Escape");
-    await sleep(settleMs);
-    state = findPickerState(root) ?? state;
-    if (state) state.ultra_preset = true;
-    return { ok: true, state, method: "ultra_preset_accepted" };
-  }
-  const maxOption = findPersonalMaxEffortOption(root, state);
-  if (!maxOption) return { ok: false, state, method: null };
-  realClick(maxOption);
+  const proOption = submenuItems.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === "pro");
+  if (!proOption) return { ok: false, state, method: null };
+  realClick(proOption);
   await sleep(settleMs);
   state = findPickerState(root) ?? state;
-  if (state) state.ladder_max_absent = maxAbsent;
-  return { ok: effortIsMaxTier(state), state, method: "effort_row_select" };
-}
-
-function findPersonalMaxEffortOption(root, state) {
-  const scopes = [];
-  if (state?.surface) scopes.push(state.surface);
-  scopes.push(...Array.from(root.querySelectorAll?.('[role="menu"]') ?? []));
-  for (const scope of uniqueElements(scopes)) {
-    const items = Array.from(scope.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
-      .filter((item) => !/^effort\b/i.test(normalizeText(textOf(item))));
-    const labels = items.map((item) => foldedModelText(textOf(item)).replace(/\s+/g, " "));
-    const maxAbsent = !labels.includes("max");
-    // Order (ruling: Max first): Max; Extra High only when Max is absent; Pro is
-    // the Enterprise ceiling. Ultra is never selected by the recipe.
-    const max = items.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === "max")
-      ?? (maxAbsent ? items.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === "extra high") : undefined)
-      ?? items.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === "pro");
-    if (max) return max;
-  }
-  return null;
+  return { ok: effortIsChatProTier(state), state, method: "effort_row_select" };
 }
 
 async function waitForFamilyMenu(root, mainMenu, trigger, options = {}) {
@@ -1130,16 +1389,9 @@ function findMainModelMenu(root) {
   return visibleMenus(root).find((menu) => isMainModelMenu(menu)) ?? null;
 }
 
-// A main model effort menu is recognized either by the legacy five-tier labels
-// (medium/high/extra high) or by the six-tier ladder (Light/Medium/High/Extra
-// High/Max/Ultra) proven live 2026-08-25. The six-tier ladder always carries Max
-// (and recognizes Ultra).
+// A main model effort menu requires the visible ChatGPT effort ladder.
 function isEffortMenuLabels(labels) {
-  if (labels.includes("medium") && labels.includes("high") && labels.includes("extra high")) {
-    return true;
-  }
-  const ladderHits = labels.filter((label) => CHATGPT_EFFORT_LADDER.includes(label));
-  return labels.includes("max") && ladderHits.length >= 4;
+  return labels.includes("medium") && labels.includes("high") && labels.includes("pro");
 }
 
 function isMainModelMenu(menu) {
@@ -1186,6 +1438,9 @@ function readSliderPickerState(root, structurallyTrustedSurface = null) {
       const evidence = structurallyTrusted ? structuralFamilyEvidence(item) : null;
       const label = evidence?.label ?? normalizeText(textOf(item));
       if (evidence?.label || evidence?.ambiguous) familyEvidence = evidence;
+      if (item.getAttribute?.("aria-haspopup") === "menu" && /\bModel\b/i.test(textOf(item))) {
+        return structurallyTrusted || isVisible(item, { allowDisabled: true });
+      }
       return (evidence?.ambiguous || (Boolean(label) && /^(?:gpt|o\d)\b/i.test(label)))
         && (structurallyTrusted || isVisible(item, { allowDisabled: true }));
     });
@@ -1264,135 +1519,23 @@ function familyMenuRadios(menu, structurallyTrusted = false) {
   return menuRadioItems(menu, structurallyTrusted).filter((item) => /^gpt\b|^o3$/i.test(normalizeText(textOf(item))));
 }
 
-function effortIsMaxTier(state) {
-  return effortMaxTierDecision(state).ok;
-}
-
-// Ladder-aware maximum-tier decision. Returns { ok, reason, ultra_preset } so callers
-// can surface diagnostics (e.g. an accepted Ultra preset) without re-deriving logic.
-//
-// Ruling (yoetz/chatgpt-max-tier, 2026-08-25):
-//  - Target is the tier literally named "Max" ("Pro" for the Enterprise picker).
-//  - "Extra High" is acceptable proof ONLY when Max is absent from the observed
-//    ladder. For the slider this means a stale five-tier simple view (ceiling
-//    "Extra High") is NOT trusted until the opened Effort submenu proves Max absent
-//    (state.ladder_max_absent). For the menu it means "Extra High" is accepted only
-//    when "max" is not among the effort_items labels.
-//  - "Ultra" is recognized in the ladder mapping but NEVER clicked/selected. If the
-//    preset/checked effort is Ultra, accept it as at-or-above-Max proof with a
-//    diagnostic (do not downgrade an operator's own choice; do not escalate to it).
-function effortMaxTierDecision(state) {
+function effortIsChatProTier(state) {
   if (state?.shape === "personal") {
     const label = foldedModelText(state.effort_label).replace(/\s+/g, " ");
-    if (label === CHATGPT_ULTRA_EFFORT_LABEL) {
-      return { ok: true, reason: "ultra_preset", ultra_preset: true };
-    }
-    if (label === "max" || label === "pro") {
-      return { ok: true, reason: "ceiling_label", ultra_preset: false };
-    }
-    if (label === "extra high" && state.ladder_max_absent === true) {
-      return { ok: true, reason: "extra_high_max_absent", ultra_preset: false };
-    }
-    return { ok: false, reason: "not_max_tier", ultra_preset: false };
+    return label === "pro";
   }
   if (state?.shape === "slider") {
-    // An accepted Ultra preset (verified via the opened Effort submenu) is
-    // at-or-above-Max proof; trust the flag stamped by selectMaxFromEffortSubmenu.
-    if (state.ultra_preset === true) {
-      return { ok: true, reason: "ultra_preset", ultra_preset: true };
-    }
-    const snapshot = sliderEffortSnapshot(state.effort_slider, state.surface);
-    if (!snapshot) return { ok: false, reason: "no_slider_snapshot", ultra_preset: false };
-    const label = snapshot.label;
-    if (label === CHATGPT_ULTRA_EFFORT_LABEL) {
-      return { ok: true, reason: "ultra_preset", ultra_preset: true };
-    }
-    if (snapshot.now !== snapshot.max) {
-      return { ok: false, reason: "below_ceiling", ultra_preset: false };
-    }
-    // At the ceiling rung: only Max/Pro are trusted ceilings. An "extra high"
-    // ceiling is a stale five-tier simple view when an Advanced Effort row submenu
-    // exists that could reveal a richer six-tier ladder (with Max). In that case,
-    // return false so moveEffortSliderToMaxTier falls through to driving the
-    // Effort submenu. If there is no Effort row, the slider IS the genuine ladder
-    // and Extra High is the real ceiling (Max truly absent) -> accept it.
-    if (CHATGPT_SLIDER_TRUSTED_CEILINGS.has(label)) {
-      return { ok: true, reason: "ceiling_label", ultra_preset: false };
-    }
-    if (label === "extra high" && state.ladder_max_absent === true) {
-      return { ok: true, reason: "extra_high_max_absent", ultra_preset: false };
-    }
-    if (label === "extra high" && !findSliderEffortRow(state)) {
-      // No Advanced Effort row to drive: the slider is the genuine ladder and
-      // Max is absent, so Extra High is the accepted ceiling.
-      return { ok: true, reason: "extra_high_no_effort_row", ultra_preset: false };
-    }
-    // Stale "extra high" slider ceiling WITH an Effort row: the simple slider is
-    // not authoritative. The Effort row's static label is a corroboration signal
-    // only — a preset Max/Pro row label is accepted here because the closed
-    // composer pill corroborates it downstream (finding B tightens that corroboration:
-    // an Extra High pill cannot confirm a Max). For Ultra, do NOT trust the row's
-    // static label here — that label can be stale too. Return false so
-    // moveEffortSliderToMaxTier drives the Effort submenu (selectMaxFromEffortSubmenu),
-    // which opens the ladder and verifies a checked Ultra preset against the real
-    // ladder before accepting it with a diagnostic.
-    if (label === "extra high") {
-      const rowLabel = sliderEffortRowLabel(state);
-      if (rowLabel === "max" || rowLabel === "pro") {
-        return { ok: true, reason: "effort_row_label", ultra_preset: false };
-      }
-      if (rowLabel === "extra high" && state.ladder_max_absent === true) {
-        return { ok: true, reason: "extra_high_max_absent", ultra_preset: false };
-      }
-    }
-    return { ok: false, reason: "untrusted_ceiling", ultra_preset: false };
+    return sliderEffortSnapshot(state.effort_slider, state.surface)?.label === "pro";
   }
-  // menu shape
   const items = state?.effort_items ?? [];
-  const labels = items.map((item) => foldedModelText(textOf(item)));
-  const maxAbsent = !labels.includes("max");
   const checked = items.find((item) => itemIsChecked(item));
-  if (!checked) return { ok: false, reason: "no_checked_effort", ultra_preset: false };
-  const checkedLabel = foldedModelText(textOf(checked));
-  if (checkedLabel === CHATGPT_ULTRA_EFFORT_LABEL) {
-    return { ok: true, reason: "ultra_preset", ultra_preset: true };
-  }
-  if (checkedLabel === "max" || checkedLabel === "pro") {
-    return { ok: true, reason: "ceiling_label", ultra_preset: false };
-  }
-  if (checkedLabel === "extra high" && maxAbsent) {
-    return { ok: true, reason: "extra_high_max_absent", ultra_preset: false };
-  }
-  return { ok: false, reason: "not_max_tier", ultra_preset: false };
+  return foldedModelText(textOf(checked)) === "pro";
 }
 
 function pillConfirmsEffortLabel(pillText, effortLabel) {
   const foldedPill = foldedModelText(pillText).replace(/\s+/g, " ");
   const foldedEffort = foldedModelText(effortLabel).replace(/\s+/g, " ");
-  if (!foldedEffort) return false;
-  if (foldedPill === foldedEffort || foldedPill.endsWith(` ${foldedEffort}`)) return true;
-  // Closed-pill corroboration is directional (yz-7p3.3 finding B): the pill tier
-  // must be at or above the verified picker tier. A pill reading "Extra High"
-  // must NOT confirm a selected "Max" when the ladder had Max (the stale-pill
-  // scenario this epic is about). Going UP is fine (picker Extra High as the
-  // genuine ceiling, pill Max/Pro). Ladder order: light<medium<high<extra high<
-  // max<ultra; Pro is the Enterprise ceiling, ranked with Max.
-  const rank = { light: 0, medium: 1, high: 2, "extra high": 3, max: 4, pro: 4, ultra: 5 };
-  const expectedRank = rank[foldedEffort];
-  if (expectedRank === undefined) {
-    if (CHATGPT_MAX_EFFORT_LABELS.has(foldedEffort)) {
-      return [...CHATGPT_MAX_EFFORT_LABELS].some((label) => foldedPill === label || foldedPill.endsWith(` ${label}`));
-    }
-    return false;
-  }
-  // Extract the pill's effort tier by matching a known ladder label as a suffix.
-  // Do NOT use the last whitespace word — "extra high" would split into "high"
-  // (rank 2, not 3), a latent mis-rank trap for any two-word tier.
-  const orderedLabels = ["ultra", "extra high", "medium", "light", "high", "max", "pro"];
-  const pillToken = orderedLabels.find((label) => foldedPill === label || foldedPill.endsWith(` ${label}`));
-  const pillRank = pillToken ? rank[pillToken] : undefined;
-  if (pillRank === undefined) return false;
-  return pillRank >= expectedRank;
+  return foldedEffort === "pro" && (foldedPill === "pro" || foldedPill.endsWith(" pro"));
 }
 
 function pillConfirmsFamilyLabel(pillText, familyLabel) {
@@ -1404,6 +1547,13 @@ function pillConfirmsFamilyLabel(pillText, familyLabel) {
     const foldedLine = foldedFamilyLabel(line);
     return foldedLine === foldedFamily || foldedLine.startsWith(`${foldedFamily} `);
   });
+}
+
+function pillHasModelFamilyToken(pillText) {
+  const foldedPill = foldedModelText(pillText).replace(/\s+/g, " ");
+  return /\bgpt[\s.-]*\d/.test(foldedPill)
+    || /\bo\d(?:[\s.-]*\d)?\b/.test(foldedPill)
+    || /\b\d+(?:\.\d+)+\b/.test(foldedPill);
 }
 
 function sliderEffortSnapshot(slider, surface = null) {
@@ -1428,15 +1578,6 @@ function pickerVerifiedEffortLabel(state) {
   if (state.shape === "personal") return state.effort_label || null;
   if (state.shape === "slider") {
     const snapshot = sliderEffortSnapshot(state.effort_slider, state.surface);
-    // When the simple slider is a stale "extra high" ceiling, the Advanced view's
-    // Effort row is the authoritative verified label (e.g. "Max" after the submenu
-    // fall-through, or "Ultra" as the operator's preset).
-    if (snapshot && snapshot.now === snapshot.max && snapshot.label === "extra high" && findSliderEffortRow(state)) {
-      const row = findSliderEffortRow(state);
-      const text = normalizeText(textOf(row)).replace(/\s+/g, " ");
-      const match = text.match(/^Effort\s+(.+)$/i);
-      if (match) return normalizeText(match[1]);
-    }
     return snapshot?.display_label ?? null;
   }
   const checked = state.effort_items?.find((item) => itemIsChecked(item));
@@ -1451,11 +1592,14 @@ function closedPillDiagnostics(pillText, state) {
   const text = pillText ?? "";
   const familyLabel = state?.family_label ?? null;
   const effortLabel = pickerVerifiedEffortLabel(state);
+  const familyStatus = text && familyLabel
+    ? pillConfirmsFamilyLabel(text, familyLabel)
+      ? "verified"
+      : pillHasModelFamilyToken(text) ? "unverified" : "skipped"
+    : "skipped";
   return {
     closed_pill_text: text || null,
-    closed_pill_family_status: text && familyLabel
-      ? verificationStatus(pillConfirmsFamilyLabel(text, familyLabel))
-      : "skipped",
+    closed_pill_family_status: familyStatus,
     closed_pill_effort_status: text && effortLabel
       ? verificationStatus(pillConfirmsEffortLabel(text, effortLabel))
       : "skipped"
@@ -1547,171 +1691,7 @@ function effortControlDiagnostics(state) {
   return null;
 }
 
-// Find the Effort row inside the Advanced (slider) picker surface. From the live
-// dump the advanced view exposes rows Model / Effort / Speed as `role="menuitem"`.
-function findSliderEffortRow(state) {
-  const surface = state?.surface;
-  if (!surface) return null;
-  return Array.from(surface.querySelectorAll?.('[role="menuitem"], button') ?? [])
-    .find((node) => /^Effort\b/i.test(normalizeText(textOf(node)))) ?? null;
-}
-
-// Read the current Effort value from the Advanced view's Effort row (e.g. "Max",
-// "Extra High", "Ultra"). This is authoritative when the simple slider is a stale
-// five-tier view: the Effort row reflects the real selection after the submenu is
-// driven, while the simple slider ceiling may still read "Extra High".
-function sliderEffortRowLabel(state) {
-  const row = findSliderEffortRow(state);
-  if (!row) return null;
-  const text = normalizeText(textOf(row)).replace(/\s+/g, " ");
-  const match = text.match(/^Effort\s+(.+)$/i);
-  return match ? foldedModelText(match[1]) : null;
-}
-
-// Read the opened Effort submenu ladder (six-tier Light/Medium/High/Extra High/Max/Ultra).
-// Returns the list of menu item nodes in document order. The submenu is a separate
-// `role="menu"` surfaced after opening the Effort row.
-function findEffortSubmenu(root, mainSurface) {
-  return Array.from(root.querySelectorAll?.('[role="menu"]') ?? [])
-    .filter((menu) => menu !== mainSurface && isVisible(menu, { allowDisabled: true }))
-    .find((menu) => {
-      const labels = Array.from(menu.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
-        .map((node) => foldedModelText(textOf(node)));
-      // Recognize the Effort ladder by at least two known ladder labels. Do NOT
-      // require "max" to be present (yz-7p3.3 finding A): a legacy five-tier
-      // submenu where Max is genuinely absent must still be recognized so the
-      // maxAbsent branch can accept Extra High. Whether Max is absent is decided
-      // AFTER, from the labels, by selectMaxFromEffortSubmenu.
-      const known = labels.filter((label) => CHATGPT_EFFORT_LADDER.includes(label));
-      return known.length >= 2;
-    }) ?? null;
-}
-
-function effortSubmenuLadderLabels(menu) {
-  if (!menu) return [];
-  return Array.from(menu.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
-    .map((node) => foldedModelText(textOf(node)));
-}
-
-// Advanced -> Effort row -> opened ladder -> select Max fall-through.
-// Used when the simple slider ceiling is stale ("Extra High" on a five-tier view)
-// while the real six-tier ladder (with Max) lives behind the Effort row submenu.
-// Returns { ok, state, method, diagnostic }. Re-verifies after selecting.
-async function selectMaxFromEffortSubmenu(root, initialState, options = {}) {
-  const settleMs = Number(options.actionSettleMs ?? 250);
-  let state = initialState;
-  const effortRow = findSliderEffortRow(state);
-  if (!effortRow) {
-    return { ok: false, state, method: null, diagnostic: "effort_row_not_found" };
-  }
-  // Open the Effort submenu. The row may use aria-haspopup/aria-controls (Radix)
-  // or open on activation; mirror the family-menu open paths.
-  const opened = await openEffortSubmenu(root, state, effortRow, options);
-  let submenu = opened.menu;
-  if (!submenu) {
-    // Submenu did not open; cannot prove the ladder. Fail closed (do not trust
-    // the stale slider ceiling).
-    return { ok: false, state, method: null, diagnostic: "effort_submenu_open_failed" };
-  }
-  const labels = effortSubmenuLadderLabels(submenu);
-  const maxAbsent = !labels.includes("max");
-  const checked = Array.from(submenu.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
-    .find((node) => itemIsChecked(node));
-  const checkedLabel = checked ? foldedModelText(textOf(checked)) : null;
-
-  // Ultra preset: if the operator's own preset is Ultra, accept it as
-  // at-or-above-Max proof with a diagnostic. Never click/escalate.
-  if (checkedLabel === CHATGPT_ULTRA_EFFORT_LABEL) {
-    state = findPickerState(root) ?? state;
-    state.ultra_preset = true;
-    state.ladder_max_absent = maxAbsent;
-    state.effort_submenu_labels = labels;
-    await closeEffortSubmenu(root, state, effortRow, options);
-    // closeEffortSubmenu's Escape + settle may cause findPickerState to return a
-    // fresh state object; re-stamp the ladder-aware proof flags so effortIsMaxTier
-    // and the success path still see the verified Ultra preset.
-    state = findPickerState(root) ?? state;
-    state.ultra_preset = true;
-    state.ladder_max_absent = maxAbsent;
-    state.effort_submenu_labels = labels;
-    return { ok: true, state, method: "ultra_preset_accepted", diagnostic: "ultra_preset" };
-  }
-
-  if (maxAbsent) {
-    // Max is absent from the opened Effort ladder: "Extra High" is acceptable
-    // proof. Mark the state so effortIsMaxTier trusts the Extra High ceiling.
-    state = findPickerState(root) ?? state;
-    state.ladder_max_absent = true;
-    state.effort_submenu_labels = labels;
-    await closeEffortSubmenu(root, state, effortRow, options);
-    // closeEffortSubmenu's Escape + settle may cause findPickerState to return a
-    // fresh state object; re-stamp the ladder-aware proof flags so effortIsMaxTier
-    // still sees the proven Max-absent Extra High ceiling.
-    state = findPickerState(root) ?? state;
-    state.ladder_max_absent = true;
-    state.effort_submenu_labels = labels;
-    const ok = effortIsMaxTier(state);
-    return { ok, state, method: ok ? "extra_high_max_absent" : null, diagnostic: ok ? "extra_high_max_absent" : "extra_high_not_at_ceiling" };
-  }
-
-  // Max is present in the ladder: select the Max row, then re-verify.
-  const maxOption = Array.from(submenu.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
-    .find((node) => foldedModelText(textOf(node)) === "max");
-  if (!maxOption) {
-    await closeEffortSubmenu(root, state, effortRow, options);
-    state = findPickerState(root) ?? state;
-    return { ok: false, state, method: null, diagnostic: "max_row_not_found" };
-  }
-  realClick(maxOption);
-  await sleep(settleMs);
-  state = findPickerState(root) ?? state;
-  state.effort_submenu_labels = labels;
-  // Re-verify: re-read the checked effort row + the closed composer pill. The
-  // submenu click should collapse the submenu and update the Effort row/pill.
-  const verified = effortIsMaxTier(state);
-  return { ok: verified, state, method: verified ? "effort_submenu_max_select" : null, diagnostic: verified ? null : "max_select_unverified" };
-}
-
-async function openEffortSubmenu(root, state, effortRow, options = {}) {
-  const settleMs = Number(options.settleMs ?? 150);
-  const mainSurface = state?.surface;
-  const isOpen = () => findEffortSubmenu(root, mainSurface)
-    ?? structurallyOpenControlledSurfaceForTrigger(root, effortRow);
-  if (isOpen()) {
-    return { menu: await waitForEffortSubmenu(root, mainSurface, effortRow, options) };
-  }
-  for (const activate of [openWithPointerEvents, openWithHoverEvents, pressEnter, pressSpace]) {
-    try {
-      if (await activate(effortRow, isOpen, { settleMs })) {
-        return { menu: await waitForEffortSubmenu(root, mainSurface, effortRow, options) };
-      }
-    } catch {
-      // Try the next Radix activation path.
-    }
-  }
-  return { menu: null };
-}
-
-async function waitForEffortSubmenu(root, mainSurface, effortRow, options = {}) {
-  const timeoutMs = Number(options.pickerTimeoutMs ?? 3000);
-  const intervalMs = Number(options.intervalMs ?? 100);
-  const startedAt = Date.now();
-  while (Date.now() - startedAt < timeoutMs) {
-    const menu = findEffortSubmenu(root, mainSurface)
-      ?? structurallyOpenControlledSurfaceForTrigger(root, effortRow);
-    if (menu) return menu;
-    await sleep(intervalMs);
-  }
-  return null;
-}
-
-async function closeEffortSubmenu(root, state, effortRow, options = {}) {
-  const settleMs = Number(options.actionSettleMs ?? 250);
-  pressActivationKey(effortRow, "Escape");
-  await sleep(settleMs);
-}
-
-async function moveEffortSliderToMaxTier(root, initialState, options = {}) {
+async function moveEffortSliderToProTier(root, initialState, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   let state = initialState;
   const originalSnapshot = sliderEffortSnapshot(initialState?.effort_slider, initialState?.surface);
@@ -1724,60 +1704,11 @@ async function moveEffortSliderToMaxTier(root, initialState, options = {}) {
     // loop does not collapse on a stale snapshot. The final fresh re-check below
     // is the authoritative verification.
     state = findPickerState(root) ?? state;
-    return effortIsMaxTier(state) ? { ok: true, state, method } : null;
+    return effortIsChatProTier(state) ? { ok: true, state, method } : null;
   };
 
   let result = await attemptKey("End", "keyboard_end");
   if (result) return result;
-
-  const maxSnapshot = sliderEffortSnapshot(state?.effort_slider, state?.surface);
-  if (maxSnapshot && originalSnapshot && maxSnapshot.now === maxSnapshot.max) {
-    state.max_effort_label = maxSnapshot.display_label;
-    // Stale-slider fall-through (ruling yoetz/chatgpt-max-tier, 2026-08-25): a slider
-    // whose ceiling label is not Max/Pro is an untrusted stale five-tier simple view.
-    // The real six-tier ladder (Light/Medium/High/Extra High/Max/Ultra) lives behind
-    // the Advanced -> Effort row submenu. Drive that submenu: read the opened ladder,
-    // select the Max row (or accept Extra High only when Max is absent), then re-verify.
-    // "Extra High valid only when Max absent" is evaluated against the OPENED Effort
-    // submenu, never the closed slider rows.
-    const ceilingUntrusted = !CHATGPT_SLIDER_TRUSTED_CEILINGS.has(maxSnapshot.label)
-      && maxSnapshot.label !== CHATGPT_ULTRA_EFFORT_LABEL
-      && state.ladder_max_absent !== true;
-      if (ceilingUntrusted) {
-      const submenuResult = await selectMaxFromEffortSubmenu(root, state, options);
-      state = submenuResult.state ?? state;
-      state.max_effort_label = maxSnapshot.display_label;
-      state.effort_submenu_diagnostic = submenuResult.diagnostic ?? null;
-      if (submenuResult.ok) {
-        return { ok: true, state, method: submenuResult.method };
-      }
-      // If the Effort submenu was actually driven (an Effort row existed), the
-      // fall-through is the authoritative path: fail closed now with method null so
-      // the failure names the real cause instead of masking it as a probe. If there
-      // was no Effort row (e.g. an unknown-label ceiling on a legacy fixture with no
-      // Advanced Effort row), continue into the restore/probe diagnostics below so
-      // the rich diagnostics (max_effort_label, checkbox_probe, family_menu_probe)
-      // are still captured.
-      if (submenuResult.diagnostic !== "effort_row_not_found") {
-        return { ok: false, state, method: null };
-      }
-    }
-    const restoreSteps = Math.max(0, maxSnapshot.now - originalSnapshot.now);
-    for (let step = 0; step < restoreSteps; step += 1) {
-      pressActivationKey(state.effort_slider, "ArrowLeft");
-      await sleep(settleMs);
-      state = findPickerState(root) ?? state;
-      state.max_effort_label = maxSnapshot.display_label;
-    }
-    const checkboxProbe = await probeProCheckbox(root, state, options);
-    state = checkboxProbe.state;
-    const familyProbe = await probeFamilyMenu(root, state, options);
-    state = familyProbe.state;
-    state.max_effort_label = maxSnapshot.display_label;
-    state.checkbox_probe = checkboxProbe.diagnostics;
-    state.family_menu_probe = familyProbe.diagnostics;
-    return { ok: false, state, method: familyProbe.diagnostics ? "family_menu_probe" : "keyboard_end_probe" };
-  }
 
   const snapshot = sliderEffortSnapshot(state?.effort_slider, state?.surface);
   const arrowAttempts = Math.min(10, Math.max(1, Math.ceil((snapshot?.max ?? 5) - (snapshot?.min ?? 1)) + 1));
@@ -1791,92 +1722,13 @@ async function moveEffortSliderToMaxTier(root, initialState, options = {}) {
     clickSliderTrackMax(state.effort_slider);
     await sleep(settleMs);
     state = findPickerState(root) ?? state;
-    if (effortIsMaxTier(state)) return { ok: true, state, method: "pointer_max" };
+    if (effortIsChatProTier(state)) return { ok: true, state, method: "pointer_pro" };
   }
-  // Guard against a stale in-loop snapshot: the move attempts may have landed
-  // the slider at a verified maximum tier even though a transient findPickerState
-  // read inside the loop returned null or a non-slider shape. Re-read fresh state
-  // once more before declaring failure; if the live slider now verifies, accept it.
-  // This is a guard, not the fix: the root cause is the transient null/non-slider
-  // read inside attemptKey, now hardened with `?? state` above.
   const finalState = findPickerState(root);
-  if (finalState) {
-    // Propagate ladder-aware proof flags established during the fall-through so a
-    // fresh re-read can still trust an Extra High ceiling proven Max-absent (or an
-    // accepted Ultra preset) without re-deriving the opened submenu ladder.
-    if (state?.ladder_max_absent === true) finalState.ladder_max_absent = true;
-    if (state?.ultra_preset === true) finalState.ultra_preset = true;
-    if (state?.effort_submenu_labels) finalState.effort_submenu_labels = state.effort_submenu_labels;
-  }
-  if (finalState && effortIsMaxTier(finalState)) {
+  if (finalState && effortIsChatProTier(finalState)) {
     return { ok: true, state: finalState, method: "final_fresh_recheck" };
   }
   return { ok: false, state: finalState ?? state, method: null };
-}
-
-async function probeFamilyMenu(root, initialState, options = {}) {
-  if (!initialState?.family_trigger || !initialState?.surface) {
-    return { state: initialState, diagnostics: null };
-  }
-  const menu = await openFamilyPicker(root, initialState.surface, initialState.family_trigger, options);
-  if (!menu) return { state: initialState, diagnostics: null };
-  const structurallyTrusted = menu === structurallyOpenControlledSurfaceForTrigger(root, initialState.family_trigger);
-  const candidates = Array.from(menu.querySelectorAll?.("*") ?? [])
-    .filter((node) => ["menuitem", "menuitemradio"].includes(node.getAttribute?.("role")))
-    .slice(0, 20)
-    .map((node) => ({
-      role: node.getAttribute?.("role") ?? null,
-      label: normalizeText(textOf(node)),
-      checked: node.getAttribute?.("aria-checked") ?? null
-    }));
-  const radioLabels = familyMenuRadios(menu, structurallyTrusted)
-    .map((node) => normalizeText(textOf(node)))
-    .filter(Boolean)
-    .slice(0, 20);
-  pressActivationKey(initialState.family_trigger, "Escape");
-  await sleep(Number(options.actionSettleMs ?? 250));
-  const closed = !findFamilySubmenu(root, initialState.surface)
-    && !structurallyOpenControlledSurfaceForTrigger(root, initialState.family_trigger);
-  const state = findPickerState(root) ?? initialState;
-  return {
-    state,
-    diagnostics: {
-      family_options: candidates,
-      family_radio_labels: radioLabels,
-      close_verified: closed
-    }
-  };
-}
-
-async function probeProCheckbox(root, initialState, options = {}) {
-  const checkbox = Array.from(initialState?.surface?.querySelectorAll?.("*") ?? [])
-    .find((node) => node.getAttribute?.("role") === "menuitemcheckbox");
-  if (!checkbox || checkbox.getAttribute?.("aria-checked") !== "false") {
-    return { state: initialState, diagnostics: null };
-  }
-  const settleMs = Number(options.actionSettleMs ?? 250);
-  const before = checkboxProbeSnapshot(root, initialState, checkbox);
-  pressActivationKey(checkbox, " ");
-  await sleep(settleMs);
-  let state = findPickerState(root) ?? initialState;
-  const enabledCheckbox = Array.from(state.surface?.querySelectorAll?.("*") ?? [])
-    .find((node) => node.getAttribute?.("role") === "menuitemcheckbox");
-  const enabled = checkboxProbeSnapshot(root, state, enabledCheckbox);
-  if (enabledCheckbox) pressActivationKey(enabledCheckbox, " ");
-  await sleep(settleMs);
-  state = findPickerState(root) ?? state;
-  const restoredCheckbox = Array.from(state.surface?.querySelectorAll?.("*") ?? [])
-    .find((node) => node.getAttribute?.("role") === "menuitemcheckbox");
-  const restored = checkboxProbeSnapshot(root, state, restoredCheckbox);
-  return {
-    state,
-    diagnostics: {
-      before,
-      enabled,
-      restored,
-      restore_verified: restoredCheckbox?.getAttribute?.("aria-checked") === "false"
-    }
-  };
 }
 
 function checkboxProbeSnapshot(root, state, checkbox) {
@@ -1943,7 +1795,7 @@ function effortDiagnostics(items) {
 
 function selectionFailure(base, modelButton, state, availableFamilies, warning, failureReason, options = {}) {
   const pickerFamily = familyIsSol(state?.family_label) ? "verified" : "unverified";
-  const pickerEffort = effortIsMaxTier(state) ? "verified" : "unverified";
+  const pickerEffort = effortIsChatProTier(state) ? "verified" : "unverified";
   const pillText = modelControlLabel(modelButton);
   const closedPill = options.closedPill
     ? closedPillDiagnostics(pillText, state)
@@ -1965,12 +1817,15 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     surface_descendants: state?.surface_trust === "aria_controls_structural"
       ? structuralSurfaceDescendants(state.surface)
       : [],
-    max_effort_label: state?.max_effort_label ?? null,
+    effort_ceiling_label: state?.effort_ceiling_label ?? null,
     advanced_rows: advancedViewRows(state?.surface),
     checkbox_probe: state?.checkbox_probe ?? null,
     family_menu_probe: state?.family_menu_probe ?? null,
     effort_control: effortControlDiagnostics(state),
     effort_move_method: state?.effort_move_method ?? null,
+    picker_close_method: state?.picker_close_method ?? null,
+    picker_close_methods: state?.picker_close_methods ?? [],
+    picker_close_verification: state?.picker_close_verification ?? null,
     pill_text: pillText,
     family_label: state?.family_label ?? null,
     family_label_candidates: state?.family_label_candidates ?? [],
@@ -2039,7 +1894,7 @@ function classTokens(node) {
 
 function modelPillSummaryMatches(value) {
   const folded = foldedModelText(value).replace(/\s+/g, " ");
-  const effort = "instant|medium|high|extra high|pro|max";
+  const effort = "instant|medium|high|extra high|pro";
   return new RegExp(`^(?:${effort})$`).test(folded)
     || new RegExp(`^\\d+(?:\\.\\d+)+(?: sol)? (?:${effort})$`).test(folded)
     || /\bgpt[\s.-]*\d/.test(folded);
@@ -2693,7 +2548,7 @@ function isAssistantControlLine(line, options = {}) {
 
 function isModelStatusText(text) {
   const value = normalizeText(text);
-  const effort = "instant|medium|high|extra high|pro|max";
+  const effort = "instant|medium|high|extra high|pro";
   return new RegExp(`^(sol|${effort}|pro thinking|thinking)$`, "i").test(value)
     || new RegExp(`^\\d+(?:\\.\\d+)+(?:\\s+sol)?\\s+(?:${effort})$`, "i").test(value)
     || new RegExp(`^gpt[\\s.-]*\\d+(?:[\\s.-]*\\d+)*(?:\\s+sol)?(?:\\s+(?:${effort}|thinking))?$`, "i").test(value);
@@ -3647,11 +3502,11 @@ export function modelSelectionDiagnostics(root = document) {
   const controlledId = modelButton?.getAttribute?.("aria-controls") ?? null;
   const controlledNode = controlledId ? root.getElementById?.(controlledId) : null;
   return {
-    requested_model: CHATGPT_SOL_ACCOUNT_MAX_MODEL,
+    requested_model: CHATGPT_SOL_CHAT_PRO_MODEL,
     current_model_label: modelControlLabel(modelButton),
-    current_matches_requested: Boolean(familyIsSol(state?.family_label) && effortIsMaxTier(state)),
+    current_matches_requested: Boolean(familyIsSol(state?.family_label) && effortIsChatProTier(state)),
     family_status: familyIsSol(state?.family_label) ? "verified" : "unverified",
-    effort_status: effortIsMaxTier(state) ? "verified" : "unverified",
+    effort_status: effortIsChatProTier(state) ? "verified" : "unverified",
     family_label: state?.family_label ?? null,
     picker_shape: state?.shape ?? null,
     surface_trust: state?.surface_trust ?? null,
