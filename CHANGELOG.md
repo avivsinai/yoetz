@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - ChatGPT recipes now force Chat mode and verify GPT-5.6 Sol with the literal Pro
   effort tier. Work mode and non-Pro effort selections are rejected.
 - Renamed the requested model id to `gpt-5-6-sol-chat-pro`.
+- Extension: Chat|Work surface toggle verified via data-tpp-toggle-value="chatgpt"; closed pill corroborates effort only.
 
 ### Fixed
 
