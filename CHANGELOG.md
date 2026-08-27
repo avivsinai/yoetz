@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Live browser recipes now use stable agent-browser tab ids and open marked tabs
+  without navigating a user-owned tab.
+
 ## [0.5.58] - 2026-08-25
 ### Changed
 
