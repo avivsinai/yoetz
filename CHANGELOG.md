@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- ChatGPT picker (native extension and CDP): the composer model pill is now
+  label-verified before use, so a leading "Thinking effort" pill can no longer
+  be mistaken for the model control; the label grammar learns the `Max` and
+  `Light` tiers, with a family-token fallback for unknown future effort labels.
+- Leftover picker surfaces — including opacity-0 menus frozen in background
+  tabs — are now detected structurally (trigger `aria-expanded`/`aria-controls`
+  plus surface `data-state`) and closed during model-selection reset instead of
+  staying invisible to cleanup.
+
+### Added
+
+- Two additional fail-closed ChatGPT picker topologies: a two-pill composer
+  (model-family menu plus a separate "Thinking effort" ladder) pinning
+  GPT-5.6 Sol then Pro, and a family-only menu exposing `Pro` alongside
+  `GPT-5.6 Sol` pinning the checked `Pro` family. Each leg is proven by a fresh
+  checked re-read; unknown topologies still fail closed. Fixture-proven from
+  failure-time inspect data; live canary on the affected seat pending.
 
 ## [0.5.59] - 2026-08-27
 ### Changed
