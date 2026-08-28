@@ -8,23 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 ### Fixed
 
-- ChatGPT picker (native extension and CDP): the composer model pill is now
-  label-verified before use, so a leading "Thinking effort" pill can no longer
-  be mistaken for the model control; the label grammar learns the `Max` and
-  `Light` tiers, with a family-token fallback for unknown future effort labels.
+- ChatGPT picker (native extension and CDP): `findModelButton` prefers a
+  grammar-matched composer pill, then a family-token pill, then any visible
+  `__composer-pill`. A lone closed label of `Thinking effort` is a live model
+  pill, not a decoy, and must still open the picker. Grammar includes
+  Instant/Medium/High/Extra High/Pro/Max/Light.
+- The current ChatGPT simple-view picker is a hybrid surface: a parsable
+  effort slider (`Pro, 5 of 5.`) plus inline `GPT-5.6 Sol` / `GPT-5.5` family
+  radios in the same menu. Classify it as the existing slider shape (legacy
+  Advanced+Effort remains an OR). Family proof is the checked inline radio
+  when present. Already-Sol already-Pro is verify-only. Unknown families or
+  non-Pro slider labels fail closed, including under structural
+  `aria-controls` trust for opacity-0 background tabs.
 - Leftover picker surfaces — including opacity-0 menus frozen in background
   tabs — are now detected structurally (trigger `aria-expanded`/`aria-controls`
   plus surface `data-state`) and closed during model-selection reset instead of
   staying invisible to cleanup.
-
-### Added
-
-- Two additional fail-closed ChatGPT picker topologies: a two-pill composer
-  (model-family menu plus a separate "Thinking effort" ladder) pinning
-  GPT-5.6 Sol then Pro, and a family-only menu exposing `Pro` alongside
-  `GPT-5.6 Sol` pinning the checked `Pro` family. Each leg is proven by a fresh
-  checked re-read; unknown topologies still fail closed. Fixture-proven from
-  failure-time inspect data; live canary on the affected seat pending.
 
 ## [0.5.59] - 2026-08-27
 ### Changed
