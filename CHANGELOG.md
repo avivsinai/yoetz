@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.60] - 2026-08-28
 ### Fixed
 
 - ChatGPT picker (native extension and CDP): `findModelButton` prefers a
@@ -26,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tabs — are now detected structurally (trigger `aria-expanded`/`aria-controls`
   plus surface `data-state`) and closed during model-selection reset instead of
   staying invisible to cleanup.
+
 
 ## [0.5.59] - 2026-08-27
 ### Changed
