@@ -89,7 +89,7 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   and forces the `Chat` radio (`data-tpp-toggle-value="chatgpt"`), then selects
   the composer model pill. `findModelButton` prefers a grammar-matched pill,
   then a family-token pill, then any visible `__composer-pill` — including a
-  closed label of `Thinking effort`, which is a live model-pill string, not a
+  mid-flow label of `Thinking effort`, which is a live model-pill string, not a
   decoy. Default mapping: select `GPT-5.6 Sol` with the literal `Pro` effort
   tier. The current ChatGPT simple-view picker is a hybrid surface: an effort
   slider whose snapshot parses (`Pro, 5 of 5.`) plus inline family radios
@@ -98,8 +98,10 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   view remains an OR). Family proof is the checked inline `GPT-5.6 Sol`
   radio when present, else the Model-row submenu. A successful click is never
   proof: reopen through `findModelButton` and re-read both legs. Already-Sol
-  already-Pro is verify-only. Missing controls, Work mode, another family, or
-  another effort tier fail closed. The requested model id is
+  already-Pro is verify-only. After close, the composer pill must corroborate
+  Pro effort (`Pro` or a family-plus-`Pro` suffix); family is never inferred
+  from the pill. Missing controls, Work mode, another family, or another
+  effort tier fail closed. The requested model id is
   `gpt-5-6-sol-chat-pro`; `model_used` is `GPT-5.6 Sol Pro`. Speed and the
   Faster/Smarter power slider stay at the user's default. Open leftover picker
   surfaces are closed structurally (`aria-expanded` / `data-state`), including

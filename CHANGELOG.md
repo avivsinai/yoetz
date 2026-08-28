@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   effort slider (`Pro, 5 of 5.`) plus inline `GPT-5.6 Sol` / `GPT-5.5` family
   radios in the same menu. Classify it as the existing slider shape (legacy
   Advanced+Effort remains an OR). Family proof is the checked inline radio
-  when present. Already-Sol already-Pro is verify-only. Unknown families or
+  when present. Already-Sol already-Pro is verify-only. After close the
+  composer pill corroborates Pro effort (live closed label is `Pro`); a
+  leftover `Thinking effort` closed label fails closed. Unknown families or
   non-Pro slider labels fail closed, including under structural
   `aria-controls` trust for opacity-0 background tabs.
 - Leftover picker surfaces — including opacity-0 menus frozen in background

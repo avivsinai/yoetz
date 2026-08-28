@@ -2630,7 +2630,19 @@ test("hybrid simple-view slider with inline Sol/5.5 radios selects verified Pro"
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(result.family_label, "GPT-5.6 Sol");
+  assert.equal(result.closed_pill_text, "Pro");
+  assert.equal(result.closed_pill_effort_status, "verified");
+  assert.equal(result.closed_pill_family_status, "skipped");
   assert.equal(findModelButton(fixture.doc), fixture.pill);
+});
+
+test("hybrid slider fails closed when the closed pill stays Thinking effort", async () => {
+  const fixture = makeHybridSimpleViewFixture({ relabelOnClose: false });
+  const result = await configureModelState(fixture.doc, {});
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_composer_pill_unverified");
+  assert.equal(result.closed_pill_text, "Thinking effort");
+  assert.equal(result.closed_pill_effort_status, "unverified");
 });
 
 test("hybrid slider at max with a non-Pro label fails closed", async () => {
@@ -3627,7 +3639,8 @@ function makeHybridSimpleViewFixture({
   sliderMin = 1,
   sliderMax = 5,
   opacity = "1",
-  startsOpen = false
+  startsOpen = false,
+  relabelOnClose = true
 } = {}) {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
@@ -3646,6 +3659,10 @@ function makeHybridSimpleViewFixture({
     menu = null;
     pill.setAttribute("aria-expanded", "false");
     pill.setAttribute("data-state", "closed");
+    if (relabelOnClose) {
+      pill.innerText = sliderLabel;
+      pill.textContent = sliderLabel;
+    }
   };
   const openMenu = () => {
     if (menu) return;

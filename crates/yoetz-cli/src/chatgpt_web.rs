@@ -749,8 +749,17 @@ async () => {{
     }}
     state.familyLabel = solLabel;
     state.familyProof = true;
+    state.verifiedEffortDisplay = liveSnap.display || "Pro";
     if (!await closeMenus(pill, state)) {{
       return result("selection-mismatch", pill, state, families, "ChatGPT model picker remained open after verification");
+    }}
+    pill = await waitForPill();
+    const closedPill = closedPillDiagnostics(pill, state);
+    if (closedPill.closedPillFamilyStatus === "unverified") {{
+      return result("selection-mismatch", pill, state, families, "ChatGPT composer model pill reported another model family after closing the picker");
+    }}
+    if (closedPill.closedPillEffortStatus !== "verified") {{
+      return result("selection-mismatch", pill, state, families, "ChatGPT composer model pill did not confirm verified Pro effort");
     }}
     const selected = result("selected", pill, state, reread.map(textOf).filter(Boolean) || families);
     selected.modelUsed = solLabel + " " + (liveSnap.display || "Pro");
@@ -947,14 +956,15 @@ async () => {{
   function closedPillDiagnostics(pill, state) {{
     const pillText = pill ? textOf(pill) : "";
     const familyLabel = state?.familyLabel || "";
-    const effortLabel = state?.effortItems?.find((item) => fold(textOf(item)) === "pro");
+    const effortLabel = state?.verifiedEffortDisplay
+      || textOf(state?.effortItems?.find((item) => fold(textOf(item)) === "pro"));
     const closedPillFamilyStatus = pillText && familyLabel
       ? pillConfirmsFamilyLabel(pillText, familyLabel)
         ? "verified"
         : pillHasModelFamilyToken(pillText) ? "unverified" : "skipped"
       : "skipped";
     const closedPillEffortStatus = pillText && effortLabel
-      ? pillConfirmsEffortLabel(pillText, textOf(effortLabel)) ? "verified" : "unverified"
+      ? pillConfirmsEffortLabel(pillText, effortLabel) ? "verified" : "unverified"
       : "skipped";
     return {{
       closedPillText: pillText,
@@ -1799,6 +1809,8 @@ mod tests {
             "classList.contains(\"__composer-pill\") && pillHasModelFamilyToken(pillLabel(button))"
         ));
         assert!(script.contains("async function selectHybrid(pill, menu)"));
+        assert!(script.contains("state.verifiedEffortDisplay = liveSnap.display || \"Pro\""));
+        assert!(script.contains("closedPill.closedPillEffortStatus !== \"verified\""));
         assert!(script.contains("classList.contains(\"__composer-pill\")"));
         assert!(script.contains(r#"[role="radiogroup"][aria-label="Select chat surface"]"#));
         assert!(script.contains(r#"[role="radio"][data-tpp-toggle-value="chatgpt"]"#));

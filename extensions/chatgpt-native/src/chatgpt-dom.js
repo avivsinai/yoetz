@@ -928,7 +928,7 @@ async function selectSolChatProModel(root, options = {}) {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill reported another model family after closing the picker", "family_composer_pill_unverified", { closedPill: true });
   }
   if ((state.shape === "slider" || state.shape === "personal")
-    && closedPill.closed_pill_effort_status === "unverified") {
+    && closedPill.closed_pill_effort_status !== "verified") {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", { closedPill: true });
   }
   const warnings = [];
@@ -1738,9 +1738,7 @@ function closedPillDiagnostics(pillText, state) {
     closed_pill_text: text || null,
     closed_pill_family_status: familyStatus,
     closed_pill_effort_status: text && effortLabel
-      ? (pillConfirmsEffortLabel(text, effortLabel)
-        ? "verified"
-        : (modelPillSummaryMatches(text) || pillHasModelFamilyToken(text) ? "unverified" : "skipped"))
+      ? verificationStatus(pillConfirmsEffortLabel(text, effortLabel))
       : "skipped"
   };
 }
