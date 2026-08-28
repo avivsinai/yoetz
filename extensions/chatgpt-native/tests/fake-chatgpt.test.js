@@ -2571,6 +2571,95 @@ test("restored ChatGPT model selection closes an open picker before restart", as
   assert.equal(fixture.menusOpen(), 0);
 });
 
+test("findModelButton skips a leading Thinking effort pill and selects 5.6 Sol\\nMax", () => {
+  const fixture = makeTwoPillComposerFixture();
+  const selected = findModelButton(fixture.doc);
+  assert.equal(selected, fixture.modelPill);
+  assert.equal(selected.innerText, "5.6 Sol\nMax");
+});
+
+test("findModelButton selects a lone captured 5.6 Sol\\nMax pill", () => {
+  const fixture = makeTwoPillComposerFixture({ includeThinking: false });
+  const selected = findModelButton(fixture.doc);
+  assert.equal(selected, fixture.modelPill);
+  assert.equal(selected.innerText, "5.6 Sol\nMax");
+});
+
+test("findModelButton returns null when Thinking effort is the only composer pill", () => {
+  const fixture = makeTwoPillComposerFixture({ includeModel: false });
+  assert.equal(findModelButton(fixture.doc), null);
+});
+
+test("findModelButton recovers a lone 5.6 Sol\\nUltra pill via family token", () => {
+  const fixture = makeTwoPillComposerFixture({
+    includeThinking: false,
+    modelLabel: "5.6 Sol\nUltra"
+  });
+  const selected = findModelButton(fixture.doc);
+  assert.equal(selected, fixture.modelPill);
+  assert.equal(selected.innerText, "5.6 Sol\nUltra");
+});
+
+test("findModelButton skips Thinking effort and recovers 5.6 Sol\\nUltra", () => {
+  const fixture = makeTwoPillComposerFixture({ modelLabel: "5.6 Sol\nUltra" });
+  const selected = findModelButton(fixture.doc);
+  assert.equal(selected, fixture.modelPill);
+  assert.equal(selected.innerText, "5.6 Sol\nUltra");
+});
+
+test("resetModelSelectionState closes an opacity-0 leftover family menu", async () => {
+  const fixture = makeOpacityZeroLeftoverFixture();
+  assert.equal(fixture.leftoverOpen(), true);
+
+  const result = await resetModelSelectionState(fixture.doc);
+
+  assert.deepEqual(result, { reset: true, picker_was_open: true });
+  assert.equal(fixture.leftoverOpen(), false);
+  assert.equal(fixture.thinkingPill.getAttribute("aria-expanded"), "false");
+  assert.equal(fixture.thinkingPill.getAttribute("data-state"), "closed");
+});
+
+// Topology labels Pro / GPT-5.6 Sol / GPT-5.5 and "Thinking effort" come from the
+// original failure-time inspect (reported-inspect). Those tabs are gone; this
+// seat recaptured only the closed pill "5.6 Sol\nMax".
+test("family-only Pro/GPT-5.6 Sol/GPT-5.5 menu selects verified Pro (mapping B)", async () => {
+  const fixture = makeFamilyOnlyPickerFixture();
+  const result = await configureModelState(fixture.doc, {});
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.failure_reason, null);
+  assert.equal(result.picker_shape, "family");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "skipped");
+  assert.equal(result.model_used, "Pro");
+  assert.equal(result.family_label, "Pro");
+  assert.deepEqual(result.available_families, ["Pro", "GPT-5.6 Sol", "GPT-5.5"]);
+  assert.equal(fixture.familyOpen(), false);
+});
+
+test("two-pill family+effort topology selects GPT-5.6 Sol then Pro (mapping A)", async () => {
+  const fixture = makeSplitFamilyEffortFixture();
+  const result = await configureModelState(fixture.doc, {});
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+});
+
+test("family-only menu without GPT-5.6 Sol fails closed", async () => {
+  const fixture = makeFamilyOnlyPickerFixture({ families: ["Pro", "GPT-5.5"] });
+  const result = await configureModelState(fixture.doc, {});
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_picker_open_failed");
+});
+
+test("family menu with an unknown label fails closed", async () => {
+  const fixture = makeFamilyOnlyPickerFixture({ families: ["GPT-5.6 Sol", "Mystery"] });
+  const result = await configureModelState(fixture.doc, {});
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_picker_open_failed");
+});
+
 test("GPT-5.6 Sol picker closes a hover submenu before the final neutral click", async () => {
   const fixture = makeSolPickerFixture({
     family: "GPT-5.6 Sol",
@@ -3485,6 +3574,242 @@ function makeSolPickerFixture({
     menusOpen: () => [mainMenu, familyMenu].filter(Boolean).length,
     surface: chatSurface
   };
+}
+
+function capturedModelPillLabel() {
+  return "5.6 Sol\nMax";
+}
+
+function makeTwoPillComposerFixture({
+  includeThinking = true,
+  includeModel = true,
+  modelLabel = capturedModelPillLabel()
+} = {}) {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask anything").append(form);
+  appendChatSurfaceToggle(body);
+  let thinkingPill = null;
+  let modelPill = null;
+  if (includeThinking) {
+    thinkingPill = new FakeElement("button", {
+      class: "__composer-pill __composer-pill--neutral",
+      "aria-haspopup": "menu",
+      "aria-expanded": "false",
+      "data-state": "closed"
+    }, "Thinking effort");
+    form.append(thinkingPill);
+  }
+  if (includeModel) {
+    modelPill = new FakeElement("button", {
+      class: "__composer-pill __composer-pill--neutral",
+      "aria-haspopup": "menu",
+      "aria-expanded": "false",
+      "data-state": "closed"
+    }, modelLabel);
+    form.append(modelPill);
+  }
+  return { doc: new FakeDocument(body), thinkingPill, modelPill, form };
+}
+
+function makeOpacityZeroLeftoverFixture() {
+  const fixture = makeTwoPillComposerFixture();
+  const closeLeftover = () => {
+    if (menu) {
+      menu.parentElement?.children && (menu.parentElement.children = menu.parentElement.children.filter((child) => child !== menu));
+      menu.parentElement = null;
+      menu = null;
+    }
+    fixture.thinkingPill.setAttribute("aria-expanded", "false");
+    fixture.thinkingPill.setAttribute("data-state", "closed");
+  };
+  let menu = new FakeElement("div", {
+    id: "leftover-family-menu",
+    role: "menu",
+    "data-state": "open",
+    style: "opacity:0"
+  });
+  for (const label of ["Pro", "GPT-5.6 Sol", "GPT-5.5"]) {
+    menu.append(new FakeElement("div", {
+      role: "menuitemradio",
+      "aria-checked": String(label === "GPT-5.6 Sol")
+    }, label));
+  }
+  fixture.thinkingPill.setAttribute("aria-expanded", "true");
+  fixture.thinkingPill.setAttribute("data-state", "open");
+  fixture.thinkingPill.setAttribute("aria-controls", "leftover-family-menu");
+  fixture.thinkingPill.onKeyDown = (event) => {
+    if (event.key === "Escape") closeLeftover();
+  };
+  fixture.doc.body.append(menu);
+  return {
+    ...fixture,
+    leftoverOpen: () => Boolean(menu) && menu.getAttribute("data-state") === "open",
+    closeLeftover
+  };
+}
+
+function makeFamilyOnlyPickerFixture({ families = ["Pro", "GPT-5.6 Sol", "GPT-5.5"] } = {}) {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask anything").append(form);
+  appendChatSurfaceToggle(body);
+  let menu = null;
+  let checkedLabel = families.includes("GPT-5.6 Sol") ? "GPT-5.6 Sol" : families[0];
+  const closeMenu = () => {
+    if (!menu) return;
+    body.children = body.children.filter((child) => child !== menu);
+    menu.parentElement = null;
+    menu = null;
+    pill.setAttribute("aria-expanded", "false");
+    pill.setAttribute("data-state", "closed");
+  };
+  const openMenu = () => {
+    if (menu) return;
+    menu = new FakeElement("div", {
+      id: "family-only-menu",
+      role: "menu",
+      "data-state": "open"
+    });
+    for (const label of families) {
+      const radio = new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": String(label === checkedLabel),
+        onClick: () => {
+          checkedLabel = label;
+          for (const child of menu.children) {
+            child.setAttribute("aria-checked", String(child.innerText === label));
+          }
+        }
+      }, label);
+      menu.append(radio);
+    }
+    body.append(menu);
+    pill.setAttribute("aria-expanded", "true");
+    pill.setAttribute("data-state", "open");
+  };
+  const pill = new FakeElement("button", {
+    class: "__composer-pill __composer-pill--neutral",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    "data-state": "closed",
+    "aria-controls": "family-only-menu",
+    onPointerDown: openMenu,
+    onKeyDown: (event) => {
+      if (event.key === "Escape") closeMenu();
+    }
+  }, capturedModelPillLabel());
+  form.append(pill);
+  composer.onPointerDown = closeMenu;
+  return {
+    doc: new FakeDocument(body),
+    pill,
+    familyOpen: () => Boolean(menu),
+    checked: () => checkedLabel
+  };
+}
+
+function makeSplitFamilyEffortFixture() {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask anything").append(form);
+  appendChatSurfaceToggle(body);
+  let familyMenu = null;
+  let effortMenu = null;
+  let checkedFamily = "Pro";
+  let checkedEffort = "Max";
+  const closeFamily = () => {
+    if (!familyMenu) return;
+    body.children = body.children.filter((child) => child !== familyMenu);
+    familyMenu.parentElement = null;
+    familyMenu = null;
+    modelPill.setAttribute("aria-expanded", "false");
+    modelPill.setAttribute("data-state", "closed");
+  };
+  const closeEffort = () => {
+    if (!effortMenu) return;
+    body.children = body.children.filter((child) => child !== effortMenu);
+    effortMenu.parentElement = null;
+    effortMenu = null;
+    thinkingPill.setAttribute("aria-expanded", "false");
+    thinkingPill.setAttribute("data-state", "closed");
+  };
+  const openFamily = () => {
+    if (familyMenu) return;
+    closeEffort();
+    familyMenu = new FakeElement("div", {
+      id: "split-family-menu",
+      role: "menu",
+      "data-state": "open"
+    });
+    for (const label of ["Pro", "GPT-5.6 Sol", "GPT-5.5"]) {
+      familyMenu.append(new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": String(label === checkedFamily),
+        onClick: () => {
+          checkedFamily = label;
+          for (const child of familyMenu.children) {
+            child.setAttribute("aria-checked", String(child.innerText === label));
+          }
+        }
+      }, label));
+    }
+    body.append(familyMenu);
+    modelPill.setAttribute("aria-expanded", "true");
+    modelPill.setAttribute("data-state", "open");
+  };
+  const openEffort = () => {
+    if (effortMenu) return;
+    closeFamily();
+    effortMenu = new FakeElement("div", {
+      id: "split-effort-menu",
+      role: "menu",
+      "data-state": "open"
+    });
+    for (const label of ["Instant", "Medium", "High", "Pro"]) {
+      effortMenu.append(new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": String(label === checkedEffort),
+        onClick: () => {
+          checkedEffort = label;
+          for (const child of effortMenu.children) {
+            child.setAttribute("aria-checked", String(child.innerText === label));
+          }
+        }
+      }, label));
+    }
+    body.append(effortMenu);
+    thinkingPill.setAttribute("aria-expanded", "true");
+    thinkingPill.setAttribute("data-state", "open");
+  };
+  const thinkingPill = new FakeElement("button", {
+    class: "__composer-pill __composer-pill--neutral",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    "data-state": "closed",
+    "aria-controls": "split-effort-menu",
+    onPointerDown: openEffort,
+    onKeyDown: (event) => {
+      if (event.key === "Escape") closeEffort();
+    }
+  }, "Thinking effort");
+  const modelPill = new FakeElement("button", {
+    class: "__composer-pill __composer-pill--neutral",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    "data-state": "closed",
+    "aria-controls": "split-family-menu",
+    onPointerDown: openFamily,
+    onKeyDown: (event) => {
+      if (event.key === "Escape") closeFamily();
+    }
+  }, capturedModelPillLabel());
+  form.append(thinkingPill, modelPill);
+  composer.onPointerDown = () => {
+    closeFamily();
+    closeEffort();
+  };
+  return { doc: new FakeDocument(body), thinkingPill, modelPill };
 }
 
 function makeSolSliderFixture({

@@ -57,17 +57,39 @@ function modelUsedLooksLikeSolPro(value) {
   return folded === "gpt-5.6 sol pro";
 }
 
+function familyListHasSol(families) {
+  return (Array.isArray(families) ? families : []).some((label) => (
+    String(label ?? "").trim().replace(/\s+/g, " ").toLowerCase() === "gpt-5.6 sol"
+  ));
+}
+
+function isFamilyProPin(selection) {
+  const used = String(selection?.model_used ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  const family = String(selection?.family_label ?? "").trim().replace(/\s+/g, " ").toLowerCase();
+  return selection?.status === "selected"
+    && selection?.requested_model === CHATGPT_MODEL
+    && selection?.picker_shape === "family"
+    && selection?.family_status === "verified"
+    && selection?.effort_status === "skipped"
+    && used === "pro"
+    && family === "pro"
+    && familyListHasSol(selection?.available_families);
+}
+
 function isAcceptableModelSelection(selection) {
   if (selection?.status === "current") {
     return selection?.requested_model === "current"
       && selection?.family_status === "skipped"
       && selection?.effort_status === "skipped";
   }
-  return selection?.status === "selected"
+  if (selection?.status === "selected"
     && selection?.requested_model === CHATGPT_MODEL
     && selection?.family_status === "verified"
     && selection?.effort_status === "verified"
-    && modelUsedLooksLikeSolPro(selection?.model_used);
+    && modelUsedLooksLikeSolPro(selection?.model_used)) {
+    return true;
+  }
+  return isFamilyProPin(selection);
 }
 
 function normalizedResponseText(value) {

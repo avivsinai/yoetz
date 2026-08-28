@@ -87,15 +87,26 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 - The built-in ChatGPT recipe pins GPT-5.6 Sol at Chat effort Pro. The recipe
   first verifies `role=radiogroup[aria-label="Select chat surface"]`
   and forces the `Chat` radio (`data-tpp-toggle-value="chatgpt"`), then selects
-  `GPT-5.6 Sol` with the literal `Pro` effort tier. Family proof comes from a
-  freshly re-read checked `GPT-5.6 Sol` `menuitemradio` in the Model submenu;
-  the closed composer pill corroborates only the `Pro` effort (`Pro` or a
-  family-plus-`Pro` suffix). Missing controls, Work mode, another family, or
+  the composer model pill (`findModelButton` requires
+  `modelPillSummaryMatches`; a leading `Thinking effort` pill is not a model
+  control). Default mapping: select `GPT-5.6 Sol` with the literal `Pro`
+  effort tier. Family proof comes from a freshly re-read checked
+  `GPT-5.6 Sol` `menuitemradio`; the closed composer pill corroborates only the
+  `Pro` effort (`Pro` or a family-plus-`Pro` suffix). Two additional
+  fail-closed topologies: (A) a two-pill composer where the model pill menu is
+  families and a `Thinking effort` pill owns the effort ladder — pin family
+  `GPT-5.6 Sol` then effort `Pro`, each by fresh checked re-read;
+  (B) a family-only menu whose radios include both `Pro` and `GPT-5.6 Sol`
+  with no effort control anywhere — pin the checked family `Pro` and compose
+  `model_used` only from labels actually read (do not invent `GPT-5.6 Pro`).
+  Anything else fails closed. Missing controls, Work mode, another family, or
   another effort tier fail closed, and family is never inferred from the pill
-  or slider text. The requested model id is `gpt-5-6-sol-chat-pro`, and
-  `model_used` is composed from the verified picker family and effort as
-  `GPT-5.6 Sol Pro`. Speed and the Faster/Smarter power slider stay at the
-  user's default and are never toggled by selection.
+  or slider text. The requested model id is `gpt-5-6-sol-chat-pro`. Default
+  `model_used` is `GPT-5.6 Sol Pro`. Mapping B reports the checked `Pro`
+  label. Speed and the Faster/Smarter power slider stay at the user's default
+  and are never toggled by selection. Open leftover picker surfaces are closed
+  structurally (`aria-expanded` / `data-state`), including opacity-0 menus
+  in background tabs.
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
 - Extension-free by default. Preferred live-Chrome transport order:
