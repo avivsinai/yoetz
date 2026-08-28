@@ -2585,9 +2585,11 @@ test("findModelButton selects a lone captured 5.6 Sol\\nMax pill", () => {
   assert.equal(selected.innerText, "5.6 Sol\nMax");
 });
 
-test("findModelButton returns null when Thinking effort is the only composer pill", () => {
+test("findModelButton finds a lone Thinking effort composer pill", () => {
   const fixture = makeTwoPillComposerFixture({ includeModel: false });
-  assert.equal(findModelButton(fixture.doc), null);
+  const selected = findModelButton(fixture.doc);
+  assert.equal(selected, fixture.thinkingPill);
+  assert.equal(selected.innerText, "Thinking effort");
 });
 
 test("findModelButton recovers a lone 5.6 Sol\\nUltra pill via family token", () => {
@@ -2619,45 +2621,62 @@ test("resetModelSelectionState closes an opacity-0 leftover family menu", async 
   assert.equal(fixture.thinkingPill.getAttribute("data-state"), "closed");
 });
 
-// Topology labels Pro / GPT-5.6 Sol / GPT-5.5 and "Thinking effort" come from the
-// original failure-time inspect (reported-inspect). Those tabs are gone; this
-// seat recaptured only the closed pill "5.6 Sol\nMax".
-test("family-only Pro/GPT-5.6 Sol/GPT-5.5 menu selects verified Pro (mapping B)", async () => {
-  const fixture = makeFamilyOnlyPickerFixture();
+test("hybrid simple-view slider with inline Sol/5.5 radios selects verified Pro", async () => {
+  const fixture = makeHybridSimpleViewFixture();
   const result = await configureModelState(fixture.doc, {});
   assert.equal(result.status, "selected", JSON.stringify(result));
-  assert.equal(result.failure_reason, null);
-  assert.equal(result.picker_shape, "family");
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.family_status, "verified");
-  assert.equal(result.effort_status, "skipped");
-  assert.equal(result.model_used, "Pro");
-  assert.equal(result.family_label, "Pro");
-  assert.deepEqual(result.available_families, ["Pro", "GPT-5.6 Sol", "GPT-5.5"]);
-  assert.equal(fixture.familyOpen(), false);
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+  assert.equal(result.closed_pill_text, "Pro");
+  assert.equal(result.closed_pill_effort_status, "verified");
+  assert.equal(result.closed_pill_family_status, "skipped");
+  assert.equal(findModelButton(fixture.doc), fixture.pill);
 });
 
-test("two-pill family+effort topology selects GPT-5.6 Sol then Pro (mapping A)", async () => {
-  const fixture = makeSplitFamilyEffortFixture();
+test("hybrid slider fails closed when the closed pill stays Thinking effort", async () => {
+  const fixture = makeHybridSimpleViewFixture({ relabelOnClose: false });
+  const result = await configureModelState(fixture.doc, {});
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_composer_pill_unverified");
+  assert.equal(result.closed_pill_text, "Thinking effort");
+  assert.equal(result.closed_pill_effort_status, "unverified");
+});
+
+test("hybrid slider at max with a non-Pro label fails closed", async () => {
+  const fixture = makeHybridSimpleViewFixture({ sliderLabel: "Expert" });
+  const result = await configureModelState(fixture.doc, {});
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_slider_move_failed");
+});
+
+test("hybrid slider with GPT-5.5 checked clicks Sol and verifies Pro", async () => {
+  const fixture = makeHybridSimpleViewFixture({ family: "GPT-5.5" });
   const result = await configureModelState(fixture.doc, {});
   assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "slider");
   assert.equal(result.model_used, "GPT-5.6 Sol Pro");
   assert.equal(result.family_status, "verified");
   assert.equal(result.effort_status, "verified");
   assert.equal(result.family_label, "GPT-5.6 Sol");
 });
 
-test("family-only menu without GPT-5.6 Sol fails closed", async () => {
-  const fixture = makeFamilyOnlyPickerFixture({ families: ["Pro", "GPT-5.5"] });
+test("hybrid slider with GPT-5.5 checked fails closed", async () => {
+  const fixture = makeHybridSimpleViewFixture({ family: "GPT-5.5", families: ["GPT-5.5"] });
   const result = await configureModelState(fixture.doc, {});
   assert.equal(result.status, "unavailable");
-  assert.equal(result.failure_reason, "model_picker_open_failed");
+  assert.equal(result.failure_reason, "model_family_not_found");
 });
 
-test("family menu with an unknown label fails closed", async () => {
-  const fixture = makeFamilyOnlyPickerFixture({ families: ["GPT-5.6 Sol", "Mystery"] });
+test("opacity-0 hybrid surface classifies via structural aria-controls trust", async () => {
+  const fixture = makeHybridSimpleViewFixture({ opacity: "0", startsOpen: true });
   const result = await configureModelState(fixture.doc, {});
-  assert.equal(result.status, "unavailable");
-  assert.equal(result.failure_reason, "model_picker_open_failed");
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.surface_trust, "aria_controls_structural");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
 });
 
 test("GPT-5.6 Sol picker closes a hover submenu before the final neutral click", async () => {
@@ -2768,7 +2787,7 @@ for (const testCase of [
 
     const result = await configureModelState(fixture.doc, {});
 
-    assert.equal(result.status, "selected");
+    assert.equal(result.status, "selected", JSON.stringify(result));
     assert.equal(result.effort_control.label, "pro");
     assert.equal(result.pill_text, "5.6 Sol\nPro");
   });
@@ -3612,6 +3631,107 @@ function makeTwoPillComposerFixture({
   return { doc: new FakeDocument(body), thinkingPill, modelPill, form };
 }
 
+function makeHybridSimpleViewFixture({
+  family = "GPT-5.6 Sol",
+  families = ["GPT-5.6 Sol", "GPT-5.5"],
+  sliderLabel = "Pro",
+  sliderNow = 5,
+  sliderMin = 1,
+  sliderMax = 5,
+  opacity = "1",
+  startsOpen = false,
+  relabelOnClose = true
+} = {}) {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask anything").append(form);
+  appendChatSurfaceToggle(body);
+  let menu = null;
+  let currentFamily = family;
+  let currentNow = sliderNow;
+  const ordinal = () => currentNow - sliderMin + 1;
+  const total = sliderMax - sliderMin + 1;
+  const valueText = () => `${sliderLabel}, ${ordinal()} of ${total}.`;
+  const closeMenu = () => {
+    if (!menu) return;
+    body.children = body.children.filter((child) => child !== menu);
+    menu.parentElement = null;
+    menu = null;
+    pill.setAttribute("aria-expanded", "false");
+    pill.setAttribute("data-state", "closed");
+    if (relabelOnClose) {
+      pill.innerText = sliderLabel;
+      pill.textContent = sliderLabel;
+    }
+  };
+  const openMenu = () => {
+    if (menu) return;
+    const slider = new FakeElement("span", {
+      role: "slider",
+      "aria-hidden": "true",
+      "aria-valuemin": String(sliderMin),
+      "aria-valuemax": String(sliderMax),
+      "aria-valuenow": String(currentNow),
+      onKeyDown: (event) => {
+        if (event.key === "End") {
+          currentNow = sliderMax;
+          slider.setAttribute("aria-valuenow", String(currentNow));
+          label.innerText = valueText();
+          label.textContent = label.innerText;
+        }
+      }
+    });
+    const label = new FakeElement("span", {}, valueText());
+    const control = new FakeElement("div", {
+      class: "group __menu-item d1BZWq_SliderControl"
+    }).append(slider, label);
+    const simple = new FakeElement("div", { class: "d1BZWq_SimpleView" }).append(
+      new FakeElement("div", {}, "Pro"),
+      control,
+      new FakeElement("div", {}, "Use Left and Right arrow keys to adjust power.")
+    );
+    menu = new FakeElement("div", {
+      id: "hybrid-simple-menu",
+      role: "menu",
+      "data-state": "open",
+      style: `opacity:${opacity}`
+    }).append(simple);
+    for (const radioLabel of families) {
+      menu.append(new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": String(radioLabel === currentFamily),
+        onClick: () => {
+          currentFamily = radioLabel;
+          for (const child of menu.children) {
+            if (child.getAttribute?.("role") === "menuitemradio") {
+              child.setAttribute("aria-checked", String(child.innerText === radioLabel));
+            }
+          }
+        }
+      }, radioLabel));
+    }
+    body.append(menu);
+    pill.setAttribute("aria-expanded", "true");
+    pill.setAttribute("data-state", "open");
+  };
+  const pill = new FakeElement("button", {
+    class: "__composer-pill __composer-pill--neutral",
+    "aria-haspopup": "menu",
+    "aria-expanded": startsOpen ? "true" : "false",
+    "data-state": startsOpen ? "open" : "closed",
+    "aria-controls": "hybrid-simple-menu",
+    onPointerDown: openMenu,
+    onKeyDown: (event) => {
+      if (event.key === "Escape") closeMenu();
+    }
+  }, "Thinking effort");
+  form.append(pill);
+  composer.onPointerDown = closeMenu;
+  const doc = new FakeDocument(body);
+  if (startsOpen) openMenu();
+  return { doc, pill, openMenu, closeMenu };
+}
+
 function makeOpacityZeroLeftoverFixture() {
   const fixture = makeTwoPillComposerFixture();
   const closeLeftover = () => {
@@ -3647,169 +3767,6 @@ function makeOpacityZeroLeftoverFixture() {
     leftoverOpen: () => Boolean(menu) && menu.getAttribute("data-state") === "open",
     closeLeftover
   };
-}
-
-function makeFamilyOnlyPickerFixture({ families = ["Pro", "GPT-5.6 Sol", "GPT-5.5"] } = {}) {
-  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
-  const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
-  const body = new FakeElement("body", {}, "Ask anything").append(form);
-  appendChatSurfaceToggle(body);
-  let menu = null;
-  let checkedLabel = families.includes("GPT-5.6 Sol") ? "GPT-5.6 Sol" : families[0];
-  const closeMenu = () => {
-    if (!menu) return;
-    body.children = body.children.filter((child) => child !== menu);
-    menu.parentElement = null;
-    menu = null;
-    pill.setAttribute("aria-expanded", "false");
-    pill.setAttribute("data-state", "closed");
-  };
-  const openMenu = () => {
-    if (menu) return;
-    menu = new FakeElement("div", {
-      id: "family-only-menu",
-      role: "menu",
-      "data-state": "open"
-    });
-    for (const label of families) {
-      const radio = new FakeElement("div", {
-        role: "menuitemradio",
-        "aria-checked": String(label === checkedLabel),
-        onClick: () => {
-          checkedLabel = label;
-          for (const child of menu.children) {
-            child.setAttribute("aria-checked", String(child.innerText === label));
-          }
-        }
-      }, label);
-      menu.append(radio);
-    }
-    body.append(menu);
-    pill.setAttribute("aria-expanded", "true");
-    pill.setAttribute("data-state", "open");
-  };
-  const pill = new FakeElement("button", {
-    class: "__composer-pill __composer-pill--neutral",
-    "aria-haspopup": "menu",
-    "aria-expanded": "false",
-    "data-state": "closed",
-    "aria-controls": "family-only-menu",
-    onPointerDown: openMenu,
-    onKeyDown: (event) => {
-      if (event.key === "Escape") closeMenu();
-    }
-  }, capturedModelPillLabel());
-  form.append(pill);
-  composer.onPointerDown = closeMenu;
-  return {
-    doc: new FakeDocument(body),
-    pill,
-    familyOpen: () => Boolean(menu),
-    checked: () => checkedLabel
-  };
-}
-
-function makeSplitFamilyEffortFixture() {
-  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
-  const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
-  const body = new FakeElement("body", {}, "Ask anything").append(form);
-  appendChatSurfaceToggle(body);
-  let familyMenu = null;
-  let effortMenu = null;
-  let checkedFamily = "Pro";
-  let checkedEffort = "Max";
-  const closeFamily = () => {
-    if (!familyMenu) return;
-    body.children = body.children.filter((child) => child !== familyMenu);
-    familyMenu.parentElement = null;
-    familyMenu = null;
-    modelPill.setAttribute("aria-expanded", "false");
-    modelPill.setAttribute("data-state", "closed");
-  };
-  const closeEffort = () => {
-    if (!effortMenu) return;
-    body.children = body.children.filter((child) => child !== effortMenu);
-    effortMenu.parentElement = null;
-    effortMenu = null;
-    thinkingPill.setAttribute("aria-expanded", "false");
-    thinkingPill.setAttribute("data-state", "closed");
-  };
-  const openFamily = () => {
-    if (familyMenu) return;
-    closeEffort();
-    familyMenu = new FakeElement("div", {
-      id: "split-family-menu",
-      role: "menu",
-      "data-state": "open"
-    });
-    for (const label of ["Pro", "GPT-5.6 Sol", "GPT-5.5"]) {
-      familyMenu.append(new FakeElement("div", {
-        role: "menuitemradio",
-        "aria-checked": String(label === checkedFamily),
-        onClick: () => {
-          checkedFamily = label;
-          for (const child of familyMenu.children) {
-            child.setAttribute("aria-checked", String(child.innerText === label));
-          }
-        }
-      }, label));
-    }
-    body.append(familyMenu);
-    modelPill.setAttribute("aria-expanded", "true");
-    modelPill.setAttribute("data-state", "open");
-  };
-  const openEffort = () => {
-    if (effortMenu) return;
-    closeFamily();
-    effortMenu = new FakeElement("div", {
-      id: "split-effort-menu",
-      role: "menu",
-      "data-state": "open"
-    });
-    for (const label of ["Instant", "Medium", "High", "Pro"]) {
-      effortMenu.append(new FakeElement("div", {
-        role: "menuitemradio",
-        "aria-checked": String(label === checkedEffort),
-        onClick: () => {
-          checkedEffort = label;
-          for (const child of effortMenu.children) {
-            child.setAttribute("aria-checked", String(child.innerText === label));
-          }
-        }
-      }, label));
-    }
-    body.append(effortMenu);
-    thinkingPill.setAttribute("aria-expanded", "true");
-    thinkingPill.setAttribute("data-state", "open");
-  };
-  const thinkingPill = new FakeElement("button", {
-    class: "__composer-pill __composer-pill--neutral",
-    "aria-haspopup": "menu",
-    "aria-expanded": "false",
-    "data-state": "closed",
-    "aria-controls": "split-effort-menu",
-    onPointerDown: openEffort,
-    onKeyDown: (event) => {
-      if (event.key === "Escape") closeEffort();
-    }
-  }, "Thinking effort");
-  const modelPill = new FakeElement("button", {
-    class: "__composer-pill __composer-pill--neutral",
-    "aria-haspopup": "menu",
-    "aria-expanded": "false",
-    "data-state": "closed",
-    "aria-controls": "split-family-menu",
-    onPointerDown: openFamily,
-    onKeyDown: (event) => {
-      if (event.key === "Escape") closeFamily();
-    }
-  }, capturedModelPillLabel());
-  form.append(thinkingPill, modelPill);
-  composer.onPointerDown = () => {
-    closeFamily();
-    closeEffort();
-  };
-  return { doc: new FakeDocument(body), thinkingPill, modelPill };
 }
 
 function makeSolSliderFixture({

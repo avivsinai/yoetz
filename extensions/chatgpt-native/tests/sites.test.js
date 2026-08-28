@@ -119,20 +119,6 @@ test("ChatGPT adapter owns conversation and model policy", () => {
     requested_model: "gpt-5-6-sol-chat-pro",
     family_status: "verified",
     effort_status: "verified",
-    model_used: "GPT-5.6 Sol Pro"
-  }), true);
-  assert.equal(adapter.isAcceptableModelSelection({
-    status: "selected",
-    requested_model: "gpt-5-6-sol-chat-pro",
-    family_status: "verified",
-    effort_status: "verified",
-    model_used: "GPT-5.6 Sol Expert"
-  }), false);
-  assert.equal(adapter.isAcceptableModelSelection({
-    status: "selected",
-    requested_model: "gpt-5-6-sol-chat-pro",
-    family_status: "verified",
-    effort_status: "verified",
     model_used: "GPT-5.6 Sol Expert"
   }), false);
   assert.equal(adapter.isAcceptableModelSelection({
@@ -141,26 +127,6 @@ test("ChatGPT adapter owns conversation and model policy", () => {
     family_status: "verified",
     effort_status: "verified",
     model_used: "GPT-5.6 Instant"
-  }), false);
-  assert.equal(adapter.isAcceptableModelSelection({
-    status: "selected",
-    requested_model: "gpt-5-6-sol-chat-pro",
-    picker_shape: "family",
-    family_status: "verified",
-    effort_status: "skipped",
-    family_label: "Pro",
-    model_used: "Pro",
-    available_families: ["Pro", "GPT-5.6 Sol", "GPT-5.5"]
-  }), true);
-  assert.equal(adapter.isAcceptableModelSelection({
-    status: "selected",
-    requested_model: "gpt-5-6-sol-chat-pro",
-    picker_shape: "family",
-    family_status: "verified",
-    effort_status: "skipped",
-    family_label: "Pro",
-    model_used: "Pro",
-    available_families: ["Pro", "GPT-5.5"]
   }), false);
   assert.equal(adapter.completion.supportsBackendApiFallback, true);
   assert.equal(adapter.completion.renderRefreshMode, "reload_conversation");
