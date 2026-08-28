@@ -133,13 +133,23 @@ export function findModelButton(root = document) {
   for (const scope of scopes) {
     const buttons = Array.from(scope.querySelectorAll('button[aria-haspopup="menu"]'))
       .filter((node) => isVisible(node, { allowDisabled: true }) && !isTranscriptModelControl(node));
-    const composerPill = buttons.find((node) => classTokens(node).includes("__composer-pill"));
+    const composerPill = buttons.find((node) => (
+      classTokens(node).includes("__composer-pill")
+      && modelPillSummaryMatches(modelControlLabel(node))
+    ));
     if (composerPill) {
       return composerPill;
     }
     const summaryFallback = buttons.find((node) => modelPillSummaryMatches(modelControlLabel(node)));
     if (summaryFallback) {
       return summaryFallback;
+    }
+    const familyTokenPill = buttons.find((node) => (
+      classTokens(node).includes("__composer-pill")
+      && pillHasModelFamilyToken(modelControlLabel(node))
+    ));
+    if (familyTokenPill) {
+      return familyTokenPill;
     }
   }
   return null;
@@ -526,11 +536,33 @@ async function ensureChatSurface(root, options = {}) {
 }
 
 export async function resetModelSelectionState(root) {
-  if (!findPickerState(root)) {
+  const leftovers = openComposerPickerLeftovers(root);
+  if (!findPickerState(root) && leftovers.length === 0) {
     return { reset: true, picker_was_open: false };
   }
-  const modelButton = findModelButton(root) ?? root.activeElement ?? root.body;
-  if (!await closeModelPicker(root, modelButton)) {
+  for (const leftover of leftovers) {
+    const closed = await closeModelPickerResult(root, leftover.trigger, null, {
+      owningTrigger: leftover.trigger
+    });
+    if (!closed.ok && leftoverSurfaceIsOpen(root, leftover.trigger)) {
+      throw chatgptCommandError(
+        "model_picker_close_failed",
+        "ChatGPT model picker remained open while resetting a restored model selection",
+        { phase: "model_selection", side_effect_started: false }
+      );
+    }
+  }
+  if (findPickerState(root) || openComposerPickerLeftovers(root).length > 0) {
+    const modelButton = findModelButton(root) ?? root.activeElement ?? root.body;
+    if (!await closeModelPicker(root, modelButton)) {
+      throw chatgptCommandError(
+        "model_picker_close_failed",
+        "ChatGPT model picker remained open while resetting a restored model selection",
+        { phase: "model_selection", side_effect_started: false }
+      );
+    }
+  }
+  if (openComposerPickerLeftovers(root).length > 0) {
     throw chatgptCommandError(
       "model_picker_close_failed",
       "ChatGPT model picker remained open while resetting a restored model selection",
@@ -700,12 +732,227 @@ function looksLikeComposerControlScope(node) {
     && !/\b(conversation|transcript|message|turn|assistant|user)\b/.test(marker);
 }
 
+function composerMenuTriggers(root) {
+  const triggers = [];
+  for (const scope of modelControlScopes(root)) {
+    for (const node of Array.from(scope.querySelectorAll?.('button[aria-haspopup="menu"]') ?? [])) {
+      if (!isTranscriptModelControl(node)) {
+        triggers.push(node);
+      }
+    }
+  }
+  return uniqueElements(triggers);
+}
+
+function findThinkingEffortPill(root) {
+  return composerMenuTriggers(root).find((node) => thinkingEffortPillMatches(modelControlLabel(node))) ?? null;
+}
+
+function openComposerPickerLeftovers(root) {
+  const leftovers = [];
+  for (const trigger of composerMenuTriggers(root)) {
+    if (!modelPickerTriggerIsOpen(trigger)) continue;
+    const surface = structurallyOpenControlledSurfaceForTrigger(root, trigger);
+    leftovers.push({ trigger, surface });
+  }
+  return leftovers;
+}
+
+function leftoverSurfaceIsOpen(root, trigger) {
+  if (!isMountedInRoot(root, trigger)) return false;
+  if (modelPickerTriggerIsOpen(trigger)) return true;
+  const surface = structurallyOpenControlledSurfaceForTrigger(root, trigger);
+  return Boolean(surface);
+}
+
 function modelControlLabel(node) {
   return normalizeText([
     textOf(node),
     node?.getAttribute?.("aria-label"),
     node?.getAttribute?.("title")
   ].filter(Boolean).join(" "));
+}
+
+function familyMenuItems(state) {
+  const structurallyTrusted = state?.surface_trust === "aria_controls_structural";
+  return menuRadioItems(state?.menu ?? state?.surface, structurallyTrusted);
+}
+
+async function selectFamilyPickerTopology(root, modelButton, state, options, base) {
+  const items = familyMenuItems(state);
+  const availableFamilies = items.map((item) => textOf(item)).filter(Boolean);
+  if (!items.some((item) => familyIsSol(textOf(item)))) {
+    await closeModelPicker(root, modelButton);
+    return selectionFailure(
+      base,
+      modelButton,
+      state,
+      availableFamilies,
+      "GPT-5.6 Sol was not visible in the family menu",
+      "model_family_not_found"
+    );
+  }
+  const effortPill = findThinkingEffortPill(root);
+  if (effortPill) {
+    return selectSplitFamilyAndEffort(root, modelButton, effortPill, state, items, availableFamilies, options, base);
+  }
+  return selectFamilyProRadio(root, modelButton, state, items, availableFamilies, options, base);
+}
+
+async function selectFamilyProRadio(root, modelButton, state, items, availableFamilies, options, base) {
+  const proOption = items.find((item) => foldedModelText(textOf(item)) === "pro") ?? null;
+  if (!proOption) {
+    await closeModelPicker(root, modelButton);
+    return selectionFailure(
+      base,
+      modelButton,
+      state,
+      availableFamilies,
+      "Pro was not visible as a family option in the model menu",
+      "model_family_not_found"
+    );
+  }
+  if (!itemIsChecked(proOption)) {
+    realClick(proOption);
+    await sleep(Number(options.actionSettleMs ?? 250));
+  }
+  modelButton = await waitForModelButton(root, options);
+  if (!modelButton) {
+    return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting Pro family", "model_family_remount_failed");
+  }
+  state = await openAndReadModelPicker(root, modelButton, options);
+  if (!state || state.shape !== "family") {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT family picker did not reopen after selecting Pro", "model_family_selection_unverified");
+  }
+  const reread = familyMenuItems(state);
+  const checked = reread.filter((item) => itemIsChecked(item));
+  const familyLabel = checked.length === 1 ? normalizeText(textOf(checked[0])) : "";
+  if (checked.length !== 1 || foldedModelText(familyLabel) !== "pro") {
+    await closeModelPicker(root, modelButton);
+    return selectionFailure(base, modelButton, state, availableFamilies, "Pro family selection could not be verified", "model_family_selection_unverified");
+  }
+  const closeResult = await closeModelPickerResult(root, modelButton, state, { owningTrigger: modelButton });
+  state.picker_close_method = closeResult.method;
+  state.picker_close_verification = closeResult.verification;
+  if (!closeResult.ok) {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
+  }
+  const verifiedFamilies = reread.map((item) => textOf(item)).filter(Boolean);
+  return {
+    ...base,
+    status: "selected",
+    model_used: familyLabel,
+    failure_reason: null,
+    family_status: "verified",
+    effort_status: "skipped",
+    picker_family_status: "verified",
+    picker_effort_status: "skipped",
+    closed_pill_family_status: "skipped",
+    closed_pill_effort_status: "skipped",
+    closed_pill_text: modelControlLabel(modelButton),
+    picker_shape: "family",
+    surface_trust: state.surface_trust ?? null,
+    effort_control: null,
+    effort_move_method: null,
+    pill_text: modelControlLabel(modelButton),
+    family_label: familyLabel,
+    family_label_candidates: verifiedFamilies,
+    family_label_source: "family_menu_checked",
+    picker_close_method: closeResult.method,
+    picker_close_verification: closeResult.verification,
+    available_options: [],
+    available_families: verifiedFamilies.length > 0 ? verifiedFamilies : availableFamilies,
+    effort_options: []
+  };
+}
+
+async function selectSplitFamilyAndEffort(root, modelButton, effortPill, state, items, availableFamilies, options, base) {
+  const solOption = items.find((item) => familyIsSol(textOf(item))) ?? null;
+  if (!solOption) {
+    await closeModelPicker(root, modelButton);
+    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol was not visible in the family menu", "model_family_not_found");
+  }
+  if (!itemIsChecked(solOption)) {
+    realClick(solOption);
+    await sleep(Number(options.actionSettleMs ?? 250));
+  }
+  modelButton = await waitForModelButton(root, options);
+  if (!modelButton) {
+    return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol", "model_family_remount_failed");
+  }
+  state = await openAndReadModelPicker(root, modelButton, options);
+  if (!state || state.shape !== "family") {
+    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol family menu selection could not be verified", "model_family_selection_unverified");
+  }
+  const reread = familyMenuItems(state);
+  const checkedFamily = reread.filter((item) => itemIsChecked(item));
+  const solLabel = checkedFamily.length === 1 ? normalizeText(textOf(checkedFamily[0])) : "";
+  if (checkedFamily.length !== 1 || !familyIsSol(solLabel)) {
+    await closeModelPicker(root, modelButton);
+    return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol family menu selection could not be verified", "model_family_selection_unverified");
+  }
+  const closedFamily = await closeModelPickerResult(root, modelButton, state, { owningTrigger: modelButton });
+  if (!closedFamily.ok) {
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
+  }
+  const liveEffortPill = findThinkingEffortPill(root) ?? effortPill;
+  let effortState = await openAndReadModelPicker(root, liveEffortPill, options);
+  if (!effortState || effortState.shape === "family") {
+    return selectionFailure(base, modelButton, effortState, availableFamilies, "GPT-5.6 Sol Pro effort was not visible in the effort menu", "effort_control_not_found");
+  }
+  if (!effortIsChatProTier(effortState)) {
+    const proOption = (effortState.effort_items ?? []).find((item) => foldedModelText(textOf(item)) === "pro") ?? null;
+    if (!proOption) {
+      await closeModelPicker(root, liveEffortPill);
+      return selectionFailure(base, modelButton, effortState, availableFamilies, "GPT-5.6 Sol Pro effort was not visible in the effort menu", "effort_control_not_found");
+    }
+    realClick(proOption);
+    await sleep(Number(options.actionSettleMs ?? 250));
+    const reopenedEffort = findThinkingEffortPill(root) ?? liveEffortPill;
+    effortState = await openAndReadModelPicker(root, reopenedEffort, options);
+    if (!effortState || !effortIsChatProTier(effortState)) {
+      return selectionFailure(base, modelButton, effortState, availableFamilies, "Pro effort selection could not be verified", "model_selection_verification_failed");
+    }
+  }
+  const checkedEffort = (effortState.effort_items ?? []).find((item) => itemIsChecked(item));
+  const effortLabel = normalizeText(textOf(checkedEffort));
+  if (foldedModelText(effortLabel) !== "pro") {
+    await closeModelPicker(root, liveEffortPill);
+    return selectionFailure(base, modelButton, effortState, availableFamilies, "Pro effort selection could not be verified", "model_selection_verification_failed");
+  }
+  const closeResult = await closeModelPickerResult(root, liveEffortPill, effortState, { owningTrigger: liveEffortPill });
+  effortState.picker_close_method = closeResult.method;
+  effortState.picker_close_verification = closeResult.verification;
+  if (!closeResult.ok) {
+    return selectionFailure(base, modelButton, effortState, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
+  }
+  const verifiedFamilies = reread.map((item) => textOf(item)).filter(Boolean);
+  return {
+    ...base,
+    status: "selected",
+    model_used: `${solLabel} ${effortLabel}`,
+    failure_reason: null,
+    family_status: "verified",
+    effort_status: "verified",
+    picker_family_status: "verified",
+    picker_effort_status: "verified",
+    closed_pill_family_status: "skipped",
+    closed_pill_effort_status: "skipped",
+    closed_pill_text: modelControlLabel(findModelButton(root) ?? modelButton),
+    picker_shape: effortState.shape,
+    surface_trust: effortState.surface_trust ?? state.surface_trust ?? null,
+    effort_control: effortControlDiagnostics(effortState),
+    effort_move_method: effortState.effort_move_method ?? null,
+    pill_text: modelControlLabel(findModelButton(root) ?? modelButton),
+    family_label: solLabel,
+    family_label_candidates: verifiedFamilies,
+    family_label_source: "family_menu_checked",
+    picker_close_method: closeResult.method,
+    picker_close_verification: closeResult.verification,
+    available_options: (effortState.effort_items ?? []).map((item) => textOf(item)).filter(Boolean),
+    available_families: verifiedFamilies.length > 0 ? verifiedFamilies : availableFamilies,
+    effort_options: effortDiagnostics(effortState.effort_items ?? [])
+  };
 }
 
 async function selectSolChatProModel(root, options = {}) {
@@ -764,6 +1011,9 @@ async function selectSolChatProModel(root, options = {}) {
       pill_text: modelControlLabel(modelButton),
       warning: "ChatGPT GPT-5.6 model picker did not open"
     };
+  }
+  if (state.shape === "family") {
+    return selectFamilyPickerTopology(root, modelButton, state, options, base);
   }
   let familyProof = await readCheckedSolFamily(root, state, options);
   availableFamilies = familyProof.available_families;
@@ -1112,7 +1362,7 @@ async function closeModelPickerResult(root, modelButton, state = null, options =
   };
 
   if (!verification.ok) {
-    const currentButton = findModelButton(root) ?? modelButton;
+    const currentButton = options.owningTrigger ?? findModelButton(root) ?? modelButton;
     verification = await tryMethod("escape", () => pressActivationKey(currentButton, "Escape"));
   }
 
@@ -1152,15 +1402,18 @@ async function waitForPickerClose(root, modelButton, state, options) {
 }
 
 function pickerCloseVerification(root, modelButton, state, options = {}) {
-  const currentButton = findModelButton(root) ?? (isMountedInRoot(root, modelButton) ? modelButton : null);
+  const currentButton = options.owningTrigger
+    ?? findModelButton(root)
+    ?? (isMountedInRoot(root, modelButton) ? modelButton : null);
   const familyTrigger = familyTriggerForPicker(root, state);
   const familySurface = familySurfaceForPicker(root, state, familyTrigger);
-  const pickerState = findPickerState(root);
+  const leftovers = openComposerPickerLeftovers(root);
+  const leftoverOpen = leftovers.some((leftover) => leftoverSurfaceIsOpen(root, leftover.trigger));
   const familyTriggerOpen = isMountedInRoot(root, familyTrigger)
     && (familyTrigger.getAttribute?.("aria-expanded") === "true"
       || familyTrigger.getAttribute?.("data-state") === "open");
   const modelTriggerOpen = isMountedInRoot(root, currentButton) && modelPickerTriggerIsOpen(currentButton);
-  const pickerSurfaceOpen = Boolean(pickerState) || Boolean(familySurface);
+  const pickerSurfaceOpen = Boolean(findPickerState(root)) || Boolean(familySurface) || leftoverOpen;
   const pillText = modelControlLabel(currentButton);
   const closedPillPro = options.requireProPill !== true || pillConfirmsEffortLabel(pillText, "Pro");
   return {
@@ -1169,7 +1422,7 @@ function pickerCloseVerification(root, modelButton, state, options = {}) {
     model_trigger_closed: !modelTriggerOpen,
     closed_pill_pro: closedPillPro,
     closed_pill_text: pillText || null,
-    ok: !familyTriggerOpen && !pickerSurfaceOpen && !modelTriggerOpen && closedPillPro
+    ok: !familyTriggerOpen && !pickerSurfaceOpen && !modelTriggerOpen && !leftoverOpen && closedPillPro
   };
 }
 
@@ -1238,7 +1491,16 @@ function findPickerState(root) {
   const personal = findPersonalPickerSurface(root);
   if (personal) return readPersonalPickerState(personal, false);
   const controlledSurface = structurallyOpenControlledSurface(root);
-  return controlledSurface ? readStructurallyTrustedPickerState(controlledSurface) : null;
+  if (controlledSurface) {
+    const classified = readStructurallyTrustedPickerState(controlledSurface);
+    if (classified) return classified;
+  }
+  for (const leftover of openComposerPickerLeftovers(root)) {
+    if (!leftover.surface) continue;
+    const classified = readStructurallyTrustedPickerState(leftover.surface);
+    if (classified) return classified;
+  }
+  return null;
 }
 
 function structurallyOpenControlledSurface(root) {
@@ -1281,6 +1543,9 @@ function classifyPickerSurface(surface, structurallyTrusted) {
   }
   if (looksLikePersonalPicker(surface)) {
     return readPersonalPickerState(surface, structurallyTrusted);
+  }
+  if (isFamilyOnlyMenuLabels(labels)) {
+    return readFamilyOnlyPickerState(surface, structurallyTrusted);
   }
   return null;
 }
@@ -1387,6 +1652,38 @@ function findMainModelMenu(root) {
 // A main model effort menu requires the visible ChatGPT effort ladder.
 function isEffortMenuLabels(labels) {
   return labels.includes("medium") && labels.includes("high") && labels.includes("pro");
+}
+
+function looksLikeFamilyRadioLabel(folded) {
+  return familyIsSol(folded)
+    || folded === "pro"
+    || /^gpt(?:[\s.-]*\d)/.test(folded)
+    || /^o\d/.test(folded);
+}
+
+function isFamilyOnlyMenuLabels(labels) {
+  if (!Array.isArray(labels) || labels.length === 0) return false;
+  if (isEffortMenuLabels(labels)) return false;
+  const folded = labels.map((label) => foldedModelText(label).replace(/\s+/g, " "));
+  if (!folded.some((label) => familyIsSol(label))) return false;
+  return folded.every((label) => looksLikeFamilyRadioLabel(label));
+}
+
+function readFamilyOnlyPickerState(menu, structurallyTrusted = false) {
+  const items = menuRadioItems(menu, structurallyTrusted);
+  const checked = items.find((item) => itemIsChecked(item));
+  return {
+    shape: "family",
+    menu,
+    surface: menu,
+    family_trigger: null,
+    family_label: checked ? textOf(checked) : "",
+    family_items: items,
+    effort_items: [],
+    effort_slider: null,
+    effort_move_method: null,
+    surface_trust: structurallyTrusted ? "aria_controls_structural" : "visible"
+  };
 }
 
 function isMainModelMenu(menu) {
@@ -1888,10 +2185,14 @@ function classTokens(node) {
 
 function modelPillSummaryMatches(value) {
   const folded = foldedModelText(value).replace(/\s+/g, " ");
-  const effort = "instant|medium|high|extra high|pro";
+  const effort = "instant|medium|high|extra high|pro|max|light";
   return new RegExp(`^(?:${effort})$`).test(folded)
     || new RegExp(`^\\d+(?:\\.\\d+)+(?: sol)? (?:${effort})$`).test(folded)
     || /\bgpt[\s.-]*\d/.test(folded);
+}
+
+function thinkingEffortPillMatches(value) {
+  return foldedModelText(value).replace(/\s+/g, " ") === "thinking effort";
 }
 
 function foldedModelText(value) {

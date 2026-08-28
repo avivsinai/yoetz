@@ -306,6 +306,53 @@ fn is_current_model_selection(selection: &serde_json::Value, requested_model: &s
             == Some("skipped")
 }
 
+fn is_family_pro_pin(selection: &serde_json::Value) -> bool {
+    let model_used = selection
+        .get("modelUsed")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let family_label = selection
+        .get("familyLabel")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    let families = selection
+        .get("availableFamilies")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .any(|label| {
+            label
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .eq_ignore_ascii_case("GPT-5.6 Sol")
+        });
+    selection
+        .get("pickerShape")
+        .and_then(serde_json::Value::as_str)
+        == Some("family")
+        && selection
+            .get("familyStatus")
+            .and_then(serde_json::Value::as_str)
+            == Some("verified")
+        && selection
+            .get("effortStatus")
+            .and_then(serde_json::Value::as_str)
+            == Some("skipped")
+        && model_used == "pro"
+        && family_label == "pro"
+        && families
+}
+
 fn is_verified_sol_chat_pro_selection(
     selection: &serde_json::Value,
     requested_model: &str,
@@ -316,10 +363,16 @@ fn is_verified_sol_chat_pro_selection(
             .get("requested")
             .and_then(serde_json::Value::as_str)
             != Some(crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL)
-        || selection
-            .get("familyStatus")
-            .and_then(serde_json::Value::as_str)
-            != Some("verified")
+    {
+        return false;
+    }
+    if is_family_pro_pin(selection) {
+        return true;
+    }
+    if selection
+        .get("familyStatus")
+        .and_then(serde_json::Value::as_str)
+        != Some("verified")
         || selection
             .get("effortStatus")
             .and_then(serde_json::Value::as_str)
@@ -515,20 +568,27 @@ async () => {{
     return scopes;
   }}
 
+  function pillLabel(node) {{
+    return normalize([textOf(node), node?.getAttribute?.("aria-label"), node?.getAttribute?.("title")].filter(Boolean).join(" "));
+  }}
+
   function summaryMatches(value) {{
     const valueFolded = fold(value);
-    return /^(instant|medium|high|extra high|pro)$/.test(valueFolded)
-      || /^\d+(?:\.\d+)+ (instant|medium|high|extra high|pro)$/.test(valueFolded)
+    const effort = "instant|medium|high|extra high|pro|max|light";
+    return new RegExp(`^(?:${{effort}})$`).test(valueFolded)
+      || new RegExp(`^\\d+(?:\\.\\d+)+(?: sol)? (?:${{effort}})$`).test(valueFolded)
       || /\bgpt[\s.-]*\d/.test(valueFolded);
   }}
 
   function findPill() {{
     for (const scope of composerScopes()) {{
       const buttons = Array.from(scope.querySelectorAll(MODEL_BUTTON_SELECTOR)).filter(isVisible);
-      const exact = buttons.find((button) => button.classList.contains("__composer-pill"));
+      const exact = buttons.find((button) => button.classList.contains("__composer-pill") && summaryMatches(pillLabel(button)));
       if (exact) return exact;
-      const fallback = buttons.find((button) => summaryMatches(textOf(button)));
+      const fallback = buttons.find((button) => summaryMatches(pillLabel(button)));
       if (fallback) return fallback;
+      const familyToken = buttons.find((button) => button.classList.contains("__composer-pill") && pillHasModelFamilyToken(pillLabel(button)));
+      if (familyToken) return familyToken;
     }}
     return null;
   }}
@@ -562,6 +622,36 @@ async () => {{
     }}) || null;
   }}
 
+  function looksLikeFamilyRadio(label) {{
+    return label === "gpt-5.6 sol" || label === "pro" || /^gpt(?:[\s.-]*\d)/.test(label) || /^o\d/.test(label);
+  }}
+
+  function familyOnlyMenu() {{
+    return visibleMenus().find((menu) => {{
+      const labels = radios(menu).map((item) => fold(textOf(item)));
+      if (labels.includes("medium") && labels.includes("high") && labels.includes("pro")) return false;
+      if (!labels.some((label) => label === "gpt-5.6 sol")) return false;
+      return labels.length > 0 && labels.every(looksLikeFamilyRadio);
+    }}) || null;
+  }}
+
+  function composerMenuTriggers() {{
+    const triggers = [];
+    for (const scope of composerScopes()) {{
+      for (const node of Array.from(scope.querySelectorAll(MODEL_BUTTON_SELECTOR))) triggers.push(node);
+    }}
+    return triggers;
+  }}
+
+  function leftoverTriggers() {{
+    return composerMenuTriggers().filter((trigger) =>
+      trigger.getAttribute("aria-expanded") === "true" || trigger.getAttribute("data-state") === "open");
+  }}
+
+  function thinkingEffortPill() {{
+    return composerMenuTriggers().find((node) => fold(pillLabel(node)) === "thinking effort") || null;
+  }}
+
   function familyMenu(main) {{
     return visibleMenus().find((menu) => menu !== main
       && radios(menu).some((item) => fold(textOf(item)) === "gpt-5.6 sol")) || null;
@@ -592,7 +682,7 @@ async () => {{
     for (const phase of phases) {{
       dispatch(element, phase[0], phase[1], phase[2]);
       await wait(125);
-      if (mode === "main" ? mainMenu() : familyMenu(main)) return true;
+      if (mode === "main" ? mainMenu() : mode === "family-only" ? familyOnlyMenu() : familyMenu(main)) return true;
     }}
     return false;
   }}
@@ -628,6 +718,113 @@ async () => {{
     if (menu) return menu;
     keyPress(pill, "Enter", "Enter");
     return waitForMain();
+  }}
+
+  async function openFamilyOnly(pill) {{
+    const existing = familyOnlyMenu();
+    if (existing) return existing;
+    await pointerOpen(pill, "family-only", null);
+    for (let attempt = 0; attempt < 30; attempt += 1) {{
+      const opened = familyOnlyMenu();
+      if (opened) return opened;
+      await wait(100);
+    }}
+    keyPress(pill, "Enter", "Enter");
+    for (let attempt = 0; attempt < 30; attempt += 1) {{
+      const opened = familyOnlyMenu();
+      if (opened) return opened;
+      await wait(100);
+    }}
+    return null;
+  }}
+
+  async function selectFamilyTopology(pill, menu) {{
+    const items = radios(menu);
+    const families = items.map(textOf).filter(Boolean);
+    const familyState = {{ menu, effortItems: [], familyTrigger: null, familyLabel: "", familyProof: false, shape: "family" }};
+    if (!items.some((item) => fold(textOf(item)) === "gpt-5.6 sol")) {{
+      await closeMenus(pill);
+      return result("not-found", pill, familyState, families, "GPT-5.6 Sol was not visible in the family menu");
+    }}
+    const effortPill = thinkingEffortPill();
+    if (effortPill) {{
+      const sol = items.find((item) => fold(textOf(item)) === "gpt-5.6 sol");
+      if (!isChecked(sol)) realClick(sol);
+      await wait(250);
+      pill = await waitForPill();
+      menu = await openFamilyOnly(pill);
+      if (!menu) {{
+        return result("selection-mismatch", pill, familyState, families, "GPT-5.6 Sol family menu selection could not be verified");
+      }}
+      const reread = radios(menu);
+      const checkedFamily = reread.filter(isChecked);
+      const solLabel = checkedFamily.length === 1 ? textOf(checkedFamily[0]) : "";
+      if (checkedFamily.length !== 1 || fold(solLabel) !== "gpt-5.6 sol") {{
+        await closeMenus(pill);
+        return result("selection-mismatch", pill, familyState, families, "GPT-5.6 Sol family menu selection could not be verified");
+      }}
+      if (!await closeMenus(pill)) {{
+        return result("selection-mismatch", pill, familyState, families, "ChatGPT model picker remained open after verification");
+      }}
+      let effortMenu = await openMain(effortPill);
+      if (!effortMenu) {{
+        return result("not-found", pill, familyState, families, "GPT-5.6 Sol Pro effort was not visible in the effort menu");
+      }}
+      let effortState = readState(effortMenu);
+      if (!effortVerified(effortState)) {{
+        const proTier = effortState.effortItems.find((item) => fold(textOf(item)) === "pro") || null;
+        if (!proTier) {{
+          await closeMenus(effortPill);
+          return result("not-found", pill, effortState, families, "GPT-5.6 Sol Pro effort was not visible in the effort menu");
+        }}
+        realClick(proTier);
+        await wait(250);
+        effortMenu = await openMain(effortPill);
+        effortState = effortMenu ? readState(effortMenu) : null;
+        if (!effortVerified(effortState)) {{
+          return result("selection-mismatch", pill, effortState, families, "Pro effort selection could not be verified");
+        }}
+      }}
+      const checkedEffort = (effortState.effortItems || []).find((item) => isChecked(item));
+      if (!await closeMenus(effortPill, effortState)) {{
+        return result("selection-mismatch", pill, effortState, families, "ChatGPT model picker remained open after verification");
+      }}
+      const selected = result("selected", pill, {{ ...effortState, familyLabel: solLabel, familyProof: true }}, reread.map(textOf).filter(Boolean));
+      selected.modelUsed = `${{solLabel}} ${{textOf(checkedEffort)}}`;
+      selected.pickerShape = "menu";
+      return selected;
+    }}
+    const pro = items.find((item) => fold(textOf(item)) === "pro");
+    if (!pro) {{
+      await closeMenus(pill);
+      return result("not-found", pill, familyState, families, "Pro was not visible as a family option in the model menu");
+    }}
+    if (!isChecked(pro)) realClick(pro);
+    await wait(250);
+    pill = await waitForPill();
+    menu = await openFamilyOnly(pill);
+    if (!menu) {{
+      return result("selection-mismatch", pill, familyState, families, "Pro family selection could not be verified");
+    }}
+    const reread = radios(menu);
+    const checked = reread.filter(isChecked);
+    const familyLabel = checked.length === 1 ? textOf(checked[0]) : "";
+    if (checked.length !== 1 || fold(familyLabel) !== "pro") {{
+      await closeMenus(pill);
+      return result("selection-mismatch", pill, familyState, families, "Pro family selection could not be verified");
+    }}
+    familyState.familyLabel = familyLabel;
+    if (!await closeMenus(pill, familyState)) {{
+      return result("selection-mismatch", pill, familyState, families, "ChatGPT model picker remained open after verification");
+    }}
+    const selected = result("selected", pill, familyState, reread.map(textOf).filter(Boolean) || families);
+    selected.status = "selected";
+    selected.modelUsed = familyLabel;
+    selected.familyStatus = "verified";
+    selected.effortStatus = "skipped";
+    selected.pickerShape = "family";
+    selected.familyLabel = familyLabel;
+    return selected;
   }}
 
   async function openFamilyMenu(state) {{
@@ -669,10 +866,12 @@ async () => {{
       && (familyTrigger.getAttribute("aria-expanded") === "true"
         || familyTrigger.getAttribute("data-state") === "open");
     const familySurface = familyMenu(state?.menu);
+    const leftoverOpen = leftoverTriggers().length > 0;
     const pickerOpen = Boolean(mainMenu())
       || Boolean(familySurface)
       || Boolean(pickerDialog())
       || familyOpen
+      || leftoverOpen
       || (mounted(pill) && (pill.getAttribute("aria-expanded") === "true"
         || pill.getAttribute("data-state") === "open"));
     const pillText = pill ? textOf(pill) : "";
@@ -739,6 +938,12 @@ async () => {{
       await tryMethod("hover_leave", () => dispatchHoverLeaveEvents(state.familyTrigger, neutral));
       if (!verification.ok && !verification.pickerSurfaceClosed) {{
         await tryMethod("trigger_escape", () => keyPress(state.familyTrigger, "Escape", "Escape"));
+      }}
+    }}
+    if (!verification.ok && leftoverTriggers().length > 0) {{
+      for (const trigger of leftoverTriggers()) {{
+        await tryMethod("leftover_escape", () => keyPress(trigger, "Escape", "Escape"));
+        if (verification.ok) break;
       }}
     }}
     if (!verification.ok && !verification.pickerSurfaceClosed) {{
@@ -916,7 +1121,11 @@ async () => {{
   let menu = await openMain(pill);
   let state = menu ? readState(menu) : null;
   let families = [];
-  if (!state) return result("not-found", pill, null, families, "ChatGPT GPT-5.6 model picker did not open");
+  if (!state) {{
+    const familyOnly = await openFamilyOnly(pill);
+    if (familyOnly) return await selectFamilyTopology(pill, familyOnly);
+    return result("not-found", pill, null, families, "ChatGPT GPT-5.6 model picker did not open");
+  }}
 
   let familyProof = await readFamilyProof(state);
   families = familyProof.families;
@@ -1535,6 +1744,39 @@ mod tests {
             chatgpt_model_selection_status(&pro_selection, "gpt-5-6-sol-chat-pro"),
             ChatgptModelSelectionStatus::Selected
         );
+
+        let family_pro = serde_json::json!({
+            "status": "selected",
+            "requested": "gpt-5-6-sol-chat-pro",
+            "modelUsed": "Pro",
+            "familyLabel": "Pro",
+            "familyStatus": "verified",
+            "effortStatus": "skipped",
+            "pickerShape": "family",
+            "availableFamilies": ["Pro", "GPT-5.6 Sol", "GPT-5.5"]
+        });
+        assert_eq!(
+            chatgpt_model_selection_status(&family_pro, "gpt-5-6-sol-chat-pro"),
+            ChatgptModelSelectionStatus::Selected
+        );
+        assert_eq!(
+            select_reported_chatgpt_model(&family_pro, "gpt-5-6-sol-chat-pro"),
+            Some("Pro".to_string())
+        );
+        let family_pro_without_sol = serde_json::json!({
+            "status": "selected",
+            "requested": "gpt-5-6-sol-chat-pro",
+            "modelUsed": "Pro",
+            "familyLabel": "Pro",
+            "familyStatus": "verified",
+            "effortStatus": "skipped",
+            "pickerShape": "family",
+            "availableFamilies": ["Pro", "GPT-5.5"]
+        });
+        assert_eq!(
+            chatgpt_model_selection_status(&family_pro_without_sol, "gpt-5-6-sol-chat-pro"),
+            ChatgptModelSelectionStatus::Mismatch
+        );
     }
 
     #[test]
@@ -1650,6 +1892,16 @@ mod tests {
         let script =
             build_model_selection_function("gpt-5-6-sol-chat-pro", ChatgptModelStrategy::Select);
         assert!(script.contains(r#"const requested = "gpt-5-6-sol-chat-pro";"#));
+        assert!(script.contains(
+            "classList.contains(\"__composer-pill\") && summaryMatches(pillLabel(button))"
+        ));
+        assert!(script.contains("function leftoverTriggers()"));
+        assert!(script.contains("function familyOnlyMenu()"));
+        assert!(script.contains(
+            "classList.contains(\"__composer-pill\") && pillHasModelFamilyToken(pillLabel(button))"
+        ));
+        assert!(script.contains("menu = await openFamilyOnly(pill)"));
+        assert!(script.contains("async function selectFamilyTopology(pill, menu)"));
         assert!(script.contains("classList.contains(\"__composer-pill\")"));
         assert!(script.contains(r#"[role="radiogroup"][aria-label="Select chat surface"]"#));
         assert!(script.contains(r#"[role="radio"][data-tpp-toggle-value="chatgpt"]"#));
