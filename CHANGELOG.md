@@ -7,11 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.61] - 2026-08-30
 ### Fixed
 
 - ChatGPT model selection now ignores retained closed picker surfaces in both
   the native extension and CDP path, so a closed menu cannot block verified
   GPT-5.6 Sol Pro selection.
+
 
 ## [0.5.60] - 2026-08-28
 ### Fixed
