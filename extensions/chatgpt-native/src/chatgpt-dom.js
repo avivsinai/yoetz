@@ -482,7 +482,7 @@ async function ensureChatSurface(root, options = {}) {
     observedValues = observedSurfaceToggleValues(root);
     if (controls) {
       const state = surfaceSelectionState(controls.chat);
-      if (state.aria_checked === "true") {
+      if (surfaceSelectionIsChat(controls)) {
         return {
           ok: true,
           elapsed_ms: Math.max(0, Date.now() - startedAt),
@@ -595,11 +595,13 @@ function positiveMs(value, fallback) {
 }
 
 function findChatSurfaceControls(root) {
-  const group = root?.querySelector?.(CHAT_SURFACE_GROUP_SELECTOR);
-  if (!group) return null;
-  const chat = group.querySelector(CHAT_SURFACE_CHAT_SELECTOR);
-  const work = group.querySelector(CHAT_SURFACE_WORK_SELECTOR);
-  return chat && work ? { group, chat, work } : null;
+  for (const group of Array.from(root?.querySelectorAll?.(CHAT_SURFACE_GROUP_SELECTOR) ?? [])) {
+    if (!isVisible(group, { allowDisabled: true })) continue;
+    const chat = group.querySelector(CHAT_SURFACE_CHAT_SELECTOR);
+    const work = group.querySelector(CHAT_SURFACE_WORK_SELECTOR);
+    if (chat && work) return { group, chat, work };
+  }
+  return null;
 }
 
 function observedSurfaceToggleValues(root) {
@@ -619,6 +621,12 @@ function surfaceSelectionState(node) {
   };
 }
 
+function surfaceSelectionIsChat(controls) {
+  const chat = surfaceSelectionState(controls?.chat);
+  const work = surfaceSelectionState(controls?.work);
+  return chat.aria_checked === "true" && work.aria_checked === "false";
+}
+
 async function waitForChatSurfaceSelection(root, timing, startedAt) {
   const settleStartedAt = Date.now();
   const remainingSelectionMs = Math.max(1, timing.timeoutMs - (settleStartedAt - startedAt));
@@ -632,7 +640,7 @@ async function waitForChatSurfaceSelection(root, timing, startedAt) {
     controls = findChatSurfaceControls(root);
     state = surfaceSelectionState(controls?.chat);
     observedValues = observedSurfaceToggleValues(root);
-    if (state.aria_checked === "true") {
+    if (surfaceSelectionIsChat(controls)) {
       return {
         ok: true,
         ...controls,
@@ -1340,16 +1348,19 @@ function structurallyOpenControlledSurfaceForTrigger(root, trigger) {
   if (!controlledId) return null;
   const surface = root.getElementById?.(controlledId);
   if (!surface) return null;
+  if (!pickerSurfaceIsOpen(surface)) return null;
   if (surface.getAttribute?.("data-state") === "open") return surface;
   const openChild = Array.from(surface.querySelectorAll?.('[role="menu"], [role="dialog"]') ?? [])
-    .find((node) => node.getAttribute?.("data-state") === "open");
+    .find((node) => pickerSurfaceIsOpen(node) && node.getAttribute?.("data-state") === "open");
   return openChild ? surface : null;
 }
 
 function readStructurallyTrustedPickerState(surface) {
+  if (!pickerSurfaceIsOpen(surface)) return null;
   const direct = classifyPickerSurface(surface, true);
   if (direct) return direct;
-  for (const nested of Array.from(surface.querySelectorAll?.('[role="menu"], [role="dialog"]') ?? [])) {
+  for (const nested of Array.from(surface.querySelectorAll?.('[role="menu"], [role="dialog"]') ?? [])
+    .filter((node) => pickerSurfaceIsOpen(node))) {
     const classified = classifyPickerSurface(nested, true);
     if (classified) return classified;
   }
@@ -1419,7 +1430,8 @@ function personalPickerSurfaceIsOpen(node) {
 
 function findPersonalPickerSurface(root) {
   const candidates = Array.from(root.querySelectorAll('div, [role="menu"], [role="dialog"]'))
-    .filter((node) => personalPickerSurfaceIsOpen(node)
+    .filter((node) => pickerSurfaceIsOpen(node)
+      && personalPickerSurfaceIsOpen(node)
       && isVisible(node, { allowDisabled: true }) && looksLikePersonalPicker(node));
   return candidates.sort((left, right) => (
     left.querySelectorAll?.("*")?.length ?? 0
@@ -1521,9 +1533,7 @@ function pickerSurfaceIsOpen(node) {
   let current = node;
   while (current) {
     const state = current.getAttribute?.("data-state");
-    if (state === "open" || state === "closed") {
-      return state === "open";
-    }
+    if (state === "closed") return false;
     current = current.parentElement;
   }
   return true;
