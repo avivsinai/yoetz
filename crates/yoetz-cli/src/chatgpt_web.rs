@@ -555,7 +555,17 @@ async () => {{
   }}
 
   function visibleMenus() {{
-    return Array.from(document.querySelectorAll("[role='menu']")).filter(isVisible);
+    return Array.from(document.querySelectorAll("[role='menu']")).filter((menu) => isVisible(menu) && pickerSurfaceIsOpen(menu));
+  }}
+
+  function pickerSurfaceIsOpen(node) {{
+    let current = node;
+    while (current) {{
+      const state = current.getAttribute?.("data-state");
+      if (state === "open" || state === "closed") return state === "open";
+      current = current.parentElement;
+    }}
+    return true;
   }}
 
   function radios(menu) {{
@@ -796,7 +806,7 @@ async () => {{
 
   function pickerDialog() {{
     return Array.from(document.querySelectorAll("[role='dialog'], [data-testid='composer-intelligence-picker-content']"))
-      .filter(isVisible)
+      .filter((node) => isVisible(node) && pickerSurfaceIsOpen(node))
       .find((node) => /\bModel\b/i.test(textOf(node)) && /\bEffort\b/i.test(textOf(node))) || null;
   }}
 
@@ -1821,6 +1831,8 @@ mod tests {
             .find("let familyProof = await readFamilyProof(state);")
             .expect("generated picker includes family selection logic");
         assert!(surface_guard < family_picker);
+        assert!(script.contains("pickerSurfaceIsOpen(menu)"));
+        assert!(script.contains("state === \"closed\""));
         assert!(script.contains("const SURFACE_SETTLE_TIMEOUT_MS = 1000;"));
         assert!(script.contains("function surfaceObservedValues()"));
         assert!(script.contains("surfaceVerificationAttempts"));

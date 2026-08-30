@@ -1513,7 +1513,20 @@ function findFamilySubmenu(root, mainMenu) {
 }
 
 function visibleMenus(root) {
-  return Array.from(root.querySelectorAll('[role="menu"]')).filter((menu) => isVisible(menu));
+  return Array.from(root.querySelectorAll('[role="menu"]'))
+    .filter((menu) => isVisible(menu) && pickerSurfaceIsOpen(menu));
+}
+
+function pickerSurfaceIsOpen(node) {
+  let current = node;
+  while (current) {
+    const state = current.getAttribute?.("data-state");
+    if (state === "open" || state === "closed") {
+      return state === "open";
+    }
+    current = current.parentElement;
+  }
+  return true;
 }
 
 function readMenuPickerState(menu, structurallyTrusted = false) {
@@ -1629,7 +1642,7 @@ function findSliderPickerSurface(root) {
 function findAdvancedPickerSurface(root) {
   const candidates = Array.from(root.querySelectorAll('div, [role="dialog"]'))
     .filter((node) => {
-      if (!isVisible(node, { allowDisabled: true })) return false;
+      if (!isVisible(node, { allowDisabled: true }) || !pickerSurfaceIsOpen(node)) return false;
       const text = normalizeText(textOf(node));
       return /\bAdvanced\b/i.test(text)
         && /\bFaster\b/i.test(text)
