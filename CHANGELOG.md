@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.5.62] - 2026-08-30
 ### Fixed
 
 - ChatGPT model selection now requires Chat to be selected while Work is
   explicitly unselected, and ignores picker surfaces below closed ancestors.
+
 
 ## [0.5.61] - 2026-08-30
 ### Fixed
