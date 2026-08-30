@@ -231,8 +231,10 @@ function appendChatSurfaceToggle(body, {
   chatClickUpdates = true,
   chatStateUpdateDelayMs = 0,
   chatSurfaceValue = "chatgpt",
-  workSurfaceValue = "work"
+  workSurfaceValue = "work",
+  workChecked = null
 } = {}) {
+  const initialWorkSelected = workChecked ?? surface === "work";
   const setSurface = (selected) => {
     const chatSelected = selected === "chat" || selected === "chatgpt";
     chat.setAttribute("aria-checked", String(chatSelected));
@@ -258,8 +260,8 @@ function appendChatSurfaceToggle(body, {
   const work = new FakeElement("button", {
     role: "radio",
     "data-tpp-toggle-value": workSurfaceValue,
-    "aria-checked": String(surface === "work"),
-    "data-state": surface === "work" ? "on" : "off",
+    "aria-checked": String(initialWorkSelected),
+    "data-state": initialWorkSelected ? "on" : "off",
     class: "box-border flex h-full w-full items-center justify-center rounded-[inherit] py-2 text-sm transition-colors duration-150 motion-reduce:transition-none ps-9 pe-11",
     onClick: () => {
       setSurface("work");
@@ -2420,6 +2422,14 @@ for (const testCase of [
     mainOpens: 1
   },
   {
+    name: "fails closed when Chat and Work are both marked selected",
+    fixture: { surface: "chat", workChecked: true, chatClickUpdates: false },
+    selectionOptions: { model_selection_timeout_ms: 30, model_selection_interval_ms: 5 },
+    expected: { status: "unavailable", failure_reason: "chat_surface_selection_mismatch" },
+    surface: { chatChecked: "true", workChecked: "true", chatClicked: true },
+    mainOpens: 0
+  },
+  {
     name: "re-reads a delayed Chat surface toggle settle",
     fixture: { surface: "work", chatStateUpdateDelayMs: 100 },
     selectionOptions: { model_selection_timeout_ms: 500, model_selection_interval_ms: 5 },
@@ -2687,6 +2697,20 @@ test("opacity-0 hybrid surface classifies via structural aria-controls trust", a
   assert.equal(result.picker_shape, "slider");
   assert.equal(result.surface_trust, "aria_controls_structural");
   assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+});
+
+test("GPT-5.6 Sol ignores a controlled picker below a closed ancestor", async () => {
+  const fixture = makeSolSliderFixture({
+    backgroundFrozen: true,
+    closedAncestor: true,
+    keyboardMode: "end"
+  });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, intervalMs: 25 });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_picker_open_failed");
+  assert.deepEqual(fixture.keyAttempts(), []);
 });
 
 test("GPT-5.6 Sol picker closes a hover submenu before the final neutral click", async () => {
@@ -2981,6 +3005,20 @@ test("GPT-5.6 Sol personal picker does not rediscover a mounted closed Radix wra
   assert.equal(fixture.wrapperMounted(), true);
   assert.equal(fixture.nestedMenuState(), "closed");
   assert.equal(modelSelectionDiagnostics(fixture.doc).picker_shape, null);
+});
+
+test("GPT-5.6 Sol ignores a personal picker below a closed ancestor", async () => {
+  const fixture = makePersonalPickerFixture({
+    wrappedRadix: true,
+    startsOpen: true,
+    closedAncestor: true
+  });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, intervalMs: 25 });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_picker_open_failed");
+  assert.equal(fixture.keyAttempts().length, 0);
 });
 
 test("GPT-5.6 Sol Advanced picker waits for an expanded Radix surface to finish animating", async () => {
@@ -3433,7 +3471,8 @@ function makeSolPickerFixture({
   chatClickUpdates = true,
   chatStateUpdateDelayMs = 0,
   chatSurfaceValue = "chatgpt",
-  workSurfaceValue = "work"
+  workSurfaceValue = "work",
+  workChecked = null
 }) {
   let currentFamily = family;
   let currentEffort = effort;
@@ -3454,7 +3493,8 @@ function makeSolPickerFixture({
       chatClickUpdates,
       chatStateUpdateDelayMs,
       chatSurfaceValue,
-      workSurfaceValue
+      workSurfaceValue,
+      workChecked
     })
     : { chat: null, work: null, group: null, track: null };
   if (transcriptPickerDecoy) {
@@ -3809,11 +3849,13 @@ function makeSolSliderFixture({
   familyValueAttributes = {},
   familyMenuChecked = null,
   pillFamilyLabel = "5.6 Sol",
-  pillEffortLabel = null
+  pillEffortLabel = null,
+  closedAncestor = false
 } = {}) {
   let currentFamily = familyLabel;
   let currentValue = initialValue;
   let panel = null;
+  let panelMount = null;
   let effortSlider = null;
   let effortLabel = null;
   let pointerAttemptCount = 0;
@@ -3839,8 +3881,10 @@ function makeSolSliderFixture({
   const closePanel = () => {
     revealGeneration += 1;
     if (!panel) return;
-    body.children = body.children.filter((child) => child !== panel);
-    panel.parentElement = null;
+    const mountedPanel = panelMount ?? panel;
+    body.children = body.children.filter((child) => child !== mountedPanel);
+    mountedPanel.parentElement = null;
+    panelMount = null;
     panel = null;
     if (familyMenu) {
       body.children = body.children.filter((child) => child !== familyMenu);
@@ -4020,7 +4064,12 @@ function makeSolSliderFixture({
         effortSlider = null;
       }
     }
-    body.append(panel);
+    if (closedAncestor) {
+      panelMount = new FakeElement("div", { "data-state": "closed" }).append(panel);
+      body.append(panelMount);
+    } else {
+      body.append(panel);
+    }
     pill.setAttribute("aria-expanded", "true");
     pill.setAttribute("data-state", "open");
     if (animatedReveal && !backgroundFrozen) {
@@ -4074,9 +4123,11 @@ function makePersonalPickerFixture({
   effortOptions = null,
   pillFamilyLabel = "5.6 Sol",
   pillEffortLabel = null,
-  familyMenuChecked = true
+  familyMenuChecked = true,
+  closedAncestor = false
 } = {}) {
   let panel = null;
+  let panelMount = null;
   let menuNode = null;
   let currentValue = 2;
   let currentEffort = effort;
@@ -4132,8 +4183,10 @@ function makePersonalPickerFixture({
     closeEffortMenu();
     closeFamilyMenu();
     if (!panel) return;
-    body.children = body.children.filter((child) => child !== panel);
-    panel.parentElement = null;
+    const mountedPanel = panelMount ?? panel;
+    body.children = body.children.filter((child) => child !== mountedPanel);
+    mountedPanel.parentElement = null;
+    panelMount = null;
     panel = null;
     menuNode = null;
   };
@@ -4255,7 +4308,12 @@ function makePersonalPickerFixture({
       menuNode.setAttribute("id", "personal-picker");
       panel = menuNode;
     }
-    body.append(panel);
+    if (closedAncestor) {
+      panelMount = new FakeElement("div", { "data-state": "closed" }).append(panel);
+      body.append(panelMount);
+    } else {
+      body.append(panel);
+    }
     pill.setAttribute("aria-expanded", "true");
     pill.setAttribute("data-state", "open");
   };

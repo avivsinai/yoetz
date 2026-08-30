@@ -401,10 +401,13 @@ async () => {{
 {visibility_helpers}
 
   function surfaceControls() {{
-    const group = document.querySelector('[role="radiogroup"][aria-label="Select chat surface"]');
-    const chat = group?.querySelector('[role="radio"][data-tpp-toggle-value="chatgpt"]');
-    const work = group?.querySelector('[role="radio"][data-tpp-toggle-value="work"]');
-    return chat && work ? {{ group, chat, work }} : null;
+    for (const group of Array.from(document.querySelectorAll('[role="radiogroup"][aria-label="Select chat surface"]'))) {{
+      if (!isVisible(group)) continue;
+      const chat = group.querySelector('[role="radio"][data-tpp-toggle-value="chatgpt"]');
+      const work = group.querySelector('[role="radio"][data-tpp-toggle-value="work"]');
+      if (chat && work) return {{ group, chat, work }};
+    }}
+    return null;
   }}
 
   function surfaceState(node) {{
@@ -412,6 +415,12 @@ async () => {{
       ariaChecked: node?.getAttribute("aria-checked") || null,
       dataState: node?.getAttribute("data-state") || null
     }};
+  }}
+
+  function surfaceSelectionIsChat(controls) {{
+    const chat = surfaceState(controls?.chat);
+    const work = surfaceState(controls?.work);
+    return chat.ariaChecked === "true" && work.ariaChecked === "false";
   }}
 
   function surfaceObservedValues() {{
@@ -440,7 +449,7 @@ async () => {{
         observedValues
       }};
     }}
-    if (state.ariaChecked === "true") {{
+    if (surfaceSelectionIsChat(controls)) {{
       return {{
         ok: true,
         elapsedMs: Date.now() - startedAt,
@@ -459,7 +468,7 @@ async () => {{
       const verified = surfaceControls();
       state = surfaceState(verified?.chat);
       observedValues = surfaceObservedValues();
-      if (state.ariaChecked === "true") {{
+      if (surfaceSelectionIsChat(verified)) {{
         return {{
           ok: true,
           elapsedMs: Date.now() - startedAt,
@@ -562,7 +571,7 @@ async () => {{
     let current = node;
     while (current) {{
       const state = current.getAttribute?.("data-state");
-      if (state === "open" || state === "closed") return state === "open";
+      if (state === "closed") return false;
       current = current.parentElement;
     }}
     return true;
@@ -1831,6 +1840,9 @@ mod tests {
             .find("let familyProof = await readFamilyProof(state);")
             .expect("generated picker includes family selection logic");
         assert!(surface_guard < family_picker);
+        assert!(script.contains("function surfaceSelectionIsChat(controls)"));
+        assert!(script.contains("work.ariaChecked === \"false\""));
+        assert!(script.contains("if (!isVisible(group)) continue;"));
         assert!(script.contains("pickerSurfaceIsOpen(menu)"));
         assert!(script.contains("state === \"closed\""));
         assert!(script.contains("const SURFACE_SETTLE_TIMEOUT_MS = 1000;"));
