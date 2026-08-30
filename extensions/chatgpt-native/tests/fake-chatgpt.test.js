@@ -2636,6 +2636,16 @@ test("hybrid simple-view slider with inline Sol/5.5 radios selects verified Pro"
   assert.equal(findModelButton(fixture.doc), fixture.pill);
 });
 
+test("hybrid simple-view ignores a retained closed menu after Pro verification", async () => {
+  const fixture = makeHybridSimpleViewFixture({ retainMountedMenu: true });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.picker_close_verification.picker_surface_closed, true);
+  assert.equal(modelSelectionDiagnostics(fixture.doc).picker_shape, null);
+});
+
 test("hybrid slider fails closed when the closed pill stays Thinking effort", async () => {
   const fixture = makeHybridSimpleViewFixture({ relabelOnClose: false });
   const result = await configureModelState(fixture.doc, {});
@@ -3640,7 +3650,8 @@ function makeHybridSimpleViewFixture({
   sliderMax = 5,
   opacity = "1",
   startsOpen = false,
-  relabelOnClose = true
+  relabelOnClose = true,
+  retainMountedMenu = false
 } = {}) {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
@@ -3654,6 +3665,16 @@ function makeHybridSimpleViewFixture({
   const valueText = () => `${sliderLabel}, ${ordinal()} of ${total}.`;
   const closeMenu = () => {
     if (!menu) return;
+    if (retainMountedMenu) {
+      menu.setAttribute("data-state", "closed");
+      pill.setAttribute("aria-expanded", "false");
+      pill.setAttribute("data-state", "closed");
+      if (relabelOnClose) {
+        pill.innerText = sliderLabel;
+        pill.textContent = sliderLabel;
+      }
+      return;
+    }
     body.children = body.children.filter((child) => child !== menu);
     menu.parentElement = null;
     menu = null;
