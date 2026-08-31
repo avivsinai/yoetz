@@ -7,6 +7,7 @@ import {
   confirmGenerationStopped,
   ensureConversationLoaded,
   ensureFreshChat,
+  ensureChatSurface,
   extractResponse,
   findModelButton,
   insertPrompt,
@@ -14,6 +15,8 @@ import {
   modelSelectionDiagnostics,
   resetModelSelectionState,
   sendAcceptanceBaseline,
+  verifyChatgptModelSelectionBeforeSend,
+  verifyChatSurface,
   uploadFile,
   waitForSendAccepted
 } from "../src/chatgpt-dom.js";
@@ -124,6 +127,9 @@ class FakeElement {
   }
 
   getBoundingClientRect() {
+    if (this.attrs.zeroLayout) {
+      return { left: 10, top: 20, width: 0, height: 0, right: 10, bottom: 20 };
+    }
     return { left: 10, top: 20, width: 200, height: 20, right: 210, bottom: 40 };
   }
 
@@ -2330,7 +2336,7 @@ test("clickSend rejects conversation drift immediately before clicking send", as
     (error) => {
       assert.equal(error.code, "conversation_changed");
       assert.equal(error.phase, "send");
-      assert.equal(error.side_effect_started, false);
+      assert.equal(error.side_effect_started, true);
       assert.equal(error.requested_conversation_id, "conv-123");
       assert.equal(error.current_conversation_id, "other");
       return true;
@@ -2351,6 +2357,52 @@ test("clickSend waits for a visible ChatGPT send control to become enabled", asy
 
   await clickSend(doc, { timeoutMs: 250, intervalMs: 10 });
   assert.equal(send.clicked, true);
+});
+
+test("clickSend runs the final guard before clicking the current send control", async () => {
+  const composer = new FakeElement("div", { id: "prompt-textarea", role: "textbox" }, "Review this");
+  const send = new FakeElement("button", { "aria-label": "Send prompt" }, "");
+  const replacement = new FakeElement("button", { "aria-label": "Send prompt" }, "");
+  const body = new FakeElement("body", {}, "Review this").append(composer, send);
+  const doc = new FakeDocument(body);
+  let guardCalls = 0;
+
+  await clickSend(doc, {
+    timeoutMs: 250,
+    intervalMs: 10,
+    beforeClick: async () => {
+      guardCalls += 1;
+      send.hidden = true;
+      body.append(replacement);
+    }
+  });
+
+  assert.equal(guardCalls, 1);
+  assert.equal(send.clicked, false);
+  assert.equal(replacement.clicked, true);
+});
+
+test("clickSend rejects a surface flip between async guard and the click", async () => {
+  const composer = new FakeElement("div", { id: "prompt-textarea", role: "textbox" }, "Review this");
+  const send = new FakeElement("button", { "aria-label": "Send prompt" }, "");
+  const body = new FakeElement("body", {}, "Review this").append(composer, send);
+  const doc = new FakeDocument(body);
+  let surface = "chat";
+
+  await assert.rejects(
+    () => clickSend(doc, {
+      timeoutMs: 250,
+      intervalMs: 10,
+      beforeClick: async () => {
+        queueMicrotask(() => { surface = "work"; });
+      },
+      verifyBeforeClick: () => {
+        if (surface !== "chat") throw new Error("surface changed before send click");
+      }
+    }),
+    /surface changed before send click/
+  );
+  assert.equal(send.clicked, false);
 });
 
 test("waitForSendAccepted requires a post-click conversation signal", async () => {
@@ -2419,7 +2471,7 @@ for (const testCase of [
     fixture: { surface: "work" },
     expected: { status: "selected", model_used: "GPT-5.6 Sol Pro" },
     surface: { chatChecked: "true", workChecked: "false", chatClicked: true },
-    mainOpens: 1
+    mainOpens: 2
   },
   {
     name: "fails closed when Chat and Work are both marked selected",
@@ -2489,6 +2541,378 @@ for (const testCase of [
   });
 }
 
+test("ChatGPT model selection accepts an absent surface toggle only with Chat composer proof", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    includeChatSurface: false
+  });
+  fixture.composer.setAttribute("aria-label", "Chat with ChatGPT");
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.deepEqual(result.surface_observed_values, []);
+  assert.equal(fixture.mainOpens(), 2);
+});
+
+test("ChatGPT model selection does not use composer proof when the surface group is hidden", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  fixture.surface.group.hidden = true;
+  fixture.composer.setAttribute("aria-label", "Chat with ChatGPT");
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable", JSON.stringify(result));
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(result.surface_evidence_seen, true);
+  assert.deepEqual(result.surface_observed_values, []);
+  assert.equal(fixture.mainOpens(), 0);
+});
+
+test("ChatGPT model selection does not hide a Work surface behind composer proof", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    surface: "work"
+  });
+  fixture.surface.group.hidden = true;
+  fixture.composer.setAttribute("aria-label", "Chat with ChatGPT");
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable", JSON.stringify(result));
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(result.surface_evidence_seen, true);
+  assert.equal(fixture.mainOpens(), 0);
+});
+
+test("ChatGPT model selection waits for late surface controls before implicit proof", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    includeChatSurface: false
+  });
+  fixture.composer.setAttribute("aria-label", "Chat with ChatGPT");
+  setTimeout(() => appendChatSurfaceToggle(fixture.doc.body), 100);
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 1500,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.deepEqual(result.surface_observed_values, ["chatgpt", "work"]);
+  assert.equal(fixture.mainOpens(), 2);
+});
+
+test("ChatGPT model selection still fails closed when an absent surface toggle has no Chat proof", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    includeChatSurface: false
+  });
+  fixture.composer.setAttribute("aria-label", "Work with ChatGPT");
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(fixture.mainOpens(), 0);
+});
+
+test("ChatGPT model selection accepts a layoutless surface wrapper with visible Chat and Work radios", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  fixture.surface.group.attrs.zeroLayout = true;
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(fixture.surface.chat.getAttribute("aria-checked"), "true");
+  assert.equal(fixture.surface.work.getAttribute("aria-checked"), "false");
+});
+
+test("ChatGPT model selection accepts an interactive surface inside a pointer-events-none wrapper", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  const interactive = new FakeElement("div", { style: "pointer-events:auto" }).append(fixture.surface.group);
+  const wrapper = new FakeElement("div", { style: "pointer-events:none" }).append(interactive);
+  fixture.doc.body.children = fixture.doc.body.children.filter((child) => child !== fixture.surface.group);
+  fixture.doc.body.append(wrapper);
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+});
+
+test("ChatGPT model selection ignores a hidden duplicate surface group", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  fixture.surface.group.hidden = true;
+  const visible = appendChatSurfaceToggle(fixture.doc.body);
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(visible.chat.getAttribute("aria-checked"), "true");
+  assert.deepEqual(result.surface_observed_values, ["chatgpt", "work"]);
+});
+
+test("ChatGPT model selection does not fall back after surface evidence disappears", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro", surface: "work" });
+  fixture.composer.setAttribute("aria-label", "Chat with ChatGPT");
+  const originalChatClick = fixture.surface.chat.onClick;
+  fixture.surface.chat.onClick = () => {
+    originalChatClick?.();
+    fixture.surface.group.hidden = true;
+  };
+
+  const result = await ensureChatSurface(fixture.doc, { timeoutMs: 40, intervalMs: 5 });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_selection_mismatch");
+  assert.equal(fixture.surface.chat.clicked, true);
+});
+
+test("ChatGPT final surface guard accepts stable explicit Chat without clicking", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+
+  const result = await ensureChatSurface(fixture.doc, {
+    timeoutMs: 100,
+    intervalMs: 5,
+    selectChat: false
+  });
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.surface_evidence_seen, true);
+  assert.equal(fixture.surface.chat.clicked, false);
+});
+
+test("ChatGPT final surface guard rejects explicit Work without composer fallback", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    surface: "work"
+  });
+  fixture.composer.setAttribute("aria-label", "Chat with ChatGPT");
+
+  const result = await ensureChatSurface(fixture.doc, {
+    timeoutMs: 100,
+    intervalMs: 5,
+    selectChat: false
+  });
+
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(result.failure_reason, "chat_surface_selection_mismatch");
+  assert.equal(result.surface_evidence_seen, true);
+  assert.equal(fixture.surface.chat.clicked, false);
+});
+
+test("ChatGPT final model proof rejects effort drift before send", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  const selection = await configureModelState(fixture.doc, {});
+
+  assert.equal(selection.status, "selected", JSON.stringify(selection));
+  assert.equal(selection.post_close_family_status, "verified");
+  assert.equal(selection.post_close_effort_status, "verified");
+  assert.equal(
+    verifyChatgptModelSelectionBeforeSend(fixture.doc, selection).ok,
+    true
+  );
+
+  fixture.pill.innerText = "High";
+  fixture.pill.textContent = "High";
+  const drift = verifyChatgptModelSelectionBeforeSend(fixture.doc, selection);
+  assert.equal(drift.ok, false, JSON.stringify(drift));
+  assert.equal(drift.failure_reason, "effort_composer_pill_unverified");
+});
+
+test("verifyChatSurface does not downgrade explicit evidence after controls disappear", () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  fixture.surface.group.hidden = true;
+  fixture.composer.setAttribute("aria-label", "Chat with ChatGPT");
+
+  const result = verifyChatSurface(fixture.doc, { surfaceEvidenceSeen: true });
+
+  assert.equal(result.ok, false, JSON.stringify(result));
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(result.surface_evidence_seen, true);
+});
+
+test("clickSend uses the real Chat surface guards before sending explicit Chat", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  const send = new FakeElement("button", {
+    "data-testid": "send-button",
+    "aria-label": "Send prompt"
+  }, "Send");
+  fixture.composer.parentElement.append(send);
+  let surfaceEvidenceSeen = false;
+
+  await clickSend(fixture.doc, {
+    timeoutMs: 100,
+    intervalMs: 5,
+    minTimeoutMs: 0,
+    requiredStableTicks: 1,
+    beforeClick: async () => {
+      const result = await ensureChatSurface(fixture.doc, {
+        timeoutMs: 100,
+        intervalMs: 5,
+        selectChat: false,
+        surfaceEvidenceSeen
+      });
+      assert.equal(result.ok, true, JSON.stringify(result));
+      surfaceEvidenceSeen = surfaceEvidenceSeen || result.surface_evidence_seen === true;
+    },
+    verifyBeforeClick: () => {
+      const result = verifyChatSurface(fixture.doc, { surfaceEvidenceSeen });
+      assert.equal(result.ok, true, JSON.stringify(result));
+    }
+  });
+
+  assert.equal(send.clicked, true);
+});
+
+test("ChatGPT menu selection rejects a closed pill that does not confirm Pro", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "High",
+    pillLabelAfterSelection: "High"
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable", JSON.stringify(result));
+  assert.equal(result.failure_reason, "effort_composer_pill_unverified");
+  assert.equal(result.picker_close_verification.closed_pill_pro, false);
+});
+
+test("ChatGPT model selection rejects an incomplete visible group beside a complete group", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  const incomplete = appendChatSurfaceToggle(fixture.doc.body);
+  incomplete.chat.attrs.zeroLayout = true;
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(fixture.mainOpens(), 0);
+});
+
+test("verifyChatSurface rejects a visible orphan surface toggle", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  fixture.doc.body.append(new FakeElement("button", {
+    role: "radio",
+    "data-tpp-toggle-value": "work",
+    "aria-checked": "false"
+  }, "Work"));
+
+  const result = verifyChatSurface(fixture.doc);
+
+  assert.equal(result.ok, false);
+  assert.deepEqual(result.observed_values, ["chatgpt", "work"]);
+});
+
+test("ChatGPT model selection fails closed on contradictory visible surface groups", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  appendChatSurfaceToggle(fixture.doc.body, { surface: "work" });
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(fixture.mainOpens(), 0);
+});
+
+test("ChatGPT model selection fails closed on duplicate visible Chat radios", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  fixture.surface.group.append(new FakeElement("button", {
+    role: "radio",
+    "data-tpp-toggle-value": "chatgpt",
+    "aria-checked": "true",
+    "data-state": "on"
+  }, "Chat"));
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(fixture.mainOpens(), 0);
+});
+
+test("ChatGPT model selection rejects zero-area surface radios", async () => {
+  const fixture = makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" });
+  fixture.surface.chat.attrs.zeroLayout = true;
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(fixture.mainOpens(), 0);
+});
+
+test("ChatGPT model selection rejects implicit proof with any toggle evidence", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    includeChatSurface: false
+  });
+  fixture.composer.setAttribute("aria-label", "Chat with ChatGPT");
+  fixture.doc.body.append(new FakeElement("button", {
+    role: "radio",
+    "data-tpp-toggle-value": "work",
+    "aria-checked": "true"
+  }, "Work"));
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(fixture.mainOpens(), 0);
+});
+
+test("ChatGPT model selection requires the exact implicit Chat composer label", async () => {
+  const fixture = makeSolPickerFixture({
+    family: "GPT-5.6 Sol",
+    effort: "Pro",
+    includeChatSurface: false
+  });
+  fixture.composer.setAttribute("aria-label", " chat with chatgpt ");
+
+  const result = await configureModelState(fixture.doc, {
+    model_selection_timeout_ms: 30,
+    model_selection_interval_ms: 5
+  });
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+  assert.equal(fixture.mainOpens(), 0);
+});
+
 for (const testCase of [
   {
     name: "rejects checked GPT-5.5 Pro Extended as stale",
@@ -2522,7 +2946,7 @@ for (const testCase of [
     options: { family: "GPT-5.6 Sol", effort: "Pro" },
     familyClicks: 0,
     effortClicks: 0,
-    mainOpens: 1,
+    mainOpens: 2,
     availableFamilies: [
       "GPT-5.6 Sol",
       "GPT-5.5",
@@ -2542,7 +2966,7 @@ for (const testCase of [
     name: "ignores transcript text that describes the Advanced picker",
     options: { family: "GPT-5.6 Sol", effort: "High", transcriptPickerDecoy: true },
     pickerShape: "menu",
-    mainOpens: 2,
+    mainOpens: 3,
     effortClicks: 1
   }
 ]) {
@@ -2643,7 +3067,19 @@ test("hybrid simple-view slider with inline Sol/5.5 radios selects verified Pro"
   assert.equal(result.closed_pill_text, "Pro");
   assert.equal(result.closed_pill_effort_status, "verified");
   assert.equal(result.closed_pill_family_status, "skipped");
+  assert.equal(result.post_close_family_status, "verified");
+  assert.equal(result.post_close_effort_status, "verified");
   assert.equal(findModelButton(fixture.doc), fixture.pill);
+});
+
+test("hybrid simple-view activates Select model before reading an inert family panel", async () => {
+  const fixture = makeHybridSimpleViewFixture({ familyViewInitiallyActive: false });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+  assert.equal(fixture.viewToggleClicks() > 0, true);
 });
 
 test("hybrid simple-view ignores a retained closed menu after Pro verification", async () => {
@@ -3457,6 +3893,25 @@ test("current model strategy waits briefly for the pill and reads it without pic
   assert.equal(pill.clicked, false);
 });
 
+test("current model strategy does not require a Chat surface control", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  composer.setAttribute("aria-label", "Chat with ChatGPT");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask anything").append(form);
+  const doc = new FakeDocument(body);
+  const pill = new FakeElement("button", { "aria-haspopup": "menu", class: "__composer-pill" }, "Pro");
+  form.append(pill);
+
+  const result = await configureModelState(doc, { model_strategy: "current" });
+
+  assert.equal(result.status, "current");
+  assert.equal(result.model_used, "Pro");
+  assert.equal(result.surface_state.aria_checked, null);
+  assert.ok(result.surface_attempts >= 2);
+  assert.equal(pill.events.length, 0);
+  assert.equal(pill.clicked, false);
+});
+
 function makeSolPickerFixture({
   family,
   effort,
@@ -3472,7 +3927,8 @@ function makeSolPickerFixture({
   chatStateUpdateDelayMs = 0,
   chatSurfaceValue = "chatgpt",
   workSurfaceValue = "work",
-  workChecked = null
+  workChecked = null,
+  pillLabelAfterSelection = null
 }) {
   let currentFamily = family;
   let currentEffort = effort;
@@ -3521,6 +3977,9 @@ function makeSolPickerFixture({
   const updatePill = (remount = false) => {
     const pillEffort = currentEffort === "Pro Extended" ? "Pro" : currentEffort;
     const label = currentFamily === "GPT-5.6 Sol" ? pillEffort : `5.5\n${pillEffort}`;
+    const displayedLabel = pillLabelAfterSelection && currentEffort === "Pro"
+      ? pillLabelAfterSelection
+      : label;
     if (remount && remountPillOnSelection) {
       const previousPill = pill;
       pill = createPill();
@@ -3532,8 +3991,8 @@ function makeSolPickerFixture({
       previousPill.onPointerDown = undefined;
       previousPill.onKeyDown = undefined;
     }
-    pill.innerText = label;
-    pill.textContent = label;
+    pill.innerText = displayedLabel;
+    pill.textContent = displayedLabel;
   };
   const effortLabels = () => ["Instant\n5.5", "Medium", "High", "Extra High", "Pro"];
   const openFamilyMenu = () => {
@@ -3637,6 +4096,7 @@ function makeSolPickerFixture({
   return {
     doc,
     pill,
+    composer,
     mainOpens: () => mainOpenCount,
     familyClicks: () => familyClickCount,
     effortClicks: () => effortClickCount,
@@ -3691,7 +4151,8 @@ function makeHybridSimpleViewFixture({
   opacity = "1",
   startsOpen = false,
   relabelOnClose = true,
-  retainMountedMenu = false
+  retainMountedMenu = false,
+  familyViewInitiallyActive = true
 } = {}) {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
@@ -3700,6 +4161,7 @@ function makeHybridSimpleViewFixture({
   let menu = null;
   let currentFamily = family;
   let currentNow = sliderNow;
+  let viewToggleClicks = 0;
   const ordinal = () => currentNow - sliderMin + 1;
   const total = sliderMax - sliderMin + 1;
   const valueText = () => `${sliderLabel}, ${ordinal()} of ${total}.`;
@@ -3726,7 +4188,12 @@ function makeHybridSimpleViewFixture({
     }
   };
   const openMenu = () => {
-    if (menu) return;
+    if (menu?.getAttribute("data-state") === "open") return;
+    if (menu) {
+      body.children = body.children.filter((child) => child !== menu);
+      menu.parentElement = null;
+      menu = null;
+    }
     const slider = new FakeElement("span", {
       role: "slider",
       "aria-hidden": "true",
@@ -3751,14 +4218,27 @@ function makeHybridSimpleViewFixture({
       control,
       new FakeElement("div", {}, "Use Left and Right arrow keys to adjust power.")
     );
+    const familyView = new FakeElement("div", {
+      "data-testid": "composer-model-picker-slider-advanced-view",
+      ...(familyViewInitiallyActive ? {} : { inert: "" })
+    });
+    simple.append(new FakeElement("div", {
+      role: "menuitem",
+      "aria-label": "Select model",
+      tabindex: "0",
+      onPointerDown: () => {
+        viewToggleClicks += 1;
+        delete familyView.attrs.inert;
+      }
+    }, "Pro"));
     menu = new FakeElement("div", {
       id: "hybrid-simple-menu",
       role: "menu",
       "data-state": "open",
       style: `opacity:${opacity}`
-    }).append(simple);
+    }).append(simple, familyView);
     for (const radioLabel of families) {
-      menu.append(new FakeElement("div", {
+      familyView.append(new FakeElement("div", {
         role: "menuitemradio",
         "aria-checked": String(radioLabel === currentFamily),
         onClick: () => {
@@ -3790,7 +4270,7 @@ function makeHybridSimpleViewFixture({
   composer.onPointerDown = closeMenu;
   const doc = new FakeDocument(body);
   if (startsOpen) openMenu();
-  return { doc, pill, openMenu, closeMenu };
+  return { doc, pill, openMenu, closeMenu, viewToggleClicks: () => viewToggleClicks };
 }
 
 function makeOpacityZeroLeftoverFixture() {

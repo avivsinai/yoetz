@@ -35,7 +35,7 @@ pub mod client;
 pub mod chatgpt;
 pub mod claude;
 
-use crate::chatgpt_web;
+use crate::{chatgpt_recipe, chatgpt_web};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -79,6 +79,10 @@ pub struct DevtoolsMcpRecipeContext {
     /// ChatGPT model slug to select.
     pub model: String,
 
+    /// Model selection policy. ChatGPT uses this for both the initial check and
+    /// the final proof that is bound to the send click.
+    pub model_strategy: chatgpt_recipe::ChatgptModelStrategy,
+
     /// User prompt to send alongside the bundle.
     pub prompt: String,
 
@@ -114,6 +118,7 @@ impl Default for DevtoolsMcpRecipeContext {
             bundle_path: None,
             bundle_text: None,
             model: String::new(),
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             prompt: String::new(),
             browser_context_id: None,
             profile_email: None,

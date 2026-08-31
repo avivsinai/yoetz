@@ -3,8 +3,7 @@ export const OWNERSHIP_ATTR = "data-yoetz-chatgpt-native-job";
 const DEFAULT_WAIT_TIMEOUT_MS = 15000;
 const DEFAULT_WAIT_INTERVAL_MS = 250;
 const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
-const DEFAULT_SURFACE_SETTLE_TIMEOUT_MS = 1000;
-const DEFAULT_SURFACE_SETTLE_INTERVAL_MS = 50;
+const MIN_IMPLICIT_SURFACE_ABSENCE_MS = 1500;
 const CHATGPT_SOL_CHAT_PRO_MODEL = "gpt-5-6-sol-chat-pro";
 const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
 const CHAT_SURFACE_GROUP_SELECTOR = '[role="radiogroup"][aria-label="Select chat surface"]';
@@ -378,7 +377,9 @@ export async function configureModelState(root, job = {}) {
     return {
       status: "unavailable",
       model_used: null,
-      requested_model: CHATGPT_SOL_CHAT_PRO_MODEL,
+      requested_model: modelSelectionStrategyForJob(job) === "current"
+        ? "current"
+        : CHATGPT_SOL_CHAT_PRO_MODEL,
       available_options: [],
       available_families: [],
       family_status: "unverified",
@@ -394,9 +395,22 @@ export async function configureModelState(root, job = {}) {
       ...surfaceResultFields(surface)
     };
   }
+
   if (modelSelectionStrategyForJob(job) === "current") {
     const modelButton = await waitForModelButton(root, { timeoutMs: 1500, intervalMs: 250 });
     const pillText = modelControlLabel(modelButton);
+    if (!modelButton || !pillText) {
+      return {
+        status: "unavailable",
+        model_used: null,
+        requested_model: "current",
+        family_status: "skipped",
+        effort_status: "skipped",
+        failure_reason: "current_model_pill_not_found",
+        warning: "ChatGPT current model pill was not visible",
+        ...surfaceResultFields(surface)
+      };
+    }
     return {
       status: "current",
       model_used: pillText ?? "",
@@ -448,6 +462,14 @@ export async function configureModelState(root, job = {}) {
     closed_pill_family_status: selection.closed_pill_family_status ?? "skipped",
     closed_pill_effort_status: selection.closed_pill_effort_status ?? "skipped",
     closed_pill_text: selection.closed_pill_text ?? selection.pill_text ?? null,
+    post_close_family_status: selection.post_close_family_status ?? "skipped",
+    post_close_effort_status: selection.post_close_effort_status ?? "skipped",
+    post_close_picker_shape: selection.post_close_picker_shape ?? null,
+    post_close_picker_close_verification: selection.post_close_picker_close_verification ?? null,
+    post_close_closed_pill_family_status: selection.post_close_closed_pill_family_status ?? null,
+    post_close_closed_pill_effort_status: selection.post_close_closed_pill_effort_status ?? null,
+    post_close_closed_pill_text: selection.post_close_closed_pill_text ?? null,
+    post_close_failure_reason: selection.post_close_failure_reason ?? null,
     failure_reason: selection.failure_reason ?? null,
     picker_shape: selection.picker_shape ?? null,
     surface_trust: selection.surface_trust ?? null,
@@ -471,44 +493,69 @@ export async function configureModelState(root, job = {}) {
   };
 }
 
-async function ensureChatSurface(root, options = {}) {
+export async function ensureChatSurface(root, options = {}) {
   const timing = surfaceTiming(options);
   const startedAt = Date.now();
   let attempts = 0;
   let observedValues = [];
+  let state = surfaceSelectionState(null);
+  let clicked = false;
+  let stableProof = null;
+  let stableObservations = 0;
+  let surfaceEvidenceSeen = options.surfaceEvidenceSeen === true;
   while (Date.now() - startedAt < timing.timeoutMs) {
     attempts += 1;
     const controls = findChatSurfaceControls(root);
     observedValues = observedSurfaceToggleValues(root);
-    if (controls) {
-      const state = surfaceSelectionState(controls.chat);
-      if (surfaceSelectionIsChat(controls)) {
-        return {
-          ok: true,
-          elapsed_ms: Math.max(0, Date.now() - startedAt),
-          attempts,
-          timeout_ms: timing.timeoutMs,
-          interval_ms: timing.intervalMs,
-          settle_timeout_ms: timing.settleTimeoutMs,
-          settle_interval_ms: timing.settleIntervalMs,
-          verification_attempts: 0,
-          state,
-          observed_values: observedValues
-        };
-      }
-
-      realClick(controls.chat);
-      const verification = await waitForChatSurfaceSelection(root, timing, startedAt);
+    const visibleSurfaceToggleCount = visibleSurfaceToggleNodes(root).length;
+    surfaceEvidenceSeen = surfaceEvidenceSeen || surfaceEvidencePresent(root);
+    state = surfaceSelectionState(controls?.chat);
+    const implicitProofReady = Date.now() - startedAt >= MIN_IMPLICIT_SURFACE_ABSENCE_MS;
+    const proof = controls && surfaceSelectionIsChat(controls)
+      && visibleSurfaceToggleCount === 2
+      ? "controls"
+      : !controls && !surfaceEvidenceSeen && implicitProofReady && implicitChatSurfaceProof(root, observedValues)
+        ? "composer_aria"
+        : null;
+    if (proof === stableProof) {
+      stableObservations += 1;
+    } else {
+      stableProof = proof;
+      stableObservations = proof ? 1 : 0;
+    }
+    if (proof && stableObservations >= 2) {
       return {
-        ...verification,
-        failure_reason: verification.ok ? undefined : "chat_surface_selection_mismatch",
-        warning: verification.ok ? undefined : "ChatGPT Chat surface could not be verified after selection",
+        ok: true,
         elapsed_ms: Math.max(0, Date.now() - startedAt),
-        attempts: attempts + verification.attempts,
+        attempts,
         timeout_ms: timing.timeoutMs,
         interval_ms: timing.intervalMs,
-        observed_values: verification.observed_values ?? observedValues
+        verification_attempts: Math.max(0, attempts - 1),
+        state,
+        observed_values: observedValues,
+        surface_evidence_seen: surfaceEvidenceSeen
       };
+    }
+    if (options.selectChat === false && surfaceEvidenceSeen && !proof) {
+      return {
+        ok: false,
+        failure_reason: "chat_surface_selection_mismatch",
+        warning: "ChatGPT Chat surface was not selected before send",
+        elapsed_ms: Math.max(0, Date.now() - startedAt),
+        attempts,
+        timeout_ms: timing.timeoutMs,
+        interval_ms: timing.intervalMs,
+        verification_attempts: Math.max(0, attempts - 1),
+        state,
+        observed_values: observedValues,
+        surface_evidence_seen: surfaceEvidenceSeen
+      };
+    }
+    if (controls && !surfaceSelectionIsChat(controls) && !clicked) {
+      realClick(controls.chat);
+      clicked = true;
+      stableProof = null;
+      stableObservations = 0;
     }
     const remainingMs = timing.timeoutMs - (Date.now() - startedAt);
     if (remainingMs <= 0) break;
@@ -516,17 +563,18 @@ async function ensureChatSurface(root, options = {}) {
   }
   return {
     ok: false,
-    failure_reason: "chat_surface_control_not_found",
-    warning: 'ChatGPT Chat surface toggle not found or could not be read',
+    failure_reason: clicked ? "chat_surface_selection_mismatch" : "chat_surface_control_not_found",
+    warning: clicked
+      ? "ChatGPT Chat surface could not be verified after selection"
+      : 'ChatGPT Chat surface toggle not found or could not be read',
     elapsed_ms: Math.max(0, Date.now() - startedAt),
     attempts,
     timeout_ms: timing.timeoutMs,
     interval_ms: timing.intervalMs,
-    settle_timeout_ms: timing.settleTimeoutMs,
-    settle_interval_ms: timing.settleIntervalMs,
-    verification_attempts: 0,
-    state: surfaceSelectionState(null),
-    observed_values: observedValues
+    verification_attempts: Math.max(0, attempts - 1),
+    state,
+    observed_values: observedValues,
+    surface_evidence_seen: surfaceEvidenceSeen
   };
 }
 
@@ -569,6 +617,9 @@ export async function resetModelSelectionState(root) {
 
 function modelSelectionOptionsForJob(job = {}) {
   const options = {};
+  if (job?.surface_evidence_seen === true) {
+    options.surfaceEvidenceSeen = true;
+  }
   const timeoutMs = Number(job?.model_selection_timeout_ms);
   if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
     options.timeoutMs = timeoutMs;
@@ -583,9 +634,7 @@ function modelSelectionOptionsForJob(job = {}) {
 function surfaceTiming(options = {}) {
   return {
     timeoutMs: positiveMs(options.timeoutMs, 30000),
-    intervalMs: positiveMs(options.intervalMs, 250),
-    settleTimeoutMs: positiveMs(options.settleTimeoutMs, DEFAULT_SURFACE_SETTLE_TIMEOUT_MS),
-    settleIntervalMs: positiveMs(options.settleIntervalMs, DEFAULT_SURFACE_SETTLE_INTERVAL_MS)
+    intervalMs: positiveMs(options.intervalMs, 250)
   };
 }
 
@@ -595,23 +644,60 @@ function positiveMs(value, fallback) {
 }
 
 function findChatSurfaceControls(root) {
-  for (const group of Array.from(root?.querySelectorAll?.(CHAT_SURFACE_GROUP_SELECTOR) ?? [])) {
-    if (!isVisible(group, { allowDisabled: true })) continue;
-    const chat = group.querySelector(CHAT_SURFACE_CHAT_SELECTOR);
-    const work = group.querySelector(CHAT_SURFACE_WORK_SELECTOR);
-    if (chat && work) return { group, chat, work };
+  const candidates = [];
+  for (const group of visibleSurfaceGroups(root)) {
+    const chats = Array.from(group.querySelectorAll(CHAT_SURFACE_CHAT_SELECTOR))
+      .filter((node) => isVisibleSurfaceRadio(node));
+    const works = Array.from(group.querySelectorAll(CHAT_SURFACE_WORK_SELECTOR))
+      .filter((node) => isVisibleSurfaceRadio(node));
+    if (chats.length !== 1 || works.length !== 1) {
+      return null;
+    }
+    candidates.push({ group, chat: chats[0], work: works[0] });
   }
-  return null;
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+function visibleSurfaceGroups(root) {
+  return Array.from(root?.querySelectorAll?.(CHAT_SURFACE_GROUP_SELECTOR) ?? [])
+    .filter((group) => isVisible(group, { allowDisabled: true, allowNoLayout: true }));
+}
+
+function surfaceEvidencePresent(root) {
+  return (root?.querySelectorAll?.(CHAT_SURFACE_GROUP_SELECTOR)?.length ?? 0) > 0
+    || (root?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]')?.length ?? 0) > 0;
+}
+
+function visibleSurfaceToggleNodes(root) {
+  return Array.from(root?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]') ?? [])
+    .filter((node) => isVisibleSurfaceRadio(node));
 }
 
 function observedSurfaceToggleValues(root) {
-  const group = root?.querySelector?.(CHAT_SURFACE_GROUP_SELECTOR);
-  const scope = group ?? root;
-  return Array.from(scope?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]') ?? [])
+  return visibleSurfaceToggleNodes(root)
     .map((node) => node?.getAttribute?.("data-tpp-toggle-value"))
     .filter(Boolean)
     .filter((value, index, values) => values.indexOf(value) === index)
     .slice(0, 10);
+}
+
+function implicitChatSurfaceProof(root, observedValues) {
+  if (observedValues.length > 0
+    || surfaceEvidencePresent(root)) {
+    return false;
+  }
+  const composer = findComposer(root);
+  return composer?.getAttribute?.("aria-label") === "Chat with ChatGPT";
+}
+
+function hasPositiveLayout(element) {
+  const rect = element?.getBoundingClientRect?.();
+  return Number(rect?.width) > 0 && Number(rect?.height) > 0;
+}
+
+function isVisibleSurfaceRadio(element) {
+  return isVisible(element, { allowDisabled: true, allowNoLayout: true })
+    && hasPositiveLayout(element);
 }
 
 function surfaceSelectionState(node) {
@@ -627,43 +713,132 @@ function surfaceSelectionIsChat(controls) {
   return chat.aria_checked === "true" && work.aria_checked === "false";
 }
 
-async function waitForChatSurfaceSelection(root, timing, startedAt) {
-  const settleStartedAt = Date.now();
-  const remainingSelectionMs = Math.max(1, timing.timeoutMs - (settleStartedAt - startedAt));
-  const settleTimeoutMs = Math.min(timing.settleTimeoutMs, remainingSelectionMs);
-  let attempts = 0;
-  let controls = null;
-  let state = surfaceSelectionState(null);
-  let observedValues = [];
-  while (Date.now() - settleStartedAt < settleTimeoutMs) {
-    attempts += 1;
-    controls = findChatSurfaceControls(root);
-    state = surfaceSelectionState(controls?.chat);
-    observedValues = observedSurfaceToggleValues(root);
-    if (surfaceSelectionIsChat(controls)) {
-      return {
-        ok: true,
-        ...controls,
-        attempts,
-        verification_attempts: attempts,
-        state,
-        settle_timeout_ms: timing.settleTimeoutMs,
-        settle_interval_ms: timing.settleIntervalMs,
-        observed_values: observedValues
-      };
-    }
-    const remainingMs = settleTimeoutMs - (Date.now() - settleStartedAt);
-    if (remainingMs <= 0) break;
-    await sleep(Math.min(timing.settleIntervalMs, remainingMs));
+function surfaceProofFields(controls, visibleSurfaceToggleCount, composer, proofKind) {
+  return {
+    surface_proof_kind: proofKind,
+    surface_chat_state: controls ? surfaceSelectionState(controls.chat) : null,
+    surface_work_state: controls ? surfaceSelectionState(controls.work) : null,
+    surface_visible_toggle_count: visibleSurfaceToggleCount,
+    surface_composer_aria: proofKind === "implicit_chat_composer_aria"
+      ? composer?.getAttribute?.("aria-label") ?? null
+      : null
+  };
+}
+
+export function verifyChatSurface(root = document, options = {}) {
+  const controls = findChatSurfaceControls(root);
+  const observedValues = observedSurfaceToggleValues(root);
+  const visibleSurfaceToggleCount = visibleSurfaceToggleNodes(root).length;
+  const surfaceEvidenceSeen = options.surfaceEvidenceSeen === true
+    || surfaceEvidencePresent(root);
+  const controlsReady = Boolean(
+    controls
+    && visibleSurfaceToggleCount === 2
+    && surfaceSelectionIsChat(controls)
+  );
+  const composer = findComposer(root);
+  const implicitReady = !controls
+    && !surfaceEvidenceSeen
+    && visibleSurfaceGroups(root).length === 0
+    && observedValues.length === 0
+    && composer?.getAttribute?.("aria-label") === "Chat with ChatGPT";
+  const proofKind = controlsReady
+    ? "explicit_chat_work_radios"
+    : implicitReady
+      ? "implicit_chat_composer_aria"
+      : null;
+  const proofFields = surfaceProofFields(controls, visibleSurfaceToggleCount, composer, proofKind);
+  if (controlsReady || implicitReady) {
+    return {
+      ok: true,
+      state: surfaceSelectionState(controls?.chat),
+      observed_values: observedValues,
+      surface_evidence_seen: surfaceEvidenceSeen,
+      ...proofFields
+    };
   }
   return {
     ok: false,
-    attempts,
-    verification_attempts: attempts,
-    state,
-    settle_timeout_ms: timing.settleTimeoutMs,
-    settle_interval_ms: timing.settleIntervalMs,
-    observed_values: observedValues
+    failure_reason: controls ? "chat_surface_selection_mismatch" : "chat_surface_control_not_found",
+    state: surfaceSelectionState(controls?.chat),
+    observed_values: observedValues,
+    surface_evidence_seen: surfaceEvidenceSeen,
+    ...proofFields
+  };
+}
+
+export function verifyChatgptModelSelectionBeforeSend(root = document, selection = {}) {
+  const surface = verifyChatSurface(root, {
+    surfaceEvidenceSeen: selection.surface_evidence_seen === true
+  });
+  const modelButton = findModelButton(root);
+  const pillText = modelControlLabel(modelButton);
+  const pickerOpen = Boolean(findPickerState(root))
+    || openComposerPickerLeftovers(root).some((leftover) => leftoverSurfaceIsOpen(root, leftover.trigger));
+  const currentFamilyStatus = pillHasModelFamilyToken(pillText)
+    ? pillConfirmsFamilyLabel(pillText, selection.family_label)
+      ? "verified"
+      : "unverified"
+    : "skipped";
+  const currentEffortStatus = pillConfirmsEffortLabel(pillText, "Pro") ? "verified" : "unverified";
+  const supportedShape = isSupportedPickerShape({ shape: selection.picker_shape });
+  const familyCorroborated = selection.closed_pill_family_status === "verified"
+    || selection.post_close_family_status === "verified";
+  const closeVerification = selection.picker_close_verification;
+  const selectedProofFieldsReady = selection.status === "selected"
+    && selection.requested_model === CHATGPT_SOL_CHAT_PRO_MODEL
+    && selection.model_used === "GPT-5.6 Sol Pro"
+    && selection.family_status === "verified"
+    && selection.effort_status === "verified"
+    && selection.picker_family_status === "verified"
+    && selection.picker_effort_status === "verified"
+    && supportedShape
+    && familyCorroborated
+    && selection.closed_pill_effort_status === "verified"
+    && selection.post_close_family_status !== "unverified"
+    && selection.post_close_effort_status !== "unverified"
+    && closeVerification?.picker_surface_closed === true
+    && closeVerification?.model_trigger_closed === true
+    && closeVerification?.family_trigger_closed === true
+    && closeVerification?.closed_pill_pro === true;
+  const currentProofFieldsReady = selection.status === "current"
+    && selection.requested_model === "current"
+    && selection.family_status === "skipped"
+    && selection.effort_status === "skipped"
+    && Boolean(pillText);
+  const currentStrategy = currentProofFieldsReady;
+  const proofFieldsReady = selectedProofFieldsReady || currentProofFieldsReady;
+  const ok = surface.ok
+    && proofFieldsReady
+    && !pickerOpen
+    && (currentStrategy || currentFamilyStatus !== "unverified")
+    && (currentStrategy || currentEffortStatus === "verified");
+  return {
+    ok,
+    failure_reason: ok
+      ? null
+      : !surface.ok
+        ? "chat_surface_selection_mismatch"
+        : pickerOpen
+          ? "model_picker_open"
+          : currentEffortStatus !== "verified"
+            ? "effort_composer_pill_unverified"
+            : !currentStrategy && currentFamilyStatus === "unverified"
+              ? "family_composer_pill_unverified"
+              : "model_selection_proof_incomplete",
+    surface_evidence_seen: selection.surface_evidence_seen === true || surface.surface_evidence_seen === true,
+    surface_state: surface.state ?? selection.surface_state ?? null,
+    surface_observed_values: surface.observed_values ?? selection.surface_observed_values ?? [],
+    surface_proof_kind: surface.surface_proof_kind ?? selection.surface_proof_kind ?? null,
+    surface_chat_state: surface.surface_chat_state ?? selection.surface_chat_state ?? null,
+    surface_work_state: surface.surface_work_state ?? selection.surface_work_state ?? null,
+    surface_visible_toggle_count: surface.surface_visible_toggle_count ?? selection.surface_visible_toggle_count ?? 0,
+    surface_composer_aria: surface.surface_composer_aria ?? selection.surface_composer_aria ?? null,
+    picker_shape: selection.picker_shape ?? null,
+    current_closed_pill_text: pillText || null,
+    current_closed_pill_family_status: currentFamilyStatus,
+    current_closed_pill_effort_status: currentEffortStatus,
+    picker_open: pickerOpen
   };
 }
 
@@ -673,7 +848,13 @@ function surfaceResultFields(surface) {
     surface_attempts: surface?.attempts ?? 0,
     surface_verification_attempts: surface?.verification_attempts ?? 0,
     surface_state: surface?.state ?? surfaceSelectionState(null),
-    surface_observed_values: surface?.observed_values ?? []
+    surface_observed_values: surface?.observed_values ?? [],
+    surface_evidence_seen: surface?.surface_evidence_seen === true,
+    surface_proof_kind: surface?.surface_proof_kind ?? null,
+    surface_chat_state: surface?.surface_chat_state ?? null,
+    surface_work_state: surface?.surface_work_state ?? null,
+    surface_visible_toggle_count: surface?.surface_visible_toggle_count ?? 0,
+    surface_composer_aria: surface?.surface_composer_aria ?? null
   };
 }
 
@@ -785,6 +966,10 @@ async function selectSolChatProModel(root, options = {}) {
     closed_pill_family_status: "skipped",
     closed_pill_effort_status: "skipped",
     closed_pill_text: null,
+    post_close_family_status: "skipped",
+    post_close_effort_status: "skipped",
+    post_close_picker_shape: null,
+    post_close_picker_close_verification: null,
     picker_shape: null,
     effort_control: null,
     effort_move_method: null,
@@ -830,6 +1015,17 @@ async function selectSolChatProModel(root, options = {}) {
       warning: "ChatGPT GPT-5.6 model picker did not open"
     };
   }
+  if (!isSupportedPickerShape(state)) {
+    await closeModelPicker(root, modelButton);
+    return selectionFailure(
+      base,
+      modelButton,
+      state,
+      availableFamilies,
+      "ChatGPT model picker exposed an unsupported shape; refusing unverified model selection",
+      "model_picker_shape_unsupported"
+    );
+  }
   let familyProof = await readCheckedSolFamily(root, state, options);
   availableFamilies = familyProof.available_families;
   if (!familyProof.ok) {
@@ -848,6 +1044,9 @@ async function selectSolChatProModel(root, options = {}) {
     }
     realClick(familyProof.sol_option);
     await sleep(Number(options.actionSettleMs ?? 250));
+    if (!await closeModelPicker(root, modelButton)) {
+      return selectionFailure(base, modelButton, familyProof.state, availableFamilies, "ChatGPT model picker did not close after selecting GPT-5.6 Sol", "model_picker_close_failed");
+    }
     modelButton = await waitForModelButton(root, options);
     if (!modelButton) {
       return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol", "model_family_remount_failed");
@@ -855,6 +1054,10 @@ async function selectSolChatProModel(root, options = {}) {
     state = await openAndReadModelPicker(root, modelButton, options);
     if (!state) {
       return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting GPT-5.6 Sol", "model_picker_reopen_failed");
+    }
+    if (!isSupportedPickerShape(state)) {
+      await closeModelPicker(root, modelButton);
+      return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker exposed an unsupported shape after selecting GPT-5.6 Sol; refusing unverified model selection", "model_picker_shape_unsupported");
     }
     familyProof = await readCheckedSolFamily(root, state, options);
     availableFamilies = familyProof.available_families;
@@ -902,6 +1105,10 @@ async function selectSolChatProModel(root, options = {}) {
       if (!state) {
         return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting Pro effort", "model_picker_reopen_failed");
       }
+      if (!isSupportedPickerShape(state)) {
+        await closeModelPicker(root, modelButton);
+        return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker exposed an unsupported shape after selecting Pro effort; refusing unverified model selection", "model_picker_shape_unsupported");
+      }
     }
   }
 
@@ -921,35 +1128,62 @@ async function selectSolChatProModel(root, options = {}) {
   const closeResult = await closeModelPickerResult(root, modelButton, state, { requireProPill: true });
   state.picker_close_method = closeResult.method;
   state.picker_close_verification = closeResult.verification;
-  const closedPillOnlyFailure = closeResult.verification.picker_surface_closed
-    && closeResult.verification.family_trigger_closed
-    && !closeResult.verification.closed_pill_pro;
-  if (!closeResult.ok && !closedPillOnlyFailure) {
-    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open after verification", "model_picker_close_failed");
+  if (!closeResult.ok) {
+    if (closeResult.verification?.picker_surface_closed
+      && closeResult.verification?.model_trigger_closed
+      && closeResult.verification?.family_trigger_closed
+      && closeResult.verification?.closed_pill_pro === false) {
+      return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", { closedPill: true });
+    }
+    return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT model picker remained open or closed composer model pill failed verification", "model_picker_close_failed");
   }
   modelButton = await waitForModelButton(root, options);
   const pillText = modelControlLabel(modelButton);
   const verifiedEffortLabel = pickerVerifiedEffortLabel(state);
   const closedPill = closedPillDiagnostics(pillText, state);
-  if ((state.shape === "slider" || state.shape === "personal")
-    && closedPill.closed_pill_family_status === "unverified") {
+  if (closedPill.closed_pill_family_status === "unverified") {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill reported another model family after closing the picker", "family_composer_pill_unverified", { closedPill: true });
   }
-  if ((state.shape === "slider" || state.shape === "personal")
-    && closedPill.closed_pill_effort_status !== "verified") {
+  if (closedPill.closed_pill_effort_status !== "verified") {
     return selectionFailure(base, modelButton, state, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", { closedPill: true });
   }
+  let postClose = {
+    post_close_family_status: "skipped",
+    post_close_effort_status: "skipped",
+    post_close_picker_shape: null,
+    post_close_picker_close_verification: null
+  };
+  if (closedPill.closed_pill_family_status === "skipped") {
+    postClose = await reverifyModelSelectionAfterClose(root, modelButton, options);
+    if (!postClose.ok) {
+      return selectionFailure(
+        base,
+        modelButton,
+        state,
+        availableFamilies,
+        "ChatGPT model family was not independently re-read after the closed composer pill omitted it",
+        "post_close_model_reverification_failed",
+        { closedPill: true, postClose }
+      );
+    }
+  }
+  const pickerFamilyStatus = familyVerified ? "verified" : "unverified";
+  const pickerEffortStatus = effortVerified ? "verified" : "unverified";
+  const familyStatus = closedPill.closed_pill_family_status === "skipped"
+    ? combinedVerificationStatus(pickerFamilyStatus, postClose.post_close_family_status)
+    : combinedVerificationStatus(pickerFamilyStatus, closedPill.closed_pill_family_status);
   const warnings = [];
 
   return {
     status: "selected",
     model_used: `${normalizeText(state.family_label)} ${verifiedEffortLabel}`,
     failure_reason: null,
-    family_status: "verified",
-    effort_status: "verified",
-    picker_family_status: "verified",
-    picker_effort_status: "verified",
+    family_status: familyStatus,
+    effort_status: combinedVerificationStatus(pickerEffortStatus, closedPill.closed_pill_effort_status),
+    picker_family_status: pickerFamilyStatus,
+    picker_effort_status: pickerEffortStatus,
     ...closedPill,
+    ...postClose,
     picker_shape: state.shape,
     surface_trust: state.surface_trust,
     effort_control: effortControlDiagnostics(state),
@@ -1024,7 +1258,8 @@ async function openFamilyPicker(root, mainMenu, trigger, options = {}) {
     return null;
   }
   const opened = () => findFamilySubmenu(root, mainMenu)
-    ?? structurallyOpenControlledSurfaceForTrigger(root, trigger);
+    ?? activeFamilyView(root, mainMenu, trigger)
+    ?? (isSelectModelViewToggle(trigger) ? null : structurallyOpenControlledSurfaceForTrigger(root, trigger));
   const settleMs = Number(options.settleMs ?? 150);
   for (const activate of [openWithHoverEvents, openWithPointerEvents, pressEnter, pressSpace]) {
     try {
@@ -1039,7 +1274,8 @@ async function openFamilyPicker(root, mainMenu, trigger, options = {}) {
 }
 
 async function readCheckedSolFamily(root, state, options = {}) {
-  const inline = familyMenuRadios(state?.surface ?? state?.menu, true);
+  const surface = state?.surface ?? state?.menu;
+  const inline = familyMenuRadios(surface, true);
   if (inline.length > 0) {
     const checkedItems = inline.filter((item) => itemIsChecked(item));
     const availableFamilies = inline.map((item) => textOf(item)).filter(Boolean);
@@ -1059,8 +1295,11 @@ async function readCheckedSolFamily(root, state, options = {}) {
     };
   }
   const familyMenu = await openFamilyPicker(root, state?.menu ?? state?.surface, state?.family_trigger, options);
-  const structurallyTrusted = familyMenu === structurallyOpenControlledSurfaceForTrigger(root, state?.family_trigger);
-  const items = familyMenuRadios(familyMenu, structurallyTrusted);
+  const controlledSurface = structurallyOpenControlledSurfaceForTrigger(root, state?.family_trigger);
+  const activeView = activeFamilyView(root, state?.menu ?? state?.surface, state?.family_trigger);
+  const familyMenuStructurallyTrusted = familyMenu === controlledSurface
+    || (state?.surface_trust === "aria_controls_structural" && familyMenu === activeView);
+  const items = familyMenuRadios(familyMenu, familyMenuStructurallyTrusted);
   const checkedItems = items.filter((item) => item.getAttribute?.("aria-checked") === "true");
   const availableFamilies = items.map((item) => textOf(item)).filter(Boolean);
   const checkedLabel = checkedItems.length === 1 ? normalizeText(textOf(checkedItems[0])) : "";
@@ -1077,6 +1316,22 @@ async function readCheckedSolFamily(root, state, options = {}) {
     checked_items: checkedItems,
     available_families: availableFamilies
   };
+}
+
+function isSelectModelViewToggle(node) {
+  return node?.getAttribute?.("role") === "menuitem"
+    && normalizeText(node.getAttribute?.("aria-label") ?? "").toLowerCase() === "select model";
+}
+
+function activeFamilyView(root, mainMenu, trigger) {
+  if (!isSelectModelViewToggle(trigger)) return null;
+  const surface = mainMenu ?? findPickerState(root)?.surface;
+  const advancedViews = Array.from(surface?.querySelectorAll?.(
+    '[data-testid="composer-model-picker-slider-advanced-view"]'
+  ) ?? []);
+  const activeAdvancedView = advancedViews.find((view) => familyMenuRadios(view, true).length > 0);
+  if (activeAdvancedView) return activeAdvancedView;
+  return familyMenuRadios(surface, true).length > 0 ? surface : null;
 }
 
 async function openWithHoverEvents(element, isOpen, options = {}) {
@@ -1225,6 +1480,54 @@ async function closeModelPickerResult(root, modelButton, state = null, options =
   };
 }
 
+async function reverifyModelSelectionAfterClose(root, modelButton, options = {}) {
+  const reopenedButton = await waitForModelButton(root, options);
+  if (!reopenedButton) {
+    return {
+      ok: false,
+      post_close_family_status: "unverified",
+      post_close_effort_status: "unverified",
+      post_close_picker_shape: null,
+      post_close_picker_close_verification: null,
+      post_close_failure_reason: "model_control_not_found"
+    };
+  }
+  const state = await openAndReadModelPicker(root, reopenedButton, options);
+  if (!state || !isSupportedPickerShape(state)) {
+    if (state) await closeModelPicker(root, reopenedButton);
+    return {
+      ok: false,
+      post_close_family_status: "unverified",
+      post_close_effort_status: "unverified",
+      post_close_picker_shape: state?.shape ?? null,
+      post_close_picker_close_verification: null,
+      post_close_failure_reason: state ? "model_picker_shape_unsupported" : "model_picker_reopen_failed"
+    };
+  }
+  const familyProof = await readCheckedSolFamily(root, state, options);
+  const verifiedState = familyProof.state ?? state;
+  const familyStatus = familyProof.ok ? "verified" : "unverified";
+  const effortStatus = effortIsChatProTier(verifiedState) ? "verified" : "unverified";
+  const close = await closeModelPickerResult(root, reopenedButton, verifiedState, { requireProPill: true });
+  const closedButton = await waitForModelButton(root, options);
+  const closedPill = closedPillDiagnostics(modelControlLabel(closedButton), verifiedState);
+  return {
+    ok: familyStatus === "verified"
+      && effortStatus === "verified"
+      && close.ok
+      && closedPill.closed_pill_effort_status === "verified"
+      && closedPill.closed_pill_family_status !== "unverified",
+    post_close_family_status: familyStatus,
+    post_close_effort_status: effortStatus,
+    post_close_picker_shape: verifiedState.shape,
+    post_close_picker_close_verification: close.verification,
+    post_close_closed_pill_family_status: closedPill.closed_pill_family_status,
+    post_close_closed_pill_effort_status: closedPill.closed_pill_effort_status,
+    post_close_closed_pill_text: closedPill.closed_pill_text,
+    post_close_failure_reason: null
+  };
+}
+
 async function waitForPickerClose(root, modelButton, state, options) {
   let verification = pickerCloseVerification(root, modelButton, state, options);
   const settleMs = Number(options.closeSettleMs ?? 50);
@@ -1309,12 +1612,38 @@ async function waitForPickerState(root, options = {}) {
   const timeoutMs = Number(options.pickerTimeoutMs ?? 3000);
   const intervalMs = Number(options.intervalMs ?? 100);
   const startedAt = Date.now();
+  let lastState = null;
   while (Date.now() - startedAt < timeoutMs) {
     const state = findPickerState(root);
-    if (state) return state;
+    if (state) lastState = state;
+    if (state && pickerStateIsReady(state)) return state;
     await sleep(intervalMs);
   }
-  return null;
+  return lastState;
+}
+
+function pickerStateIsReady(state) {
+  const surface = state?.surface ?? state?.menu;
+  if (!surface) return false;
+  if (state?.shape === "slider") {
+    const familyItems = familyMenuRadios(surface, state.surface_trust === "aria_controls_structural");
+    const familyTrigger = state.family_trigger
+      && (isVisible(state.family_trigger, { allowDisabled: true })
+        || (state.surface_trust === "aria_controls_structural"
+          && structurallyReadablePickerItem(state.family_trigger, surface)))
+      ? state.family_trigger
+      : null;
+    if (familyItems.length === 0 && !familyTrigger) return false;
+  }
+  const style = surface.ownerDocument?.defaultView?.getComputedStyle?.(surface);
+  if (style?.opacity !== "0") return true;
+  if (state?.surface_trust !== "aria_controls_structural") return false;
+  const familyItems = familyMenuRadios(surface, true);
+  const familyTrigger = state.family_trigger
+    && structurallyReadablePickerItem(state.family_trigger, surface)
+    ? state.family_trigger
+    : null;
+  return familyItems.length > 0 || Boolean(familyTrigger);
 }
 
 function findPickerState(root) {
@@ -1482,9 +1811,9 @@ async function selectPersonalChatProEffort(root, initialState, options = {}) {
   realClick(initialState.effort_row);
   await sleep(settleMs);
   let state = findPickerState(root) ?? initialState;
-  // Inspect the opened Effort submenu ladder before selecting.
-  const submenuItems = Array.from(root.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
-    .filter((item) => !/^effort\b/i.test(normalizeText(textOf(item))));
+  const effortMenu = personalEffortMenu(root, initialState);
+  const submenuItems = Array.from(effortMenu?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
+    .filter((item) => isVisible(item));
   const proOption = submenuItems.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === "pro");
   if (!proOption) return { ok: false, state, method: null };
   realClick(proOption);
@@ -1493,13 +1822,25 @@ async function selectPersonalChatProEffort(root, initialState, options = {}) {
   return { ok: effortIsChatProTier(state), state, method: "effort_row_select" };
 }
 
+function personalEffortMenu(root, state) {
+  const personalSurface = state?.surface ?? null;
+  const candidates = Array.from(root?.querySelectorAll?.('[role="menu"], [role="dialog"]') ?? [])
+    .filter((surface) => surface !== personalSurface
+      && pickerSurfaceIsOpen(surface)
+      && isVisible(surface, { allowDisabled: true })
+      && Array.from(surface.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
+        .some((item) => isVisible(item) && foldedModelText(textOf(item)).replace(/\s+/g, " ") === "pro"));
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
 async function waitForFamilyMenu(root, mainMenu, trigger, options = {}) {
   const timeoutMs = Number(options.pickerTimeoutMs ?? 3000);
   const intervalMs = Number(options.intervalMs ?? 100);
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
     const menu = findFamilySubmenu(root, mainMenu)
-      ?? structurallyOpenControlledSurfaceForTrigger(root, trigger);
+      ?? activeFamilyView(root, mainMenu, trigger)
+      ?? (isSelectModelViewToggle(trigger) ? null : structurallyOpenControlledSurfaceForTrigger(root, trigger));
     if (menu) return menu;
     await sleep(intervalMs);
   }
@@ -1586,6 +1927,10 @@ function readSliderPickerState(root, structurallyTrustedSurface = null) {
   }
   let familyEvidence = null;
   const familyTrigger = Array.from(surface.querySelectorAll('[role="menuitem"], button'))
+    .find((item) => isSelectModelViewToggle(item)
+      && (isVisible(item, { allowDisabled: true })
+        || (structurallyTrusted && structurallyReadablePickerItem(item, surface))))
+    ?? Array.from(surface.querySelectorAll('[role="menuitem"], button'))
     .find((item) => {
       const evidence = structurallyTrusted ? structuralFamilyEvidence(item) : null;
       const label = evidence?.label ?? normalizeText(textOf(item));
@@ -1672,7 +2017,29 @@ function findAdvancedPickerSurface(root) {
 
 function menuRadioItems(menu, structurallyTrusted = false) {
   return Array.from(menu?.querySelectorAll?.('[role="menuitemradio"]') ?? [])
-    .filter((item) => structurallyTrusted || isVisible(item));
+    .filter((item) => pickerSurfaceIsOpen(item)
+      && (isVisible(item) || (structurallyTrusted && structurallyReadablePickerItem(item, menu))));
+}
+
+function structurallyReadablePickerItem(item, surface) {
+  let current = item;
+  while (current) {
+    if (current.hidden
+      || current.getAttribute?.("hidden") != null
+      || current.getAttribute?.("aria-hidden") === "true"
+      || current.getAttribute?.("inert") != null) {
+      return false;
+    }
+    const style = current.ownerDocument?.defaultView?.getComputedStyle?.(current);
+    if (style && (style.visibility === "hidden"
+      || style.display === "none"
+      || style.contentVisibility === "hidden")) {
+      return false;
+    }
+    if (current === surface) break;
+    current = current.parentElement;
+  }
+  return true;
 }
 
 function familyMenuRadios(menu, structurallyTrusted = false) {
@@ -1690,6 +2057,10 @@ function effortIsChatProTier(state) {
   const items = state?.effort_items ?? [];
   const checked = items.find((item) => itemIsChecked(item));
   return foldedModelText(textOf(checked)) === "pro";
+}
+
+function isSupportedPickerShape(state) {
+  return state?.shape === "menu" || state?.shape === "slider" || state?.shape === "personal";
 }
 
 function pillConfirmsEffortLabel(pillText, effortLabel) {
@@ -1954,8 +2325,8 @@ function effortDiagnostics(items) {
 }
 
 function selectionFailure(base, modelButton, state, availableFamilies, warning, failureReason, options = {}) {
-  const pickerFamily = familyIsSol(state?.family_label) ? "verified" : "unverified";
-  const pickerEffort = effortIsChatProTier(state) ? "verified" : "unverified";
+  const pickerFamily = isSupportedPickerShape(state) && familyIsSol(state?.family_label) ? "verified" : "unverified";
+  const pickerEffort = isSupportedPickerShape(state) && effortIsChatProTier(state) ? "verified" : "unverified";
   const pillText = modelControlLabel(modelButton);
   const closedPill = options.closedPill
     ? closedPillDiagnostics(pillText, state)
@@ -1972,6 +2343,7 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     family_status: combinedVerificationStatus(pickerFamily, closedPill.closed_pill_family_status),
     effort_status: combinedVerificationStatus(pickerEffort, closedPill.closed_pill_effort_status),
     ...closedPill,
+    ...(options.postClose ?? {}),
     picker_shape: state?.shape ?? null,
     surface_trust: state?.surface_trust ?? null,
     surface_descendants: state?.surface_trust === "aria_controls_structural"
@@ -2101,7 +2473,15 @@ export async function clickSend(root, options = {}) {
       enabledTicks += 1;
       if (enabledTicks >= requiredStableTicks) {
         assertExpectedConversationBeforeSendClick(root, options.expectedConversationId);
-        button.click();
+        await options.beforeClick?.();
+        options.verifyBeforeClick?.();
+        assertExpectedConversationBeforeSendClick(root, options.expectedConversationId);
+        const verifiedButton = findSendButtonControl(root, { requireEnabled: true });
+        if (!verifiedButton) {
+          enabledTicks = 0;
+          continue;
+        }
+        verifiedButton.click();
         return true;
       }
     } else {
@@ -2134,7 +2514,7 @@ function assertExpectedConversationBeforeSendClick(root, expectedConversationId)
     `ChatGPT conversation changed before send click; expected ${expected}, current ${currentConversationId ?? "(none)"}`,
     {
       phase: "send",
-      side_effect_started: false,
+      side_effect_started: true,
       requested_conversation_id: expected,
       current_conversation_id: currentConversationId,
       current_url: currentLocationForError(win),
@@ -3664,6 +4044,7 @@ export function modelSelectionDiagnostics(root = document) {
     requested_model: CHATGPT_SOL_CHAT_PRO_MODEL,
     current_model_label: modelControlLabel(modelButton),
     current_matches_requested: Boolean(familyIsSol(state?.family_label) && effortIsChatProTier(state)),
+    surface_groups: chatSurfaceDiagnostics(root),
     family_status: familyIsSol(state?.family_label) ? "verified" : "unverified",
     effort_status: effortIsChatProTier(state) ? "verified" : "unverified",
     family_label: state?.family_label ?? null,
@@ -3690,6 +4071,46 @@ export function modelSelectionDiagnostics(root = document) {
     legacy_picker: visibleLegacyPickerMarkers(root).slice(0, 10),
     composer: elementSummary(findComposer(root)),
     model_control_scopes: modelControlScopes(root).slice(0, 5).map(elementSummary)
+  };
+}
+
+function chatSurfaceDiagnostics(root) {
+  return Array.from(root?.querySelectorAll?.(CHAT_SURFACE_GROUP_SELECTOR) ?? [])
+    .slice(0, 10)
+    .map((group) => ({
+      group: surfaceVisibilityDiagnostics(group, { allowNoLayout: true }),
+      chat: surfaceNodeDiagnostics(group, CHAT_SURFACE_CHAT_SELECTOR),
+      work: surfaceNodeDiagnostics(group, CHAT_SURFACE_WORK_SELECTOR)
+    }));
+}
+
+function surfaceNodeDiagnostics(group, selector) {
+  return Array.from(group?.querySelectorAll?.(selector) ?? [])
+    .slice(0, 10)
+    .map((node) => surfaceVisibilityDiagnostics(node));
+}
+
+function surfaceVisibilityDiagnostics(node, options = {}) {
+  const rect = node?.getBoundingClientRect?.();
+  const style = node?.ownerDocument?.defaultView?.getComputedStyle?.(node);
+  const ancestors = pickerAncestorDiagnostics(node);
+  return {
+    visible: isVisible(node, { allowDisabled: true, ...options }),
+    positive_layout: hasPositiveLayout(node),
+    hidden: Boolean(node?.hidden),
+    aria_hidden: node?.getAttribute?.("aria-hidden") ?? null,
+    inert: node?.getAttribute?.("inert") != null,
+    aria_checked: node?.getAttribute?.("aria-checked") ?? null,
+    data_state: node?.getAttribute?.("data-state") ?? null,
+    width: Number(rect?.width) || 0,
+    height: Number(rect?.height) || 0,
+    display: style?.display ?? null,
+    visibility: style?.visibility ?? null,
+    opacity: style?.opacity ?? null,
+    pointer_events: style?.pointerEvents ?? null,
+    content_visibility: style?.contentVisibility ?? null,
+    ancestor_chain: ancestors,
+    first_non_rendered_ancestor: ancestors.find((ancestor) => ancestor.non_rendered) ?? null
   };
 }
 
@@ -3752,6 +4173,9 @@ function pickerAncestorDiagnostics(node) {
       tag: current.tagName?.toLowerCase?.() ?? "element",
       id: String(current.getAttribute?.("id") ?? "").slice(0, 120),
       class: String(current.getAttribute?.("class") ?? "").slice(0, 160),
+      hidden: Boolean(current.hidden),
+      aria_hidden: current.getAttribute?.("aria-hidden") ?? null,
+      inert: current.getAttribute?.("inert") != null,
       display,
       visibility,
       content_visibility: contentVisibility,
@@ -3898,12 +4322,16 @@ function isVisible(element, options = {}) {
     if (style && (
       style.visibility === "hidden"
       || style.display === "none"
+      || style.contentVisibility === "hidden"
       || (!options.allowTransparent && style.opacity === "0")
-      || (!options.allowPointerEventsNone && style.pointerEvents === "none")
     )) {
       return false;
     }
     current = current.parentElement;
+  }
+  const elementStyle = element.ownerDocument?.defaultView?.getComputedStyle?.(element);
+  if (!options.allowPointerEventsNone && elementStyle?.pointerEvents === "none") {
+    return false;
   }
   if (!options.allowNoLayout && typeof element.getClientRects === "function" && element.getClientRects().length === 0) {
     return false;

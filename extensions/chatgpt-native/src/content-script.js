@@ -4,6 +4,23 @@ const siteAdapterModules = Object.freeze({
   chatgpt: "src/sites/chatgpt.js",
   claude: "src/sites/claude.js"
 });
+// This literal is stamped by the release script. A content script already injected into an open
+// tab keeps its old source after an extension reload, so the live manifest version alone is not a
+// reliable freshness check.
+const CONTENT_SCRIPT_BUILD = "0.5.62";
+const NATIVE_JOB_COMMANDS_CAPABILITY = "native_job_commands_v1";
+const CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY = "chatgpt_click_bound_send_receipt_v1";
+const CONTENT_SCRIPT_INSTANCE_ID = `cs_${cryptoRandomId()}`;
+const SECURE_CONTENT_SCRIPT_COMMANDS = new Set([
+  "yoetz_prepare_job",
+  "yoetz_bind_job",
+  "yoetz_upload_file",
+  "yoetz_configure_model",
+  "yoetz_send_prompt",
+  "yoetz_extract_response",
+  "yoetz_fetch_conversation",
+  "yoetz_cancel_send"
+]);
 const LIFECYCLE_RETRY_ATTEMPTS = 3;
 const LIFECYCLE_RETRY_DELAY_MS = 250;
 
@@ -56,6 +73,11 @@ async function notifyPersistedLifecycle(event) {
 }
 
 async function handleMessage(message) {
+  if (message?.type === "yoetz_secure_command") {
+    assertContentScriptContract(message);
+    const payload = message.payload;
+    message = { ...payload, type: message.command };
+  }
   switch (message?.type) {
     case "yoetz_prepare_job":
       return prepareJob(message.job);
@@ -86,6 +108,88 @@ async function handleMessage(message) {
     default:
       throw new Error(`unknown content-script command ${message?.type}`);
   }
+}
+
+function assertContentScriptContract(message) {
+  const command = message?.command;
+  const payload = message?.payload;
+  const contract = message?.content_script_contract;
+  const job = payload?.job;
+  const recipe = String(job?.recipe ?? "").trim();
+  const required = Array.isArray(contract?.required_content_script_capabilities)
+    ? contract.required_content_script_capabilities
+    : [];
+  const actual = contentScriptCapabilitiesForRecipe(recipe);
+  const failures = [];
+  if (!SECURE_CONTENT_SCRIPT_COMMANDS.has(command)) {
+    failures.push(`unsupported command ${JSON.stringify(command)}`);
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload) || payload.type !== command) {
+    failures.push("payload command mismatch");
+  }
+  if (contract?.content_script_instance_id !== CONTENT_SCRIPT_INSTANCE_ID) {
+    failures.push("content-script instance mismatch");
+  }
+  if (contract?.content_script_build !== CONTENT_SCRIPT_BUILD) {
+    failures.push("content-script build mismatch");
+  }
+  if (contract?.content_script_recipe !== recipe) {
+    failures.push("content-script recipe mismatch");
+  }
+  if (required.length !== actual.length || actual.some((capability) => !required.includes(capability))) {
+    failures.push("content-script capability mismatch");
+  }
+  if (failures.length === 0) {
+    return;
+  }
+  throw commandError(
+    "content_script_contract_mismatch",
+    `refusing ${String(command ?? "unknown")} for ${failures.join(", ")}`,
+    {
+      phase: contentScriptCommandPhase(command, job),
+      side_effect_started: contentScriptCommandHasSideEffect(command, job),
+      content_script_instance_id: CONTENT_SCRIPT_INSTANCE_ID,
+      expected_content_script_instance_id: contract?.content_script_instance_id ?? null,
+      content_script_build: CONTENT_SCRIPT_BUILD,
+      expected_content_script_build: contract?.content_script_build ?? null,
+      content_script_recipe: recipe || null,
+      expected_content_script_recipe: contract?.content_script_recipe ?? null,
+      required_content_script_capabilities: required
+    }
+  );
+}
+
+function contentScriptCapabilitiesForRecipe(recipe) {
+  return [
+    NATIVE_JOB_COMMANDS_CAPABILITY,
+    ...(recipe === "chatgpt" ? [CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY] : [])
+  ];
+}
+
+function contentScriptCommandPhase(command, job) {
+  if (command === "yoetz_configure_model") {
+    return "model_selection";
+  }
+  if (command === "yoetz_send_prompt" || command === "yoetz_cancel_send") {
+    return "send";
+  }
+  if (command === "yoetz_extract_response" || command === "yoetz_fetch_conversation") {
+    return "wait_response";
+  }
+  if (command === "yoetz_bind_job" && job?.status === "waiting_response") {
+    return "wait_response";
+  }
+  return "upload";
+}
+
+function contentScriptCommandHasSideEffect(command, job) {
+  return [
+    "yoetz_send_prompt",
+    "yoetz_extract_response",
+    "yoetz_fetch_conversation",
+    "yoetz_cancel_send"
+  ].includes(command)
+    || (command === "yoetz_bind_job" && job?.status === "waiting_response");
 }
 
 // Best-effort cancel: click the site's stop control, then WAIT for generation to
@@ -188,6 +292,9 @@ async function uploadJobFile(job, filePayload) {
 }
 
 async function configureModel(job, options = {}) {
+  const phase = options.phase ?? "model_selection";
+  const sideEffectStarted = options.side_effect_started === true;
+  const sendCommitted = options.send_committed === true;
   const {
     classifyBlockingState,
     configureModelState,
@@ -195,21 +302,45 @@ async function configureModel(job, options = {}) {
     resetModelSelectionState
   } = await domHelpers(job);
   const adapter = await siteAdapter(job);
-  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "model_selection", adapter));
+  assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, phase, adapter));
   assertNoBlockingState(classifyBlockingState, {
-    phase: "model_selection",
-    side_effect_started: false,
-    send_committed: false
+    phase,
+    side_effect_started: sideEffectStarted,
+    send_committed: sendCommitted
   });
   if (options.reset) {
     await resetModelSelectionState(document);
   }
-  const selection = await configureModelState(document, job);
+  let selection;
+  try {
+    selection = await configureModelState(document, job);
+  } catch (error) {
+    if (phase !== "send") {
+      throw error;
+    }
+    throw commandError(
+      "model_selection_not_verified_before_send",
+      `ChatGPT GPT-5.6 Sol Pro was not verified immediately before send: ${String(error?.message ?? error)}`,
+      {
+        phase: "send",
+        side_effect_started: true,
+        send_committed: false,
+        requested_model: job.model ?? "gpt-5-6-sol-chat-pro",
+        model_selection_error_code: error?.code ?? null
+      }
+    );
+  }
   assertNoBlockingState(classifyBlockingState, {
-    phase: "model_selection",
-    side_effect_started: false,
-    send_committed: false
+    phase,
+    side_effect_started: sideEffectStarted,
+    send_committed: sendCommitted
   });
+  if (adapter.recipe === "chatgpt" && selection?.surface_evidence_seen === true) {
+    const activeJob = activeJobs.get(job.job_id);
+    if (activeJob) {
+      activeJob.surface_evidence_seen = true;
+    }
+  }
   return selection;
 }
 
@@ -221,6 +352,7 @@ async function sendPrompt(job, prompt) {
     insertPrompt,
     parseOwnedWindowName,
     sendAcceptanceBaseline,
+    verifyChatgptModelSelectionBeforeSend,
     waitForSendAccepted
   } = await domHelpers(job);
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send", adapter));
@@ -233,6 +365,10 @@ async function sendPrompt(job, prompt) {
     side_effect_started: true,
     send_committed: false
   });
+  let finalModelSelection = null;
+  let surfaceEvidenceSeen = job.surface_evidence_seen === true
+    || activeJobs.get(job.job_id)?.surface_evidence_seen === true;
+  job.surface_evidence_seen = surfaceEvidenceSeen;
   const baseline = sendAcceptanceBaseline(document);
   await insertPrompt(document, prompt, { timeoutMs: 20000 });
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send", adapter));
@@ -249,6 +385,83 @@ async function sendPrompt(job, prompt) {
   if (expectedConversationId) {
     clickOptions.expectedConversationId = expectedConversationId;
   }
+  if (adapter.recipe === "chatgpt") {
+    clickOptions.beforeClick = async () => {
+      job.surface_evidence_seen = surfaceEvidenceSeen
+        || activeJobs.get(job.job_id)?.surface_evidence_seen === true;
+      finalModelSelection = await configureModel(job, {
+        phase: "send",
+        side_effect_started: true,
+        send_committed: false
+      });
+      if (!adapter.isAcceptableModelSelection(finalModelSelection)) {
+        throw commandError(
+          "model_selection_not_verified_before_send",
+          `ChatGPT GPT-5.6 Sol Pro was not verified immediately before send: ${finalModelSelection?.failure_reason ?? finalModelSelection?.status ?? "unknown"}`,
+          {
+            phase: "send",
+            side_effect_started: true,
+            send_committed: false,
+            requested_model: finalModelSelection?.requested_model ?? job.model ?? "gpt-5-6-sol-chat-pro",
+            model_selection_status: finalModelSelection?.status ?? "unknown",
+            model_selection_failure_reason: finalModelSelection?.failure_reason ?? null
+          }
+        );
+      }
+      surfaceEvidenceSeen = Boolean(
+        surfaceEvidenceSeen
+        || finalModelSelection.surface_evidence_seen === true
+        || activeJobs.get(job.job_id)?.surface_evidence_seen === true
+      );
+      job.surface_evidence_seen = surfaceEvidenceSeen;
+      finalModelSelection = {
+        ...finalModelSelection,
+        surface_evidence_seen: surfaceEvidenceSeen
+      };
+      return finalModelSelection;
+    };
+    clickOptions.verifyBeforeClick = () => {
+      const proof = verifyChatgptModelSelectionBeforeSend(document, finalModelSelection);
+      surfaceEvidenceSeen = Boolean(surfaceEvidenceSeen || proof.surface_evidence_seen === true);
+      job.surface_evidence_seen = surfaceEvidenceSeen;
+      if (!proof.ok) {
+        throw commandError(
+          "model_selection_not_verified_before_send",
+          `ChatGPT GPT-5.6 Sol Pro proof changed or was incomplete immediately before send: ${proof.failure_reason ?? "unknown"}`,
+          {
+            phase: "send",
+            side_effect_started: true,
+            send_committed: false,
+            requested_model: finalModelSelection?.requested_model ?? job.model ?? "gpt-5-6-sol-chat-pro",
+            model_selection_status: finalModelSelection?.status ?? "unknown",
+            model_selection_failure_reason: proof.failure_reason,
+            surface_failure_reason: proof.failure_reason,
+            surface_state: proof.surface_state,
+            surface_observed_values: proof.surface_observed_values
+          }
+        );
+      }
+      finalModelSelection = {
+        ...finalModelSelection,
+        model_used: finalModelSelection?.requested_model === "current"
+          ? proof.current_closed_pill_text
+          : finalModelSelection?.model_used ?? null,
+        surface_evidence_seen: surfaceEvidenceSeen,
+        surface_state: proof.surface_state,
+        surface_observed_values: proof.surface_observed_values,
+        surface_proof_kind: proof.surface_proof_kind,
+        surface_chat_state: proof.surface_chat_state,
+        surface_work_state: proof.surface_work_state,
+        surface_visible_toggle_count: proof.surface_visible_toggle_count,
+        surface_composer_aria: proof.surface_composer_aria,
+        click_bound: true,
+        click_bound_closed_pill_text: proof.current_closed_pill_text,
+        click_bound_closed_pill_family_status: proof.current_closed_pill_family_status,
+        click_bound_closed_pill_effort_status: proof.current_closed_pill_effort_status
+      };
+      return proof;
+    };
+  }
   await clickSend(document, clickOptions);
   let accepted;
   try {
@@ -264,7 +477,8 @@ async function sendPrompt(job, prompt) {
       `${adapter.displayName} send click was committed, but Yoetz could not confirm ${adapter.displayName} accepted the prompt before timeout. If a response eventually appears, do not rerun automatically: ${String(error?.message ?? error)}`,
       {
         phase: "send",
-        side_effect_started: true
+        side_effect_started: true,
+        send_committed: true
       }
     );
   }
@@ -275,7 +489,45 @@ async function sendPrompt(job, prompt) {
     url: location.href,
     conversation_id: adapter.conversationIdFromUrl(location.href),
     submitted_user_count: submitted.user_count,
-    submitted_assistant_count: submitted.assistant_count
+    submitted_assistant_count: submitted.assistant_count,
+    ...(finalModelSelection
+      ? {
+        final_model_selection: {
+          status: finalModelSelection.status ?? null,
+          model_used: finalModelSelection.model_used ?? null,
+          requested_model: finalModelSelection.requested_model ?? null,
+          family_status: finalModelSelection.family_status ?? null,
+          effort_status: finalModelSelection.effort_status ?? null,
+          picker_family_status: finalModelSelection.picker_family_status ?? null,
+          picker_effort_status: finalModelSelection.picker_effort_status ?? null,
+          picker_shape: finalModelSelection.picker_shape ?? null,
+          post_close_family_status: finalModelSelection.post_close_family_status ?? null,
+          post_close_effort_status: finalModelSelection.post_close_effort_status ?? null,
+          post_close_picker_shape: finalModelSelection.post_close_picker_shape ?? null,
+          post_close_picker_close_verification: finalModelSelection.post_close_picker_close_verification ?? null,
+          post_close_closed_pill_family_status: finalModelSelection.post_close_closed_pill_family_status ?? null,
+          post_close_closed_pill_effort_status: finalModelSelection.post_close_closed_pill_effort_status ?? null,
+          post_close_closed_pill_text: finalModelSelection.post_close_closed_pill_text ?? null,
+          post_close_failure_reason: finalModelSelection.post_close_failure_reason ?? null,
+          closed_pill_family_status: finalModelSelection.closed_pill_family_status ?? null,
+          closed_pill_effort_status: finalModelSelection.closed_pill_effort_status ?? null,
+          closed_pill_text: finalModelSelection.closed_pill_text ?? null,
+          surface_evidence_seen: finalModelSelection.surface_evidence_seen === true,
+          surface_state: finalModelSelection.surface_state ?? null,
+          surface_observed_values: finalModelSelection.surface_observed_values ?? [],
+          surface_proof_kind: finalModelSelection.surface_proof_kind ?? null,
+          surface_chat_state: finalModelSelection.surface_chat_state ?? null,
+          surface_work_state: finalModelSelection.surface_work_state ?? null,
+          surface_visible_toggle_count: finalModelSelection.surface_visible_toggle_count ?? 0,
+          surface_composer_aria: finalModelSelection.surface_composer_aria ?? null,
+          picker_close_verification: finalModelSelection.picker_close_verification ?? null,
+          click_bound: finalModelSelection.click_bound === true,
+          click_bound_closed_pill_text: finalModelSelection.click_bound_closed_pill_text ?? null,
+          click_bound_closed_pill_family_status: finalModelSelection.click_bound_closed_pill_family_status ?? null,
+          click_bound_closed_pill_effort_status: finalModelSelection.click_bound_closed_pill_effort_status ?? null
+        }
+      }
+      : {})
   };
 }
 
@@ -373,6 +625,7 @@ async function inspectPage(runId, options = {}) {
     // text_content_chars) even when the SW build is current. Surfacing the content-script
     // manifest version here lets an operator detect that stale-injected-script case directly.
     content_script_build: contentScriptBuild(),
+    content_script_instance_id: CONTENT_SCRIPT_INSTANCE_ID,
     page_text_chars: pageText.length
   };
   if (options.include_page_text) {
@@ -416,6 +669,14 @@ async function probe(recipe) {
   const { getPageText } = adapter.dom;
   return {
     recipe: adapter.recipe,
+    capabilities: [
+      NATIVE_JOB_COMMANDS_CAPABILITY,
+      ...(adapter.recipe === "chatgpt"
+        ? [CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY]
+        : [])
+    ],
+    content_script_build: contentScriptBuild(),
+    content_script_instance_id: CONTENT_SCRIPT_INSTANCE_ID,
     url: location.href,
     title: document.title,
     text: getPageText(document).slice(0, 2000)
@@ -425,15 +686,15 @@ async function probe(recipe) {
 async function bindJob(job) {
   const adapter = await siteAdapter(job);
   const { markOwnership, parseOwnedWindowName } = await domHelpers(job);
+  const bindDetail = job.status === "waiting_for_file"
+    ? { phase: "upload", side_effect_started: false }
+    : { phase: "wait_response", side_effect_started: true };
   const parsed = parseOwnedWindowName(window.name);
   if (parsed?.job_id !== job.job_id || parsed?.run_id !== job.run_id) {
     throw commandError(
       "ownership_lost",
       `tab ownership marker mismatch for job ${job.job_id}`,
-      {
-        phase: "wait_response",
-        side_effect_started: true
-      }
+      bindDetail
     );
   }
   const urlRunId = runIdFromUrl(location.href);
@@ -441,10 +702,7 @@ async function bindJob(job) {
     throw commandError(
       "ownership_lost",
       `tab URL ownership marker mismatch for job ${job.job_id}`,
-      {
-        phase: "wait_response",
-        side_effect_started: true
-      }
+      bindDetail
     );
   }
   const conversationId = adapter.conversationIdFromUrl(location.href);
@@ -456,8 +714,7 @@ async function bindJob(job) {
       "conversation_changed",
       `tab moved from ${adapter.displayName} conversation ${expectedConversationId} to ${conversationId ?? "(none)"}`,
       {
-        phase: "wait_response",
-        side_effect_started: true,
+        ...bindDetail,
         requested_conversation_id: expectedConversationId,
         current_conversation_id: conversationId
       }
@@ -474,6 +731,8 @@ async function bindJob(job) {
 }
 
 function assertJobOwnership(job, parseOwnedWindowName, options = {}) {
+  const phase = options.phase ?? "upload";
+  const sideEffectStarted = options.side_effect_started === true;
   const parsed = parseOwnedWindowName(window.name);
   const active = activeJobs.get(job.job_id);
   if (!active?.prepare_complete) {
@@ -492,8 +751,8 @@ function assertJobOwnership(job, parseOwnedWindowName, options = {}) {
       code,
       `job ${job.job_id} expected ${options.adapter.displayName} conversation ${options.requireConversation}, current conversation is ${actualConversationId ?? "(none)"}`,
       {
-        phase: options.phase ?? "upload",
-        side_effect_started: false,
+        phase,
+        side_effect_started: sideEffectStarted,
         requested_conversation_id: options.requireConversation,
         current_conversation_id: actualConversationId
       }
@@ -501,17 +760,18 @@ function assertJobOwnership(job, parseOwnedWindowName, options = {}) {
   }
   if (options.requireFresh && options.adapter.isConversationUrl(location.href)) {
     throw commandError("fresh_chat_lost", `job ${job.job_id} is no longer on a fresh ${options.adapter.displayName} page`, {
-      phase: "upload",
-      side_effect_started: false
+      phase,
+      side_effect_started: sideEffectStarted
     });
   }
 }
 
 function ownershipOptionsForJob(job, phase, adapter) {
   const conversationId = conversationIdForJob(job);
+  const sideEffectStarted = phase === "send" || phase === "wait_response";
   return conversationId
-    ? { adapter, requireConversation: conversationId, phase }
-    : { adapter, requireFresh: true, phase };
+    ? { adapter, requireConversation: conversationId, phase, side_effect_started: sideEffectStarted }
+    : { adapter, requireFresh: true, phase, side_effect_started: sideEffectStarted };
 }
 
 function assertUrlRunMarker(job) {
@@ -631,11 +891,19 @@ function conversationLocationDetail(code) {
 }
 
 function contentScriptBuild() {
-  try {
-    return chrome.runtime?.getManifest?.().version ?? "unknown";
-  } catch {
-    return "unknown";
+  return CONTENT_SCRIPT_BUILD;
+}
+
+function cryptoRandomId() {
+  const bytes = new Uint8Array(12);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
   }
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }
 
 function runIdFromUrl(value) {
@@ -668,11 +936,24 @@ function errorResponse(error) {
     "provider_message",
     "provider_dom",
     "requested_model",
+    "model_selection_status",
+    "model_selection_failure_reason",
+    "model_selection_error_code",
     "send_committed",
+    "content_script_instance_id",
+    "expected_content_script_instance_id",
+    "content_script_build",
+    "expected_content_script_build",
+    "content_script_recipe",
+    "expected_content_script_recipe",
+    "required_content_script_capabilities",
     "requested_conversation_id",
     "current_conversation_id",
     "current_url",
-    "current_pathname"
+    "current_pathname",
+    "surface_failure_reason",
+    "surface_state",
+    "surface_observed_values"
   ]) {
     if (error?.[key] !== undefined) {
       response[key] = error[key];

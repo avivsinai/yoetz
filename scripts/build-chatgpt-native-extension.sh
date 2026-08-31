@@ -56,6 +56,15 @@ if (!workspaceVersion) {
 if (manifest.version !== workspaceVersion) {
   throw new Error(`manifest version ${manifest.version} must match workspace version ${workspaceVersion}`);
 }
+const contentScript = readFileSync(join(extensionDir, "src/content-script.js"), "utf8");
+const contentScriptBuild = contentScript.match(/^const CONTENT_SCRIPT_BUILD = "([^"]+)";$/m)?.[1];
+const serviceWorker = readFileSync(join(extensionDir, "src/service-worker.js"), "utf8");
+const serviceWorkerBuild = serviceWorker.match(/^const CONTENT_SCRIPT_BUILD = "([^"]+)";$/m)?.[1];
+if (contentScriptBuild !== manifest.version || serviceWorkerBuild !== manifest.version) {
+  throw new Error(
+    `extension content contract markers ${contentScriptBuild ?? "missing"}/${serviceWorkerBuild ?? "missing"} must both match manifest version ${manifest.version}`
+  );
+}
 for (const permission of requiredPermissions) {
   if (!permissions.includes(permission)) {
     throw new Error(`missing required permission: ${permission}`);

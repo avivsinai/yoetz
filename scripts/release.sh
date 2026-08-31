@@ -197,6 +197,19 @@ if [[ -f extensions/chatgpt-native/manifest.json ]]; then
     || sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"${VERSION}\"/" extensions/chatgpt-native/manifest.json
 fi
 
+YOETZ_VERSION="${VERSION}" perl -0pi -e '
+  my $count = s/^const CONTENT_SCRIPT_BUILD = "[^"]+";$/const CONTENT_SCRIPT_BUILD = "$ENV{YOETZ_VERSION}";/m;
+  die "failed to update content script build marker\n" unless $count == 1;
+' extensions/chatgpt-native/src/content-script.js
+YOETZ_VERSION="${VERSION}" perl -0pi -e '
+  my $count = s/^const CONTENT_SCRIPT_BUILD = "[^"]+";$/const CONTENT_SCRIPT_BUILD = "$ENV{YOETZ_VERSION}";/m;
+  die "failed to update service worker content contract marker\n" unless $count == 1;
+' extensions/chatgpt-native/src/service-worker.js
+YOETZ_VERSION="${VERSION}" perl -0pi -e '
+  my $count = s/^const TEST_CONTENT_SCRIPT_BUILD = "[^"]+";$/const TEST_CONTENT_SCRIPT_BUILD = "$ENV{YOETZ_VERSION}";/m;
+  die "failed to update service-worker test content contract marker\n" unless $count == 1;
+' extensions/chatgpt-native/tests/service-worker.test.js
+
 while IFS= read -r SKILL_MD; do
   if grep -q '^version:' "$SKILL_MD"; then
     sed -i '' "s/^version: .*/version: ${VERSION}/" "$SKILL_MD" 2>/dev/null \
@@ -219,6 +232,9 @@ for f in .codex-plugin/plugin.json .claude-plugin/plugin.json; do
   [[ -f "$f" ]] && git add "$f"
 done
 [[ -f extensions/chatgpt-native/manifest.json ]] && git add extensions/chatgpt-native/manifest.json
+git add extensions/chatgpt-native/src/content-script.js
+git add extensions/chatgpt-native/src/service-worker.js
+git add extensions/chatgpt-native/tests/service-worker.test.js
 find skills -mindepth 2 -maxdepth 2 -name SKILL.md -print0 | while IFS= read -r -d '' f; do
   git add "$f"
 done

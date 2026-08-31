@@ -74,6 +74,26 @@ export async function ensureFreshChat(_document, job) {
   return { status: "fresh", pathname: globalThis.location.pathname };
 }
 
+export async function ensureChatSurface(_document, options) {
+  hooks.ensureChatSurfaceCalls.push(options);
+  return hooks.ensureChatSurfaceResult ?? { ok: true };
+}
+
+export function verifyChatSurface(_document, options) {
+  hooks.verifyChatSurfaceCalls.push(options);
+  return hooks.verifyChatSurfaceResult ?? { ok: true };
+}
+
+export function verifyChatgptModelSelectionBeforeSend(_document, selection) {
+  hooks.verifyChatgptModelSelectionCalls.push(selection);
+  return hooks.verifyChatgptModelSelectionResult ?? {
+    ok: true,
+    surface_evidence_seen: selection?.surface_evidence_seen === true,
+    surface_state: null,
+    surface_observed_values: []
+  };
+}
+
 export async function ensureConversationLoaded(_document, conversationId, options) {
   hooks.ensureConversationLoadedCalls.push({ conversationId, options });
   const actual = conversationIdFromLocation();
@@ -111,7 +131,15 @@ export async function uploadFile(_document, file, options) {
 
 export function configureModelState(_document, job) {
   hooks.configureModelCalls.push(job);
-  return { status: "selected", model_used: "GPT-5.6 Sol Pro", requested_model: "gpt-5-6-sol-chat-pro", family_status: "verified", effort_status: "verified" };
+  hooks.events.push("configure_model");
+  return hooks.configureModelResult ?? {
+    status: "selected",
+    model_used: "GPT-5.6 Sol Pro",
+    requested_model: "gpt-5-6-sol-chat-pro",
+    family_status: "verified",
+    effort_status: "verified",
+    surface_evidence_seen: Boolean(hooks.configureModelSurfaceEvidenceSeen)
+  };
 }
 
 export function sendAcceptanceBaseline() {
@@ -120,12 +148,16 @@ export function sendAcceptanceBaseline() {
 }
 
 export async function insertPrompt(_document, prompt, options) {
+  hooks.events.push("insert_prompt");
   hooks.insertPromptCalls.push({ prompt, options });
   hooks.afterInsertPrompt?.();
 }
 
 export async function clickSend(_document, options) {
   hooks.clickSendCalls.push(options);
+  await options.beforeClick?.();
+  options.verifyBeforeClick?.();
+  hooks.clickCommittedCalls += 1;
 }
 
 export async function waitForSendAccepted() {
@@ -157,6 +189,9 @@ const dom = {
   classifyWaitManualHandoff,
   classifyBlockingState,
   ensureFreshChat,
+  ensureChatSurface,
+    verifyChatSurface,
+    verifyChatgptModelSelectionBeforeSend,
   ensureConversationLoaded,
   markOwnership,
   uploadFile,
@@ -184,6 +219,13 @@ export const siteAdapter = {
   },
   isExpectedConversationIdAssignment() {
     return Boolean(hooks.allowConversationAssignment);
+  },
+  isAcceptableModelSelection(selection) {
+    return selection?.status === "selected"
+      && selection?.requested_model === "gpt-5-6-sol-chat-pro"
+      && selection?.family_status === "verified"
+      && selection?.effort_status === "verified"
+      && selection?.model_used === "GPT-5.6 Sol Pro";
   },
   isConversationUrl(value) {
     return Boolean(this.conversationIdFromUrl(value));
@@ -223,10 +265,107 @@ test("content script resume path skips fresh enforcement and completes on reques
     assert.equal(sent.ok, true);
     assert.equal(sent.payload.conversation_id, "conv-123");
     assert.equal(hooks.clickSendCalls[0].expectedConversationId, "conv-123");
+    assert.equal(hooks.configureModelCalls.length, 2);
+    assert.ok(hooks.events.indexOf("configure_model") < hooks.events.indexOf("insert_prompt"));
+    assert.equal(hooks.verifyChatgptModelSelectionCalls.length, 1);
 
     const extracted = await send({ type: "yoetz_extract_response", job });
     assert.equal(extracted.ok, true);
     assert.equal(extracted.payload.conversation_id, "conv-123");
+  } finally {
+    restore();
+  }
+});
+
+test("content script probe advertises the generic command contract for each recipe", async () => {
+  const chatgpt = await loadContentScript("probe_chatgpt", "https://chatgpt.com/");
+  try {
+    const response = await chatgpt.send({ type: "yoetz_probe", recipe: "chatgpt" });
+    assert.equal(response.ok, true);
+    assert.equal(response.payload.recipe, "chatgpt");
+    assert.deepEqual(response.payload.capabilities, [
+      "native_job_commands_v1",
+      "chatgpt_click_bound_send_receipt_v1"
+    ]);
+  } finally {
+    chatgpt.restore();
+  }
+
+  const claude = await loadContentScript("probe_claude", "https://claude.ai/new");
+  try {
+    claude.hooks.recipe = "claude";
+    const response = await claude.send({ type: "yoetz_probe", recipe: "claude" });
+    assert.equal(response.ok, true);
+    assert.equal(response.payload.recipe, "claude");
+    assert.deepEqual(response.payload.capabilities, ["native_job_commands_v1"]);
+  } finally {
+    claude.restore();
+  }
+});
+
+test("content script accepts the bound command envelope and rejects a stale injection nonce", async () => {
+  const { send, hooks, restore } = await loadContentScript("secure_command_contract", "https://chatgpt.com/");
+  try {
+    const probe = await send({ type: "yoetz_probe", recipe: "chatgpt" });
+    const job = {
+      job_id: "job_secure",
+      run_id: "run_secure",
+      recipe: "chatgpt",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+    const contract = {
+      content_script_instance_id: probe.payload.content_script_instance_id,
+      content_script_build: probe.payload.content_script_build,
+      content_script_recipe: "chatgpt",
+      required_content_script_capabilities: probe.payload.capabilities
+    };
+    const prepared = await send({
+      type: "yoetz_secure_command",
+      command: "yoetz_prepare_job",
+      content_script_contract: contract,
+      payload: { type: "yoetz_prepare_job", job }
+    });
+    assert.equal(prepared.ok, true);
+
+    const stale = await send({
+      type: "yoetz_secure_command",
+      command: "yoetz_upload_file",
+      content_script_contract: {
+        ...contract,
+        content_script_instance_id: "cs_stale"
+      },
+      payload: {
+        type: "yoetz_upload_file",
+        job,
+        file: {
+          filename: "bundle.md",
+          mime_type: "text/markdown",
+          bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+        }
+      }
+    });
+    assert.equal(stale.ok, false);
+    assert.equal(stale.code, "content_script_contract_mismatch");
+    assert.equal(stale.phase, "upload");
+    assert.equal(stale.side_effect_started, false);
+    assert.equal(hooks.uploadFileCalls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("content script reports restored waiting-for-file bind failures before side effects", async () => {
+  const { send, restore } = await loadContentScript("bind_waiting_for_file", "https://chatgpt.com/");
+  try {
+    const response = await send({
+      type: "yoetz_bind_job",
+      job: { ...resumeJob(), status: "waiting_for_file" }
+    });
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "ownership_lost");
+    assert.equal(response.phase, "upload");
+    assert.equal(response.side_effect_started, false);
   } finally {
     restore();
   }
@@ -621,9 +760,187 @@ test("content script resume send rechecks conversation drift after prompt insert
     assert.equal(response.ok, false);
     assert.equal(response.code, "conversation_changed");
     assert.equal(response.phase, "send");
-    assert.equal(response.side_effect_started, false);
+    assert.equal(response.side_effect_started, true);
     assert.equal(hooks.insertPromptCalls.length, 1);
     assert.equal(hooks.clickSendCalls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("content script marks a fresh-job conversation drift after upload as send-side effect", async () => {
+  const { send, hooks, restore, location } = await loadContentScript("fresh_send_drift", "https://chatgpt.com/?_yoetz=run_fresh_send");
+  try {
+    const job = {
+      job_id: "job_fresh_send",
+      run_id: "run_fresh_send",
+      recipe: "chatgpt",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+    assert.equal((await send({ type: "yoetz_prepare_job", job })).ok, true);
+    assert.equal((await send({
+      type: "yoetz_upload_file",
+      job,
+      file: {
+        filename: "bundle.md",
+        mime_type: "text/markdown",
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+      }
+    })).ok, true);
+    hooks.afterInsertPrompt = () => {
+      location.href = "https://chatgpt.com/c/other?_yoetz=run_fresh_send";
+      location.pathname = "/c/other";
+    };
+
+    const response = await send({ type: "yoetz_send_prompt", job, prompt: "continue" });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "fresh_chat_lost");
+    assert.equal(response.phase, "send");
+    assert.equal(response.side_effect_started, true);
+    assert.equal(hooks.clickSendCalls.length, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("content script rechecks the Chat surface immediately before sending", async () => {
+  const { send, hooks, restore } = await loadContentScript("send_surface_guard", "https://chatgpt.com/?_yoetz=run_surface_guard");
+  try {
+    const job = { job_id: "job_surface_guard", run_id: "run_surface_guard", send_timeout_ms: 1000 };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+    hooks.verifyChatgptModelSelectionResult = {
+      ok: false,
+      failure_reason: "chat_surface_selection_mismatch",
+      surface_state: { aria_checked: "false", data_state: "unchecked" },
+      surface_observed_values: ["chatgpt", "work"]
+    };
+    hooks.verifyChatSurfaceResult = {
+      ok: false,
+      failure_reason: "chat_surface_selection_mismatch",
+      state: { aria_checked: "false", data_state: "unchecked" },
+      observed_values: ["chatgpt", "work"]
+    };
+
+    const response = await send({ type: "yoetz_send_prompt", job, prompt: "review" });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "model_selection_not_verified_before_send");
+    assert.equal(response.phase, "send");
+    assert.equal(response.side_effect_started, true);
+    assert.equal(response.send_committed, false);
+    assert.equal(response.surface_failure_reason, "chat_surface_selection_mismatch");
+    assert.deepEqual(response.surface_observed_values, ["chatgpt", "work"]);
+    assert.equal(hooks.ensureChatSurfaceCalls.length, 0);
+    assert.equal(hooks.verifyChatSurfaceCalls.length, 0);
+    assert.equal(hooks.verifyChatgptModelSelectionCalls.length, 1);
+    assert.equal(hooks.clickSendCalls.length, 1);
+    assert.equal(hooks.clickCommittedCalls, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("content script rejects a synchronous Chat surface drift after the async guard", async () => {
+  const { send, hooks, restore } = await loadContentScript("send_surface_sync_guard", "https://chatgpt.com/?_yoetz=run_surface_sync_guard");
+  try {
+    const job = { job_id: "job_surface_sync_guard", run_id: "run_surface_sync_guard", send_timeout_ms: 1000 };
+    assert.equal((await send({ type: "yoetz_prepare_job", job })).ok, true);
+    hooks.verifyChatgptModelSelectionResult = {
+      ok: false,
+      failure_reason: "chat_surface_selection_mismatch",
+      state: { aria_checked: "false", data_state: "off" },
+      observed_values: ["chatgpt", "work"]
+    };
+
+    const response = await send({ type: "yoetz_send_prompt", job, prompt: "review" });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "model_selection_not_verified_before_send");
+    assert.match(response.error, /changed or was incomplete immediately before send/);
+    assert.equal(hooks.ensureChatSurfaceCalls.length, 0);
+    assert.equal(hooks.verifyChatSurfaceCalls.length, 0);
+    assert.equal(hooks.verifyChatgptModelSelectionCalls.length, 1);
+    assert.equal(hooks.clickCommittedCalls, 0);
+  } finally {
+    restore();
+  }
+});
+
+test("content script carries explicit Chat surface evidence through the final send guards", async () => {
+  const { send, hooks, restore } = await loadContentScript("send_surface_evidence", "https://chatgpt.com/?_yoetz=run_surface_evidence");
+  try {
+    const job = {
+      job_id: "job_surface_evidence",
+      run_id: "run_surface_evidence",
+      send_timeout_ms: 1000,
+      surface_evidence_seen: true
+    };
+    assert.equal((await send({ type: "yoetz_prepare_job", job })).ok, true);
+    hooks.verifyChatgptModelSelectionResult = { ok: true, surface_evidence_seen: true };
+
+    const response = await send({ type: "yoetz_send_prompt", job, prompt: "review" });
+
+    assert.equal(response.ok, true, JSON.stringify(response));
+    assert.equal(hooks.ensureChatSurfaceCalls.length, 0);
+    assert.equal(hooks.verifyChatgptModelSelectionCalls.length, 1);
+    assert.equal(hooks.verifyChatgptModelSelectionCalls[0].surface_evidence_seen, true);
+    assert.equal(hooks.clickCommittedCalls, 1);
+    assert.equal(response.payload.final_model_selection.click_bound, true);
+    assert.equal(response.payload.final_model_selection.surface_evidence_seen, true);
+  } finally {
+    restore();
+  }
+});
+
+test("content script fences a committed send when acceptance is unknown", async () => {
+  const { send, hooks, restore } = await loadContentScript("send_acceptance_unknown", "https://chatgpt.com/?_yoetz=run_acceptance_unknown");
+  try {
+    const job = { job_id: "job_acceptance_unknown", run_id: "run_acceptance_unknown", send_timeout_ms: 1000 };
+    assert.equal((await send({ type: "yoetz_prepare_job", job })).ok, true);
+    hooks.afterWaitForSendAccepted = () => {
+      throw new Error("send acceptance was not observed");
+    };
+
+    const response = await send({ type: "yoetz_send_prompt", job, prompt: "review" });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "send_acceptance_unknown");
+    assert.equal(response.phase, "send");
+    assert.equal(response.side_effect_started, true);
+    assert.equal(response.send_committed, true);
+    assert.equal(hooks.clickCommittedCalls, 1);
+  } finally {
+    restore();
+  }
+});
+
+test("content script rejects final ChatGPT model drift before clicking send", async () => {
+  const { send, hooks, restore } = await loadContentScript("send_model_guard", "https://chatgpt.com/?_yoetz=run_model_guard");
+  try {
+    const job = { job_id: "job_model_guard", run_id: "run_model_guard", send_timeout_ms: 1000 };
+    assert.equal((await send({ type: "yoetz_prepare_job", job })).ok, true);
+    hooks.configureModelResult = {
+      status: "selected",
+      model_used: "GPT-5.6 Sol Expert",
+      requested_model: "gpt-5-6-sol-chat-pro",
+      family_status: "verified",
+      effort_status: "verified"
+    };
+
+    const response = await send({ type: "yoetz_send_prompt", job, prompt: "review" });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "model_selection_not_verified_before_send");
+    assert.equal(response.phase, "send");
+    assert.equal(response.side_effect_started, true);
+    assert.equal(response.send_committed, false);
+    assert.equal(response.model_selection_status, "selected");
+    assert.equal(response.model_selection_failure_reason, null);
+    assert.equal(hooks.insertPromptCalls.length, 1);
+    assert.equal(hooks.clickCommittedCalls, 0);
   } finally {
     restore();
   }
@@ -849,8 +1166,13 @@ async function loadContentScript(label, href) {
     markOwnershipCalls: [],
     uploadFileCalls: [],
     configureModelCalls: [],
+    events: [],
+    ensureChatSurfaceCalls: [],
+    verifyChatSurfaceCalls: [],
+    verifyChatgptModelSelectionCalls: [],
     insertPromptCalls: [],
     clickSendCalls: [],
+    clickCommittedCalls: 0,
     sendAcceptanceBaselineCalls: 0,
     manualHandoffInputs: [],
     waitManualHandoffInputs: []

@@ -120,6 +120,7 @@ pub struct RecipeContext {
     pub fallback_used: bool,
     pub use_stealth: bool,
     pub headed: bool,
+    pub model_strategy: chatgpt_recipe::ChatgptModelStrategy,
     pub vars: BTreeMap<String, String>,
     pub warnings: Vec<String>,
     /// Target URL for captcha recovery (defaults to CHATGPT_URL).
@@ -552,6 +553,7 @@ fn run_recipe_with_connection(
     let mut headed = ctx.headed;
     let mut pending_chatgpt_send_baseline: Option<ChatgptResponseBaseline> = None;
     let mut pending_claude_send_baseline: Option<ClaudeResponseBaseline> = None;
+    let mut chatgpt_surface_evidence_seen = false;
     let mut chatgpt_stage = ChatgptRecipeStage::Idle;
     let mut claude_stage = ClaudeRecipeStage::Idle;
     let mut chatgpt_focus_cache = ChatgptRunTabFocusCache::default();
@@ -698,6 +700,10 @@ fn run_recipe_with_connection(
                     mark_chatgpt_error_after_side_effect(err, chatgpt_stage.terminal_phase(action))
                 })
                 .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+            if let Some(selection) = parse_stdout_json(&stdout) {
+                chatgpt_surface_evidence_seen =
+                    chatgpt_surface_evidence_seen || selection_surface_evidence_seen(&selection);
+            }
 
             if wants_json || wants_jsonl {
                 let stdout_value =
@@ -779,9 +785,21 @@ fn run_recipe_with_connection(
         }
 
         if action == CHATGPT_SEND_ACTION {
-            let stdout = run_chatgpt_send(connection, ctx.use_stealth, headed)
-                .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send)
-                .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
+            let stdout = run_chatgpt_send(
+                match ctx.model_strategy {
+                    chatgpt_recipe::ChatgptModelStrategy::Select => {
+                        crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL
+                    }
+                    chatgpt_recipe::ChatgptModelStrategy::Current => "current",
+                },
+                ctx.model_strategy,
+                connection,
+                ctx.use_stealth,
+                headed,
+                chatgpt_surface_evidence_seen,
+            )
+            .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send)
+            .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
             pending_chatgpt_send_baseline = parse_chatgpt_send_baseline_from_stdout(&stdout);
             chatgpt_stage.mark_send_succeeded();
 
@@ -1072,7 +1090,7 @@ fn run_recipe_with_connection(
         .as_millis()
         .min(u128::from(u64::MAX)) as u64;
     let payload = if is_chatgpt_recipe {
-        chatgpt_recipe_payload_from_steps(&events, ctx.fallback_used)
+        chatgpt_recipe_payload_from_steps(&events, ctx.fallback_used, ctx.model_strategy)
     } else if is_claude_recipe {
         claude_recipe_payload_from_steps(
             &events,
@@ -1105,6 +1123,10 @@ fn run_recipe_with_connection(
             "model_used": payload.get("model_used").cloned().unwrap_or(Value::Null),
             "model_selection_status": payload
                 .get("model_selection_status")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "final_model_selection": payload
+                .get("final_model_selection")
                 .cloned()
                 .unwrap_or(Value::Null),
             "warnings": payload
@@ -1168,10 +1190,15 @@ fn record_builtin_step_event(
     Ok(())
 }
 
-fn chatgpt_recipe_payload_from_steps(steps: &[Value], fallback_used: bool) -> Value {
+fn chatgpt_recipe_payload_from_steps(
+    steps: &[Value],
+    fallback_used: bool,
+    model_strategy: chatgpt_recipe::ChatgptModelStrategy,
+) -> Value {
     let mut response = Value::Null;
     let mut model_used = Value::Null;
     let mut model_selection_status = chatgpt_recipe::ChatgptModelSelectionStatus::Unavailable;
+    let mut final_model_selection = Value::Null;
     let mut warnings: Vec<String> = Vec::new();
 
     for step in steps {
@@ -1180,13 +1207,39 @@ fn chatgpt_recipe_payload_from_steps(steps: &[Value], fallback_used: bool) -> Va
             .and_then(Value::as_str)
             .unwrap_or_default();
         let stdout = step.get("stdout").unwrap_or(&Value::Null);
-        if action == CHATGPT_SELECT_MODEL_ACTION {
+        if action == CHATGPT_SELECT_MODEL_ACTION || action == CHATGPT_SEND_ACTION {
             if let Some(value) = stdout.get("model_used").cloned() {
                 model_used = value;
             }
             if let Some(value) = stdout.get("model_selection_status").cloned() {
                 if let Ok(status) = serde_json::from_value(value) {
                     model_selection_status = status;
+                }
+            }
+            if action == CHATGPT_SEND_ACTION {
+                if let Some(value) = stdout.get("final_model_selection").cloned() {
+                    final_model_selection = value;
+                }
+                if let Some(value) = stdout
+                    .get("final_model_selection")
+                    .and_then(|selection| selection.get("model_used"))
+                    .cloned()
+                {
+                    model_used = value;
+                }
+                if let Some(value) = stdout
+                    .get("final_model_selection")
+                    .and_then(|selection| selection.get("status"))
+                    .and_then(Value::as_str)
+                {
+                    model_selection_status = match value {
+                        "selected" => chatgpt_recipe::ChatgptModelSelectionStatus::Selected,
+                        "current" => chatgpt_recipe::ChatgptModelSelectionStatus::Current,
+                        "mismatch" | "selection-mismatch" => {
+                            chatgpt_recipe::ChatgptModelSelectionStatus::Mismatch
+                        }
+                        _ => chatgpt_recipe::ChatgptModelSelectionStatus::Unavailable,
+                    };
                 }
             }
         }
@@ -1210,9 +1263,10 @@ fn chatgpt_recipe_payload_from_steps(steps: &[Value], fallback_used: bool) -> Va
         transport: "agent-browser".to_string(),
         backend: "agent-browser".to_string(),
         response: response.as_str().unwrap_or_default().to_string(),
-        model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
+        model_strategy,
         model_used: model_used.as_str().map(str::to_owned),
         model_selection_status,
+        final_model_selection: (!final_model_selection.is_null()).then_some(final_model_selection),
         warnings,
         fallback_used,
         delivery_mode: chatgpt_recipe::ChatgptDeliveryMode::FileUpload,
@@ -1984,10 +2038,27 @@ fn run_chatgpt_select_model(
     use_stealth: bool,
     headed: bool,
 ) -> Result<String> {
-    let requested_model = crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL;
-    let function = chatgpt_web::build_model_selection_function(
+    run_chatgpt_select_model_with_surface_evidence(_ctx, connection, use_stealth, headed, false)
+}
+
+fn run_chatgpt_select_model_with_surface_evidence(
+    _ctx: &RecipeContext,
+    connection: Option<&BrowserConnection>,
+    use_stealth: bool,
+    headed: bool,
+    prior_surface_evidence_seen: bool,
+) -> Result<String> {
+    let model_strategy = _ctx.model_strategy;
+    let requested_model = match model_strategy {
+        chatgpt_recipe::ChatgptModelStrategy::Select => {
+            crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL
+        }
+        chatgpt_recipe::ChatgptModelStrategy::Current => "current",
+    };
+    let function = chatgpt_web::build_model_selection_function_with_surface_evidence(
         requested_model,
-        chatgpt_recipe::ChatgptModelStrategy::Select,
+        model_strategy,
+        prior_surface_evidence_seen,
     );
     let expression = chatgpt_web::wrap_function_source_for_json_eval(&function)?;
     let stdout = run_agent_browser_with_connection_timeout(
@@ -2009,18 +2080,32 @@ fn run_chatgpt_select_model(
         chatgpt_web::chatgpt_model_selection_status(&selection, requested_model);
     match status {
         "selected"
-            if model_selection_status
+            if model_strategy == chatgpt_recipe::ChatgptModelStrategy::Select
+                && model_selection_status
                 == chatgpt_recipe::ChatgptModelSelectionStatus::Selected =>
         {
             Ok(json!({
                 "status": "ok",
                 "model_used": model_used,
                 "model_selection_status": model_selection_status,
+                "surface_evidence_seen": selection_surface_evidence_seen(&selection),
             })
             .to_string())
         }
-        "selected" => Err(anyhow!(
-            "ChatGPT reported selected without verified GPT-5.6 Sol maximum-tier proof"
+        "current"
+            if model_strategy == chatgpt_recipe::ChatgptModelStrategy::Current
+                && model_selection_status == chatgpt_recipe::ChatgptModelSelectionStatus::Current =>
+        {
+            Ok(json!({
+                "status": "ok",
+                "model_used": model_used,
+                "model_selection_status": model_selection_status,
+                "surface_evidence_seen": selection_surface_evidence_seen(&selection),
+            })
+            .to_string())
+        }
+        "selected" | "current" => Err(anyhow!(
+            "ChatGPT returned model selection status `{status}` for strategy `{model_strategy:?}`"
         )),
         "missing-selector" => Err(anyhow!(
             "ChatGPT model selector button not found. url={:?}, title={:?}",
@@ -2066,6 +2151,14 @@ fn run_chatgpt_select_model(
         )),
         other => Err(anyhow!("unexpected ChatGPT model selection status `{other}`")),
     }
+}
+
+fn selection_surface_evidence_seen(selection: &Value) -> bool {
+    selection
+        .get("surface_evidence_seen")
+        .or_else(|| selection.get("surfaceEvidenceSeen"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn run_chatgpt_open_attachment_ui(
@@ -2282,16 +2375,24 @@ fn run_chatgpt_wait_upload(
 }
 
 fn run_chatgpt_send(
+    requested_model: &str,
+    model_strategy: chatgpt_recipe::ChatgptModelStrategy,
     connection: Option<&BrowserConnection>,
     use_stealth: bool,
     headed: bool,
+    prior_surface_evidence_seen: bool,
 ) -> Result<String> {
-    let expression = chatgpt_web::wrap_function_source_for_json_eval(
-        &chatgpt_web::build_send_button_click_function(),
-    )?;
     let started_at = Instant::now();
+    let mut surface_evidence_seen = prior_surface_evidence_seen;
 
     loop {
+        let expression = chatgpt_web::wrap_function_source_for_json_eval(
+            &chatgpt_web::build_send_button_click_function_with_model_selection_for(
+                requested_model,
+                model_strategy,
+                surface_evidence_seen,
+            ),
+        )?;
         let stdout = run_agent_browser_with_connection_timeout(
             vec!["eval".to_string(), expression.clone()],
             OutputFormat::Text,
@@ -2302,18 +2403,82 @@ fn run_chatgpt_send(
         )?;
         let result: Value = parse_stdout_json(&stdout)
             .with_context(|| format!("parse ChatGPT send result: {stdout}"))?;
+        surface_evidence_seen = surface_evidence_seen
+            || result
+                .get("surfaceEvidenceSeen")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
         match result
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("unknown")
         {
             "sent" => {
+                let final_selection_raw = result
+                    .get("finalModelSelection")
+                    .filter(|value| value.is_object())
+                    .ok_or_else(|| {
+                        anyhow!("ChatGPT send proof did not return a final model selection receipt")
+                    })
+                    .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion)?;
+                if final_selection_raw
+                    .get("clickBound")
+                    .and_then(Value::as_bool)
+                    != Some(true)
+                {
+                    return Err(anyhow!(
+                        "ChatGPT final model selection proof was not bound to the send click: {}",
+                        final_selection_raw
+                    ))
+                    .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion);
+                }
+                let final_status = chatgpt_web::chatgpt_model_selection_status(
+                    final_selection_raw,
+                    requested_model,
+                );
+                let expected_status = match model_strategy {
+                    chatgpt_recipe::ChatgptModelStrategy::Select => {
+                        chatgpt_recipe::ChatgptModelSelectionStatus::Selected
+                    }
+                    chatgpt_recipe::ChatgptModelStrategy::Current => {
+                        chatgpt_recipe::ChatgptModelSelectionStatus::Current
+                    }
+                };
+                if final_status != expected_status {
+                    return Err(anyhow!(
+                        "ChatGPT final model selection proof used unexpected strategy status: expected {:?}, got {:?}: {}",
+                        expected_status,
+                        final_status,
+                        final_selection_raw
+                    ))
+                    .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion);
+                }
                 let baseline = parse_chatgpt_send_baseline(&result)
-                    .ok_or_else(|| anyhow!("missing assistant baseline in ChatGPT send payload"))?;
+                    .ok_or_else(|| anyhow!("missing assistant baseline in ChatGPT send payload"))
+                    .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion)?;
+                let model_used = chatgpt_web::select_reported_chatgpt_model(
+                    final_selection_raw,
+                    requested_model,
+                );
+                let final_selection =
+                    chatgpt_web::canonical_chatgpt_final_model_selection(final_selection_raw);
+                chatgpt_web::validate_chatgpt_final_model_selection(
+                    &final_selection,
+                    model_strategy,
+                )
+                .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion)?;
+                let model_selection_status = match final_status {
+                    chatgpt_recipe::ChatgptModelSelectionStatus::Selected => "selected",
+                    chatgpt_recipe::ChatgptModelSelectionStatus::Current => "current",
+                    _ => unreachable!("expected ChatGPT model selection status was checked above"),
+                };
                 return Ok(json!({
                     "status": "ok",
                     "assistantCountBeforeSend": baseline.assistant_msg_count,
                     "assistantLastLenBeforeSend": baseline.assistant_last_len,
+                    "model_used": model_used,
+                    "model_selection_status": model_selection_status,
+                    "final_model_selection": final_selection,
                 })
                 .to_string());
             }
@@ -2323,6 +2488,26 @@ fn run_chatgpt_send(
                     return Err(anyhow!(
                         "ChatGPT send button never became enabled after typing. {}",
                         diagnostics
+                    ));
+                }
+                thread::sleep(Duration::from_millis(CHATGPT_SEND_ENABLE_POLL_INTERVAL_MS));
+            }
+            "surface-not-ready" => {
+                let diagnostics = result.get("diagnostics").cloned().unwrap_or(Value::Null);
+                if started_at.elapsed() >= Duration::from_millis(CHATGPT_SEND_ENABLE_TIMEOUT_MS) {
+                    return Err(anyhow!(
+                        "ChatGPT Chat surface was not verified immediately before send. {}",
+                        diagnostics
+                    ));
+                }
+                thread::sleep(Duration::from_millis(CHATGPT_SEND_ENABLE_POLL_INTERVAL_MS));
+            }
+            "model-not-ready" => {
+                let selection = result.get("modelSelection").cloned().unwrap_or(Value::Null);
+                if started_at.elapsed() >= Duration::from_millis(CHATGPT_SEND_ENABLE_TIMEOUT_MS) {
+                    return Err(anyhow!(
+                        "ChatGPT GPT-5.6 Sol was not verified in the same browser operation as send. {}",
+                        selection
                     ));
                 }
                 thread::sleep(Duration::from_millis(CHATGPT_SEND_ENABLE_POLL_INTERVAL_MS));
@@ -6027,6 +6212,7 @@ mod tests {
             fallback_used: false,
             use_stealth: true,
             headed: false,
+            model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
             target_url: CHATGPT_URL.to_string(),
             warnings: Vec::new(),
             vars: BTreeMap::from([(
@@ -6183,7 +6369,7 @@ case "$*" in
     elif [ "$count" = "2" ]; then
       printf '{"status":"marked"}'
     else
-      printf '{"status":"sent","assistantCountBeforeSend":0,"assistantLastLenBeforeSend":0}'
+      printf '%s' '{"status":"sent","assistantCountBeforeSend":0,"assistantLastLenBeforeSend":0,"finalModelSelection":{"status":"selected","modelUsed":"GPT-5.6 Sol Pro","requested":"gpt-5-6-sol-chat-pro","familyStatus":"verified","effortStatus":"verified","pickerFamilyStatus":"verified","pickerEffortStatus":"verified","pickerShape":"personal","postCloseFamilyStatus":"verified","postCloseEffortStatus":"verified","closedPillFamilyStatus":"skipped","closedPillEffortStatus":"verified","closedPillText":"Pro","pickerCloseVerification":{"picker_surface_closed":true,"model_trigger_closed":true,"family_trigger_closed":true,"closed_pill_pro":true},"clickBound":true,"clickBoundClosedPillText":"Pro","clickBoundClosedPillFamilyStatus":"skipped","clickBoundClosedPillEffortStatus":"verified","surfaceEvidenceSeen":false,"surfaceProofKind":"implicit_chat_composer_aria","surfaceVisibleToggleCount":0,"surfaceComposerAria":"Chat with ChatGPT","surfaceObservedValues":[],"surfaceChatState":null,"surfaceWorkState":null}}'
     fi
     ;;
 esac
@@ -6214,7 +6400,7 @@ if %errorlevel%==0 (
   ) else if "!count!"=="2" (
     echo {"status":"marked"}
   ) else (
-    echo {"status":"sent","assistantCountBeforeSend":0,"assistantLastLenBeforeSend":0}
+    echo {"status":"sent","assistantCountBeforeSend":0,"assistantLastLenBeforeSend":0,"finalModelSelection":{"status":"selected","modelUsed":"GPT-5.6 Sol Pro","requested":"gpt-5-6-sol-chat-pro","familyStatus":"verified","effortStatus":"verified","pickerFamilyStatus":"verified","pickerEffortStatus":"verified","pickerShape":"personal","postCloseFamilyStatus":"verified","postCloseEffortStatus":"verified","closedPillFamilyStatus":"skipped","closedPillEffortStatus":"verified","closedPillText":"Pro","pickerCloseVerification":{"picker_surface_closed":true,"model_trigger_closed":true,"family_trigger_closed":true,"closed_pill_pro":true},"clickBound":true,"clickBoundClosedPillText":"Pro","clickBoundClosedPillFamilyStatus":"skipped","clickBoundClosedPillEffortStatus":"verified","surfaceEvidenceSeen":false,"surfaceProofKind":"implicit_chat_composer_aria","surfaceVisibleToggleCount":0,"surfaceComposerAria":"Chat with ChatGPT","surfaceObservedValues":[],"surfaceChatState":null,"surfaceWorkState":null}}
   )
 )
 "#,
@@ -8081,6 +8267,20 @@ steps:
             }),
             json!({
                 "type": "browser_step",
+                "action": CHATGPT_SEND_ACTION,
+                "stdout": {
+                    "status": "ok",
+                    "model_used": "GPT-5.6 Sol Pro",
+                    "model_selection_status": "selected",
+                    "final_model_selection": {
+                        "status": "selected",
+                        "model_used": "GPT-5.6 Sol Pro",
+                        "click_bound": true
+                    }
+                }
+            }),
+            json!({
+                "type": "browser_step",
                 "action": CHATGPT_WAIT_ACTION,
                 "stdout": {
                     "status": "ok",
@@ -8090,19 +8290,28 @@ steps:
             }),
         ];
 
-        let payload = chatgpt_recipe_payload_from_steps(&steps, true);
+        let payload = chatgpt_recipe_payload_from_steps(
+            &steps,
+            true,
+            chatgpt_recipe::ChatgptModelStrategy::Select,
+        );
         assert_eq!(payload["transport"], "agent-browser");
         assert_eq!(payload["backend"], "agent-browser");
         assert_eq!(payload["response"], "final answer");
         assert_eq!(payload["model_used"], "GPT-5.6 Sol Pro");
         assert_eq!(payload["model_selection_status"], "selected");
+        assert_eq!(payload["final_model_selection"]["click_bound"], true);
         assert_eq!(payload["fallback_used"], true);
         assert_eq!(payload["warnings"], json!(["used paste fallback"]));
         assert_eq!(payload["delivery_mode"], "file_upload");
         assert_eq!(payload["auto_paste_fallback"], false);
         assert_eq!(payload["steps"], json!(steps));
 
-        let primary_payload = chatgpt_recipe_payload_from_steps(&steps, false);
+        let primary_payload = chatgpt_recipe_payload_from_steps(
+            &steps,
+            false,
+            chatgpt_recipe::ChatgptModelStrategy::Select,
+        );
         assert_eq!(primary_payload["fallback_used"], false);
     }
 
@@ -8281,6 +8490,23 @@ steps:
     fn parse_stdout_json_keeps_plain_string_scalars_as_strings() {
         let parsed = parse_stdout_json(r#""1""#).expect("string scalar");
         assert_eq!(parsed, Value::String("1".into()));
+    }
+
+    #[test]
+    fn selection_surface_evidence_seen_is_fail_closed() {
+        assert!(selection_surface_evidence_seen(&serde_json::json!({
+            "surfaceEvidenceSeen": true
+        })));
+        assert!(selection_surface_evidence_seen(&serde_json::json!({
+            "surface_evidence_seen": true
+        })));
+        assert!(!selection_surface_evidence_seen(&serde_json::json!({
+            "surfaceEvidenceSeen": false
+        })));
+        assert!(!selection_surface_evidence_seen(&serde_json::json!({
+            "surfaceEvidenceSeen": "true"
+        })));
+        assert!(!selection_surface_evidence_seen(&serde_json::json!({})));
     }
 
     #[test]
