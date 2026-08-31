@@ -3150,13 +3150,17 @@ fn instance_socket_binding_matches(
     {
         return false;
     }
-    instance_socket_path_candidates(
+    let candidates = instance_socket_path_candidates(
         paths,
         &record.socket_base_path,
         &record.instance.native_instance_id,
-    )
-    .iter()
-    .any(|candidate| candidate == &record.instance.socket_path)
+    );
+    let explicit_base_is_selected = env::var_os("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET")
+        .is_some_and(|value| Path::new(&value) == record.socket_base_path);
+    (explicit_base_is_selected && record.instance.socket_path == record.socket_base_path)
+        || candidates
+            .iter()
+            .any(|candidate| candidate == &record.instance.socket_path)
 }
 
 #[cfg(not(unix))]
@@ -4265,12 +4269,28 @@ mod native_host_unix {
         paths: &ExtensionPaths,
         native_instance_id: &str,
     ) -> Result<(UnixListener, PathBuf)> {
+        let explicit_socket = env::var_os("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET").is_some();
+        if explicit_socket
+            && unix_socket_path_fits(&paths.socket_path)
+            && !active_socket_exists(&paths.socket_path)
+        {
+            ensure_socket_parent_path(paths, &paths.socket_path)?;
+            remove_stale_socket(&paths.socket_path)?;
+            let listener = UnixListener::bind(&paths.socket_path)
+                .with_context(|| format!("bind {}", paths.socket_path.display()))?;
+            return Ok((listener, paths.socket_path.clone()));
+        }
+
         let socket_path = instance_socket_path(paths, native_instance_id);
         ensure_socket_parent_path(paths, &socket_path)?;
         remove_stale_socket(&socket_path)?;
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("bind {}", socket_path.display()))?;
         Ok((listener, socket_path))
+    }
+
+    fn active_socket_exists(path: &Path) -> bool {
+        path.exists() && UnixStream::connect(path).is_ok()
     }
 
     fn instance_socket_path(paths: &ExtensionPaths, native_instance_id: &str) -> PathBuf {
@@ -4538,7 +4558,10 @@ mod native_host_unix {
             sequence,
         });
         if let Some(identity) = terminal_identity.as_ref() {
-            if extension_session.terminal_job_ids.contains(identity)
+            if extension_session
+                .terminal_job_ids
+                .iter()
+                .any(|known| terminal_job_matches(known, identity))
                 || terminal_delivery_receipt_exists(paths, identity)?
             {
                 eprintln!(
@@ -4772,6 +4795,15 @@ mod native_host_unix {
             .join(format!("{}.json", hex::encode(digest.finalize())))
     }
 
+    fn terminal_job_matches(
+        left: &TerminalDeliveryIdentity,
+        right: &TerminalDeliveryIdentity,
+    ) -> bool {
+        left.job_id == right.job_id
+            && left.run_id == right.run_id
+            && left.workspace_id == right.workspace_id
+    }
+
     fn terminal_delivery_receipt_exists(
         paths: &ExtensionPaths,
         identity: &TerminalDeliveryIdentity,
@@ -4843,7 +4875,9 @@ mod native_host_unix {
                 .as_u64()
                 .map(Some)
                 .context("terminal envelope payload.sequence must be a u64"),
-            None => Ok(None),
+            // Older extensions omitted the sequence. Treat their first terminal
+            // delivery as sequence zero so deduplication and ACK remain compatible.
+            None => Ok(Some(0)),
         }
     }
 
@@ -6522,6 +6556,8 @@ mod tests {
     #[cfg(unix)]
     #[serial]
     fn explicit_socket_env_derives_instance_specific_socket_paths() {
+        use std::os::unix::net::UnixListener;
+
         let dir = TempDir::new().unwrap();
         let explicit = dir.path().join("explicit.sock");
         let _socket_guard = EnvGuard::set("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET", &explicit);
@@ -6532,6 +6568,7 @@ mod tests {
         let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
 
         let paths = extension_paths().unwrap();
+        let _base_listener = UnixListener::bind(&explicit).unwrap();
         let (_listener, socket_path) =
             native_host_unix::bind_native_host_listener(&paths, "native_test").unwrap();
 
@@ -6540,6 +6577,43 @@ mod tests {
             explicit.with_file_name("explicit.sock-native_test")
         );
         assert_ne!(socket_path, paths.socket_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn instance_socket_binding_accepts_explicit_base_path() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("explicit.sock");
+        let _socket_guard = EnvGuard::set("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET", &base);
+        let paths = ExtensionPaths {
+            state_dir: dir.path().join("state"),
+            instances_dir: dir.path().join(INSTANCES_DIRNAME),
+            manifest_path: dir.path().join("manifest.json"),
+            wrapper_path: dir.path().join("wrapper"),
+            socket_path: base.clone(),
+            token_path: dir.path().join(TOKEN_FILENAME),
+            status_path: dir.path().join(STATUS_FILENAME),
+        };
+        let record = PersistedExtensionInstanceRecord {
+            instance: ExtensionInstanceStatus {
+                native_instance_id: "native_explicit_base".to_string(),
+                socket_path: base.clone(),
+                pid: process::id(),
+                extension_instance_id: None,
+                extension_version: None,
+                profile_email: None,
+                profile_id: None,
+                recipes: default_extension_recipes(),
+                capabilities: Vec::new(),
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 1,
+            },
+            socket_binding_version: INSTANCE_SOCKET_BINDING_VERSION,
+            socket_base_path: base,
+        };
+
+        assert!(instance_socket_binding_matches(&paths, &record));
     }
 
     #[test]
