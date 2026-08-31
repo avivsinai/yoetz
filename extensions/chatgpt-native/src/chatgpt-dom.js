@@ -23,22 +23,44 @@ const MANUAL_HANDOFF_SHELL_SELECTORS = Object.freeze([
 ]);
 
 export function ownedWindowName(job) {
-  return `${YOETZ_WINDOW_PREFIX}${job.run_id}:${job.job_id}`;
+  const base = `${YOETZ_WINDOW_PREFIX}${job.run_id}:${job.job_id}`;
+  const workspaceId = String(job?.workspace_id ?? "");
+  const ownershipNonce = String(job?.ownership_nonce ?? "");
+  return workspaceId || ownershipNonce
+    ? `${base}|${encodeURIComponent(workspaceId)}|${encodeURIComponent(ownershipNonce)}`
+    : base;
 }
 
 export function parseOwnedWindowName(value) {
   if (typeof value !== "string" || !value.startsWith(YOETZ_WINDOW_PREFIX)) {
     return null;
   }
-  const rest = value.slice(YOETZ_WINDOW_PREFIX.length);
-  const separator = rest.lastIndexOf(":");
-  if (separator <= 0 || separator === rest.length - 1) {
+  const [identity, workspaceId, ownershipNonce] = value
+    .slice(YOETZ_WINDOW_PREFIX.length)
+    .split("|");
+  const separator = identity.lastIndexOf(":");
+  if (separator <= 0 || separator === identity.length - 1) {
     return null;
   }
-  return {
-    run_id: rest.slice(0, separator),
-    job_id: rest.slice(separator + 1)
+  const parsed = {
+    run_id: identity.slice(0, separator),
+    job_id: identity.slice(separator + 1)
   };
+  if (workspaceId) {
+    parsed.workspace_id = decodeMarkerField(workspaceId);
+  }
+  if (ownershipNonce) {
+    parsed.ownership_nonce = decodeMarkerField(ownershipNonce);
+  }
+  return parsed.workspace_id === null || parsed.ownership_nonce === null ? null : parsed;
+}
+
+function decodeMarkerField(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
 }
 
 export function chatgptJobUrl(runId) {
@@ -190,12 +212,25 @@ export function markOwnership(root, job) {
   }
   target.setAttribute(OWNERSHIP_ATTR, job.job_id);
   target.setAttribute("data-yoetz-run-id", job.run_id);
+  if (job.workspace_id) {
+    target.setAttribute("data-yoetz-workspace-id", job.workspace_id);
+  }
+  if (job.ownership_nonce) {
+    target.setAttribute("data-yoetz-ownership-nonce", job.ownership_nonce);
+  }
   return true;
 }
 
 export function assertOwnedPage(win, job) {
   const parsed = parseOwnedWindowName(win.name);
-  return parsed?.job_id === job.job_id && parsed?.run_id === job.run_id;
+  return ownershipMatchesJob(parsed, job);
+}
+
+function ownershipMatchesJob(parsed, job) {
+  return parsed?.job_id === job?.job_id
+    && parsed?.run_id === job?.run_id
+    && (job?.workspace_id == null || parsed?.workspace_id === job.workspace_id)
+    && (job?.ownership_nonce == null || parsed?.ownership_nonce === job.ownership_nonce);
 }
 
 export async function insertPrompt(root, prompt, options = {}) {
@@ -3127,17 +3162,35 @@ export function isResponseGenerating(root = document) {
 // one is rendered. Mirrors isResponseGenerating's selector list so we click the
 // same affordance we use to detect ongoing generation. Returns true if a stop
 // control was found and clicked, false if generation was already idle.
-// Never throws — cancel is best-effort and a missing stop button is normal when
-// the response has already settled or the page navigated away.
-export function clickStopGenerating(root = document) {
-  const button = firstVisible(root, [
+// Page teardown remains best-effort; an explicit beforeStopClick authorization
+// failure propagates so the caller can report that ownership was unverified.
+function findStopGenerating(root = document) {
+  return firstVisible(root, [
     'button[data-testid*="stop"]',
     'button[aria-label*="Stop generating" i]',
     'button[aria-label*="Stop streaming" i]'
   ]);
+}
+
+export function clickStopGenerating(root = document) {
+  const button = findStopGenerating(root);
   if (!button) {
     return false;
   }
+  try {
+    button.click();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function clickStopGeneratingAuthorized(root, beforeStopClick) {
+  const button = findStopGenerating(root);
+  if (!button) {
+    return false;
+  }
+  await beforeStopClick();
   try {
     button.click();
     return true;
@@ -3156,11 +3209,14 @@ export function clickStopGenerating(root = document) {
 // Bounded loop (default ≤5s, 250ms interval) with ONE extra re-click if the
 // stop control is still present after the first interval (covers a click that
 // landed on a stale/transitional button). Returns { stopped, confirmed_idle,
-// waited_ms }. Never throws — cancel is best-effort and a torn-down or
-// navigated page must not turn into a hard error.
+// waited_ms }. Page teardown is best-effort, but beforeStopClick authorization
+// failures propagate so a stale owner cannot click a reused Stop control.
 export async function confirmGenerationStopped(root = document, options = {}) {
   const timeoutMs = Number(options.timeoutMs ?? 5000);
   const intervalMs = Number(options.intervalMs ?? 250);
+  const beforeStopClick = typeof options.beforeStopClick === "function"
+    ? options.beforeStopClick
+    : null;
   const startedAt = Date.now();
   let stopped = false;
   let reclicked = false;
@@ -3169,7 +3225,9 @@ export async function confirmGenerationStopped(root = document, options = {}) {
     if (!isResponseGenerating(root)) {
       return { stopped: false, confirmed_idle: true, waited_ms: 0 };
     }
-    stopped = clickStopGenerating(root);
+    stopped = beforeStopClick
+      ? await clickStopGeneratingAuthorized(root, beforeStopClick)
+      : clickStopGenerating(root);
     while (Date.now() - startedAt < timeoutMs) {
       await sleep(intervalMs);
       if (!isResponseGenerating(root)) {
@@ -3179,7 +3237,10 @@ export async function confirmGenerationStopped(root = document, options = {}) {
       // first click hit a transitional control, then keep polling.
       if (!reclicked) {
         reclicked = true;
-        if (clickStopGenerating(root)) {
+        const clicked = beforeStopClick
+          ? await clickStopGeneratingAuthorized(root, beforeStopClick)
+          : clickStopGenerating(root);
+        if (clicked) {
           stopped = true;
         }
       }
@@ -3187,7 +3248,10 @@ export async function confirmGenerationStopped(root = document, options = {}) {
     // Timed out still generating: report not-idle so the caller can warn the
     // user the run may still be live server-side.
     return { stopped, confirmed_idle: false, waited_ms: Date.now() - startedAt };
-  } catch {
+  } catch (error) {
+    if (error?.code === "ownership_unverified") {
+      throw error;
+    }
     // Page torn down / navigated mid-poll. Treat as best-effort: we clicked
     // (maybe), we cannot confirm idle.
     return { stopped, confirmed_idle: false, waited_ms: Date.now() - startedAt };

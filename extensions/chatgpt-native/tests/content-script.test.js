@@ -13,19 +13,28 @@ export { fetchConversationAnswer };
 const hooks = globalThis.__contentScriptTestHooks;
 
 export function ownedWindowName(job) {
-  return \`yoetz-chatgpt-native:\${job.run_id}:\${job.job_id}\`;
+  const base = \`yoetz-chatgpt-native:\${job.run_id}:\${job.job_id}\`;
+  return job.workspace_id || job.ownership_nonce
+    ? \`\${base}|\${encodeURIComponent(job.workspace_id ?? "")}|\${encodeURIComponent(job.ownership_nonce ?? "")}\`
+    : base;
 }
 
 export function parseOwnedWindowName(value) {
   if (typeof value !== "string" || !value.startsWith("yoetz-chatgpt-native:")) {
     return null;
   }
-  const rest = value.slice("yoetz-chatgpt-native:".length);
-  const separator = rest.lastIndexOf(":");
-  return separator > 0 ? {
-    run_id: rest.slice(0, separator),
-    job_id: rest.slice(separator + 1)
-  } : null;
+  const [identity, workspaceId, ownershipNonce] = value
+    .slice("yoetz-chatgpt-native:".length)
+    .split("|");
+  const separator = identity.lastIndexOf(":");
+  if (separator <= 0 || separator === identity.length - 1) return null;
+  const parsed = {
+    run_id: identity.slice(0, separator),
+    job_id: identity.slice(separator + 1)
+  };
+  if (workspaceId) parsed.workspace_id = decodeURIComponent(workspaceId);
+  if (ownershipNonce) parsed.ownership_nonce = decodeURIComponent(ownershipNonce);
+  return parsed;
 }
 
 export function getPageText() {
@@ -207,6 +216,7 @@ const dom = {
 export const siteAdapter = {
   recipe: hooks.recipe ?? "chatgpt",
   displayName: "ChatGPT",
+  homeUrl: "https://chatgpt.com/",
   dom,
   fetchConversationAnswer,
   conversationIdFromUrl(value) {
@@ -229,6 +239,9 @@ export const siteAdapter = {
   },
   isConversationUrl(value) {
     return Boolean(this.conversationIdFromUrl(value));
+  },
+  isAllowedTabUrl(value) {
+    return String(value ?? "").startsWith("https://chatgpt.com/");
   }
 };`;
 
@@ -599,7 +612,7 @@ test("content script inspect labels model diagnostics as current chip state", as
     "https://chatgpt.com/c/conv-123?_yoetz=run-inspect"
   );
   try {
-    globalThis.window.name = "yoetz-chatgpt-native:run-inspect:job-inspect";
+    globalThis.window.name = "yoetz-chatgpt-native:run-inspect:job-inspect|workspace_test|nonce-inspect";
     hooks.modelSelectionDiagnostics = {
       modelChip: "GPT-5.6 Sol Pro",
       modelVerified: true
@@ -607,13 +620,36 @@ test("content script inspect labels model diagnostics as current chip state", as
 
     const response = await send({
       type: "yoetz_inspect_page",
+      job_id: "job-inspect",
       run_id: "run-inspect",
+      workspace_id: "workspace_test",
+      ownership_nonce: "nonce-inspect",
       recipe: "chatgpt"
     });
 
     assert.equal(response.ok, true);
     assert.deepEqual(response.payload.current_model_chip_state, hooks.modelSelectionDiagnostics);
     assert.equal(response.payload.model_selection, undefined);
+  } finally {
+    restore();
+  }
+});
+
+test("content script inspect rejects a conversation-only match without durable ownership", async () => {
+  const { send, restore } = await loadContentScript(
+    "inspect_unowned_conversation",
+    "https://chatgpt.com/c/conv-123"
+  );
+  try {
+    const response = await send({
+      type: "yoetz_inspect_page",
+      run_id: "conv-123",
+      workspace_id: "workspace_test",
+      recipe: "chatgpt"
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "run_mismatch");
   } finally {
     restore();
   }
@@ -1117,6 +1153,38 @@ test("content script requires the surviving window.name marker for conversation 
 
     assert.equal(extracted.ok, false);
     assert.match(extracted.error, /ownership marker mismatch/);
+  } finally {
+    restore();
+  }
+});
+
+test("content script verifies durable tab ownership without requiring in-memory active state", async () => {
+  const { send, restore, location } = await loadContentScript(
+    "durable_ownership_probe",
+    "https://chatgpt.com/?_yoetz=run_durable_ownership"
+  );
+  try {
+    const job = {
+      job_id: "job_durable_ownership",
+      run_id: "run_durable_ownership",
+      workspace_id: "workspace_test",
+      ownership_nonce: "nonce_durable_ownership"
+    };
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+    const verified = await send({ type: "yoetz_verify_job_ownership", job });
+    assert.equal(verified.ok, true, JSON.stringify(verified));
+    assert.equal(verified.payload.owned, true);
+    assert.equal(verified.payload.job_id, job.job_id);
+    assert.equal(verified.payload.run_id, job.run_id);
+    assert.equal(verified.payload.workspace_id, job.workspace_id);
+    assert.equal(verified.payload.ownership_nonce, job.ownership_nonce);
+    assert.equal(verified.payload.origin, "https://chatgpt.com");
+
+    location.href = "https://chatgpt.com/?_yoetz=run_other";
+    const rejected = await send({ type: "yoetz_verify_job_ownership", job });
+    assert.equal(rejected.ok, false);
+    assert.equal(rejected.code, "ownership_unverified");
   } finally {
     restore();
   }

@@ -95,9 +95,13 @@ async function handleMessage(message) {
       return fetchSiteConversationAnswer(message.job, message.conversation_id);
     case "yoetz_cancel_send":
       return cancelSend(message.job);
+    case "yoetz_verify_job_ownership":
+      return verifyJobOwnership(message.job);
     case "yoetz_inspect_page":
       return inspectPage(message.run_id, {
-        conversation_id: message.conversation_id,
+        job_id: message.job_id,
+        workspace_id: message.workspace_id,
+        ownership_nonce: message.ownership_nonce,
         include_page_text: Boolean(message.include_page_text),
         recipe: message.recipe
       });
@@ -199,14 +203,16 @@ function contentScriptCommandHasSideEffect(command, job) {
 // can report a truthful stop status to the CLI.
 //
 // Intentionally does NOT call assertJobOwnership — the cancel may arrive after
-// the tab has navigated, lost its window.name marker, or after the content
-// script reloaded (in which case activeJobs is empty). Cancel is a kill, not a
-// safe-tab-only operation; the service worker is already going to remove the
-// tab right after this regardless of outcome. confirmGenerationStopped never
-// throws, so cancel stays best-effort.
+// the content script reloaded (in which case activeJobs is empty). Instead,
+// verify the durable marker and current conversation immediately before each
+// provider Stop click. The service worker also probes before sending this
+// command and before removing the tab.
 async function cancelSend(job) {
   const { confirmGenerationStopped } = await domHelpers(job);
-  const result = await confirmGenerationStopped(document);
+  const beforeStopClick = async () => {
+    await verifyJobOwnership(job);
+  };
+  const result = await confirmGenerationStopped(document, { beforeStopClick });
   return {
     stopped: Boolean(result?.stopped),
     confirmed_idle: Boolean(result?.confirmed_idle),
@@ -600,13 +606,16 @@ async function inspectPage(runId, options = {}) {
   const adapter = await siteAdapter(options.recipe);
   const { extractResponse, getPageText, modelSelectionDiagnostics, parseOwnedWindowName } = await domHelpers(options.recipe);
   const parsed = parseOwnedWindowName(window.name);
-  const urlRunId = runIdFromUrl(location.href);
   const conversationId = adapter.conversationIdFromUrl(location.href);
-  const conversationTarget = String(options.conversation_id ?? "").trim();
-  const runMatches = !runId || parsed?.run_id === runId || urlRunId === runId;
-  const conversationMatches = Boolean(conversationTarget && conversationId === conversationTarget);
-  if (!runMatches && !conversationMatches) {
-    throw commandError("run_mismatch", `tab is not owned by Yoetz run or conversation ${runId}`);
+  const jobId = String(options.job_id ?? "").trim();
+  const workspaceId = String(options.workspace_id ?? "").trim();
+  const ownershipNonce = String(options.ownership_nonce ?? "").trim();
+  const jobMatches = Boolean(jobId && parsed?.job_id === jobId);
+  const runMatches = Boolean(runId && parsed?.run_id === runId);
+  const workspaceMatches = Boolean(workspaceId && parsed?.workspace_id === workspaceId);
+  const nonceMatches = Boolean(ownershipNonce && parsed?.ownership_nonce === ownershipNonce);
+  if (!jobMatches || !runMatches || !workspaceMatches || !nonceMatches) {
+    throw commandError("run_mismatch", `tab is not owned by Yoetz job ${jobId || "(unknown)"}, run ${runId}, workspace ${workspaceId || "(unknown)"}`);
   }
   const extraction = extractResponse(document);
   const pageText = getPageText(document);
@@ -690,7 +699,7 @@ async function bindJob(job) {
     ? { phase: "upload", side_effect_started: false }
     : { phase: "wait_response", side_effect_started: true };
   const parsed = parseOwnedWindowName(window.name);
-  if (parsed?.job_id !== job.job_id || parsed?.run_id !== job.run_id) {
+  if (!ownershipMarkerMatchesJob(parsed, job)) {
     throw commandError(
       "ownership_lost",
       `tab ownership marker mismatch for job ${job.job_id}`,
@@ -730,6 +739,89 @@ async function bindJob(job) {
   };
 }
 
+async function verifyJobOwnership(job) {
+  const adapter = await siteAdapter(job);
+  const { parseOwnedWindowName } = adapter.dom;
+  const parsed = parseOwnedWindowName(window.name);
+  const urlRunId = runIdFromUrl(location.href);
+  const expectedOrigin = new URL(adapter.homeUrl).origin;
+  const currentOrigin = new URL(location.href).origin;
+  if (currentOrigin !== expectedOrigin || !adapter.isAllowedTabUrl(location.href)) {
+    throw commandError(
+      "ownership_unverified",
+      "tab origin is not an allowed " + adapter.displayName + " page",
+      {
+        phase: "upload",
+        side_effect_started: false,
+        expected_origin: expectedOrigin,
+        current_origin: currentOrigin,
+        current_url: location.href
+      }
+    );
+  }
+  if (!ownershipMarkerMatchesJob(parsed, job)) {
+    throw commandError(
+      "ownership_unverified",
+      "tab durable ownership marker does not match the requested job",
+      {
+        phase: "upload",
+        side_effect_started: false,
+        expected_job_id: job?.job_id ?? null,
+        expected_run_id: job?.run_id ?? null,
+        current_ownership: parsed,
+        current_url: location.href
+      }
+    );
+  }
+  if (urlRunId && urlRunId !== job.run_id) {
+    throw commandError(
+      "ownership_unverified",
+      "tab URL ownership marker does not match the requested run",
+      {
+        phase: "upload",
+        side_effect_started: false,
+        expected_run_id: job?.run_id ?? null,
+        current_url_run_id: urlRunId,
+        current_url: location.href
+      }
+    );
+  }
+  const expectedConversationId = expectedConversationIdForJob(job);
+  const currentConversationId = adapter.conversationIdFromUrl(location.href);
+  if (expectedConversationId
+      && currentConversationId !== expectedConversationId
+      && !isExpectedConversationIdAssignment(job, adapter, expectedConversationId, currentConversationId)) {
+    throw commandError(
+      "ownership_unverified",
+      "tab conversation does not match the requested job conversation",
+      {
+        phase: "upload",
+        side_effect_started: false,
+        requested_conversation_id: expectedConversationId,
+        current_conversation_id: currentConversationId,
+        current_url: location.href
+      }
+    );
+  }
+  return {
+    owned: true,
+    job_id: job.job_id,
+    run_id: job.run_id,
+    ...(job.workspace_id != null ? { workspace_id: job.workspace_id } : {}),
+    ...(job.ownership_nonce != null ? { ownership_nonce: job.ownership_nonce } : {}),
+    origin: currentOrigin,
+    window_name: window.name,
+    url: location.href
+  };
+}
+
+function ownershipMarkerMatchesJob(parsed, job) {
+  return parsed?.job_id === job?.job_id
+    && parsed?.run_id === job?.run_id
+    && (job?.workspace_id == null || parsed?.workspace_id === job.workspace_id)
+    && (job?.ownership_nonce == null || parsed?.ownership_nonce === job.ownership_nonce);
+}
+
 function assertJobOwnership(job, parseOwnedWindowName, options = {}) {
   const phase = options.phase ?? "upload";
   const sideEffectStarted = options.side_effect_started === true;
@@ -738,7 +830,7 @@ function assertJobOwnership(job, parseOwnedWindowName, options = {}) {
   if (!active?.prepare_complete) {
     throw new Error(`job ${job.job_id} is not active in this tab`);
   }
-  if (parsed?.job_id !== job.job_id || parsed?.run_id !== job.run_id) {
+  if (!ownershipMarkerMatchesJob(parsed, job)) {
     throw new Error(`tab ownership marker mismatch for job ${job.job_id}`);
   }
   if (options.requireConversation) {
