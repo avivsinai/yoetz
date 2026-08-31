@@ -4667,16 +4667,16 @@ mod native_host_unix {
         if let Some(mut delivery) = delivery {
             if let Err(err) = write_json_frame(&mut delivery.stream, &envelope) {
                 eprintln!("yoetz chrome native local client write failed for {job_id}: {err:#}");
-                if client_is_current_owner(&clients, &job_id, &delivery.owner_id) {
+                if client_is_current_owner(clients, &job_id, &delivery.owner_id) {
                     if let Some(cancel) = delivery.cancel_on_write_error {
                         let _ = forward_to_extension(stdout, &cancel);
                     }
                 }
-                remove_client_if_owner(&clients, &job_id, &delivery.owner_id);
+                remove_client_if_owner(clients, &job_id, &delivery.owner_id);
             } else {
                 if remove_client {
                     let removed_current_owner =
-                        remove_client_if_owner(&clients, &job_id, &delivery.owner_id).is_some();
+                        remove_client_if_owner(clients, &job_id, &delivery.owner_id).is_some();
                     if removed_current_owner {
                         delivered_terminal_sequence = terminal_sequence;
                     }
@@ -4705,7 +4705,7 @@ mod native_host_unix {
             }
 
             if remove_client {
-                remove_client_if_owner(&clients, &job_id, &delivery.owner_id);
+                remove_client_if_owner(clients, &job_id, &delivery.owner_id);
             }
         }
 
@@ -5964,6 +5964,7 @@ mod tests {
 
         let lock_file = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(dir.path().join("recipe.lock"))
