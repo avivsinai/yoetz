@@ -99,6 +99,11 @@ const MAX_NATIVE_OUTBOUND_BYTES = Math.max(
   Number(globalThis.__YOETZ_MAX_NATIVE_OUTBOUND_BYTES ?? 64 * 1024 * 1024) || 64 * 1024 * 1024
 );
 const MAX_PERSISTED_TERMINAL_ENVELOPE_BYTES = 1024 * 1024;
+const TERMINAL_RETRY_INTERVAL_MS = 30000;
+const TERMINAL_OUTBOX_KEY_PREFIX = "terminal-outbox.";
+const TERMINAL_ACK_KEY_PREFIX = "terminal-ack.";
+const CANCEL_PENDING_KEY_PREFIX = "cancel-pending.";
+const MAX_TERMINAL_ID_CHARS = 512;
 const WAITING_RESPONSE_PROGRESS_INTERVAL_MS = Math.max(50, Number(globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS ?? 60000) || 60000);
 const CONTENT_SCRIPT_RECONNECT_ATTEMPTS = Math.max(
   1,
@@ -151,7 +156,9 @@ const ATTACHMENT_TRACE_PENDING_LEGS = new Set([
 const jobs = new Map();
 const terminalJobIds = new Map();
 const contentScriptRecoveries = new Map();
+const cancellationOperations = new Map();
 const suspensionGates = new Map();
+const nativeRestorePromises = new Map();
 const chunks = new ChunkAssembler();
 let nativePort = null;
 let extensionIdentityPromise = null;
@@ -275,6 +282,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === HEARTBEAT_ALARM) {
     if (nativePort) {
       postNative(makeEnvelope("heartbeat", { payload: { status: "alive" } }));
+      void retryPendingTerminalJobs();
     } else {
       connectNative();
     }
@@ -297,16 +305,42 @@ function connectNative() {
     return;
   }
   try {
-    nativePort = chrome.runtime.connectNative(NATIVE_HOST);
+    const port = chrome.runtime.connectNative(NATIVE_HOST);
     connectionGeneration += 1;
-    nativePort.onMessage.addListener(handleNativeMessage);
-    nativePort.onDisconnect.addListener(handleNativeDisconnect);
+    const generation = connectionGeneration;
+    nativePort = port;
+    // A disconnected native port can still deliver queued callbacks after a
+    // replacement port is installed. Fence every callback by both identity and
+    // generation so an old connection cannot mutate or tear down the new one.
+    port.onMessage.addListener((message) => {
+      if (nativePort !== port || connectionGeneration !== generation) {
+        return;
+      }
+      void handleNativeMessage(message, port, generation);
+    });
+    port.onDisconnect.addListener(() => {
+      if (nativePort !== port || connectionGeneration !== generation) {
+        return;
+      }
+      handleNativeDisconnect(port, generation);
+    });
+    const restorePromise = reconcileAcknowledgedTerminalTombstones()
+      .then(() => restoreJobsFromStorage({ emitLostState: true }))
+      .then(() => retryPendingTerminalJobs());
+    nativeRestorePromises.set(generation, restorePromise);
+    void restorePromise.then(
+      () => {
+        if (nativeRestorePromises.get(generation) === restorePromise) {
+          nativeRestorePromises.delete(generation);
+        }
+      },
+      (error) => {
+        setStatus("restore_failed", String(error?.message ?? error));
+      }
+    );
     setStatus("connected");
     postHello();
     startHeartbeat();
-    restoreJobsFromStorage({ emitLostState: true }).catch((error) => {
-      setStatus("restore_failed", String(error?.message ?? error));
-    });
   } catch (error) {
     setStatus("missing_native_host", String(error?.message ?? error));
     scheduleReconnect();
@@ -326,10 +360,34 @@ function reconnectNative() {
   connectNative();
 }
 
-async function handleNativeMessage(message) {
+async function handleNativeMessage(message, sourcePort = nativePort, sourceGeneration = connectionGeneration) {
+  if (nativePort !== sourcePort || connectionGeneration !== sourceGeneration) {
+    return;
+  }
+  const restorePromise = nativeRestorePromises.get(sourceGeneration);
+  if (restorePromise) {
+    try {
+      await restorePromise;
+    } catch {
+      // Do not synthesize a terminal for a target that may exist only in the
+      // durable store. The next native connection retries restoration.
+      return;
+    }
+    if (nativePort !== sourcePort || connectionGeneration !== sourceGeneration) {
+      return;
+    }
+  }
   const validation = validateEnvelope(message);
   if (!validation.ok) {
-    const delivered = postNative(errorEnvelope(null, validation.code, validation.message, { request_id: message?.request_id }));
+    const delivered = await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), validation.code, validation.message, {
+        request_id: message?.request_id,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
     if (delivered && validation.code === "version_mismatch") {
       await setStatus("version_mismatch", validation.message);
     }
@@ -367,47 +425,120 @@ async function handleNativeMessage(message) {
         await handleTerminalAck(message);
         break;
       default:
-        postNative(errorEnvelope(message, "unsupported_type", `unsupported service-worker message ${message.type}`));
+        await postTerminalMessage(
+          message,
+          errorEnvelope(message, "unsupported_type", `unsupported service-worker message ${message.type}`),
+          { status: "failed", phase: "profile" }
+        );
     }
   } catch (error) {
+    if (["capability_mismatch", "run_mismatch"].includes(error?.code)) {
+      await postTerminalMessage(
+        message,
+        errorEnvelope(messageJob(message), error.code, String(error?.message ?? error), {
+          request_id: message?.request_id,
+          phase: error?.phase ?? "profile",
+          side_effect_started: false
+        }),
+        { status: "failed", phase: error?.phase ?? "profile" }
+      );
+      return;
+    }
     const job = message?.job_id ? jobs.get(message.job_id) : null;
     if (job) {
       await handlePollerError(job, error);
       return;
     }
     if (!terminalJobIds.has(message?.job_id)) {
-      postNative(errorEnvelope(message, "extension_error", String(error?.message ?? error), {
-        request_id: message?.request_id
-      }));
+      await postTerminalMessage(
+        message,
+        errorEnvelope(message, "extension_error", String(error?.message ?? error), {
+          request_id: message?.request_id,
+          phase: phaseForStatus(job?.status) ?? "profile",
+          side_effect_started: Boolean(job?.tab_id)
+        }),
+        { status: "failed", phase: phaseForStatus(job?.status) ?? "profile" }
+      );
     }
   }
 }
 
 async function startJob(message) {
   cleanupTerminalJobIds();
-  if (jobs.has(message.job_id) || terminalJobIds.has(message.job_id)) {
-    postNative(errorEnvelope(messageJob(message), "duplicate_job", `job ${message.job_id} is already known to this extension instance`, {
+  const existing = jobs.get(message.job_id);
+  if (existing) {
+    assertMessageOwnsJob(message, existing);
+  }
+  if (existing?.terminal_envelope && !existing.terminal_delivered_at) {
+    // The retained terminal owns this job_id. Replay it instead of creating a
+    // second terminal sequence that could ACK and clear the original job.
+    await postTerminalJob(existing, existing.terminal_envelope, {
+      status: existing.status,
+      phase: phaseForStatus(existing.status) ?? "profile"
+    });
+    return;
+  }
+  if (existing) {
+    // A live job owns this route. The native host rejects duplicate local
+    // clients before forwarding them; this notice is only an in-extension
+    // fallback and must never look terminal to the owner.
+    postNative(progress(existing, "duplicate_job", {
       request_id: message.request_id,
-      phase: "profile",
-      side_effect_started: false
+      code: "duplicate_job",
+      message: `job ${message.job_id} is already known to this extension instance`
     }));
+    return;
+  }
+  if (terminalJobIds.has(message.job_id)) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), "duplicate_job", `job ${message.job_id} is already known to this extension instance`, {
+        request_id: message.request_id,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
+    return;
+  }
+  const oversizedSelector = ["profile_email", "extension_instance_id", "extension_profile_id"]
+    .find((field) => typeof message.payload?.[field] === "string"
+      && message.payload[field].length > MAX_TERMINAL_ID_CHARS);
+  if (oversizedSelector) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), "selector_too_long", "profile selector exceeds the maximum supported length", {
+        request_id: message.request_id,
+        phase: "profile",
+        side_effect_started: false,
+        field: oversizedSelector,
+        max_length: MAX_TERMINAL_ID_CHARS
+      }),
+      { status: "failed", phase: "profile" }
+    );
     return;
   }
   let adapter;
   try {
     adapter = siteAdapterForRecipe(message.payload?.recipe);
   } catch (error) {
-    postNative(errorEnvelope(messageJob(message), error?.code ?? "unsupported_recipe", String(error?.message ?? error), {
-      request_id: message.request_id,
-      phase: "profile",
-      side_effect_started: false
-    }));
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), error?.code ?? "unsupported_recipe", String(error?.message ?? error), {
+        request_id: message.request_id,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
     return;
   }
   const job = normalizeJob(message, adapter);
   job.started_at = Date.now();
   job.updated_at = Date.now();
   job.connection_generation = connectionGeneration;
+  jobs.set(job.job_id, job);
+  const continuationEpoch = Number(job.continuation_epoch ?? 0);
 
   if (job.conversation_error) {
     await failJob(job, "invalid_conversation", job.conversation_error.message, {
@@ -418,6 +549,9 @@ async function startJob(message) {
   }
 
   const targetProfile = await validateTargetProfile(job);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   if (!targetProfile.ok) {
     await failJob(job, targetProfile.code, targetProfile.message, targetProfile.detail);
     return;
@@ -425,16 +559,28 @@ async function startJob(message) {
 
   job.expected_conversation_id = job.conversation_id ?? null;
   job.status = "opening_tab";
-  jobs.set(job.job_id, job);
   await persistJob(job);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
 
   const url = job.expected_conversation_id
     ? adapter.conversationJobUrl(job.expected_conversation_id, job.run_id)
     : adapter.jobUrl(job.run_id);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   const tab = await createJobTab(url, adapter);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    await discardCreatedJobTab(tab);
+    return;
+  }
   job.tab_id = tab.id;
   job.updated_at = Date.now();
   await persistJob(job);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   const inspectCommand = inspectCommandForJob(job);
   if (!postNative(progress(job, "tab_opened", {
     tab_id: tab.id,
@@ -447,9 +593,18 @@ async function startJob(message) {
   }
 
   await waitForSiteTab(tab.id, adapter);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   const contentScriptProbe = await waitForContentScript(tab.id, adapter);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   recordContentScriptContract(job, contentScriptProbe);
   const prepared = await sendToTab(tab.id, { type: "yoetz_prepare_job", job });
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   if (prepared.manual_handoff) {
     postNative(progress(job, "manual_handoff", prepared.manual_handoff));
     await failJob(job, "manual_handoff", prepared.manual_handoff.message, {
@@ -464,20 +619,29 @@ async function startJob(message) {
   job.model_selection_attempt = Number(job.model_selection_attempt ?? 0) + 1;
   job.updated_at = Date.now();
   await persistJob(job);
-  await completeModelSelection(job, tab.id, job.model_selection_attempt);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
+  await completeModelSelection(job, tab.id, job.model_selection_attempt, {}, continuationEpoch);
 }
 
-async function completeModelSelection(job, tabId, attempt, options = {}) {
+async function completeModelSelection(job, tabId, attempt, options = {}, continuationEpoch = job?.continuation_epoch) {
   const adapter = adapterForJob(job);
+  if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
+    return;
+  }
   let modelSelection;
   try {
+    if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
+      return;
+    }
     modelSelection = await sendToTab(tabId, {
       type: "yoetz_configure_model",
       job,
       reset: options.reset === true
     });
   } catch (error) {
-    if (staleSelectionAttempt(job, attempt)) {
+    if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
       return;
     }
     if (
@@ -487,31 +651,34 @@ async function completeModelSelection(job, tabId, attempt, options = {}) {
       throw error;
     }
     try {
+      if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
+        return;
+      }
       await recoverContentScriptJob(job, error, { source: "model_selection" });
     } catch (recoveryError) {
-      if (staleSelectionAttempt(job, attempt)) {
+      if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
         return;
       }
       throw recoveryError;
     }
     forgetSettledSuccessfulRecovery(job.job_id);
-    if (staleSelectionAttempt(job, attempt)) {
+    if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
       return;
     }
     const retryAttempt = Number(job.model_selection_attempt ?? 0) + 1;
     job.model_selection_attempt = retryAttempt;
     job.updated_at = Date.now();
     await persistJob(job);
-    if (staleSelectionAttempt(job, retryAttempt)) {
+    if (staleSelectionAttempt(job, retryAttempt, continuationEpoch)) {
       return;
     }
     return completeModelSelection(job, tabId, retryAttempt, {
       ...options,
       reset: true,
       selectionRecoveryRetried: true
-    });
+    }, continuationEpoch);
   }
-  if (staleSelectionAttempt(job, attempt)) {
+  if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
     return;
   }
   if (adapter.recipe === "chatgpt") {
@@ -526,6 +693,9 @@ async function completeModelSelection(job, tabId, attempt, options = {}) {
     ...(modelSelection.warning ? [modelSelection.warning] : [])
   ];
   if (!postNative(progress(job, "model_selection", modelSelection))) {
+    if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
+      return;
+    }
     await recordTerminalDeliveryLost(job, "model_selection");
     return;
   }
@@ -551,13 +721,13 @@ async function completeModelSelection(job, tabId, attempt, options = {}) {
   }
 
   await maybeGroupTab(tabId, job);
-  if (staleSelectionAttempt(job, attempt)) {
+  if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
     return;
   }
   job.status = "waiting_for_file";
   job.updated_at = Date.now();
   await persistJob(job);
-  if (staleSelectionAttempt(job, attempt)) {
+  if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
     return;
   }
   if (!postNative(progress(job, "ready_for_file", { tab_id: tabId, message: `${adapter.displayName} tab is ready for bundle upload` }))) {
@@ -565,11 +735,9 @@ async function completeModelSelection(job, tabId, attempt, options = {}) {
   }
 }
 
-function staleSelectionAttempt(job, attempt) {
+function staleSelectionAttempt(job, attempt, continuationEpoch = job?.continuation_epoch) {
   return Number(job.model_selection_attempt) !== attempt
-    || !jobs.has(job.job_id)
-    || TERMINAL_STATUSES.has(job.status)
-    || job.cancelled;
+    || !jobContinuationIsLive(job, continuationEpoch);
 }
 
 function modelSelectionFailureDiagnostics(selection) {
@@ -622,7 +790,12 @@ function formatModelSelectionFailureDiagnostics(diagnostics) {
 
 async function acceptFileChunk(message) {
   const job = requireJob(message.job_id);
+  assertMessageOwnsJob(message, job);
   assertJobConnectionCurrent(job);
+  const continuationEpoch = Number(job.continuation_epoch ?? 0);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   if (!["waiting_for_file", "receiving_file"].includes(job.status)) {
     await failJob(job, "unexpected_chunk", `job ${job.job_id} is not accepting file chunks in status ${job.status}`, {
       phase: "upload",
@@ -665,6 +838,9 @@ async function acceptFileChunk(message) {
     if (previousStatus !== "receiving_file") {
       job.status = "receiving_file";
       await persistJob(job);
+      if (!jobContinuationIsLive(job, continuationEpoch)) {
+        return;
+      }
     } else {
       job.status = "receiving_file";
     }
@@ -678,22 +854,27 @@ async function acceptFileChunk(message) {
   job.status = "file_received";
   job.updated_at = Date.now();
   await persistJob(job);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   assertJobConnectionCurrent(job);
-  await runJobWithFile(job, file);
+  await runJobWithFile(job, file, continuationEpoch);
 }
 
-async function runJobWithFile(job, file) {
-  if (job.cancelled) return;
+async function runJobWithFile(job, file, continuationEpoch = job?.continuation_epoch) {
+  if (!jobContinuationIsLive(job, continuationEpoch)) return;
   assertJobConnectionCurrent(job);
   const adapter = adapterForJob(job);
   const uploadProbe = await requireContentScriptCapability(job.tab_id, adapter, {
     phase: "upload",
     side_effect_started: false
   });
+  if (!jobContinuationIsLive(job, continuationEpoch)) return;
   recordContentScriptContract(job, uploadProbe);
   job.status = "uploading_file";
   job.updated_at = Date.now();
   await persistJob(job);
+  if (!jobContinuationIsLive(job, continuationEpoch)) return;
   const uploadResult = await sendToTab(job.tab_id, {
     type: "yoetz_upload_file",
     job,
@@ -703,8 +884,8 @@ async function runJobWithFile(job, file) {
       bytes_base64: uint8ArrayToBase64(file.bytes)
     }
   });
+  if (!jobContinuationIsLive(job, continuationEpoch)) return;
   assertJobConnectionCurrent(job);
-  if (job.cancelled) return;
   if (!postNative(progress(job, "file_uploaded", {
     filename: file.filename,
     bytes: file.bytes.byteLength,
@@ -724,17 +905,30 @@ async function runJobWithFile(job, file) {
       job,
       blocking_context: "pre_send_baseline"
     });
+    if (!jobContinuationIsLive(job, continuationEpoch)) return;
     assertJobConnectionCurrent(job);
     job.status = "sending_prompt";
     job.updated_at = Date.now();
     await persistJob(job);
+    if (!jobContinuationIsLive(job, continuationEpoch)) return;
     const sendProbe = await requireContentScriptCapability(job.tab_id, adapter, {
       phase: "send",
       side_effect_started: true,
       send_committed: false
     });
+    if (!jobContinuationIsLive(job, continuationEpoch)) return;
     recordContentScriptContract(job, sendProbe);
+    if (!jobContinuationIsLive(job, continuationEpoch)) return;
     const sendResult = await sendToTab(job.tab_id, { type: "yoetz_send_prompt", job, prompt });
+    if (!jobContinuationIsLive(job, continuationEpoch)) {
+      return;
+    }
+    if (sendResult?.sent === true) {
+      job.send_committed = true;
+      job.updated_at = Date.now();
+      await persistJob(job);
+      if (!jobContinuationIsLive(job, continuationEpoch)) return;
+    }
     if (job.recipe === "chatgpt") {
       const finalModelSelection = sendResult?.final_model_selection;
       const expectedModelSelectionStatus = job.model_strategy === "current" ? "current" : "selected";
@@ -746,6 +940,7 @@ async function runJobWithFile(job, file) {
         ? null
         : validateChatgptFinalModelSelectionReceipt(finalModelSelection, job);
       if (receiptMissing || receiptError) {
+        if (!jobContinuationIsLive(job, continuationEpoch)) return;
         await failJob(
           job,
           receiptMissing ? "send_proof_missing" : "send_proof_invalid",
@@ -777,7 +972,7 @@ async function runJobWithFile(job, file) {
       : null;
     assertSubmittedConversationCurrent(job, sendResult);
     assertJobConnectionCurrent(job);
-    if (job.cancelled) return;
+    if (!jobContinuationIsLive(job, continuationEpoch)) return;
     const inspectCommand = inspectCommandForJob(job);
     if (!postNative(progress(job, "prompt_sent", {
       timeout_ms: responseWaitTimeoutMs(job),
@@ -788,10 +983,12 @@ async function runJobWithFile(job, file) {
       conversation_url: conversationUrlForJob(job, conversationIdForJob(job)),
       message: `prompt sent; waiting for ${adapterForJob(job).displayName} response (timeout ${formatDurationForMessage(responseWaitTimeoutMs(job))}); inspect with: ${inspectCommand}`
     }))) {
+      if (!jobContinuationIsLive(job, continuationEpoch)) return;
       await recordTerminalDeliveryLost(job, "send");
       return;
     }
   } else {
+    if (!jobContinuationIsLive(job, continuationEpoch)) return;
     postNative(progress(job, "manual_handoff", { state: "prompt_required", message: "no prompt supplied" }));
     await failJob(job, "manual_handoff", "no prompt supplied", {
       state: "prompt_required",
@@ -806,13 +1003,18 @@ async function runJobWithFile(job, file) {
   job.response_wait_started_at = Date.now();
   job.updated_at = Date.now();
   await persistJob(job);
-  const extraction = await waitForResponse(job);
+  if (!jobContinuationIsLive(job, continuationEpoch)) return;
+  const extraction = await waitForResponse(job, continuationEpoch);
+  if (!jobContinuationIsLive(job, continuationEpoch)) return;
   assertJobConnectionCurrent(job);
-  if (job.cancelled || !extraction) return;
-  await completeJobWithExtraction(job, extraction);
+  if (!extraction) return;
+  await completeJobWithExtraction(job, extraction, continuationEpoch);
 }
 
-async function completeJobWithExtraction(job, extraction) {
+async function completeJobWithExtraction(job, extraction, continuationEpoch = job?.continuation_epoch) {
+  if (await cancellationFence(job) || !jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   const conversationId = conversationIdForJob(job, extraction);
   const adapter = adapterForJob(job);
   const finalityAnchor = adapter.recipe === "chatgpt"
@@ -861,6 +1063,10 @@ async function completeJobWithExtraction(job, extraction) {
       })
     }
   });
+  if (await cancellationFence(job) || !jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
+  stampTerminalSequence(job, completeEnvelope);
   const completeBytes = nativeEnvelopeByteLength(completeEnvelope);
   if (completeBytes > MAX_NATIVE_OUTBOUND_BYTES) {
     const adapter = adapterForJob(job);
@@ -882,33 +1088,54 @@ async function completeJobWithExtraction(job, extraction) {
     );
     return;
   }
-  if (TERMINAL_STATUSES.has(job.status)) {
+  if (completeBytes > MAX_PERSISTED_TERMINAL_ENVELOPE_BYTES) {
+    const inspectCommand = inspectCommandForJob(job);
+    await failJob(
+      job,
+      "response_too_large",
+      `${adapter.displayName} response is too large to retain safely for chrome-extension-native replay (${completeBytes} bytes > ${MAX_PERSISTED_TERMINAL_ENVELOPE_BYTES} bytes); inspect the owned tab with: ${inspectCommand}`,
+      {
+        phase: "wait_response",
+        side_effect_started: true,
+        completion_reason: extraction.completion_reason,
+        extraction_method: extraction.method,
+        response_length: extraction.text?.length ?? 0,
+        native_message_bytes: completeBytes,
+        max_persisted_terminal_envelope_bytes: MAX_PERSISTED_TERMINAL_ENVELOPE_BYTES,
+        inspect_command: inspectCommand
+      }
+    );
     return;
   }
   job.status = "complete";
   forgetContentScriptRecovery(job.job_id);
   rememberTerminalJob(job.job_id);
-  stampTerminalSequence(job, completeEnvelope);
-  job.terminal_envelope = completeEnvelope;
-  job.terminal_delivered_at = null;
-  job.updated_at = Date.now();
-  await persistTerminalJobBestEffort(job);
-  const posted = postNative(completeEnvelope);
-  if (!posted) {
-    await recordTerminalDeliveryLost(job, "wait_response");
-    return;
-  }
-  await closeOwnedTabOnComplete(job);
-  jobs.delete(job.job_id);
-  chunks.discard(job.job_id);
+  await postTerminalJob(job, completeEnvelope, { status: "complete", phase: "wait_response" });
 }
 
 async function closeOwnedTabOnComplete(job) {
-  if (!job.close_tab_on_complete || !job.tab_id) {
+  if (!job.close_tab_on_complete || !job.tab_id || job.tab_disposition) {
     return;
   }
+  const ownership = await verifyTabOwnership(job);
+  if (!ownership.owned) {
+    job.tab_disposition = "kept_ownership_unverified";
+    job.tab_ownership_verified = false;
+    job.tab_ownership_error = ownership.error ?? ownership.reason;
+    job.updated_at = Date.now();
+    await persistTerminalJobBestEffort(job);
+    postNative(progress(job, "tab_close_skipped", {
+      tab_id: job.tab_id,
+      tab_disposition: job.tab_disposition,
+      ownership_verified: false,
+      ownership_error: job.tab_ownership_error,
+      message: "kept the tab because durable job ownership could not be verified"
+    }));
+    return;
+  }
+  job.tab_ownership_verified = true;
   let phase = "tab_closed";
-  let detail = { tab_id: job.tab_id };
+  let detail = { tab_id: job.tab_id, ownership_verified: true };
   try {
     await chrome.tabs.remove(job.tab_id);
     job.tab_disposition = "closed";
@@ -917,10 +1144,11 @@ async function closeOwnedTabOnComplete(job) {
     phase = "tab_close_failed";
     detail = {
       tab_id: job.tab_id,
+      ownership_verified: true,
       error: String(error?.message ?? error)
     };
   }
-  await persistJob(job);
+  await persistTerminalJobBestEffort(job);
   // The native host currently releases the per-job client after job_complete,
   // so this progress event is intentionally unrouted until host routing grows
   // an explicit post-terminal channel. The persisted shard is authoritative.
@@ -929,6 +1157,15 @@ async function closeOwnedTabOnComplete(job) {
 
 function conversationIdForJob(job, extraction = null) {
   return job?.submitted_conversation_id ?? extraction?.conversation_id ?? job?.conversation_id ?? null;
+}
+
+function expectedConversationIdForJob(job) {
+  return String(
+    job?.expected_conversation_id
+      ?? job?.submitted_conversation_id
+      ?? job?.conversation_id
+      ?? ""
+  ).trim() || null;
 }
 
 function conversationUrlForJob(job, conversationId) {
@@ -966,18 +1203,25 @@ async function resumeWaitingResponseJob(job) {
 }
 
 async function continueWaitingResponseJob(job) {
+  const continuationEpoch = Number(job.continuation_epoch ?? 0);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   const lease = acquirePollerLease(job);
   if (lease == null) {
     return;
   }
   try {
-    const extraction = await waitForResponse(job);
+    const extraction = await waitForResponse(job, continuationEpoch);
+    if (!jobContinuationIsLive(job, continuationEpoch)) {
+      return;
+    }
     if (!holdsPollerLease(job, lease)) {
       return;
     }
     assertJobConnectionCurrent(job);
-    if (job.cancelled || !extraction) return;
-    await completeJobWithExtraction(job, extraction);
+    if (!extraction) return;
+    await completeJobWithExtraction(job, extraction, continuationEpoch);
   } catch (error) {
     if (!holdsPollerLease(job, lease)) {
       return;
@@ -1104,11 +1348,35 @@ function jobCanResumePolling(job) {
     && jobs.has(job.job_id)
     && !TERMINAL_STATUSES.has(job.status)
     && job.status === "waiting_response"
-    && !job.cancelled
+    && !cancellationIsPending(job)
   );
 }
 
 async function handlePollerError(job, error) {
+  const code = error?.code ?? "extension_error";
+  if (code === "connection_generation_changed") {
+    if (isNativeReconnectResumableState(job)) {
+      await pauseForNativeReconnect(job);
+    } else if (jobs.has(job.job_id) && !TERMINAL_STATUSES.has(job.status)) {
+      const phase = phaseForStatus(job.status) ?? "upload";
+      await failJob(
+        job,
+        "bridge_interrupted",
+        adapterForJob(job).displayName
+          + " job was interrupted by a native bridge restart during "
+          + phase
+          + "; the provider operation was not retried automatically. Inspect the owned tab before rerunning.",
+        {
+          phase,
+          side_effect_started: Boolean(job.tab_id || job.send_committed),
+          send_committed: Boolean(job.send_committed),
+          reconnect_reason: String(error?.message ?? error),
+          inspect_command: job.run_id ? inspectCommandForJob(job) : undefined
+        }
+      );
+    }
+    return;
+  }
   const recovery = contentScriptRecoveries.get(job.job_id);
   if (recovery) {
     try {
@@ -1125,50 +1393,197 @@ async function handlePollerError(job, error) {
   if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
     return;
   }
-  const code = error?.code ?? "extension_error";
   const detail = errorContextForJob(job, error);
   await failJob(job, code, jobErrorMessage(job, error, code, detail), detail);
 }
 
+async function pauseForNativeReconnect(job) {
+  if (!isNativeReconnectResumableState(job)) {
+    return;
+  }
+  job.native_reconnect_pending = true;
+  job.native_disconnected_at = job.native_disconnected_at ?? Date.now();
+  job.updated_at = Date.now();
+  await persistJobBestEffort(job);
+  scheduleNativeReconnectResume(job);
+}
+
+function isNativeReconnectResumableState(job) {
+  return Boolean(
+    job
+    && jobs.has(job.job_id)
+    && !TERMINAL_STATUSES.has(job.status)
+    && ["waiting_for_file", "waiting_response"].includes(job.status)
+    && !cancellationIsPending(job)
+  );
+}
+
+function isTerminalPendingJob(job) {
+  return Boolean(
+    job
+    && TERMINAL_STATUSES.has(job.status)
+    && !job.terminal_delivered_at
+    && (
+      job.terminal_envelope
+      || job.terminal_persistence_failed === true
+      || job.status === "terminal_delivery_lost"
+      || job.delivery_lost_phase
+    )
+  );
+}
+
+function isReconnectRestorableJob(job) {
+  return isNativeReconnectResumableState(job) || isTerminalPendingJob(job);
+}
+
+function scheduleNativeReconnectResume(job) {
+  if (!jobCanResumePolling(job)
+      || job.native_reconnect_pending !== true
+      || job.connection_generation !== connectionGeneration
+      || !nativePort
+      || job.poller_lease != null) {
+    return;
+  }
+  job.native_reconnect_pending = false;
+  job.native_disconnected_at = null;
+  void persistJobBestEffort(job);
+  void continueWaitingResponseJob(job);
+}
+
 async function cancelJob(message) {
   const job = requireJob(message.job_id);
-  assertJobConnectionCurrent(job);
-  if (TERMINAL_STATUSES.has(job.status)) {
-    postNative(makeEnvelope("job_cancel", {
+  assertMessageOwnsJob(message, job);
+  // Once the cancellation intent is durable, a reconnect or worker restore
+  // must be allowed to finish it even though the request's connection is old.
+  if (!job.cancel_pending) {
+    assertJobConnectionCurrent(job);
+  }
+  if (!job.cancel_pending && !TERMINAL_STATUSES.has(job.status)) {
+    // Set the in-memory fence before the first await. A poller that is already
+    // past its extraction await must not be able to claim a later terminal.
+    job.continuation_epoch = Number(job.continuation_epoch ?? 0) + 1;
+    job.cancel_pending = {
       request_id: message.request_id,
-      job_id: job.job_id,
-      run_id: job.run_id,
-      workspace_id: job.workspace_id,
-      capability_token: job.capability_token,
-      payload: { cancelled: false, already_terminal: true }
+      phase: "requested",
+      requested_at: Date.now()
+    };
+    job.cancel_pending_durable = false;
+    job.cancel_requested = true;
+    job.cancelled = true;
+    job.updated_at = Date.now();
+  }
+  return serializeCancellation(job, () => cancelJobInternal(message, job));
+}
+
+function serializeCancellation(job, operation) {
+  const existing = cancellationOperations.get(job.job_id);
+  if (existing) {
+    return existing;
+  }
+  const pending = Promise.resolve().then(operation);
+  const tracked = pending.finally(() => {
+    if (cancellationOperations.get(job.job_id) === tracked) {
+      cancellationOperations.delete(job.job_id);
+    }
+  });
+  cancellationOperations.set(job.job_id, tracked);
+  return tracked;
+}
+
+function cancellationIsPending(job) {
+  return Boolean(job?.cancel_pending || job?.cancelled || job?.cancel_retry_pending);
+}
+
+function jobContinuationIsLive(job, continuationEpoch = job?.continuation_epoch) {
+  return Boolean(
+    job
+    && jobs.get(job.job_id) === job
+    && Number(job.continuation_epoch ?? 0) === Number(continuationEpoch ?? 0)
+    && !cancellationIsPending(job)
+    && !TERMINAL_STATUSES.has(job.status)
+  );
+}
+
+async function cancellationFence(job) {
+  if (!cancellationIsPending(job)) {
+    return false;
+  }
+  const operation = cancellationOperations.get(job.job_id);
+  if (operation) {
+    try {
+      await operation;
+    } catch {
+      // The cancellation operation reports its own durable failure. If it
+      // clears the fence, the caller may continue with its original action.
+    }
+  } else if (job.cancel_pending) {
+    await finishPendingCancellation(job);
+  }
+  return cancellationIsPending(job) || TERMINAL_STATUSES.has(job.status);
+}
+
+async function cancelJobInternal(message, job) {
+  if (TERMINAL_STATUSES.has(job.status)) {
+    if (job.terminal_envelope && !job.terminal_delivered_at) {
+      await postTerminalJob(job, job.terminal_envelope, {
+        status: job.status,
+        phase: phaseForStatus(job.status) ?? "wait_response"
+      });
+    }
+    return;
+  }
+  if (job.cancel_pending && job.cancel_pending_durable === true) {
+    await finishPendingCancellationInternal(job);
+    return;
+  }
+  if (!await persistCancelPending(job)) {
+    // Do not tear down the provider tab while the cancellation intent is not
+    // durable. The live job remains available for a reconnect retry.
+    job.cancel_pending_persistence_failed = true;
+    job.cancel_pending = null;
+    job.cancel_pending_durable = false;
+    job.cancel_retry_pending = true;
+    job.cancel_requested = true;
+    job.cancelled = false;
+    job.updated_at = Date.now();
+    await persistJobBestEffort(job);
+    postNative(progress(job, "cancel_pending_persistence_failed", {
+      code: "cancel_pending_persistence_failed",
+      message: "cancellation was not persisted; the owned tab was kept open and cancellation will not be retried automatically until the bridge reconnects"
     }));
     return;
   }
-  job.cancelled = true;
-  job.status = "cancelled";
-  forgetContentScriptRecovery(job.job_id);
-  rememberTerminalJob(job.job_id);
-  job.updated_at = Date.now();
-  chunks.discard(job.job_id);
-  await persistTerminalJobBestEffort(job);
+  job.cancel_pending_durable = true;
+  job.cancel_retry_pending = false;
+  job.cancel_pending_persistence_failed = false;
+  await finishPendingCancellationInternal(job);
+}
 
-  // Best-effort: tell the content script to click the site's stop control AND
-  // wait for generation to actually go idle before we tear the tab down — a bare
-  // a stop click only initiates the site's abort, and removing the tab
-  // microseconds later races/drops that request so the server keeps generating.
-  // We await cancelSend so chrome.tabs.remove below runs only AFTER the stop is
-  // confirmed (or its bounded ~5s idle-wait elapses). The content script's
-  // cancelSend handler does NOT require the ownership marker — cancel is a kill,
-  // and the tab may have navigated away, lost its window.name marker, or had its
-  // content script reloaded. We never let a content-script failure block the
-  // rest of the cancel teardown.
+async function finishPendingCancellation(job) {
+  if (!job?.cancel_pending || TERMINAL_STATUSES.has(job.status)) {
+    return;
+  }
+  return serializeCancellation(job, () => finishPendingCancellationInternal(job));
+}
+
+async function finishPendingCancellationInternal(job) {
+  if (!job?.cancel_pending || TERMINAL_STATUSES.has(job.status)) {
+    return;
+  }
+  forgetContentScriptRecovery(job.job_id);
+  job.updated_at = Date.now();
+
+  // Verify the durable window.name marker and provider origin before sending a
+  // stop command or removing the tab. A stale job record must never destroy a
+  // tab that a later run or the user now owns.
+  let ownership = await verifyTabOwnership(job);
   let stopClicked = false;
   // stopConfirmed === false means we could not confirm generation halted (timed
   // out still generating, or the content script was unreachable). The CLI uses
   // it to warn the user the run may still be live server-side. null = unknown
   // (no tab to ask).
   let stopConfirmed = job.tab_id ? false : null;
-  if (job.tab_id) {
+  if (job.tab_id && ownership.owned) {
     try {
       const stopResult = await sendToTab(job.tab_id, { type: "yoetz_cancel_send", job });
       stopClicked = Boolean(stopResult?.stopped);
@@ -1179,7 +1594,9 @@ async function cancelJob(message) {
     }
   }
   // True when we asked a tab to stop but could not confirm it went idle.
-  const cancelMayStillBeRunning = job.tab_id ? stopConfirmed === false : false;
+  let cancelMayStillBeRunning = job.tab_id
+    ? !ownership.owned || stopConfirmed === false
+    : false;
 
   // Close the tab so generation cannot continue in the background. V1 chooses
   // hard removal over chrome.tabGroups.update({ collapsed: true }) into a
@@ -1189,14 +1606,28 @@ async function cancelJob(message) {
   // here through the tabGroups API instead of chrome.tabs.remove. This runs only
   // after the awaited cancelSend above resolves, so we never destroy the page
   // mid-abort.
-  let tabDisposition = job.tab_id ? "close_failed" : "closed";
-  if (job.tab_id && chrome.tabs?.remove) {
-    try {
-      await chrome.tabs.remove(job.tab_id);
-      tabDisposition = "closed";
-    } catch {
-      // Tab already closed by the user, or removal racing with navigation.
+  let tabDisposition = job.tab_id
+    ? (ownership.owned ? "close_failed" : "kept_ownership_unverified")
+    : "closed";
+  if (job.tab_id && ownership.owned && chrome.tabs?.remove) {
+    // stopToTab is awaited above, so ownership can change while the provider
+    // aborts. Re-probe immediately before removal; a stale positive probe must
+    // never authorize destroying a tab that was reused by another run.
+    ownership = await verifyTabOwnership(job);
+    if (!ownership.owned) {
+      cancelMayStillBeRunning = true;
+      tabDisposition = "kept_ownership_unverified";
+    } else {
+      try {
+        await chrome.tabs.remove(job.tab_id);
+        tabDisposition = "closed";
+      } catch {
+        // Tab already closed by the user, or removal racing with navigation.
+      }
     }
+  }
+  if (!job.cancel_pending || TERMINAL_STATUSES.has(job.status)) {
+    return;
   }
 
   postNative(progress(job, "cancelled", {
@@ -1205,10 +1636,14 @@ async function cancelJob(message) {
     stop_clicked: stopClicked,
     stop_confirmed: stopConfirmed,
     generation_idle: stopConfirmed,
-    may_still_be_running: cancelMayStillBeRunning
+    may_still_be_running: cancelMayStillBeRunning,
+    ownership_verified: ownership.owned,
+    ...(ownership.owned
+      ? {}
+      : { ownership_error: ownership.error ?? ownership.reason })
   }));
   const cancelEnvelope = makeEnvelope("job_cancel", {
-    request_id: message.request_id,
+    request_id: job.cancel_pending.request_id ?? job.request_id,
     job_id: job.job_id,
     run_id: job.run_id,
     workspace_id: job.workspace_id,
@@ -1219,19 +1654,27 @@ async function cancelJob(message) {
       stop_clicked: stopClicked,
       stop_confirmed: stopConfirmed,
       generation_idle: stopConfirmed,
-      may_still_be_running: cancelMayStillBeRunning
+      may_still_be_running: cancelMayStillBeRunning,
+      ownership_verified: ownership.owned,
+      ...(ownership.owned
+        ? {}
+        : { ownership_error: ownership.error ?? ownership.reason })
     }
   });
+  job.status = "cancelled";
+  job.tab_disposition = tabDisposition;
+  job.tab_ownership_verified = ownership.owned;
+  if (!ownership.owned) {
+    job.tab_ownership_error = ownership.error ?? ownership.reason;
+  }
+  job.may_still_be_running = cancelMayStillBeRunning;
+  job.cancel_pending.phase = "teardown_complete";
   job.terminal_envelope = cancelEnvelope;
   job.terminal_delivered_at = null;
-  stampTerminalSequence(job, cancelEnvelope);
-  await persistTerminalJobBestEffort(job);
-  if (!postNative(cancelEnvelope)) {
-    await recordTerminalDeliveryLost(job, "cancel");
+  const posted = await postTerminalJob(job, cancelEnvelope, { status: "cancelled", phase: "cancel" });
+  if (posted) {
+    await removeCancelPending(job.job_id);
   }
-  // Evict only after the terminal envelope is posted. Delivery is confirmed by
-  // terminal_ack; Port.postMessage returning is not a receipt.
-  jobs.delete(job.job_id);
 }
 
 async function completePairing(message) {
@@ -1250,6 +1693,27 @@ async function completePairing(message) {
 }
 
 async function handleReconnect(message) {
+  if (message.payload?.intent === "job_reconnect") {
+    const targetedJob = message?.job_id ? jobs.get(message.job_id) : null;
+    if (!targetedJob) {
+      // An explicitly targeted request must never degrade into global recovery
+      // when its durable owner is gone or has already been acknowledged.
+      postNative(makeEnvelope("reconnect", {
+        request_id: message.request_id,
+        job_id: message.job_id,
+        run_id: message.run_id,
+        workspace_id: message.workspace_id,
+        payload: {
+          restored_jobs: [],
+          restored_runs: []
+        }
+      }));
+      return;
+    }
+    assertMessageOwnsJob(message, targetedJob);
+    await handleTargetedReconnect(message, targetedJob);
+    return;
+  }
   if (message.payload?.intent === "reload_extension") {
     postNative(makeEnvelope("reconnect", {
       request_id: message.request_id,
@@ -1268,7 +1732,7 @@ async function handleReconnect(message) {
     return;
   }
   if (message.payload?.intent === "bridge_check") {
-    postNative(makeEnvelope("job_complete", {
+    await postTerminalMessage(message, makeEnvelope("job_complete", {
       request_id: message.request_id,
       job_id: message.job_id,
       run_id: message.run_id,
@@ -1276,21 +1740,146 @@ async function handleReconnect(message) {
       payload: {
         status: "ok"
       }
-    }));
+    }), { status: "complete", phase: "profile" });
     return;
   }
+  const waitingResponseJobs = [];
+  for (const job of jobs.values()) {
+    if (TERMINAL_STATUSES.has(job.status)) {
+      continue;
+    }
+    if (job.cancel_pending || job.cancelled) {
+      await finishPendingCancellation(job);
+      continue;
+    }
+    if (job.cancel_retry_pending) {
+      continue;
+    }
+    if (!["waiting_for_file", "waiting_response"].includes(job.status)) {
+      await failJob(
+        job,
+        "bridge_interrupted",
+        adapterForJob(job).displayName
+          + " job was interrupted by a native bridge restart during "
+          + (phaseForStatus(job.status) ?? "upload")
+          + "; the provider operation was not retried automatically. Inspect the owned tab before rerunning.",
+        {
+          phase: phaseForStatus(job.status) ?? "upload",
+          side_effect_started: Boolean(job.tab_id || job.send_committed),
+          send_committed: Boolean(job.send_committed),
+          reconnect_reason: "native bridge reconnect",
+          inspect_command: job.run_id ? inspectCommandForJob(job) : undefined
+        }
+      );
+      continue;
+    }
+    job.connection_generation = connectionGeneration;
+    if (job.status === "waiting_response") {
+      job.native_reconnect_pending = true;
+      waitingResponseJobs.push(job);
+    }
+    job.updated_at = Date.now();
+    await persistJob(job);
+  }
   await recoverJobs(message);
+  for (const job of waitingResponseJobs) {
+    scheduleNativeReconnectResume(job);
+  }
+}
+
+async function handleTargetedReconnect(message, job) {
+  if (job.cancel_pending || job.cancelled) {
+    await finishPendingCancellation(job);
+    return;
+  }
+  if (job.cancel_retry_pending) {
+    // The prior cancel could not reach durable storage. A targeted reconnect
+    // has a live owner route, so retry the intent before exposing the job again.
+    job.cancel_pending = {
+      request_id: message.request_id ?? job.request_id,
+      phase: "requested",
+      requested_at: Date.now()
+    };
+    job.cancel_pending_durable = false;
+    job.cancel_retry_pending = false;
+    job.cancel_pending_persistence_failed = false;
+    job.cancel_requested = true;
+    job.cancelled = true;
+    job.updated_at = Date.now();
+    await serializeCancellation(job, () => cancelJobInternal({
+      ...message,
+      type: "job_cancel",
+      request_id: job.cancel_pending.request_id
+    }, job));
+    return;
+  }
+  if (isTerminalPendingJob(job)) {
+    await retryPendingTerminalJobs(job.job_id);
+  } else if (TERMINAL_STATUSES.has(job.status)) {
+    return;
+  } else if (!isNativeReconnectResumableState(job)) {
+    await failJob(
+      job,
+      "bridge_interrupted",
+      `${adapterForJob(job).displayName} job was interrupted by a targeted native bridge reconnect during ${phaseForStatus(job.status) ?? "upload"}; the provider operation was not retried automatically. Inspect the owned tab before rerunning.`,
+      {
+        phase: phaseForStatus(job.status) ?? "upload",
+        side_effect_started: Boolean(job.tab_id || job.send_committed),
+        send_committed: Boolean(job.send_committed),
+        reconnect_reason: "targeted native bridge reconnect",
+        inspect_command: job.run_id ? inspectCommandForJob(job) : undefined
+      }
+    );
+    return;
+  } else {
+    job.connection_generation = connectionGeneration;
+    if (job.status === "waiting_response") {
+      job.native_reconnect_pending = true;
+    }
+    job.updated_at = Date.now();
+    await persistJob(job);
+    if (job.status === "waiting_response") {
+      scheduleNativeReconnectResume(job);
+    } else {
+      postNative(progress(job, "ready_for_file", {
+        tab_id: job.tab_id,
+        restored: true,
+        message: `${adapterForJob(job).displayName} tab is ready for bundle upload`
+      }));
+    }
+  }
+
+  const current = jobs.get(job.job_id) ?? job;
+  const restorable = isReconnectRestorableJob(current)
+    && current.run_id
+    && current.workspace_id === message.workspace_id;
+  postNative(makeEnvelope("reconnect", {
+    request_id: message.request_id,
+    job_id: message.job_id,
+    run_id: message.run_id,
+    workspace_id: message.workspace_id,
+    payload: {
+      restored_jobs: restorable ? [current.job_id] : [],
+      restored_runs: restorable
+        ? [{
+          job_id: current.job_id,
+          run_id: current.run_id,
+          workspace_id: current.workspace_id
+        }]
+        : []
+    }
+  }));
 }
 
 async function handleDoctorAuthProbe(message) {
   const adapter = siteAdapterForRecipe(message.payload?.recipe);
-  postNative(makeEnvelope("job_complete", {
+  await postTerminalMessage(message, makeEnvelope("job_complete", {
     request_id: message.request_id,
     job_id: message.job_id,
     run_id: message.run_id,
     workspace_id: message.workspace_id,
     payload: await probeSiteAuthentication(adapter)
-  }));
+  }), { status: "complete", phase: "profile" });
 }
 
 async function probeSiteAuthentication(adapter) {
@@ -1402,9 +1991,77 @@ async function handleInspectRun(message) {
   const adapter = siteAdapterForRecipe(message.payload?.recipe);
   const runId = String(message.payload?.run_id ?? "").trim();
   if (!runId) {
-    postNative(errorEnvelope(messageJob(message), "missing_run_id", "inspect_run requires payload.run_id", {
-      request_id: message.request_id
-    }));
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), "missing_run_id", "inspect_run requires payload.run_id", {
+        request_id: message.request_id,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
+    return;
+  }
+  // inspect_run normally uses a fresh control job_id. Resolve that request to
+  // one durable provider job before reading any tab. A run id alone is not an
+  // ownership credential because two jobs can share a caller-supplied run id.
+  const targetedJob = message?.job_id ? jobs.get(message.job_id) : null;
+  if (targetedJob) {
+    assertMessageOwnsJob(message, targetedJob);
+    if (runId !== targetedJob.run_id) {
+      throw commandError(
+        "run_mismatch",
+        `inspect target run ${runId} does not match active job ${targetedJob.job_id}`,
+        {
+          phase: "profile",
+          side_effect_started: false,
+          expected_run_id: targetedJob.run_id,
+          received_run_id: runId
+        }
+      );
+    }
+  }
+  const liveInspectCandidates = targetedJob
+    ? [targetedJob]
+    : Array.from(jobs.values()).filter((job) => (
+      job?.job_id
+      && job.run_id === runId
+      && job.workspace_id === message.workspace_id
+      && (job.recipe ?? adapter.recipe) === adapter.recipe
+    ));
+  const acknowledgedInspectCandidates = targetedJob
+    ? []
+    : await loadAcknowledgedInspectableJobs(runId, message.workspace_id, adapter.recipe);
+  const inspectCandidates = Array.from(new Map(
+    [...liveInspectCandidates, ...acknowledgedInspectCandidates]
+      .map((job) => [job.job_id, job])
+  ).values());
+  if (inspectCandidates.length !== 1) {
+    const code = inspectCandidates.length === 0 ? "run_not_found" : "run_ambiguous";
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), code, inspectCandidates.length === 0
+        ? `no durable ${adapter.displayName} job found for run ${runId}`
+        : `more than one durable ${adapter.displayName} job owns run ${runId}`, {
+          request_id: message.request_id,
+          phase: "profile",
+          side_effect_started: false
+        }),
+      { status: "failed", phase: "profile" }
+    );
+    return;
+  }
+  const inspectJob = inspectCandidates[0];
+  if (!inspectJob.tab_id || !inspectJob.ownership_nonce) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), "ownership_unverified", `durable ${adapter.displayName} job ${inspectJob.job_id} has no inspectable owned tab`, {
+        request_id: message.request_id,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
     return;
   }
   const tabs = await chrome.tabs.query({ url: adapter.tabQueryPattern });
@@ -1417,8 +2074,10 @@ async function handleInspectRun(message) {
     try {
       const inspection = sanitizeInspection(await sendToTab(tab.id, {
         type: "yoetz_inspect_page",
+        job_id: inspectJob.job_id,
         run_id: runId,
-        conversation_id: runId,
+        workspace_id: message.workspace_id,
+        ownership_nonce: inspectJob.ownership_nonce,
         recipe: adapter.recipe
       }));
       const responseInProgress = Boolean(inspection?.extraction?.is_generating);
@@ -1446,17 +2105,24 @@ async function handleInspectRun(message) {
     }
   }
   if (matches.length === 0) {
-    postNative(errorEnvelope(messageJob(message), "run_not_found", `no Yoetz ${adapter.displayName} tab found for run ${runId}`, {
-      request_id: message.request_id,
-      run_id: runId,
-      inspected_tabs: errors
-    }));
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), "run_not_found", `no Yoetz ${adapter.displayName} tab found for run ${runId}`, {
+        request_id: message.request_id,
+        run_id: runId,
+        inspected_tabs: errors,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
     return;
   }
-  postNative(makeEnvelope("job_complete", {
+  await postTerminalMessage(message, makeEnvelope("job_complete", {
     request_id: message.request_id,
     job_id: message.job_id,
     run_id: runId,
+    workspace_id: message.workspace_id,
     payload: {
       run_id: runId,
       // Runtime build marker for the SERVICE WORKER. Lets an operator confirm the live SW is the
@@ -1468,7 +2134,49 @@ async function handleInspectRun(message) {
       service_worker_build: serviceWorkerBuild(),
       tabs: matches
     }
-  }));
+  }), { status: "complete", phase: "profile" });
+}
+
+async function loadAcknowledgedInspectableJobs(runId, workspaceId, recipe) {
+  if (!chrome.storage.local?.get) {
+    return [];
+  }
+  const localStored = (await chrome.storage.local.get(null)) ?? {};
+  return Object.entries(localStored)
+    .filter(([key]) => key.startsWith(TERMINAL_ACK_KEY_PREFIX))
+    .map(([, tombstone]) => inspectableJobFromAckTombstone(tombstone, runId, workspaceId, recipe))
+    .filter(Boolean);
+}
+
+function inspectableJobFromAckTombstone(tombstone, runId, workspaceId, recipe) {
+  const acknowledgedAt = Number(tombstone?.acknowledged_at);
+  if (
+    !tombstone?.job_id
+    || tombstone.run_id !== runId
+    || (tombstone.workspace_id ?? null) !== (workspaceId ?? null)
+    || (tombstone.recipe ?? recipe) !== recipe
+    || !Number.isInteger(tombstone.tab_id)
+    || typeof tombstone.ownership_nonce !== "string"
+    || tombstone.ownership_nonce.length === 0
+    || !Number.isSafeInteger(acknowledgedAt)
+    || Date.now() - acknowledgedAt > JOB_TTL_MS
+  ) {
+    return null;
+  }
+  return {
+    job_id: tombstone.job_id,
+    run_id: tombstone.run_id,
+    workspace_id: tombstone.workspace_id ?? null,
+    recipe,
+    status: tombstone.status ?? terminalStatusForEnvelope({ type: tombstone.terminal_type }),
+    tab_id: tombstone.tab_id,
+    ownership_nonce: tombstone.ownership_nonce,
+    conversation_id: tombstone.conversation_id ?? null,
+    expected_conversation_id: tombstone.expected_conversation_id ?? null,
+    submitted_conversation_id: tombstone.submitted_conversation_id ?? null,
+    terminal_delivered_at: acknowledgedAt,
+    inspect_only: true
+  };
 }
 
 // Runtime build marker for the service worker (manifest version of the LIVE SW). Used in the
@@ -1519,7 +2227,7 @@ async function handleRequestIdentityPermission(message) {
   if (granted) {
     extensionIdentityPromise = null;
   }
-  postNative(makeEnvelope("job_complete", {
+  await postTerminalMessage(message, makeEnvelope("job_complete", {
     request_id: message.request_id,
     job_id: message.job_id,
     run_id: message.run_id,
@@ -1532,35 +2240,99 @@ async function handleRequestIdentityPermission(message) {
       already_granted: alreadyGranted,
       error
     }
-  }));
+  }), { status: "complete", phase: "profile" });
 }
 
 function messageJob(message) {
   return {
-    job_id: message.job_id,
-    run_id: message.run_id,
-    workspace_id: message.workspace_id,
-    capability_token: message.capability_token,
-    request_id: message.request_id
+    job_id: message?.job_id,
+    run_id: message?.run_id,
+    workspace_id: message?.workspace_id,
+    capability_token: message?.capability_token,
+    request_id: message?.request_id,
+    recipe: message?.payload?.recipe ?? null
   };
 }
 
 async function recoverJobs(message) {
+  await reconcileAcknowledgedTerminalTombstones();
   await restoreJobsFromStorage({ emitLostState: true });
+  for (const job of jobs.values()) {
+    if (job.cancel_pending && !TERMINAL_STATUSES.has(job.status)) {
+      await finishPendingCancellation(job);
+    }
+  }
+  await retryPendingTerminalJobs();
+  for (const job of jobs.values()) {
+    if (job.status !== "waiting_for_file"
+        || job.terminal_delivered_at
+        || cancellationIsPending(job)) {
+      continue;
+    }
+    const adapter = adapterForJob(job);
+    postNative(progress(job, "ready_for_file", {
+      tab_id: job.tab_id,
+      restored: true,
+      message: `${adapter.displayName} tab is ready for bundle upload`
+    }));
+  }
   postNative(makeEnvelope("reconnect", {
     request_id: message.request_id,
     job_id: message.job_id,
     run_id: message.run_id,
     workspace_id: message.workspace_id,
     payload: {
-      restored_jobs: Array.from(jobs.keys())
+      restored_jobs: Array.from(jobs.values())
+        .filter((job) => isReconnectRestorableJob(job) && reconnectIdentityMatches(message, job))
+        .map((job) => job.job_id),
+      restored_runs: Array.from(jobs.values())
+        .filter((job) => (
+          job.job_id
+          && job.run_id
+          && isReconnectRestorableJob(job)
+          && reconnectIdentityMatches(message, job)
+        ))
+        .map((job) => ({
+          job_id: job.job_id,
+          run_id: job.run_id,
+          workspace_id: job.workspace_id
+        }))
     }
   }));
 }
 
+function reconnectIdentityMatches(message, job) {
+  return message?.workspace_id == null || job?.workspace_id === message.workspace_id;
+}
+
 async function restoreJobsFromStorage({ emitLostState = false } = {}) {
   const stored = (await chrome.storage.session.get(null)) ?? {};
-  const restored = [];
+  const localStored = chrome.storage.local
+    ? ((await chrome.storage.local.get(null)) ?? {})
+    : {};
+  const acknowledgedTombstones = Object.entries(localStored)
+    .filter(([key, value]) => (
+      key.startsWith(TERMINAL_ACK_KEY_PREFIX)
+      && value?.job_id
+      && value?.terminal_type
+      && value?.sequence !== undefined
+    ))
+    .map(([, value]) => value);
+  const isAcknowledged = (job) => acknowledgedTombstones.some((tombstone) => (
+    tombstone.job_id === job.job_id
+    && (tombstone.run_id ?? null) === (job.run_id ?? null)
+    && (tombstone.workspace_id ?? null) === (job.workspace_id ?? null)
+  ));
+  const restoredByJobId = new Map();
+  const addRestored = (job, priority = 1) => {
+    if (!job?.job_id || isAcknowledged(job)) {
+      return;
+    }
+    const existing = restoredByJobId.get(job.job_id);
+    if (!existing || priority > existing.priority) {
+      restoredByJobId.set(job.job_id, { job, priority });
+    }
+  };
 
   // Migrate from the legacy single-map shape ({ jobs: { id: job, ... } }) to the
   // sharded shape ({ "jobs.<id>": job }). Older extensions wrote the whole map on
@@ -1575,7 +2347,7 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
       if (!job?.job_id) {
         continue;
       }
-      restored.push(job);
+      addRestored(job, 1);
       migratedShards[jobsStorageKey(job.job_id)] = strippedJobForStorage(job);
     }
     if (Object.keys(migratedShards).length > 0) {
@@ -1590,10 +2362,18 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
     if (!key.startsWith(JOBS_KEY_PREFIX) || !value) {
       continue;
     }
-    restored.push(value);
+    addRestored(value, 1);
+  }
+  for (const [key, value] of Object.entries(localStored)) {
+    if (key.startsWith(CANCEL_PENDING_KEY_PREFIX)) {
+      addRestored(value, 2);
+    }
+    if (key.startsWith(TERMINAL_OUTBOX_KEY_PREFIX)) {
+      addRestored(value, 3);
+    }
   }
 
-  for (const job of restored) {
+  for (const { job } of restoredByJobId.values()) {
     if (!job?.job_id) {
       continue;
     }
@@ -1603,9 +2383,27 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
         continue;
       }
       rememberTerminalJob(job.job_id);
-      if (!job.terminal_delivered_at && job.terminal_envelope) {
-        stampTerminalSequence(job, job.terminal_envelope);
-        postNative(job.terminal_envelope);
+      // Keep every unacknowledged terminal in memory until its matching ACK.
+      // Jobs without an envelope are repaired by retryPendingTerminalJobs.
+      const needsTerminalRepair = job.status === "terminal_delivery_lost"
+        || job.terminal_persistence_failed === true
+        || Boolean(job.delivery_lost_phase);
+      if (!job.terminal_delivered_at
+          && (job.terminal_envelope || needsTerminalRepair)
+          && !jobs.has(job.job_id)) {
+        if (job.terminal_envelope) {
+          stampTerminalSequence(job, job.terminal_envelope);
+        }
+        jobs.set(job.job_id, job);
+      }
+      continue;
+    }
+    if (job.cancel_pending || job.cancelled || job.cancel_retry_pending) {
+      if (job.cancel_pending) {
+        jobs.set(job.job_id, job);
+        await finishPendingCancellation(job);
+      } else if (job.cancel_retry_pending) {
+        jobs.set(job.job_id, job);
       }
       continue;
     }
@@ -1677,18 +2475,92 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
   }
 }
 
+// An ACK is a durable commit point, but cleanup can be interrupted by a worker
+// restart. Reconcile the ACK ledger before resuming live jobs so an acknowledged
+// terminal cannot leave its outbox, cancellation intent, or owned tab behind.
+async function reconcileAcknowledgedTerminalTombstones() {
+  if (!chrome.storage.local?.get) {
+    return;
+  }
+  const localStored = (await chrome.storage.local.get(null)) ?? {};
+  const sessionStored = (await chrome.storage.session.get(null)) ?? {};
+  for (const [key, tombstone] of Object.entries(localStored)) {
+    if (!key.startsWith(TERMINAL_ACK_KEY_PREFIX)
+        || !tombstone?.job_id
+        || !tombstone.terminal_type
+        || tombstone.cleanup_pending === "done") {
+      continue;
+    }
+    const outbox = localStored[terminalOutboxStorageKey(tombstone.job_id)];
+    const cancellation = localStored[cancelPendingStorageKey(tombstone.job_id)];
+    const sessionJob = sessionStored[jobsStorageKey(tombstone.job_id)];
+    const source = [outbox, cancellation, sessionJob]
+      .find((value) => value && typeof value === "object") ?? {};
+    const job = {
+      ...source,
+      job_id: tombstone.job_id,
+      run_id: tombstone.run_id ?? source.run_id ?? null,
+      workspace_id: tombstone.workspace_id ?? source.workspace_id ?? null,
+      recipe: tombstone.recipe ?? source.recipe ?? null,
+      tab_id: tombstone.tab_id ?? source.tab_id ?? null,
+      close_tab_on_complete: tombstone.close_tab_on_complete === true
+        || source.close_tab_on_complete === true,
+      ownership_nonce: tombstone.ownership_nonce ?? source.ownership_nonce ?? null,
+      conversation_id: tombstone.conversation_id ?? source.conversation_id ?? null,
+      expected_conversation_id: tombstone.expected_conversation_id
+        ?? source.expected_conversation_id
+        ?? null,
+      submitted_conversation_id: tombstone.submitted_conversation_id
+        ?? source.submitted_conversation_id
+        ?? null,
+      status: tombstone.status
+        ?? terminalStatusForEnvelope({ type: tombstone.terminal_type }),
+      terminal_type: tombstone.terminal_type,
+      terminal_sequence: tombstone.sequence,
+      terminal_delivered_at: tombstone.acknowledged_at ?? Date.now(),
+      updated_at: Date.now()
+    };
+    const shouldRetryTabClose = tombstone.cleanup_pending === "tab_close"
+      || (!tombstone.cleanup_pending
+        && job.close_tab_on_complete
+        && job.tab_id
+        && job.status === "complete");
+    if (shouldRetryTabClose) {
+      await closeOwnedTabOnComplete(job);
+    }
+    if (!await persistTerminalAckCleanup(job.job_id, "records")) {
+      continue;
+    }
+    const outboxRemoved = await removeTerminalOutbox(job.job_id);
+    const cancellationRemoved = await removeCancelPending(job.job_id);
+    const { terminal_envelope: _terminalEnvelope, ...sessionCleanup } = job;
+    const sessionPersisted = await persistJobBestEffort(sessionCleanup);
+    if (!outboxRemoved || !cancellationRemoved || !sessionPersisted) {
+      continue;
+    }
+    if (await persistTerminalAckCleanup(job.job_id, "done")) {
+      jobs.delete(job.job_id);
+      chunks.discard(job.job_id);
+    }
+  }
+}
+
 function canResumeJobAfterWorkerRestart(job) {
   // The tab is prepared and no file chunks have been accepted yet. There is no
   // in-memory ChunkAssembler state to reconstruct, so the native process can
   // continue by sending the first chunk after reconnect.
-  return job.status === "waiting_for_file" && Boolean(job.tab_id);
+  return job.status === "waiting_for_file"
+    && Boolean(job.tab_id)
+    && !cancellationIsPending(job);
 }
 
 function canResumeWaitingResponseAfterWorkerRestart(job) {
   // The prompt has already been accepted by the site and the only remaining
   // mutable state is the DOM polling loop. Rebind the content script to the
   // persisted owned tab and continue structural-finality polling.
-  return job.status === "waiting_response" && Boolean(job.tab_id);
+  return job.status === "waiting_response"
+    && Boolean(job.tab_id)
+    && !cancellationIsPending(job);
 }
 
 function normalizeJob(message, adapter) {
@@ -1698,6 +2570,7 @@ function normalizeJob(message, adapter) {
     job_id: message.job_id,
     run_id: message.run_id,
     workspace_id: message.workspace_id,
+    ownership_nonce: cryptoRandomId(),
     capability_token: message.capability_token,
     request_id: message.request_id,
     recipe: adapter.recipe,
@@ -1721,6 +2594,7 @@ function normalizeJob(message, adapter) {
     model_selection_status: "unavailable",
     model_used: null,
     warnings: [],
+    continuation_epoch: 0,
     status: "starting"
   };
 }
@@ -2033,6 +2907,17 @@ async function createJobTab(url, adapter) {
   return chrome.tabs.create({ url, active: activateOnCreate });
 }
 
+async function discardCreatedJobTab(tab) {
+  if (!tab?.id || !chrome.tabs?.remove) {
+    return;
+  }
+  try {
+    await chrome.tabs.remove(tab.id);
+  } catch {
+    // Cancellation already removed it, or the browser closed it concurrently.
+  }
+}
+
 async function waitForContentScript(tabId, adapter, detail = {
   phase: "upload",
   side_effect_started: false,
@@ -2161,6 +3046,68 @@ async function sendToTab(tabId, message) {
   return response.payload;
 }
 
+async function verifyTabOwnership(job) {
+  if (!job?.tab_id) {
+    return { owned: true, reason: "no_tab" };
+  }
+  const adapter = adapterForJob(job);
+  let response;
+  try {
+    response = await chrome.tabs.sendMessage(job.tab_id, {
+      type: "yoetz_verify_job_ownership",
+      job
+    });
+  } catch (error) {
+    return {
+      owned: false,
+      reason: "ownership_probe_failed",
+      error: String(error?.message ?? error)
+    };
+  }
+  if (!response?.ok) {
+    return {
+      owned: false,
+      reason: response?.code ?? "ownership_probe_rejected",
+      error: response?.error ?? "content script did not confirm durable tab ownership"
+    };
+  }
+  const result = response.payload;
+  const expectedOrigin = new URL(adapter.homeUrl).origin;
+  const expectedConversationId = expectedConversationIdForJob(job);
+  const observedConversationId = result?.url
+    ? adapter.conversationIdFromUrl(result.url)
+    : null;
+  const conversationMatches = !expectedConversationId
+    || observedConversationId === expectedConversationId
+    || Boolean(adapter.isExpectedConversationIdAssignment?.(
+      job,
+      expectedConversationId,
+      observedConversationId
+    ));
+  if (
+    result?.owned !== true
+    || result.job_id !== job.job_id
+    || result.run_id !== job.run_id
+    || (job.workspace_id != null && result.workspace_id !== job.workspace_id)
+    || (job.ownership_nonce != null && result.ownership_nonce !== job.ownership_nonce)
+    || result.origin !== expectedOrigin
+    || !conversationMatches
+  ) {
+    return {
+      owned: false,
+      reason: "ownership_probe_mismatch",
+      error: "content script returned ownership evidence for a different job, run, workspace, nonce, conversation, or origin",
+      expected_origin: expectedOrigin,
+      expected_workspace_id: job.workspace_id ?? null,
+      expected_ownership_nonce: job.ownership_nonce ?? null,
+      expected_conversation_id: expectedConversationId,
+      observed_conversation_id: observedConversationId,
+      observed: result ?? null
+    };
+  }
+  return result;
+}
+
 function secureContentScriptMessage(message) {
   if (!SECURE_CONTENT_SCRIPT_COMMANDS.has(message?.type)) {
     return message;
@@ -2283,7 +3230,7 @@ async function maybeGroupTab(tabId, job) {
   }
 }
 
-async function waitForResponse(job) {
+async function waitForResponse(job, continuationEpoch = job?.continuation_epoch) {
   const completion = adapterForJob(job).completion;
   const startedAt = Number(job.response_wait_started_at) || Date.now();
   job.response_wait_started_at = startedAt;
@@ -2317,20 +3264,23 @@ async function waitForResponse(job) {
   let reportedAwaitingFinalAffordance = false;
   const timeoutMs = responseWaitTimeoutMs(job);
   while (Date.now() - startedAt <= timeoutMs) {
-    if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
+    if (!jobContinuationIsLive(job, continuationEpoch)) {
       return null;
     }
     assertJobConnectionCurrent(job);
-    if (job.cancelled) {
+    if (cancellationIsPending(job)) {
       return null;
     }
     const extraction = await extractResponseForJob(job);
-    if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status)) {
+    if (!jobContinuationIsLive(job, continuationEpoch)) {
       return null;
     }
     assertJobConnectionCurrent(job);
     if (reconcileJobConversationCurrent(job, extraction)) {
       await persistJob(job);
+      if (!jobContinuationIsLive(job, continuationEpoch)) {
+        return null;
+      }
     }
     if (extraction?.manual_handoff) {
       postNative(progress(job, "manual_handoff", extraction.manual_handoff));
@@ -2550,7 +3500,10 @@ async function waitForResponse(job) {
       renderRefreshStableForMs = Date.now() - renderRefreshCandidateSinceMs;
       if (renderRefreshStableForMs >= MIN_RENDER_FREEZE_IDLE_MS
           && completion.canRefreshFrozenRender(job, MAX_RENDER_REFRESH_ATTEMPTS)) {
-        await refreshFrozenRender(job, extraction, renderRefreshStableForMs);
+        await refreshFrozenRender(job, extraction, renderRefreshStableForMs, continuationEpoch);
+        if (!jobContinuationIsLive(job, continuationEpoch)) {
+          return null;
+        }
         renderRefreshCandidate = null;
         renderRefreshCandidateSinceMs = 0;
         finalAffordanceCandidate = null;
@@ -2637,6 +3590,9 @@ async function waitForResponse(job) {
     await sleep(nextDelay);
   }
   const inspectCommand = inspectCommandForJob(job);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return null;
+  }
   const adapter = adapterForJob(job);
   const timeoutSummary = `${adapter.displayName} response did not reach stable completion before timeout (baseline_assistant_count=${job.response_baseline?.assistant_count ?? 0}, best_method=${best.method}, best_text_chars=${best.text?.length ?? 0}, best_assistant_count=${best.assistant_count ?? 0}, best_turn_index=${best.turn_index ?? -1}, best_copy_button_count=${best.copy_button_count ?? 0}, best_is_generating=${Boolean(best.is_generating)}, last_method=${last.method}, last_text_chars=${last.text?.length ?? 0}, last_assistant_count=${last.assistant_count ?? 0}, last_turn_index=${last.turn_index ?? -1}, last_copy_button_count=${last.copy_button_count ?? 0}, last_is_generating=${Boolean(last.is_generating)}, last_diagnostics=${diagnosticSummary(last.diagnostics)}). The owned ${adapter.displayName} tab is left open; if it finishes later, recover with: ${inspectCommand}`;
   await failJob(job, "response_timeout", timeoutSummary, {
@@ -2999,7 +3955,9 @@ function forgetContentScriptRecovery(jobId) {
 async function recoverContentScriptJobOnce(job, error, options = {}) {
   if (job.content_script_suspended_at && !options.restoredFromBfcache) {
     await parkForPageshow(job);
-    if (!jobs.has(job.job_id) || TERMINAL_STATUSES.has(job.status) || job.cancelled) {
+    if (!jobs.has(job.job_id)
+        || TERMINAL_STATUSES.has(job.status)
+        || cancellationIsPending(job)) {
       return;
     }
   }
@@ -3191,13 +4149,19 @@ function nonNegativeFiniteNumber(value) {
   return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
-async function refreshFrozenRender(job, extraction, stableForMs) {
+async function refreshFrozenRender(job, extraction, stableForMs, continuationEpoch = job?.continuation_epoch) {
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   const conversationId = conversationIdForJob(job, extraction);
   const adapter = adapterForJob(job);
   const url = adapter.conversationJobUrl(conversationId, job.run_id);
   job.render_refresh_attempts = Number(job.render_refresh_attempts ?? 0) + 1;
   job.updated_at = Date.now();
   await persistJob(job);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   postNative(progress(job, "render_refreshing", {
     tab_id: job.tab_id,
     conversation_id: conversationId,
@@ -3209,16 +4173,34 @@ async function refreshFrozenRender(job, extraction, stableForMs) {
     extraction_method: extraction?.method ?? "none",
     message: `refreshing owned ${adapter.displayName} conversation render after idle short response stayed frozen for ${formatDurationForMessage(stableForMs)}`
   }));
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   await chrome.tabs.update(job.tab_id, { url, active: false });
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   await waitForSiteTab(job.tab_id, adapter);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   const contentScriptProbe = await waitForContentScript(job.tab_id, adapter, {
     phase: "wait_response",
     side_effect_started: true,
     send_committed: true
   });
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   recordContentScriptContract(job, contentScriptProbe);
   await persistJob(job);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   postNative(progress(job, "render_refreshed", {
     tab_id: job.tab_id,
     conversation_id: conversationId,
@@ -3247,7 +4229,7 @@ function nativeEnvelopeByteLength(message) {
 }
 
 function enforceMessageCapability(message) {
-  if (!message?.job_id || message.type === "job_start" || message.type === "terminal_ack") {
+  if (!message?.job_id || message.type === "terminal_ack") {
     return;
   }
   const job = jobs.get(message.job_id);
@@ -3261,6 +4243,32 @@ function enforceMessageCapability(message) {
     phase: phaseForStatus(job.status) ?? "upload",
     side_effect_started: Boolean(job.tab_id)
   });
+}
+
+function assertMessageOwnsJob(message, job) {
+  const messageRunId = message?.run_id ?? null;
+  const jobRunId = job?.run_id ?? null;
+  const messageWorkspaceId = message?.workspace_id ?? null;
+  const jobWorkspaceId = job?.workspace_id ?? null;
+  if (
+    message?.job_id !== job?.job_id
+    || messageRunId !== jobRunId
+    || messageWorkspaceId !== jobWorkspaceId
+  ) {
+    throw commandError(
+      "run_mismatch",
+      "message identity does not match active job " + (job?.job_id ?? "unknown"),
+      {
+        phase: "profile",
+        side_effect_started: false,
+        expected_job_id: job?.job_id ?? null,
+        expected_run_id: jobRunId,
+        received_run_id: messageRunId,
+        expected_workspace_id: jobWorkspaceId,
+        received_workspace_id: messageWorkspaceId
+      }
+    );
+  }
 }
 
 function assertJobConnectionCurrent(job) {
@@ -3361,7 +4369,133 @@ function cleanupTerminalJobIds() {
   }
 }
 
+const TERMINAL_ENVELOPE_TYPES = new Set(["job_complete", "job_error", "job_cancel"]);
+
+function isTerminalEnvelope(envelope) {
+  return TERMINAL_ENVELOPE_TYPES.has(envelope?.type);
+}
+
+function terminalStatusForEnvelope(envelope) {
+  switch (envelope?.type) {
+    case "job_complete":
+      return "complete";
+    case "job_cancel":
+      return "cancelled";
+    default:
+      return "failed";
+  }
+}
+
+async function postTerminalMessage(message, envelope, { status, phase } = {}) {
+  if (!message?.job_id) {
+    return postNative(envelope);
+  }
+  const existing = jobs.get(message.job_id);
+  if (existing?.terminal_envelope && !existing.terminal_delivered_at) {
+    return postTerminalJob(existing, existing.terminal_envelope, {
+      status: existing.status,
+      phase: phaseForStatus(existing.status) ?? phase ?? "profile"
+    });
+  }
+  if (existing && !TERMINAL_STATUSES.has(existing.status)) {
+    const rejectionCode = envelope?.payload?.code;
+    if (rejectionCode === "capability_mismatch" || rejectionCode === "run_mismatch") {
+      // The malformed request cannot be routed on its received identity. Fail
+      // the owning job using the durable owner identity so the native client
+      // receives a terminal response and the rejection is not replay-poisoned.
+      const ownedError = errorEnvelope(
+        existing,
+        rejectionCode,
+        envelope?.payload?.message ?? "request identity does not match the active job",
+        {
+          request_id: envelope?.request_id ?? message?.request_id,
+          phase: phase ?? "profile",
+          side_effect_started: false,
+          received_run_id: message?.run_id ?? null,
+          received_workspace_id: message?.workspace_id ?? null
+        }
+      );
+      return postTerminalJob(existing, ownedError, {
+        status: "failed",
+        phase: phase ?? "profile"
+      });
+    }
+    // A live job owns this route. Do not replace it with an unrelated terminal
+    // response that could later be ACKed as the live job's terminal.
+    return postNative(progress(existing, "request_rejected", {
+      request_id: envelope?.request_id ?? message?.request_id,
+      code: envelope?.payload?.code ?? "request_rejected",
+      message: envelope?.payload?.message ?? "request rejected while the job is active"
+    }));
+  }
+  if (existing?.terminal_delivered_at) {
+    return false;
+  }
+  const job = {
+    ...messageJob(message),
+    status: status ?? terminalStatusForEnvelope(envelope),
+    started_at: Date.now(),
+    updated_at: Date.now(),
+    connection_generation: connectionGeneration
+  };
+  jobs.set(job.job_id, job);
+  return postTerminalJob(job, envelope, {
+    status: job.status,
+    phase: phase ?? phaseForStatus(job.status) ?? "profile"
+  });
+}
+
+async function postTerminalJob(job, envelope, { status, phase } = {}) {
+  if (!isTerminalEnvelope(envelope)) {
+    return postNative(envelope);
+  }
+  if (!job?.job_id) {
+    return postNative(envelope);
+  }
+  if (cancellationIsPending(job) && envelope.type !== "job_cancel") {
+    return false;
+  }
+  if (job.terminal_delivered_at) {
+    return false;
+  }
+  if (job.terminal_envelope && job.terminal_envelope !== envelope) {
+    envelope = job.terminal_envelope;
+  }
+  envelope = boundedTerminalEnvelope(job, envelope, phase ?? phaseForStatus(status) ?? "upload");
+  const envelopeStatus = terminalStatusForEnvelope(envelope);
+  job.status = status && !(status === "complete" && envelopeStatus !== "complete")
+    ? status
+    : envelopeStatus;
+  job.terminal_type = envelope.type;
+  job.terminal_envelope = envelope;
+  stampTerminalSequence(job, envelope);
+  job.terminal_delivered_at = null;
+  job.updated_at = Date.now();
+  rememberTerminalJob(job.job_id);
+  jobs.set(job.job_id, job);
+  const persisted = await persistTerminalJobBestEffort(job);
+  if (!persisted) {
+    job.terminal_persistence_failed = true;
+    await recordTerminalDeliveryLost(job, phase ?? phaseForStatus(job.status) ?? "upload");
+    return false;
+  }
+  if (!postNative(envelope)) {
+    await recordTerminalDeliveryLost(job, phase ?? phaseForStatus(job.status) ?? "upload");
+    return false;
+  }
+  job.terminal_last_post_at = Date.now();
+  job.terminal_last_post_generation = connectionGeneration;
+  job.terminal_persistence_failed = false;
+  return true;
+}
+
 async function failJob(job, code, message, detail = {}) {
+  // Cancellation owns the terminal outcome once its in-memory fence is set.
+  // Do not mutate status or replace the cancellation envelope from a poller
+  // error that resumes after the cancellation request.
+  if (job && cancellationIsPending(job)) {
+    return;
+  }
   if (job && TERMINAL_STATUSES.has(job.status)) {
     return;
   }
@@ -3371,33 +4505,79 @@ async function failJob(job, code, message, detail = {}) {
     // not assert that the user has not already closed the tab independently.
     payloadDetail.tab_disposition = "kept";
   }
-  if (job) {
-    job.status = terminalStatus ?? "failed";
-    forgetContentScriptRecovery(job.job_id);
-    rememberTerminalJob(job.job_id);
-    job.updated_at = Date.now();
-    chunks.discard(job.job_id);
-    job.terminal_envelope = errorEnvelope(job, code, message, payloadDetail);
-    stampTerminalSequence(job, job.terminal_envelope);
-    job.terminal_delivered_at = null;
-    await persistTerminalJobBestEffort(job);
+  if (!job) {
+    await postTerminalMessage(null, errorEnvelope(job, code, message, payloadDetail));
+    return;
   }
-  const posted = postNative(job?.terminal_envelope ?? errorEnvelope(job, code, message, payloadDetail));
-  if (job) {
-    if (!posted) {
-      await recordTerminalDeliveryLost(job, payloadDetail.phase ?? phaseForStatus(job.status) ?? "upload");
-    } else {
-      jobs.delete(job.job_id);
-    }
+  job.status = terminalStatus ?? "failed";
+  forgetContentScriptRecovery(job.job_id);
+  rememberTerminalJob(job.job_id);
+  job.updated_at = Date.now();
+  chunks.discard(job.job_id);
+  job.terminal_envelope = errorEnvelope(job, code, message, payloadDetail);
+  await postTerminalJob(job, job.terminal_envelope, {
+    status: job.status,
+    phase: payloadDetail.phase ?? phaseForStatus(job.status) ?? "upload"
+  });
+}
+
+function boundedTerminalEnvelope(job, envelope, phase) {
+  stampTerminalSequence(job, envelope);
+  const bytes = nativeEnvelopeByteLength(envelope);
+  if (bytes <= MAX_PERSISTED_TERMINAL_ENVELOPE_BYTES) {
+    return envelope;
   }
+  const replacement = errorEnvelope(job, "terminal_payload_too_large", "terminal payload exceeded the durable replay limit; inspect the owned tab before rerunning", {
+    phase,
+    side_effect_started: Boolean(job?.tab_id || job?.send_committed),
+    original_terminal_type: envelope?.type ?? null,
+    original_terminal_bytes: bytes,
+    max_persisted_terminal_envelope_bytes: MAX_PERSISTED_TERMINAL_ENVELOPE_BYTES
+  });
+  stampTerminalSequence(job, replacement);
+  return replacement;
 }
 
 async function recordTerminalDeliveryLost(job, phase) {
-  job.status = "terminal_delivery_lost";
+  if (!job?.job_id) {
+    return;
+  }
+  const deliveryPhase = phase ?? phaseForStatus(job.status) ?? "upload";
+  if (!job.terminal_envelope) {
+    let inspectCommand = null;
+    let displayName = "Yoetz";
+    if (job.recipe) {
+      try {
+        displayName = adapterForJob(job).displayName;
+        inspectCommand = job.run_id ? inspectCommandForJob(job) : null;
+      } catch {
+        // Keep the fallback terminal bounded even when the original recipe is invalid.
+      }
+    }
+    const message = `${displayName} terminal delivery was lost during ${deliveryPhase}${inspectCommand ? `; inspect with: ${inspectCommand}` : ""}`;
+    job.terminal_envelope = errorEnvelope(job, "terminal_delivery_lost", message, {
+      phase: deliveryPhase,
+      side_effect_started: Boolean(job.tab_id || job.send_committed),
+      terminal_delivery_lost: true,
+      inspect_command: inspectCommand ?? undefined
+    });
+    stampTerminalSequence(job, job.terminal_envelope);
+    job.terminal_delivered_at = null;
+  }
+  job.terminal_envelope = boundedTerminalEnvelope(job, job.terminal_envelope, deliveryPhase);
+  const successfulCompletion = job.status === "complete"
+    && job.terminal_envelope?.type === "job_complete";
+  if (!successfulCompletion) {
+    job.status = "terminal_delivery_lost";
+  } else {
+    job.terminal_delivery_lost = true;
+  }
   forgetContentScriptRecovery(job.job_id);
-  job.delivery_lost_phase = phase;
+  job.delivery_lost_phase = deliveryPhase;
   job.updated_at = Date.now();
-  await persistJob(job);
+  rememberTerminalJob(job.job_id);
+  jobs.set(job.job_id, job);
+  await persistTerminalJobBestEffort(job);
 }
 
 async function persistJob(job) {
@@ -3408,13 +4588,74 @@ async function persistJob(job) {
   // read-modify-write. Each job owns its own key and only rewrites itself; lost
   // updates from interleaved persists are no longer possible.
   await chrome.storage.session.set({
-    [jobsStorageKey(job.job_id)]: strippedJobForStorage(job)
+    [jobsStorageKey(job.job_id)]: TERMINAL_STATUSES.has(job.status)
+      ? terminalJobForStorage(job)
+      : strippedJobForStorage(job)
   });
 }
 
-async function persistTerminalJobBestEffort(job) {
+async function persistJobBestEffort(job) {
   try {
     await persistJob(job);
+    return true;
+  } catch (error) {
+    console.warn(`could not persist job ${job?.job_id ?? "unknown"}: ${String(error?.message ?? error)}`);
+    return false;
+  }
+}
+
+async function persistCancelPending(job) {
+  if (!job?.job_id || !chrome.storage.local?.set) {
+    return false;
+  }
+  const value = cancellationJobForStorage(job);
+  try {
+    await chrome.storage.local.set({ [cancelPendingStorageKey(job.job_id)]: value });
+    try {
+      await chrome.storage.session?.set?.({ [jobsStorageKey(job.job_id)]: value });
+    } catch (error) {
+      console.warn(
+        "could not mirror cancellation intent for "
+          + job.job_id
+          + ": "
+          + String(error?.message ?? error)
+      );
+    }
+    return true;
+  } catch (error) {
+    console.warn(`could not persist cancellation intent for ${job.job_id}: ${String(error?.message ?? error)}`);
+    return false;
+  }
+}
+
+async function persistTerminalJobBestEffort(job) {
+  const terminalRecord = terminalJobForStorage(job);
+  if (job?.terminal_envelope && !terminalRecord.terminal_envelope) {
+    console.warn(`could not persist terminal job ${job.job_id ?? "unknown"}: terminal envelope exceeds the persisted size limit`);
+    return false;
+  }
+  if (!globalThis.chrome?.storage?.local?.set) {
+    console.warn(`could not persist terminal job ${job?.job_id ?? "unknown"}: chrome.storage.local is unavailable`);
+    return false;
+  }
+  try {
+    // The local outbox is the durable source of truth. The session shard is a
+    // fast mirror for status/inspection and is intentionally written second.
+    await chrome.storage.local.set({
+      [terminalOutboxStorageKey(job.job_id)]: terminalRecord
+    });
+    try {
+      await chrome.storage.session?.set?.({
+        [jobsStorageKey(job.job_id)]: terminalRecord
+      });
+    } catch (error) {
+      console.warn(
+        "could not mirror terminal job "
+          + (job?.job_id ?? "unknown")
+          + ": "
+          + String(error?.message ?? error)
+      );
+    }
     return true;
   } catch (error) {
     console.warn(`could not persist terminal job ${job?.job_id ?? "unknown"}: ${String(error?.message ?? error)}`);
@@ -3422,8 +4663,57 @@ async function persistTerminalJobBestEffort(job) {
   }
 }
 
+async function retryPendingTerminalJobs(jobId = null) {
+  if (!nativePort) {
+    return;
+  }
+  const now = Date.now();
+  for (const job of jobs.values()) {
+    if (jobId && job.job_id !== jobId) {
+      continue;
+    }
+    if (!TERMINAL_STATUSES.has(job.status) || job.terminal_delivered_at) {
+      continue;
+    }
+    if (!job.terminal_envelope
+        && (job.status === "terminal_delivery_lost"
+          || job.terminal_persistence_failed === true
+          || Boolean(job.delivery_lost_phase))) {
+      await recordTerminalDeliveryLost(job, phaseForStatus(job.status) ?? "wait_response");
+    }
+    if (!job.terminal_envelope) {
+      continue;
+    }
+    const sameConnection = job.terminal_last_post_generation === connectionGeneration;
+    if (sameConnection
+        && Number.isSafeInteger(job.terminal_last_post_at)
+        && now - job.terminal_last_post_at < TERMINAL_RETRY_INTERVAL_MS) {
+      continue;
+    }
+    const delivered = await postTerminalJob(job, job.terminal_envelope, {
+      status: job.status,
+      phase: phaseForStatus(job.status) ?? "wait_response"
+    });
+    if (!delivered && !nativePort) {
+      return;
+    }
+  }
+}
+
 function jobsStorageKey(jobId) {
   return `${JOBS_KEY_PREFIX}${jobId}`;
+}
+
+function terminalOutboxStorageKey(jobId) {
+  return `${TERMINAL_OUTBOX_KEY_PREFIX}${jobId}`;
+}
+
+function terminalAckStorageKey(jobId) {
+  return `${TERMINAL_ACK_KEY_PREFIX}${jobId}`;
+}
+
+function cancelPendingStorageKey(jobId) {
+  return `${CANCEL_PENDING_KEY_PREFIX}${jobId}`;
 }
 
 function terminalAgeStamp(job) {
@@ -3436,6 +4726,9 @@ function terminalAgeStamp(job) {
 }
 
 function isExpiredTerminalJob(job) {
+  if (TERMINAL_STATUSES.has(job?.status) && !job?.terminal_delivered_at) {
+    return false;
+  }
   const stamp = terminalAgeStamp(job);
   return stamp != null && Date.now() - stamp > JOB_TTL_MS;
 }
@@ -3448,6 +4741,32 @@ async function removeJobShard(jobId) {
     await chrome.storage.session.remove(jobsStorageKey(jobId));
   } catch (error) {
     console.warn(`could not remove expired job ${jobId}: ${String(error?.message ?? error)}`);
+  }
+}
+
+async function removeTerminalOutbox(jobId) {
+  if (!jobId || !chrome.storage.local?.remove) {
+    return false;
+  }
+  try {
+    await chrome.storage.local.remove(terminalOutboxStorageKey(jobId));
+    return true;
+  } catch (error) {
+    console.warn(`could not remove acknowledged terminal outbox ${jobId}: ${String(error?.message ?? error)}`);
+    return false;
+  }
+}
+
+async function removeCancelPending(jobId) {
+  if (!jobId || !chrome.storage.local?.remove) {
+    return false;
+  }
+  try {
+    await chrome.storage.local.remove(cancelPendingStorageKey(jobId));
+    return true;
+  } catch (error) {
+    console.warn(`could not remove cancellation intent ${jobId}: ${String(error?.message ?? error)}`);
+    return false;
   }
 }
 
@@ -3492,23 +4811,73 @@ function inboundAckSequence(message) {
   return sequence;
 }
 
+async function persistTerminalAck(job, sequence, terminalType) {
+  if (!chrome.storage.local?.set || !job?.job_id || !terminalType) {
+    return false;
+  }
+  const tombstone = {
+    job_id: job.job_id,
+    run_id: job.run_id ?? null,
+    workspace_id: job.workspace_id ?? null,
+    recipe: job.recipe ?? null,
+    tab_id: job.tab_id ?? null,
+    close_tab_on_complete: job.close_tab_on_complete === true,
+    ownership_nonce: job.ownership_nonce ?? null,
+    conversation_id: job.conversation_id ?? null,
+    expected_conversation_id: job.expected_conversation_id ?? null,
+    submitted_conversation_id: job.submitted_conversation_id ?? null,
+    status: job.status ?? terminalStatusForEnvelope({ type: terminalType }),
+      terminal_type: terminalType,
+    sequence,
+    acknowledged_at: Date.now(),
+    cleanup_pending: job.close_tab_on_complete === true
+      && Boolean(job.tab_id)
+      && (job.status === "complete" || terminalType === "job_complete")
+      ? "tab_close"
+      : "records"
+  };
+  try {
+    await chrome.storage.local.set({ [terminalAckStorageKey(job.job_id)]: tombstone });
+    return true;
+  } catch (error) {
+    console.warn(`could not commit terminal ACK for ${job.job_id}: ${String(error?.message ?? error)}`);
+    return false;
+  }
+}
+
+async function persistTerminalAckCleanup(jobId, phase) {
+  if (!chrome.storage.local?.get || !chrome.storage.local?.set || !jobId) {
+    return false;
+  }
+  const key = terminalAckStorageKey(jobId);
+  try {
+    const stored = (await chrome.storage.local.get(key))?.[key];
+    if (!stored || typeof stored !== "object") {
+      return false;
+    }
+    await chrome.storage.local.set({ [key]: { ...stored, cleanup_pending: phase } });
+    return true;
+  } catch (error) {
+    console.warn(`could not advance terminal ACK cleanup for ${jobId}: ${String(error?.message ?? error)}`);
+    return false;
+  }
+}
+
 async function loadJobForTerminalAck(jobId) {
   const live = jobs.get(jobId);
   if (live) {
     return live;
   }
   const key = jobsStorageKey(jobId);
+  if (chrome.storage.local) {
+    const durable = (await chrome.storage.local.get(terminalOutboxStorageKey(jobId)))?.[terminalOutboxStorageKey(jobId)];
+    if (durable && typeof durable === "object") {
+      return durable;
+    }
+  }
   const stored = (await chrome.storage.session.get(key))?.[key];
   if (stored && typeof stored === "object") {
     return stored;
-  }
-  if (terminalJobIds.has(jobId)) {
-    return {
-      job_id: jobId,
-      status: "complete",
-      terminal_sequence: 0,
-      updated_at: Date.now()
-    };
   }
   return null;
 }
@@ -3529,13 +4898,138 @@ async function handleTerminalAck(message) {
   if (expectedTerminalSequence(job) !== sequence) {
     return;
   }
+  const acknowledgedType = message?.payload?.terminal_type;
+  const expectedType = job.terminal_envelope?.type
+    ?? job.terminal_type
+    ?? (job.terminal_envelope_too_large ? acknowledgedType : null);
+  if (!expectedType || acknowledgedType !== expectedType) {
+    return;
+  }
+  if (job.run_id != null && message.run_id !== job.run_id) {
+    return;
+  }
+  if (job.workspace_id != null && message.workspace_id !== job.workspace_id) {
+    return;
+  }
   if (job.terminal_delivered_at) {
+    return;
+  }
+  if (!await persistTerminalAck(job, sequence, acknowledgedType)) {
     return;
   }
   job.terminal_delivered_at = Date.now();
   job.updated_at = Date.now();
   rememberTerminalJob(jobId);
-  await persistTerminalJobBestEffort(job);
+  await persistJobBestEffort(job);
+  if (job.close_tab_on_complete
+      && (job.status === "complete" || job.terminal_envelope?.type === "job_complete")) {
+    await closeOwnedTabOnComplete(job);
+  }
+  await persistTerminalAckCleanup(jobId, "records");
+  const outboxRemoved = await removeTerminalOutbox(jobId);
+  const cancellationRemoved = await removeCancelPending(jobId);
+  delete job.terminal_envelope;
+  delete job.terminal_persistence_failed;
+  const sessionPersisted = await persistJobBestEffort(job);
+  if (outboxRemoved && cancellationRemoved && sessionPersisted
+      && await persistTerminalAckCleanup(jobId, "done")) {
+    jobs.delete(jobId);
+    chunks.discard(jobId);
+  }
+}
+
+const TERMINAL_STORAGE_FIELDS = Object.freeze([
+  "job_id",
+  "run_id",
+  "workspace_id",
+  "capability_token",
+  "request_id",
+  "recipe",
+  "status",
+  "tab_id",
+  "ownership_nonce",
+  "conversation_id",
+  "expected_conversation_id",
+  "submitted_conversation_id",
+  "close_tab_on_complete",
+  "tab_disposition",
+  "tab_ownership_verified",
+  "tab_ownership_error",
+  "may_still_be_running",
+  "send_committed",
+  "started_at",
+  "updated_at",
+  "terminal_envelope",
+  "terminal_type",
+  "terminal_envelope_too_large",
+  "terminal_sequence",
+  "terminal_at",
+  "terminal_delivered_at",
+  "terminal_persistence_failed",
+  "terminal_delivery_lost",
+  "delivery_lost_phase",
+  "terminal_last_post_at",
+  "terminal_last_post_generation",
+  "last_response_progress_length",
+  "last_response_progress_tail"
+]);
+
+const CANCEL_PENDING_STORAGE_FIELDS = Object.freeze([
+  "job_id",
+  "run_id",
+  "workspace_id",
+  "capability_token",
+  "request_id",
+  "recipe",
+  "status",
+  "tab_id",
+  "ownership_nonce",
+  "conversation_id",
+  "expected_conversation_id",
+  "submitted_conversation_id",
+  "close_tab_on_complete",
+  "send_committed",
+  "content_script_instance_id",
+  "content_script_build",
+  "content_script_recipe",
+  "cancel_pending",
+  "cancel_requested",
+  "cancelled",
+  "started_at",
+  "updated_at"
+]);
+
+function storageRecordFromFields(job, fields) {
+  const record = {};
+  for (const field of fields) {
+    if (job?.[field] !== undefined) {
+      record[field] = job[field];
+    }
+  }
+  if (record.terminal_envelope) {
+    record.terminal_envelope = JSON.parse(JSON.stringify(record.terminal_envelope));
+  }
+  return record;
+}
+
+function terminalJobForStorage(job) {
+  const record = storageRecordFromFields(job, TERMINAL_STORAGE_FIELDS);
+  if (typeof job?.last_response_progress_text === "string" && job.last_response_progress_text.length > 0) {
+    record.last_response_progress_length = job.last_response_progress_text.length;
+    record.last_response_progress_tail = job.last_response_progress_text.slice(-RESPONSE_TEXT_PERSIST_TAIL);
+  }
+  if (
+    record.terminal_envelope
+    && nativeEnvelopeByteLength(record.terminal_envelope) > MAX_PERSISTED_TERMINAL_ENVELOPE_BYTES
+  ) {
+    delete record.terminal_envelope;
+    record.terminal_envelope_too_large = true;
+  }
+  return record;
+}
+
+function cancellationJobForStorage(job) {
+  return storageRecordFromFields(job, CANCEL_PENDING_STORAGE_FIELDS);
 }
 
 // Build a JSON-cloneable, size-bounded view of a job for chrome.storage.session.
@@ -3553,6 +5047,8 @@ function strippedJobForStorage(job) {
     last_response_progress_text: fullText,
     poller_lease: _pollerLease,
     poller_lease_seq: _pollerLeaseSeq,
+    terminal_last_post_at: _terminalLastPostAt,
+    terminal_last_post_generation: _terminalLastPostGeneration,
     ...rest
   } = job;
   if (
@@ -3579,6 +5075,9 @@ async function cleanupExpiredJobs() {
     if (!key.startsWith(JOBS_KEY_PREFIX) || !value) {
       continue;
     }
+    if (TERMINAL_STATUSES.has(value.status) && !value.terminal_delivered_at) {
+      continue;
+    }
     const stamp = TERMINAL_STATUSES.has(value.status)
       ? terminalAgeStamp(value)
       : (value.updated_at ?? value.started_at ?? 0);
@@ -3591,7 +5090,10 @@ async function cleanupExpiredJobs() {
   }
 }
 
-function handleNativeDisconnect() {
+function handleNativeDisconnect(port = nativePort, generation = connectionGeneration) {
+  if (nativePort !== port || connectionGeneration !== generation) {
+    return;
+  }
   connectionGeneration += 1;
   nativePort = null;
   stopHeartbeat();
@@ -3614,14 +5116,19 @@ function stopHeartbeat() {
 }
 
 function postNative(message) {
-  if (!nativePort) {
+  const port = nativePort;
+  const generation = connectionGeneration;
+  if (!port) {
     return false;
   }
   try {
-    nativePort.postMessage(message);
+    port.postMessage(message);
     return true;
   } catch (error) {
     const detail = String(error?.message ?? error);
+    if (nativePort !== port || connectionGeneration !== generation) {
+      return false;
+    }
     connectionGeneration += 1;
     nativePort = null;
     stopHeartbeat();

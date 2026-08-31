@@ -21,6 +21,16 @@ test("ownedWindowName round trips run and job ids", () => {
   assert.equal(parseOwnedWindowName("not-yoetz"), null);
 });
 
+test("ownedWindowName binds workspace and ownership nonce when present", () => {
+  const job = {
+    run_id: "run_abc",
+    job_id: "job_xyz",
+    workspace_id: "workspace_/release",
+    ownership_nonce: "nonce-123"
+  };
+  assert.deepEqual(parseOwnedWindowName(ownedWindowName(job)), job);
+});
+
 test("chatgptJobUrl scopes jobs to chatgpt.com with a Yoetz marker", () => {
   assert.equal(chatgptJobUrl("run 1"), "https://chatgpt.com/?_yoetz=run+1");
 });

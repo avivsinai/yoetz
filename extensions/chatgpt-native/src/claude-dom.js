@@ -37,18 +37,44 @@ const USAGE_CREDITS_TEXT_PATTERN = /\bout of usage credits\b/i;
 const blockingStateScanCache = new WeakMap();
 
 export function ownedWindowName(job) {
-  return `${YOETZ_WINDOW_PREFIX}${job.run_id}:${job.job_id}`;
+  const base = `${YOETZ_WINDOW_PREFIX}${job.run_id}:${job.job_id}`;
+  const workspaceId = String(job?.workspace_id ?? "");
+  const ownershipNonce = String(job?.ownership_nonce ?? "");
+  return workspaceId || ownershipNonce
+    ? `${base}|${encodeURIComponent(workspaceId)}|${encodeURIComponent(ownershipNonce)}`
+    : base;
 }
 
 export function parseOwnedWindowName(value) {
   if (typeof value !== "string" || !value.startsWith(YOETZ_WINDOW_PREFIX)) {
     return null;
   }
-  const rest = value.slice(YOETZ_WINDOW_PREFIX.length);
-  const separator = rest.lastIndexOf(":");
-  return separator > 0
-    ? { run_id: rest.slice(0, separator), job_id: rest.slice(separator + 1) }
-    : null;
+  const [identity, workspaceId, ownershipNonce] = value
+    .slice(YOETZ_WINDOW_PREFIX.length)
+    .split("|");
+  const separator = identity.lastIndexOf(":");
+  if (separator <= 0 || separator === identity.length - 1) {
+    return null;
+  }
+  const parsed = {
+    run_id: identity.slice(0, separator),
+    job_id: identity.slice(separator + 1)
+  };
+  if (workspaceId) {
+    parsed.workspace_id = decodeMarkerField(workspaceId);
+  }
+  if (ownershipNonce) {
+    parsed.ownership_nonce = decodeMarkerField(ownershipNonce);
+  }
+  return parsed.workspace_id === null || parsed.ownership_nonce === null ? null : parsed;
+}
+
+function decodeMarkerField(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
 }
 
 export function claudeJobUrl(runId) {
@@ -172,12 +198,22 @@ export function getPageText(root = document) {
 }
 
 export function markOwnership(root, job) {
-  root.documentElement?.setAttribute(OWNERSHIP_ATTR, `${job.run_id}:${job.job_id}`);
+  const target = root.documentElement;
+  target?.setAttribute(OWNERSHIP_ATTR, `${job.run_id}:${job.job_id}`);
+  if (job.workspace_id) {
+    target?.setAttribute("data-yoetz-workspace-id", job.workspace_id);
+  }
+  if (job.ownership_nonce) {
+    target?.setAttribute("data-yoetz-ownership-nonce", job.ownership_nonce);
+  }
 }
 
 export function assertOwnedPage(win, job) {
   const parsed = parseOwnedWindowName(win.name);
-  if (parsed?.run_id !== job.run_id || parsed?.job_id !== job.job_id) {
+  if (parsed?.run_id !== job.run_id
+      || parsed?.job_id !== job.job_id
+      || (job.workspace_id != null && parsed?.workspace_id !== job.workspace_id)
+      || (job.ownership_nonce != null && parsed?.ownership_nonce !== job.ownership_nonce)) {
     throw new Error(`tab ownership marker mismatch for job ${job.job_id}`);
   }
 }
@@ -609,16 +645,30 @@ export function isResponseGenerating(root = document) {
   );
 }
 
+function findStopGenerating(root = document) {
+  return root.querySelector("button[aria-label='Stop response']");
+}
+
 export function clickStopGenerating(root = document) {
-  const stop = root.querySelector("button[aria-label='Stop response']");
+  const stop = findStopGenerating(root);
   if (!stop) return false;
+  stop.click();
+  return true;
+}
+
+async function clickStopGeneratingAuthorized(root, beforeStopClick) {
+  const stop = findStopGenerating(root);
+  if (!stop) return false;
+  await beforeStopClick();
   stop.click();
   return true;
 }
 
 export async function confirmGenerationStopped(root = document, options = {}) {
   const startedAt = Date.now();
-  const stopped = clickStopGenerating(root);
+  const stopped = typeof options.beforeStopClick === "function"
+    ? await clickStopGeneratingAuthorized(root, options.beforeStopClick)
+    : clickStopGenerating(root);
   const timeoutMs = options.timeoutMs ?? 5000;
   while (Date.now() - startedAt <= timeoutMs) {
     if (!isResponseGenerating(root)) {

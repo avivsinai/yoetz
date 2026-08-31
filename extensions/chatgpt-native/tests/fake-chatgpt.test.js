@@ -599,6 +599,51 @@ test("confirmGenerationStopped never throws when the page tears down mid-poll", 
   assert.equal(typeof result.stopped, "boolean");
 });
 
+test("confirmGenerationStopped refuses the first Stop click when ownership is unverified", async () => {
+  const stop = new FakeElement("button", { "aria-label": "Stop streaming" }, "Stop");
+  const body = new FakeElement("body", {}, "Stop").append(stop);
+  const doc = new FakeDocument(body);
+  const ownershipError = Object.assign(new Error("ownership changed"), {
+    code: "ownership_unverified"
+  });
+
+  await assert.rejects(
+    confirmGenerationStopped(doc, {
+      beforeStopClick: async () => {
+        throw ownershipError;
+      }
+    }),
+    (error) => error === ownershipError
+  );
+  assert.equal(stop.clicked, false);
+});
+
+test("confirmGenerationStopped rechecks ownership before its bounded Stop re-click", async () => {
+  const stop = new FakeElement("button", { "aria-label": "Stop streaming" }, "Stop");
+  const body = new FakeElement("body", {}, "Stop").append(stop);
+  const doc = new FakeDocument(body);
+  const ownershipError = Object.assign(new Error("ownership changed"), {
+    code: "ownership_unverified"
+  });
+  let ownershipChecks = 0;
+
+  await assert.rejects(
+    confirmGenerationStopped(doc, {
+      timeoutMs: 100,
+      intervalMs: 10,
+      beforeStopClick: async () => {
+        ownershipChecks += 1;
+        if (ownershipChecks > 1) {
+          throw ownershipError;
+        }
+      }
+    }),
+    (error) => error === ownershipError
+  );
+  assert.equal(ownershipChecks, 2);
+  assert.equal(stop.clicked, true);
+});
+
 test("extractResponse ignores user prompt articles and copy controls", () => {
   const userCopy = new FakeElement("button", { "aria-label": "Copy" }, "Copy");
   const userTurn = new FakeElement("article", { "data-message-author-role": "user" }, "bundle.md\nFile\nReview the attached file and provide your analysis.")

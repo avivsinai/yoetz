@@ -520,9 +520,9 @@ async () => {{
           surfaceProofKind: proof === "controls"
             ? "explicit_chat_work_radios"
             : "implicit_chat_composer_aria",
-          surfaceChatState: surfaceState(controls?.chat),
-          surfaceWorkState: surfaceState(controls?.work),
-          surfaceVisibleToggleCount,
+          surfaceChatState: proof === "controls" ? surfaceState(controls?.chat) : null,
+          surfaceWorkState: proof === "controls" ? surfaceState(controls?.work) : null,
+          surfaceVisibleToggleCount: visibleSurfaceToggleCount,
           surfaceComposerAria: proof === "composer_aria"
             ? composer?.getAttribute("aria-label") || null
             : null,
@@ -551,8 +551,8 @@ async () => {{
       state,
       observedValues,
       surfaceProofKind: null,
-      surfaceChatState: surfaceState(null),
-      surfaceWorkState: surfaceState(null),
+      surfaceChatState: null,
+      surfaceWorkState: null,
       surfaceVisibleToggleCount: surfaceObservedToggleNodes().length,
       surfaceComposerAria: lastComposerAria,
       surfaceEvidenceSeen
@@ -1441,8 +1441,8 @@ async () => {{
       surfaceState: surface?.state ?? surfaceState(null),
       surfaceObservedValues: surface?.observedValues ?? [],
       surfaceProofKind: surface?.surfaceProofKind ?? null,
-      surfaceChatState: surface?.surfaceChatState ?? surfaceState(null),
-      surfaceWorkState: surface?.surfaceWorkState ?? surfaceState(null),
+      surfaceChatState: surface?.surfaceChatState ?? null,
+      surfaceWorkState: surface?.surfaceWorkState ?? null,
       surfaceVisibleToggleCount: surface?.surfaceVisibleToggleCount ?? 0,
       surfaceComposerAria: surface?.surfaceComposerAria ?? null,
       surfaceEvidenceSeen
@@ -1936,7 +1936,7 @@ pub fn build_send_button_click_function_with_surface_evidence(
         surfaceProofKind: "explicit_chat_work_radios",
         surfaceChatState: chatState,
         surfaceWorkState: workState,
-        surfaceVisibleToggleCount,
+        surfaceVisibleToggleCount: visibleSurfaceToggleCount,
         surfaceComposerAria: null,
       }};
     }}
@@ -1950,7 +1950,7 @@ pub fn build_send_button_click_function_with_surface_evidence(
         surfaceProofKind: null,
         surfaceChatState: chatState,
         surfaceWorkState: workState,
-        surfaceVisibleToggleCount,
+        surfaceVisibleToggleCount: visibleSurfaceToggleCount,
         surfaceComposerAria: composer?.getAttribute("aria-label") || null,
       }};
     }}
@@ -1961,9 +1961,9 @@ pub fn build_send_button_click_function_with_surface_evidence(
         state: surfaceState(null),
         observedValues,
         surfaceProofKind: "implicit_chat_composer_aria",
-        surfaceChatState: surfaceState(null),
-        surfaceWorkState: surfaceState(null),
-        surfaceVisibleToggleCount,
+        surfaceChatState: null,
+        surfaceWorkState: null,
+        surfaceVisibleToggleCount: visibleSurfaceToggleCount,
         surfaceComposerAria: "Chat with ChatGPT",
       }};
     }}
@@ -1977,7 +1977,7 @@ pub fn build_send_button_click_function_with_surface_evidence(
       surfaceProofKind: null,
       surfaceChatState: chatState,
       surfaceWorkState: workState,
-      surfaceVisibleToggleCount,
+      surfaceVisibleToggleCount: visibleSurfaceToggleCount,
       surfaceComposerAria: composer?.getAttribute("aria-label") || null,
     }};
   }};
@@ -3619,6 +3619,42 @@ mod tests {
             .and_then(|value| value.as_bool()),
             Some(false)
         );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires Chrome"]
+    #[serial]
+    fn fake_chatgpt_fixture_current_strategy_preserves_implicit_surface_nulls() -> anyhow::Result<()>
+    {
+        let (_browser, tab) = launch_fake_chatgpt_fixture()?;
+        tab.evaluate(
+            r##"(() => {
+              const pill = document.createElement("button");
+              pill.className = "__composer-pill";
+              pill.setAttribute("aria-haspopup", "menu");
+              pill.textContent = "5.5 Instant";
+              document.querySelector("#chat-form").appendChild(pill);
+              return "mounted";
+            })()"##,
+            true,
+        )?;
+
+        let result = eval_fixture_function(
+            &tab,
+            &build_send_button_click_function_with_model_selection_for(
+                "current",
+                ChatgptModelStrategy::Current,
+                false,
+            ),
+        )?;
+        assert_eq!(result["status"], "sent", "{result}");
+        let receipt = canonical_chatgpt_final_model_selection(&result["finalModelSelection"]);
+        assert_eq!(receipt["surface_proof_kind"], "implicit_chat_composer_aria");
+        assert_eq!(receipt["surface_visible_toggle_count"], 0);
+        assert_eq!(receipt["surface_chat_state"], serde_json::Value::Null);
+        assert_eq!(receipt["surface_work_state"], serde_json::Value::Null);
+        validate_chatgpt_final_model_selection(&receipt, ChatgptModelStrategy::Current)?;
         Ok(())
     }
 
