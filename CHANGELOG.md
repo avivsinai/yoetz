@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.63] - 2026-08-31
 ### Fixed
 
 - ChatGPT browser recipes now enforce Chat mode and GPT-5.6 Sol Pro selection at
@@ -15,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   resuming or sending jobs, and rejects stale tab state.
 - Native extension setup, update, and auto-heal now require a release-bound
   package fingerprint before copying or reloading extension code.
+
 
 ## [0.5.62] - 2026-08-30
 ### Fixed

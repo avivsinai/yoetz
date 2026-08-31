@@ -24,7 +24,7 @@ const NATIVE_JOB_COMMANDS_CAPABILITY = "native_job_commands_v1";
 const CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY = "chatgpt_click_bound_send_receipt_v1";
 // This literal is stamped by the release script and must match the content script. The managed
 // extension manifest can receive a local reload suffix, so it is not the content-script identity.
-const CONTENT_SCRIPT_BUILD = "0.5.62";
+const CONTENT_SCRIPT_BUILD = "0.5.63";
 const SECURE_CONTENT_SCRIPT_COMMANDS = new Set([
   "yoetz_prepare_job",
   "yoetz_bind_job",
