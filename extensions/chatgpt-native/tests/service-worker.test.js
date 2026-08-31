@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { uint8ArrayToBase64 } from "../src/chunks.js";
 
-const TEST_CONTENT_SCRIPT_BUILD = "0.5.62";
+const TEST_CONTENT_SCRIPT_BUILD = "0.5.63";
 
 globalThis.__YOETZ_MIN_STABLE_IDLE_MS = 100;
 globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER = 0;
