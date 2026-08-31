@@ -111,6 +111,9 @@ pub fn mark_terminal_fallback_phase(
     recipe: BuiltinWebRecipe,
     phase: WebRecipeTransportPhase,
 ) -> AnyhowError {
+    if terminal_fallback_marker(&err).is_some_and(|(marked_recipe, _)| marked_recipe == recipe) {
+        return err;
+    }
     err.context(WebRecipeTerminalFallbackError { recipe, phase })
 }
 
@@ -169,6 +172,27 @@ mod tests {
             Some((BuiltinWebRecipe::Claude, WebRecipeTransportPhase::Send))
         );
         assert!(err.to_string().contains("Claude send phase failed"));
+    }
+
+    #[test]
+    fn terminal_fallback_marker_preserves_an_inner_phase_for_the_same_recipe() {
+        let err = mark_terminal_fallback_phase(
+            mark_terminal_fallback_phase(
+                anyhow!("final receipt validation failed"),
+                BuiltinWebRecipe::Chatgpt,
+                WebRecipeTransportPhase::PostCompletion,
+            ),
+            BuiltinWebRecipe::Chatgpt,
+            WebRecipeTransportPhase::Send,
+        );
+
+        assert_eq!(
+            terminal_fallback_marker(&err),
+            Some((
+                BuiltinWebRecipe::Chatgpt,
+                WebRecipeTransportPhase::PostCompletion,
+            ))
+        );
     }
 
     #[test]

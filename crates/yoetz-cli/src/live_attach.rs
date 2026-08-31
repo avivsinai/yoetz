@@ -789,6 +789,7 @@ impl TestSessionClient {
                 response: "ok".to_string(),
                 model_used: None,
                 model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus::Unavailable,
+                final_model_selection: None,
             }),
             TestRecipeBehavior::Error(message) => Err(anyhow!(message)),
             TestRecipeBehavior::CdpTargetCreateDeniedClosed => {
@@ -811,6 +812,7 @@ impl TestSessionClient {
                     response: "ok".to_string(),
                     model_used: None,
                     model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus::Unavailable,
+                    final_model_selection: None,
                 })
             }
         }

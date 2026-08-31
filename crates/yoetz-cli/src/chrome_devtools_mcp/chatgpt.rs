@@ -102,12 +102,14 @@ pub struct ChatgptRunResult {
     pub response: String,
     pub model_used: Option<String>,
     pub model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus,
+    pub final_model_selection: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct ModelSelectionOutcome {
     model_used: Option<String>,
     model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus,
+    surface_evidence_seen: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -337,7 +339,7 @@ async fn run_attached_recipe_inner(
     // Step 2: wait for the composer to mount, then verify GPT-5.6 Sol at verified Pro effort.
     // before any upload/send side effects.
     wait_for_composer_ready(client, /* focus_composer */ true).await?;
-    let model_selection = maybe_select_model(client, &ctx.model).await?;
+    let model_selection = maybe_select_model(client, &ctx.model, ctx.model_strategy).await?;
 
     // Step 3: upload the bundle if we have a path.
     //
@@ -387,7 +389,11 @@ async fn run_attached_recipe_inner(
         .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send)
         .context("type_text into ChatGPT composer")?;
 
-    let click_send_js = chatgpt_web::build_send_button_click_function();
+    let click_send_js = chatgpt_web::build_send_button_click_function_with_model_selection_for(
+        &ctx.model,
+        ctx.model_strategy,
+        model_selection.surface_evidence_seen,
+    );
     let clicked = client
         .evaluate_script(&click_send_js, vec![])
         .await
@@ -401,10 +407,56 @@ async fn run_attached_recipe_inner(
                 .cloned()
                 .unwrap_or(serde_json::Value::Null)
         ))
-        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send);
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion);
     }
+    let expected_model_selection_status = match ctx.model_strategy {
+        chatgpt_recipe::ChatgptModelStrategy::Select => {
+            chatgpt_recipe::ChatgptModelSelectionStatus::Selected
+        }
+        chatgpt_recipe::ChatgptModelStrategy::Current => {
+            chatgpt_recipe::ChatgptModelSelectionStatus::Current
+        }
+    };
+    let final_model_selection = clicked
+        .get("finalModelSelection")
+        .filter(|value| value.is_object())
+        .map(chatgpt_web::canonical_chatgpt_final_model_selection)
+        .ok_or_else(|| anyhow!("ChatGPT send proof did not return a final model selection receipt"))
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion)?;
+    chatgpt_web::validate_chatgpt_final_model_selection(&final_model_selection, ctx.model_strategy)
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion)?;
+    if final_model_selection
+        .get("click_bound")
+        .and_then(serde_json::Value::as_bool)
+        != Some(true)
+    {
+        return Err(anyhow!(
+            "ChatGPT final model selection proof was not bound to the send click: {}",
+            final_model_selection
+        ))
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion);
+    }
+    let final_model_selection_status = chatgpt_web::chatgpt_model_selection_status(
+        clicked
+            .get("finalModelSelection")
+            .expect("final model selection was checked above"),
+        &ctx.model,
+    );
+    if final_model_selection_status != expected_model_selection_status {
+        return Err(anyhow!(
+            "ChatGPT final model selection proof used unexpected strategy status: expected {:?}, got {:?}: {}",
+            expected_model_selection_status,
+            final_model_selection_status,
+            final_model_selection
+        ))
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion);
+    }
+    let final_model_used = final_model_selection
+        .get("model_used")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
     let response_baseline = parse_response_baseline(&clicked)
-        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send)
+        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion)
         .context("parse ChatGPT response baseline before send")?;
 
     // Step 6: stable-idle polling for response completion.
@@ -431,8 +483,9 @@ async fn run_attached_recipe_inner(
 
     Ok(ChatgptRunResult {
         response: response_text,
-        model_used: model_selection.model_used,
-        model_selection_status: model_selection.model_selection_status,
+        model_used: final_model_used.or(model_selection.model_used),
+        model_selection_status: final_model_selection_status,
+        final_model_selection: Some(final_model_selection),
     })
 }
 
@@ -732,8 +785,9 @@ fn should_retry_wait_for_composer_error(err: &anyhow::Error) -> bool {
 async fn maybe_select_model(
     client: &ChromeCdpClient,
     requested_model: &str,
+    model_strategy: chatgpt_recipe::ChatgptModelStrategy,
 ) -> Result<ModelSelectionOutcome> {
-    let script = build_model_selection_script(requested_model);
+    let script = build_model_selection_script(requested_model, model_strategy);
     let selection = client
         .evaluate_script(&script, vec![])
         .await
@@ -748,13 +802,39 @@ async fn maybe_select_model(
     let model_used = chatgpt_web::select_reported_chatgpt_model(&selection, requested_model);
     let model_selection_status =
         chatgpt_web::chatgpt_model_selection_status(&selection, requested_model);
+    let expected_model_selection_status = match model_strategy {
+        chatgpt_recipe::ChatgptModelStrategy::Select => {
+            chatgpt_recipe::ChatgptModelSelectionStatus::Selected
+        }
+        chatgpt_recipe::ChatgptModelStrategy::Current => {
+            chatgpt_recipe::ChatgptModelSelectionStatus::Current
+        }
+    };
     match status {
         "selected"
-            if model_selection_status == chatgpt_recipe::ChatgptModelSelectionStatus::Selected =>
+            if model_strategy == chatgpt_recipe::ChatgptModelStrategy::Select
+                && model_selection_status == expected_model_selection_status =>
         {
             Ok(ModelSelectionOutcome {
                 model_used,
                 model_selection_status,
+                surface_evidence_seen: selection
+                    .get("surfaceEvidenceSeen")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            })
+        }
+        "current"
+            if model_strategy == chatgpt_recipe::ChatgptModelStrategy::Current
+                && model_selection_status == expected_model_selection_status =>
+        {
+            Ok(ModelSelectionOutcome {
+                model_used,
+                model_selection_status,
+                surface_evidence_seen: selection
+                    .get("surfaceEvidenceSeen")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             })
         }
         "selected" => Err(anyhow!(
@@ -847,11 +927,11 @@ fn parse_response_baseline(state: &serde_json::Value) -> Result<ResponseBaseline
     })
 }
 
-fn build_model_selection_script(requested_model: &str) -> String {
-    chatgpt_web::build_model_selection_function(
-        requested_model,
-        crate::chatgpt_recipe::ChatgptModelStrategy::Select,
-    )
+fn build_model_selection_script(
+    requested_model: &str,
+    model_strategy: chatgpt_recipe::ChatgptModelStrategy,
+) -> String {
+    chatgpt_web::build_model_selection_function(requested_model, model_strategy)
 }
 
 /// Rewrite a CDP attach failure with actionable guidance.
@@ -2098,8 +2178,10 @@ mod tests {
 
     #[test]
     fn model_selection_script_requires_verified_sol_chat_pro_contract() {
-        let explicit_script =
-            build_model_selection_script(crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL);
+        let explicit_script = build_model_selection_script(
+            crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL,
+            crate::chatgpt_recipe::ChatgptModelStrategy::Select,
+        );
         assert!(explicit_script.contains(r#"const requested = "gpt-5-6-sol-chat-pro";"#));
         assert!(explicit_script.contains("classList.contains(\"__composer-pill\")"));
         assert!(explicit_script.contains("familyStatus"));

@@ -20,7 +20,26 @@ const TERMINAL_STATUSES = new Set(["complete", "cancelled", "failed", "manual_ha
 const EXTENSION_ID_STORAGE_KEY = "yoetz_extension_instance_id";
 const ADVERTISED_RECIPES = Object.freeze(advertisedRecipes());
 const TERMINAL_ACK_CAPABILITY = "terminal_ack";
-const ADVERTISED_CAPABILITIES = Object.freeze([TERMINAL_ACK_CAPABILITY]);
+const NATIVE_JOB_COMMANDS_CAPABILITY = "native_job_commands_v1";
+const CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY = "chatgpt_click_bound_send_receipt_v1";
+// This literal is stamped by the release script and must match the content script. The managed
+// extension manifest can receive a local reload suffix, so it is not the content-script identity.
+const CONTENT_SCRIPT_BUILD = "0.5.62";
+const SECURE_CONTENT_SCRIPT_COMMANDS = new Set([
+  "yoetz_prepare_job",
+  "yoetz_bind_job",
+  "yoetz_upload_file",
+  "yoetz_configure_model",
+  "yoetz_send_prompt",
+  "yoetz_extract_response",
+  "yoetz_fetch_conversation",
+  "yoetz_cancel_send"
+]);
+const ADVERTISED_CAPABILITIES = Object.freeze([
+  TERMINAL_ACK_CAPABILITY,
+  NATIVE_JOB_COMMANDS_CAPABILITY,
+  CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY
+]);
 const MIN_STABLE_IDLE_MS = Number(globalThis.__YOETZ_MIN_STABLE_IDLE_MS ?? 90000);
 // Require multiple stable polls so final controls cannot win before late text hydration.
 const STABLE_IDLE_INTERVAL_MULTIPLIER = Number(globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER ?? 3);
@@ -428,7 +447,8 @@ async function startJob(message) {
   }
 
   await waitForSiteTab(tab.id, adapter);
-  await waitForContentScript(tab.id, adapter);
+  const contentScriptProbe = await waitForContentScript(tab.id, adapter);
+  recordContentScriptContract(job, contentScriptProbe);
   const prepared = await sendToTab(tab.id, { type: "yoetz_prepare_job", job });
   if (prepared.manual_handoff) {
     postNative(progress(job, "manual_handoff", prepared.manual_handoff));
@@ -493,6 +513,11 @@ async function completeModelSelection(job, tabId, attempt, options = {}) {
   }
   if (staleSelectionAttempt(job, attempt)) {
     return;
+  }
+  if (adapter.recipe === "chatgpt") {
+    job.surface_evidence_seen = Boolean(
+      job.surface_evidence_seen || modelSelection.surface_evidence_seen
+    );
   }
   job.model_used = modelSelection.model_used ?? null;
   job.model_selection_status = modelSelection.status ?? "unavailable";
@@ -660,6 +685,12 @@ async function acceptFileChunk(message) {
 async function runJobWithFile(job, file) {
   if (job.cancelled) return;
   assertJobConnectionCurrent(job);
+  const adapter = adapterForJob(job);
+  const uploadProbe = await requireContentScriptCapability(job.tab_id, adapter, {
+    phase: "upload",
+    side_effect_started: false
+  });
+  recordContentScriptContract(job, uploadProbe);
   job.status = "uploading_file";
   job.updated_at = Date.now();
   await persistJob(job);
@@ -697,7 +728,45 @@ async function runJobWithFile(job, file) {
     job.status = "sending_prompt";
     job.updated_at = Date.now();
     await persistJob(job);
+    const sendProbe = await requireContentScriptCapability(job.tab_id, adapter, {
+      phase: "send",
+      side_effect_started: true,
+      send_committed: false
+    });
+    recordContentScriptContract(job, sendProbe);
     const sendResult = await sendToTab(job.tab_id, { type: "yoetz_send_prompt", job, prompt });
+    if (job.recipe === "chatgpt") {
+      const finalModelSelection = sendResult?.final_model_selection;
+      const expectedModelSelectionStatus = job.model_strategy === "current" ? "current" : "selected";
+      const expectedRequestedModel = job.model_strategy === "current" ? "current" : job.model;
+      const receiptMissing = !finalModelSelection
+        || typeof finalModelSelection !== "object"
+        || Array.isArray(finalModelSelection);
+      const receiptError = receiptMissing
+        ? null
+        : validateChatgptFinalModelSelectionReceipt(finalModelSelection, job);
+      if (receiptMissing || receiptError) {
+        await failJob(
+          job,
+          receiptMissing ? "send_proof_missing" : "send_proof_invalid",
+          `ChatGPT send returned without a valid click-bound final model selection receipt for strategy ${job.model_strategy ?? "select"} and model ${expectedRequestedModel}${receiptError ? `: ${receiptError}` : ""}. The prompt may already be submitted; inspect the owned tab before rerunning.`,
+          {
+            phase: "post_completion",
+            side_effect_started: true,
+            send_committed: true,
+            model_strategy: job.model_strategy,
+            final_model_selection: finalModelSelection ?? null
+          }
+        );
+        return;
+      }
+      job.final_model_selection = finalModelSelection;
+      job.surface_evidence_seen = Boolean(
+        job.surface_evidence_seen || finalModelSelection.surface_evidence_seen === true
+      );
+      job.model_used = finalModelSelection.model_used ?? job.model_used;
+      job.model_selection_status = finalModelSelection.status ?? job.model_selection_status;
+    }
     job.submitted_url = sendResult?.url ?? null;
     job.submitted_conversation_id = sendResult?.conversation_id ?? null;
     job.submitted_user_count = Number.isFinite(Number(sendResult?.submitted_user_count))
@@ -776,11 +845,12 @@ async function completeJobWithExtraction(job, extraction) {
       // internal naming, so it must not overwrite a proven label. Keep it as
       // observability (model_slug) and as the fallback when there was no
       // picker proof (current/kept_current/unavailable).
-      model_used: job.model_selection_status === "selected" && job.model_used
+      model_used: ["selected", "current"].includes(job.model_selection_status) && job.model_used
         ? job.model_used
         : (extraction.model_slug ?? job.model_used ?? null),
       model_slug: extraction.model_slug ?? null,
       model_selection_status: job.model_selection_status ?? "unavailable",
+      final_model_selection: job.final_model_selection ?? null,
       warnings: completionWarnings({
         jobWarnings: job.warnings,
         extraction,
@@ -874,8 +944,14 @@ async function resumeWaitingResponseJob(job) {
         source: "worker_restore"
       });
     } else {
-      await waitForContentScript(job.tab_id, adapter);
+      const contentScriptProbe = await waitForContentScript(job.tab_id, adapter, {
+        phase: "wait_response",
+        side_effect_started: true,
+        send_committed: true
+      });
+      recordContentScriptContract(job, contentScriptProbe);
       const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
+      await persistJob(job);
       postNative(progress(job, "content_script_recovered", {
         restored: true,
         url: rebound?.url ?? null,
@@ -911,6 +987,95 @@ async function continueWaitingResponseJob(job) {
   } finally {
     releasePollerLease(job, lease);
   }
+}
+
+function validateChatgptFinalModelSelectionReceipt(receipt, job) {
+  const strategy = job?.model_strategy === "current" ? "current" : "select";
+  const expectedStatus = strategy === "current" ? "current" : "selected";
+  const expectedModel = strategy === "current" ? "current" : job?.model;
+  if (receipt.click_bound !== true) return "click_bound is not true";
+  if (receipt.status !== expectedStatus) return `status=${JSON.stringify(receipt.status)}`;
+  if (receipt.requested_model !== expectedModel) return `requested_model=${JSON.stringify(receipt.requested_model)}`;
+  if (strategy === "select") {
+    for (const [key, expected] of [
+      ["model_used", "GPT-5.6 Sol Pro"],
+      ["family_status", "verified"],
+      ["effort_status", "verified"],
+      ["picker_family_status", "verified"],
+      ["picker_effort_status", "verified"],
+      ["click_bound_closed_pill_effort_status", "verified"]
+    ]) {
+      if (receipt[key] !== expected) return `${key}=${JSON.stringify(receipt[key])}`;
+    }
+    // ChatGPT can render only the selected effort tier in the closed pill.
+    // The picker proof still binds the family when that observation is skipped.
+    const clickBoundFamilyProof = receipt.click_bound_closed_pill_family_status === "verified"
+      || (receipt.click_bound_closed_pill_family_status === "skipped"
+        && receipt.family_status === "verified"
+        && receipt.picker_family_status === "verified"
+        && receipt.closed_pill_family_status !== "unverified"
+        && receipt.post_close_family_status !== "unverified");
+    if (!clickBoundFamilyProof) {
+      return `click_bound_closed_pill_family_status=${JSON.stringify(receipt.click_bound_closed_pill_family_status)}`;
+    }
+    if (!new Set(["menu", "slider", "personal"]).has(receipt.picker_shape)) {
+      return `picker_shape=${JSON.stringify(receipt.picker_shape)}`;
+    }
+    const close = receipt.picker_close_verification;
+    if (!close || close.picker_surface_closed !== true
+      || close.model_trigger_closed !== true
+      || close.family_trigger_closed !== true
+      || close.closed_pill_pro !== true) {
+      return "picker_close_verification is incomplete";
+    }
+  } else {
+    if (typeof receipt.model_used !== "string" || !receipt.model_used.trim()) {
+      return "Current model_used is empty";
+    }
+    if (receipt.family_status !== "skipped" || receipt.effort_status !== "skipped") {
+      return "Current family/effort proof is not skipped";
+    }
+    if (typeof receipt.click_bound_closed_pill_text !== "string"
+        || !receipt.click_bound_closed_pill_text.trim()
+        || receipt.model_used.replace(/\s+/g, " ").trim()
+          !== receipt.click_bound_closed_pill_text.replace(/\s+/g, " ").trim()) {
+      return "Current model_used does not match the click-time closed pill";
+    }
+  }
+  if (typeof receipt.click_bound_closed_pill_text !== "string"
+      || !receipt.click_bound_closed_pill_text.trim()) {
+    return "click-time closed pill text is empty";
+  }
+  const observed = Array.isArray(receipt.surface_observed_values)
+    ? receipt.surface_observed_values
+    : [];
+  const chatState = receipt.surface_chat_state;
+  const workState = receipt.surface_work_state;
+  if (receipt.surface_proof_kind === "explicit_chat_work_radios") {
+    if (receipt.surface_evidence_seen !== true
+        || receipt.surface_visible_toggle_count !== 2
+        || chatState?.aria_checked !== "true"
+        || workState?.aria_checked !== "false"
+        || !observed.includes("chatgpt")
+        || !observed.includes("work")) {
+      return "explicit Chat/Work surface proof is incomplete";
+    }
+    if (receipt.surface_composer_aria !== null) {
+      return "explicit surface proof must not claim implicit composer proof";
+    }
+  } else if (receipt.surface_proof_kind === "implicit_chat_composer_aria") {
+    if (receipt.surface_evidence_seen !== false
+        || receipt.surface_visible_toggle_count !== 0
+        || observed.length !== 0
+        || receipt.surface_composer_aria !== "Chat with ChatGPT"
+        || chatState !== null
+        || workState !== null) {
+      return "implicit Chat composer proof is incomplete";
+    }
+  } else {
+    return `surface_proof_kind=${JSON.stringify(receipt.surface_proof_kind)}`;
+  }
+  return null;
 }
 
 function acquirePollerLease(job) {
@@ -1451,9 +1616,22 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
       continue;
     }
     if (canResumeJobAfterWorkerRestart(job)) {
+      const adapter = adapterForJob(job);
       job.connection_generation = connectionGeneration;
       job.updated_at = Date.now();
       jobs.set(job.job_id, job);
+      try {
+        const contentScriptProbe = await waitForContentScript(job.tab_id, adapter, {
+          phase: "upload",
+          side_effect_started: false,
+          send_committed: false
+        });
+        recordContentScriptContract(job, contentScriptProbe);
+        await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
+      } catch (error) {
+        await handlePollerError(job, error);
+        continue;
+      }
       await persistJob(job);
       postNative(progress(job, "ready_for_file", {
         tab_id: job.tab_id,
@@ -1575,7 +1753,18 @@ function errorContextForJob(job, error = null) {
     "provider_message",
     "provider_dom",
     "requested_model",
-    "send_committed"
+    "model_selection_status",
+    "model_selection_failure_reason",
+    "model_selection_error_code",
+    "send_committed",
+    "required_content_script_capability",
+    "required_content_script_capabilities",
+    "content_script_instance_id",
+    "expected_content_script_instance_id",
+    "content_script_build",
+    "expected_content_script_build",
+    "expected_content_script_recipe",
+    "content_script_recipe"
   ]) {
     if (error?.[key] !== undefined) {
       detail[key] = error[key];
@@ -1844,24 +2033,195 @@ async function createJobTab(url, adapter) {
   return chrome.tabs.create({ url, active: activateOnCreate });
 }
 
-async function waitForContentScript(tabId, adapter) {
+async function waitForContentScript(tabId, adapter, detail = {
+  phase: "upload",
+  side_effect_started: false,
+  send_committed: false
+}) {
+  let lastError = null;
   for (let attempt = 0; attempt < CONTENT_SCRIPT_RECONNECT_ATTEMPTS; attempt += 1) {
     try {
-      await sendToTab(tabId, { type: "yoetz_probe", recipe: adapter.recipe });
-      return;
-    } catch {
+      return await requireContentScriptCapability(tabId, adapter, detail);
+    } catch (error) {
+      if ([
+        "content_script_build_mismatch",
+        "content_script_capability_missing",
+        "content_script_recipe_mismatch",
+        "content_script_instance_missing"
+      ].includes(error?.code)) {
+        throw error;
+      }
+      lastError = error;
       await sleep(CONTENT_SCRIPT_RECONNECT_DELAY_MS);
     }
+  }
+  if (lastError) {
+    throw new Error(`Yoetz content script did not become ready in ${adapter.displayName} tab ${tabId}`);
   }
   throw new Error(`Yoetz content script did not become ready in ${adapter.displayName} tab ${tabId}`);
 }
 
+function requiredContentScriptCapabilitiesForRecipe(recipe) {
+  return [
+    NATIVE_JOB_COMMANDS_CAPABILITY,
+    ...(recipe === "chatgpt"
+      ? [CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY]
+      : [])
+  ];
+}
+
+function requiredContentScriptCapabilities(adapter) {
+  return requiredContentScriptCapabilitiesForRecipe(adapter?.recipe);
+}
+
+async function requireContentScriptCapability(tabId, adapter, detail = {}) {
+  const probe = await sendToTab(tabId, { type: "yoetz_probe", recipe: adapter.recipe });
+  const required = requiredContentScriptCapabilities(adapter);
+  const capabilities = Array.isArray(probe?.capabilities) ? probe.capabilities : [];
+  const instanceId = String(probe?.content_script_instance_id ?? "").trim();
+  if (!instanceId) {
+    throw commandError(
+      "content_script_instance_missing",
+      `${adapter.displayName} content script did not advertise an injection identity; refusing provider-visible work until the managed extension is reloaded`,
+      {
+        ...detail,
+        content_script_instance_id: null,
+        expected_content_script_instance_id: "non-empty",
+        tab_id: tabId
+      }
+    );
+  }
+  if (probe?.recipe !== adapter.recipe) {
+    throw commandError(
+      "content_script_recipe_mismatch",
+      `${adapter.displayName} tab reported recipe ${JSON.stringify(probe?.recipe ?? null)} instead of ${JSON.stringify(adapter.recipe)}; refusing provider-visible work until the managed extension is reloaded`,
+      {
+        ...detail,
+        expected_content_script_recipe: adapter.recipe,
+        content_script_recipe: probe?.recipe ?? null,
+        content_script_instance_id: instanceId,
+        required_content_script_capabilities: required,
+        tab_id: tabId
+      }
+    );
+  }
+  const expectedBuild = CONTENT_SCRIPT_BUILD;
+  const observedBuild = String(probe?.content_script_build ?? "").trim();
+  if (!observedBuild || observedBuild !== expectedBuild) {
+    throw commandError(
+      "content_script_build_mismatch",
+      `${adapter.displayName} content script build ${JSON.stringify(observedBuild || null)} does not match the extension content contract ${JSON.stringify(expectedBuild)}; refusing provider-visible work until the managed extension is reloaded`,
+      {
+        ...detail,
+        content_script_build: observedBuild || null,
+        expected_content_script_build: expectedBuild,
+        content_script_instance_id: instanceId,
+        tab_id: tabId
+      }
+    );
+  }
+  const missing = required.find((capability) => !capabilities.includes(capability));
+  if (!missing) {
+    return probe;
+  }
+  throw commandError(
+    "content_script_capability_missing",
+    `${adapter.displayName} content script does not advertise required capability ${missing}; refusing provider-visible work until the managed extension is reloaded`,
+    {
+      ...detail,
+      required_content_script_capability: missing,
+      required_content_script_capabilities: required,
+      content_script_build: probe?.content_script_build ?? null,
+      content_script_instance_id: instanceId,
+      tab_id: tabId
+    }
+  );
+}
+
+function recordContentScriptContract(job, probe) {
+  if (!job.recipe && probe?.recipe) {
+    job.recipe = probe.recipe;
+  }
+  if (job.model_strategy == null) {
+    job.model_strategy = "select";
+  }
+  if (job.model == null) {
+    job.model = siteAdapterForRecipe(job.recipe).defaultModel;
+  }
+  job.content_script_instance_id = String(probe?.content_script_instance_id ?? "").trim();
+  job.content_script_build = String(probe?.content_script_build ?? "").trim();
+  job.content_script_recipe = probe?.recipe ?? null;
+}
+
 async function sendToTab(tabId, message) {
-  const response = await chrome.tabs.sendMessage(tabId, message);
+  const response = await chrome.tabs.sendMessage(tabId, secureContentScriptMessage(message));
   if (!response?.ok) {
     throw tabCommandError(response);
   }
   return response.payload;
+}
+
+function secureContentScriptMessage(message) {
+  if (!SECURE_CONTENT_SCRIPT_COMMANDS.has(message?.type)) {
+    return message;
+  }
+  const job = message?.job;
+  const instanceId = String(job?.content_script_instance_id ?? "").trim();
+  const build = String(job?.content_script_build ?? "").trim();
+  if (!instanceId || !build || !job?.recipe) {
+    throw commandError(
+      "content_script_contract_missing",
+      `cannot send ${message.type} without a bound content-script contract`,
+      {
+        phase: contentScriptCommandPhase(message),
+        side_effect_started: contentScriptCommandHasSideEffect(message),
+        content_script_instance_id: instanceId || null,
+        expected_content_script_build: build || CONTENT_SCRIPT_BUILD,
+        expected_content_script_recipe: job?.recipe ?? null,
+        tab_id: null
+      }
+    );
+  }
+  return {
+    type: "yoetz_secure_command",
+    command: message.type,
+    content_script_contract: {
+      content_script_instance_id: instanceId,
+      content_script_build: build,
+      content_script_recipe: job.recipe,
+      required_content_script_capabilities: requiredContentScriptCapabilitiesForRecipe(job.recipe)
+    },
+    payload: message
+  };
+}
+
+function contentScriptCommandPhase(message) {
+  if (message?.type === "yoetz_configure_model") {
+    return "model_selection";
+  }
+  if (message?.type === "yoetz_send_prompt") {
+    return "send";
+  }
+  if (message?.type === "yoetz_extract_response" || message?.type === "yoetz_fetch_conversation") {
+    return "wait_response";
+  }
+  if (message?.type === "yoetz_cancel_send") {
+    return "send";
+  }
+  if (message?.type === "yoetz_bind_job" && message?.job?.status === "waiting_response") {
+    return "wait_response";
+  }
+  return "upload";
+}
+
+function contentScriptCommandHasSideEffect(message) {
+  return [
+    "yoetz_send_prompt",
+    "yoetz_extract_response",
+    "yoetz_fetch_conversation",
+    "yoetz_cancel_send"
+  ].includes(message?.type)
+    || (message?.type === "yoetz_bind_job" && message?.job?.status === "waiting_response");
 }
 
 function tabCommandError(response) {
@@ -1883,7 +2243,18 @@ function tabCommandError(response) {
     "provider_message",
     "provider_dom",
     "requested_model",
+    "model_selection_status",
+    "model_selection_failure_reason",
+    "model_selection_error_code",
     "send_committed",
+    "required_content_script_capability",
+    "required_content_script_capabilities",
+    "content_script_instance_id",
+    "expected_content_script_instance_id",
+    "content_script_build",
+    "expected_content_script_build",
+    "expected_content_script_recipe",
+    "content_script_recipe",
     "requested_conversation_id",
     "current_conversation_id",
     "current_url",
@@ -2642,7 +3013,12 @@ async function recoverContentScriptJobOnce(job, error, options = {}) {
     source: options.source ?? "command_error",
     restored_from_bfcache: Boolean(options.restoredFromBfcache)
   }));
-  await waitForContentScript(job.tab_id, adapterForJob(job));
+  const contentScriptProbe = await waitForContentScript(job.tab_id, adapterForJob(job), {
+    phase: phaseForStatus(job.status) ?? "wait_response",
+    side_effect_started: Boolean(job.status !== "selecting_model" && job.status !== "opening_tab"),
+    send_committed: Boolean(job.send_committed)
+  });
+  recordContentScriptContract(job, contentScriptProbe);
   const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
   job.content_script_recovery_in_progress = false;
   job.updated_at = Date.now();
@@ -2745,6 +3121,9 @@ function openSuspensionGate(job) {
 }
 
 function isRecoverableContentScriptError(error) {
+  if (error?.code === "content_script_contract_mismatch") {
+    return true;
+  }
   const message = String(error?.message ?? error);
   return /Could not establish connection|Receiving end does not exist|Extension context invalidated|message (?:port|channel)(?: is)? closed|A listener indicated an asynchronous response.*channel closed|is not active in this tab/i.test(message);
 }
@@ -2832,7 +3211,13 @@ async function refreshFrozenRender(job, extraction, stableForMs) {
   }));
   await chrome.tabs.update(job.tab_id, { url, active: false });
   await waitForSiteTab(job.tab_id, adapter);
-  await waitForContentScript(job.tab_id, adapter);
+  const contentScriptProbe = await waitForContentScript(job.tab_id, adapter, {
+    phase: "wait_response",
+    side_effect_started: true,
+    send_committed: true
+  });
+  recordContentScriptContract(job, contentScriptProbe);
+  await persistJob(job);
   const rebound = await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
   postNative(progress(job, "render_refreshed", {
     tab_id: job.tab_id,

@@ -70,8 +70,17 @@ pub struct ChatgptRecipeRunResult {
     pub response: String,
     pub model_used: Option<String>,
     pub model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus,
+    pub final_model_selection: Option<Value>,
     pub warnings: Vec<String>,
 }
+
+type ChatgptRecipeExecutionResult = (
+    String,
+    Vec<String>,
+    Option<String>,
+    chatgpt_recipe::ChatgptModelSelectionStatus,
+    Option<Value>,
+);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaudeRecipeRunResult {
@@ -940,6 +949,8 @@ struct ChatgptSendResult {
     assistant_count_before_send: Option<usize>,
     #[serde(rename = "assistantLastLenBeforeSend")]
     assistant_last_len_before_send: Option<usize>,
+    #[serde(rename = "finalModelSelection")]
+    final_model_selection: Option<Value>,
     warning: Option<String>,
 }
 
@@ -1116,6 +1127,9 @@ fn build_chatgpt_send_script(
     file_upload_path: Option<&str>,
     upload_timeout_ms: u64,
     bundle_file_name: Option<&str>,
+    model: &str,
+    model_strategy: chatgpt_recipe::ChatgptModelStrategy,
+    prior_surface_evidence_seen: bool,
 ) -> String {
     let page_name_json = serde_json::to_string(page_name).unwrap();
     let file_upload_path_json = serde_json::to_string(&file_upload_path).unwrap();
@@ -1125,8 +1139,14 @@ fn build_chatgpt_send_script(
     let composer_selector_json = chatgpt_web::composer_selector_json();
     let send_button_selector_json = chatgpt_web::send_button_selector_json();
     let stop_button_selector_json = chatgpt_web::stop_button_selector_json();
-    let send_click_function_json =
-        serde_json::to_string(&chatgpt_web::build_send_button_click_function()).unwrap();
+    let send_click_function_json = serde_json::to_string(
+        &chatgpt_web::build_send_button_click_function_with_model_selection_for(
+            model,
+            model_strategy,
+            prior_surface_evidence_seen,
+        ),
+    )
+    .unwrap();
     let open_attachment_ui_function_json =
         serde_json::to_string(&chatgpt_web::build_open_attachment_ui_function()).unwrap();
     let upload_menu_item_click_function_json =
@@ -1265,6 +1285,7 @@ if (!sendState.sendButtonPresent || sendState.sendDisabled) {{
   console.log(JSON.stringify({{
     status: "error",
     error: "ChatGPT send button never became enabled after typing; this usually means dev-browser is still on the broken Playwright live-attach path. If you upgraded yoetz, run `yoetz browser reset` once so the dev-browser daemon restarts with the Chrome 147 compatibility flag. " + JSON.stringify(sendState),
+    finalModelSelection: null,
     warning,
   }}));
   return;
@@ -1277,6 +1298,7 @@ if (sendClick?.status !== "sent") {{
   console.log(JSON.stringify({{
     status: "error",
     error: "ChatGPT send click did not succeed: " + JSON.stringify(sendClick || null),
+    finalModelSelection: sendClick?.finalModelSelection || null,
     warning,
   }}));
   return;
@@ -1319,9 +1341,10 @@ if (!transitionState || !transitionState.transitionObserved) {{
   console.log(JSON.stringify({{
     status: "error",
     error: "ChatGPT send click did not trigger a UI transition within 10s. " + JSON.stringify(transitionState || {{}}),
-    assistantCountBeforeSend: sendClick.assistantCountBeforeSend || 0,
-    assistantLastLenBeforeSend: sendClick.assistantLastLenBeforeSend || 0,
-    warning,
+            assistantCountBeforeSend: sendClick.assistantCountBeforeSend || 0,
+            assistantLastLenBeforeSend: sendClick.assistantLastLenBeforeSend || 0,
+            finalModelSelection: sendClick.finalModelSelection || null,
+            warning,
   }}));
   return;
 }}
@@ -1329,6 +1352,7 @@ console.log(JSON.stringify({{
         status: "sent",
         assistantCountBeforeSend: sendClick.assistantCountBeforeSend || 0,
         assistantLastLenBeforeSend: sendClick.assistantLastLenBeforeSend || 0,
+        finalModelSelection: sendClick.finalModelSelection || null,
         warning,
 }}));
 "##,
@@ -1818,12 +1842,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
         )
     };
 
-    let result = (|| -> Result<(
-        String,
-        Vec<String>,
-        Option<String>,
-        chatgpt_recipe::ChatgptModelSelectionStatus,
-    )> {
+    let result = (|| -> Result<ChatgptRecipeExecutionResult> {
         let mut warnings = Vec::new();
         let file_upload_path = if ctx.paste_mode {
             None
@@ -1859,12 +1878,8 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
             ctx.prompt.clone()
         };
 
-        let prepare_script = build_chatgpt_prepare_script(
-            &page_name,
-            &ctx.model,
-            ctx.model_strategy,
-            &ctx.run_id,
-        );
+        let prepare_script =
+            build_chatgpt_prepare_script(&page_name, &ctx.model, ctx.model_strategy, &ctx.run_id);
         let prepare_stdout = {
             let attach_attempt_lock = browser::acquire_attach_attempt_lock()?;
             if ctx.show_approval_guidance {
@@ -1885,10 +1900,6 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
             .model_selection
             .clone()
             .unwrap_or_else(|| serde_json::json!({"status": "unknown"}));
-        let model_used = prepare
-            .model_selection
-            .as_ref()
-            .and_then(|selection| chatgpt_web::select_reported_chatgpt_model(selection, &ctx.model));
         let model_selection_status =
             chatgpt_web::chatgpt_model_selection_status(&model_selection, &ctx.model);
         let classified_issue =
@@ -1920,12 +1931,25 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
                 ));
             }
         }
-        if model_selection_status != chatgpt_recipe::ChatgptModelSelectionStatus::Selected {
+        let expected_model_selection_status = match ctx.model_strategy {
+            chatgpt_recipe::ChatgptModelStrategy::Select => {
+                chatgpt_recipe::ChatgptModelSelectionStatus::Selected
+            }
+            chatgpt_recipe::ChatgptModelStrategy::Current => {
+                chatgpt_recipe::ChatgptModelSelectionStatus::Current
+            }
+        };
+        if model_selection_status != expected_model_selection_status {
             return Err(anyhow!(
-                "ChatGPT did not provide verified GPT-5.6 Sol maximum-tier selection proof: {}",
+                "ChatGPT did not provide the requested model selection proof: {}",
                 model_selection
             ));
         }
+
+        let prior_surface_evidence_seen = model_selection
+            .get("surfaceEvidenceSeen")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let send_script = build_chatgpt_send_script(
             &page_name,
@@ -1938,6 +1962,9 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
                 .map(Path::new)
                 .and_then(|path| path.file_name())
                 .and_then(|value| value.to_str()),
+            &ctx.model,
+            ctx.model_strategy,
+            prior_surface_evidence_seen,
         );
         let send_stdout = run_script(
             &send_script,
@@ -1945,8 +1972,44 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
         )
         .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Upload)?;
         let send: ChatgptSendResult = parse_script_json("parse chatgpt send result", &send_stdout)?;
-        match send.status.as_str() {
-            "sent" => {}
+        let (model_used, model_selection_status, final_model_selection) = match send.status.as_str()
+        {
+            "sent" => {
+                let final_selection = send
+                    .final_model_selection
+                    .as_ref()
+                    .filter(|value| value.is_object())
+                    .ok_or_else(|| {
+                        anyhow!("ChatGPT send proof did not return a final model selection receipt")
+                    })
+                    .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion)?;
+                if final_selection.get("clickBound").and_then(Value::as_bool) != Some(true) {
+                    return Err(anyhow!(
+                        "ChatGPT final model selection proof was not bound to the send click: {}",
+                        final_selection
+                    ))
+                    .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion);
+                }
+                let final_status =
+                    chatgpt_web::chatgpt_model_selection_status(final_selection, &ctx.model);
+                if final_status != expected_model_selection_status {
+                    return Err(anyhow!(
+                        "ChatGPT final model selection proof changed before send: {}",
+                        final_selection
+                    ))
+                    .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion);
+                }
+                let final_model_used =
+                    chatgpt_web::select_reported_chatgpt_model(final_selection, &ctx.model);
+                let final_selection =
+                    chatgpt_web::canonical_chatgpt_final_model_selection(final_selection);
+                chatgpt_web::validate_chatgpt_final_model_selection(
+                    &final_selection,
+                    ctx.model_strategy,
+                )
+                .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion)?;
+                (final_model_used, final_status, Some(final_selection))
+            }
             "error" => {
                 let detail = send
                     .error
@@ -1959,7 +2022,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
                 return Err(anyhow!("unexpected ChatGPT send status `{other}`"))
                     .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send);
             }
-        }
+        };
         if let Some(warning) = send.warning {
             warnings.push(warning);
         }
@@ -1988,10 +2051,16 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
             format_chatgpt_wait_duration(wait_started_at.elapsed())
         );
         warnings.append(&mut poll_warnings);
-        Ok((response, warnings, model_used, model_selection_status))
+        Ok((
+            response,
+            warnings,
+            model_used,
+            model_selection_status,
+            final_model_selection,
+        ))
     })();
 
-    let (response, warnings, model_used, model_selection_status) = result?;
+    let (response, warnings, model_used, model_selection_status, final_model_selection) = result?;
     for warning in &warnings {
         eprintln!("warn: {warning}");
     }
@@ -1999,6 +2068,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
         response,
         model_used,
         model_selection_status,
+        final_model_selection,
         warnings,
     })
 }
@@ -2777,12 +2847,18 @@ mod tests {
             Some("/tmp/bundle.txt"),
             180_000,
             Some("bundle.txt"),
+            "gpt-5-6-sol-chat-pro",
+            chatgpt_recipe::ChatgptModelStrategy::Select,
+            false,
         );
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
         assert!(script.contains("const FILE_UPLOAD_PATH = \"/tmp/bundle.txt\";"));
         assert!(script.contains("if (FILE_UPLOAD_PATH !== null)"));
         assert!(script.contains("const UPLOAD_TIMEOUT_MS = 180000;"));
+        assert!(script.contains("finalModelSelection"));
+        assert!(script.contains("clickBound"));
+        assert!(script.contains("GPT-5.6 Sol Pro"));
         assert!(!script.contains("DISABLE_EXTENDED"));
         assert!(script.contains("await composer.waitFor({ state: \"visible\", timeout: 15000 });"));
         assert!(script.contains("const COMPOSER_FILE_INPUT_MARKER = \"yoetz-upload-target\";"));

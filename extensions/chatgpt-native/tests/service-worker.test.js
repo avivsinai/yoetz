@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { uint8ArrayToBase64 } from "../src/chunks.js";
 
+const TEST_CONTENT_SCRIPT_BUILD = "0.5.62";
+
 globalThis.__YOETZ_MIN_STABLE_IDLE_MS = 100;
 globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER = 0;
 globalThis.__YOETZ_BACKEND_API_CONFIRMATION_MS = 50;
@@ -53,38 +55,58 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
       },
       get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
       sendMessage: async (id, message) => {
-        sentToTabs.push({ id, message });
-        switch (message.type) {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        sentToTabs.push({ id, message: command });
+        switch (command.type) {
           case "yoetz_probe":
-            return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT", text: "" } };
+            return {
+              ok: true,
+              payload: {
+                url: "https://chatgpt.com/",
+                title: "ChatGPT",
+                text: "",
+                recipe: "chatgpt",
+                content_script_instance_id: "test-content-script",
+                content_script_build: TEST_CONTENT_SCRIPT_BUILD,
+                capabilities: [
+                  "terminal_ack",
+                  "native_job_commands_v1",
+                  "chatgpt_click_bound_send_receipt_v1"
+                ]
+              }
+            };
           case "yoetz_prepare_job":
-            jobTabs.set(message.job.job_id, id);
+            jobTabs.set(command.job.job_id, id);
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
             return { ok: true, payload: verifiedSolProSelection() };
           case "yoetz_upload_file":
-            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+            return { ok: true, payload: { filename: command.file.filename, size: 4 } };
           case "yoetz_send_prompt":
-            sentJobs.add(message.job.job_id);
+            sentJobs.add(command.job.job_id);
             return {
               ok: true,
               payload: {
                 sent: true,
-                conversation_id: `conv-${message.job.job_id}`
+                conversation_id: `conv-${command.job.job_id}`,
+                final_model_selection: {
+                  ...verifiedSolProSelection(),
+                  click_bound: true
+                }
               }
             };
           case "yoetz_extract_response":
-            extractedJobs.add(message.job.job_id);
+            extractedJobs.add(command.job.job_id);
             return {
               ok: true,
-              payload: sentJobs.has(message.job.job_id) && releasableJobs.has(message.job.job_id)
-                ? { method: "assistant_dom_fallback", text: `answer ${message.job.job_id}`, is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0, conversation_id: `conv-${message.job.job_id}`, model_slug: "gpt-5-6-pro" }
-                : sentJobs.has(message.job.job_id)
-                  ? { method: "assistant_dom_fallback", text: `partial ${message.job.job_id}`, is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0, conversation_id: `conv-${message.job.job_id}` }
+              payload: sentJobs.has(command.job.job_id) && releasableJobs.has(command.job.job_id)
+                ? { method: "assistant_dom_fallback", text: `answer ${command.job.job_id}`, is_generating: false, assistant_count: 1, copy_button_count: 1, has_copy_button: true, turn_index: 0, conversation_id: `conv-${command.job.job_id}`, model_slug: "gpt-5-6-pro" }
+                : sentJobs.has(command.job.job_id)
+                  ? { method: "assistant_dom_fallback", text: `partial ${command.job.job_id}`, is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0, conversation_id: `conv-${command.job.job_id}` }
                   : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
             };
           default:
-            throw new Error(`unexpected tab message ${message.type}`);
+            throw new Error(`unexpected tab message ${command.type}`);
         }
       },
       group: async () => 1
@@ -101,7 +123,11 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     assert.equal(port.messages[0].payload.profile_id, "gaia-work");
     assert.match(port.messages[0].payload.extension_instance_id, /^ext_/);
     assert.deepEqual(port.messages[0].payload.recipes, ["chatgpt", "claude"]);
-    assert.deepEqual(port.messages[0].payload.capabilities, ["terminal_ack"]);
+    assert.deepEqual(port.messages[0].payload.capabilities, [
+      "terminal_ack",
+      "native_job_commands_v1",
+      "chatgpt_click_bound_send_receipt_v1"
+    ]);
 
     port.emit(envelope("reconnect", "job_reconnect"));
     await eventually(() => port.messages.some((message) => message.type === "reconnect" && message.job_id === "job_reconnect"));
@@ -1045,7 +1071,23 @@ test("service worker bridge_check is a no-op and does not recover jobs", async (
   globalThis.chrome = chromeStub({
     port,
     storage,
-    tabs: {}
+    tabs: {
+      sendMessage: async (_id, message) => {
+        if (message.type === "yoetz_probe") {
+          return {
+            ok: true,
+            payload: {
+              recipe: "chatgpt",
+              capabilities: ["native_job_commands_v1", "chatgpt_click_bound_send_receipt_v1"]
+            }
+          };
+        }
+        if (message.type === "yoetz_bind_job") {
+          return { ok: true, payload: { rebound: true } };
+        }
+        throw new Error(`unexpected tab message ${message.type}`);
+      }
+    }
   });
 
   try {
@@ -1077,6 +1119,115 @@ test("service worker bridge_check is a no-op and does not recover jobs", async (
   }
 });
 
+test("service worker refuses a restored ChatGPT job when the tab has an old content script", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+  await storage.set({
+    "jobs.job_restored_old_probe": {
+      job_id: "job_restored_old_probe",
+      run_id: "run_job_restored_old_probe",
+      workspace_id: "workspace_test",
+      recipe: "chatgpt",
+      status: "waiting_for_file",
+      prompt: "prompt",
+      tab_id: 42,
+      started_at: now,
+      updated_at: now
+    }
+  });
+  const sentToTabs = [];
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    advertiseChatgptCapability: false,
+    tabs: {
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_restored_old_probe" }),
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        if (message.type === "yoetz_probe") {
+          return {
+            ok: true,
+            payload: { recipe: "chatgpt", content_script_build: "0.5.62.37" }
+          };
+        }
+        throw new Error(`unexpected tab message ${message.type}`);
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?restored_old_probe=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.job_id, "job_restored_old_probe");
+    assert.equal(error.payload.code, "content_script_build_mismatch");
+    assert.equal(error.payload.phase, "upload");
+    assert.equal(error.payload.side_effect_started, false);
+    assert.equal(error.payload.content_script_build, "0.5.62.37");
+    assert.equal(error.payload.expected_content_script_build, TEST_CONTENT_SCRIPT_BUILD);
+    assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
+    assert.equal(sentToTabs.some(({ message }) => message.type === "yoetz_upload_file"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker refuses a restored Claude job when content script build is missing", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+  await storage.set({
+    "jobs.job_restored_claude_missing_build": {
+      job_id: "job_restored_claude_missing_build",
+      run_id: "run_job_restored_claude_missing_build",
+      workspace_id: "workspace_test",
+      recipe: "claude",
+      status: "waiting_for_file",
+      prompt: "prompt",
+      tab_id: 42,
+      started_at: now,
+      updated_at: now
+    }
+  });
+  const sentToTabs = [];
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    contentScriptBuild: null,
+    tabs: {
+      get: async (id) => ({ id, status: "complete", url: "https://claude.ai/?_yoetz=run_job_restored_claude_missing_build" }),
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        if (message.type === "yoetz_probe") {
+          return {
+            ok: true,
+            payload: { recipe: "claude", capabilities: ["native_job_commands_v1"] }
+          };
+        }
+        throw new Error(`unexpected tab message ${message.type}`);
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?restored_claude_missing_build=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error.job_id, "job_restored_claude_missing_build");
+    assert.equal(error.payload.code, "content_script_build_mismatch");
+    assert.equal(error.payload.content_script_build, null);
+    assert.equal(error.payload.expected_content_script_build, TEST_CONTENT_SCRIPT_BUILD);
+    assert.equal(error.payload.phase, "upload");
+    assert.equal(error.payload.side_effect_started, false);
+    assert.equal(sentToTabs.some(({ message }) => message.type === "yoetz_upload_file"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker opens fresh and resume jobs in new owned tabs", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -1101,7 +1252,7 @@ test("service worker opens fresh and resume jobs in new owned tabs", async () =>
         sentToTabs.push({ id, message });
         switch (message.type) {
           case "yoetz_probe":
-            return { ok: true, payload: {} };
+            return { ok: true, payload: { recipe: "chatgpt" } };
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
@@ -1994,8 +2145,9 @@ test("completion falls back to backend model_slug when the picker was not proven
     await eventually(() => port.messages.some((message) => message.type === "job_complete" && message.job_id === "job_slug_fallback"));
     const complete = port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_slug_fallback");
     assert.equal(complete.payload.model_selection_status, "current");
-    // No picker proof => the backend slug is the only signal, so it is reported.
-    assert.equal(complete.payload.model_used, "gpt-5.6-sol-wm");
+    // The final receipt now preserves the click-time Current pill, while the
+    // backend slug remains an observability field.
+    assert.equal(complete.payload.model_used, "5.5 Instant");
     assert.equal(complete.payload.model_slug, "gpt-5.6-sol-wm");
   } finally {
     globalThis.chrome = originalChrome;
@@ -2484,7 +2636,11 @@ test("service worker hello falls back with instance id when profile identity fai
     assert.equal(hello.payload.profile_email, null);
     assert.equal(hello.payload.profile_id, null);
     assert.deepEqual(hello.payload.recipes, ["chatgpt", "claude"]);
-    assert.deepEqual(hello.payload.capabilities, ["terminal_ack"]);
+    assert.deepEqual(hello.payload.capabilities, [
+      "terminal_ack",
+      "native_job_commands_v1",
+      "chatgpt_click_bound_send_receipt_v1"
+    ]);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -9037,6 +9193,16 @@ test("service worker resumes waiting_for_file jobs after service-worker restart"
       sendMessage: async (id, message) => {
         sentToTabs.push({ id, message });
         switch (message.type) {
+          case "yoetz_probe":
+            return {
+              ok: true,
+              payload: {
+                recipe: "chatgpt",
+                capabilities: ["native_job_commands_v1", "chatgpt_click_bound_send_receipt_v1"]
+              }
+            };
+          case "yoetz_bind_job":
+            return { ok: true, payload: { rebound: true } };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_extract_response":
@@ -9063,10 +9229,17 @@ test("service worker resumes waiting_for_file jobs after service-worker restart"
       const restored = (await storage.get("jobs.job_restore_waiting"))["jobs.job_restore_waiting"];
       return restored?.status === "waiting_for_file" && Number.isFinite(restored.connection_generation);
     });
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress"
+      && message.job_id === "job_restore_waiting"
+      && message.payload?.phase === "ready_for_file"
+    ));
     assert.equal(port.messages.some((message) => message.type === "job_error" && message.job_id === "job_restore_waiting"), false);
     const restoredReady = port.messages.find((message) => message.type === "job_progress" && message.job_id === "job_restore_waiting" && message.payload?.phase === "ready_for_file");
     assert.equal(restoredReady?.payload.restored, true);
     assert.equal(restoredReady?.payload.tab_id, 42);
+    const bindIndex = sentToTabs.findIndex((item) => item.message.type === "yoetz_bind_job");
+    assert.ok(bindIndex >= 0);
 
     port.emit(envelope("job_file_chunk", "job_restore_waiting", {
       sequence: 0,
@@ -9077,10 +9250,18 @@ test("service worker resumes waiting_for_file jobs after service-worker restart"
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
 
-    await eventually(() => port.messages.some((message) => message.type === "job_complete" && message.job_id === "job_restore_waiting"));
+    await eventually(() => {
+      const error = port.messages.find((message) => message.type === "job_error" && message.job_id === "job_restore_waiting");
+      if (error) {
+        throw new Error(`restored job failed: ${JSON.stringify(error)}`);
+      }
+      return port.messages.some((message) => message.type === "job_complete" && message.job_id === "job_restore_waiting");
+    });
     const complete = port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_restore_waiting");
     assert.equal(complete.payload.response, "restored answer");
-    assert.equal(sentToTabs.find((item) => item.message.type === "yoetz_upload_file")?.id, 42);
+    const uploadIndex = sentToTabs.findIndex((item) => item.message.type === "yoetz_upload_file");
+    assert.ok(bindIndex < uploadIndex);
+    assert.equal(sentToTabs[uploadIndex]?.id, 42);
   } finally {
     globalThis.chrome = originalChrome;
   }
@@ -9405,7 +9586,9 @@ async function runSuccessfulCompletionCase({
   closeTabOnComplete,
   failCompleteDelivery = false,
   removeError = null,
-  responseText = "done"
+  responseText = "done",
+  decorateChatgptSendReceipt = true,
+  expectedTerminalStatus = null
 }) {
   const originalChrome = globalThis.chrome;
   const port = makePort();
@@ -9426,6 +9609,7 @@ async function runSuccessfulCompletionCase({
   globalThis.chrome = chromeStub({
     port,
     storage,
+    decorateChatgptSendReceipt,
     tabs: {
       create: async (options) => ({ id: ++tabId, ...options }),
       get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
@@ -9529,7 +9713,8 @@ async function runSuccessfulCompletionCase({
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
 
-    const terminalStatus = failCompleteDelivery ? "terminal_delivery_lost" : "complete";
+    const terminalStatus = expectedTerminalStatus
+      ?? (failCompleteDelivery ? "terminal_delivery_lost" : "complete");
     await eventually(async () =>
       (await storage.get(`jobs.${jobId}`))[`jobs.${jobId}`]?.status === terminalStatus
     );
@@ -9551,13 +9736,224 @@ async function runSuccessfulCompletionCase({
   }
 }
 
+test("service worker fails closed when a ChatGPT send omits the click-bound receipt", async () => {
+  const result = await runSuccessfulCompletionCase({
+    jobId: "job_missing_send_receipt",
+    closeTabOnComplete: false,
+    decorateChatgptSendReceipt: false,
+    expectedTerminalStatus: "failed"
+  });
+  const error = result.messages.find((message) => message.type === "job_error");
+  assert.equal(error?.payload.code, "send_proof_missing");
+  assert.equal(error?.payload.phase, "post_completion");
+  assert.equal(error?.payload.side_effect_started, true);
+  assert.equal(error?.payload.send_committed, true);
+  assert.equal(result.messages.some((message) => message.type === "job_complete"), false);
+});
+
+test("service worker rechecks the content-script contract immediately before send", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  const storage = makeStorage();
+  let probeCount = 0;
+  let tabId = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      create: async (options) => ({ id: ++tabId, ...options }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        switch (message.type) {
+          case "yoetz_probe":
+            probeCount += 1;
+            return {
+              ok: true,
+              payload: {
+                recipe: "chatgpt",
+                capabilities: probeCount < 3
+                  ? ["native_job_commands_v1", "chatgpt_click_bound_send_receipt_v1"]
+                  : ["chatgpt_click_bound_send_receipt_v1"]
+              }
+            };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedSolProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?stale_before_send=${Date.now()}`);
+    port.emit(envelope("job_start", "job_stale_before_send", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1000
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_progress" && message.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_stale_before_send", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_stale_before_send.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.job_id === "job_stale_before_send"
+    ));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_stale_before_send"
+    );
+    assert.equal(error.payload.code, "content_script_capability_missing");
+    assert.equal(error.payload.phase, "send");
+    assert.equal(error.payload.side_effect_started, true);
+    assert.equal(error.payload.send_committed, false);
+    assert.equal(sentToTabs.some(({ message }) => message.type === "yoetz_send_prompt"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker rejects a probe for the wrong recipe before upload", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const sentToTabs = [];
+  const storage = makeStorage();
+  let tabId = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      create: async (options) => ({ id: ++tabId, ...options }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (id, message) => {
+        sentToTabs.push({ id, message });
+        if (message.type === "yoetz_probe") {
+          return {
+            ok: true,
+            payload: {
+              recipe: "claude",
+              capabilities: ["native_job_commands_v1", "chatgpt_click_bound_send_receipt_v1"]
+            }
+          };
+        }
+        throw new Error(`unexpected tab message ${message.type}`);
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?wrong_probe_recipe=${Date.now()}`);
+    port.emit(envelope("job_start", "job_wrong_probe_recipe", { prompt: "prompt" }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.job_id === "job_wrong_probe_recipe"
+    ));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_wrong_probe_recipe"
+    );
+    assert.equal(error.payload.code, "content_script_recipe_mismatch");
+    assert.equal(error.payload.phase, "upload");
+    assert.equal(error.payload.side_effect_started, false);
+    assert.equal(error.payload.expected_content_script_recipe, "chatgpt");
+    assert.equal(error.payload.content_script_recipe, "claude");
+    assert.equal(sentToTabs.some(({ message }) => message.type === "yoetz_prepare_job"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker binds provider commands to the probed content-script instance", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const received = [];
+  let tabId = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    preserveSecureEnvelope: true,
+    tabs: {
+      create: async (options) => ({ id: ++tabId, ...options }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_secure_receiver" }),
+      sendMessage: async (id, message) => {
+        received.push({ id, message });
+        if (message.type === "yoetz_probe") {
+          return {
+            ok: true,
+            payload: {
+              recipe: "chatgpt",
+              content_script_build: TEST_CONTENT_SCRIPT_BUILD,
+              capabilities: [
+                "native_job_commands_v1",
+                "chatgpt_click_bound_send_receipt_v1"
+              ]
+            }
+          };
+        }
+        if (message.type === "yoetz_secure_command") {
+          return { ok: false, error: "unknown content-script command yoetz_secure_command" };
+        }
+        throw new Error(`unexpected tab message ${message.type}`);
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?secure_receiver=${Date.now()}`);
+    port.emit(envelope("job_start", "job_secure_receiver", { prompt: "review" }));
+    await eventually(() => port.messages.some((message) =>
+      message.type === "job_error" && message.job_id === "job_secure_receiver"
+    ));
+    const securePrepare = received.find(({ message }) => message.type === "yoetz_secure_command");
+    assert.equal(securePrepare?.message.command, "yoetz_prepare_job");
+    assert.equal(securePrepare?.message.content_script_contract.content_script_instance_id, "test-content-script");
+    assert.equal(received.some(({ message }) => message.type === "yoetz_prepare_job"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 function verifiedSolProSelection() {
   return {
     status: "selected",
     model_used: "GPT-5.6 Sol Pro",
     requested_model: "gpt-5-6-sol-chat-pro",
     family_status: "verified",
-    effort_status: "verified"
+    effort_status: "verified",
+    picker_family_status: "verified",
+    picker_effort_status: "verified",
+    picker_shape: "personal",
+    picker_close_verification: {
+      picker_surface_closed: true,
+      model_trigger_closed: true,
+      family_trigger_closed: true,
+      closed_pill_pro: true
+    },
+    click_bound_closed_pill_text: "GPT-5.6 Sol Pro",
+    click_bound_closed_pill_family_status: "verified",
+    click_bound_closed_pill_effort_status: "verified",
+    surface_evidence_seen: true,
+    surface_state: { aria_checked: "true", data_state: "on" },
+    surface_proof_kind: "explicit_chat_work_radios",
+    surface_chat_state: { aria_checked: "true", data_state: "on" },
+    surface_work_state: { aria_checked: "false", data_state: "off" },
+    surface_visible_toggle_count: 2,
+    surface_composer_aria: null,
+    surface_observed_values: ["chatgpt", "work"]
   };
 }
 
@@ -9578,6 +9974,15 @@ function currentSelection() {
     requested_model: "current",
     family_status: "skipped",
     effort_status: "skipped",
+    click_bound_closed_pill_text: "5.5 Instant",
+    surface_evidence_seen: true,
+    surface_state: { aria_checked: "true", data_state: "on" },
+    surface_proof_kind: "explicit_chat_work_radios",
+    surface_chat_state: { aria_checked: "true", data_state: "on" },
+    surface_work_state: { aria_checked: "false", data_state: "off" },
+    surface_visible_toggle_count: 2,
+    surface_composer_aria: null,
+    surface_observed_values: ["chatgpt", "work"],
     warning: "model pinning bypassed — answer may come from any model",
     warnings: []
   };
@@ -9654,7 +10059,71 @@ function makeStorage() {
   };
 }
 
-function chromeStub({ port, tabs, profileEmail = "", profileId = "profile-test", profileError = null, storage = makeStorage(), localStorage = makeStorage(), reload = () => {}, alarms = null }) {
+function chromeStub({ port, tabs, profileEmail = "", profileId = "profile-test", profileError = null, storage = makeStorage(), localStorage = makeStorage(), reload = () => {}, alarms = null, decorateChatgptSendReceipt = true, advertiseChatgptCapability = true, contentScriptBuild = TEST_CONTENT_SCRIPT_BUILD, contentScriptInstanceId = "test-content-script", preserveSecureEnvelope = false }) {
+  const wrappedTabs = typeof tabs?.sendMessage === "function"
+    ? {
+        ...tabs,
+        sendMessage: async (tabId, message) => {
+          const forwardedMessage = !preserveSecureEnvelope && message?.type === "yoetz_secure_command"
+            ? message.payload
+            : message;
+          const response = await tabs.sendMessage(tabId, forwardedMessage);
+          if (forwardedMessage?.type === "yoetz_probe" && response?.ok === true) {
+            const payload = { ...(response.payload ?? {}) };
+            let changed = false;
+            if (contentScriptBuild !== null
+                && !Object.prototype.hasOwnProperty.call(payload, "content_script_build")) {
+              payload.content_script_build = contentScriptBuild;
+              changed = true;
+            }
+            if (advertiseChatgptCapability
+                && (!Object.prototype.hasOwnProperty.call(payload, "capabilities")
+                  || !Object.prototype.hasOwnProperty.call(payload, "recipe"))) {
+              payload.capabilities = Object.prototype.hasOwnProperty.call(payload, "capabilities")
+                ? payload.capabilities
+                : [
+                    "native_job_commands_v1",
+                    ...(forwardedMessage.recipe === "chatgpt"
+                      ? ["chatgpt_click_bound_send_receipt_v1"]
+                      : [])
+                  ];
+              payload.recipe = payload.recipe ?? forwardedMessage.recipe;
+              changed = true;
+            }
+            if (contentScriptInstanceId !== null
+                && !Object.prototype.hasOwnProperty.call(payload, "content_script_instance_id")) {
+              payload.content_script_instance_id = contentScriptInstanceId;
+              changed = true;
+            }
+            if (changed) {
+              return {
+                ...response,
+                payload: {
+                  ...payload,
+                  recipe: payload.recipe ?? forwardedMessage.recipe
+                }
+              };
+            }
+          }
+          const payload = response?.payload;
+          if (!decorateChatgptSendReceipt
+              || forwardedMessage?.type !== "yoetz_send_prompt"
+              || forwardedMessage.job?.recipe === "claude"
+              || response?.ok !== true
+              || payload?.sent !== true
+              || Object.prototype.hasOwnProperty.call(payload ?? {}, "final_model_selection")) {
+            return response;
+          }
+          const selection = forwardedMessage.job?.model_strategy === "current"
+            ? { ...currentSelection(), click_bound: true }
+            : { ...verifiedSolProSelection(), click_bound: true };
+          return {
+            ...response,
+            payload: { ...payload, final_model_selection: selection }
+          };
+        }
+      }
+    : tabs;
   return {
     runtime: {
       connectNative: () => port,
@@ -9683,7 +10152,7 @@ function chromeStub({ port, tabs, profileEmail = "", profileId = "profile-test",
       create: () => {},
       clear: () => {}
     },
-    tabs,
+    tabs: wrappedTabs,
     tabGroups: {
       update: async () => {}
     }
