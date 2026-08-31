@@ -39,6 +39,7 @@ pub const TOKEN_FILENAME: &str = "chatgpt-native.token";
 pub const STATUS_FILENAME: &str = "chatgpt-native-status.json";
 pub const WRAPPER_FILENAME: &str = "yoetz-chrome-native-host";
 pub const INSTANCES_DIRNAME: &str = "instances";
+const INSTANCE_SOCKET_BINDING_VERSION: u32 = 2;
 const EXTENSION_LIFECYCLE_LOCK_FILENAME: &str = "extension-lifecycle.lock";
 pub const CHROME_EXTENSIONS_URL: &str = "chrome://extensions/";
 pub const CHATGPT_EXTENSION_DIR_ENV: &str = "YOETZ_CHATGPT_NATIVE_EXTENSION_DIR";
@@ -49,6 +50,8 @@ pub const MAX_BUNDLE_BYTES: u64 = 10 * 1024 * 1024;
 const CHUNK_BYTES: usize = 192 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const RECIPE_READ_GRACE: Duration = Duration::from_secs(60);
+const RECIPE_RECONNECT_WINDOW: Duration = Duration::from_secs(60);
+const RECIPE_RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const EXTENSION_RELOAD_VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
 const EXTENSION_RELOAD_VERIFY_INTERVAL: Duration = Duration::from_millis(250);
 #[cfg(unix)]
@@ -152,6 +155,33 @@ pub struct ExtensionInstanceStatus {
     pub last_seen_ms: u128,
 }
 
+#[derive(Clone, Debug)]
+struct PersistedExtensionInstanceRecord {
+    instance: ExtensionInstanceStatus,
+    socket_binding_version: u32,
+    socket_base_path: PathBuf,
+}
+
+fn parse_persisted_instance_record(text: &str) -> Result<PersistedExtensionInstanceRecord> {
+    let value: Value = serde_json::from_str(text)?;
+    let socket_binding_version = value
+        .get("socket_binding_version")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .context("socket_binding_version must be a u32")?;
+    let socket_base_path = value
+        .get("socket_base_path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .context("socket_base_path must be a string")?;
+    let instance = serde_json::from_value(value)?;
+    Ok(PersistedExtensionInstanceRecord {
+        instance,
+        socket_binding_version,
+        socket_base_path,
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DoctorReport {
     pub ok: bool,
@@ -242,10 +272,21 @@ pub struct ProtocolEnvelope {
 }
 
 impl ProtocolEnvelope {
+    #[cfg(test)]
     fn new(
         kind: impl Into<String>,
         job_id: Option<String>,
         run_id: Option<String>,
+        payload: Value,
+    ) -> Self {
+        Self::new_with_workspace(kind, job_id, run_id, workspace_id().ok(), payload)
+    }
+
+    fn new_with_workspace(
+        kind: impl Into<String>,
+        job_id: Option<String>,
+        run_id: Option<String>,
+        workspace_id: Option<String>,
         payload: Value,
     ) -> Self {
         Self {
@@ -254,7 +295,7 @@ impl ProtocolEnvelope {
             request_id: new_id("req"),
             job_id,
             run_id,
-            workspace_id: workspace_id().ok(),
+            workspace_id,
             capability_token: None,
             kind: kind.into(),
             payload,
@@ -472,9 +513,13 @@ fn prepare_managed_chatgpt_extension_unlocked() -> Result<ManagedExtensionUpdate
 fn prepare_managed_chatgpt_extension_from(
     source_dir: &Path,
 ) -> Result<ManagedExtensionUpdateResult> {
-    ensure_extension_source_authentic(source_dir)?;
+    let source_fingerprint = ensure_extension_source_authentic(source_dir)?;
     let extension_dir = managed_chatgpt_extension_dir()?;
-    let mut result = sync_managed_chatgpt_extension_from_unchecked(source_dir, &extension_dir)?;
+    let mut result = sync_managed_chatgpt_extension_from_authenticated(
+        source_dir,
+        &extension_dir,
+        Some(&source_fingerprint),
+    )?;
     let legacy_dir = legacy_loaded_chatgpt_extension_dir()?;
     if legacy_dir.exists() && !paths_refer_to_same_location(&legacy_dir, &extension_dir) {
         sync_extension_dir_exact(&extension_dir, &legacy_dir).with_context(|| {
@@ -488,9 +533,18 @@ fn prepare_managed_chatgpt_extension_from(
     Ok(result)
 }
 
+#[cfg(test)]
 fn sync_managed_chatgpt_extension_from_unchecked(
     source_dir: &Path,
     extension_dir: &Path,
+) -> Result<ManagedExtensionUpdateResult> {
+    sync_managed_chatgpt_extension_from_authenticated(source_dir, extension_dir, None)
+}
+
+fn sync_managed_chatgpt_extension_from_authenticated(
+    source_dir: &Path,
+    extension_dir: &Path,
+    expected_source_fingerprint: Option<&str>,
 ) -> Result<ManagedExtensionUpdateResult> {
     if !is_chatgpt_extension_source_dir(source_dir) {
         bail!(
@@ -539,8 +593,12 @@ fn sync_managed_chatgpt_extension_from_unchecked(
     } else {
         "updated"
     };
-    let copied_files =
-        copy_extension_dir_atomically(source_dir, extension_dir, Some(stamped_version.as_str()))?;
+    let copied_files = copy_extension_dir_atomically_with_expected_fingerprint(
+        source_dir,
+        extension_dir,
+        Some(stamped_version.as_str()),
+        expected_source_fingerprint,
+    )?;
 
     Ok(ManagedExtensionUpdateResult {
         status,
@@ -579,6 +637,20 @@ fn copy_extension_dir_atomically(
     extension_dir: &Path,
     stamped_version: Option<&str>,
 ) -> Result<usize> {
+    copy_extension_dir_atomically_with_expected_fingerprint(
+        source_dir,
+        extension_dir,
+        stamped_version,
+        None,
+    )
+}
+
+fn copy_extension_dir_atomically_with_expected_fingerprint(
+    source_dir: &Path,
+    extension_dir: &Path,
+    stamped_version: Option<&str>,
+    expected_source_fingerprint: Option<&str>,
+) -> Result<usize> {
     let parent = extension_dir
         .parent()
         .context("managed extension directory must have a parent")?;
@@ -601,6 +673,25 @@ fn copy_extension_dir_atomically(
 
     let copied_files = copy_extension_dir_contents(source_dir, &temp_dir)
         .with_context(|| format!("copy extension source from {}", source_dir.display()))?;
+    if let Some(expected) = expected_source_fingerprint {
+        let verification = extension_package_fingerprint(&temp_dir).and_then(|observed| {
+            if observed == expected {
+                return Ok(());
+            }
+            bail!(
+                "staged extension fingerprint {observed} does not match authenticated source fingerprint {expected}"
+            )
+        });
+        if let Err(error) = verification {
+            let _ = fs::remove_dir_all(&temp_dir);
+            return Err(error).with_context(|| {
+                format!(
+                    "verify staged ChatGPT native extension before activating {}",
+                    extension_dir.display()
+                )
+            });
+        }
+    }
     if let Some(version) = stamped_version {
         write_extension_manifest_version(&temp_dir, version)?;
     }
@@ -754,10 +845,10 @@ fn extension_dir_fingerprint(
     Ok(files)
 }
 
-fn ensure_extension_source_authentic(source_dir: &Path) -> Result<()> {
+fn ensure_extension_source_authentic(source_dir: &Path) -> Result<String> {
     let observed = extension_package_fingerprint(source_dir)?;
     if observed == EXPECTED_CHATGPT_EXTENSION_FINGERPRINT {
-        return Ok(());
+        return Ok(observed);
     }
     bail!(
         "refusing to sync ChatGPT native extension source {}: content fingerprint {} does not match the release-bound CLI fingerprint {}",
@@ -1026,14 +1117,24 @@ fn extension_version_skew_message(
     extension_version: Option<&str>,
     site_flag: Option<&str>,
 ) -> Option<String> {
-    let extension_version = extension_version?.trim();
-    if extension_version.is_empty() || extension_version_is_cli_compatible(extension_version) {
+    let update_hint = match site_flag {
+        Some(site_flag) => format!("yoetz browser extension update {site_flag}"),
+        None => {
+            "yoetz browser extension update --chatgpt or yoetz browser extension update --claude"
+                .to_string()
+        }
+    };
+    let extension_version = match extension_version.map(str::trim) {
+        Some(version) if !version.is_empty() => version,
+        _ => {
+            return Some(format!(
+                "loaded chrome-extension-native extension did not advertise a non-empty version; run {update_hint}"
+            ))
+        }
+    };
+    if extension_version_is_cli_compatible(extension_version) {
         return None;
     }
-    let update_hint = match site_flag {
-        Some(site_flag) => format!("`yoetz browser extension update {site_flag}`"),
-        None => "`yoetz browser extension update --chatgpt` or `yoetz browser extension update --claude`".to_string(),
-    };
     Some(format!(
         "loaded chrome-extension-native extension version {extension_version} does not match yoetz CLI {YOETZ_CLI_VERSION}; run {update_hint}"
     ))
@@ -1044,11 +1145,24 @@ fn managed_extension_identity_message(
     expected_version: Option<&str>,
     managed_dir: &Path,
 ) -> Option<String> {
-    let observed = observed_version?.trim();
-    let expected = expected_version?.trim();
-    if observed.is_empty() || expected.is_empty() {
-        return None;
-    }
+    let observed = match observed_version.map(str::trim) {
+        Some(version) if !version.is_empty() => version,
+        _ => {
+            return Some(format!(
+                "loaded Yoetz extension did not advertise a non-empty version; managed copy is {}",
+                managed_dir.display()
+            ))
+        }
+    };
+    let expected = match expected_version.map(str::trim) {
+        Some(version) if !version.is_empty() => version,
+        _ => {
+            return Some(format!(
+                "managed extension copy at {} has no stamped sync identity; run yoetz browser extension update --chatgpt or yoetz browser extension update --claude to initialize it",
+                managed_dir.display()
+            ))
+        }
+    };
     let observed_parts = chrome_extension_version_parts(observed);
     let expected_parts = chrome_extension_version_parts(expected);
     if expected_parts.as_ref().is_none_or(|parts| parts.len() != 4) {
@@ -1092,7 +1206,7 @@ pub fn status() -> Result<ExtensionStatus> {
     let manifest_installed = paths.manifest_path.exists();
     let wrapper_installed = paths.wrapper_path.exists();
     let status_file_present = paths.status_path.exists();
-    let connected_instances = connected_extension_instances(&paths);
+    let connected_instances = connected_extension_instances(&paths).instances;
     let socket_reachable = socket_reachable(&paths.socket_path) || !connected_instances.is_empty();
     let status_value = read_status_file(&paths.status_path);
     let latest_instance_with_hello = connected_instances
@@ -1141,8 +1255,9 @@ pub fn status() -> Result<ExtensionStatus> {
         .and_then(|value| value.get("version_mismatch"))
         .and_then(Value::as_str)
         .map(str::to_string);
-    let extension_version_mismatch =
-        extension_version_skew_message(extension_version.as_deref(), None);
+    let extension_version_mismatch = hello_seen
+        .then(|| extension_version_skew_message(extension_version.as_deref(), None))
+        .flatten();
     let version_mismatch = protocol_version_mismatch
         .clone()
         .or_else(|| extension_version_mismatch.clone());
@@ -1245,7 +1360,7 @@ pub fn prune_stale_instance_records() -> Result<usize> {
 pub fn doctor() -> Result<DoctorReport> {
     let paths = extension_paths()?;
     let status_value = read_status_file(&paths.status_path);
-    let connected_instances = connected_extension_instances(&paths);
+    let connected_instances = connected_extension_instances(&paths).instances;
     let latest_instance_with_hello = connected_instances
         .iter()
         .filter(|instance| instance_has_extension_hello(instance))
@@ -1865,42 +1980,23 @@ pub(crate) fn run_chatgpt_recipe_with_lease(
         .context("chrome-extension-native transport requires `--bundle`")?;
     let bundle = validate_bundle_path(bundle_path)?;
     let token = read_capability_token(&lease.paths.token_path)?;
-    let mut stream = connect_socket(&lease.instance.socket_path).with_context(|| {
-        format!(
-            "chrome-extension-native bridge is not connected at {}. Run `yoetz browser extension doctor --chatgpt`, then open Chrome with the Yoetz extension enabled.",
-            lease.instance.socket_path.display()
-        )
-    })?;
-    stream.set_read_timeout(Some(
-        Duration::from_millis(spec.wait_timeout_ms).saturating_add(RECIPE_READ_GRACE),
-    ))?;
-
-    let job_id = new_id("job");
-    let start = ProtocolEnvelope::new(
-        "job_start",
-        Some(job_id.clone()),
-        Some(spec.run_id.clone()),
+    let envelope = run_extension_recipe_with_reconnect(
+        format,
+        lease,
+        reconnect_selector_for_instance(&lease.instance),
+        BuiltinWebRecipe::Chatgpt,
+        &spec.run_id,
+        spec.wait_timeout_ms,
+        &bundle,
+        &token,
         chatgpt_job_start_payload(spec, &bundle),
-    )
-    .with_token(token);
-    write_json_frame(&mut stream, &start)?;
-
-    loop {
-        let envelope = read_json_frame(&mut stream)?;
-        validate_inbound_envelope(&envelope)?;
-        match envelope.kind.as_str() {
-            "job_progress" => emit_progress(format, &envelope)?,
-            "job_complete" => {
-                return parse_recipe_result(envelope, BuiltinWebRecipe::Chatgpt)
-                    .with_chatgpt_phase(ChatgptTransportPhase::PostCompletion)
-            }
-            "job_error" => return Err(job_error(envelope)),
-            other => {
-                if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
-                    eprintln!("info: ignored chrome-extension-native event `{other}`");
-                }
-            }
-        }
+    )?;
+    match envelope.kind.as_str() {
+        "job_complete" => parse_recipe_result(envelope, BuiltinWebRecipe::Chatgpt)
+            .with_chatgpt_phase(ChatgptTransportPhase::PostCompletion),
+        "job_error" => Err(job_error(envelope)),
+        "job_cancel" => Err(job_cancel_error(envelope, BuiltinWebRecipe::Chatgpt)),
+        other => bail!("chrome-extension-native recipe returned unexpected terminal `{other}`"),
     }
 }
 
@@ -1926,40 +2022,241 @@ pub(crate) fn run_claude_recipe_with_lease(
         .context("chrome-extension-native transport requires `--bundle`")?;
     let bundle = validate_bundle_path(bundle_path)?;
     let token = read_capability_token(&lease.paths.token_path)?;
+    let envelope = run_extension_recipe_with_reconnect(
+        format,
+        lease,
+        reconnect_selector_for_instance(&lease.instance),
+        BuiltinWebRecipe::Claude,
+        &spec.run_id,
+        spec.wait_timeout_ms,
+        &bundle,
+        &token,
+        claude_job_start_payload(spec, &bundle),
+    )?;
+    match envelope.kind.as_str() {
+        "job_complete" => parse_recipe_result(envelope, BuiltinWebRecipe::Claude),
+        "job_error" => Err(job_error_for_recipe(envelope, BuiltinWebRecipe::Claude)),
+        "job_cancel" => Err(job_cancel_error(envelope, BuiltinWebRecipe::Claude)),
+        other => bail!("chrome-extension-native recipe returned unexpected terminal `{other}`"),
+    }
+}
+
+fn run_extension_recipe_with_reconnect(
+    format: OutputFormat,
+    lease: &ExtensionRecipeLease,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+    run_id: &str,
+    wait_timeout_ms: u64,
+    bundle: &BundleInfo,
+    token: &str,
+    start_payload: Value,
+) -> Result<ProtocolEnvelope> {
+    let workspace_id = workspace_id()?;
+    let job_id = new_id("job");
     let mut stream = connect_socket(&lease.instance.socket_path).with_context(|| {
         format!(
-            "chrome-extension-native bridge is not connected at {}. Run `yoetz browser extension doctor --claude`, then open Chrome with the Yoetz extension enabled.",
-            lease.instance.socket_path.display()
+            "chrome-extension-native bridge is not connected at {}. Run `yoetz browser extension doctor --{}` then open Chrome with the Yoetz extension enabled.",
+            lease.instance.socket_path.display(),
+            recipe.as_str()
         )
     })?;
-    stream.set_read_timeout(Some(
-        Duration::from_millis(spec.wait_timeout_ms).saturating_add(RECIPE_READ_GRACE),
-    ))?;
-
-    let job_id = new_id("job");
-    let start = ProtocolEnvelope::new(
+    set_recipe_read_timeout(&stream, wait_timeout_ms)?;
+    let start = ProtocolEnvelope::new_with_workspace(
         "job_start",
-        Some(job_id),
-        Some(spec.run_id.clone()),
-        claude_job_start_payload(spec, &bundle),
+        Some(job_id.clone()),
+        Some(run_id.to_string()),
+        Some(workspace_id.clone()),
+        start_payload,
     )
-    .with_token(token);
-    write_json_frame(&mut stream, &start)?;
+    .with_token(token.to_string());
+    write_json_frame(&mut stream, &start).context("start chrome-extension-native recipe")?;
 
+    let mut pending = None;
     loop {
-        let envelope = read_json_frame(&mut stream)?;
-        validate_inbound_envelope(&envelope)?;
-        match envelope.kind.as_str() {
-            "job_progress" => emit_progress(format, &envelope)?,
-            "job_complete" => return parse_recipe_result(envelope, BuiltinWebRecipe::Claude),
-            "job_error" => return Err(job_error_for_recipe(envelope, BuiltinWebRecipe::Claude)),
-            other => {
-                if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
-                    eprintln!("info: ignored chrome-extension-native event `{other}`");
+        match pending
+            .take()
+            .map(Ok)
+            .unwrap_or_else(|| read_json_frame(&mut stream))
+        {
+            Ok(envelope) => {
+                validate_inbound_envelope(&envelope)?;
+                match envelope.kind.as_str() {
+                    "job_progress" => emit_progress(format, &envelope)?,
+                    "job_complete" | "job_error" | "job_cancel" => return Ok(envelope),
+                    other => {
+                        if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
+                            eprintln!("info: ignored chrome-extension-native event `{other}`");
+                        }
+                    }
                 }
             }
+            Err(error) if is_recipe_disconnect_error(&error) => {
+                eprintln!(
+                    "warning: chrome-extension-native local client disconnected for {job_id}; reconnecting without resubmitting the job"
+                );
+                let (reconnected, first) = reconnect_recipe_stream(
+                    lease,
+                    selector,
+                    recipe,
+                    run_id,
+                    &job_id,
+                    &workspace_id,
+                    bundle,
+                    token,
+                    wait_timeout_ms,
+                )?;
+                stream = reconnected;
+                pending = first;
+            }
+            Err(error) => return Err(error).context("read chrome-extension-native recipe event"),
         }
     }
+}
+
+fn reconnect_selector_for_instance(
+    instance: &ExtensionInstanceStatus,
+) -> ExtensionInstanceSelector<'_> {
+    if let Some(extension_instance_id) = instance.extension_instance_id.as_deref() {
+        return ExtensionInstanceSelector {
+            extension_instance_id: Some(extension_instance_id),
+            ..ExtensionInstanceSelector::default()
+        };
+    }
+    if let Some(extension_profile_id) = instance.profile_id.as_deref() {
+        return ExtensionInstanceSelector {
+            extension_profile_id: Some(extension_profile_id),
+            ..ExtensionInstanceSelector::default()
+        };
+    }
+    ExtensionInstanceSelector {
+        profile_email: instance.profile_email.as_deref(),
+        ..ExtensionInstanceSelector::default()
+    }
+}
+
+fn reconnect_recipe_stream(
+    lease: &ExtensionRecipeLease,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+    run_id: &str,
+    job_id: &str,
+    workspace_id: &str,
+    bundle: &BundleInfo,
+    token: &str,
+    wait_timeout_ms: u64,
+) -> Result<(SocketStream, Option<ProtocolEnvelope>)> {
+    let deadline = Instant::now() + RECIPE_RECONNECT_WINDOW;
+    let mut last_error = anyhow!("no connected native host instance was available");
+    loop {
+        if Instant::now() >= deadline {
+            return Err(last_error).context(format!(
+                "chrome-extension-native could not reconnect job {job_id} within {}s; the original job was not resubmitted",
+                RECIPE_RECONNECT_WINDOW.as_secs()
+            ));
+        }
+        match select_extension_instance(&lease.paths, selector).and_then(|instance| {
+            ensure_instance_matches_managed_copy(&instance)?;
+            ensure_instance_supports_capability(&instance, NATIVE_JOB_COMMANDS_CAPABILITY)?;
+            if recipe == BuiltinWebRecipe::Claude {
+                ensure_instance_supports_recipe(&instance, "claude")?;
+            }
+            let mut stream = connect_socket(&instance.socket_path)
+                .with_context(|| format!("connect {}", instance.socket_path.display()))?;
+            set_recipe_read_timeout(&stream, wait_timeout_ms)?;
+            let reconnect = ProtocolEnvelope::new_with_workspace(
+                "reconnect",
+                Some(job_id.to_string()),
+                Some(run_id.to_string()),
+                Some(workspace_id.to_string()),
+                json!({
+                    "intent": "job_reconnect",
+                    "recipe": recipe.as_str(),
+                    "bundle_path": bundle.path,
+                    "bundle_size": bundle.size,
+                    "file_name": bundle.file_name,
+                    "mime": bundle.mime,
+                }),
+            )
+            .with_token(token.to_string());
+            write_json_frame(&mut stream, &reconnect)
+                .context("send chrome-extension-native reconnect")?;
+            loop {
+                let response = read_json_frame(&mut stream)
+                    .context("read chrome-extension-native reconnect confirmation")?;
+                validate_inbound_envelope(&response)?;
+                match response.kind.as_str() {
+                    "job_progress" | "heartbeat" => continue,
+                    "job_complete" | "job_error" | "job_cancel" => {
+                        if response.job_id.as_deref() != Some(job_id)
+                            || response.run_id.as_deref() != Some(run_id)
+                            || response.workspace_id.as_deref() != Some(workspace_id)
+                        {
+                            bail!(
+                                "chrome-extension-native reconnect returned a terminal for another job or run"
+                            );
+                        }
+                        return Ok((stream, Some(response)));
+                    }
+                    "reconnect" => {
+                        let restored = response
+                            .payload
+                            .get("restored_runs")
+                            .and_then(Value::as_array)
+                            .is_some_and(|runs| {
+                                runs.iter().any(|entry| {
+                                    entry.get("job_id").and_then(Value::as_str) == Some(job_id)
+                                        && entry.get("run_id").and_then(Value::as_str)
+                                            == Some(run_id)
+                                        && entry.get("workspace_id").and_then(Value::as_str)
+                                            == Some(workspace_id)
+                                })
+                            });
+                        if response.job_id.as_deref() != Some(job_id)
+                            || response.run_id.as_deref() != Some(run_id)
+                            || response.workspace_id.as_deref() != Some(workspace_id)
+                            || !restored
+                        {
+                            bail!(
+                                "chrome-extension-native reconnect did not confirm restoration of the requested job and run"
+                            );
+                        }
+                        return Ok((stream, None));
+                    }
+                    other => {
+                        eprintln!(
+                            "info: ignored chrome-extension-native reconnect event `{other}`"
+                        );
+                    }
+                }
+            }
+        }) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = error,
+        }
+        thread::sleep(RECIPE_RECONNECT_INTERVAL);
+    }
+}
+
+fn set_recipe_read_timeout(stream: &SocketStream, wait_timeout_ms: u64) -> Result<()> {
+    stream.set_read_timeout(Some(
+        Duration::from_millis(wait_timeout_ms).saturating_add(RECIPE_READ_GRACE),
+    ))?;
+    Ok(())
+}
+
+fn is_recipe_disconnect_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+            )
+        )
+    })
 }
 
 pub fn serve_native_host_chatgpt() -> Result<()> {
@@ -2211,29 +2508,87 @@ fn instance_has_extension_hello(instance: &ExtensionInstanceStatus) -> bool {
         .extension_instance_id
         .as_deref()
         .is_some_and(|value| !value.is_empty())
-        || instance
+        && instance
             .extension_version
             .as_deref()
             .is_some_and(|value| !value.is_empty())
 }
 
-fn connected_extension_instances(paths: &ExtensionPaths) -> Vec<ExtensionInstanceStatus> {
-    let Ok(entries) = fs::read_dir(&paths.instances_dir) else {
-        return Vec::new();
+#[derive(Debug, Default)]
+struct ConnectedExtensionInstances {
+    instances: Vec<ExtensionInstanceStatus>,
+    malformed_records: usize,
+    record_count: usize,
+}
+
+fn connected_extension_instances(paths: &ExtensionPaths) -> ConnectedExtensionInstances {
+    let entries = match fs::read_dir(&paths.instances_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return ConnectedExtensionInstances::default();
+        }
+        Err(_) => {
+            return ConnectedExtensionInstances {
+                instances: Vec::new(),
+                malformed_records: 1,
+                record_count: 0,
+            };
+        }
     };
-    let mut instances = entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let path = entry.path();
-            let text = fs::read_to_string(path).ok()?;
-            serde_json::from_str::<ExtensionInstanceStatus>(&text).ok()
-        })
-        .filter(|instance| instance.protocol_version == PROTOCOL_VERSION)
-        .filter(|instance| process_alive(instance.pid))
-        .filter(|instance| socket_reachable(&instance.socket_path))
-        .collect::<Vec<_>>();
-    instances.sort_by(|a, b| a.native_instance_id.cmp(&b.native_instance_id));
-    instances
+    let mut connected = ConnectedExtensionInstances::default();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            connected.malformed_records += 1;
+            continue;
+        };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        connected.record_count += 1;
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            connected.malformed_records += 1;
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            connected.malformed_records += 1;
+            continue;
+        }
+        let Some(record_name) = path.file_stem().and_then(|value| value.to_str()) else {
+            connected.malformed_records += 1;
+            continue;
+        };
+        let Ok(text) = fs::read_to_string(&path) else {
+            connected.malformed_records += 1;
+            continue;
+        };
+        let record = match parse_persisted_instance_record(&text) {
+            Ok(record) => record,
+            Err(_) => {
+                connected.malformed_records += 1;
+                continue;
+            }
+        };
+        if record.instance.native_instance_id != record_name {
+            connected.malformed_records += 1;
+            continue;
+        }
+        if !instance_socket_binding_matches(paths, &record) {
+            connected.malformed_records += 1;
+            continue;
+        }
+        let instance = record.instance;
+        if instance.protocol_version == PROTOCOL_VERSION
+            && process_alive(instance.pid)
+            && socket_reachable(&instance.socket_path)
+        {
+            connected.instances.push(instance);
+        }
+    }
+    connected
+        .instances
+        .sort_by(|a, b| a.native_instance_id.cmp(&b.native_instance_id));
+    connected
 }
 
 fn prune_stale_instance_records_at(paths: &ExtensionPaths) -> usize {
@@ -2246,14 +2601,27 @@ fn prune_stale_instance_records_at(paths: &ExtensionPaths) -> usize {
         if path.extension().and_then(|value| value.to_str()) != Some("json") {
             continue;
         }
-        let stale = fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<ExtensionInstanceStatus>(&text).ok())
-            .is_none_or(|instance| {
-                instance.protocol_version != PROTOCOL_VERSION
-                    || !process_alive(instance.pid)
-                    || !socket_reachable(&instance.socket_path)
-            });
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(instance) = serde_json::from_str::<ExtensionInstanceStatus>(&text) else {
+            continue;
+        };
+        let Some(record_name) = path.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if instance.native_instance_id != record_name {
+            continue;
+        }
+        let stale = instance.protocol_version != PROTOCOL_VERSION
+            || !process_alive(instance.pid)
+            || !socket_reachable(&instance.socket_path);
         if stale && fs::remove_file(&path).is_ok() {
             pruned += 1;
         }
@@ -2286,7 +2654,20 @@ fn select_extension_instance(
     paths: &ExtensionPaths,
     selector: ExtensionInstanceSelector<'_>,
 ) -> Result<ExtensionInstanceStatus> {
-    let instances = connected_extension_instances(paths);
+    let connected = connected_extension_instances(paths);
+    if connected.malformed_records > 0 {
+        bail!(
+            "chrome-extension-native found {} unreadable or non-canonical instance record(s); refusing to route until the instance records are repaired",
+            connected.malformed_records
+        );
+    }
+    if connected.record_count > 0 && connected.instances.is_empty() {
+        bail!(
+            "chrome-extension-native found {} instance record(s) but none are connected; refusing the legacy shared-socket fallback until the records are repaired or removed",
+            connected.record_count
+        );
+    }
+    let instances = connected.instances;
     let requested_email = non_empty_selector(selector.profile_email);
     let requested_extension_instance_id = non_empty_selector(selector.extension_instance_id);
     let requested_extension_profile_id = non_empty_selector(selector.extension_profile_id);
@@ -2439,17 +2820,60 @@ fn ensure_reload_can_reach_managed_copy(
 
 fn ensure_instance_matches_managed_copy(instance: &ExtensionInstanceStatus) -> Result<()> {
     let managed_dir = managed_chatgpt_extension_dir()?;
-    let expected_version = extension_manifest_version(&managed_dir);
-    if let Some(message) = managed_extension_identity_message(
-        instance.extension_version.as_deref(),
-        expected_version.as_deref(),
-        &managed_dir,
-    ) {
-        bail!(message);
+    ensure_live_managed_extension_identity(instance, &managed_dir)
+}
+
+fn ensure_live_managed_extension_identity(
+    instance: &ExtensionInstanceStatus,
+    managed_dir: &Path,
+) -> Result<()> {
+    let expected_version = extension_manifest_version(managed_dir).ok_or_else(|| {
+        anyhow::anyhow!(
+            "managed extension copy at {} has no stamped four-component version; run yoetz browser extension update --chatgpt or yoetz browser extension update --claude",
+            managed_dir.display()
+        )
+    })?;
+    let expected_parts = chrome_extension_version_parts(&expected_version).ok_or_else(|| {
+        anyhow::anyhow!(
+            "managed extension version is not a valid Chrome version: {expected_version}"
+        )
+    })?;
+    if expected_parts.len() != 4 {
+        bail!(
+            "managed extension copy at {} has no stamped four-component version; run yoetz browser extension update --chatgpt or yoetz browser extension update --claude",
+            managed_dir.display()
+        );
+    }
+    let extension_instance_id = non_empty_selector(instance.extension_instance_id.as_deref())
+        .context(
+            "loaded chrome-extension-native extension did not advertise a non-empty instance id",
+        )?;
+    let observed_version = non_empty_selector(instance.extension_version.as_deref()).context(
+        "loaded chrome-extension-native extension did not advertise a non-empty version",
+    )?;
+    let observed_parts = chrome_extension_version_parts(observed_version).ok_or_else(|| {
+        anyhow::anyhow!("loaded extension version {observed_version} is not a valid Chrome version")
+    })?;
+    if observed_parts.len() != 4 || !extension_version_is_cli_compatible(observed_version) {
+        bail!(
+            "loaded Yoetz extension version {observed_version} is not a stamped four-component version for yoetz CLI {YOETZ_CLI_VERSION}; managed copy is {}",
+            managed_dir.display()
+        );
+    }
+    if observed_version != expected_version {
+        if let Some(message) = managed_extension_identity_message(
+            Some(observed_version),
+            Some(&expected_version),
+            managed_dir,
+        ) {
+            bail!(message);
+        }
+        bail!(
+            "loaded extension instance {extension_instance_id} does not match managed extension version {expected_version}"
+        );
     }
     Ok(())
 }
-
 fn wait_for_extension_version(
     paths: &ExtensionPaths,
     selector: ExtensionInstanceSelector<'_>,
@@ -2673,6 +3097,80 @@ fn default_socket_path(state_dir: &Path) -> PathBuf {
 fn unix_socket_path_fits(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
     path.as_os_str().as_bytes().len() < MAX_UNIX_SOCKET_PATH_BYTES
+}
+
+#[cfg(unix)]
+fn instance_socket_path_candidates(
+    paths: &ExtensionPaths,
+    base_socket_path: &Path,
+    native_instance_id: &str,
+) -> [PathBuf; 3] {
+    let base_name = base_socket_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(SOCKET_FILENAME);
+    let explicit_socket =
+        base_socket_path.with_file_name(format!("{base_name}-{native_instance_id}"));
+    let state_socket = paths
+        .instances_dir
+        .join(format!("{native_instance_id}.sock"));
+    let mut hash = Sha256::new();
+    hash.update(native_instance_id.as_bytes());
+    let digest = hex::encode(hash.finalize());
+    let fallback_socket =
+        socket_fallback_dir(&paths.state_dir).join(format!("{}.sock", &digest[..16]));
+    [explicit_socket, state_socket, fallback_socket]
+}
+
+#[cfg(unix)]
+fn instance_socket_path_for_base(
+    paths: &ExtensionPaths,
+    base_socket_path: &Path,
+    native_instance_id: &str,
+    use_explicit_base: bool,
+) -> PathBuf {
+    let [explicit_socket, state_socket, fallback_socket] =
+        instance_socket_path_candidates(paths, base_socket_path, native_instance_id);
+    if use_explicit_base && unix_socket_path_fits(&explicit_socket) {
+        return explicit_socket;
+    }
+    if unix_socket_path_fits(&state_socket) {
+        return state_socket;
+    }
+    fallback_socket
+}
+
+#[cfg(unix)]
+fn instance_socket_binding_matches(
+    paths: &ExtensionPaths,
+    record: &PersistedExtensionInstanceRecord,
+) -> bool {
+    if record.socket_binding_version != INSTANCE_SOCKET_BINDING_VERSION
+        || record.socket_base_path.as_os_str().is_empty()
+    {
+        return false;
+    }
+    let candidates = instance_socket_path_candidates(
+        paths,
+        &record.socket_base_path,
+        &record.instance.native_instance_id,
+    );
+    let explicit_base_is_selected = env::var_os("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET")
+        .is_some_and(|value| Path::new(&value) == record.socket_base_path);
+    (explicit_base_is_selected && record.instance.socket_path == record.socket_base_path)
+        || candidates
+            .iter()
+            .any(|candidate| candidate == &record.instance.socket_path)
+}
+
+#[cfg(not(unix))]
+fn instance_socket_binding_matches(
+    paths: &ExtensionPaths,
+    record: &PersistedExtensionInstanceRecord,
+) -> bool {
+    record.socket_binding_version == INSTANCE_SOCKET_BINDING_VERSION
+        && !record.socket_base_path.as_os_str().is_empty()
+        && record.instance.socket_path != paths.socket_path
 }
 
 #[cfg(unix)]
@@ -2981,8 +3479,14 @@ fn send_control_job_with_recipe(
 ) -> Result<ProtocolEnvelope> {
     let paths = extension_paths()?;
     let instance = select_extension_instance(&paths, selector)?;
+    let reload_request = kind == "reconnect"
+        && payload.get("intent").and_then(Value::as_str) == Some("reload_extension");
     if let Some(recipe) = required_recipe {
         ensure_instance_supports_recipe(&instance, recipe)?;
+    }
+    if !reload_request {
+        ensure_instance_matches_managed_copy(&instance)?;
+        ensure_instance_supports_capability(&instance, NATIVE_JOB_COMMANDS_CAPABILITY)?;
     }
     let token = read_capability_token(&paths.token_path)?;
     let job_id = new_id(kind);
@@ -2993,7 +3497,18 @@ fn send_control_job_with_recipe(
         )
     })?;
     stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT))?;
-    let envelope = ProtocolEnvelope::new(kind, Some(job_id), None, payload).with_token(token);
+    let control_run_id = (kind == "inspect_run")
+        .then(|| payload.get("run_id").and_then(Value::as_str))
+        .flatten()
+        .map(str::to_string);
+    let envelope = ProtocolEnvelope::new_with_workspace(
+        kind,
+        Some(job_id),
+        control_run_id,
+        Some(workspace_id()?),
+        payload,
+    )
+    .with_token(token);
     write_json_frame(&mut stream, &envelope)?;
     loop {
         let response = read_json_frame(&mut stream)
@@ -3207,6 +3722,33 @@ fn parse_model_selection_status(value: Option<&str>) -> ChatgptModelSelectionSta
 
 fn job_error(envelope: ProtocolEnvelope) -> anyhow::Error {
     job_error_for_recipe(envelope, BuiltinWebRecipe::Chatgpt)
+}
+
+fn job_cancel_error(envelope: ProtocolEnvelope, recipe: BuiltinWebRecipe) -> anyhow::Error {
+    let mut message = format!("{} job was cancelled", recipe.as_str());
+    if let Some(reason) = envelope.payload.get("reason").and_then(Value::as_str) {
+        message.push_str(&format!(": {reason}"));
+    }
+    let side_effect_started = envelope
+        .payload
+        .get("may_still_be_running")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || envelope
+            .payload
+            .get("cancelled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+    let error = anyhow!(message);
+    if side_effect_started {
+        crate::web_recipe::mark_terminal_fallback_phase(
+            error,
+            recipe,
+            ChatgptTransportPhase::WaitResponse,
+        )
+    } else {
+        error
+    }
 }
 
 fn job_error_for_recipe(envelope: ProtocolEnvelope, recipe: BuiltinWebRecipe) -> anyhow::Error {
@@ -3508,16 +4050,34 @@ fn unsupported_socket_error() -> io::Error {
 mod native_host_unix {
     use super::*;
     use std::collections::{HashMap, HashSet};
-    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::thread;
 
     type Clients = Arc<Mutex<HashMap<String, ClientJob>>>;
 
-    struct ClientJob {
-        stream: UnixStream,
+    #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+    struct TerminalDeliveryIdentity {
         job_id: String,
         run_id: Option<String>,
+        #[serde(default)]
+        workspace_id: Option<String>,
+        terminal_type: String,
+        sequence: u64,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    struct TerminalDeliveryReceipt {
+        identity: TerminalDeliveryIdentity,
+        delivered_at_ms: u128,
+    }
+
+    struct ClientJob {
+        stream: UnixStream,
+        owner_id: String,
+        job_id: String,
+        run_id: Option<String>,
+        workspace_id: Option<String>,
         chunks: Vec<Value>,
         next_chunk: usize,
         side_effect_started: bool,
@@ -3527,8 +4087,10 @@ mod native_host_unix {
 
     struct RouteDelivery {
         stream: UnixStream,
+        owner_id: String,
         job_id: String,
         run_id: Option<String>,
+        workspace_id: Option<String>,
         fallback_phase: Option<&'static str>,
         side_effect_started: bool,
         client_error: Option<ProtocolEnvelope>,
@@ -3547,13 +4109,14 @@ mod native_host_unix {
     struct NativeHostRuntime {
         native_instance_id: String,
         socket_path: PathBuf,
+        socket_base_path: PathBuf,
         instance_path: PathBuf,
     }
 
     #[derive(Default)]
     struct ExtensionSessionState {
         terminal_ack_capable: bool,
-        terminal_job_ids: HashSet<String>,
+        terminal_job_ids: HashSet<TerminalDeliveryIdentity>,
     }
 
     impl SocketFileGuard {
@@ -3587,6 +4150,7 @@ mod native_host_unix {
         let runtime = NativeHostRuntime {
             native_instance_id,
             socket_path,
+            socket_base_path: paths.socket_path.clone(),
             instance_path,
         };
         let _socket_guard = SocketFileGuard::new(runtime.socket_path.clone());
@@ -3604,6 +4168,8 @@ mod native_host_unix {
             "pid": process::id(),
             "native_instance_id": runtime.native_instance_id,
             "socket_path": runtime.socket_path,
+            "socket_binding_version": INSTANCE_SOCKET_BINDING_VERSION,
+            "socket_base_path": runtime.socket_base_path,
             "connected_at_ms": now_millis(),
         });
         write_status_file(&paths.status_path, &status)?;
@@ -3703,9 +4269,12 @@ mod native_host_unix {
         paths: &ExtensionPaths,
         native_instance_id: &str,
     ) -> Result<(UnixListener, PathBuf)> {
-        let explicit_socket = env::var("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET").is_ok();
-        ensure_socket_parent_path(paths, &paths.socket_path)?;
-        if explicit_socket || !active_socket_exists(&paths.socket_path) {
+        let explicit_socket = env::var_os("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET").is_some();
+        if explicit_socket
+            && unix_socket_path_fits(&paths.socket_path)
+            && !active_socket_exists(&paths.socket_path)
+        {
+            ensure_socket_parent_path(paths, &paths.socket_path)?;
             remove_stale_socket(&paths.socket_path)?;
             let listener = UnixListener::bind(&paths.socket_path)
                 .with_context(|| format!("bind {}", paths.socket_path.display()))?;
@@ -3725,13 +4294,12 @@ mod native_host_unix {
     }
 
     fn instance_socket_path(paths: &ExtensionPaths, native_instance_id: &str) -> PathBuf {
-        let state_socket = paths
-            .instances_dir
-            .join(format!("{native_instance_id}.sock"));
-        if unix_socket_path_fits(&state_socket) {
-            return state_socket;
-        }
-        socket_fallback_dir(&paths.state_dir).join(format!("{native_instance_id}.sock"))
+        instance_socket_path_for_base(
+            paths,
+            &paths.socket_path,
+            native_instance_id,
+            env::var_os("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET").is_some(),
+        )
     }
 
     pub(super) fn ensure_socket_parent_path(
@@ -3802,6 +4370,7 @@ mod native_host_unix {
                 let error = client_error_envelope_from_parts(
                     &job_id,
                     envelope.run_id.clone(),
+                    envelope.workspace_id.clone(),
                     "bundle_validation_failed",
                     &format!("native host could not prepare job bundle: {err:#}"),
                     Some("upload"),
@@ -3813,17 +4382,57 @@ mod native_host_unix {
             }
             Err(err) => return Err(err),
         };
+        let owner_id = new_id("client");
         let client = ClientJob {
             stream: stream.try_clone()?,
+            owner_id: owner_id.clone(),
             job_id: job_id.clone(),
             run_id: envelope.run_id.clone(),
+            workspace_id: envelope.workspace_id.clone(),
             chunks,
             next_chunk: 0,
             side_effect_started: false,
             fallback_phase: None,
             cancel_on_disconnect: envelope.kind == "job_start",
         };
-        clients.lock().unwrap().insert(job_id.clone(), client);
+        let route_error = {
+            let mut routes = clients.lock().unwrap();
+            match routes.get(&job_id) {
+                Some(existing)
+                    if matches!(envelope.kind.as_str(), "reconnect" | "job_cancel")
+                        && client_identity_matches(existing, &envelope) =>
+                {
+                    // A reconnect or explicit cancellation may intentionally
+                    // replace the old local owner, but the old handler can no
+                    // longer remove the new route because owner_id is checked.
+                    routes.insert(job_id.clone(), client);
+                    None
+                }
+                Some(existing) => Some(client_error_envelope_from_parts(
+                    &job_id,
+                    envelope.run_id.clone(),
+                    envelope.workspace_id.clone(),
+                    if envelope.kind == "job_start" || client_identity_matches(existing, &envelope)
+                    {
+                        "duplicate_job"
+                    } else {
+                        "route_conflict"
+                    },
+                    &format!("job {job_id} is already connected to this native host"),
+                    Some("profile"),
+                    false,
+                )),
+                None => {
+                    routes.insert(job_id.clone(), client);
+                    None
+                }
+            }
+        };
+        if let Some(error) = route_error {
+            write_json_frame(&mut stream, &error)
+                .context("write duplicate job error to local client")?;
+            return Ok(());
+        }
 
         let forward_result = match envelope.kind.as_str() {
             "job_start"
@@ -3835,7 +4444,7 @@ mod native_host_unix {
             other => Err(anyhow!("unsupported local client message `{other}`")),
         };
         if let Err(err) = forward_result {
-            if let Some(mut client) = clients.lock().unwrap().remove(&job_id) {
+            if let Some(mut client) = remove_client_if_owner(&clients, &job_id, &owner_id) {
                 let error = client_error_envelope(
                     &client,
                     "forward_to_extension_failed",
@@ -3857,6 +4466,12 @@ mod native_host_unix {
                     if control.job_id.as_ref() != Some(&job_id) {
                         bail!("local client control message changed job_id");
                     }
+                    if control.run_id != envelope.run_id {
+                        bail!("local client control message changed run_id");
+                    }
+                    if control.workspace_id != envelope.workspace_id {
+                        bail!("local client control message changed workspace_id");
+                    }
                     let (forwarded, _) = prepare_local_message(control.clone())?;
                     match control.kind.as_str() {
                         "job_cancel"
@@ -3864,7 +4479,9 @@ mod native_host_unix {
                         | "inspect_run"
                         | "request_identity_permission" => {
                             if let Err(err) = forward_to_extension(&stdout, &forwarded) {
-                                if let Some(mut client) = clients.lock().unwrap().remove(&job_id) {
+                                if let Some(mut client) =
+                                    remove_client_if_owner(&clients, &job_id, &owner_id)
+                                {
                                     let error = client_error_envelope(
                                         &client,
                                         "forward_to_extension_failed",
@@ -3883,7 +4500,7 @@ mod native_host_unix {
                     }
                 }
                 Err(err) if is_timeout_error(&err) => {
-                    if !clients.lock().unwrap().contains_key(&job_id) {
+                    if !client_is_current_owner(&clients, &job_id, &owner_id) {
                         return Ok(());
                     }
                 }
@@ -3891,12 +4508,13 @@ mod native_host_unix {
                 Err(err) => return Err(err).context("read local client control frame"),
             }
         }
-        let still_active = clients.lock().unwrap().remove(&job_id).is_some();
+        let still_active = remove_client_if_owner(&clients, &job_id, &owner_id).is_some();
         if still_active && envelope.kind == "job_start" {
-            let cancel = ProtocolEnvelope::new(
+            let cancel = ProtocolEnvelope::new_with_workspace(
                 "job_cancel",
                 Some(job_id),
                 envelope.run_id.clone(),
+                envelope.workspace_id.clone(),
                 json!({
                     "reason": "local_client_disconnected"
                 }),
@@ -3932,25 +4550,84 @@ mod native_host_unix {
             return Ok(());
         };
         let terminal_sequence = terminal_sequence(&envelope)?;
-        if let Some(sequence) = terminal_sequence {
-            if extension_session.terminal_job_ids.contains(&job_id) {
+        let terminal_identity = terminal_sequence.map(|sequence| TerminalDeliveryIdentity {
+            job_id: job_id.clone(),
+            run_id: envelope.run_id.clone(),
+            workspace_id: envelope.workspace_id.clone(),
+            terminal_type: envelope.kind.clone(),
+            sequence,
+        });
+        if let Some(identity) = terminal_identity.as_ref() {
+            if extension_session
+                .terminal_job_ids
+                .iter()
+                .any(|known| terminal_job_matches(known, identity))
+                || terminal_delivery_receipt_exists(paths, identity)?
+            {
                 eprintln!(
                     "yoetz chrome native dropped duplicate terminal envelope `{}` for {job_id}",
                     envelope.kind
                 );
-                acknowledge_terminal(stdout, &envelope, sequence, extension_session)?;
+                extension_session.terminal_job_ids.insert(identity.clone());
+                acknowledge_terminal(stdout, &envelope, identity.sequence, extension_session)?;
                 record_instance_activity(runtime, &envelope)?;
                 return Ok(());
             }
         }
-        let mut delivered_terminal_sequence = None;
-        let mut remove_client = matches!(
+        let terminal_delivery = matches!(
             envelope.kind.as_str(),
             "job_complete" | "job_error" | "job_cancel" | "pair_complete"
         );
+        if terminal_delivery {
+            // Keep the route lock through the socket write, receipt commit, and
+            // terminal ACK. A reconnect cannot acquire a successor route in
+            // the window between removing this owner and acknowledging it.
+            let mut clients = clients.lock().unwrap();
+            let Some(client) = clients.get_mut(&job_id) else {
+                drop(clients);
+                record_instance_activity(runtime, &envelope)?;
+                return Ok(());
+            };
+            if !client_identity_matches(client, &envelope) {
+                eprintln!(
+                    "yoetz chrome native refused to route `{}` for job {job_id}: job/run/workspace identity does not match the current local owner",
+                    envelope.kind
+                );
+                return Ok(());
+            }
+            update_client_effect_state(client, &envelope);
+            let owner_id = client.owner_id.clone();
+            if let Err(err) = write_json_frame(&mut client.stream, &envelope) {
+                eprintln!("yoetz chrome native local client write failed for {job_id}: {err:#}");
+                remove_client_if_owner_locked(&mut clients, &job_id, &owner_id);
+            } else {
+                if let Some(identity) = terminal_identity.as_ref() {
+                    record_terminal_delivery_receipt(paths, identity)?;
+                    extension_session.terminal_job_ids.insert(identity.clone());
+                    acknowledge_terminal(stdout, &envelope, identity.sequence, extension_session)?;
+                }
+                remove_client_if_owner_locked(&mut clients, &job_id, &owner_id);
+            }
+            drop(clients);
+            if is_manual_handoff(&envelope) {
+                record_manual_handoff(paths, &envelope)?;
+            }
+            record_instance_activity(runtime, &envelope)?;
+            return Ok(());
+        }
+
+        let mut delivered_terminal_sequence = None;
+        let mut remove_client = false;
         let delivery = {
             let mut clients = clients.lock().unwrap();
             if let Some(client) = clients.get_mut(&job_id) {
+                if !client_identity_matches(client, &envelope) {
+                    eprintln!(
+                        "yoetz chrome native refused to route `{}` for job {job_id}: job/run/workspace identity does not match the current local owner",
+                        envelope.kind
+                    );
+                    return Ok(());
+                }
                 update_client_effect_state(client, &envelope);
                 if should_replay_upload_from_start(&envelope) {
                     client.next_chunk = 0;
@@ -3961,7 +4638,8 @@ mod native_host_unix {
                         eprintln!(
                             "yoetz chrome native local client clone failed for {job_id}: {err:#}"
                         );
-                        clients.remove(&job_id);
+                        let owner_id = client.owner_id.clone();
+                        remove_client_if_owner_locked(&mut clients, &job_id, &owner_id);
                         return Ok(());
                     }
                 };
@@ -3987,16 +4665,17 @@ mod native_host_unix {
                     None
                 };
                 let delivery_job_id = client.job_id.clone();
+                let delivery_owner_id = client.owner_id.clone();
                 let delivery_run_id = client.run_id.clone();
+                let delivery_workspace_id = client.workspace_id.clone();
                 let delivery_fallback_phase = client.fallback_phase;
                 let delivery_side_effect_started = client.side_effect_started;
-                if remove_client {
-                    clients.remove(&job_id);
-                }
                 Some(RouteDelivery {
                     stream,
+                    owner_id: delivery_owner_id,
                     job_id: delivery_job_id,
                     run_id: delivery_run_id,
+                    workspace_id: delivery_workspace_id,
                     fallback_phase: delivery_fallback_phase,
                     side_effect_started: delivery_side_effect_started,
                     client_error,
@@ -4011,12 +4690,20 @@ mod native_host_unix {
         if let Some(mut delivery) = delivery {
             if let Err(err) = write_json_frame(&mut delivery.stream, &envelope) {
                 eprintln!("yoetz chrome native local client write failed for {job_id}: {err:#}");
-                if let Some(cancel) = delivery.cancel_on_write_error {
-                    let _ = forward_to_extension(stdout, &cancel);
+                if client_is_current_owner(clients, &job_id, &delivery.owner_id) {
+                    if let Some(cancel) = delivery.cancel_on_write_error {
+                        let _ = forward_to_extension(stdout, &cancel);
+                    }
                 }
-                clients.lock().unwrap().remove(&job_id);
+                remove_client_if_owner(clients, &job_id, &delivery.owner_id);
             } else {
-                delivered_terminal_sequence = terminal_sequence;
+                if remove_client {
+                    let removed_current_owner =
+                        remove_client_if_owner(clients, &job_id, &delivery.owner_id).is_some();
+                    if removed_current_owner {
+                        delivered_terminal_sequence = terminal_sequence;
+                    }
+                }
                 if let Some(error) = delivery.client_error {
                     let _ = write_json_frame(&mut delivery.stream, &error);
                     remove_client = true;
@@ -4026,6 +4713,7 @@ mod native_host_unix {
                         let error = client_error_envelope_from_parts(
                             &delivery.job_id,
                             delivery.run_id.clone(),
+                            delivery.workspace_id.clone(),
                             "forward_to_extension_failed",
                             &format!(
                                 "native host could not forward file chunk to extension: {err}"
@@ -4040,12 +4728,14 @@ mod native_host_unix {
             }
 
             if remove_client {
-                clients.lock().unwrap().remove(&job_id);
+                remove_client_if_owner(clients, &job_id, &delivery.owner_id);
             }
         }
 
         if let Some(sequence) = delivered_terminal_sequence {
-            extension_session.terminal_job_ids.insert(job_id.clone());
+            let identity = terminal_identity.context("terminal delivery identity disappeared")?;
+            record_terminal_delivery_receipt(paths, &identity)?;
+            extension_session.terminal_job_ids.insert(identity);
             acknowledge_terminal(stdout, &envelope, sequence, extension_session)?;
         }
         if is_manual_handoff(&envelope) {
@@ -4053,6 +4743,124 @@ mod native_host_unix {
         }
         record_instance_activity(runtime, &envelope)?;
         Ok(())
+    }
+
+    fn client_identity_matches(client: &ClientJob, envelope: &ProtocolEnvelope) -> bool {
+        client.run_id == envelope.run_id && client.workspace_id == envelope.workspace_id
+    }
+
+    fn client_is_current_owner(clients: &Clients, job_id: &str, owner_id: &str) -> bool {
+        clients
+            .lock()
+            .unwrap()
+            .get(job_id)
+            .is_some_and(|client| client.owner_id == owner_id)
+    }
+
+    fn remove_client_if_owner(
+        clients: &Clients,
+        job_id: &str,
+        owner_id: &str,
+    ) -> Option<ClientJob> {
+        let mut clients = clients.lock().unwrap();
+        remove_client_if_owner_locked(&mut clients, job_id, owner_id)
+    }
+
+    fn remove_client_if_owner_locked(
+        clients: &mut HashMap<String, ClientJob>,
+        job_id: &str,
+        owner_id: &str,
+    ) -> Option<ClientJob> {
+        if clients
+            .get(job_id)
+            .is_some_and(|client| client.owner_id == owner_id)
+        {
+            clients.remove(job_id)
+        } else {
+            None
+        }
+    }
+
+    fn terminal_delivery_receipt_path(
+        paths: &ExtensionPaths,
+        identity: &TerminalDeliveryIdentity,
+    ) -> PathBuf {
+        let encoded =
+            serde_json::to_vec(identity).expect("terminal delivery identity is serializable");
+        let mut digest = Sha256::new();
+        digest.update(encoded);
+        paths
+            .state_dir
+            .join("terminal-receipts")
+            .join(format!("{}.json", hex::encode(digest.finalize())))
+    }
+
+    fn terminal_job_matches(
+        left: &TerminalDeliveryIdentity,
+        right: &TerminalDeliveryIdentity,
+    ) -> bool {
+        left.job_id == right.job_id
+            && left.run_id == right.run_id
+            && left.workspace_id == right.workspace_id
+    }
+
+    fn terminal_delivery_receipt_exists(
+        paths: &ExtensionPaths,
+        identity: &TerminalDeliveryIdentity,
+    ) -> Result<bool> {
+        let path = terminal_delivery_receipt_path(paths, identity);
+        match fs::read_to_string(&path) {
+            Ok(contents) => {
+                let receipt: TerminalDeliveryReceipt = serde_json::from_str(&contents)
+                    .with_context(|| {
+                        format!("read terminal delivery receipt {}", path.display())
+                    })?;
+                Ok(receipt.identity == *identity)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error)
+                .with_context(|| format!("read terminal delivery receipt {}", path.display())),
+        }
+    }
+
+    fn record_terminal_delivery_receipt(
+        paths: &ExtensionPaths,
+        identity: &TerminalDeliveryIdentity,
+    ) -> Result<()> {
+        let path = terminal_delivery_receipt_path(paths, identity);
+        let parent = path
+            .parent()
+            .context("terminal delivery receipt path has no parent directory")?;
+        ensure_private_dir(parent)?;
+        let receipt = TerminalDeliveryReceipt {
+            identity: identity.clone(),
+            delivered_at_ms: now_millis(),
+        };
+        let rendered = serde_json::to_string_pretty(&receipt)? + "\n";
+        let temp_path = parent.join(format!(".terminal-receipt-{}.tmp", new_id("write")));
+        let result = (|| -> Result<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp_path)
+                .with_context(|| {
+                    format!(
+                        "create terminal delivery receipt staging file {}",
+                        temp_path.display()
+                    )
+                })?;
+            file.write_all(rendered.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temp_path, &path).with_context(|| {
+                format!("activate terminal delivery receipt {}", path.display())
+            })?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        result
     }
 
     fn terminal_sequence(envelope: &ProtocolEnvelope) -> Result<Option<u64>> {
@@ -4067,6 +4875,8 @@ mod native_host_unix {
                 .as_u64()
                 .map(Some)
                 .context("terminal envelope payload.sequence must be a u64"),
+            // Older extensions omitted the sequence. Treat their first terminal
+            // delivery as sequence zero so deduplication and ACK remain compatible.
             None => Ok(Some(0)),
         }
     }
@@ -4080,11 +4890,15 @@ mod native_host_unix {
         if !extension_session.terminal_ack_capable {
             return Ok(());
         }
-        let ack = ProtocolEnvelope::new(
+        let ack = ProtocolEnvelope::new_with_workspace(
             "terminal_ack",
             envelope.job_id.clone(),
             envelope.run_id.clone(),
-            json!({ "sequence": sequence }),
+            envelope.workspace_id.clone(),
+            json!({
+                "sequence": sequence,
+                "terminal_type": envelope.kind.clone(),
+            }),
         );
         forward_to_extension(stdout, &ack)
     }
@@ -4093,10 +4907,11 @@ mod native_host_unix {
         let Some(payload) = client.chunks.get(client.next_chunk).cloned() else {
             return Ok(None);
         };
-        let chunk = ProtocolEnvelope::new(
+        let chunk = ProtocolEnvelope::new_with_workspace(
             "job_file_chunk",
             Some(client.job_id.clone()),
             client.run_id.clone(),
+            client.workspace_id.clone(),
             payload,
         );
         client.next_chunk += 1;
@@ -4106,7 +4921,9 @@ mod native_host_unix {
     fn prepare_local_message(
         mut envelope: ProtocolEnvelope,
     ) -> Result<(ProtocolEnvelope, Vec<Value>)> {
-        let chunks = if envelope.kind == "job_start" {
+        let chunks = if matches!(envelope.kind.as_str(), "job_start" | "reconnect")
+            && envelope.payload.get("bundle_path").is_some()
+        {
             let bundle = validate_local_job_bundle(&envelope)?;
             if let Some(payload) = envelope.payload.as_object_mut() {
                 payload.remove("bundle_path");
@@ -4126,12 +4943,12 @@ mod native_host_unix {
             .payload
             .get("bundle_path")
             .and_then(Value::as_str)
-            .context("job_start payload missing bundle_path")?;
+            .context("local message payload missing bundle_path")?;
         let bundle = validate_bundle_path(Path::new(bundle_path))?;
         if let Some(size) = envelope.payload.get("bundle_size").and_then(Value::as_u64) {
             if size != bundle.size {
                 bail!(
-                    "job_start bundle_size {} does not match current file size {}",
+                    "bundle_size {} does not match current file size {}",
                     size,
                     bundle.size
                 );
@@ -4191,10 +5008,11 @@ mod native_host_unix {
     }
 
     fn local_client_disconnected_cancel(client: &ClientJob) -> ProtocolEnvelope {
-        ProtocolEnvelope::new(
+        ProtocolEnvelope::new_with_workspace(
             "job_cancel",
             Some(client.job_id.clone()),
             client.run_id.clone(),
+            client.workspace_id.clone(),
             json!({"reason": "local_client_disconnected"}),
         )
     }
@@ -4244,13 +5062,11 @@ mod native_host_unix {
             .drain()
             .map(|(_, client)| client)
             .collect();
-        for mut client in drained {
-            let error = client_error_envelope(
-                &client,
-                "native_host_disconnected",
-                "Chrome native messaging connection closed before the job finished",
-            );
-            let _ = write_json_frame(&mut client.stream, &error);
+        for client in drained {
+            // Closing the local stream is a recoverable transport signal. A
+            // synthetic job_error would make the CLI stop before it can send
+            // the authenticated reconnect for the still-running extension job.
+            let _ = client.stream.shutdown(std::net::Shutdown::Both);
         }
     }
 
@@ -4258,6 +5074,7 @@ mod native_host_unix {
         client_error_envelope_from_parts(
             &client.job_id,
             client.run_id.clone(),
+            client.workspace_id.clone(),
             code,
             message,
             client.fallback_phase,
@@ -4268,15 +5085,17 @@ mod native_host_unix {
     fn client_error_envelope_from_parts(
         job_id: &str,
         run_id: Option<String>,
+        workspace_id: Option<String>,
         code: &str,
         message: &str,
         fallback_phase: Option<&'static str>,
         side_effect_started: bool,
     ) -> ProtocolEnvelope {
-        ProtocolEnvelope::new(
+        ProtocolEnvelope::new_with_workspace(
             "job_error",
             Some(job_id.to_string()),
             run_id,
+            workspace_id,
             json!({
                 "code": code,
                 "message": message,
@@ -4359,12 +5178,16 @@ mod native_host_unix {
     }
 
     fn write_instance_status(runtime: &NativeHostRuntime, patch: Value) -> Result<()> {
-        if let Some(parent) = runtime.instance_path.parent() {
-            ensure_private_dir(parent)?;
-        }
+        let parent = runtime
+            .instance_path
+            .parent()
+            .context("native host instance path has no parent directory")?;
+        ensure_private_dir(parent)?;
         let mut value = json!({
             "native_instance_id": runtime.native_instance_id,
             "socket_path": runtime.socket_path,
+            "socket_binding_version": INSTANCE_SOCKET_BINDING_VERSION,
+            "socket_base_path": runtime.socket_base_path,
             "pid": process::id(),
             "extension_instance_id": Value::Null,
             "extension_version": Value::Null,
@@ -4375,35 +5198,99 @@ mod native_host_unix {
             "protocol_version": PROTOCOL_VERSION,
             "last_seen_ms": now_millis(),
         });
-        if let Some(existing) = read_status_file(&runtime.instance_path) {
-            value = existing;
-            if let Some(object) = value.as_object_mut() {
+        match fs::read_to_string(&runtime.instance_path) {
+            Ok(text) => {
+                value = serde_json::from_str(&text).with_context(|| {
+                    format!(
+                        "read native host instance {}",
+                        runtime.instance_path.display()
+                    )
+                })?;
+                if !value.is_object() {
+                    bail!(
+                        "native host instance {} is not a JSON object",
+                        runtime.instance_path.display()
+                    );
+                }
+                let object = value
+                    .as_object_mut()
+                    .context("native host instance JSON object disappeared")?;
                 object.insert(
                     "native_instance_id".to_string(),
                     json!(runtime.native_instance_id),
                 );
                 object.insert("socket_path".to_string(), json!(runtime.socket_path));
+                object.insert(
+                    "socket_binding_version".to_string(),
+                    json!(INSTANCE_SOCKET_BINDING_VERSION),
+                );
+                object.insert(
+                    "socket_base_path".to_string(),
+                    json!(runtime.socket_base_path),
+                );
                 object.insert("pid".to_string(), json!(process::id()));
                 object.insert("last_seen_ms".to_string(), json!(now_millis()));
             }
-        }
-        if let Some(object) = value.as_object_mut() {
-            if let Some(patch) = patch.as_object() {
-                for (key, value) in patch {
-                    object.insert(key.clone(), value.clone());
-                }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "read native host instance {}",
+                        runtime.instance_path.display()
+                    )
+                });
             }
         }
-        fs::write(
-            &runtime.instance_path,
-            serde_json::to_string_pretty(&value)? + "\n",
-        )
-        .with_context(|| {
-            format!(
-                "write native host instance {}",
-                runtime.instance_path.display()
-            )
-        })
+        let object = value
+            .as_object_mut()
+            .context("native host instance status must be a JSON object")?;
+        if let Some(patch) = patch.as_object() {
+            for (key, value) in patch {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+        let rendered = serde_json::to_string_pretty(&value)? + "\n";
+        let temp_path = parent.join(format!(
+            ".{}.tmp-{}",
+            runtime.native_instance_id,
+            new_id("instance-status")
+        ));
+        let write_result = (|| -> Result<()> {
+            let mut temp_file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp_path)
+                .with_context(|| {
+                    format!(
+                        "create native host instance staging file {}",
+                        temp_path.display()
+                    )
+                })?;
+            temp_file.write_all(rendered.as_bytes()).with_context(|| {
+                format!(
+                    "write native host instance staging file {}",
+                    temp_path.display()
+                )
+            })?;
+            temp_file.sync_all().with_context(|| {
+                format!(
+                    "sync native host instance staging file {}",
+                    temp_path.display()
+                )
+            })?;
+            fs::rename(&temp_path, &runtime.instance_path).with_context(|| {
+                format!(
+                    "activate native host instance {}",
+                    runtime.instance_path.display()
+                )
+            })?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&temp_path);
+        }
+        write_result
     }
 
     fn record_protocol_mismatch(
@@ -4518,12 +5405,74 @@ mod native_host_unix {
         }
 
         #[test]
+        fn duplicate_local_job_is_rejected_without_replacing_active_client() {
+            let token = "test-token";
+            let (active_stream, active_peer) = UnixStream::pair().unwrap();
+            let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+            clients.lock().unwrap().insert(
+                "job_duplicate".to_string(),
+                ClientJob {
+                    stream: active_stream,
+                    owner_id: "owner_active".to_string(),
+                    job_id: "job_duplicate".to_string(),
+                    run_id: Some("run_active".to_string()),
+                    workspace_id: None,
+                    chunks: Vec::new(),
+                    next_chunk: 0,
+                    side_effect_started: true,
+                    fallback_phase: Some("wait_response"),
+                    cancel_on_disconnect: true,
+                },
+            );
+            let (server, mut client) = UnixStream::pair().unwrap();
+            let handler_clients = Arc::clone(&clients);
+            let handler = thread::spawn(move || {
+                handle_client(
+                    server,
+                    token,
+                    Arc::new(Mutex::new(io::stdout())),
+                    handler_clients,
+                )
+            });
+            let start = ProtocolEnvelope::new(
+                "job_start",
+                Some("job_duplicate".to_string()),
+                Some("run_duplicate".to_string()),
+                json!({}),
+            )
+            .with_token(token.to_string());
+
+            write_json_frame(&mut client, &start).unwrap();
+            let error = read_json_frame(&mut client).unwrap();
+
+            assert_eq!(error.kind, "job_error");
+            assert_eq!(error.job_id.as_deref(), Some("job_duplicate"));
+            assert_eq!(error.payload["code"], "duplicate_job");
+            assert_eq!(error.payload["phase"], "profile");
+            assert_eq!(error.payload["side_effect_started"], false);
+            handler.join().unwrap().unwrap();
+            assert_eq!(
+                clients
+                    .lock()
+                    .unwrap()
+                    .get("job_duplicate")
+                    .unwrap()
+                    .run_id
+                    .as_deref(),
+                Some("run_active")
+            );
+            drop(active_peer);
+        }
+
+        #[test]
         fn model_selection_progress_preserves_the_diagnostic_phase() {
             let (stream, _peer) = UnixStream::pair().unwrap();
             let mut client = ClientJob {
                 stream,
+                owner_id: "owner_model".to_string(),
                 job_id: "job_model".to_string(),
                 run_id: Some("run_model".to_string()),
+                workspace_id: None,
                 chunks: Vec::new(),
                 next_chunk: 0,
                 side_effect_started: false,
@@ -4541,6 +5490,249 @@ mod native_host_unix {
 
             assert!(client.side_effect_started);
             assert_eq!(client.fallback_phase, Some("model_selection"));
+        }
+
+        #[test]
+        fn instance_status_write_is_atomic_and_rejects_malformed_final_records() {
+            use tempfile::TempDir;
+
+            let dir = TempDir::new().unwrap();
+            let instances_dir = dir.path().join("instances");
+            let instance_path = instances_dir.join("native_test.json");
+            let runtime = NativeHostRuntime {
+                native_instance_id: "native_test".to_string(),
+                socket_path: dir.path().join("native.sock"),
+                socket_base_path: dir.path().join("base.sock"),
+                instance_path: instance_path.clone(),
+            };
+
+            write_instance_status(&runtime, json!({})).unwrap();
+            let instance: ExtensionInstanceStatus =
+                serde_json::from_str(&fs::read_to_string(&instance_path).unwrap()).unwrap();
+            assert_eq!(instance.native_instance_id, "native_test");
+            assert_eq!(
+                fs::read_dir(&instances_dir)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>(),
+                vec![std::ffi::OsString::from("native_test.json")]
+            );
+
+            fs::write(&instance_path, "{").unwrap();
+            let error = write_instance_status(&runtime, json!({})).unwrap_err();
+            assert!(format!("{error:#}").contains("read native host instance"));
+            assert_eq!(fs::read_to_string(instance_path).unwrap(), "{");
+        }
+
+        #[test]
+        fn terminal_local_client_write_failure_can_retry_after_reconnect() {
+            use tempfile::TempDir;
+
+            let dir = TempDir::new().unwrap();
+            let instances_dir = dir.path().join("instances");
+            fs::create_dir_all(&instances_dir).unwrap();
+            let paths = ExtensionPaths {
+                state_dir: dir.path().to_path_buf(),
+                instances_dir,
+                manifest_path: dir.path().join("manifest.json"),
+                wrapper_path: dir.path().join("wrapper"),
+                socket_path: dir.path().join("native.sock"),
+                token_path: dir.path().join("token"),
+                status_path: dir.path().join("status.json"),
+            };
+            let runtime = NativeHostRuntime {
+                native_instance_id: "native_test".to_string(),
+                socket_path: paths.socket_path.clone(),
+                socket_base_path: paths.socket_path.clone(),
+                instance_path: paths.instances_dir.join("native_test.json"),
+            };
+            let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+            let stdout = Arc::new(Mutex::new(io::stdout()));
+            let mut extension_session = ExtensionSessionState::default();
+            let terminal = ProtocolEnvelope::new_with_workspace(
+                "job_complete",
+                Some("job_reconnect".to_string()),
+                Some("run_reconnect".to_string()),
+                None,
+                json!({
+                    "sequence": 0,
+                    "is_final": true,
+                    "response": "answer"
+                }),
+            );
+
+            let (failed_stream, failed_peer) = UnixStream::pair().unwrap();
+            failed_peer.shutdown(std::net::Shutdown::Both).unwrap();
+            drop(failed_peer);
+            clients.lock().unwrap().insert(
+                "job_reconnect".to_string(),
+                ClientJob {
+                    stream: failed_stream,
+                    owner_id: "owner_failed".to_string(),
+                    job_id: "job_reconnect".to_string(),
+                    run_id: Some("run_reconnect".to_string()),
+                    workspace_id: None,
+                    chunks: Vec::new(),
+                    next_chunk: 0,
+                    side_effect_started: true,
+                    fallback_phase: Some("wait_response"),
+                    cancel_on_disconnect: false,
+                },
+            );
+
+            route_extension_message(
+                terminal.clone(),
+                &clients,
+                &stdout,
+                &paths,
+                &runtime,
+                &mut extension_session,
+            )
+            .unwrap();
+            assert!(!extension_session
+                .terminal_job_ids
+                .iter()
+                .any(|identity| identity.job_id == "job_reconnect"));
+            assert!(clients.lock().unwrap().is_empty());
+
+            let (retry_stream, mut retry_peer) = UnixStream::pair().unwrap();
+            retry_peer
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            clients.lock().unwrap().insert(
+                "job_reconnect".to_string(),
+                ClientJob {
+                    stream: retry_stream,
+                    owner_id: "owner_retry".to_string(),
+                    job_id: "job_reconnect".to_string(),
+                    run_id: Some("run_reconnect".to_string()),
+                    workspace_id: None,
+                    chunks: Vec::new(),
+                    next_chunk: 0,
+                    side_effect_started: true,
+                    fallback_phase: Some("wait_response"),
+                    cancel_on_disconnect: false,
+                },
+            );
+
+            route_extension_message(
+                terminal,
+                &clients,
+                &stdout,
+                &paths,
+                &runtime,
+                &mut extension_session,
+            )
+            .unwrap();
+            let delivered = read_json_frame(&mut retry_peer).unwrap();
+            assert_eq!(delivered.kind, "job_complete");
+            assert_eq!(delivered.payload["sequence"], 0);
+            assert!(extension_session
+                .terminal_job_ids
+                .iter()
+                .any(|identity| identity.job_id == "job_reconnect"));
+        }
+
+        #[test]
+        fn native_transport_loss_closes_local_stream_without_synthetic_terminal_error() {
+            let (server, mut peer) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+            clients.lock().unwrap().insert(
+                "job_transport_loss".to_string(),
+                ClientJob {
+                    stream: server,
+                    owner_id: "owner_transport_loss".to_string(),
+                    job_id: "job_transport_loss".to_string(),
+                    run_id: Some("run_transport_loss".to_string()),
+                    workspace_id: None,
+                    chunks: Vec::new(),
+                    next_chunk: 0,
+                    side_effect_started: true,
+                    fallback_phase: Some("wait_response"),
+                    cancel_on_disconnect: true,
+                },
+            );
+
+            notify_clients_transport_lost(&clients);
+
+            let error = read_json_frame(&mut peer).unwrap_err();
+            assert!(is_disconnect_error(&error));
+            assert!(clients.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn terminal_delivery_receipts_bind_job_run_type_and_sequence() {
+            use tempfile::TempDir;
+
+            let dir = TempDir::new().unwrap();
+            let paths = ExtensionPaths {
+                state_dir: dir.path().to_path_buf(),
+                instances_dir: dir.path().join(INSTANCES_DIRNAME),
+                manifest_path: dir.path().join("manifest.json"),
+                wrapper_path: dir.path().join("wrapper"),
+                socket_path: dir.path().join("native.sock"),
+                token_path: dir.path().join("token"),
+                status_path: dir.path().join("status.json"),
+            };
+            let identity = TerminalDeliveryIdentity {
+                job_id: "job_receipt".to_string(),
+                run_id: Some("run_receipt".to_string()),
+                workspace_id: None,
+                terminal_type: "job_complete".to_string(),
+                sequence: 7,
+            };
+            record_terminal_delivery_receipt(&paths, &identity).unwrap();
+            assert!(terminal_delivery_receipt_exists(&paths, &identity).unwrap());
+            assert!(!terminal_delivery_receipt_exists(
+                &paths,
+                &TerminalDeliveryIdentity {
+                    sequence: 8,
+                    ..identity.clone()
+                }
+            )
+            .unwrap());
+            assert!(!terminal_delivery_receipt_exists(
+                &paths,
+                &TerminalDeliveryIdentity {
+                    workspace_id: Some("workspace_other".to_string()),
+                    ..identity.clone()
+                }
+            )
+            .unwrap());
+            assert!(!terminal_delivery_receipt_exists(
+                &paths,
+                &TerminalDeliveryIdentity {
+                    run_id: Some("run_other".to_string()),
+                    ..identity
+                }
+            )
+            .unwrap());
+        }
+
+        #[test]
+        fn superseded_connection_cannot_remove_the_current_route() {
+            let (old_stream, _old_peer) = UnixStream::pair().unwrap();
+            let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+            clients.lock().unwrap().insert(
+                "job_owner".to_string(),
+                ClientJob {
+                    stream: old_stream,
+                    owner_id: "owner_new".to_string(),
+                    job_id: "job_owner".to_string(),
+                    run_id: Some("run_owner".to_string()),
+                    workspace_id: None,
+                    chunks: Vec::new(),
+                    next_chunk: 0,
+                    side_effect_started: false,
+                    fallback_phase: None,
+                    cancel_on_disconnect: true,
+                },
+            );
+
+            assert!(remove_client_if_owner(&clients, "job_owner", "owner_old").is_none());
+            assert!(client_is_current_owner(&clients, "job_owner", "owner_new"));
+            assert!(remove_client_if_owner(&clients, "job_owner", "owner_new").is_some());
         }
     }
 }
@@ -4660,6 +5852,197 @@ mod tests {
 
         assert_eq!(payload["conversation_id"], "conv-123");
         assert_eq!(payload["close_tab_on_complete"], true);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn chatgpt_recipe_reconnects_the_public_path_without_resubmitting_job_start() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let _state_guard = EnvGuard::set("YOETZ_DIR", dir.path());
+        let instances_dir = dir.path().join(INSTANCES_DIRNAME);
+        fs::create_dir_all(&instances_dir).unwrap();
+        let paths = ExtensionPaths {
+            state_dir: dir.path().to_path_buf(),
+            instances_dir,
+            manifest_path: dir.path().join("manifest.json"),
+            wrapper_path: dir.path().join("wrapper"),
+            socket_path: dir.path().join("native.sock"),
+            token_path: dir.path().join(TOKEN_FILENAME),
+            status_path: dir.path().join("status.json"),
+        };
+        let token = ensure_capability_token(&paths.token_path).unwrap();
+        let managed_version = format!("{YOETZ_CLI_VERSION}.1");
+        let managed_dir = managed_chatgpt_extension_dir().unwrap();
+        fs::create_dir_all(&managed_dir).unwrap();
+        fs::write(
+            managed_dir.join("manifest.json"),
+            format!("{{\"version\":\"{managed_version}\"}}\n"),
+        )
+        .unwrap();
+        let bundle_path = dir.path().join("review.md");
+        fs::write(&bundle_path, "review body").unwrap();
+        let server_bundle_path = bundle_path.canonicalize().unwrap();
+        let old_socket = dir.path().join("old.sock");
+        let old_listener = UnixListener::bind(&old_socket).unwrap();
+        let new_instance_id = "native_reconnect";
+        let new_socket =
+            instance_socket_path_for_base(&paths, &paths.socket_path, new_instance_id, true);
+        let server_paths = paths.clone();
+        let server_token = token.clone();
+        let server_managed_version = managed_version.clone();
+        let server = thread::spawn(move || {
+            let (mut old_client, _) = old_listener.accept().unwrap();
+            let start = read_json_frame(&mut old_client).unwrap();
+            assert_eq!(start.kind, "job_start");
+            assert_eq!(
+                start.capability_token.as_deref(),
+                Some(server_token.as_str())
+            );
+            let job_id = start.job_id.clone().unwrap();
+            let run_id = start.run_id.clone().unwrap();
+            drop(old_client);
+
+            native_host_unix::ensure_socket_parent_path(&server_paths, &new_socket).unwrap();
+            let new_listener = UnixListener::bind(&new_socket).unwrap();
+            write_instance_fixture(
+                &server_paths,
+                ExtensionInstanceStatus {
+                    native_instance_id: new_instance_id.to_string(),
+                    socket_path: new_socket.clone(),
+                    pid: process::id(),
+                    extension_instance_id: Some("ext_old".to_string()),
+                    extension_version: Some(server_managed_version),
+                    profile_email: None,
+                    profile_id: None,
+                    recipes: vec!["chatgpt".to_string()],
+                    capabilities: vec![NATIVE_JOB_COMMANDS_CAPABILITY.to_string()],
+                    protocol_version: PROTOCOL_VERSION,
+                    last_seen_ms: 1,
+                },
+            );
+
+            loop {
+                let (mut client, _) = new_listener.accept().unwrap();
+                match read_json_frame(&mut client) {
+                    Ok(reconnect) => {
+                        assert_eq!(reconnect.kind, "reconnect");
+                        assert_eq!(reconnect.job_id.as_deref(), Some(job_id.as_str()));
+                        assert_eq!(reconnect.run_id.as_deref(), Some(run_id.as_str()));
+                        assert_eq!(
+                            reconnect.capability_token.as_deref(),
+                            Some(server_token.as_str())
+                        );
+                        assert_eq!(reconnect.payload["bundle_path"], json!(server_bundle_path));
+                        let confirmation = ProtocolEnvelope::new(
+                            "reconnect",
+                            Some(job_id.clone()),
+                            Some(run_id.clone()),
+                            json!({
+                                "restored_jobs": [job_id.clone()],
+                                "restored_runs": [{
+                                    "job_id": job_id.clone(),
+                                    "run_id": run_id.clone(),
+                                    "workspace_id": workspace_id().unwrap()
+                                }]
+                            }),
+                        );
+                        write_json_frame(&mut client, &confirmation).unwrap();
+                        let complete = ProtocolEnvelope::new(
+                            "job_complete",
+                            Some(job_id),
+                            Some(run_id),
+                            json!({
+                                "is_final": true,
+                                "response": "reconnected answer",
+                                "model_strategy": "select",
+                                "model_used": "GPT-5.6 Sol Pro",
+                                "model_selection_status": "selected",
+                                "final_model_selection": {
+                                    "click_bound": true,
+                                    "status": "selected",
+                                    "requested_model": "gpt-5-6-sol-chat-pro",
+                                    "model_used": "GPT-5.6 Sol Pro",
+                                    "family_status": "verified",
+                                    "effort_status": "verified",
+                                    "picker_family_status": "verified",
+                                    "picker_effort_status": "verified",
+                                    "click_bound_closed_pill_text": "GPT-5.6 Sol Pro",
+                                    "click_bound_closed_pill_family_status": "verified",
+                                    "click_bound_closed_pill_effort_status": "verified",
+                                    "picker_shape": "personal",
+                                    "picker_close_verification": {
+                                        "picker_surface_closed": true,
+                                        "model_trigger_closed": true,
+                                        "family_trigger_closed": true,
+                                        "closed_pill_pro": true
+                                    },
+                                    "surface_evidence_seen": true,
+                                    "surface_proof_kind": "explicit_chat_work_radios",
+                                    "surface_chat_state": {"aria_checked": "true"},
+                                    "surface_work_state": {"aria_checked": "false"},
+                                    "surface_visible_toggle_count": 2,
+                                    "surface_observed_values": ["chatgpt", "work"]
+                                }
+                            }),
+                        );
+                        write_json_frame(&mut client, &complete).unwrap();
+                        break;
+                    }
+                    Err(_) => continue,
+                }
+            }
+        });
+
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("recipe.lock"))
+            .unwrap();
+        let lease = ExtensionRecipeLease {
+            _lifecycle_lock: ExtensionLifecycleLock { _file: lock_file },
+            paths,
+            instance: ExtensionInstanceStatus {
+                native_instance_id: "native_old".to_string(),
+                socket_path: old_socket,
+                pid: process::id(),
+                extension_instance_id: Some("ext_old".to_string()),
+                extension_version: Some(managed_version),
+                profile_email: None,
+                profile_id: None,
+                recipes: vec!["chatgpt".to_string()],
+                capabilities: vec![NATIVE_JOB_COMMANDS_CAPABILITY.to_string()],
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 1,
+            },
+            recipe: BuiltinWebRecipe::Chatgpt,
+        };
+        let spec = ChatgptRecipeSpec {
+            bundle_path: Some(bundle_path),
+            model: crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL.to_string(),
+            model_strategy: ChatgptModelStrategy::Select,
+            prompt: "review".to_string(),
+            browser_context_id: None,
+            profile_email: None,
+            extension_instance_id: None,
+            extension_profile_id: None,
+            conversation_id: None,
+            run_id: "run_public_reconnect".to_string(),
+            wait_timeout_ms: 2_000,
+            wait_interval_ms: 50,
+            upload_timeout_ms: 2_000,
+            send_timeout_ms: 2_000,
+            close_tab_on_complete: false,
+        };
+
+        let result = run_chatgpt_recipe_with_lease(&spec, OutputFormat::Json, &lease).unwrap();
+
+        server.join().unwrap();
+        assert_eq!(result.response, "reconnected answer");
     }
 
     #[test]
@@ -5124,6 +6507,117 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    #[serial]
+    fn native_host_bind_uses_instance_specific_socket_paths() {
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+
+        let paths = extension_paths().unwrap();
+        let (_listener, socket_path) =
+            native_host_unix::bind_native_host_listener(&paths, "native_test").unwrap();
+
+        assert_eq!(
+            socket_path.extension().and_then(|value| value.to_str()),
+            Some("sock")
+        );
+        assert!(unix_socket_path_fits(&socket_path));
+        assert_ne!(socket_path, paths.socket_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn native_host_bind_shortens_long_instance_socket_paths() {
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+
+        let paths = extension_paths().unwrap();
+        let long_instance_id = "native_1234567890abcdef_1234567890abcdef";
+        let (_listener, socket_path) =
+            native_host_unix::bind_native_host_listener(&paths, long_instance_id).unwrap();
+
+        assert!(unix_socket_path_fits(&socket_path));
+        assert_ne!(
+            socket_path,
+            paths.instances_dir.join(format!("{long_instance_id}.sock"))
+        );
+        assert_ne!(socket_path, paths.socket_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn explicit_socket_env_derives_instance_specific_socket_paths() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let explicit = dir.path().join("explicit.sock");
+        let _socket_guard = EnvGuard::set("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET", &explicit);
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+
+        let paths = extension_paths().unwrap();
+        let _base_listener = UnixListener::bind(&explicit).unwrap();
+        let (_listener, socket_path) =
+            native_host_unix::bind_native_host_listener(&paths, "native_test").unwrap();
+
+        assert_eq!(
+            socket_path,
+            explicit.with_file_name("explicit.sock-native_test")
+        );
+        assert_ne!(socket_path, paths.socket_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn instance_socket_binding_accepts_explicit_base_path() {
+        let dir = TempDir::new().unwrap();
+        let base = dir.path().join("explicit.sock");
+        let _socket_guard = EnvGuard::set("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET", &base);
+        let paths = ExtensionPaths {
+            state_dir: dir.path().join("state"),
+            instances_dir: dir.path().join(INSTANCES_DIRNAME),
+            manifest_path: dir.path().join("manifest.json"),
+            wrapper_path: dir.path().join("wrapper"),
+            socket_path: base.clone(),
+            token_path: dir.path().join(TOKEN_FILENAME),
+            status_path: dir.path().join(STATUS_FILENAME),
+        };
+        let record = PersistedExtensionInstanceRecord {
+            instance: ExtensionInstanceStatus {
+                native_instance_id: "native_explicit_base".to_string(),
+                socket_path: base.clone(),
+                pid: process::id(),
+                extension_instance_id: None,
+                extension_version: None,
+                profile_email: None,
+                profile_id: None,
+                recipes: default_extension_recipes(),
+                capabilities: Vec::new(),
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 1,
+            },
+            socket_binding_version: INSTANCE_SOCKET_BINDING_VERSION,
+            socket_base_path: base,
+        };
+
+        assert!(instance_socket_binding_matches(&paths, &record));
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn stale_socket_cleanup_rejects_regular_files() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("not-a-socket.sock");
@@ -5322,7 +6816,7 @@ mod tests {
         let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
         let paths = extension_paths().unwrap();
         fs::create_dir_all(&paths.instances_dir).unwrap();
-        let socket = dir.path().join("work.sock");
+        let socket = fixture_socket_path(&paths, "native_work", "work.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         write_instance_fixture(
             &paths,
@@ -5397,7 +6891,7 @@ mod tests {
             }),
         )
         .unwrap();
-        let socket = dir.path().join("work.sock");
+        let socket = fixture_socket_path(&paths, "native_work", "work.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         write_instance_fixture(
             &paths,
@@ -5462,7 +6956,7 @@ mod tests {
         let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
         let paths = extension_paths().unwrap();
         fs::create_dir_all(&paths.instances_dir).unwrap();
-        let socket = dir.path().join("work.sock");
+        let socket = fixture_socket_path(&paths, "native_work", "work.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         write_instance_fixture(
             &paths,
@@ -5524,7 +7018,7 @@ mod tests {
         );
         let paths = extension_paths().unwrap();
         fs::create_dir_all(&paths.instances_dir).unwrap();
-        let socket = dir.path().join("work.sock");
+        let socket = fixture_socket_path(&paths, "native_work", "work.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         write_instance_fixture(
             &paths,
@@ -5824,6 +7318,35 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn authenticated_extension_copy_rejects_staged_fingerprint_mismatch_before_activation() {
+        let dir = TempDir::new().unwrap();
+        let source = dir.path().join("source");
+        copy_current_extension_source(&source);
+        let target = dir.path().join("managed");
+        write_extension_source_fixture(&target, YOETZ_CLI_VERSION);
+        fs::write(target.join("src").join("sentinel.js"), "keep-managed-copy").unwrap();
+
+        let error = copy_extension_dir_atomically_with_expected_fingerprint(
+            &source,
+            &target,
+            Some(format!("{YOETZ_CLI_VERSION}.1").as_str()),
+            Some("not-the-authenticated-fingerprint"),
+        )
+        .unwrap_err();
+
+        assert!(format!("{error:#}").contains("staged extension fingerprint"));
+        assert_eq!(
+            fs::read_to_string(target.join("src").join("sentinel.js")).unwrap(),
+            "keep-managed-copy"
+        );
+        assert_eq!(
+            extension_manifest_version(&target).as_deref(),
+            Some(YOETZ_CLI_VERSION)
+        );
+    }
+
+    #[test]
     fn packaged_extension_source_is_anchored_to_executable_prefix() {
         let dir = TempDir::new().unwrap();
         let prefix = dir.path().join("prefix");
@@ -5923,7 +7446,7 @@ mod tests {
         let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
         let paths = extension_paths().unwrap();
         fs::create_dir_all(&paths.instances_dir).unwrap();
-        let socket = dir.path().join("skewed.sock");
+        let socket = fixture_socket_path(&paths, "native_skewed", "skewed.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         write_instance_fixture(
             &paths,
@@ -5975,7 +7498,7 @@ mod tests {
         let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
         let paths = extension_paths().unwrap();
         fs::create_dir_all(&paths.instances_dir).unwrap();
-        let socket = dir.path().join("current.sock");
+        let socket = fixture_socket_path(&paths, "native_current", "current.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         write_instance_fixture(
             &paths,
@@ -6018,7 +7541,7 @@ mod tests {
         let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
         let paths = extension_paths().unwrap();
         fs::create_dir_all(&paths.instances_dir).unwrap();
-        let socket = dir.path().join("stale.sock");
+        let socket = fixture_socket_path(&paths, "native_stale", "stale.sock");
         let _listener = UnixListener::bind(&socket).unwrap();
         let dead_pid = i32::MAX as u32;
         assert!(!process_alive(dead_pid));
@@ -6054,6 +7577,151 @@ mod tests {
     #[test]
     #[cfg(unix)]
     #[serial]
+    fn instance_socket_binding_record_survives_cli_override_removal() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+        let explicit = dir.path().join("custom.sock");
+        let socket_guard = EnvGuard::set("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET", &explicit);
+        let paths_with_override = extension_paths().unwrap();
+        fs::create_dir_all(&paths_with_override.instances_dir).unwrap();
+        let socket =
+            instance_socket_path_for_base(&paths_with_override, &explicit, "native_explicit", true);
+        let _listener = UnixListener::bind(&socket).unwrap();
+        write_instance_fixture(
+            &paths_with_override,
+            ExtensionInstanceStatus {
+                native_instance_id: "native_explicit".to_string(),
+                socket_path: socket.clone(),
+                pid: process::id(),
+                extension_instance_id: Some("ext_explicit".to_string()),
+                extension_version: Some(YOETZ_CLI_VERSION.to_string()),
+                profile_email: None,
+                profile_id: None,
+                recipes: default_extension_recipes(),
+                capabilities: Vec::new(),
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 1,
+            },
+        );
+        drop(socket_guard);
+
+        let paths_without_override = extension_paths().unwrap();
+        let selected = select_extension_instance(
+            &paths_without_override,
+            ExtensionInstanceSelector::default(),
+        )
+        .unwrap();
+        assert_eq!(selected.native_instance_id, "native_explicit");
+        assert_eq!(selected.socket_path, socket);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn instance_records_block_shared_fallback_until_repaired() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+        let paths = extension_paths().unwrap();
+        fs::create_dir_all(&paths.instances_dir).unwrap();
+        native_host_unix::ensure_socket_parent_path(&paths, &paths.socket_path).unwrap();
+        let _shared_listener = UnixListener::bind(&paths.socket_path).unwrap();
+        write_instance_fixture(
+            &paths,
+            ExtensionInstanceStatus {
+                native_instance_id: "native_dead".to_string(),
+                socket_path: fixture_socket_path(&paths, "native_dead", "dead.sock"),
+                pid: i32::MAX as u32,
+                extension_instance_id: Some("ext_dead".to_string()),
+                extension_version: Some(YOETZ_CLI_VERSION.to_string()),
+                profile_email: None,
+                profile_id: None,
+                recipes: default_extension_recipes(),
+                capabilities: Vec::new(),
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 1,
+            },
+        );
+
+        let error =
+            select_extension_instance(&paths, ExtensionInstanceSelector::default()).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("refusing the legacy shared-socket fallback"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn stale_shared_instance_record_is_pruned() {
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+        let paths = extension_paths().unwrap();
+        fs::create_dir_all(&paths.instances_dir).unwrap();
+        let instance = ExtensionInstanceStatus {
+            native_instance_id: "native_legacy_shared".to_string(),
+            socket_path: paths.socket_path.clone(),
+            pid: i32::MAX as u32,
+            extension_instance_id: None,
+            extension_version: None,
+            profile_email: None,
+            profile_id: None,
+            recipes: default_extension_recipes(),
+            capabilities: Vec::new(),
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1,
+        };
+        let record_path = paths.instances_dir.join("native_legacy_shared.json");
+        fs::write(
+            &record_path,
+            serde_json::to_string_pretty(&instance).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(prune_stale_instance_records_at(&paths), 1);
+        assert!(!record_path.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn shared_socket_fallback_requires_no_instance_records() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let _manifest_guard = EnvGuard::set(
+            "YOETZ_CHROME_NATIVE_MESSAGING_DIR",
+            &dir.path().join("native-hosts"),
+        );
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &dir.path().join("state"));
+        let paths = extension_paths().unwrap();
+        native_host_unix::ensure_socket_parent_path(&paths, &paths.socket_path).unwrap();
+        let _listener = UnixListener::bind(&paths.socket_path).unwrap();
+
+        let selected =
+            select_extension_instance(&paths, ExtensionInstanceSelector::default()).unwrap();
+        assert_eq!(selected.native_instance_id, "legacy");
+        assert_eq!(selected.socket_path, paths.socket_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
     fn select_extension_instance_routes_by_profile_and_fails_closed_when_ambiguous() {
         use std::os::unix::net::UnixListener;
 
@@ -6064,8 +7732,8 @@ mod tests {
         let _state_guard = EnvGuard::set("YOETZ_DIR", &state_dir);
         let paths = extension_paths().unwrap();
         fs::create_dir_all(&paths.instances_dir).unwrap();
-        let work_socket = dir.path().join("work.sock");
-        let personal_socket = dir.path().join("personal.sock");
+        let work_socket = fixture_socket_path(&paths, "native_work", "work.sock");
+        let personal_socket = fixture_socket_path(&paths, "native_personal", "personal.sock");
         let _work_listener = UnixListener::bind(&work_socket).unwrap();
         let _personal_listener = UnixListener::bind(&personal_socket).unwrap();
         write_instance_fixture(
@@ -6101,6 +7769,44 @@ mod tests {
             },
         );
 
+        fs::write(
+            paths.instances_dir.join("native_malformed.json"),
+            "{\"native_instance_id\":",
+        )
+        .unwrap();
+        let err =
+            select_extension_instance(&paths, ExtensionInstanceSelector::default()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unreadable or non-canonical instance record"));
+        fs::remove_file(paths.instances_dir.join("native_malformed.json")).unwrap();
+
+        let shared_socket = paths.socket_path.clone();
+        native_host_unix::ensure_socket_parent_path(&paths, &shared_socket).unwrap();
+        let _shared_listener = UnixListener::bind(&shared_socket).unwrap();
+        write_instance_fixture(
+            &paths,
+            ExtensionInstanceStatus {
+                native_instance_id: "native_shared".to_string(),
+                socket_path: shared_socket,
+                pid: process::id(),
+                extension_instance_id: Some("ext_shared".to_string()),
+                extension_version: Some("0.4.0".to_string()),
+                profile_email: Some("shared@example.com".to_string()),
+                profile_id: Some("shared_profile".to_string()),
+                recipes: default_extension_recipes(),
+                capabilities: Vec::new(),
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 3,
+            },
+        );
+        let err =
+            select_extension_instance(&paths, ExtensionInstanceSelector::default()).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("unreadable or non-canonical instance record"));
+        fs::remove_file(paths.instances_dir.join("native_shared.json")).unwrap();
+
         let err =
             select_extension_instance(&paths, ExtensionInstanceSelector::default()).unwrap_err();
         assert!(err
@@ -6132,8 +7838,8 @@ mod tests {
         let _state_guard = EnvGuard::set("YOETZ_DIR", &state_dir);
         let paths = extension_paths().unwrap();
         fs::create_dir_all(&paths.instances_dir).unwrap();
-        let work_socket = dir.path().join("work.sock");
-        let personal_socket = dir.path().join("personal.sock");
+        let work_socket = fixture_socket_path(&paths, "native_work", "work.sock");
+        let personal_socket = fixture_socket_path(&paths, "native_personal", "personal.sock");
         let _work_listener = UnixListener::bind(&work_socket).unwrap();
         let _personal_listener = UnixListener::bind(&personal_socket).unwrap();
         write_instance_fixture(
@@ -6256,11 +7962,53 @@ mod tests {
         assert!(err.to_string().contains("expected exact response `OK`"));
     }
 
+    #[cfg(unix)]
+    fn fixture_socket_path(
+        paths: &ExtensionPaths,
+        native_instance_id: &str,
+        base_name: &str,
+    ) -> PathBuf {
+        let base = paths
+            .state_dir
+            .parent()
+            .expect("extension state parent")
+            .join(base_name);
+        instance_socket_path_for_base(paths, &base, native_instance_id, true)
+    }
+
+    fn fixture_socket_base_path(
+        paths: &ExtensionPaths,
+        instance: &ExtensionInstanceStatus,
+    ) -> PathBuf {
+        let suffix = format!("-{}", instance.native_instance_id);
+        let Some(file_name) = instance
+            .socket_path
+            .file_name()
+            .and_then(|value| value.to_str())
+        else {
+            return paths.socket_path.clone();
+        };
+        file_name
+            .strip_suffix(&suffix)
+            .map(|base_name| instance.socket_path.with_file_name(base_name))
+            .unwrap_or_else(|| paths.socket_path.clone())
+    }
+
     fn write_instance_fixture(paths: &ExtensionPaths, instance: ExtensionInstanceStatus) {
         let path = paths
             .instances_dir
             .join(format!("{}.json", instance.native_instance_id));
-        fs::write(path, serde_json::to_string_pretty(&instance).unwrap()).unwrap();
+        let mut value = serde_json::to_value(&instance).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.insert(
+            "socket_binding_version".to_string(),
+            json!(INSTANCE_SOCKET_BINDING_VERSION),
+        );
+        object.insert(
+            "socket_base_path".to_string(),
+            json!(fixture_socket_base_path(paths, &instance)),
+        );
+        fs::write(path, serde_json::to_string_pretty(&value).unwrap()).unwrap();
     }
 
     fn write_extension_source_fixture(path: &Path, version: &str) {
