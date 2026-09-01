@@ -1333,7 +1333,8 @@ async function readCheckedSolFamily(root, state, options = {}) {
   const controlledSurface = structurallyOpenControlledSurfaceForTrigger(root, state?.family_trigger);
   const activeView = activeFamilyView(root, state?.menu ?? state?.surface, state?.family_trigger);
   const familyMenuStructurallyTrusted = familyMenu === controlledSurface
-    || (state?.surface_trust === "aria_controls_structural" && familyMenu === activeView);
+    || (state?.surface_trust === "aria_controls_structural" && familyMenu === activeView)
+    || (familyMenu === activeView && expandedSelectModelView(state?.family_trigger, familyMenu));
   const items = familyMenuRadios(familyMenu, familyMenuStructurallyTrusted);
   const checkedItems = items.filter((item) => item.getAttribute?.("aria-checked") === "true");
   const availableFamilies = items.map((item) => textOf(item)).filter(Boolean);
@@ -1345,7 +1346,16 @@ async function readCheckedSolFamily(root, state, options = {}) {
       family_label: checkedLabel,
       family_label_candidates: availableFamilies,
       family_label_source: checkedItems.length === 1 ? "family_menu_checked" : null,
-      family_label_ambiguous: checkedItems.length > 1
+      family_label_ambiguous: checkedItems.length > 1,
+      family_menu_probe: {
+        trigger_found: Boolean(state?.family_trigger),
+        trigger_is_select_model_toggle: isSelectModelViewToggle(state?.family_trigger),
+        trigger_expanded: state?.family_trigger?.getAttribute?.("aria-expanded") ?? null,
+        menu_found: Boolean(familyMenu),
+        menu_structurally_trusted: familyMenuStructurallyTrusted,
+        radio_count: items.length,
+        checked_count: checkedItems.length
+      }
     },
     sol_option: items.find((item) => familyIsSol(textOf(item))) ?? null,
     checked_items: checkedItems,
@@ -1356,6 +1366,18 @@ async function readCheckedSolFamily(root, state, options = {}) {
 function isSelectModelViewToggle(node) {
   return node?.getAttribute?.("role") === "menuitem"
     && normalizeText(node.getAttribute?.("aria-label") ?? "").toLowerCase() === "select model";
+}
+
+// The hybrid picker keeps the family radios mounted but collapsed: the
+// advanced view carries `inert` plus an opacity-0 wrapper whose reveal
+// animation is rAF-driven and never settles in background tabs. The trigger's
+// aria-expanded="true" combined with the view shedding `inert` is the
+// structural open signal; opacity must not gate the read.
+function expandedSelectModelView(trigger, view) {
+  return isSelectModelViewToggle(trigger)
+    && trigger?.getAttribute?.("aria-expanded") === "true"
+    && Boolean(view)
+    && structurallyReadablePickerItem(view, view);
 }
 
 function activeFamilyView(root, mainMenu, trigger) {
@@ -1581,7 +1603,11 @@ function pickerCloseVerification(root, modelButton, state, options = {}) {
   const familySurface = familySurfaceForPicker(root, state, familyTrigger);
   const leftovers = openComposerPickerLeftovers(root);
   const leftoverOpen = leftovers.some((leftover) => leftoverSurfaceIsOpen(root, leftover.trigger));
+  // A retained closed menu keeps its "Select model" toggle mounted with a
+  // stale aria-expanded="true"; the toggle only counts as open inside an
+  // open surface.
   const familyTriggerOpen = isMountedInRoot(root, familyTrigger)
+    && pickerSurfaceIsOpen(familyTrigger)
     && (familyTrigger.getAttribute?.("aria-expanded") === "true"
       || familyTrigger.getAttribute?.("data-state") === "open");
   const modelTriggerOpen = isMountedInRoot(root, currentButton) && modelPickerTriggerIsOpen(currentButton);
@@ -1964,7 +1990,7 @@ function readSliderPickerState(root, structurallyTrustedSurface = null) {
   const familyTrigger = Array.from(surface.querySelectorAll('[role="menuitem"], button'))
     .find((item) => isSelectModelViewToggle(item)
       && (isVisible(item, { allowDisabled: true })
-        || (structurallyTrusted && structurallyReadablePickerItem(item, surface))))
+        || structurallyReadablePickerItem(item, surface)))
     ?? Array.from(surface.querySelectorAll('[role="menuitem"], button'))
     .find((item) => {
       const evidence = structurallyTrusted ? structuralFamilyEvidence(item) : null;
@@ -2407,7 +2433,7 @@ function advancedViewRows(surface) {
   const advanced = Array.from(surface?.querySelectorAll?.("*") ?? [])
     .find((node) => node.getAttribute?.("data-testid") === "composer-model-picker-slider-advanced-view");
   return Array.from(advanced?.querySelectorAll?.("*") ?? [])
-    .filter((row) => ["menuitem", "menuitemcheckbox"].includes(row.getAttribute?.("role")))
+    .filter((row) => ["menuitem", "menuitemcheckbox", "menuitemradio"].includes(row.getAttribute?.("role")))
     .slice(0, 20)
     .map((row) => {
       const parts = Array.from(row.querySelectorAll?.("span, div") ?? [])

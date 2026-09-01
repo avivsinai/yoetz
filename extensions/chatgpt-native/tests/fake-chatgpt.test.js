@@ -3127,6 +3127,86 @@ test("hybrid simple-view activates Select model before reading an inert family p
   assert.equal(fixture.viewToggleClicks() > 0, true);
 });
 
+// September 2026 enterprise picker: no aria-controls on the pill (visible-only
+// surface trust), family radios collapsed behind an aria-expanded "Select
+// model" toggle inside an inert advanced view, and the reveal animation's
+// opacity-0 wrapper never settles in background tabs.
+test("collapsed Select model view verifies Sol via expanded-toggle trust while the wrapper stays opacity-0", async () => {
+  const fixture = makeHybridSimpleViewFixture({
+    pillAriaControls: false,
+    collapsedFamilyView: true,
+    familyWrapperOpacityOnExpand: "0"
+  });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "slider");
+  assert.equal(result.surface_trust, "visible");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+  assert.equal(
+    ["family_menu_checked", "inline_family_radio"].includes(result.family_label_source),
+    true,
+    result.family_label_source
+  );
+  assert.equal(fixture.viewToggleClicks() > 0, true);
+});
+
+test("collapsed Select model view tolerates a retained closed menu with a stale expanded toggle", async () => {
+  const fixture = makeHybridSimpleViewFixture({
+    pillAriaControls: false,
+    collapsedFamilyView: true,
+    retainMountedMenu: true
+  });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.picker_close_verification.family_trigger_closed, true);
+  assert.equal(result.picker_close_verification.picker_surface_closed, true);
+});
+
+test("collapsed Select model view with GPT-5.5 checked clicks Sol and verifies Pro", async () => {
+  const fixture = makeHybridSimpleViewFixture({
+    pillAriaControls: false,
+    collapsedFamilyView: true,
+    family: "GPT-5.5"
+  });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+});
+
+test("collapsed Select model view fails closed when the toggle never expands", async () => {
+  const fixture = makeHybridSimpleViewFixture({
+    pillAriaControls: false,
+    collapsedFamilyView: true,
+    expandStalls: true
+  });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_family_menu_unverified");
+  assert.equal(result.family_status, "unverified");
+});
+
+test("collapsed Select model view fails closed when only GPT-5.5 exists", async () => {
+  const fixture = makeHybridSimpleViewFixture({
+    pillAriaControls: false,
+    collapsedFamilyView: true,
+    family: "GPT-5.5",
+    families: ["GPT-5.5"]
+  });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_family_not_found");
+});
+
 test("hybrid simple-view ignores a retained closed menu after Pro verification", async () => {
   const fixture = makeHybridSimpleViewFixture({ retainMountedMenu: true });
   const result = await configureModelState(fixture.doc, {});
@@ -4197,7 +4277,11 @@ function makeHybridSimpleViewFixture({
   startsOpen = false,
   relabelOnClose = true,
   retainMountedMenu = false,
-  familyViewInitiallyActive = true
+  familyViewInitiallyActive = true,
+  pillAriaControls = true,
+  collapsedFamilyView = false,
+  expandStalls = false,
+  familyWrapperOpacityOnExpand = "0"
 } = {}) {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
@@ -4265,17 +4349,28 @@ function makeHybridSimpleViewFixture({
     );
     const familyView = new FakeElement("div", {
       "data-testid": "composer-model-picker-slider-advanced-view",
-      ...(familyViewInitiallyActive ? {} : { inert: "" })
+      ...(familyViewInitiallyActive && !collapsedFamilyView ? {} : { inert: "" })
     });
-    simple.append(new FakeElement("div", {
+    const familyWrapper = collapsedFamilyView
+      ? new FakeElement("div", { style: "opacity:0" })
+      : null;
+    if (familyWrapper) familyView.append(familyWrapper);
+    const viewToggle = new FakeElement("div", {
       role: "menuitem",
       "aria-label": "Select model",
       tabindex: "0",
+      ...(collapsedFamilyView ? { "aria-expanded": "false" } : {}),
       onPointerDown: () => {
         viewToggleClicks += 1;
+        if (expandStalls) return;
         delete familyView.attrs.inert;
+        if (collapsedFamilyView) {
+          viewToggle.setAttribute("aria-expanded", "true");
+          familyWrapper.setAttribute("style", `opacity:${familyWrapperOpacityOnExpand}`);
+        }
       }
-    }, "Pro"));
+    }, "Pro");
+    simple.append(viewToggle);
     menu = new FakeElement("div", {
       id: "hybrid-simple-menu",
       role: "menu",
@@ -4283,7 +4378,7 @@ function makeHybridSimpleViewFixture({
       style: `opacity:${opacity}`
     }).append(simple, familyView);
     for (const radioLabel of families) {
-      familyView.append(new FakeElement("div", {
+      (familyWrapper ?? familyView).append(new FakeElement("div", {
         role: "menuitemradio",
         "aria-checked": String(radioLabel === currentFamily),
         onClick: () => {
@@ -4305,7 +4400,7 @@ function makeHybridSimpleViewFixture({
     "aria-haspopup": "menu",
     "aria-expanded": startsOpen ? "true" : "false",
     "data-state": startsOpen ? "open" : "closed",
-    "aria-controls": "hybrid-simple-menu",
+    ...(pillAriaControls ? { "aria-controls": "hybrid-simple-menu" } : {}),
     onPointerDown: openMenu,
     onKeyDown: (event) => {
       if (event.key === "Escape") closeMenu();

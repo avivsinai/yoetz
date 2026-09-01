@@ -96,7 +96,16 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   (`GPT-5.6 Sol` / `GPT-5.5`) in the same menu, with no `Advanced`/`Effort`
   gating text. Classify that as the existing slider shape (legacy Advanced
   view remains an OR). Family proof is the checked inline `GPT-5.6 Sol`
-  radio when present, else the Model-row submenu. A successful click is never
+  radio when present, else the Model-row submenu. Since September 2026 the
+  family radios may instead sit collapsed behind an aria-expanded
+  `Select model` menuitem inside an `inert`
+  `composer-model-picker-slider-advanced-view`; expanding that toggle and the
+  view shedding `inert` is the structural family-proof signal — opacity never
+  gates the read because the reveal animation is rAF-driven and stays 0 in
+  background tabs, and the simple view goes `inert` while the family view is
+  expanded. A retained closed menu keeps the toggle mounted with a stale
+  `aria-expanded="true"`; close verification counts it only inside an open
+  surface. A successful click is never
   proof: reopen through `findModelButton` and re-read both legs. Already-Sol
   already-Pro is verify-only. After close, the composer pill must corroborate
   Pro effort (`Pro` or a family-plus-`Pro` suffix); family is never inferred
