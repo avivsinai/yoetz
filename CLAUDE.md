@@ -105,7 +105,20 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   background tabs, and the simple view goes `inert` while the family view is
   expanded. A retained closed menu keeps the toggle mounted with a stale
   `aria-expanded="true"`; close verification counts it only inside an open
-  surface. A successful click is never
+  surface. Late September 2026 unified this into one picker: the effort tier
+  rows (Medium/High/Extra High/Pro) sit as `menuitemradio` entries labeled
+  ONLY via aria-label (no text) inside the same advanced view as the family
+  radios, and the simple view's "Power" slider degenerates to a
+  single-position "Instant, 1 of 1." control that must never be read as the
+  effort slider. ChatGPT also defers hydration in hidden tabs — a MAIN-world
+  visibility shim (injected only into `?_yoetz=` tabs) makes them hydrate;
+  model selection waits for the composer pill to settle before touching the
+  page (interacting mid-hydration wedges an empty, handler-less menu, which
+  the open loop recovers by Escape + reopen). When the account's effort
+  quota is exhausted, ChatGPT keeps the tier rows mounted but disabled
+  (aria-disabled + data-disabled, tooltip "Limit reached…"); the recipe
+  fails closed with `effort_options_disabled` in both the selection and
+  post-close reverification legs. A successful click is never
   proof: reopen through `findModelButton` and re-read both legs. Already-Sol
   already-Pro is verify-only. After close, the composer pill must corroborate
   Pro effort (`Pro` or a family-plus-`Pro` suffix); family is never inferred

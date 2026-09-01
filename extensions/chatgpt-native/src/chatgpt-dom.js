@@ -406,7 +406,33 @@ function conversationUnavailableError(conversationId, currentConversationId, win
   );
 }
 
+// Hidden tabs hydrate late (tens of seconds), and interacting with the page
+// before hydration completes can wedge it permanently: the composer pill
+// opens an empty menu whose items and handlers never attach. In a genuinely
+// hidden tab, hold off until the composer pill node has been stable for a
+// few seconds. The MAIN-world visibility shim does not reach this isolated
+// world, so document.hidden here reflects the tab's real visibility.
+async function waitForHiddenTabHydration(root, options = {}) {
+  const doc = typeof root?.hidden === "boolean" ? root : root?.ownerDocument;
+  if (doc?.hidden !== true) return;
+  const deadline = Date.now() + Number(options.hydrationTimeoutMs ?? 30000);
+  const stabilityMs = Number(options.hydrationStabilityMs ?? 3000);
+  let last = findModelButton(root);
+  let stableSince = Date.now();
+  while (Date.now() < deadline) {
+    await sleep(1000);
+    const current = findModelButton(root);
+    if (!current || current !== last) {
+      last = current;
+      stableSince = Date.now();
+      continue;
+    }
+    if (Date.now() - stableSince >= stabilityMs) return;
+  }
+}
+
 export async function configureModelState(root, job = {}) {
+  await waitForHiddenTabHydration(root, modelSelectionOptionsForJob(job));
   const surface = await ensureChatSurface(root, modelSelectionOptionsForJob(job));
   if (!surface.ok) {
     return {
@@ -1104,6 +1130,20 @@ async function selectSolChatProModel(root, options = {}) {
   state = familyProof.state;
 
   if (!effortIsChatProTier(state)) {
+    const disabledPro = disabledProEffortOption(state.surface ?? state.menu);
+    if (disabledPro) {
+      await closeModelPicker(root, modelButton);
+      return selectionFailure(
+        base,
+        modelButton,
+        state,
+        availableFamilies,
+        disabledPro.reason
+          ? `ChatGPT Pro effort is disabled: ${disabledPro.reason}`
+          : "ChatGPT Pro effort is disabled (account limit reached or rollout lock); refusing unverified selection",
+        "effort_options_disabled"
+      );
+    }
     if (state.shape === "personal") {
       const selected = await selectPersonalChatProEffort(root, state, options);
       state = selected.state ?? state;
@@ -1125,7 +1165,7 @@ async function selectSolChatProModel(root, options = {}) {
         return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol effort slider did not move to verified Pro", "effort_slider_move_failed");
       }
     } else {
-      const proOption = state.effort_items.find((item) => foldedModelText(textOf(item)) === "pro");
+      const proOption = state.effort_items.find((item) => foldedModelText(optionLabel(item)) === "pro");
       if (!proOption) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, state, availableFamilies, "GPT-5.6 Sol Pro effort was not visible in the effort menu", "effort_control_not_found");
@@ -1191,13 +1231,18 @@ async function selectSolChatProModel(root, options = {}) {
   if (closedPill.closed_pill_family_status === "skipped") {
     postClose = await reverifyModelSelectionAfterClose(root, modelButton, options);
     if (!postClose.ok) {
+      const quotaLocked = postClose.post_close_failure_reason === "effort_options_disabled";
       return selectionFailure(
         base,
         modelButton,
         state,
         availableFamilies,
-        "ChatGPT model family was not independently re-read after the closed composer pill omitted it",
-        "post_close_model_reverification_failed",
+        quotaLocked
+          ? (postClose.post_close_disabled_reason
+            ? `ChatGPT Pro effort is disabled: ${postClose.post_close_disabled_reason}`
+            : "ChatGPT Pro effort is disabled (account limit reached or rollout lock); refusing unverified selection")
+          : "ChatGPT model family was not independently re-read after the closed composer pill omitted it",
+        quotaLocked ? "effort_options_disabled" : "post_close_model_reverification_failed",
         { closedPill: true, postClose }
       );
     }
@@ -1261,23 +1306,41 @@ async function openAndReadModelPicker(root, modelButton, options = {}) {
 
 async function openModelPicker(root, modelButton, options = {}) {
   const settleMs = Number(options.settleMs ?? 150);
+  // Hidden-tab hydration can take ~20s before the pill accepts activation;
+  // each attempt costs roughly five seconds, so eight keeps the budget
+  // bounded near forty.
+  const attempts = Number(options.openAttempts ?? 8);
   const opened = () => Boolean(findPickerState(root));
-  const openedOrTriggered = () => opened() || modelPickerTriggerIsOpen(modelButton);
-  if (opened()) {
-    return true;
-  }
-  if (modelPickerTriggerIsOpen(modelButton)) {
-    return Boolean(await waitForPickerState(root, options));
-  }
-  const activators = [openWithPointerEvents, pressEnter, pressSpace];
-  for (const activate of activators) {
-    try {
-      if (await activate(modelButton, openedOrTriggered, { settleMs })) {
-        return opened() || Boolean(await waitForPickerState(root, options));
+  let button = modelButton;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    // A hydrating page can replace the composer pill after it was first
+    // resolved; events dispatched at the detached node do nothing, so
+    // re-resolve the live pill on every attempt.
+    if (!isMountedInRoot(root, button)) {
+      button = await waitForModelButton(root, options) ?? button;
+    }
+    if (opened()) return true;
+    const currentButton = button;
+    const openedOrTriggered = () => opened() || modelPickerTriggerIsOpen(currentButton);
+    if (!modelPickerTriggerIsOpen(currentButton)) {
+      for (const activate of [openWithPointerEvents, pressEnter, pressSpace]) {
+        try {
+          if (await activate(currentButton, openedOrTriggered, { settleMs })) break;
+        } catch {
+          recordModelPickerActivationException(root);
+          // Try the next activation path; ChatGPT changes this control frequently.
+        }
       }
-    } catch {
-      recordModelPickerActivationException(root);
-      // Try the next activation path; ChatGPT changes this control frequently.
+    }
+    // Throttled background tabs can commit the menu open (or mount a
+    // classifiable surface) well after the dispatched events; wait bounded
+    // before retrying with a freshly resolved pill.
+    if (await waitForPickerState(root, options)) return true;
+    // A menu opened mid-hydration can mount empty and never repopulate;
+    // close the wedged surface so the next attempt reopens a fresh one.
+    if (modelPickerTriggerIsOpen(currentButton)) {
+      pressActivationKey(currentButton, "Escape");
+      await sleep(settleMs);
     }
   }
   return false;
@@ -1565,6 +1628,9 @@ async function reverifyModelSelectionAfterClose(root, modelButton, options = {})
   const verifiedState = familyProof.state ?? state;
   const familyStatus = familyProof.ok ? "verified" : "unverified";
   const effortStatus = effortIsChatProTier(verifiedState) ? "verified" : "unverified";
+  const disabledPro = effortStatus === "unverified"
+    ? disabledProEffortOption(verifiedState.surface ?? verifiedState.menu)
+    : null;
   const close = await closeModelPickerResult(root, reopenedButton, verifiedState, { requireProPill: true });
   const closedButton = await waitForModelButton(root, options);
   const closedPill = closedPillDiagnostics(modelControlLabel(closedButton), verifiedState);
@@ -1581,7 +1647,10 @@ async function reverifyModelSelectionAfterClose(root, modelButton, options = {})
     post_close_closed_pill_family_status: closedPill.closed_pill_family_status,
     post_close_closed_pill_effort_status: closedPill.closed_pill_effort_status,
     post_close_closed_pill_text: closedPill.closed_pill_text,
-    post_close_failure_reason: null
+    post_close_failure_reason: disabledPro
+      ? "effort_options_disabled"
+      : null,
+    post_close_disabled_reason: disabledPro?.reason ?? null
   };
 }
 
@@ -1759,17 +1828,27 @@ function readStructurallyTrustedPickerState(surface) {
 
 function classifyPickerSurface(surface, structurallyTrusted) {
   if (!surface) return null;
-  const labels = menuRadioItems(surface, structurallyTrusted).map((item) => foldedModelText(textOf(item)));
+  const labels = menuRadioItems(surface, structurallyTrusted).map((item) => foldedModelText(optionLabel(item)));
   if (isEffortMenuLabels(labels)) {
     return readMenuPickerState(surface, structurallyTrusted);
   }
   if (looksLikePersonalPicker(surface)) {
     return readPersonalPickerState(surface, structurallyTrusted);
   }
-  if (surfaceHasParsableEffortSlider(surface) || looksLikeLegacyAdvancedPicker(surface)) {
+  if (surfaceHasParsableEffortSlider(surface)
+    || looksLikeLegacyAdvancedPicker(surface)
+    || hasSelectModelViewToggle(surface)) {
     return readSliderPickerState(surface.ownerDocument ?? surface, structurallyTrusted ? surface : null);
   }
   return null;
+}
+
+// The quota-locked unified picker exposes only a degenerate single-position
+// slider, so the "Select model" view toggle is the classification anchor.
+function hasSelectModelViewToggle(surface) {
+  return Array.from(surface?.querySelectorAll?.('[role="menuitem"]') ?? [])
+    .some((item) => isSelectModelViewToggle(item)
+      && (isVisible(item, { allowDisabled: true }) || structurallyReadablePickerItem(item, surface)));
 }
 
 function sliderLooksLikePowerControl(slider, surface) {
@@ -1778,7 +1857,7 @@ function sliderLooksLikePowerControl(slider, surface) {
     slider?.getAttribute?.("title"),
     textOf(slider)
   ].filter(Boolean).join(" "));
-  if (/\b(?:faster|smarter|speed)\b/i.test(direct)) return true;
+  if (/\b(?:faster|smarter|speed|instant)\b/i.test(direct)) return true;
   let ancestor = slider?.parentElement;
   for (let depth = 0; ancestor && ancestor !== surface && depth < 4; depth += 1, ancestor = ancestor.parentElement) {
     const text = normalizeText(textOf(ancestor));
@@ -1918,7 +1997,7 @@ function isEffortMenuLabels(labels) {
 }
 
 function isMainModelMenu(menu) {
-  const labels = menuRadioItems(menu).map((item) => foldedModelText(textOf(item)));
+  const labels = menuRadioItems(menu).map((item) => foldedModelText(optionLabel(item)));
   return isEffortMenuLabels(labels);
 }
 
@@ -1942,7 +2021,11 @@ function pickerSurfaceIsOpen(node) {
 }
 
 function readMenuPickerState(menu, structurallyTrusted = false) {
-  const effortItems = menuRadioItems(menu, structurallyTrusted);
+  // The September 2026 picker can put family radios (GPT-5.6 Sol / GPT-5.5)
+  // inline next to the effort tiers in one menu; effort verification must
+  // only look at the non-family radios.
+  const effortItems = menuRadioItems(menu, structurallyTrusted)
+    .filter((item) => !isFamilyOptionLabel(optionLabel(item)));
   const familyTrigger = Array.from(menu.querySelectorAll('[role="menuitem"]'))
     .find((item) => {
       const label = normalizeText(textOf(item));
@@ -2051,7 +2134,8 @@ function findSliderPickerSurface(root) {
   const advanced = findAdvancedPickerSurface(root);
   if (advanced) return advanced;
   return visibleMenus(root).find((menu) => (
-    surfaceHasParsableEffortSlider(menu) && !looksLikePersonalPicker(menu)
+    (surfaceHasParsableEffortSlider(menu) || hasSelectModelViewToggle(menu))
+      && !looksLikePersonalPicker(menu)
   )) ?? null;
 }
 
@@ -2103,8 +2187,42 @@ function structurallyReadablePickerItem(item, surface) {
   return true;
 }
 
+function isFamilyOptionLabel(value) {
+  return /^gpt\b|^o3$/i.test(normalizeText(value));
+}
+
+// The unified September 2026 picker labels its effort tier rows through
+// aria-label with no text content; label reads must accept either.
+function optionLabel(item) {
+  return normalizeText(textOf(item)) || normalizeText(item?.getAttribute?.("aria-label") ?? "");
+}
+
+function effortOptionDisabled(option) {
+  return option?.getAttribute?.("aria-disabled") === "true"
+    || option?.getAttribute?.("data-disabled") != null;
+}
+
+// When the account's effort quota is exhausted, ChatGPT keeps the tier rows
+// mounted but disables them (aria-disabled + data-disabled) — no selection
+// path exists until the limit resets. Detect that state so the failure names
+// the real cause instead of a generic open/move failure.
+function disabledProEffortOption(surface) {
+  const pro = Array.from(surface?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
+    .find((item) => !isFamilyOptionLabel(optionLabel(item))
+      && foldedModelText(optionLabel(item)).replace(/\s+/g, " ") === "pro");
+  if (!pro || !effortOptionDisabled(pro)) return null;
+  const describedBy = pro.getAttribute?.("aria-describedby");
+  const described = describedBy
+    ? normalizeText(textOf(pro.ownerDocument?.getElementById?.(describedBy)))
+    : "";
+  return {
+    option: pro,
+    reason: described || normalizeText(pro.getAttribute?.("title") ?? "") || null
+  };
+}
+
 function familyMenuRadios(menu, structurallyTrusted = false) {
-  return menuRadioItems(menu, structurallyTrusted).filter((item) => /^gpt\b|^o3$/i.test(normalizeText(textOf(item))));
+  return menuRadioItems(menu, structurallyTrusted).filter((item) => isFamilyOptionLabel(textOf(item)));
 }
 
 function effortIsChatProTier(state) {
@@ -2117,7 +2235,7 @@ function effortIsChatProTier(state) {
   }
   const items = state?.effort_items ?? [];
   const checked = items.find((item) => itemIsChecked(item));
-  return foldedModelText(textOf(checked)) === "pro";
+  return foldedModelText(optionLabel(checked)) === "pro";
 }
 
 function isSupportedPickerShape(state) {
@@ -2162,6 +2280,9 @@ function sliderEffortSnapshot(slider, surface = null) {
     || max <= min || now < min || now > max || Number(match[2]) !== ordinal || Number(match[3]) !== total) {
     return null;
   }
+  // "Instant, n of m." is the speed control on the September 2026 list
+  // picker, not an effort tier; it must never be read as the effort slider.
+  if (foldedModelText(match[1]) === "instant") return null;
   return { label: foldedModelText(match[1]), display_label: match[1], now, min, max, value_text: nearbyLabel };
 }
 
@@ -2173,7 +2294,7 @@ function pickerVerifiedEffortLabel(state) {
     return snapshot?.display_label ?? null;
   }
   const checked = state.effort_items?.find((item) => itemIsChecked(item));
-  return checked ? (normalizeText(textOf(checked)) || null) : null;
+  return checked ? (optionLabel(checked) || null) : null;
 }
 
 function verificationStatus(ok) {
@@ -2382,7 +2503,11 @@ function itemIsChecked(item) {
 }
 
 function effortDiagnostics(items) {
-  return items.map((item) => ({ label: textOf(item), checked: itemIsChecked(item) }));
+  return items.map((item) => ({
+    label: optionLabel(item),
+    checked: itemIsChecked(item),
+    disabled: effortOptionDisabled(item)
+  }));
 }
 
 function selectionFailure(base, modelButton, state, availableFamilies, warning, failureReason, options = {}) {
@@ -2443,7 +2568,8 @@ function advancedViewRows(surface) {
       return {
         role: row.getAttribute?.("role") ?? null,
         checked: row.getAttribute?.("aria-checked") ?? null,
-        label: parts[0] ?? normalizeText(textOf(row)),
+        disabled: effortOptionDisabled(row),
+        label: row.getAttribute?.("aria-label") ?? parts[0] ?? normalizeText(textOf(row)),
         value: parts[1] ?? null
       };
     });
