@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- The native ChatGPT recipe now verifies GPT-5.6 Sol on the September 2026
+  hybrid picker, where the family radios sit collapsed behind an
+  aria-expanded "Select model" toggle inside an `inert` advanced view whose
+  reveal animation never settles in background tabs. Family proof now accepts
+  the expanded toggle plus the view shedding `inert` as the structural open
+  signal instead of gating on opacity, and picker-close verification no longer
+  trips on the stale expanded toggle retained inside a closed menu
+  ([#461](https://github.com/avivsinai/yoetz/issues/461)).
+- `family_menu_probe` and `advanced_rows` model-selection diagnostics are now
+  populated on the family-menu path (including `menuitemradio` rows), so
+  future ChatGPT picker drift is self-describing in failure output.
 
 ## [0.5.63] - 2026-08-31
 ### Fixed
