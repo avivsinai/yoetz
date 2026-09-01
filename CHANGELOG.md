@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.64] - 2026-09-01
 ### Fixed
 
 - The native ChatGPT recipe now verifies GPT-5.6 Sol on the September 2026
@@ -19,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `family_menu_probe` and `advanced_rows` model-selection diagnostics are now
   populated on the family-menu path (including `menuitemradio` rows), so
   future ChatGPT picker drift is self-describing in failure output.
+
 
 ## [0.5.63] - 2026-08-31
 ### Fixed
