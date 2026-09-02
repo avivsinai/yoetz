@@ -414,28 +414,48 @@ function conversationUnavailableError(conversationId, currentConversationId, win
 // world, so document.hidden here reflects the tab's real visibility.
 async function waitForHiddenTabHydration(root, options = {}) {
   const doc = typeof root?.hidden === "boolean" ? root : root?.ownerDocument;
-  if (doc?.hidden !== true) return;
+  if (doc?.hidden !== true) return "visible";
   const deadline = Date.now() + Number(options.hydrationTimeoutMs ?? 30000);
+  const attr = (name) => doc.documentElement?.getAttribute?.(name) === "1";
   const stabilityMs = Number(options.hydrationStabilityMs ?? 3000);
+  const shimPresent = attr("data-yoetz-shim");
+  // With the MAIN-world shim present it stamps data-yoetz-hydrated once the
+  // composer pill carries a React fiber; the server-rendered skeleton is
+  // stable but handler-less, so node stability must not short-circuit the
+  // flag wait. It serves only as a secondary gate once the flag times out
+  // (shim loaded but its pill probe never matched).
+  if (shimPresent) {
+    while (Date.now() < deadline) {
+      if (attr("data-yoetz-hydrated")) return "flag";
+      await sleep(500);
+    }
+  }
+  const stabilityDeadline = shimPresent
+    ? Date.now() + Math.min(stabilityMs * 2, 10000)
+    : deadline;
   let last = findModelButton(root);
   let stableSince = Date.now();
-  while (Date.now() < deadline) {
-    await sleep(1000);
+  while (Date.now() < stabilityDeadline) {
+    await sleep(500);
     const current = findModelButton(root);
     if (!current || current !== last) {
       last = current;
       stableSince = Date.now();
       continue;
     }
-    if (Date.now() - stableSince >= stabilityMs) return;
+    if (Date.now() - stableSince >= stabilityMs) {
+      return shimPresent ? "flag_timeout_node_stability" : "node_stability";
+    }
   }
+  return "timeout";
 }
 
 export async function configureModelState(root, job = {}) {
-  await waitForHiddenTabHydration(root, modelSelectionOptionsForJob(job));
+  const hydrationSignal = await waitForHiddenTabHydration(root, modelSelectionOptionsForJob(job));
   const surface = await ensureChatSurface(root, modelSelectionOptionsForJob(job));
   if (!surface.ok) {
     return {
+      hydration_signal: hydrationSignal,
       status: "unavailable",
       model_used: null,
       requested_model: modelSelectionStrategyForJob(job) === "current"
@@ -511,6 +531,7 @@ export async function configureModelState(root, job = {}) {
   const selection = await selectSolChatProModel(root, modelSelectionOptionsForJob(job));
   const warnings = selection.warning ? [selection.warning] : [];
   return {
+    hydration_signal: hydrationSignal,
     status: selection.status,
     model_used: selection.model_used,
     requested_model: CHATGPT_SOL_CHAT_PRO_MODEL,
@@ -531,6 +552,7 @@ export async function configureModelState(root, job = {}) {
     post_close_closed_pill_effort_status: selection.post_close_closed_pill_effort_status ?? null,
     post_close_closed_pill_text: selection.post_close_closed_pill_text ?? null,
     post_close_failure_reason: selection.post_close_failure_reason ?? null,
+    post_close_disabled_reason: selection.post_close_disabled_reason ?? null,
     failure_reason: selection.failure_reason ?? null,
     picker_shape: selection.picker_shape ?? null,
     surface_trust: selection.surface_trust ?? null,
@@ -688,6 +710,14 @@ function modelSelectionOptionsForJob(job = {}) {
   const intervalMs = Number(job?.model_selection_interval_ms);
   if (Number.isFinite(intervalMs) && intervalMs > 0) {
     options.intervalMs = intervalMs;
+  }
+  const hydrationTimeoutMs = Number(job?.hydration_timeout_ms);
+  if (Number.isFinite(hydrationTimeoutMs) && hydrationTimeoutMs > 0) {
+    options.hydrationTimeoutMs = hydrationTimeoutMs;
+  }
+  const hydrationStabilityMs = Number(job?.hydration_stability_ms);
+  if (Number.isFinite(hydrationStabilityMs) && hydrationStabilityMs > 0) {
+    options.hydrationStabilityMs = hydrationStabilityMs;
   }
   return options;
 }
@@ -1304,6 +1334,26 @@ async function openAndReadModelPicker(root, modelButton, options = {}) {
   return waitForPickerState(root, options);
 }
 
+// A picker menu can be mounted and open in the DOM before it is classifiable
+// (the advanced view is still inert, the pill has no aria-controls yet), and
+// before the pill's own aria-expanded flips. Detecting that raw mounted-open
+// state is what lets the activation sequence abort BEFORE its trailing click
+// toggles the freshly opened menu back closed.
+function pickerMenuMounted(root) {
+  return Array.from(root.querySelectorAll?.('[role="menu"]') ?? []).some((menu) => {
+    if (menu.getAttribute?.("data-state") === "closed") return false;
+    if (!pickerSurfaceIsOpen(menu)) return false;
+    // Structural readability (not opacity) gates the signal, so a stale
+    // display:none menu can never suppress activation, while the
+    // mid-animation opacity-0 menu still counts.
+    if (!structurallyReadablePickerItem(menu, menu)) return false;
+    const hasToggle = Array.from(menu.querySelectorAll?.('[role="menuitem"]') ?? [])
+      .some((item) => isSelectModelViewToggle(item) && structurallyReadablePickerItem(item, menu));
+    const hasFamily = familyMenuRadios(menu, true).length > 0;
+    return hasToggle || hasFamily;
+  });
+}
+
 async function openModelPicker(root, modelButton, options = {}) {
   const settleMs = Number(options.settleMs ?? 150);
   // Hidden-tab hydration can take ~20s before the pill accepts activation;
@@ -1311,6 +1361,10 @@ async function openModelPicker(root, modelButton, options = {}) {
   // bounded near forty.
   const attempts = Number(options.openAttempts ?? 8);
   const opened = () => Boolean(findPickerState(root));
+  // Abort the activation gesture as soon as a picker menu is mounted-open,
+  // even if it is not yet classifiable — otherwise the gesture's trailing
+  // click lands on the open trigger and toggles the menu closed.
+  const openSignal = () => opened() || pickerMenuMounted(root);
   let button = modelButton;
   for (let attempt = 0; attempt < attempts; attempt += 1) {
     // A hydrating page can replace the composer pill after it was first
@@ -1321,8 +1375,8 @@ async function openModelPicker(root, modelButton, options = {}) {
     }
     if (opened()) return true;
     const currentButton = button;
-    const openedOrTriggered = () => opened() || modelPickerTriggerIsOpen(currentButton);
-    if (!modelPickerTriggerIsOpen(currentButton)) {
+    const openedOrTriggered = () => openSignal() || modelPickerTriggerIsOpen(currentButton);
+    if (!modelPickerTriggerIsOpen(currentButton) && !openSignal()) {
       for (const activate of [openWithPointerEvents, pressEnter, pressSpace]) {
         try {
           if (await activate(currentButton, openedOrTriggered, { settleMs })) break;
@@ -1336,14 +1390,17 @@ async function openModelPicker(root, modelButton, options = {}) {
     // classifiable surface) well after the dispatched events; wait bounded
     // before retrying with a freshly resolved pill.
     if (await waitForPickerState(root, options)) return true;
-    // A menu opened mid-hydration can mount empty and never repopulate;
-    // close the wedged surface so the next attempt reopens a fresh one.
-    if (modelPickerTriggerIsOpen(currentButton)) {
+    // Only a wedged EMPTY menu (mounted but with no picker hallmarks) should
+    // be closed for a fresh reopen; never Escape a menu that mounted open
+    // with real content but merely failed to classify this tick.
+    if (modelPickerTriggerIsOpen(currentButton) && !pickerMenuMounted(root)) {
       pressActivationKey(currentButton, "Escape");
       await sleep(settleMs);
     }
   }
-  return false;
+  // Final settle: a menu can mount-open but classify only after the advanced
+  // view sheds inert on a later frame.
+  return Boolean(await waitForPickerState(root, options));
 }
 
 function modelPickerTriggerIsOpen(modelButton) {
@@ -1793,6 +1850,20 @@ function findPickerState(root) {
     const classified = readStructurallyTrustedPickerState(leftover.surface);
     if (classified) return classified;
   }
+  // Last resort: a menu that mounted open with real picker content but whose
+  // pill wiring (aria-controls) or CSS visibility has not settled — common in
+  // a throttled hidden tab mid-open-animation. Trust it structurally by its
+  // content, not by the pill or by opacity.
+  const mountedMenus = Array.from(root.querySelectorAll?.('[role="menu"]') ?? [])
+    .filter((menu) => menu.getAttribute?.("data-state") !== "closed"
+      && pickerSurfaceIsOpen(menu)
+      && (hasSelectModelViewToggle(menu)
+        || familyMenuRadios(menu, true).length > 0
+        || menuRadioItems(menu, true).length > 0));
+  for (const menu of mountedMenus) {
+    const classified = readStructurallyTrustedPickerState(menu);
+    if (classified) return classified;
+  }
   return null;
 }
 
@@ -1837,7 +1908,8 @@ function classifyPickerSurface(surface, structurallyTrusted) {
   }
   if (surfaceHasParsableEffortSlider(surface)
     || looksLikeLegacyAdvancedPicker(surface)
-    || hasSelectModelViewToggle(surface)) {
+    || hasSelectModelViewToggle(surface)
+    || hybridFamilyView(surface, structurallyTrusted)) {
     return readSliderPickerState(surface.ownerDocument ?? surface, structurallyTrusted ? surface : null);
   }
   return null;
@@ -2053,7 +2125,7 @@ function readSliderPickerState(root, structurallyTrustedSurface = null) {
   if (inlineFamily.length > 0) {
     const checked = inlineFamily.find((item) => itemIsChecked(item));
     const effortSlider = Array.from(surface.querySelectorAll('[role="slider"]'))
-      .find((slider) => Boolean(sliderEffortSnapshot(slider, surface))) ?? null;
+      .find((slider) => sliderIsEffortControl(slider, surface) && Boolean(sliderEffortSnapshot(slider, surface))) ?? null;
     return {
       shape: "slider",
       menu: surface.getAttribute?.("role") === "menu" ? surface : null,
@@ -2133,10 +2205,29 @@ function sliderIsEffortControl(slider, surface) {
 function findSliderPickerSurface(root) {
   const advanced = findAdvancedPickerSurface(root);
   if (advanced) return advanced;
+  // Anchors for the hybrid slider shape, in order of specificity: a parsable
+  // effort slider, the collapsed "Select model" toggle, or — once that view
+  // is expanded and the simple view has gone inert — the inline family radios
+  // themselves.
   return visibleMenus(root).find((menu) => (
-    (surfaceHasParsableEffortSlider(menu) || hasSelectModelViewToggle(menu))
+    (surfaceHasParsableEffortSlider(menu)
+      || hasSelectModelViewToggle(menu)
+      || hybridFamilyView(menu, false))
       && !looksLikePersonalPicker(menu)
   )) ?? null;
+}
+
+// The hybrid picker with its family view already expanded: inline family
+// radios alongside the (possibly degenerate) slider or the advanced-view
+// container. A bare family submenu (menu-shape or personal-shape pickers)
+// carries neither hallmark and must not classify as a slider surface.
+function hybridFamilyView(surface, structurallyTrusted = false) {
+  if (familyMenuRadios(surface, structurallyTrusted).length === 0) return false;
+  // A bare [role=slider] is not a hallmark: the personal picker's Faster/
+  // Smarter power slider would qualify and then be dragged as "effort".
+  return surfaceHasParsableEffortSlider(surface)
+    || Array.from(surface.querySelectorAll?.("*") ?? [])
+      .some((node) => node.getAttribute?.("data-testid") === "composer-model-picker-slider-advanced-view");
 }
 
 function findAdvancedPickerSurface(root) {

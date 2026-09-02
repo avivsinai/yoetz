@@ -6,6 +6,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- The native ChatGPT recipe no longer flaps to `model_picker_open_failed` in
+  throttled hidden tabs. The activation gesture now aborts as soon as the
+  picker menu is mounted-open (before it is classifiable), so its trailing
+  click can no longer toggle the freshly opened menu closed; a menu whose
+  pill wiring or CSS visibility has not settled is classified structurally
+  by its content; a pre-expanded family view (inert simple view, degenerate
+  slider) classifies from the inline family radios; and the visibility shim
+  stamps `data-yoetz-shim` at document start and `data-yoetz-hydrated`
+  once the composer model pill carries a React fiber, so the hidden-tab
+  hydration gate waits for real hydration (node stability is only the
+  no-shim fallback). The shim also answers IntersectionObserver and
+  requestIdleCallback in yoetz-owned hidden tabs, which Chrome never
+  delivers to background tabs and which gate the lazy mount of the Chat/Work
+  header when the account defaults to Work. Live runs on the quota-locked
+  account now report `effort_options_disabled` with family verified.
+- Model-selection diagnostics carry `hydration_signal`
+  (`visible|flag|node_stability|flag_timeout_node_stability|timeout`).
+- Post-close reverification fields (`post_close_failure_reason`,
+  `post_close_disabled_reason`, statuses, pill text) are included in
+  model-selection failure diagnostics.
 
 ## [0.5.65] - 2026-09-02
 ### Fixed
