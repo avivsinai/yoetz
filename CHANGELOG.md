@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.66] - 2026-09-02
 ### Fixed
 
 - The native ChatGPT recipe no longer flaps to `model_picker_open_failed` in
@@ -28,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Post-close reverification fields (`post_close_failure_reason`,
   `post_close_disabled_reason`, statuses, pill text) are included in
   model-selection failure diagnostics.
+
 
 ## [0.5.65] - 2026-09-02
 ### Fixed
