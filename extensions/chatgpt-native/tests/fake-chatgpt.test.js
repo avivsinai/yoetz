@@ -3256,6 +3256,45 @@ test("a stale display:none family menu does not suppress picker activation", asy
   assert.ok(Date.now() - startedAt < 10000, "activation must not burn the open-retry budget");
 });
 
+test("a retained opacity-0 bare family submenu neither suppresses activation nor classifies", async () => {
+  const fixture = makeHybridSimpleViewFixture({ leftoverBareFamilyMenu: true });
+  const startedAt = Date.now();
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.ok(Date.now() - startedAt < 10000);
+});
+
+test("a retained picker menu inside a display:none wrapper is not classified as open", async () => {
+  const fixture = makeHybridSimpleViewFixture({ leftoverWrappedHiddenMenu: true });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_close_verification.picker_surface_closed, true);
+});
+
+test("a family view that mounts before its effort controls waits instead of failing effort_control_not_found", async () => {
+  const fixture = makeHybridSimpleViewFixture({ advancedViewInitiallyEmpty: true });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+});
+
+test("hidden-tab hydration gate never exceeds its total budget with the shim present", async () => {
+  const fixture = makeHybridSimpleViewFixture({ pillAriaControls: false, collapsedFamilyView: true });
+  fixture.doc.hidden = true;
+  fixture.doc.documentElement.setAttribute("data-yoetz-shim", "1");
+  const startedAt = Date.now();
+  const result = await configureModelState(fixture.doc, { hydration_timeout_ms: 4000, hydration_stability_ms: 1000 });
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.hydration_signal, "flag_timeout_node_stability");
+  // Gate must finish inside hydration_timeout_ms (4s); selection itself is ~1.5s.
+  assert.ok(Date.now() - startedAt < 4000 + 2000, `gate + selection took ${Date.now() - startedAt}ms`);
+});
+
 test("collapsed Select model view tolerates a retained closed menu with a stale expanded toggle", async () => {
   const fixture = makeHybridSimpleViewFixture({
     pillAriaControls: false,
@@ -4468,7 +4507,10 @@ function makeHybridSimpleViewFixture({
   clickToggles = false,
   simpleViewInert = false,
   sliderAriaLabel = null,
-  leftoverHiddenFamilyMenu = false
+  leftoverHiddenFamilyMenu = false,
+  leftoverBareFamilyMenu = false,
+  leftoverWrappedHiddenMenu = false,
+  advancedViewInitiallyEmpty = false
 } = {}) {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
@@ -4479,6 +4521,7 @@ function makeHybridSimpleViewFixture({
   let currentNow = sliderNow;
   let viewToggleClicks = 0;
   let sliderKeys = 0;
+  let openCount = 0;
   const ordinal = () => currentNow - sliderMin + 1;
   const total = sliderMax - sliderMin + 1;
   const valueText = () => `${sliderLabel}, ${ordinal()} of ${total}.`;
@@ -4506,6 +4549,7 @@ function makeHybridSimpleViewFixture({
   };
   const openMenu = () => {
     if (menu?.getAttribute("data-state") === "open") return;
+    openCount += 1;
     if (menu) {
       body.children = body.children.filter((child) => child !== menu);
       menu.parentElement = null;
@@ -4544,6 +4588,23 @@ function makeHybridSimpleViewFixture({
       "data-testid": "composer-model-picker-slider-advanced-view",
       ...(familyViewInitiallyActive && !collapsedFamilyView ? {} : { inert: "" })
     });
+    if (advancedViewInitiallyEmpty && openCount === 1) {
+      // First open: family radios + container mounted, effort controls not yet.
+      body.append(new FakeElement("div", { id: "hybrid-simple-menu", role: "menu", "data-state": "open" })
+        .append(familyView));
+      for (const radioLabel of families) {
+        familyView.append(new FakeElement("div", { role: "menuitemradio", "aria-checked": String(radioLabel === currentFamily) }, radioLabel));
+      }
+      menu = body.children[body.children.length - 1];
+      pill.setAttribute("aria-expanded", "true");
+      pill.setAttribute("data-state", "open");
+      // Effort controls hydrate shortly after.
+      setTimeout(() => {
+        if (menu?.getAttribute("data-state") !== "open") return;
+        menu.append(simple);
+      }, 700);
+      return;
+    }
     const familyWrapper = collapsedFamilyView
       ? new FakeElement("div", { style: "opacity:0" })
       : null;
@@ -4606,6 +4667,29 @@ function makeHybridSimpleViewFixture({
   }, "Thinking effort");
   form.append(pill);
   composer.onPointerDown = closeMenu;
+  if (leftoverBareFamilyMenu) {
+    // A retained, opacity-0 family submenu with only family radios (legacy
+    // family-menu shape, no slider / advanced view, no data-state).
+    const leftover = new FakeElement("div", { role: "menu", style: "opacity:0" });
+    for (const label of families) {
+      leftover.append(new FakeElement("div", { role: "menuitemradio", "aria-checked": String(label === "GPT-5.6 Sol") }, label));
+    }
+    body.append(leftover);
+  }
+  if (leftoverWrappedHiddenMenu) {
+    // A retained full picker menu inside a display:none portal wrapper, with
+    // no data-state anywhere on the chain.
+    const wrapper = new FakeElement("div", { style: "display:none" });
+    const leftover = new FakeElement("div", { role: "menu" });
+    leftover.append(new FakeElement("div", { role: "menuitem", "aria-label": "Select model", tabindex: "0" }, "Pro"));
+    const view = new FakeElement("div", { "data-testid": "composer-model-picker-slider-advanced-view" });
+    for (const label of families) {
+      view.append(new FakeElement("div", { role: "menuitemradio", "aria-checked": String(label === "GPT-5.6 Sol") }, label));
+    }
+    leftover.append(view);
+    wrapper.append(leftover);
+    body.append(wrapper);
+  }
   if (leftoverHiddenFamilyMenu) {
     // A stale, display:none family menu left over from an earlier picker
     // interaction; it must never count as the mounted-open picker.

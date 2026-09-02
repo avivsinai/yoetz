@@ -95,19 +95,29 @@
     if (typeof NativeIntersectionObserver === "function") {
       const observerCallbacks = new WeakMap();
       const observerTargets = new WeakMap();
+      const observerDelivered = new WeakMap();
+      // The lazily mounted header only needs the assist during hydration;
+      // after that window, background lazy-loaders (sidebar pagination,
+      // media) keep their native behavior so a hidden tab cannot page
+      // itself into the account rate limit.
+      const assistUntil = performance.now() + 90000;
       window.IntersectionObserver = class YoetzIntersectionObserver extends NativeIntersectionObserver {
         constructor(callback, init) {
           super(callback, init);
           observerCallbacks.set(this, callback);
           observerTargets.set(this, new Set());
+          observerDelivered.set(this, new WeakSet());
         }
         observe(target) {
           super.observe(target);
-          const targets = observerTargets.get(this);
-          targets?.add(target);
-          if (!reallyHidden()) return;
+          observerTargets.get(this)?.add(target);
+          if (!reallyHidden() || performance.now() > assistUntil) return;
+          if (observerDelivered.get(this)?.has(target)) return;
           setTimeout(() => {
+            if (!reallyHidden()) return;
             if (!observerTargets.get(this)?.has(target)) return;
+            if (observerDelivered.get(this)?.has(target)) return;
+            observerDelivered.get(this)?.add(target);
             const rect = target?.getBoundingClientRect?.()
               ?? { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
             const viewport = {
@@ -116,7 +126,7 @@
               right: window.innerWidth, bottom: window.innerHeight
             };
             try {
-              observerCallbacks.get(this)?.([{
+              observerCallbacks.get(this)?.call(this, [{
                 target,
                 isIntersecting: true,
                 intersectionRatio: 1,
@@ -159,9 +169,13 @@
           ? setTimeout(() => {
             if (!idleRequests.delete(nativeId)) return;
             nativeCancelIdle?.(nativeId);
-            // Present a normal idle slice, not a timed-out one, so callers
-            // do the real work instead of their degraded path.
-            callback({ didTimeout: false, timeRemaining: () => 16 });
+            // Present a normal, shrinking idle slice (not a timed-out one) so
+            // callers do the real work and their time-slicing loops end.
+            const sliceStart = performance.now();
+            callback({
+              didTimeout: false,
+              timeRemaining: () => Math.max(0, 16 - (performance.now() - sliceStart))
+            });
           }, Math.min(Number(options?.timeout) || 200, 200))
           : null;
         idleRequests.set(nativeId, timer);
@@ -186,8 +200,12 @@
     document.documentElement.setAttribute("data-yoetz-shim", "1");
     const hydrationPoll = setInterval(() => {
       try {
-        const pill = document.querySelector('button.__composer-pill[aria-haspopup="menu"]');
-        if (pill && Object.keys(pill).some((key) => key.startsWith("__react"))) {
+        // Same shape the driver's findModelButton accepts: any composer menu
+        // trigger, not only the current pill class, so class drift alone
+        // cannot leave the flag unset.
+        const pills = document.querySelectorAll('button.__composer-pill[aria-haspopup="menu"], form button[aria-haspopup="menu"]');
+        const hydrated = Array.from(pills).some((pill) => Object.keys(pill).some((key) => key.startsWith("__react")));
+        if (hydrated) {
           document.documentElement.setAttribute("data-yoetz-hydrated", "1");
           clearInterval(hydrationPoll);
         }

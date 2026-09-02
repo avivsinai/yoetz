@@ -99,6 +99,33 @@ test("hidden tab: observe delivers exactly one synthetic intersecting entry with
   assert.equal(Object.keys(io).includes("__yoetzCallback"), false);
 });
 
+test("hidden tab: repeated observe of one target delivers once, with the observer as this", async () => {
+  const { win } = loadShim({ hidden: true });
+  const calls = [];
+  const io = new win.IntersectionObserver(function (entries, observer) { calls.push([this === io, observer === io, entries.length]); });
+  const t = target();
+  io.observe(t);
+  io.observe(t);
+  io.observe(t);
+  await tick(20);
+  assert.deepEqual(calls, [[true, true, 1]]);
+});
+
+test("hidden tab: requestIdleCallback fallback slice shrinks toward zero", async () => {
+  const { win } = loadShim({ hidden: true });
+  let first = null;
+  let later = null;
+  win.requestIdleCallback((deadline) => {
+    first = deadline.timeRemaining();
+    const spin = performance.now() + 20;
+    while (performance.now() < spin) { /* burn the slice */ }
+    later = deadline.timeRemaining();
+  });
+  await tick(300);
+  assert.ok(first > 0 && first <= 16, `first=${first}`);
+  assert.equal(later, 0);
+});
+
 test("hidden tab: unobserve or disconnect before delivery drops the synthetic entry", async () => {
   const { win } = loadShim({ hidden: true });
   let calls = 0;
@@ -127,11 +154,11 @@ test("visible tab: observe delivers no synthetic entry and still observes native
 test("hidden tab: requestIdleCallback fires once from the fallback timer as a normal idle slice", async () => {
   const { win, state } = loadShim({ hidden: true });
   const deadlines = [];
-  win.requestIdleCallback((deadline) => deadlines.push(deadline), { timeout: 5000 });
+  win.requestIdleCallback((deadline) => deadlines.push({ didTimeout: deadline.didTimeout, remaining: deadline.timeRemaining() }), { timeout: 5000 });
   await tick(400);
   assert.equal(deadlines.length, 1);
   assert.equal(deadlines[0].didTimeout, false);
-  assert.ok(deadlines[0].timeRemaining() > 0);
+  assert.ok(deadlines[0].remaining > 0);
   assert.deepEqual(state.nativeIdleFires, [], "native delivery must be cancelled after the fallback fired");
 });
 

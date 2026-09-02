@@ -415,28 +415,30 @@ function conversationUnavailableError(conversationId, currentConversationId, win
 async function waitForHiddenTabHydration(root, options = {}) {
   const doc = typeof root?.hidden === "boolean" ? root : root?.ownerDocument;
   if (doc?.hidden !== true) return "visible";
-  const deadline = Date.now() + Number(options.hydrationTimeoutMs ?? 30000);
-  const attr = (name) => doc.documentElement?.getAttribute?.(name) === "1";
+  const totalMs = Number(options.hydrationTimeoutMs ?? 30000);
   const stabilityMs = Number(options.hydrationStabilityMs ?? 3000);
+  const deadline = Date.now() + totalMs;
+  const attr = (name) => doc.documentElement?.getAttribute?.(name) === "1";
   const shimPresent = attr("data-yoetz-shim");
   // With the MAIN-world shim present it stamps data-yoetz-hydrated once the
   // composer pill carries a React fiber; the server-rendered skeleton is
   // stable but handler-less, so node stability must not short-circuit the
-  // flag wait. It serves only as a secondary gate once the flag times out
-  // (shim loaded but its pill probe never matched).
+  // flag wait. A short stability window is reserved at the END of the same
+  // total budget as a secondary gate for a shim whose pill probe never
+  // matched; the whole gate never exceeds hydrationTimeoutMs.
+  const reservedMs = shimPresent ? Math.min(Math.max(stabilityMs * 2, stabilityMs + 1000), totalMs / 2) : 0;
   if (shimPresent) {
-    while (Date.now() < deadline) {
+    const flagDeadline = deadline - reservedMs;
+    while (Date.now() < flagDeadline) {
       if (attr("data-yoetz-hydrated")) return "flag";
       await sleep(500);
     }
   }
-  const stabilityDeadline = shimPresent
-    ? Date.now() + Math.min(stabilityMs * 2, 10000)
-    : deadline;
   let last = findModelButton(root);
   let stableSince = Date.now();
-  while (Date.now() < stabilityDeadline) {
+  while (Date.now() < deadline) {
     await sleep(500);
+    if (shimPresent && attr("data-yoetz-hydrated")) return "flag";
     const current = findModelButton(root);
     if (!current || current !== last) {
       last = current;
@@ -482,6 +484,7 @@ export async function configureModelState(root, job = {}) {
     const pillText = modelControlLabel(modelButton);
     if (!modelButton || !pillText) {
       return {
+        hydration_signal: hydrationSignal,
         status: "unavailable",
         model_used: null,
         requested_model: "current",
@@ -493,6 +496,7 @@ export async function configureModelState(root, job = {}) {
       };
     }
     return {
+      hydration_signal: hydrationSignal,
       status: "current",
       model_used: pillText ?? "",
       requested_model: "current",
@@ -1343,14 +1347,15 @@ function pickerMenuMounted(root) {
   return Array.from(root.querySelectorAll?.('[role="menu"]') ?? []).some((menu) => {
     if (menu.getAttribute?.("data-state") === "closed") return false;
     if (!pickerSurfaceIsOpen(menu)) return false;
-    // Structural readability (not opacity) gates the signal, so a stale
-    // display:none menu can never suppress activation, while the
-    // mid-animation opacity-0 menu still counts.
-    if (!structurallyReadablePickerItem(menu, menu)) return false;
+    // Structural readability up to the document root (not opacity) gates the
+    // signal, so a stale menu hidden by itself or by any ancestor wrapper
+    // can never count, while the mid-animation opacity-0 menu still does.
+    if (!structurallyReadablePickerItem(menu, null)) return false;
     const hasToggle = Array.from(menu.querySelectorAll?.('[role="menuitem"]') ?? [])
       .some((item) => isSelectModelViewToggle(item) && structurallyReadablePickerItem(item, menu));
-    const hasFamily = familyMenuRadios(menu, true).length > 0;
-    return hasToggle || hasFamily;
+    // Exactly the hallmarks classification accepts: a bare family submenu
+    // (radios only) is not a picker surface and must not be counted here.
+    return hasToggle || hybridFamilyView(menu, true);
   });
 }
 
@@ -1376,7 +1381,10 @@ async function openModelPicker(root, modelButton, options = {}) {
     if (opened()) return true;
     const currentButton = button;
     const openedOrTriggered = () => openSignal() || modelPickerTriggerIsOpen(currentButton);
-    if (!modelPickerTriggerIsOpen(currentButton) && !openSignal()) {
+    // Radix opens on pointerdown, which always goes out before the abort
+    // check, so a pre-existing mounted menu can delay but never suppress
+    // activation; it only stops the trailing phases.
+    if (!modelPickerTriggerIsOpen(currentButton)) {
       for (const activate of [openWithPointerEvents, pressEnter, pressSpace]) {
         try {
           if (await activate(currentButton, openedOrTriggered, { settleMs })) break;
@@ -1706,7 +1714,17 @@ async function reverifyModelSelectionAfterClose(root, modelButton, options = {})
     post_close_closed_pill_text: closedPill.closed_pill_text,
     post_close_failure_reason: disabledPro
       ? "effort_options_disabled"
-      : null,
+      : familyStatus !== "verified"
+        ? "post_close_family_unverified"
+        : effortStatus !== "verified"
+          ? "post_close_effort_unverified"
+          : !close.ok
+            ? "post_close_picker_close_failed"
+            : closedPill.closed_pill_effort_status !== "verified"
+              ? "post_close_closed_pill_effort_unverified"
+              : closedPill.closed_pill_family_status === "unverified"
+                ? "post_close_closed_pill_family_unverified"
+                : null,
     post_close_disabled_reason: disabledPro?.reason ?? null
   };
 }
@@ -1809,6 +1827,11 @@ async function waitForPickerState(root, options = {}) {
   return lastState;
 }
 
+function surfaceHasEffortRows(surface) {
+  return menuRadioItems(surface, true).some((item) => !isFamilyOptionLabel(optionLabel(item)))
+    || Boolean(disabledProEffortOption(surface));
+}
+
 function pickerStateIsReady(state) {
   const surface = state?.surface ?? state?.menu;
   if (!surface) return false;
@@ -1821,6 +1844,10 @@ function pickerStateIsReady(state) {
       ? state.family_trigger
       : null;
     if (familyItems.length === 0 && !familyTrigger) return false;
+    // A family view can mount before its effort controls; without an effort
+    // slider, tier rows, or the disabled ladder the surface is still
+    // hydrating and must keep the open/retry budget alive.
+    if (!state.effort_slider && !surfaceHasEffortRows(surface)) return false;
   }
   const style = surface.ownerDocument?.defaultView?.getComputedStyle?.(surface);
   if (style?.opacity !== "0") return true;
@@ -1857,6 +1884,7 @@ function findPickerState(root) {
   const mountedMenus = Array.from(root.querySelectorAll?.('[role="menu"]') ?? [])
     .filter((menu) => menu.getAttribute?.("data-state") !== "closed"
       && pickerSurfaceIsOpen(menu)
+      && structurallyReadablePickerItem(menu, null)
       && (hasSelectModelViewToggle(menu)
         || familyMenuRadios(menu, true).length > 0
         || menuRadioItems(menu, true).length > 0));

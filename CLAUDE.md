@@ -116,19 +116,27 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   page (interacting mid-hydration wedges an empty, handler-less menu, which
   the open loop recovers by Escape + reopen). The shim stamps
   `data-yoetz-shim` at document start and `data-yoetz-hydrated` on `<html>`
-  once the model pill carries a React fiber; with the shim marker present
-  the hydration gate waits ONLY for that flag (the skeleton pill is stable
-  within 3s, so node stability is the fallback solely when no shim marker
-  exists). The shim also fires IntersectionObserver entries and
-  requestIdleCallback in yoetz tabs — Chrome never delivers them to
-  background tabs, and the Chat/Work header mounts lazily behind them when
-  the account defaults to Work. ChatGPT rate-limits accounts that open many
+  once a composer menu trigger carries a React fiber; with the shim marker
+  present the hydration gate waits for that flag, reserving a short
+  node-stability window at the END of the same total budget as a secondary
+  gate (the skeleton pill is stable within 3s, so stability alone is never
+  a hydration proof); the whole gate never exceeds `hydration_timeout_ms`
+  and reports `hydration_signal`. The shim also fires IntersectionObserver entries (once per
+  target, only while genuinely hidden, only during the first 90s) and backs
+  requestIdleCallback with a shrinking timer slice in yoetz tabs — Chrome
+  never delivers them to background tabs, and the Chat/Work header mounts
+  lazily behind them when the account defaults to Work; native delivery is
+  never suppressed. ChatGPT rate-limits accounts that open many
   automation tabs quickly ("Too many requests" modal); it surfaces as
   composer/surface not found, so pace live verification runs. Radix opens
   on pointerdown and a trailing click on the open trigger toggles it closed, so the activation gesture must abort on the raw
-  mounted-open menu (`pickerMenuMounted`) even before classification; a
+  mounted-open menu (`pickerMenuMounted`, same hallmarks as classification,
+  ancestors structurally readable) even before classification — pointerdown
+  always goes out first, so a leftover menu can never suppress activation; a
   mounted-open menu whose pill wiring or CSS visibility has not settled is
-  classified structurally by content, and a pre-expanded family view (simple
+  classified structurally by content, and a slider-shape surface is not
+  ready until an effort control, tier rows, or the disabled ladder is
+  mounted, and a pre-expanded family view (simple
   view inert, slider degenerate) classifies from the inline family radios
   only when a parsable effort slider or the advanced-view container is
   present alongside them (a bare slider would match the personal picker's

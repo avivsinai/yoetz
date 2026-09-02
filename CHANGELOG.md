@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- ChatGPT recipe review follow-ups (cross-model + peer review of v0.5.66): a
+  retained bare family submenu or a picker menu hidden by an ancestor wrapper
+  can no longer suppress activation or be classified as the open picker;
+  a family view that mounts before its effort controls keeps the open/retry
+  budget instead of failing `effort_control_not_found` at once; the hidden-tab
+  hydration gate now fits inside `hydration_timeout_ms` (documented
+  accordingly) and stamps on any composer menu trigger, not only the current
+  pill class; `hydration_signal` is reported for `--followup` (current-model)
+  results too; `post_close_failure_reason` names every failing post-close
+  leg and the close-verification object is included in diagnostics.
+- Visibility shim hygiene: IntersectionObserver assist delivers once per
+  target, with the observer as `this`, only while genuinely hidden and only
+  during the first 90s (no background pagination storms); the
+  requestIdleCallback fallback slice shrinks to zero so time-slicing loops
+  terminate.
 
 ## [0.5.66] - 2026-09-02
 ### Fixed
