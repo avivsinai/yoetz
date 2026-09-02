@@ -12,7 +12,12 @@ test("manifest is one multi-site transport package", () => {
   assert.equal(manifest.minimum_chrome_version, "120");
   assert.equal(manifest.name, "Yoetz Native Transport");
   assert.deepEqual(manifest.host_permissions, ["https://chatgpt.com/*", "https://claude.ai/*"]);
-  assert.deepEqual(manifest.content_scripts[0].matches, ["https://chatgpt.com/*", "https://claude.ai/*"]);
+  const shimScript = manifest.content_scripts[0];
+  assert.deepEqual(shimScript.matches, ["https://chatgpt.com/*_yoetz=*"]);
+  assert.deepEqual(shimScript.js, ["src/page-visibility-shim.js"]);
+  assert.equal(shimScript.run_at, "document_start");
+  assert.equal(shimScript.world, "MAIN");
+  assert.deepEqual(manifest.content_scripts[1].matches, ["https://chatgpt.com/*", "https://claude.ai/*"]);
   assert.deepEqual(
     manifest.web_accessible_resources[0].matches,
     ["https://chatgpt.com/*", "https://claude.ai/*"]
