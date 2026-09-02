@@ -114,7 +114,25 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   visibility shim (injected only into `?_yoetz=` tabs) makes them hydrate;
   model selection waits for the composer pill to settle before touching the
   page (interacting mid-hydration wedges an empty, handler-less menu, which
-  the open loop recovers by Escape + reopen). When the account's effort
+  the open loop recovers by Escape + reopen). The shim stamps
+  `data-yoetz-shim` at document start and `data-yoetz-hydrated` on `<html>`
+  once the model pill carries a React fiber; with the shim marker present
+  the hydration gate waits ONLY for that flag (the skeleton pill is stable
+  within 3s, so node stability is the fallback solely when no shim marker
+  exists). The shim also fires IntersectionObserver entries and
+  requestIdleCallback in yoetz tabs — Chrome never delivers them to
+  background tabs, and the Chat/Work header mounts lazily behind them when
+  the account defaults to Work. ChatGPT rate-limits accounts that open many
+  automation tabs quickly ("Too many requests" modal); it surfaces as
+  composer/surface not found, so pace live verification runs. Radix opens
+  on pointerdown and a trailing click on the open trigger toggles it closed, so the activation gesture must abort on the raw
+  mounted-open menu (`pickerMenuMounted`) even before classification; a
+  mounted-open menu whose pill wiring or CSS visibility has not settled is
+  classified structurally by content, and a pre-expanded family view (simple
+  view inert, slider degenerate) classifies from the inline family radios
+  only when a parsable effort slider or the advanced-view container is
+  present alongside them (a bare slider would match the personal picker's
+  power control). When the account's effort
   quota is exhausted, ChatGPT keeps the tier rows mounted but disabled
   (aria-disabled + data-disabled, tooltip "Limit reached…"); the recipe
   fails closed with `effort_options_disabled` in both the selection and

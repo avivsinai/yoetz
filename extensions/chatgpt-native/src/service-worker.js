@@ -744,6 +744,7 @@ function modelSelectionFailureDiagnostics(selection) {
   const diagnostics = {};
   for (const key of [
     "failure_reason",
+    "hydration_signal",
     "picker_shape",
     "surface_trust",
     "surface_descendants",
@@ -754,6 +755,12 @@ function modelSelectionFailureDiagnostics(selection) {
     "effort_move_method",
     "picker_close_method",
     "picker_close_verification",
+    "post_close_failure_reason",
+    "post_close_disabled_reason",
+    "post_close_family_status",
+    "post_close_effort_status",
+    "post_close_picker_shape",
+    "post_close_closed_pill_text",
     "family_status",
     "effort_status",
     "picker_family_status",

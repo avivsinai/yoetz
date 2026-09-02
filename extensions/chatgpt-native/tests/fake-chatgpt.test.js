@@ -3154,6 +3154,108 @@ test("collapsed Select model view verifies Sol via expanded-toggle trust while t
   assert.equal(fixture.viewToggleClicks() > 0, true);
 });
 
+// Live failure shape from 2026-09-02: the menu mounts open at opacity 0
+// mid-animation, the pill has no aria-controls yet, the family radios are
+// still inert, so the freshly opened menu is not classifiable on the tick
+// the gesture checks it — and the gesture's trailing click toggles it closed.
+test("mid-animation unclassifiable menu is not toggled closed by the trailing click", async () => {
+  const fixture = makeHybridSimpleViewFixture({
+    pillAriaControls: false,
+    collapsedFamilyView: true,
+    opacity: "0",
+    clickToggles: true
+  });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+});
+
+test("hidden tab with the shim present waits for hydration instead of node stability", async () => {
+  const fixture = makeHybridSimpleViewFixture({ pillAriaControls: false, collapsedFamilyView: true });
+  fixture.doc.hidden = true;
+  fixture.doc.documentElement.setAttribute("data-yoetz-shim", "1");
+  setTimeout(() => fixture.doc.documentElement.setAttribute("data-yoetz-hydrated", "1"), 6000);
+  const startedAt = Date.now();
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.ok(Date.now() - startedAt >= 6000, "a stable skeleton pill must not short-circuit the hydration wait");
+});
+
+test("hidden tab waits for the shim's hydration flag before touching the page", async () => {
+  const fixture = makeHybridSimpleViewFixture({ pillAriaControls: false, collapsedFamilyView: true });
+  fixture.doc.hidden = true;
+  fixture.doc.documentElement.setAttribute("data-yoetz-shim", "1");
+  fixture.doc.documentElement.setAttribute("data-yoetz-hydrated", "1");
+  const startedAt = Date.now();
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.ok(Date.now() - startedAt < 10000, "flagged hydration must not wait for the fallback budget");
+});
+
+test("hidden tab without a hydration flag falls back to node stability within its budget", async () => {
+  const fixture = makeHybridSimpleViewFixture({ pillAriaControls: false, collapsedFamilyView: true });
+  fixture.doc.hidden = true;
+  const result = await configureModelState(fixture.doc, {
+    hydration_timeout_ms: 1500,
+    hydration_stability_ms: 500
+  });
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+});
+
+// Live state from 2026-09-02 stage probe: the menu opens with the family view
+// already expanded — the simple view (and the Select-model toggle inside it)
+// is inert+aria-hidden, the slider is the degenerate Instant control — so the
+// readable inline family radios are the only classification anchor.
+test("pre-expanded menu with an inert simple view classifies from the inline family radios", async () => {
+  const fixture = makeHybridSimpleViewFixture({
+    pillAriaControls: false,
+    simpleViewInert: true,
+    sliderLabel: "Instant",
+    sliderNow: 1,
+    sliderMin: 1,
+    sliderMax: 1
+  });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.family_status, "verified", JSON.stringify(result));
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+  assert.equal(result.failure_reason, "effort_control_not_found");
+});
+
+test("inline family radios beside a Faster/Smarter power slider never drag the power slider", async () => {
+  const fixture = makeHybridSimpleViewFixture({
+    pillAriaControls: false,
+    simpleViewInert: true,
+    sliderAriaLabel: "Faster to Smarter",
+    sliderLabel: "Balanced",
+    sliderNow: 1,
+    sliderMin: 1,
+    sliderMax: 3
+  });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.effort_status, "unverified");
+  assert.equal(fixture.sliderKeys(), 0, "power slider must not receive key presses");
+  assert.equal(fixture.sliderNow(), 1);
+});
+
+test("a stale display:none family menu does not suppress picker activation", async () => {
+  const fixture = makeHybridSimpleViewFixture({ leftoverHiddenFamilyMenu: true });
+  const startedAt = Date.now();
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.ok(Date.now() - startedAt < 10000, "activation must not burn the open-retry budget");
+});
+
 test("collapsed Select model view tolerates a retained closed menu with a stale expanded toggle", async () => {
   const fixture = makeHybridSimpleViewFixture({
     pillAriaControls: false,
@@ -3229,11 +3331,10 @@ test("thinking-effort list picker fails closed when Pro is missing", async () =>
   const fixture = makeThinkingEffortListFixture({ efforts: ["Medium", "High"] });
   const result = await configureModelState(fixture.doc, {});
 
-  // A ladder without Pro never classifies as a supported picker shape, so the
-  // failure surfaces as an unclassified open rather than a missing control.
   assert.equal(result.status, "unavailable");
-  assert.equal(result.failure_reason, "model_picker_open_failed");
-  assert.equal(result.family_status, "unverified");
+  assert.equal(result.failure_reason, "effort_control_not_found");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "unverified");
 });
 
 test("wedged empty menus are closed and reopened until items hydrate", async () => {
@@ -4363,7 +4464,11 @@ function makeHybridSimpleViewFixture({
   pillAriaControls = true,
   collapsedFamilyView = false,
   expandStalls = false,
-  familyWrapperOpacityOnExpand = "0"
+  familyWrapperOpacityOnExpand = "0",
+  clickToggles = false,
+  simpleViewInert = false,
+  sliderAriaLabel = null,
+  leftoverHiddenFamilyMenu = false
 } = {}) {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
@@ -4373,6 +4478,7 @@ function makeHybridSimpleViewFixture({
   let currentFamily = family;
   let currentNow = sliderNow;
   let viewToggleClicks = 0;
+  let sliderKeys = 0;
   const ordinal = () => currentNow - sliderMin + 1;
   const total = sliderMax - sliderMin + 1;
   const valueText = () => `${sliderLabel}, ${ordinal()} of ${total}.`;
@@ -4408,10 +4514,12 @@ function makeHybridSimpleViewFixture({
     const slider = new FakeElement("span", {
       role: "slider",
       "aria-hidden": "true",
+      ...(sliderAriaLabel ? { "aria-label": sliderAriaLabel } : {}),
       "aria-valuemin": String(sliderMin),
       "aria-valuemax": String(sliderMax),
       "aria-valuenow": String(currentNow),
       onKeyDown: (event) => {
+        sliderKeys += 1;
         if (event.key === "End") {
           currentNow = sliderMax;
           slider.setAttribute("aria-valuenow", String(currentNow));
@@ -4424,7 +4532,10 @@ function makeHybridSimpleViewFixture({
     const control = new FakeElement("div", {
       class: "group __menu-item d1BZWq_SliderControl"
     }).append(slider, label);
-    const simple = new FakeElement("div", { class: "d1BZWq_SimpleView" }).append(
+    const simple = new FakeElement("div", {
+      class: "d1BZWq_SimpleView",
+      ...(simpleViewInert ? { inert: "", "aria-hidden": "true" } : {})
+    }).append(
       new FakeElement("div", {}, "Pro"),
       control,
       new FakeElement("div", {}, "Use Left and Right arrow keys to adjust power.")
@@ -4484,15 +4595,37 @@ function makeHybridSimpleViewFixture({
     "data-state": startsOpen ? "open" : "closed",
     ...(pillAriaControls ? { "aria-controls": "hybrid-simple-menu" } : {}),
     onPointerDown: openMenu,
+    // Radix opens on pointerdown; a trailing click on the now-open trigger
+    // toggles it closed again.
+    onClick: () => {
+      if (clickToggles && menu?.getAttribute("data-state") === "open") closeMenu();
+    },
     onKeyDown: (event) => {
       if (event.key === "Escape") closeMenu();
     }
   }, "Thinking effort");
   form.append(pill);
   composer.onPointerDown = closeMenu;
+  if (leftoverHiddenFamilyMenu) {
+    // A stale, display:none family menu left over from an earlier picker
+    // interaction; it must never count as the mounted-open picker.
+    const leftover = new FakeElement("div", { role: "menu", style: "display:none" });
+    for (const label of families) {
+      leftover.append(new FakeElement("div", { role: "menuitemradio", "aria-checked": "false" }, label));
+    }
+    body.append(leftover);
+  }
   const doc = new FakeDocument(body);
   if (startsOpen) openMenu();
-  return { doc, pill, openMenu, closeMenu, viewToggleClicks: () => viewToggleClicks };
+  return {
+    doc,
+    pill,
+    openMenu,
+    closeMenu,
+    viewToggleClicks: () => viewToggleClicks,
+    sliderKeys: () => sliderKeys,
+    sliderNow: () => currentNow
+  };
 }
 
 // September 2026 "Thinking effort" list picker: one menu holding inline family
@@ -4597,7 +4730,12 @@ function makeThinkingEffortListFixture({
         }
       }));
     }
-    for (const radio of radios) menu.append(radio);
+    // Live DOM wraps the family + tier radios in the advanced-view container.
+    const advancedView = new FakeElement("div", {
+      "data-testid": "composer-model-picker-slider-advanced-view"
+    });
+    for (const radio of radios) advancedView.append(radio);
+    menu.append(advancedView);
     body.append(menu);
     pill.setAttribute("aria-expanded", "true");
     pill.setAttribute("data-state", "open");
