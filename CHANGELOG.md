@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.65] - 2026-09-02
 ### Fixed
 
 - The native ChatGPT recipe now survives the unified September 2026 picker
@@ -20,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   slider-move failures, in both the selection and post-close
   reverification legs. Effort diagnostics now include per-option disabled
   state.
+
 
 ## [0.5.64] - 2026-09-01
 ### Fixed
