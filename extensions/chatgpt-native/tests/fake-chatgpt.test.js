@@ -3194,6 +3194,88 @@ test("collapsed Select model view fails closed when the toggle never expands", a
   assert.equal(result.family_status, "unverified");
 });
 
+test("thinking-effort list picker clicks Pro and verifies Sol from inline radios", async () => {
+  const fixture = makeThinkingEffortListFixture();
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.picker_shape, "menu");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "verified");
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+  assert.equal(result.closed_pill_text, "Pro");
+  assert.notEqual(result.failure_reason, "effort_slider_move_failed");
+});
+
+test("thinking-effort list picker already at Pro verifies without clicking", async () => {
+  const fixture = makeThinkingEffortListFixture({ effort: "Pro" });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+});
+
+test("thinking-effort list picker at opacity 0 verifies via aria-controls structural trust", async () => {
+  const fixture = makeThinkingEffortListFixture({ opacity: "0" });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.surface_trust, "aria_controls_structural");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+});
+
+test("thinking-effort list picker fails closed when Pro is missing", async () => {
+  const fixture = makeThinkingEffortListFixture({ efforts: ["Medium", "High"] });
+  const result = await configureModelState(fixture.doc, {});
+
+  // A ladder without Pro never classifies as a supported picker shape, so the
+  // failure surfaces as an unclassified open rather than a missing control.
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_picker_open_failed");
+  assert.equal(result.family_status, "unverified");
+});
+
+test("wedged empty menus are closed and reopened until items hydrate", async () => {
+  const fixture = makeThinkingEffortListFixture({ emptyMenuOpens: 2 });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+});
+
+test("quota-locked effort ladder fails closed with effort_options_disabled and the limit reason", async () => {
+  const fixture = makeThinkingEffortListFixture({
+    effort: null,
+    effortsDisabled: true,
+    disabledReason: "Limit reached. Try again after Oct 1, 2026."
+  });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_options_disabled");
+  assert.equal(result.family_status, "verified");
+  assert.match(result.warning, /Limit reached\. Try again after Oct 1, 2026\./);
+});
+
+test("quota-locked effort ladder without a tooltip still names the disabled state", async () => {
+  const fixture = makeThinkingEffortListFixture({ effort: null, effortsDisabled: true });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_options_disabled");
+  assert.match(result.warning, /Pro effort is disabled/);
+});
+
+test("thinking-effort list picker with GPT-5.5 checked clicks Sol and verifies", async () => {
+  const fixture = makeThinkingEffortListFixture({ family: "GPT-5.5" });
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.family_label, "GPT-5.6 Sol");
+  assert.equal(result.model_used, "GPT-5.6 Sol Pro");
+});
+
 test("collapsed Select model view fails closed when only GPT-5.5 exists", async () => {
   const fixture = makeHybridSimpleViewFixture({
     pillAriaControls: false,
@@ -4411,6 +4493,133 @@ function makeHybridSimpleViewFixture({
   const doc = new FakeDocument(body);
   if (startsOpen) openMenu();
   return { doc, pill, openMenu, closeMenu, viewToggleClicks: () => viewToggleClicks };
+}
+
+// September 2026 "Thinking effort" list picker: one menu holding inline family
+// radios (GPT-5.6 Sol / GPT-5.5), explicit effort radios (Medium / High /
+// Extra High / Pro), and a single-position "Instant, 1 of 1." speed slider
+// that must never be read as the effort control. The pill starts as
+// "Thinking effort" and carries aria-controls wiring.
+function makeThinkingEffortListFixture({
+  families = ["GPT-5.6 Sol", "GPT-5.5"],
+  family = "GPT-5.6 Sol",
+  efforts = ["Medium", "High", "Extra High", "Pro"],
+  effort = "High",
+  opacity = "1",
+  effortsDisabled = false,
+  disabledReason = null,
+  emptyMenuOpens = 0
+} = {}) {
+  const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
+  const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask anything").append(form);
+  appendChatSurfaceToggle(body);
+  let menu = null;
+  let currentFamily = family;
+  let currentEffort = effort;
+  const closeMenu = () => {
+    if (!menu) return;
+    body.children = body.children.filter((child) => child !== menu);
+    menu.parentElement = null;
+    menu = null;
+    pill.setAttribute("aria-expanded", "false");
+    pill.setAttribute("data-state", "closed");
+    pill.innerText = currentEffort;
+    pill.textContent = currentEffort;
+  };
+  let openCount = 0;
+  const openMenu = () => {
+    if (menu?.getAttribute("data-state") === "open") return;
+    openCount += 1;
+    menu = new FakeElement("div", {
+      id: "thinking-effort-list-menu",
+      role: "menu",
+      "data-state": "open",
+      style: `opacity:${opacity}`
+    });
+    // A menu opened mid-hydration mounts with no items at all.
+    if (openCount <= emptyMenuOpens) {
+      body.append(menu);
+      pill.setAttribute("aria-expanded", "true");
+      pill.setAttribute("data-state", "open");
+      return;
+    }
+    menu.append(new FakeElement("div", {}, "5.6 Sol"));
+    const instantSlider = new FakeElement("span", {
+      role: "slider",
+      "aria-hidden": "true",
+      "aria-valuemin": "0",
+      "aria-valuemax": "0",
+      "aria-valuenow": "0"
+    });
+    menu.append(new FakeElement("div", {}).append(
+      instantSlider,
+      new FakeElement("span", {}, "Instant, 1 of 1."),
+      new FakeElement("span", {}, "Use Left and Right arrow keys to adjust power.")
+    ));
+    const radios = [];
+    for (const label of families) {
+      radios.push(new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": String(label === currentFamily),
+        onClick: () => {
+          currentFamily = label;
+          for (const radio of radios) {
+            if (families.includes(radio.innerText)) {
+              radio.setAttribute("aria-checked", String(radio.innerText === label));
+            }
+          }
+        }
+      }, label));
+    }
+    // Live effort tier rows carry their label only through aria-label.
+    for (const label of efforts) {
+      radios.push(new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": String(label === currentEffort),
+        "aria-label": label,
+        ...(effortsDisabled
+          ? {
+              "aria-disabled": "true",
+              "data-disabled": "",
+              ...(disabledReason ? { "aria-describedby": "effort-limit-tip" } : {})
+            }
+          : {}),
+        onClick: () => {
+          if (effortsDisabled) return;
+          currentEffort = label;
+          for (const radio of radios) {
+            const radioLabel = radio.getAttribute("aria-label");
+            if (radioLabel && efforts.includes(radioLabel)) {
+              radio.setAttribute("aria-checked", String(radioLabel === label));
+            }
+          }
+        }
+      }));
+    }
+    for (const radio of radios) menu.append(radio);
+    body.append(menu);
+    pill.setAttribute("aria-expanded", "true");
+    pill.setAttribute("data-state", "open");
+  };
+  const pill = new FakeElement("button", {
+    class: "__composer-pill __composer-pill--neutral",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    "data-state": "closed",
+    "aria-controls": "thinking-effort-list-menu",
+    onPointerDown: openMenu,
+    onKeyDown: (event) => {
+      if (event.key === "Escape") closeMenu();
+    }
+  }, "Thinking effort");
+  form.append(pill);
+  if (disabledReason) {
+    body.append(new FakeElement("div", { id: "effort-limit-tip" }, disabledReason));
+  }
+  composer.onPointerDown = closeMenu;
+  const doc = new FakeDocument(body);
+  return { doc, pill, openMenu, closeMenu };
 }
 
 function makeOpacityZeroLeftoverFixture() {

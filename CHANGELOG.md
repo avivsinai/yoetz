@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+
+- The native ChatGPT recipe now survives the unified September 2026 picker
+  rollout: a main-world visibility shim (yoetz-owned tabs only) lets hidden
+  tabs hydrate, model selection waits for composer hydration and reopens
+  wedged empty menus, tier rows labeled only via aria-label classify
+  correctly, and the degenerate single-position "Instant" slider is never
+  read as the effort control.
+- When the account's effort quota is exhausted, ChatGPT disables the tier
+  ladder; the recipe now fails with `effort_options_disabled` (surfacing the
+  limit tooltip when available) instead of misleading picker-open or
+  slider-move failures, in both the selection and post-close
+  reverification legs. Effort diagnostics now include per-option disabled
+  state.
 
 ## [0.5.64] - 2026-09-01
 ### Fixed

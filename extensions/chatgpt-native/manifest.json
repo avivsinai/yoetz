@@ -31,6 +31,16 @@
   "content_scripts": [
     {
       "matches": [
+        "https://chatgpt.com/*_yoetz=*"
+      ],
+      "js": [
+        "src/page-visibility-shim.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": [
         "https://chatgpt.com/*",
         "https://claude.ai/*"
       ],
