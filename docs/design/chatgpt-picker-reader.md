@@ -73,9 +73,18 @@ Rules for `readPicker`:
   same value. This is what makes it snapshot-testable.
 - **Total.** Never throws; an unrecognized DOM yields `shape: null` with
   `diagnostics` populated. The driver decides what `null` means.
-- **Owns every DOM heuristic.** Every function in the table below moves under
-  it (or is deleted). Nothing outside the reader may call `querySelectorAll`
-  on a picker surface.
+- **Owns every DOM heuristic on the picker surface — and locates nothing.**
+  Every function in the table below moves under it (or is deleted). Nothing
+  outside the reader may call `querySelectorAll` on a picker surface. The
+  converse holds too: the reader never locates page-level controls. The
+  composer pill and any leftover picker triggers are **inputs** —
+  `readPicker(root, { pill, leftoverTriggers })` — found by the driver's
+  layout-dependent locators (`findModelButton` 152, `openComposerPickerLeftovers`
+  1026, `composerMenuTriggers`, `modelControlScopes`, `findComposer`), which
+  stay in `chatgpt-dom.js`. The reader imports nothing from `chatgpt-dom.js`;
+  a text-level test asserts none of those identifiers (nor `isVisible`,
+  `checkVisibility`, `getBoundingClientRect`, `getComputedStyle`) appear in
+  the reader module. (Ruling on amit-pi's Wave 1 question, 2026-09-03.)
 - `family.label` is derived from **text** of `menuitemradio` items matching
   `isFamilyOptionLabel` (`^gpt\b|^o3$`), never from aria-label (the tier rows
   are aria-label-only; keeping the asymmetry is what stops a tier row from
