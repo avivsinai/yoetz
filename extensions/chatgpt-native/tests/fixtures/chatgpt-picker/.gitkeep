@@ -1,0 +1,7 @@
+# Fixture directory for ChatGPT picker snapshots.
+#
+# Each file here is a serialized [role="menu"] captured by
+# scripts/capture-chatgpt-picker.mjs from a live ChatGPT tab. Named by date and
+# observed shape (see docs/design/chatgpt-picker-reader.md). The Wave 0
+# chatgpt-picker-reader.test.js loops this directory; with no fixtures present
+# the suite passes trivially. Add the six shape fixtures after Wave 0 lands.
