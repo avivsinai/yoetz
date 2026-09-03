@@ -5630,3 +5630,21 @@ function matchesSimpleSelector(element, selector) {
   }
   return text && selector === "*";
 }
+
+// Wave 2 marker: the value-based selectSolChatProModel driver path (consumes
+// readPicker) drives a quota-locked fixture to effort_options_disabled with
+// family verified — the field-observed behavior (enterprise account, the quota
+// lock is our oracle until Oct 1).
+test("Wave 2 driver: quota-locked fixture → effort_options_disabled, family verified", async () => {
+  const fixture = makeThinkingEffortListFixture({
+    effort: null,
+    effortsDisabled: true,
+    disabledReason: "Limit reached until 2026-10-01."
+  });
+  const result = await configureModelState(fixture.doc, {});
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_options_disabled");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.picker_family_status, "verified");
+  assert.match(result.warning, /Limit reached until 2026-10-01/);
+});

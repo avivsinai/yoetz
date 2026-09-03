@@ -32,7 +32,7 @@ const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
  * @property {"aria_controls_structural"|"visible"|null} trust
  * @property {boolean} ready       // finished mounting: family readable AND (effort control | tier rows | disabled ladder)
  * @property {{label:string|null, checked:boolean, options:string[], solOption:Element|null, checkedCount:number}} family
- * @property {{label:string|null, options:string[], disabled:boolean, disabledReason:string|null, control:Element|null, kind:"slider"|"rows"|"row"|null}} effort
+ * @property {{label:string|null, options:string[], items:Element[], disabled:boolean, disabledReason:string|null, control:Element|null, kind:"slider"|"rows"|"row"|null}} effort
  * @property {{familyTrigger:Element|null, viewToggle:Element|null, expanded:boolean}} nav   // how to reach the family view if it is collapsed
  * @property {Object} diagnostics  // {advanced_rows, effort_control, family_menu_probe} verbatim shapes
  */
@@ -843,7 +843,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
         trust: null,
         ready: false,
         family: { label: null, checked: false, options: [], solOption: null, checkedCount: 0 },
-        effort: { label: null, options: [], disabled: false, disabledReason: null, control: null, kind: null },
+        effort: { label: null, options: [], items: [], disabled: false, disabledReason: null, control: null, kind: null },
         nav: { familyTrigger: null, viewToggle: null, expanded: false },
         diagnostics: {
           advanced_rows: [],
@@ -873,12 +873,14 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
     let effortControl = null;
     let effortKind = null;
     let effortOptions = [];
+    let effortItems = [];
     let effortDisabled = false;
     let effortDisabledReason = null;
     if (state.shape === "personal") {
       effortLabel = state.effort_label ?? null;
       effortKind = "row";
       effortControl = state.effort_row ?? null;
+      effortItems = [];
     } else if (state.shape === "slider") {
       const snapshot = sliderEffortSnapshot(state.effort_slider, surface);
       if (snapshot) {
@@ -903,7 +905,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
         effortKind = "rows";
       }
     } else if (state.shape === "menu") {
-      const effortItems = (state.effort_items ?? [])
+      effortItems = (state.effort_items ?? [])
         .filter((item) => !isFamilyOptionLabel(optionLabel(item))
           && structurallyReadable(item, surface));
       effortOptions = effortItems.map((item) => optionLabel(item)).filter(Boolean);
@@ -943,6 +945,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
       effort: {
         label: effortLabel,
         options: effortOptions,
+        items: effortItems,
         disabled: effortDisabled,
         disabledReason: effortDisabledReason,
         control: effortControl,
@@ -968,7 +971,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
       trust: null,
       ready: false,
       family: { label: null, checked: false, options: [], solOption: null, checkedCount: 0 },
-      effort: { label: null, options: [], disabled: false, disabledReason: null, control: null, kind: null },
+      effort: { label: null, options: [], items: [], disabled: false, disabledReason: null, control: null, kind: null },
       nav: { familyTrigger: null, viewToggle: null, expanded: false },
       diagnostics: {
         advanced_rows: [],
@@ -990,52 +993,25 @@ export {
   textOf,
   foldedModelText,
   foldedFamilyLabel,
-  isFamilyOptionLabel,
   optionLabel,
-  effortOptionDisabled,
   itemIsChecked,
   familyIsSol,
   modelPickerTriggerIsOpen,
   pickerSurfaceIsOpen,
-  structurallyReadablePickerItem,
-  menuRadioItems,
   familyMenuRadios,
   disabledProEffortOption,
   isSelectModelViewToggle,
   expandedSelectModelView,
   activeFamilyView,
-  visibleMenus,
-  findMainModelMenu,
-  isEffortMenuLabels,
-  isMainModelMenu,
   findFamilySubmenu,
-  looksLikeLegacyAdvancedPicker,
-  looksLikePersonalPicker,
-  findPersonalPickerSurface,
-  surfaceHasParsableEffortSlider,
-  hasSelectModelViewToggle,
-  findAdvancedPickerSurface,
-  hybridFamilyView,
-  findSliderPickerSurface,
-  sliderLooksLikePowerControl,
-  sliderIsEffortControl,
   sliderEffortSnapshot,
-  effortLabelNearSlider,
-  structuralFamilyEvidence,
   structurallyOpenControlledSurfaceForTrigger,
-  readMenuPickerState,
-  readSliderPickerState,
-  readPersonalPickerState,
-  readStructurallyTrustedPickerState,
-  classifyPickerSurface,
-  surfaceHasEffortRows,
   pickerStateIsReady,
   findPickerState,
   isSupportedPickerShape,
   effortIsChatProTier,
   advancedViewRows,
   sliderEffortDiagnostics,
-  personalEffortDiagnostics,
   effortControlDiagnostics,
   effortDiagnostics
 };
