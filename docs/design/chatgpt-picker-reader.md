@@ -175,6 +175,34 @@ for interaction sequencing — open/abort/Escape/close — where the fake's
 event dispatch is the point. Target: fake suite shrinks to ~40 tests; reader
 suite is fixture-driven.
 
+## jsdom boundary (verified 2026-09-03, jsdom 30.0.1)
+
+jsdom has **no layout engine**: `getBoundingClientRect()` is always 0×0,
+`Element.checkVisibility` is undefined, `Element.inert` (the property) is
+undefined, and `getComputedStyle(child).display` does **not** cascade from a
+`display:none` ancestor. Today's `isVisible` (chatgpt-dom.js:4354) relies on
+`checkVisibility` and layout, so it cannot be the reader's visibility test.
+
+Consequences for the reader — these are requirements, not suggestions:
+
+- The reader's readability predicate walks ancestors itself and reads
+  **attributes and inline style only**: `hidden`, `aria-hidden="true"`,
+  the `inert` attribute, `data-state="closed"`, and inline
+  `display:none` / `visibility:hidden`. This is exactly what
+  `structurallyReadablePickerItem` (2288) does today, minus its
+  `getComputedStyle` call, and it matches invariant 4 (opacity never gates).
+- The reader never calls `isVisible`, `checkVisibility`, or
+  `getBoundingClientRect`. Anything needing geometry stays in the driver.
+- The capture script must therefore write **computed** `display`/`visibility`
+  onto the clone as inline style when they differ from the stylesheet
+  default (Wave 1 amends `scripts/capture-chatgpt-picker.mjs`: for each
+  element, if `getComputedStyle(live).display === "none"` or
+  `visibility === "hidden"`, set it inline on the clone). `inert` is already
+  copied as an attribute by the Wave 0 script.
+- Fixture assertions are therefore about structure and text, never about
+  geometry — which is the point: geometry is Chrome's business, the picker's
+  *meaning* is ours.
+
 ## Compatibility (what must not change)
 
 - `failure_reason` strings, all 26 of them (`grep -oE '"[a-z_]+_(failed|unverified|not_found|disabled|mismatch|detected)"'`), and the `status ∈ {selected,current,unavailable}` contract consumed by
