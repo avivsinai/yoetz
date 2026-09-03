@@ -1,0 +1,17 @@
+{
+  "_comment": "Expected PickerRead values per fixture, asserted by tests/chatgpt-picker-reader.test.js from Wave 1 on. Captured from live Enterprise ChatGPT tabs with the inline serializer described in docs/design/chatgpt-picker-reader.md (computed inert + display/visibility written back as attributes; script/svg/use/canvas bodies stripped).",
+  "2026-09-03-unified-quota-locked-family-expanded.html": {
+    "shape": "slider",
+    "ready": true,
+    "family": { "label": "GPT-5.6 Sol", "checked": true, "checkedCount": 1, "options": ["GPT-5.6 Sol", "GPT-5.5"] },
+    "effort": { "label": null, "disabled": true, "kind": "rows", "options": ["Medium", "High", "Extra High", "Pro"] },
+    "nav": { "expanded": true },
+    "_notes": [
+      "Account effort quota exhausted (Limit reached until 2026-10-01): all four tier rows carry aria-disabled=true + data-disabled; none is checked, so effort.label is null and effort.disabled is true.",
+      "Tier rows carry BOTH aria-label and visible text (design assumption 'aria-label only' was wrong as of this capture; isFamilyOptionLabel on text still excludes them from the family read).",
+      "Each tier row is wrapped in a tooltip <span data-state=closed>; pickerSurfaceIsOpen must not treat that wrapper as closing the row — the surface root has data-state=open.",
+      "Simple view (Power slider, 'Instant, 1 of 1.') is inert; the [role=slider] has aria-valuemin=aria-valuemax=0 and must never be read as the effort control.",
+      "Select-model toggle is inside an aria-hidden=true, inert wrapper with aria-expanded=true; ChatGPT now persists the expanded state, so the collapsed shape from 2026-09-01 is no longer reproducible on this account."
+    ]
+  }
+}
