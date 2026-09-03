@@ -112,7 +112,10 @@ const SERIALIZER = String.raw`
   }
 
   // Walk live and clone in parallel (same tree order) to copy live state onto
-  // the clone: computed inert as an attribute, and data-state/aria-* verbatim.
+  // the clone: computed inert as an attribute, data-state/aria-* verbatim, and
+  // computed display/visibility written inline when none/hidden (jsdom has no
+  // layout engine, so the reader's attribute+inline-style predicate cannot see
+  // stylesheet-driven display:none/visibility:hidden unless we bake them in).
   function sync(liveEl, cloneEl) {
     if (!liveEl || !cloneEl || cloneEl.nodeType !== 1) return;
     if (effectivelyInert(liveEl)) cloneEl.setAttribute('inert', '');
@@ -130,11 +133,21 @@ const SERIALIZER = String.raw`
     for (var j = 0; j < ariaNames.length; j++) {
       cloneEl.setAttribute(ariaNames[j], liveEl.getAttribute(ariaNames[j]));
     }
+    // Bake computed display/visibility inline so jsdom's attribute+inline-style
+    // readability predicate sees the same hidden state Chrome does. Only write
+    // when the computed value hides the node; never overwrite an existing
+    // inline value that already expresses the same intent.
+    var computed = liveEl.ownerDocument && liveEl.ownerDocument.defaultView
+      ? liveEl.ownerDocument.defaultView.getComputedStyle(liveEl) : null;
+    if (computed) {
+      if (computed.display === 'none') cloneEl.style.setProperty('display', 'none', 'important');
+      if (computed.visibility === 'hidden') cloneEl.style.setProperty('visibility', 'hidden', 'important');
+    }
     var liveKids = liveEl.children, cloneKids = cloneEl.children;
     var ci = 0;
     for (var li = 0; li < liveKids.length && ci < cloneKids.length; li++) {
-      // Skip live children that won't be in the clone (script/svg/use/canvas
-      // are kept but emptied below, so they still occupy a slot).
+      // Index parity holds only because cloneNode(true) preserves child order,
+      // so liveKids[i] corresponds to cloneKids[i] one-to-one.
       sync(liveKids[li], cloneKids[ci]);
       ci++;
     }
@@ -152,6 +165,12 @@ const SERIALIZER = String.raw`
   return clone.outerHTML;
 })
 `;
+
+// Serializer summary: clones the open menu, copies computed inert +
+// data-state/aria-* + computed display/visibility (when none/hidden) from the
+// live node onto the clone, strips the bodies of <script>/<svg>/<use>/<canvas>,
+// and returns outerHTML. Computed styles are baked in because jsdom has no
+// layout engine (see docs/design/chatgpt-picker-reader.md "jsdom boundary").
 
 async function main() {
   const args = parseArgs(process.argv);

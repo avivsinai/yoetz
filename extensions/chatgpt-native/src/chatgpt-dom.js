@@ -1,11 +1,90 @@
 export const YOETZ_WINDOW_PREFIX = "yoetz-chatgpt-native:";
 export const OWNERSHIP_ATTR = "data-yoetz-chatgpt-native-job";
+
+import {
+  readPicker,
+  normalizeText,
+  textOf,
+  foldedModelText,
+  foldedFamilyLabel,
+  isFamilyOptionLabel,
+  optionLabel,
+  effortOptionDisabled,
+  itemIsChecked,
+  familyIsSol,
+  modelPickerTriggerIsOpen,
+  pickerSurfaceIsOpen,
+  structurallyReadablePickerItem,
+  menuRadioItems,
+  familyMenuRadios,
+  disabledProEffortOption,
+  isSelectModelViewToggle,
+  expandedSelectModelView,
+  activeFamilyView as activeFamilyViewPure,
+  visibleMenus,
+  findMainModelMenu,
+  isEffortMenuLabels,
+  isMainModelMenu,
+  findFamilySubmenu,
+  looksLikeLegacyAdvancedPicker,
+  looksLikePersonalPicker,
+  findPersonalPickerSurface,
+  surfaceHasParsableEffortSlider,
+  hasSelectModelViewToggle,
+  findAdvancedPickerSurface,
+  hybridFamilyView,
+  findSliderPickerSurface,
+  sliderLooksLikePowerControl,
+  sliderIsEffortControl,
+  sliderEffortSnapshot,
+  effortLabelNearSlider,
+  structuralFamilyEvidence,
+  structurallyOpenControlledSurfaceForTrigger,
+  readMenuPickerState,
+  readSliderPickerState,
+  readPersonalPickerState,
+  readStructurallyTrustedPickerState,
+  classifyPickerSurface,
+  surfaceHasEffortRows,
+  pickerStateIsReady,
+  findPickerState as findPickerStatePure,
+  isSupportedPickerShape,
+  effortIsChatProTier,
+  advancedViewRows,
+  sliderEffortDiagnostics,
+  personalEffortDiagnostics,
+  effortControlDiagnostics,
+  effortDiagnostics
+} from "./chatgpt-picker-reader.js";
+
+// Re-export the helpers that moved to the reader so existing callers
+// (tests, sites/chatgpt.js `export *`) keep resolving them from here.
+export {
+  normalizeText,
+  readPicker
+};
 const DEFAULT_WAIT_TIMEOUT_MS = 15000;
 const DEFAULT_WAIT_INTERVAL_MS = 250;
 const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
 const MIN_IMPLICIT_SURFACE_ABSENCE_MS = 1500;
 const CHATGPT_SOL_CHAT_PRO_MODEL = "gpt-5-6-sol-chat-pro";
 const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
+
+// findPickerState / activeFamilyView wrappers: the driver calls these with the
+// pre-Wave-1 signature (root only). They locate the layout-dependent pill
+// and leftover composer triggers (which stay in this module) and pass them
+// into the pure reader so the reader never locates anything itself.
+function findPickerState(root) {
+  return findPickerStatePure(root, {
+    pill: findModelButton(root),
+    leftoverTriggers: openComposerPickerLeftovers(root).map((entry) => entry.trigger)
+  });
+}
+
+function activeFamilyView(root, mainMenu, trigger) {
+  return activeFamilyViewPure(root, mainMenu, trigger, findModelButton(root),
+    openComposerPickerLeftovers(root).map((entry) => entry.trigger));
+}
 const CHAT_SURFACE_GROUP_SELECTOR = '[role="radiogroup"][aria-label="Select chat surface"]';
 const CHAT_SURFACE_CHAT_SELECTOR = '[role="radio"][data-tpp-toggle-value="chatgpt"]';
 const CHAT_SURFACE_WORK_SELECTOR = '[role="radio"][data-tpp-toggle-value="work"]';
@@ -1048,7 +1127,6 @@ function modelControlLabel(node) {
   ].filter(Boolean).join(" "));
 }
 
-
 async function selectSolChatProModel(root, options = {}) {
   const base = {
     status: "unavailable",
@@ -1410,12 +1488,6 @@ async function openModelPicker(root, modelButton, options = {}) {
   // view sheds inert on a later frame.
   return Boolean(await waitForPickerState(root, options));
 }
-
-function modelPickerTriggerIsOpen(modelButton) {
-  return modelButton?.getAttribute?.("aria-expanded") === "true"
-    || modelButton?.getAttribute?.("data-state") === "open";
-}
-
 async function openFamilyPicker(root, mainMenu, trigger, options = {}) {
   if (!trigger) {
     return null;
@@ -1490,35 +1562,6 @@ async function readCheckedSolFamily(root, state, options = {}) {
     available_families: availableFamilies
   };
 }
-
-function isSelectModelViewToggle(node) {
-  return node?.getAttribute?.("role") === "menuitem"
-    && normalizeText(node.getAttribute?.("aria-label") ?? "").toLowerCase() === "select model";
-}
-
-// The hybrid picker keeps the family radios mounted but collapsed: the
-// advanced view carries `inert` plus an opacity-0 wrapper whose reveal
-// animation is rAF-driven and never settles in background tabs. The trigger's
-// aria-expanded="true" combined with the view shedding `inert` is the
-// structural open signal; opacity must not gate the read.
-function expandedSelectModelView(trigger, view) {
-  return isSelectModelViewToggle(trigger)
-    && trigger?.getAttribute?.("aria-expanded") === "true"
-    && Boolean(view)
-    && structurallyReadablePickerItem(view, view);
-}
-
-function activeFamilyView(root, mainMenu, trigger) {
-  if (!isSelectModelViewToggle(trigger)) return null;
-  const surface = mainMenu ?? findPickerState(root)?.surface;
-  const advancedViews = Array.from(surface?.querySelectorAll?.(
-    '[data-testid="composer-model-picker-slider-advanced-view"]'
-  ) ?? []);
-  const activeAdvancedView = advancedViews.find((view) => familyMenuRadios(view, true).length > 0);
-  if (activeAdvancedView) return activeAdvancedView;
-  return familyMenuRadios(surface, true).length > 0 ? surface : null;
-}
-
 async function openWithHoverEvents(element, isOpen, options = {}) {
   const settleMs = Number(options.settleMs ?? 150);
   const phases = [
@@ -1826,225 +1869,10 @@ async function waitForPickerState(root, options = {}) {
   }
   return lastState;
 }
-
-function surfaceHasEffortRows(surface) {
-  return menuRadioItems(surface, true).some((item) => !isFamilyOptionLabel(optionLabel(item)))
-    || Boolean(disabledProEffortOption(surface));
-}
-
-function pickerStateIsReady(state) {
-  const surface = state?.surface ?? state?.menu;
-  if (!surface) return false;
-  if (state?.shape === "slider") {
-    const familyItems = familyMenuRadios(surface, state.surface_trust === "aria_controls_structural");
-    const familyTrigger = state.family_trigger
-      && (isVisible(state.family_trigger, { allowDisabled: true })
-        || (state.surface_trust === "aria_controls_structural"
-          && structurallyReadablePickerItem(state.family_trigger, surface)))
-      ? state.family_trigger
-      : null;
-    if (familyItems.length === 0 && !familyTrigger) return false;
-    // A family view can mount before its effort controls; without an effort
-    // slider, tier rows, or the disabled ladder the surface is still
-    // hydrating and must keep the open/retry budget alive.
-    if (!state.effort_slider && !surfaceHasEffortRows(surface)) return false;
-  }
-  const style = surface.ownerDocument?.defaultView?.getComputedStyle?.(surface);
-  if (style?.opacity !== "0") return true;
-  if (state?.surface_trust !== "aria_controls_structural") return false;
-  const familyItems = familyMenuRadios(surface, true);
-  const familyTrigger = state.family_trigger
-    && structurallyReadablePickerItem(state.family_trigger, surface)
-    ? state.family_trigger
-    : null;
-  return familyItems.length > 0 || Boolean(familyTrigger);
-}
-
-function findPickerState(root) {
-  const menu = findMainModelMenu(root);
-  if (menu) return readMenuPickerState(menu, false);
-  const slider = readSliderPickerState(root);
-  if (slider) return slider;
-  const personal = findPersonalPickerSurface(root);
-  if (personal) return readPersonalPickerState(personal, false);
-  const controlledSurface = structurallyOpenControlledSurface(root);
-  if (controlledSurface) {
-    const classified = readStructurallyTrustedPickerState(controlledSurface);
-    if (classified) return classified;
-  }
-  for (const leftover of openComposerPickerLeftovers(root)) {
-    if (!leftover.surface) continue;
-    const classified = readStructurallyTrustedPickerState(leftover.surface);
-    if (classified) return classified;
-  }
-  // Last resort: a menu that mounted open with real picker content but whose
-  // pill wiring (aria-controls) or CSS visibility has not settled — common in
-  // a throttled hidden tab mid-open-animation. Trust it structurally by its
-  // content, not by the pill or by opacity.
-  const mountedMenus = Array.from(root.querySelectorAll?.('[role="menu"]') ?? [])
-    .filter((menu) => menu.getAttribute?.("data-state") !== "closed"
-      && pickerSurfaceIsOpen(menu)
-      && structurallyReadablePickerItem(menu, null)
-      && (hasSelectModelViewToggle(menu)
-        || familyMenuRadios(menu, true).length > 0
-        || menuRadioItems(menu, true).length > 0));
-  for (const menu of mountedMenus) {
-    const classified = readStructurallyTrustedPickerState(menu);
-    if (classified) return classified;
-  }
-  return null;
-}
-
 function structurallyOpenControlledSurface(root) {
   const trigger = findModelButton(root);
   return structurallyOpenControlledSurfaceForTrigger(root, trigger);
 }
-
-function structurallyOpenControlledSurfaceForTrigger(root, trigger) {
-  if (!modelPickerTriggerIsOpen(trigger)) return null;
-  const controlledId = trigger?.getAttribute?.("aria-controls");
-  if (!controlledId) return null;
-  const surface = root.getElementById?.(controlledId);
-  if (!surface) return null;
-  if (!pickerSurfaceIsOpen(surface)) return null;
-  if (surface.getAttribute?.("data-state") === "open") return surface;
-  const openChild = Array.from(surface.querySelectorAll?.('[role="menu"], [role="dialog"]') ?? [])
-    .find((node) => pickerSurfaceIsOpen(node) && node.getAttribute?.("data-state") === "open");
-  return openChild ? surface : null;
-}
-
-function readStructurallyTrustedPickerState(surface) {
-  if (!pickerSurfaceIsOpen(surface)) return null;
-  const direct = classifyPickerSurface(surface, true);
-  if (direct) return direct;
-  for (const nested of Array.from(surface.querySelectorAll?.('[role="menu"], [role="dialog"]') ?? [])
-    .filter((node) => pickerSurfaceIsOpen(node))) {
-    const classified = classifyPickerSurface(nested, true);
-    if (classified) return classified;
-  }
-  return null;
-}
-
-function classifyPickerSurface(surface, structurallyTrusted) {
-  if (!surface) return null;
-  const labels = menuRadioItems(surface, structurallyTrusted).map((item) => foldedModelText(optionLabel(item)));
-  if (isEffortMenuLabels(labels)) {
-    return readMenuPickerState(surface, structurallyTrusted);
-  }
-  if (looksLikePersonalPicker(surface)) {
-    return readPersonalPickerState(surface, structurallyTrusted);
-  }
-  if (surfaceHasParsableEffortSlider(surface)
-    || looksLikeLegacyAdvancedPicker(surface)
-    || hasSelectModelViewToggle(surface)
-    || hybridFamilyView(surface, structurallyTrusted)) {
-    return readSliderPickerState(surface.ownerDocument ?? surface, structurallyTrusted ? surface : null);
-  }
-  return null;
-}
-
-// The quota-locked unified picker exposes only a degenerate single-position
-// slider, so the "Select model" view toggle is the classification anchor.
-function hasSelectModelViewToggle(surface) {
-  return Array.from(surface?.querySelectorAll?.('[role="menuitem"]') ?? [])
-    .some((item) => isSelectModelViewToggle(item)
-      && (isVisible(item, { allowDisabled: true }) || structurallyReadablePickerItem(item, surface)));
-}
-
-function sliderLooksLikePowerControl(slider, surface) {
-  const direct = normalizeText([
-    slider?.getAttribute?.("aria-label"),
-    slider?.getAttribute?.("title"),
-    textOf(slider)
-  ].filter(Boolean).join(" "));
-  if (/\b(?:faster|smarter|speed|instant)\b/i.test(direct)) return true;
-  let ancestor = slider?.parentElement;
-  for (let depth = 0; ancestor && ancestor !== surface && depth < 4; depth += 1, ancestor = ancestor.parentElement) {
-    const text = normalizeText(textOf(ancestor));
-    if (/\beffort\b/i.test(text)) return false;
-    if (/\bspeed\b/i.test(text) || (/\bfaster\b/i.test(text) && /\bsmarter\b/i.test(text))) return true;
-  }
-  return false;
-}
-
-function surfaceHasParsableEffortSlider(surface) {
-  return Array.from(surface?.querySelectorAll?.('[role="slider"]') ?? [])
-    .some((slider) => !sliderLooksLikePowerControl(slider, surface) && sliderEffortSnapshot(slider, surface));
-}
-
-function looksLikeLegacyAdvancedPicker(surface) {
-  const text = normalizeText(textOf(surface));
-  return /\bAdvanced\b/i.test(text)
-    && /\bEffort\b/i.test(text)
-    && (surface.querySelectorAll?.('[role="slider"]')?.length ?? 0) > 0;
-}
-
-function looksLikePersonalPicker(node) {
-  const text = normalizeText(textOf(node));
-  return /\bFaster\b/i.test(text)
-    && /\bSmarter\b/i.test(text)
-    && /\bModel\b/i.test(text)
-    && /\bEffort\b/i.test(text)
-    && /\bSpeed\b/i.test(text)
-    && !/\bAdvanced\b/i.test(text);
-}
-
-function personalPickerSurfaceIsOpen(node) {
-  const state = node?.getAttribute?.("data-state");
-  if (state === "open") return true;
-  if (state === "closed") return false;
-  return Array.from(node.querySelectorAll?.('[role="menu"], [role="dialog"]') ?? [])
-    .some((child) => child.getAttribute?.("data-state") === "open");
-}
-
-function findPersonalPickerSurface(root) {
-  const candidates = Array.from(root.querySelectorAll('div, [role="menu"], [role="dialog"]'))
-    .filter((node) => pickerSurfaceIsOpen(node)
-      && personalPickerSurfaceIsOpen(node)
-      && isVisible(node, { allowDisabled: true }) && looksLikePersonalPicker(node));
-  return candidates.sort((left, right) => (
-    left.querySelectorAll?.("*")?.length ?? 0
-  ) - (
-    right.querySelectorAll?.("*")?.length ?? 0
-  ))[0] ?? null;
-}
-
-function readPersonalPickerState(surface, structurallyTrusted = false) {
-  const controls = Array.from(surface.querySelectorAll?.('[role="menuitem"], button') ?? []);
-  let familyEvidence = null;
-  const familyTrigger = controls.find((item) => {
-    const evidence = structuralFamilyEvidence(item);
-    if (evidence.label || evidence.ambiguous) familyEvidence = evidence;
-    return Boolean(evidence.label || evidence.ambiguous);
-  }) ?? controls.find((item) => /\bModel\b/i.test(textOf(item)) && item.getAttribute?.("aria-haspopup") === "menu") ?? null;
-  const effortRow = controls.find((item) => /\bEffort\b/i.test(textOf(item))) ?? null;
-  const effortLabel = labeledRowValue(effortRow, "Effort");
-  const familyLabel = familyEvidence?.label || labeledRowValue(familyTrigger, "Model");
-  if (!familyTrigger || !effortRow || !effortLabel || (!familyLabel && !familyEvidence?.ambiguous)) return null;
-  return {
-    shape: "personal",
-    menu: null,
-    surface,
-    family_trigger: familyTrigger,
-    family_label: familyLabel,
-    family_label_candidates: familyEvidence?.labels ?? (familyLabel ? [familyLabel] : []),
-    family_label_source: familyEvidence?.source ?? (familyLabel ? "labeled_row" : null),
-    family_label_ambiguous: familyEvidence?.ambiguous ?? false,
-    effort_row: effortRow,
-    effort_label: effortLabel,
-    effort_items: [],
-    effort_slider: null,
-    effort_move_method: null,
-    surface_trust: structurallyTrusted ? "aria_controls_structural" : "visible"
-  };
-}
-
-function labeledRowValue(row, label) {
-  const text = normalizeText(textOf(row)).replace(/\s+/g, " ");
-  const match = text.match(new RegExp(`^${label}\\s+(.+)$`, "i"));
-  return normalizeText(match?.[1] ?? "");
-}
-
 async function selectPersonalChatProEffort(root, initialState, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   if (!initialState?.effort_row) return { ok: false, state: initialState, method: null };
@@ -2086,281 +1914,6 @@ async function waitForFamilyMenu(root, mainMenu, trigger, options = {}) {
   }
   return null;
 }
-
-function findMainModelMenu(root) {
-  return visibleMenus(root).find((menu) => isMainModelMenu(menu)) ?? null;
-}
-
-// A main model effort menu requires the visible ChatGPT effort ladder.
-function isEffortMenuLabels(labels) {
-  return labels.includes("medium") && labels.includes("high") && labels.includes("pro");
-}
-
-function isMainModelMenu(menu) {
-  const labels = menuRadioItems(menu).map((item) => foldedModelText(optionLabel(item)));
-  return isEffortMenuLabels(labels);
-}
-
-function findFamilySubmenu(root, mainMenu) {
-  return visibleMenus(root).find((menu) => menu !== mainMenu && familyMenuRadios(menu).some((item) => familyIsSol(textOf(item)))) ?? null;
-}
-
-function visibleMenus(root) {
-  return Array.from(root.querySelectorAll('[role="menu"]'))
-    .filter((menu) => isVisible(menu) && pickerSurfaceIsOpen(menu));
-}
-
-function pickerSurfaceIsOpen(node) {
-  let current = node;
-  while (current) {
-    const state = current.getAttribute?.("data-state");
-    if (state === "closed") return false;
-    current = current.parentElement;
-  }
-  return true;
-}
-
-function readMenuPickerState(menu, structurallyTrusted = false) {
-  // The September 2026 picker can put family radios (GPT-5.6 Sol / GPT-5.5)
-  // inline next to the effort tiers in one menu; effort verification must
-  // only look at the non-family radios.
-  const effortItems = menuRadioItems(menu, structurallyTrusted)
-    .filter((item) => !isFamilyOptionLabel(optionLabel(item)));
-  const familyTrigger = Array.from(menu.querySelectorAll('[role="menuitem"]'))
-    .find((item) => {
-      const label = normalizeText(textOf(item));
-      return item.getAttribute?.("aria-haspopup") === "menu"
-        && /^(?:gpt|o\d)\b/i.test(label);
-    });
-  return {
-    shape: "menu",
-    menu,
-    surface: menu,
-    family_trigger: familyTrigger ?? null,
-    family_label: textOf(familyTrigger),
-    effort_items: effortItems,
-    effort_slider: null,
-    effort_move_method: null,
-    surface_trust: structurallyTrusted ? "aria_controls_structural" : "visible"
-  };
-}
-
-function readSliderPickerState(root, structurallyTrustedSurface = null) {
-  const surface = structurallyTrustedSurface ?? findSliderPickerSurface(root);
-  if (!surface) return null;
-  const structurallyTrusted = Boolean(structurallyTrustedSurface);
-  const inlineFamily = familyMenuRadios(surface, true);
-  if (inlineFamily.length > 0) {
-    const checked = inlineFamily.find((item) => itemIsChecked(item));
-    const effortSlider = Array.from(surface.querySelectorAll('[role="slider"]'))
-      .find((slider) => sliderIsEffortControl(slider, surface) && Boolean(sliderEffortSnapshot(slider, surface))) ?? null;
-    return {
-      shape: "slider",
-      menu: surface.getAttribute?.("role") === "menu" ? surface : null,
-      surface,
-      family_trigger: null,
-      family_label: checked ? textOf(checked) : "",
-      family_label_candidates: inlineFamily.map((item) => textOf(item)).filter(Boolean),
-      family_label_source: checked ? "inline_family_radio" : null,
-      family_label_ambiguous: false,
-      effort_items: [],
-      effort_slider: effortSlider,
-      effort_move_method: null,
-      surface_trust: structurallyTrusted ? "aria_controls_structural" : "visible"
-    };
-  }
-  let familyEvidence = null;
-  const familyTrigger = Array.from(surface.querySelectorAll('[role="menuitem"], button'))
-    .find((item) => isSelectModelViewToggle(item)
-      && (isVisible(item, { allowDisabled: true })
-        || structurallyReadablePickerItem(item, surface)))
-    ?? Array.from(surface.querySelectorAll('[role="menuitem"], button'))
-    .find((item) => {
-      const evidence = structurallyTrusted ? structuralFamilyEvidence(item) : null;
-      const label = evidence?.label ?? normalizeText(textOf(item));
-      if (evidence?.label || evidence?.ambiguous) familyEvidence = evidence;
-      if (item.getAttribute?.("aria-haspopup") === "menu" && /\bModel\b/i.test(textOf(item))) {
-        return structurallyTrusted || isVisible(item, { allowDisabled: true });
-      }
-      return (evidence?.ambiguous || (Boolean(label) && /^(?:gpt|o\d)\b/i.test(label)))
-        && (structurallyTrusted || isVisible(item, { allowDisabled: true }));
-    });
-  const effortSlider = Array.from(surface.querySelectorAll('[role="slider"]'))
-    .filter((slider) => structurallyTrusted || isVisible(slider) || Boolean(sliderEffortSnapshot(slider, surface)))
-    .find((slider) => sliderIsEffortControl(slider, surface) && Boolean(sliderEffortSnapshot(slider, surface))) ?? null;
-  return {
-    shape: "slider",
-    menu: null,
-    surface,
-    family_trigger: familyTrigger ?? null,
-    family_label: structurallyTrusted ? familyEvidence?.label ?? "" : textOf(familyTrigger),
-    family_label_candidates: structurallyTrusted ? familyEvidence?.labels ?? [] : [],
-    family_label_source: structurallyTrusted ? familyEvidence?.source ?? null : null,
-    family_label_ambiguous: structurallyTrusted ? familyEvidence?.ambiguous ?? false : false,
-    effort_items: [],
-    effort_slider: effortSlider,
-    effort_move_method: null,
-    surface_trust: structurallyTrusted ? "aria_controls_structural" : "visible"
-  };
-}
-
-function sliderIsEffortControl(slider, surface) {
-  const directLabel = normalizeText([
-    slider?.getAttribute?.("aria-label"),
-    slider?.getAttribute?.("title")
-  ].filter(Boolean).join(" "));
-  if (/\b(?:faster|smarter)\b/i.test(directLabel) || sliderLooksLikePowerControl(slider, surface)) return false;
-  if (/\beffort\b/i.test(directLabel)) return true;
-  if (sliderEffortSnapshot(slider, surface)) return true;
-
-  const labelledBy = normalizeText(slider?.getAttribute?.("aria-labelledby") ?? "")
-    .split(" ")
-    .map((id) => slider?.ownerDocument?.getElementById?.(id))
-    .filter(Boolean)
-    .map((node) => textOf(node))
-    .join(" ");
-  if (/\beffort\b/i.test(labelledBy)) return true;
-
-  let ancestor = slider?.parentElement;
-  while (ancestor && ancestor !== surface) {
-    const text = normalizeText(textOf(ancestor));
-    if (/\beffort\b/i.test(text) && !/\b(?:faster|smarter)\b/i.test(text)) return true;
-    ancestor = ancestor.parentElement;
-  }
-  return false;
-}
-
-function findSliderPickerSurface(root) {
-  const advanced = findAdvancedPickerSurface(root);
-  if (advanced) return advanced;
-  // Anchors for the hybrid slider shape, in order of specificity: a parsable
-  // effort slider, the collapsed "Select model" toggle, or — once that view
-  // is expanded and the simple view has gone inert — the inline family radios
-  // themselves.
-  return visibleMenus(root).find((menu) => (
-    (surfaceHasParsableEffortSlider(menu)
-      || hasSelectModelViewToggle(menu)
-      || hybridFamilyView(menu, false))
-      && !looksLikePersonalPicker(menu)
-  )) ?? null;
-}
-
-// The hybrid picker with its family view already expanded: inline family
-// radios alongside the (possibly degenerate) slider or the advanced-view
-// container. A bare family submenu (menu-shape or personal-shape pickers)
-// carries neither hallmark and must not classify as a slider surface.
-function hybridFamilyView(surface, structurallyTrusted = false) {
-  if (familyMenuRadios(surface, structurallyTrusted).length === 0) return false;
-  // A bare [role=slider] is not a hallmark: the personal picker's Faster/
-  // Smarter power slider would qualify and then be dragged as "effort".
-  return surfaceHasParsableEffortSlider(surface)
-    || Array.from(surface.querySelectorAll?.("*") ?? [])
-      .some((node) => node.getAttribute?.("data-testid") === "composer-model-picker-slider-advanced-view");
-}
-
-function findAdvancedPickerSurface(root) {
-  const candidates = Array.from(root.querySelectorAll('div, [role="dialog"]'))
-    .filter((node) => {
-      if (!isVisible(node, { allowDisabled: true }) || !pickerSurfaceIsOpen(node)) return false;
-      const text = normalizeText(textOf(node));
-      return /\bAdvanced\b/i.test(text)
-        && /\bFaster\b/i.test(text)
-        && /\bSmarter\b/i.test(text)
-        && /\bModel\b/i.test(text)
-        && /\bEffort\b/i.test(text)
-        && /\b(?:GPT|o\d)\b/i.test(text)
-        && Array.from(node.querySelectorAll?.('[role="slider"]') ?? [])
-          .some((slider) => isVisible(slider, { allowDisabled: true }) || Boolean(sliderEffortSnapshot(slider, node)));
-    });
-  return candidates.sort((left, right) => (
-    left.querySelectorAll?.("*")?.length ?? 0
-  ) - (
-    right.querySelectorAll?.("*")?.length ?? 0
-  ))[0] ?? null;
-}
-
-function menuRadioItems(menu, structurallyTrusted = false) {
-  return Array.from(menu?.querySelectorAll?.('[role="menuitemradio"]') ?? [])
-    .filter((item) => pickerSurfaceIsOpen(item)
-      && (isVisible(item) || (structurallyTrusted && structurallyReadablePickerItem(item, menu))));
-}
-
-function structurallyReadablePickerItem(item, surface) {
-  let current = item;
-  while (current) {
-    if (current.hidden
-      || current.getAttribute?.("hidden") != null
-      || current.getAttribute?.("aria-hidden") === "true"
-      || current.getAttribute?.("inert") != null) {
-      return false;
-    }
-    const style = current.ownerDocument?.defaultView?.getComputedStyle?.(current);
-    if (style && (style.visibility === "hidden"
-      || style.display === "none"
-      || style.contentVisibility === "hidden")) {
-      return false;
-    }
-    if (current === surface) break;
-    current = current.parentElement;
-  }
-  return true;
-}
-
-function isFamilyOptionLabel(value) {
-  return /^gpt\b|^o3$/i.test(normalizeText(value));
-}
-
-// The unified September 2026 picker labels its effort tier rows through
-// aria-label with no text content; label reads must accept either.
-function optionLabel(item) {
-  return normalizeText(textOf(item)) || normalizeText(item?.getAttribute?.("aria-label") ?? "");
-}
-
-function effortOptionDisabled(option) {
-  return option?.getAttribute?.("aria-disabled") === "true"
-    || option?.getAttribute?.("data-disabled") != null;
-}
-
-// When the account's effort quota is exhausted, ChatGPT keeps the tier rows
-// mounted but disables them (aria-disabled + data-disabled) — no selection
-// path exists until the limit resets. Detect that state so the failure names
-// the real cause instead of a generic open/move failure.
-function disabledProEffortOption(surface) {
-  const pro = Array.from(surface?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
-    .find((item) => !isFamilyOptionLabel(optionLabel(item))
-      && foldedModelText(optionLabel(item)).replace(/\s+/g, " ") === "pro");
-  if (!pro || !effortOptionDisabled(pro)) return null;
-  const describedBy = pro.getAttribute?.("aria-describedby");
-  const described = describedBy
-    ? normalizeText(textOf(pro.ownerDocument?.getElementById?.(describedBy)))
-    : "";
-  return {
-    option: pro,
-    reason: described || normalizeText(pro.getAttribute?.("title") ?? "") || null
-  };
-}
-
-function familyMenuRadios(menu, structurallyTrusted = false) {
-  return menuRadioItems(menu, structurallyTrusted).filter((item) => isFamilyOptionLabel(textOf(item)));
-}
-
-function effortIsChatProTier(state) {
-  if (state?.shape === "personal") {
-    const label = foldedModelText(state.effort_label).replace(/\s+/g, " ");
-    return label === "pro";
-  }
-  if (state?.shape === "slider") {
-    return sliderEffortSnapshot(state.effort_slider, state.surface)?.label === "pro";
-  }
-  const items = state?.effort_items ?? [];
-  const checked = items.find((item) => itemIsChecked(item));
-  return foldedModelText(optionLabel(checked)) === "pro";
-}
-
-function isSupportedPickerShape(state) {
-  return state?.shape === "menu" || state?.shape === "slider" || state?.shape === "personal";
-}
-
 function pillConfirmsEffortLabel(pillText, effortLabel) {
   const foldedPill = foldedModelText(pillText).replace(/\s+/g, " ");
   const foldedEffort = foldedModelText(effortLabel).replace(/\s+/g, " ");
@@ -2384,27 +1937,6 @@ function pillHasModelFamilyToken(pillText) {
     || /\bo\d(?:[\s.-]*\d)?\b/.test(foldedPill)
     || /\b\d+(?:\.\d+)+\b/.test(foldedPill);
 }
-
-function sliderEffortSnapshot(slider, surface = null) {
-  if (!slider) return null;
-  const valueText = normalizeText(slider.getAttribute?.("aria-valuetext") ?? "");
-  const nearbyLabel = valueText || effortLabelNearSlider(slider, surface);
-  const match = nearbyLabel.match(/^([A-Z][A-Za-z ]{1,24}),\s*(\d+)\s+of\s+(\d+)\s*\.?\s*$/);
-  const now = Number(slider.getAttribute?.("aria-valuenow"));
-  const min = Number(slider.getAttribute?.("aria-valuemin"));
-  const max = Number(slider.getAttribute?.("aria-valuemax"));
-  const ordinal = now - min + 1;
-  const total = max - min + 1;
-  if (!match || !Number.isFinite(now) || !Number.isFinite(min) || !Number.isFinite(max)
-    || max <= min || now < min || now > max || Number(match[2]) !== ordinal || Number(match[3]) !== total) {
-    return null;
-  }
-  // "Instant, n of m." is the speed control on the September 2026 list
-  // picker, not an effort tier; it must never be read as the effort slider.
-  if (foldedModelText(match[1]) === "instant") return null;
-  return { label: foldedModelText(match[1]), display_label: match[1], now, min, max, value_text: nearbyLabel };
-}
-
 function pickerVerifiedEffortLabel(state) {
   if (!state) return null;
   if (state.shape === "personal") return state.effort_label || null;
@@ -2443,86 +1975,6 @@ function combinedVerificationStatus(pickerStatus, closedStatus) {
   if (pickerStatus === "verified") return "verified";
   return pickerStatus ?? "unverified";
 }
-
-function effortLabelNearSlider(slider, surface) {
-  let scope = slider?.parentElement;
-  for (let depth = 0; scope && depth < 8; depth += 1, scope = scope.parentElement) {
-    const label = Array.from(scope.querySelectorAll?.("span, div") ?? [])
-      .map((node) => normalizeText(textOf(node)))
-      .find((text) => /^[A-Z][A-Za-z ]{1,24},\s*\d+\s+of\s+\d+\s*\.?$/.test(text));
-    if (label) return label;
-    if (scope === surface) break;
-  }
-  return "";
-}
-
-function structuralFamilyEvidence(control) {
-  const empty = { label: "", labels: [], source: null, ambiguous: false };
-  if (!control || control.getAttribute?.("aria-haspopup") !== "menu") return empty;
-  if (!/\bModel\b/i.test(textOf(control))) return empty;
-  const matches = Array.from(control.querySelectorAll?.("*") ?? [])
-    .map((node) => ({ node, label: normalizeText(textOf(node)) }))
-    .filter(({ label }) => /^(?:gpt|o\d)\b/i.test(label));
-  const labelsByFold = new Map();
-  for (const match of matches) {
-    const folded = foldedModelText(match.label);
-    if (!labelsByFold.has(folded)) labelsByFold.set(folded, match.label);
-  }
-  const labels = [...labelsByFold.values()];
-  if (labels.length > 1) {
-    return { label: "", labels, source: null, ambiguous: true };
-  }
-  if (matches.length === 0) return empty;
-  const explicit = matches.find(({ node }) => {
-    const ariaCurrent = normalizeText(node.getAttribute?.("aria-current") ?? "").toLowerCase();
-    return (ariaCurrent && ariaCurrent !== "false") || node.getAttribute?.("data-state") === "checked";
-  });
-  const selected = explicit ?? matches.reduce((deepest, match) => (
-    descendantDepth(match.node, control) >= descendantDepth(deepest.node, control) ? match : deepest
-  ));
-  const source = explicit
-    ? (selected.node.getAttribute?.("data-state") === "checked" ? "data_state_checked" : "aria_current")
-    : "deepest_unique";
-  return { label: selected.label, labels, source, ambiguous: false };
-}
-
-function descendantDepth(node, ancestor) {
-  let depth = 0;
-  for (let current = node; current && current !== ancestor; current = current.parentElement) depth += 1;
-  return depth;
-}
-
-function foldedFamilyLabel(value) {
-  return foldedModelText(value).replace(/\s+/g, " ").replace(/^gpt[\s-]*/, "");
-}
-
-function sliderEffortDiagnostics(slider, surface = null) {
-  const snapshot = sliderEffortSnapshot(slider, surface);
-  return snapshot ? {
-    role: "slider",
-    label: snapshot.label,
-    value_text: snapshot.value_text,
-    value_now: snapshot.now,
-    value_min: snapshot.min,
-    value_max: snapshot.max
-  } : null;
-}
-
-function personalEffortDiagnostics(state) {
-  if (!state?.effort_label) return null;
-  return {
-    role: "menuitem",
-    label: foldedModelText(state.effort_label).replace(/\s+/g, " "),
-    value_text: state.effort_label
-  };
-}
-
-function effortControlDiagnostics(state) {
-  if (state?.shape === "personal") return personalEffortDiagnostics(state);
-  if (state?.shape === "slider") return sliderEffortDiagnostics(state.effort_slider, state.surface);
-  return null;
-}
-
 async function moveEffortSliderToProTier(root, initialState, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   let state = initialState;
@@ -2612,23 +2064,6 @@ function clickSliderTrackMax(slider) {
   }
   return true;
 }
-
-function familyIsSol(value) {
-  return foldedModelText(value) === foldedModelText(CHATGPT_SOL_FAMILY_LABEL);
-}
-
-function itemIsChecked(item) {
-  return item?.getAttribute?.("aria-checked") === "true" || item?.getAttribute?.("data-state") === "checked";
-}
-
-function effortDiagnostics(items) {
-  return items.map((item) => ({
-    label: optionLabel(item),
-    checked: itemIsChecked(item),
-    disabled: effortOptionDisabled(item)
-  }));
-}
-
 function selectionFailure(base, modelButton, state, availableFamilies, warning, failureReason, options = {}) {
   const pickerFamily = isSupportedPickerShape(state) && familyIsSol(state?.family_label) ? "verified" : "unverified";
   const pickerEffort = isSupportedPickerShape(state) && effortIsChatProTier(state) ? "verified" : "unverified";
@@ -2672,28 +2107,6 @@ function selectionFailure(base, modelButton, state, availableFamilies, warning, 
     warning
   };
 }
-
-function advancedViewRows(surface) {
-  const advanced = Array.from(surface?.querySelectorAll?.("*") ?? [])
-    .find((node) => node.getAttribute?.("data-testid") === "composer-model-picker-slider-advanced-view");
-  return Array.from(advanced?.querySelectorAll?.("*") ?? [])
-    .filter((row) => ["menuitem", "menuitemcheckbox", "menuitemradio"].includes(row.getAttribute?.("role")))
-    .slice(0, 20)
-    .map((row) => {
-      const parts = Array.from(row.querySelectorAll?.("span, div") ?? [])
-        .map((node) => normalizeText(textOf(node)))
-        .filter((text, index, all) => text && all.indexOf(text) === index)
-        .slice(0, 2);
-      return {
-        role: row.getAttribute?.("role") ?? null,
-        checked: row.getAttribute?.("aria-checked") ?? null,
-        disabled: effortOptionDisabled(row),
-        label: row.getAttribute?.("aria-label") ?? parts[0] ?? normalizeText(textOf(row)),
-        value: parts[1] ?? null
-      };
-    });
-}
-
 function structuralSurfaceDescendants(surface) {
   return Array.from(surface?.querySelectorAll?.("*") ?? []).slice(0, 40).map((node) => ({
     tag: node.tagName?.toLowerCase?.() ?? "element",
@@ -2736,11 +2149,6 @@ function modelPillSummaryMatches(value) {
     || new RegExp(`^\\d+(?:\\.\\d+)+(?: sol)? (?:${effort})$`).test(folded)
     || /\bgpt[\s.-]*\d/.test(folded);
 }
-
-function foldedModelText(value) {
-  return normalizeText(value).toLowerCase();
-}
-
 function dispatchSyntheticEvent(element, type, constructorName, init = {}) {
   const win = element?.ownerDocument?.defaultView ?? globalThis;
   const EventConstructor = win?.[constructorName] ?? globalThis[constructorName] ?? win?.Event ?? globalThis.Event;
@@ -3528,15 +2936,6 @@ export async function confirmGenerationStopped(root = document, options = {}) {
     return { stopped, confirmed_idle: false, waited_ms: Date.now() - startedAt };
   }
 }
-
-export function normalizeText(value) {
-  return String(value ?? "")
-    .replace(/\r\n/g, "\n")
-    .replace(/[ \t]+\n/g, "\n")
-    .replace(/\n{3,}/g, "\n\n")
-    .trim();
-}
-
 function firstVisible(root, selectors) {
   return firstMatching(root, selectors, { allowHidden: false });
 }
@@ -4521,20 +3920,6 @@ function pickerAncestorDiagnostics(node) {
   }
   return ancestors;
 }
-
-function textOf(node) {
-  const inner = normalizeText(node?.innerText ?? "");
-  return inner || normalizeText(node?.textContent ?? "");
-}
-
-// Body-text reader for assistant ANSWER content nodes (markdown leaves), NOT control/label
-// nodes. Uses textContent, not innerText, on purpose: ChatGPT virtualizes/clips long assistant
-// turns, so innerText (layout-dependent) returns only the rendered head — observed live as a
-// single "I" for a completed 955 KB Pro review while the full answer sat in textContent. Because
-// callers pass markdown LEAF nodes (the [class*="markdown"] answer content, never the turn
-// container) and the result is still run through cleanAssistantText's per-line control/status
-// stripping, this recovers the full answer without pulling in reasoning/thinking-block text or
-// code-block "Copy code"/sr-only control lines (those are separate nodes and/or stripped lines).
 function bodyTextOf(node) {
   return normalizeText(node?.textContent ?? "");
 }
