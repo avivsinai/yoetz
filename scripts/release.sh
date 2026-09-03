@@ -222,6 +222,7 @@ if [[ "$skip_verify" -eq 0 ]]; then
   cargo test --workspace
   cargo clippy --workspace -- -D warnings
   cargo fmt --all -- --check
+  npm ci --prefix extensions/chatgpt-native --ignore-scripts
   node --test extensions/chatgpt-native/tests/*.test.js
   ./scripts/build-chatgpt-native-extension.sh --check
 fi

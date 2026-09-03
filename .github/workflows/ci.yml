@@ -137,6 +137,7 @@ jobs:
         run: ./scripts/build-live-cdp-daemon.sh --check
       - name: Verify ChatGPT native extension package
         run: ./scripts/build-chatgpt-native-extension.sh --check
+      - run: npm ci --prefix extensions/chatgpt-native --ignore-scripts
       - name: Test ChatGPT native extension
         run: node --test extensions/chatgpt-native/tests/*.test.js
       - run: npm ci --prefix scripts --omit=dev --ignore-scripts
