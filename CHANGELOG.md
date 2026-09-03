@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.67] - 2026-09-03
 ### Fixed
 
 - ChatGPT recipe review follow-ups (cross-model + peer review of v0.5.66): a
@@ -23,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   during the first 90s (no background pagination storms); the
   requestIdleCallback fallback slice shrinks to zero so time-slicing loops
   terminate.
+
 
 ## [0.5.66] - 2026-09-02
 ### Fixed

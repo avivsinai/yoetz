@@ -7,7 +7,7 @@ const siteAdapterModules = Object.freeze({
 // This literal is stamped by the release script. A content script already injected into an open
 // tab keeps its old source after an extension reload, so the live manifest version alone is not a
 // reliable freshness check.
-const CONTENT_SCRIPT_BUILD = "0.5.66";
+const CONTENT_SCRIPT_BUILD = "0.5.67";
 const NATIVE_JOB_COMMANDS_CAPABILITY = "native_job_commands_v1";
 const CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY = "chatgpt_click_bound_send_receipt_v1";
 const CONTENT_SCRIPT_INSTANCE_ID = `cs_${cryptoRandomId()}`;
