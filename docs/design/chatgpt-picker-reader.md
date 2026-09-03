@@ -77,10 +77,10 @@ Rules for `readPicker`:
   it (or is deleted). Nothing outside the reader may call `querySelectorAll`
   on a picker surface.
 - `family.label` is derived from **text** of `menuitemradio` items matching
-  `isFamilyOptionLabel` (`^gpt\b|^o3$`), never from aria-label (the tier rows
-  are aria-label-only; keeping the asymmetry is what stops a tier row from
-  being read as a family). This is today's `familyMenuRadios` rule and it is
-  preserved on purpose.
+  `isFamilyOptionLabel` (`^gpt\b|^o3$`). The 2026-09-03 capture shows tier
+  rows carry both `aria-label` and visible text, so the label *source* is not
+  what separates them — the `isFamilyOptionLabel` pattern is. This is
+  today's `familyMenuRadios` rule and it is preserved on purpose.
 - `effort.label` reads the checked tier row by `optionLabel` (text || aria-label),
   or the parsable slider snapshot (`Label, n of m.`), rejecting `instant`,
   `faster`, `smarter`, `speed` labels as power controls (today's
@@ -148,16 +148,22 @@ expand the family view, then serialize the open `[role="menu"]` with computed
 `<script>`/`<svg>` bodies stripped. It never touches the extension, the
 native host, or `inspect_run` (Rust→SW→CS, three layers — deliberately out of
 scope for the implementer). One file per observed shape, named by date and
-shape:
+shape. Captured so far (each with an `expectations.json` entry):
 
 ```
-2026-08-27-personal-picker-pro.html
-2026-08-30-hybrid-slider-inline-family.html
-2026-09-01-collapsed-select-model-inert.html
-2026-09-01-thinking-effort-list-aria-label-rows.html
-2026-09-02-unified-quota-locked-instant-slider.html
-2026-09-02-pre-expanded-family-view-empty-effort.html
+2026-09-03-unified-quota-locked-family-expanded.html   # the only shape this account renders today
 ```
+
+Still wanted, in priority order — each is a **state** ChatGPT can only be
+observed in, not a build we can force, so they are captured opportunistically
+and the reader is written against the historical fake fixtures for them until
+then: personal-account picker (needs the personal login);
+collapsed-`Select model` view (ChatGPT now persists the expanded state, so
+this needs a fresh account or a cleared `localStorage`); hybrid slider with
+a 5-position effort slider (needs Pro quota, i.e. after 2026-10-01);
+family view mounted before its effort controls (a hydration race — capture
+from a hidden tab). A fixture that cannot be captured is not blocking: the
+old fake-DOM test for that shape stays until it can be.
 
 `tests/chatgpt-picker-reader.test.js` loads each into a real DOM
 (`jsdom` as a **devDependency** in `extensions/chatgpt-native/package.json`,
