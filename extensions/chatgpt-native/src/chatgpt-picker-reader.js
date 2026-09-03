@@ -894,7 +894,8 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
         // still the active effort options of an open surface).
         const effortItems = Array.from(surface?.querySelectorAll?.('[role="menuitemradio"]') ?? [])
           .filter((item) => !isFamilyOptionLabel(optionLabel(item))
-            && item.getAttribute?.("data-state") !== "closed");
+            && item.getAttribute?.("data-state") !== "closed"
+            && structurallyReadable(item, surface));
         effortOptions = effortItems.map((item) => optionLabel(item)).filter(Boolean);
         const checkedEffort = effortItems.find((item) => itemIsChecked(item)) ?? null;
         effortLabel = checkedEffort ? optionLabel(checkedEffort) : null;
@@ -903,7 +904,8 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
       }
     } else if (state.shape === "menu") {
       const effortItems = (state.effort_items ?? [])
-        .filter((item) => !isFamilyOptionLabel(optionLabel(item)));
+        .filter((item) => !isFamilyOptionLabel(optionLabel(item))
+          && structurallyReadable(item, surface));
       effortOptions = effortItems.map((item) => optionLabel(item)).filter(Boolean);
       const checkedEffort = effortItems.find((item) => itemIsChecked(item)) ?? null;
       effortLabel = checkedEffort ? optionLabel(checkedEffort) : null;

@@ -92,3 +92,26 @@ test("reader module contains no layout-dependent identifiers (jsdom boundary loc
   }
   assert.deepEqual(failures, [], `forbidden identifiers found in reader: ${failures.join(", ")}`);
 });
+
+// Regression: a tier row inside an inert or display:none ancestor must not be
+// reported as a live effort option (fail-closed). Observed in Wave 1 review:
+// the slider-shape "rows" branch bypassed structurallyReadable, so an
+// aria-checked row under <div inert> became effort.label.
+test("readPicker ignores tier rows under inert/display:none ancestors (fail-closed)", () => {
+  // Slider-shape surface: the only checked tier row (Medium) is inside an
+  // inert wrapper; High is under display:none. Pro is readable but unchecked.
+  // Before F1, Medium leaked through as effort.label and High as an option.
+  const html = `<div role="menu" data-state="open">
+    <div role="menuitem" aria-label="Select model" aria-expanded="true"></div>
+    <div role="menuitemradio" aria-checked="true">GPT-5.6 Sol</div>
+    <div role="menuitemradio" aria-checked="false">GPT-5.5</div>
+    <div role="menuitemradio" aria-checked="false" aria-label="Pro">Pro</div>
+    <div inert><div role="menuitemradio" aria-checked="true" aria-label="Medium">Medium</div></div>
+    <div style="display:none"><div role="menuitemradio" aria-checked="true" aria-label="High">High</div></div>
+  </div>`;
+  const dom = new JSDOM(html);
+  const read = readPicker(dom.window.document);
+  assert.equal(read.shape, "slider");
+  assert.equal(read.effort.label, null, "inert/display:none checked rows must not become effort.label");
+  assert.deepEqual(read.effort.options, ["Pro"], "only the readable row should be an option");
+});
