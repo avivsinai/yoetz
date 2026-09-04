@@ -26,7 +26,7 @@ hidden tabs*. Today that knowledge is read in six places that must agree:
 |---|---|---|
 | `findPickerState` | 1863 | which surface is the picker, what shape |
 | `pickerStateIsReady` | 1835 | whether it has finished mounting |
-| `readCheckedSolFamily` | 1439 | which family is checked (3 trust legs) |
+| `readCheckedSolFamily` | 1439 | which family is checked (3 trust legs) — the *reveal* half stays in the driver as `revealFamily`; the *proof* half moves into the reader |
 | `effortIsChatProTier` | 2347 | which tier is checked (3 shapes) |
 | `disabledProEffortOption` | 2328 | whether the ladder is quota-locked |
 | `pickerMenuMounted` | 1346 | "is a picker open at all" for the click-abort |
@@ -64,8 +64,17 @@ One plain object, produced by one pure function, consumed by everyone.
  * @property {{familyTrigger:Element|null, viewToggle:Element|null, expanded:boolean}} nav   // how to reach the family view if it is collapsed
  * @property {Object} diagnostics  // the current advanced_rows / effort_control / family_menu_probe shapes, verbatim
  */
-export function readPicker(root, { pill } = {}) → PickerRead
+export function readPicker(root, { pill, leftoverTriggers, familySurface } = {}) → PickerRead
 ```
+
+`familySurface` (Wave 2 amendment): for the `menu` and `personal` shapes the
+family radios live in a Radix **submenu** that exists only after the family
+trigger is hovered/activated, so a read of the main surface legitimately
+cannot see them. Revealing is a driver action (`revealFamily` — the existing
+`openFamilyPicker` gesture sequence, unchanged); the reader then reads the
+family from the passed `familySurface` with today's three-leg trust rule.
+Reveal and proof stay separated: the driver never derives a label, the reader
+never dispatches an event.
 
 Rules for `readPicker`:
 
