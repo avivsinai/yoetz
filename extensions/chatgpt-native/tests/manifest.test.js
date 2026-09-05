@@ -26,6 +26,7 @@ test("manifest is one multi-site transport package", () => {
     new Set(manifest.web_accessible_resources[0].resources),
     new Set([
       "src/chatgpt-dom.js",
+      "src/chatgpt-picker-reader.js",
       "src/claude-dom.js",
       "src/sites/chatgpt.js",
       "src/sites/chatgpt-backend.js",

@@ -32,7 +32,7 @@ const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
  * @property {"aria_controls_structural"|"visible"|null} trust
  * @property {boolean} ready       // finished mounting: family readable AND (effort control | tier rows | disabled ladder)
  * @property {{label:string|null, checked:boolean, options:string[], solOption:Element|null, checkedCount:number}} family
- * @property {{label:string|null, options:string[], disabled:boolean, disabledReason:string|null, control:Element|null, kind:"slider"|"rows"|"row"|null}} effort
+ * @property {{label:string|null, options:string[], items:Element[], disabled:boolean, disabledReason:string|null, control:Element|null, kind:"slider"|"rows"|"row"|null}} effort
  * @property {{familyTrigger:Element|null, viewToggle:Element|null, expanded:boolean}} nav   // how to reach the family view if it is collapsed
  * @property {Object} diagnostics  // {advanced_rows, effort_control, family_menu_probe} verbatim shapes
  */
@@ -833,7 +833,7 @@ function effortIsChatProTier(state) {
 // (Wave 2).
 // ---------------------------------------------------------------------------
 
-export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
+export function readPicker(root, { pill = null, leftoverTriggers = [], familySurface = null } = {}) {
   try {
     const state = findPickerState(root, { pill, leftoverTriggers });
     if (!state) {
@@ -843,7 +843,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
         trust: null,
         ready: false,
         family: { label: null, checked: false, options: [], solOption: null, checkedCount: 0 },
-        effort: { label: null, options: [], disabled: false, disabledReason: null, control: null, kind: null },
+        effort: { label: null, options: [], items: [], disabled: false, disabledReason: null, control: null, kind: null },
         nav: { familyTrigger: null, viewToggle: null, expanded: false },
         diagnostics: {
           advanced_rows: [],
@@ -857,28 +857,68 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
     const trust = state.surface_trust ?? null;
     const ready = pickerStateIsReady(state);
 
-    // Family value.
-    const familyRadios = state.shape === "menu" || state.shape === "slider"
-      ? familyMenuRadios(surface, trust === "aria_controls_structural")
+    // Family value. On the main surface the reader reads inline family
+    // radios. When the family lives in a Radix submenu (menu/personal shapes)
+    // the main surface has no inline radios; the driver reveals the submenu
+    // (revealFamily, clicks only) and passes it as familySurface. The reader
+    // then reads family from familySurface with the same three-leg trust rule
+    // readCheckedSolFamily used: controlled-by-trigger, aria_controls_structural
+    // + activeView, or expandedSelectModelView.
+    let familyRadios = state.shape === "menu" || state.shape === "slider"
+      ? familyMenuRadios(surface, true)
       : [];
+    let familyMenuProbe = null;
+    if (familyRadios.length === 0 && familySurface) {
+      const trigger = state.family_trigger ?? null;
+      const controlledSurface = structurallyOpenControlledSurfaceForTrigger(root, trigger);
+      const activeView = activeFamilyView(root, surface, trigger, pill, leftoverTriggers);
+      const familyTrusted = familySurface === controlledSurface
+        || (trust === "aria_controls_structural" && familySurface === activeView)
+        || (familySurface === activeView && expandedSelectModelView(trigger, familySurface));
+      familyRadios = familyMenuRadios(familySurface, familyTrusted);
+      familyMenuProbe = {
+        trigger_found: Boolean(trigger),
+        trigger_is_select_model_toggle: isSelectModelViewToggle(trigger),
+        trigger_expanded: trigger?.getAttribute?.("aria-expanded") ?? null,
+        menu_found: Boolean(familySurface),
+        menu_structurally_trusted: familyTrusted,
+        radio_count: familyRadios.length,
+        checked_count: familyRadios.filter((item) => item?.getAttribute?.("aria-checked") === "true").length
+      };
+    }
+    // When reading from a submenu (familySurface), the checked predicate is
+    // strict aria-checked === "true" (not itemIsChecked, which also accepts
+    // data-state=checked) — matching the legacy readCheckedSolFamily submenu
+    // read. The test fixture sets aria-checked=false + data-state=checked to
+    // exercise the strict requirement.
+    const familyChecked = familyMenuProbe
+      ? (item) => item?.getAttribute?.("aria-checked") === "true"
+      : itemIsChecked;
     const familyOptions = familyRadios.map((item) => optionLabel(item)).filter(Boolean);
-    const checkedFamily = familyRadios.find((item) => itemIsChecked(item)) ?? null;
+    const checkedFamily = familyRadios.find((item) => familyChecked(item)) ?? null;
     const solOption = familyRadios.find((item) => familyIsSol(optionLabel(item))) ?? null;
-    const familyLabel = state.family_label
-      ? (state.family_label || null)
-      : (checkedFamily ? optionLabel(checkedFamily) : null);
+    // When family was read from a submenu (familySurface), the label comes
+    // from the checked radio, not state.family_label (which is the trigger
+    // text like "Model\nGPT-5.6 Sol").
+    const familyLabel = familyMenuProbe
+      ? (checkedFamily ? optionLabel(checkedFamily) : null)
+      : (state.family_label
+        ? (state.family_label || null)
+        : (checkedFamily ? optionLabel(checkedFamily) : null));
 
     // Effort value.
     let effortLabel = null;
     let effortControl = null;
     let effortKind = null;
     let effortOptions = [];
+    let effortItems = [];
     let effortDisabled = false;
     let effortDisabledReason = null;
     if (state.shape === "personal") {
       effortLabel = state.effort_label ?? null;
       effortKind = "row";
       effortControl = state.effort_row ?? null;
+      effortItems = [];
     } else if (state.shape === "slider") {
       const snapshot = sliderEffortSnapshot(state.effort_slider, surface);
       if (snapshot) {
@@ -903,7 +943,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
         effortKind = "rows";
       }
     } else if (state.shape === "menu") {
-      const effortItems = (state.effort_items ?? [])
+      effortItems = (state.effort_items ?? [])
         .filter((item) => !isFamilyOptionLabel(optionLabel(item))
           && structurallyReadable(item, surface));
       effortOptions = effortItems.map((item) => optionLabel(item)).filter(Boolean);
@@ -926,7 +966,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
       : null;
     const expanded = viewToggle ? expandedSelectModelView(viewToggle, surface) : false;
 
-    const family_menu_probe = state.family_menu_probe ?? null;
+    const family_menu_probe = familyMenuProbe ?? state.family_menu_probe ?? null;
 
     return {
       shape: state.shape,
@@ -938,11 +978,12 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
         checked: Boolean(checkedFamily),
         options: familyOptions,
         solOption,
-        checkedCount: familyRadios.filter((item) => itemIsChecked(item)).length
+        checkedCount: familyRadios.filter((item) => familyChecked(item)).length
       },
       effort: {
         label: effortLabel,
         options: effortOptions,
+        items: effortItems,
         disabled: effortDisabled,
         disabledReason: effortDisabledReason,
         control: effortControl,
@@ -968,7 +1009,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
       trust: null,
       ready: false,
       family: { label: null, checked: false, options: [], solOption: null, checkedCount: 0 },
-      effort: { label: null, options: [], disabled: false, disabledReason: null, control: null, kind: null },
+      effort: { label: null, options: [], items: [], disabled: false, disabledReason: null, control: null, kind: null },
       nav: { familyTrigger: null, viewToggle: null, expanded: false },
       diagnostics: {
         advanced_rows: [],
@@ -990,52 +1031,25 @@ export {
   textOf,
   foldedModelText,
   foldedFamilyLabel,
-  isFamilyOptionLabel,
   optionLabel,
-  effortOptionDisabled,
   itemIsChecked,
   familyIsSol,
   modelPickerTriggerIsOpen,
   pickerSurfaceIsOpen,
-  structurallyReadablePickerItem,
-  menuRadioItems,
   familyMenuRadios,
   disabledProEffortOption,
   isSelectModelViewToggle,
   expandedSelectModelView,
   activeFamilyView,
-  visibleMenus,
-  findMainModelMenu,
-  isEffortMenuLabels,
-  isMainModelMenu,
   findFamilySubmenu,
-  looksLikeLegacyAdvancedPicker,
-  looksLikePersonalPicker,
-  findPersonalPickerSurface,
-  surfaceHasParsableEffortSlider,
-  hasSelectModelViewToggle,
-  findAdvancedPickerSurface,
-  hybridFamilyView,
-  findSliderPickerSurface,
-  sliderLooksLikePowerControl,
-  sliderIsEffortControl,
   sliderEffortSnapshot,
-  effortLabelNearSlider,
-  structuralFamilyEvidence,
   structurallyOpenControlledSurfaceForTrigger,
-  readMenuPickerState,
-  readSliderPickerState,
-  readPersonalPickerState,
-  readStructurallyTrustedPickerState,
-  classifyPickerSurface,
-  surfaceHasEffortRows,
   pickerStateIsReady,
   findPickerState,
   isSupportedPickerShape,
   effortIsChatProTier,
   advancedViewRows,
   sliderEffortDiagnostics,
-  personalEffortDiagnostics,
   effortControlDiagnostics,
   effortDiagnostics
 };
