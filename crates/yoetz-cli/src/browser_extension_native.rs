@@ -623,11 +623,18 @@ fn sync_extension_dir_exact(source_dir: &Path, extension_dir: &Path) -> Result<u
     if paths_refer_to_same_location(source_dir, extension_dir) {
         return Ok(0);
     }
-    if is_chatgpt_extension_source_dir(extension_dir)
-        && extension_dir_fingerprint(source_dir, None)?
-            == extension_dir_fingerprint(extension_dir, None)?
-    {
-        return Ok(0);
+    if is_chatgpt_extension_source_dir(extension_dir) {
+        // Identical package contents → already in sync. A fingerprint error
+        // (e.g. a legacy unpacked dir missing release-package files) falls
+        // through to a full re-copy, matching the pre-allow-list behavior.
+        if let (Ok(source_fp), Ok(target_fp)) = (
+            extension_package_fingerprint(source_dir),
+            extension_package_fingerprint(extension_dir),
+        ) {
+            if source_fp == target_fp {
+                return Ok(0);
+            }
+        }
     }
     copy_extension_dir_atomically(source_dir, extension_dir, None)
 }
@@ -744,8 +751,8 @@ fn managed_chatgpt_extension_needs_sync(source_dir: &Path, extension_dir: &Path)
         return Ok(true);
     }
     Ok(
-        extension_dir_fingerprint(source_dir, Some(&source_version))?
-            != extension_dir_fingerprint(extension_dir, Some(&source_version))?,
+        extension_package_fingerprint_with_version(source_dir, Some(&source_version))?
+            != extension_package_fingerprint_with_version(extension_dir, Some(&source_version))?,
     )
 }
 
@@ -778,71 +785,35 @@ fn ensure_replaceable_extension_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// The managed copy holds exactly the release package (manifest, host template,
+// popup, icons/, src/) — the same allow-list the release fingerprint
+// authenticates. Copying the whole source tree would drag in dev-only content
+// (tests/, package.json, node_modules/ with its .bin symlinks) that must never
+// be loaded into Chrome.
 fn copy_extension_dir_contents(source_dir: &Path, target_dir: &Path) -> Result<usize> {
     fs::create_dir_all(target_dir).with_context(|| format!("create {}", target_dir.display()))?;
     let mut copied = 0;
-    for entry in
-        fs::read_dir(source_dir).with_context(|| format!("read {}", source_dir.display()))?
-    {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target_dir.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&source_path)
-            .with_context(|| format!("inspect {}", source_path.display()))?;
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "extension source must not contain symlinks: {}",
-                source_path.display()
-            );
+    for relative in extension_package_file_paths(source_dir)? {
+        let source_path = source_dir.join(&relative);
+        let target_path = target_dir.join(&relative);
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
         }
-        if metadata.is_dir() {
-            copied += copy_extension_dir_contents(&source_path, &target_path)?;
-        } else if metadata.is_file() {
-            fs::copy(&source_path, &target_path).with_context(|| {
-                format!(
-                    "copy extension file {} to {}",
-                    source_path.display(),
-                    target_path.display()
-                )
-            })?;
-            copied += 1;
-        } else {
-            bail!(
-                "extension source contains unsupported file type: {}",
-                source_path.display()
-            );
-        }
+        fs::copy(&source_path, &target_path).with_context(|| {
+            format!(
+                "copy {} -> {}",
+                source_path.display(),
+                target_path.display()
+            )
+        })?;
+        copied += 1;
     }
     Ok(copied)
 }
 
 fn count_regular_files(root: &Path) -> Result<usize> {
-    Ok(extension_file_paths(root)?.len())
-}
-
-fn extension_dir_fingerprint(
-    root: &Path,
-    manifest_version_override: Option<&str>,
-) -> Result<Vec<(PathBuf, String)>> {
-    let mut files = Vec::new();
-    for relative in extension_file_paths(root)? {
-        let path = root.join(&relative);
-        let mut bytes = fs::read(&path)
-            .with_context(|| format!("read extension file {}", root.join(&relative).display()))?;
-        if relative == Path::new("manifest.json") {
-            let mut manifest = serde_json::from_slice::<Value>(&bytes)
-                .with_context(|| format!("parse extension manifest {}", path.display()))?;
-            if let Some(version) = manifest_version_override {
-                manifest["version"] = Value::String(version.to_string());
-            }
-            bytes = serde_json::to_vec(&manifest)
-                .with_context(|| format!("normalize extension manifest {}", path.display()))?;
-        }
-        let mut hash = Sha256::new();
-        hash.update(&bytes);
-        files.push((relative, hex::encode(hash.finalize())));
-    }
-    Ok(files)
+    Ok(extension_package_file_paths(root)?.len())
 }
 
 fn ensure_extension_source_authentic(source_dir: &Path) -> Result<String> {
@@ -859,11 +830,32 @@ fn ensure_extension_source_authentic(source_dir: &Path) -> Result<String> {
 }
 
 fn extension_package_fingerprint(root: &Path) -> Result<String> {
+    extension_package_fingerprint_with_version(root, None)
+}
+
+// Allow-list fingerprint over exactly the release package files. The manifest
+// version override exists because the managed copy stamps its manifest with a
+// .N suffix (update) while the source carries the release version; comparing
+// the two for sync decisions must hash both with the SAME normalized version
+// or every comparison would report a change that is only the stamp.
+fn extension_package_fingerprint_with_version(
+    root: &Path,
+    manifest_version_override: Option<&str>,
+) -> Result<String> {
     let mut hash = Sha256::new();
     for relative in extension_package_file_paths(root)? {
         let path = root.join(&relative);
-        let bytes = fs::read(&path)
+        let mut bytes = fs::read(&path)
             .with_context(|| format!("read extension package file {}", path.display()))?;
+        if relative == Path::new("manifest.json") {
+            if let Some(version) = manifest_version_override {
+                let mut manifest = serde_json::from_slice::<Value>(&bytes)
+                    .with_context(|| format!("parse extension manifest {}", path.display()))?;
+                manifest["version"] = Value::String(version.to_string());
+                bytes = serde_json::to_vec(&manifest)
+                    .with_context(|| format!("normalize extension manifest {}", path.display()))?;
+            }
+        }
         hash.update(normalized_extension_relative_path(&relative).as_bytes());
         hash.update([0]);
         hash.update((bytes.len() as u64).to_le_bytes());
@@ -923,39 +915,6 @@ fn collect_extension_package_files(
 
 fn normalized_extension_relative_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
-}
-
-fn extension_file_paths(root: &Path) -> Result<Vec<PathBuf>> {
-    fn walk(base: &Path, current: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-        for entry in fs::read_dir(current).with_context(|| format!("read {}", current.display()))? {
-            let entry = entry?;
-            let path = entry.path();
-            let metadata = fs::symlink_metadata(&path)
-                .with_context(|| format!("inspect {}", path.display()))?;
-            if metadata.file_type().is_symlink() {
-                bail!(
-                    "extension directory must not contain symlinks: {}",
-                    path.display()
-                );
-            }
-            if metadata.is_dir() {
-                walk(base, &path, files)?;
-            } else if metadata.is_file() {
-                files.push(path.strip_prefix(base).unwrap_or(&path).to_path_buf());
-            } else {
-                bail!(
-                    "extension directory contains unsupported file type: {}",
-                    path.display()
-                );
-            }
-        }
-        Ok(())
-    }
-
-    let mut files = Vec::new();
-    walk(root, root, &mut files)?;
-    files.sort();
-    Ok(files)
 }
 
 fn extension_manifest_version(extension_dir: &Path) -> Option<String> {
@@ -7281,6 +7240,72 @@ mod tests {
         let payload = serde_json::to_value(&result).unwrap();
         assert_eq!(payload["source_version"], YOETZ_CLI_VERSION);
         assert_eq!(payload["source_provenance"], "environment_override");
+    }
+
+    // Observed 2026-09-05 (yoetz#483): jsdom devDependency .bin symlinks made
+    // extension update refuse the source and the managed copy carried tests/.
+    #[test]
+    #[serial]
+    fn copy_extension_dir_contents_copies_only_the_release_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("extensions/chatgpt-native");
+        copy_extension_dir_contents(&checkout, &source).unwrap();
+        fs::create_dir_all(source.join("node_modules/.bin")).unwrap();
+        fs::write(source.join("node_modules/.bin/real-tool"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            source.join("node_modules/.bin/real-tool"),
+            source.join("node_modules/.bin/tldts"),
+        )
+        .unwrap();
+        fs::create_dir_all(source.join("tests")).unwrap();
+        fs::write(source.join("tests/dev-only.test.js"), "// not shipped").unwrap();
+        fs::write(source.join("package.json"), "{}").unwrap();
+
+        let target = dir.path().join("managed");
+        let copied = copy_extension_dir_contents(&source, &target).unwrap();
+
+        assert_eq!(copied, extension_package_file_paths(&checkout).unwrap().len());
+        assert!(target.join("manifest.json").is_file());
+        assert!(target.join("src/chatgpt-dom.js").is_file());
+        assert!(!target.join("node_modules").exists());
+        assert!(!target.join("tests").exists());
+        assert!(!target.join("package.json").exists());
+        assert_eq!(
+            extension_package_fingerprint(&target).unwrap(),
+            extension_package_fingerprint(&checkout).unwrap()
+        );
+
+        // End-to-end: the real update path must succeed against this source
+        // (symlinks and all), skip node_modules/tests/package.json, then report
+        // the managed copy up-to-date on the SECOND run instead of re-syncing.
+        let state = dir.path().join("state");
+        let _source_guard = EnvGuard::set(CHATGPT_EXTENSION_DIR_ENV, &source);
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &state);
+
+        let first = prepare_managed_chatgpt_extension_unlocked().unwrap();
+        assert_eq!(first.status, "updated");
+        assert!(first.copied_files > 0);
+        let managed = first.extension_dir.clone();
+        assert!(managed.join("manifest.json").is_file());
+        assert!(managed.join("src/chatgpt-dom.js").is_file());
+        assert!(!managed.join("node_modules").exists());
+        assert!(!managed.join("tests").exists());
+        assert!(!managed.join("package.json").exists());
+        assert_eq!(
+            extension_package_fingerprint_with_version(&managed, Some(first.source_version.as_str()))
+                .unwrap(),
+            extension_package_fingerprint_with_version(&checkout, Some(first.source_version.as_str()))
+                .unwrap()
+        );
+
+        let second = prepare_managed_chatgpt_extension_unlocked().unwrap();
+        assert_eq!(second.status, "current");
+        assert_eq!(second.copied_files, 0);
     }
 
     #[test]
