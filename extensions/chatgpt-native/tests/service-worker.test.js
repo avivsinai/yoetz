@@ -79,7 +79,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
             jobTabs.set(command.job.job_id, id);
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: command.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -90,7 +90,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
                 sent: true,
                 conversation_id: `conv-${command.job.job_id}`,
                 final_model_selection: {
-                  ...verifiedSolProSelection(),
+                  ...verifiedLatestProSelection(),
                   click_bound: true
                 }
               }
@@ -195,7 +195,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     // observability.
     assert.equal(
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.model_used,
-      "GPT-5.6 Sol Pro"
+      "Latest Pro"
     );
     assert.equal(
       port.messages.find((message) => message.type === "job_complete" && message.job_id === "job_a")?.payload.model_slug,
@@ -212,7 +212,7 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     }
     assert.equal(
       sentToTabs.find((item) => item.message.type === "yoetz_configure_model" && item.message.job.job_id === "job_b")?.message.job.model,
-      "gpt-5-6-sol-chat-pro"
+      "gpt-6-pro-chat"
     );
   } finally {
     globalThis.chrome = originalChrome;
@@ -245,7 +245,7 @@ test("service worker targeted reconnect only restores the requested job", async 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -477,7 +477,7 @@ test("service worker reconciles ChatGPT conversation assignment after the URL ma
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1333,7 +1333,7 @@ test("service worker opens fresh and resume jobs in new owned tabs", async () =>
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -1497,7 +1497,7 @@ test("service worker trims a valid conversation id before opening the resume tab
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -1542,7 +1542,7 @@ test("service worker fails immediately when send reports the wrong resumed conve
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_extract_response":
@@ -1613,7 +1613,7 @@ test("service worker fails resumed jobs when post-send extraction omits the conv
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1821,7 +1821,7 @@ test("service worker fails fast on metadata manual handoff detected while waitin
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -1882,7 +1882,7 @@ test("service worker fails fast on metadata manual handoff detected while waitin
   }
 });
 
-test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async () => {
+test("service worker fails closed when Latest Pro is unavailable", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
@@ -1905,7 +1905,7 @@ test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async ()
               payload: {
                 status: "unavailable",
                 model_used: "Default",
-                requested_model: "gpt-5-6-sol-chat-pro",
+                requested_model: "gpt-6-pro-chat",
                 available_options: ["Default"],
                 failure_reason: "effort_slider_move_failed",
                 picker_shape: "slider",
@@ -1922,8 +1922,8 @@ test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async ()
                 picker_effort_status: "unverified",
                 closed_pill_family_status: "verified",
                 closed_pill_effort_status: "unverified",
-                closed_pill_text: "5.6 Sol\nHigh",
-                warning: "GPT-5.6 Sol was not visible in the family submenu"
+                closed_pill_text: "6\nHigh",
+                warning: "Latest was not visible in the family submenu"
               }
             };
           default:
@@ -1949,7 +1949,7 @@ test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async ()
     assert.equal(error.payload.model_selection_diagnostics.picker_shape, "slider");
     assert.equal(error.payload.model_selection_diagnostics.effort_control.value_text, "High, 3 of 5");
     assert.equal(error.payload.model_selection_diagnostics.picker_family_status, "verified");
-    assert.equal(error.payload.model_selection_diagnostics.closed_pill_text, "5.6 Sol\nHigh");
+    assert.equal(error.payload.model_selection_diagnostics.closed_pill_text, "6\nHigh");
     assert.match(error.payload.message, /reason: effort_slider_move_failed/);
     assert.equal(sentToTabs.includes("yoetz_upload_file"), false);
     assert.equal(sentToTabs.includes("yoetz_send_prompt"), false);
@@ -1958,7 +1958,7 @@ test("service worker fails closed when GPT-5.6 Sol Pro is unavailable", async ()
   }
 });
 
-test("service worker fails resumed jobs before upload when GPT-5.6 Sol Pro is unavailable", async () => {
+test("service worker fails resumed jobs before upload when Latest Pro is unavailable", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const createdTabs = [];
@@ -1985,7 +1985,7 @@ test("service worker fails resumed jobs before upload when GPT-5.6 Sol Pro is un
               payload: {
                 status: "unavailable",
                 model_used: "Default",
-                requested_model: "gpt-5-6-sol-chat-pro",
+                requested_model: "gpt-6-pro-chat",
                 family_status: "unverified",
                 effort_status: "unverified",
                 available_options: ["Default"],
@@ -2023,7 +2023,7 @@ test("service worker fails resumed jobs before upload when GPT-5.6 Sol Pro is un
   }
 });
 
-test("service worker fails closed when GPT-5.6 Sol Pro selection is only kept_current", async () => {
+test("service worker fails closed when Latest Pro selection is only kept_current", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   const sentToTabs = [];
@@ -2231,7 +2231,7 @@ test("completion falls back to backend model_slug when the picker was not proven
   }
 });
 
-test("service worker fails closed when GPT-5.6 Sol Pro selection fails", async () => {
+test("service worker fails closed when Latest Pro selection fails", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -2270,7 +2270,7 @@ test("service worker fails closed when GPT-5.6 Sol Pro selection fails", async (
     await eventually(() => port.messages.some((message) => message.type === "job_error"));
     const error = port.messages.find((message) => message.type === "job_error");
     assert.equal(error.payload.code, "model_selection_failed");
-    assert.equal(error.payload.requested_model, "gpt-5-6-sol-chat-pro");
+    assert.equal(error.payload.requested_model, "gpt-6-pro-chat");
     assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
   } finally {
     globalThis.chrome = originalChrome;
@@ -2329,7 +2329,7 @@ test("service worker rejects the legacy extended_status selection proof", async 
   }
 });
 
-test("service worker accepts only verified GPT-5.6 Sol Pro selection", async () => {
+test("service worker accepts only verified Latest Pro selection", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -2349,8 +2349,8 @@ test("service worker accepts only verified GPT-5.6 Sol Pro selection", async () 
               ok: true,
               payload: {
                 status: "selected",
-                model_used: "GPT-5.6 Sol Pro",
-                requested_model: "gpt-5-6-sol-chat-pro",
+                model_used: "Latest Pro",
+                requested_model: "gpt-6-pro-chat",
                 family_status: "verified",
                 effort_status: "verified"
               }
@@ -2391,7 +2391,7 @@ test("service worker rejects duplicate active job starts before opening another 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -2433,7 +2433,7 @@ test("service worker rejects follow-on messages with the wrong capability token"
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -2482,7 +2482,7 @@ test("service worker rejects inspect reuse of an active job for another run", as
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -2646,7 +2646,7 @@ test("service worker allows matching extension instance id when profile identity
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -2722,7 +2722,7 @@ test("service worker allows matching profile email before opening a tab", async 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -3118,7 +3118,7 @@ test("service worker times out stale pre-send assistant text as job_error", asyn
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3177,7 +3177,7 @@ test("service worker classifies final affordance without scoped assistant text",
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3261,7 +3261,7 @@ test("service worker fails extraction when final affordance page text alternates
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3346,7 +3346,7 @@ test("service worker completes post-send response when preceding user count is u
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3418,7 +3418,7 @@ test("service worker does not complete on brief stable assistant text without a 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3490,7 +3490,7 @@ test("service worker completes long stable assistant text with an unscoped copy 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3570,7 +3570,7 @@ test("service worker does not complete long idle assistant text with only baseli
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3653,7 +3653,7 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return {
               ok: true,
@@ -3750,7 +3750,7 @@ test("service worker polls adaptively after post-send assistant text appears", a
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -3848,7 +3848,7 @@ test("service worker keeps stable-idle finality tied to the configured interval 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4170,7 +4170,7 @@ test("service worker emits final-affordance waiting progress once across state f
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4270,7 +4270,7 @@ test("service worker completion is structural and does not classify response tex
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4342,7 +4342,7 @@ test("service worker fails closed on Sources-only DOM chrome when backend finali
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4440,7 +4440,7 @@ test("service worker accepts a scoped single-letter assistant markdown response"
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4516,7 +4516,7 @@ test("service worker reports oversized completed responses before native deliver
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4602,7 +4602,7 @@ test("service worker latches a completed scoped response when later ChatGPT DOM 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4682,7 +4682,7 @@ test("service worker preserves the best final response across a transient genera
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4800,7 +4800,7 @@ test("service worker labels interim Pro turns as non-final and completes on the 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4899,7 +4899,7 @@ test("service worker settles same-length post-final text churn instead of timing
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -4977,7 +4977,7 @@ test("service worker waits for scoped response text bytes to stabilize after fin
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5062,7 +5062,7 @@ test("service worker waits for streaming one-letter prefix to reach final assist
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5153,7 +5153,7 @@ test("service worker does not complete when ChatGPT idles before final assistant
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5244,7 +5244,7 @@ test("service worker completes with backend-api text when the DOM answer turn ne
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5353,7 +5353,7 @@ test("service worker accepts fresh backend finality when the DOM generating heur
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5461,7 +5461,7 @@ test("service worker treats a stale backend-api node as still generating until a
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5593,7 +5593,7 @@ test("service worker does not return a longer transient caption before a shorter
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5731,7 +5731,7 @@ test("service worker fails closed if the backend positive-finality anchor disapp
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -5861,7 +5861,7 @@ test("service worker refreshes a frozen render while backend finality is pending
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -6012,7 +6012,7 @@ test("service worker reloads an idle frozen short response and completes from th
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -6130,7 +6130,7 @@ test("service worker refreshes a frozen short render at most once", async () => 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -6208,7 +6208,7 @@ test("service worker rejects stale copy-button extraction from a pre-send assist
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -6284,7 +6284,7 @@ test("service worker does not complete on copy button while response is still ge
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -6353,7 +6353,7 @@ test("service worker does not complete long unscoped-copy text while response is
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -6428,7 +6428,7 @@ test("service worker completes when a generating response becomes idle without t
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -6501,7 +6501,7 @@ test("service worker does not complete only because post-send copy controls incr
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -6574,7 +6574,7 @@ test("service worker rebinds owned tab after content script reload during respon
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -6658,7 +6658,7 @@ test("service worker restarts model selection from scratch after persisted bfcac
                 resolveSuspendedSelection = resolve;
               });
             }
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -6699,7 +6699,7 @@ test("service worker restarts model selection from scratch after persisted bfcac
       ok: true,
       payload: {
         status: "unavailable",
-        requested_model: "gpt-5-6-sol-chat-pro",
+        requested_model: "gpt-6-pro-chat",
         failure_reason: "stale_suspended_attempt"
       }
     });
@@ -6734,7 +6734,7 @@ test("service worker retries model selection once after a transient content-scri
             if (configureAttempts.length === 1) {
               throw new Error("Could not establish connection. Receiving end does not exist.");
             }
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_bind_job":
             return { ok: true, payload: { url: "https://chatgpt.com/", title: "ChatGPT" } };
           default:
@@ -6833,10 +6833,10 @@ test("service worker keeps one live model-selection attempt when recovery retry 
             if (configureCalls.length === 2) {
               markSecondConfigureStarted();
               return new Promise((resolve) => {
-                resolveSecondConfigure = () => resolve({ ok: true, payload: verifiedSolProSelection() });
+                resolveSecondConfigure = () => resolve({ ok: true, payload: verifiedLatestProSelection() });
               });
             }
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_bind_job":
             bindCalls += 1;
             markBindStarted();
@@ -6902,7 +6902,7 @@ test("service worker keeps the fail-closed model-selection result when bfcache r
   const failedSelection = {
     status: "unavailable",
     model_used: null,
-    requested_model: "gpt-5-6-sol-chat-pro",
+    requested_model: "gpt-6-pro-chat",
     family_status: "unverified",
     effort_status: "unverified",
     failure_reason: "model_picker_open_failed",
@@ -6962,7 +6962,7 @@ test("service worker keeps the fail-closed model-selection result when bfcache r
     assert.equal(error.payload.failure_reason, failedSelection.failure_reason);
     assert.deepEqual(error.payload.model_selection, failedSelection);
 
-    resolveSuspendedSelection({ ok: true, payload: verifiedSolProSelection() });
+    resolveSuspendedSelection({ ok: true, payload: verifiedLatestProSelection() });
     await new Promise((resolve) => setTimeout(resolve, 0));
     assert.equal(port.messages.some((message) => message.payload?.phase === "ready_for_file"), false);
     assert.equal(port.messages.filter((message) => message.type === "job_error").length, 1);
@@ -6986,7 +6986,7 @@ test("service worker does not resurrect a terminal model selection from a stale 
   const failedSelection = {
     status: "unavailable",
     model_used: null,
-    requested_model: "gpt-5-6-sol-chat-pro",
+    requested_model: "gpt-6-pro-chat",
     family_status: "unverified",
     effort_status: "unverified",
     failure_reason: "model_picker_open_failed",
@@ -7020,7 +7020,7 @@ test("service worker does not resurrect a terminal model selection from a stale 
             }
             return {
               ok: true,
-              payload: configureCalls === 2 ? verifiedSolProSelection() : failedSelection
+              payload: configureCalls === 2 ? verifiedLatestProSelection() : failedSelection
             };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
@@ -7056,7 +7056,7 @@ test("service worker does not resurrect a terminal model selection from a stale 
     releaseAttemptTwoGrouping();
     assert.equal((await attemptTwoPageshow).ok, true);
     await new Promise((resolve) => setTimeout(resolve, 0));
-    resolveInitialSelection({ ok: true, payload: verifiedSolProSelection() });
+    resolveInitialSelection({ ok: true, payload: verifiedLatestProSelection() });
     await new Promise((resolve) => setTimeout(resolve, 0));
 
     const persisted = await storage.get(`jobs.${jobId}`);
@@ -7108,7 +7108,7 @@ test("service worker idempotently rebinds a persisted bfcache restore without re
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             uploadCalls += 1;
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
@@ -7237,7 +7237,7 @@ test("service worker terminates actionably when persisted bfcache reconnect fail
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             uploadCalls += 1;
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
@@ -7370,7 +7370,7 @@ test("service worker parks a suspended waiting_response job past the reconnect p
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             uploadCalls += 1;
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
@@ -7614,7 +7614,7 @@ test("service worker joins an extraction rejection delivered several tasks after
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             uploadCalls += 1;
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
@@ -7731,7 +7731,7 @@ test("service worker times out a parked suspension at the response deadline with
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -7821,7 +7821,7 @@ test("service worker preserves content-script committed-send error metadata", as
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_extract_response":
@@ -8081,7 +8081,7 @@ test("service worker stops before upload when final chunk ack cannot reach nativ
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           default:
             throw new Error(`unexpected tab message ${message.type}`);
         }
@@ -8242,7 +8242,7 @@ test("service worker shards storage by job id so concurrent jobs do not clobber 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -8326,7 +8326,7 @@ test("service worker caps last_response_progress_text on disk while keeping the 
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -8448,7 +8448,7 @@ test("service worker does not persist on every in-flight chunk", async () => {
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 16 } };
           case "yoetz_send_prompt":
@@ -9295,7 +9295,7 @@ test("service worker cancelJob isolates one of two active ChatGPT jobs", async (
             jobTabs.set(message.job.job_id, id);
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -9423,7 +9423,7 @@ test("service worker keeps the tab when durable ownership cannot be verified", a
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -9515,7 +9515,7 @@ test("service worker cancelJob waits for cancelSend to resolve before removing t
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -9663,7 +9663,7 @@ test("service worker cancelJob removes the tab but warns may_still_be_running wh
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -9744,7 +9744,7 @@ test("service worker cancelJob reports close_failed when tab removal throws afte
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -9840,7 +9840,7 @@ test("service worker persists cancellation intent before teardown and retries af
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -10606,7 +10606,7 @@ async function runSuccessfulCompletionCase({
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_send_prompt":
@@ -10806,7 +10806,7 @@ test("service worker rechecks the content-script contract immediately before sen
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_extract_response":
@@ -11018,7 +11018,7 @@ test("service worker terminates non-resumable provider work on native reconnect"
           case "yoetz_prepare_job":
             return { ok: true, payload: { manual_handoff: null } };
           case "yoetz_configure_model":
-            return { ok: true, payload: verifiedSolProSelection() };
+            return { ok: true, payload: verifiedLatestProSelection() };
           case "yoetz_upload_file":
             return { ok: true, payload: { filename: message.file.filename, size: 4 } };
           case "yoetz_extract_response":
@@ -11041,7 +11041,7 @@ test("service worker terminates non-resumable provider work on native reconnect"
                 sent: true,
                 conversation_id: "conv_bridge_interrupt",
                 final_model_selection: {
-                  ...verifiedSolProSelection(),
+                  ...verifiedLatestProSelection(),
                   click_bound: true
                 }
               }
@@ -11094,11 +11094,11 @@ test("service worker terminates non-resumable provider work on native reconnect"
   }
 });
 
-function verifiedSolProSelection() {
+function verifiedLatestProSelection() {
   return {
     status: "selected",
-    model_used: "GPT-5.6 Sol Pro",
-    requested_model: "gpt-5-6-sol-chat-pro",
+    model_used: "Latest Pro",
+    requested_model: "gpt-6-pro-chat",
     family_status: "verified",
     effort_status: "verified",
     picker_family_status: "verified",
@@ -11110,8 +11110,8 @@ function verifiedSolProSelection() {
       family_trigger_closed: true,
       closed_pill_pro: true
     },
-    click_bound_closed_pill_text: "GPT-5.6 Sol Pro",
-    click_bound_closed_pill_family_status: "verified",
+    click_bound_closed_pill_text: "6\nPro",
+    click_bound_closed_pill_family_status: "skipped",
     click_bound_closed_pill_effort_status: "verified",
     surface_evidence_seen: true,
     surface_state: { aria_checked: "true", data_state: "on" },
@@ -11329,7 +11329,7 @@ function chromeStub({ port, tabs, connectNative = null, profileEmail = "", profi
           }
           const selection = forwardedMessage.job?.model_strategy === "current"
             ? { ...currentSelection(), click_bound: true }
-            : { ...verifiedSolProSelection(), click_bound: true };
+            : { ...verifiedLatestProSelection(), click_bound: true };
           return {
             ...response,
             payload: { ...payload, final_model_selection: selection }

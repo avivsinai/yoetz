@@ -51,9 +51,9 @@ name: chatgpt
 # transports connect directly to Chrome via CDP.
 #
 # Variables:
-#   This recipe supports exactly one ChatGPT target: GPT-5.6 Sol at Chat effort Pro.
+#   This recipe supports exactly one ChatGPT target: the Latest family at Chat effort Pro.
 #   `model` and `extended` overrides are intentionally unsupported.
-#   Selection is fail-closed unless the picker proves both the GPT-5.6 Sol
+#   Selection is fail-closed unless the picker proves both the Latest
 #              family and the literal Pro effort tier in one verification pass.
 #              model-switcher DOM is rejected with a diagnostic breadcrumb.
 #   prompt   — prompt text to send with the attachment. For Yoetz bundle
@@ -167,7 +167,7 @@ steps:
   # Click send once the typed prompt has enabled the button.
   - action: chatgpt_send
 
-  # Poll for response completion. Default 90min timeout for GPT-5.6 Sol at maximum effort;
+  # Poll for response completion. Default 90min timeout for Latest at maximum effort;
   # override with --var wait_timeout_ms=N or --var wait_interval_ms=N.
   - action: chatgpt_wait_response
     args: ["--interval-ms", "{{wait_interval_ms}}", "--timeout-ms", "{{wait_timeout_ms}}"]

@@ -2665,13 +2665,13 @@ mod tests {
     fn build_chatgpt_prepare_script_uses_named_page_and_login_check() {
         let script = build_chatgpt_prepare_script(
             "yoetz-chatgpt-test",
-            crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL,
+            crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL,
             crate::chatgpt_recipe::ChatgptModelStrategy::Select,
             "run-123",
         );
 
         assert!(script.contains("const PAGE_NAME = \"yoetz-chatgpt-test\";"));
-        assert!(script.contains("const MODEL = \"gpt-5-6-sol-chat-pro\";"));
+        assert!(script.contains("const MODEL = \"gpt-6-pro-chat\";"));
         assert!(script.contains("const MODEL_STRATEGY = \"select\";"));
         assert!(script.contains("const MARKED_URL = \"https://chatgpt.com/?_yoetz=run-123\";"));
         assert!(script.contains("const WINDOW_NAME = \"yoetz:run-123\";"));
@@ -2847,7 +2847,7 @@ mod tests {
             Some("/tmp/bundle.txt"),
             180_000,
             Some("bundle.txt"),
-            "gpt-5-6-sol-chat-pro",
+            "gpt-6-pro-chat",
             chatgpt_recipe::ChatgptModelStrategy::Select,
             false,
         );
@@ -2858,7 +2858,7 @@ mod tests {
         assert!(script.contains("const UPLOAD_TIMEOUT_MS = 180000;"));
         assert!(script.contains("finalModelSelection"));
         assert!(script.contains("clickBound"));
-        assert!(script.contains("GPT-5.6 Sol Pro"));
+        assert!(script.contains("Latest Pro"));
         assert!(!script.contains("DISABLE_EXTENDED"));
         assert!(script.contains("await composer.waitFor({ state: \"visible\", timeout: 15000 });"));
         assert!(script.contains("const COMPOSER_FILE_INPUT_MARKER = \"yoetz-upload-target\";"));
@@ -2882,7 +2882,7 @@ mod tests {
     fn parse_script_json_reads_prepare_result() {
         let result: ChatgptPrepareResult = parse_script_json(
             "prepare",
-            r#"{"status":"ready","loggedIn":true,"composerReady":true,"modelUsed":"GPT-5.6 Sol Pro","modelSelection":{"status":"selected","requested":"gpt-5-6-sol-chat-pro","modelUsed":"GPT-5.6 Sol Pro","familyStatus":"verified","effortStatus":"verified"},"url":"https://chatgpt.com/","title":"ChatGPT","bodyText":"Send a message"}"#,
+            r#"{"status":"ready","loggedIn":true,"composerReady":true,"modelUsed":"Latest Pro","modelSelection":{"status":"selected","requested":"gpt-6-pro-chat","modelUsed":"Latest Pro","familyStatus":"verified","effortStatus":"verified"},"url":"https://chatgpt.com/","title":"ChatGPT","bodyText":"Send a message"}"#,
         )
         .unwrap();
 
@@ -2903,7 +2903,7 @@ mod tests {
                 .as_ref()
                 .and_then(|selection| selection.get("modelUsed"))
                 .and_then(Value::as_str),
-            Some("GPT-5.6 Sol Pro")
+            Some("Latest Pro")
         );
         assert_eq!(result.title, "ChatGPT");
     }

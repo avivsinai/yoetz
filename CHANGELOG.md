@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Changed
+
+- ChatGPT Chat recipe repinned from GPT-5.6 Sol to the `Latest` family at Pro
+  effort (live probe 2026-09-05: `Latest` checked, GPT-5.6 Sol / GPT-5.5
+  unchecked, closed pill `6 Pro`). Requested model id is now
+  `gpt-6-pro-chat` and `model_used` is `Latest Pro`, in the native driver and
+  the CDP copy alike. The reader accepts `Latest` as a family option (it
+  previously dropped it and reported `checked_count=0`); the `6 Pro` pill
+  grammar corroborates effort only, never family. A Sol-only menu fails
+  closed with `model_family_not_found` and names the refused Sol fallback;
+  a Sol-worded closed pill fails `family_composer_pill_unverified`.
+- `capture-chatgpt-picker.mjs` accepts a browser debugger WebSocket
+  (`--browser-ws` / `YOETZ_BROWSER_WS`, or a `ws://.../devtools/browser/...`
+  `--cdp-url`) via `Target.getTargets` plus flattened attach, keeping
+  HTTP `/json/list` as fallback; page-exception text now surfaces.
 
 ## [0.5.67] - 2026-09-03
 ### Fixed

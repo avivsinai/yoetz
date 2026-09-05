@@ -312,9 +312,9 @@ Chrome remote-debugging approval friction, recommend the opt-in
 `chrome-extension-native` transport as the robust path. Use the native setup
 flow, load/update the extension in Chrome, run `doctor`, then target the stable
 `extension_instance_id` when multiple profiles are open.
-The recipe requires ChatGPT's GPT-5.6 composer-pill picker. Yoetz targets only
-GPT-5.6 Sol at the literal `Pro` effort tier and fails closed if that selection
-cannot be proven; Work mode, unknown labels, and missing controls are rejected explicitly.
+The recipe requires ChatGPT's composer-pill picker. Yoetz targets only
+the `Latest` family at the literal `Pro` effort tier and fails closed if that selection
+cannot be proven; a Sol-only menu, Work mode, unknown labels, and missing controls are rejected explicitly.
 
 Do not silently switch transports after upload/send/wait side effects. If the
 extension reports a terminal ChatGPT phase, preserve the manual-recovery tab and
@@ -577,9 +577,9 @@ Requires Node >= 24.4. If macOS shows a Keychain prompt for `Chrome Safe Storage
 
 ### Use ChatGPT Pro via recipe
 
-The built-in ChatGPT recipe always targets GPT-5.6 Sol at the verified `Pro` effort tier.
+The built-in ChatGPT recipe always targets the `Latest` family at the verified `Pro` effort tier.
 Do not pass `model` or `extended` overrides; the CLI rejects them. An unproven
-GPT-5.6 Sol `Pro` selection is a hard failure before upload/send, including
+`Latest Pro` selection is a hard failure before upload/send, including
 Enterprise accounts that still expose the legacy picker.
 
 ```bash

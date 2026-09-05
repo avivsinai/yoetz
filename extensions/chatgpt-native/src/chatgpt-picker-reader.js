@@ -24,6 +24,10 @@
 // from chatgpt-dom.js; chatgpt-dom.js imports from here.
 
 const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
+// Live probe 2026-09-05 (yz-a8c.1): the Chat family radio checked on a Pro
+// account is "Latest" (GPT-5.6 Sol and GPT-5.5 mounted unchecked). "Latest" is
+// the selection target; Sol is recognized only to refuse it (never select Sol).
+const CHATGPT_TARGET_FAMILY_LABEL = "Latest";
 
 /**
  * @typedef {Object} PickerRead
@@ -31,8 +35,9 @@ const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
  * @property {Element|null} surface                   // the open picker root, for the driver to act on
  * @property {"aria_controls_structural"|"visible"|null} trust
  * @property {boolean} ready       // finished mounting: family readable AND (effort control | tier rows | disabled ladder)
- * @property {{label:string|null, checked:boolean, options:string[], solOption:Element|null, checkedCount:number}} family
+ * @property {{label:string|null, checked:boolean, options:string[], latestOption:Element|null, checkedCount:number}} family
  * @property {{label:string|null, options:string[], items:Element[], disabled:boolean, disabledReason:string|null, control:Element|null, kind:"slider"|"rows"|"row"|null}} effort
+
  * @property {{familyTrigger:Element|null, viewToggle:Element|null, expanded:boolean}} nav   // how to reach the family view if it is collapsed
  * @property {Object} diagnostics  // {advanced_rows, effort_control, family_menu_probe} verbatim shapes
  */
@@ -63,7 +68,10 @@ function foldedFamilyLabel(value) {
 }
 
 function isFamilyOptionLabel(value) {
-  return /^gpt\b|^o3$/i.test(normalizeText(value));
+  // "Latest" is the GPT-6 Chat family radio (live probe 2026-09-05); without
+  // this the reader drops it and reports checked_count=0 on a Latest-checked
+  // picker. Sol/5.5 rows stay family options so they are never read as effort.
+  return /^gpt\b|^o3$|^latest$/i.test(normalizeText(value));
 }
 
 // The unified September 2026 picker labels its effort tier rows through
@@ -83,6 +91,10 @@ function itemIsChecked(item) {
 
 function familyIsSol(value) {
   return foldedModelText(value) === foldedModelText(CHATGPT_SOL_FAMILY_LABEL);
+}
+
+function familyIsLatest(value) {
+  return foldedModelText(value) === foldedModelText(CHATGPT_TARGET_FAMILY_LABEL);
 }
 
 function descendantDepth(node, ancestor) {
@@ -283,7 +295,7 @@ function structuralFamilyEvidence(control) {
   if (!/\bModel\b/i.test(textOf(control))) return empty;
   const matches = Array.from(control.querySelectorAll?.("*") ?? [])
     .map((node) => ({ node, label: normalizeText(textOf(node)) }))
-    .filter(({ label }) => /^(?:gpt|o\d)\b/i.test(label));
+    .filter(({ label }) => /^(?:gpt|o\d|latest)\b/i.test(label));
   const labelsByFold = new Map();
   for (const match of matches) {
     const folded = foldedModelText(match.label);
@@ -396,7 +408,7 @@ function isMainModelMenu(menu) {
 }
 
 function findFamilySubmenu(root, mainMenu) {
-  return visibleMenus(root).find((menu) => menu !== mainMenu && familyMenuRadios(menu).some((item) => familyIsSol(textOf(item)))) ?? null;
+  return visibleMenus(root).find((menu) => menu !== mainMenu && familyMenuRadios(menu).some((item) => familyIsLatest(textOf(item)))) ?? null;
 }
 
 function looksLikeLegacyAdvancedPicker(surface) {
@@ -449,7 +461,7 @@ function findAdvancedPickerSurface(root) {
         && /\bSmarter\b/i.test(text)
         && /\bModel\b/i.test(text)
         && /\bEffort\b/i.test(text)
-        && /\b(?:GPT|o\d)\b/i.test(text)
+        && /\b(?:GPT|o\d|Latest)\b/i.test(text)
         && Array.from(node.querySelectorAll?.('[role="slider"]') ?? [])
           .some((slider) => isVisibleInline(slider, node) || Boolean(sliderEffortSnapshot(slider, node)));
     });
@@ -512,16 +524,16 @@ function structurallyOpenControlledSurfaceForTrigger(root, trigger) {
 // ---------------------------------------------------------------------------
 
 function readMenuPickerState(menu, structurallyTrusted = false) {
-  // The September 2026 picker can put family radios (GPT-5.6 Sol / GPT-5.5)
-  // inline next to the effort tiers in one menu; effort verification must
-  // only look at the non-family radios.
+  // The September 2026 picker can put family radios (Latest / GPT-5.6 Sol /
+  // GPT-5.5) inline next to the effort tiers in one menu; effort verification
+  // must only look at the non-family radios.
   const effortItems = menuRadioItems(menu, structurallyTrusted)
     .filter((item) => !isFamilyOptionLabel(optionLabel(item)));
   const familyTrigger = Array.from(menu.querySelectorAll('[role="menuitem"]'))
     .find((item) => {
       const label = normalizeText(textOf(item));
       return item.getAttribute?.("aria-haspopup") === "menu"
-        && /^(?:gpt|o\d)\b/i.test(label);
+        && /^(?:gpt|o\d|latest)\b/i.test(label);
     });
   return {
     shape: "menu",
@@ -573,7 +585,7 @@ function readSliderPickerState(root, structurallyTrustedSurface = null) {
       if (item.getAttribute?.("aria-haspopup") === "menu" && /\bModel\b/i.test(textOf(item))) {
         return structurallyTrusted || structurallyReadable(item, surface);
       }
-      return (evidence?.ambiguous || (Boolean(label) && /^(?:gpt|o\d)\b/i.test(label)))
+      return (evidence?.ambiguous || (Boolean(label) && /^(?:gpt|o\d|latest)\b/i.test(label)))
         && (structurallyTrusted || structurallyReadable(item, surface));
     });
   const effortSlider = Array.from(surface.querySelectorAll('[role="slider"]'))
@@ -842,8 +854,9 @@ export function readPicker(root, { pill = null, leftoverTriggers = [], familySur
         surface: null,
         trust: null,
         ready: false,
-        family: { label: null, checked: false, options: [], solOption: null, checkedCount: 0 },
+        family: { label: null, checked: false, options: [], latestOption: null, checkedCount: 0 },
         effort: { label: null, options: [], items: [], disabled: false, disabledReason: null, control: null, kind: null },
+
         nav: { familyTrigger: null, viewToggle: null, expanded: false },
         diagnostics: {
           advanced_rows: [],
@@ -888,18 +901,18 @@ export function readPicker(root, { pill = null, leftoverTriggers = [], familySur
     }
     // When reading from a submenu (familySurface), the checked predicate is
     // strict aria-checked === "true" (not itemIsChecked, which also accepts
-    // data-state=checked) — matching the legacy readCheckedSolFamily submenu
-    // read. The test fixture sets aria-checked=false + data-state=checked to
-    // exercise the strict requirement.
+    // data-state=checked) — matching the driver's submenu re-read. The test
+    // fixture sets aria-checked=false + data-state=checked to exercise the
+    // strict requirement.
     const familyChecked = familyMenuProbe
       ? (item) => item?.getAttribute?.("aria-checked") === "true"
       : itemIsChecked;
     const familyOptions = familyRadios.map((item) => optionLabel(item)).filter(Boolean);
     const checkedFamily = familyRadios.find((item) => familyChecked(item)) ?? null;
-    const solOption = familyRadios.find((item) => familyIsSol(optionLabel(item))) ?? null;
+    const latestOption = familyRadios.find((item) => familyIsLatest(optionLabel(item))) ?? null;
     // When family was read from a submenu (familySurface), the label comes
     // from the checked radio, not state.family_label (which is the trigger
-    // text like "Model\nGPT-5.6 Sol").
+    // text like "Model\nLatest").
     const familyLabel = familyMenuProbe
       ? (checkedFamily ? optionLabel(checkedFamily) : null)
       : (state.family_label
@@ -977,7 +990,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [], familySur
         label: familyLabel || null,
         checked: Boolean(checkedFamily),
         options: familyOptions,
-        solOption,
+        latestOption,
         checkedCount: familyRadios.filter((item) => familyChecked(item)).length
       },
       effort: {
@@ -1008,7 +1021,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [], familySur
       surface: null,
       trust: null,
       ready: false,
-      family: { label: null, checked: false, options: [], solOption: null, checkedCount: 0 },
+      family: { label: null, checked: false, options: [], latestOption: null, checkedCount: 0 },
       effort: { label: null, options: [], items: [], disabled: false, disabledReason: null, control: null, kind: null },
       nav: { familyTrigger: null, viewToggle: null, expanded: false },
       diagnostics: {
@@ -1034,8 +1047,10 @@ export {
   optionLabel,
   itemIsChecked,
   familyIsSol,
+  familyIsLatest,
   modelPickerTriggerIsOpen,
   pickerSurfaceIsOpen,
+  visibleMenus,
   familyMenuRadios,
   disabledProEffortOption,
   isSelectModelViewToggle,

@@ -3,7 +3,7 @@ import { fetchConversationAnswer } from "./chatgpt-backend.js";
 export * from "../chatgpt-dom.js";
 export { fetchConversationAnswer } from "./chatgpt-backend.js";
 
-const CHATGPT_MODEL = "gpt-5-6-sol-chat-pro";
+const CHATGPT_MODEL = "gpt-6-pro-chat";
 const CHATGPT_ORIGIN = "https://chatgpt.com";
 
 function conversationIdFromUrl(value) {
@@ -52,9 +52,9 @@ function isExpectedConversationIdAssignment(job, expectedConversationId, current
     && normalizeConversationId(current).ok;
 }
 
-function modelUsedLooksLikeSolPro(value) {
+function modelUsedLooksLikeLatestPro(value) {
   const folded = String(value ?? "").trim().replace(/\s+/g, " ").toLowerCase();
-  return folded === "gpt-5.6 sol pro";
+  return folded === "latest pro";
 }
 
 function isAcceptableModelSelection(selection) {
@@ -67,7 +67,7 @@ function isAcceptableModelSelection(selection) {
     && selection?.requested_model === CHATGPT_MODEL
     && selection?.family_status === "verified"
     && selection?.effort_status === "verified"
-    && modelUsedLooksLikeSolPro(selection?.model_used);
+    && modelUsedLooksLikeLatestPro(selection?.model_used);
 }
 
 function normalizedResponseText(value) {

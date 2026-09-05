@@ -354,8 +354,8 @@ Agent skill installation options are listed in [Agent Skills](#agent-skills).
 ## Browser Recipes: ChatGPT Pro And Claude
 
 Browser recipes let Yoetz use web-only model surfaces from the terminal. The
-built-in ChatGPT recipe targets GPT-5.6 Sol at the account's known top tier
-(`Pro` or `Extra High`) and is fail-closed: if Yoetz cannot prove the requested
+built-in ChatGPT recipe targets the `Latest` family at the account's known top tier
+(`Pro`) and is fail-closed: if Yoetz cannot prove the requested
 surface is available, it stops
 instead of silently downgrading. The built-in Claude recipe applies the same
 contract to claude.ai with exactly Fable 5 and Effort Max.
