@@ -64,10 +64,11 @@ function activeFamilyView(root, mainMenu, trigger) {
 // module (the pill and leftover composer triggers). waitForRead polls until
 // the reader reports the surface is ready, mirroring waitForPickerState's
 // budget. Both are sync-read + async-poll; the reader itself stays pure.
-function read(root) {
+function read(root, { familySurface = null } = {}) {
   return readPicker(root, {
     pill: findModelButton(root),
-    leftoverTriggers: openComposerPickerLeftovers(root).map((entry) => entry.trigger)
+    leftoverTriggers: openComposerPickerLeftovers(root).map((entry) => entry.trigger),
+    familySurface
   });
 }
 
@@ -1154,6 +1155,18 @@ function legacyStateFromRead(read, extras = {}) {
   };
 }
 
+// revealFamily: the driver's family-reveal helper (Wave 2 F1). The reader is
+// pure and cannot click; when family radios live in a Radix submenu that only
+// mounts after hovering the family trigger, the driver reveals the submenu
+// here and returns the element for readPicker to read via { familySurface }.
+// No reading in here — pure gesture sequence (hover → pointer → Enter → Space).
+async function revealFamily(root, r, options = {}) {
+  if (r.family.options.length > 0) return null;
+  if (!r.nav.familyTrigger) return null;
+  const mainMenu = r.surface;
+  return openFamilyPicker(root, mainMenu, r.nav.familyTrigger, options);
+}
+
 async function selectSolChatProModel(root, options = {}) {
   const base = {
     status: "unavailable",
@@ -1229,34 +1242,33 @@ async function selectSolChatProModel(root, options = {}) {
 
   // Family: ensure the family view is visible and Sol is checked. The reader
   // reads inline family radios; when the family is in a separate submenu the
-  // driver opens it via readCheckedSolFamily (the pure reader cannot click).
+  // driver reveals it (revealFamily, clicks only) and re-reads with
+  // familySurface so the reader sees the radios there.
   if (!r.family.checked && r.nav.viewToggle && !r.nav.expanded) {
     realClick(r.nav.viewToggle);
     await sleep(Number(options.actionSettleMs ?? 250));
     r = await waitForRead(root, options);
     availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
   }
-  // Always read the authoritative family proof (opens the submenu if the
-  // family radios live there; the pure reader only sees inline radios). This
-  // populates available_families and confirms Sol is checked.
-  const pickerState = findPickerState(root);
-  let familyProof = await readCheckedSolFamily(root, pickerState, options);
-  availableFamilies = familyProof.available_families.length > 0 ? familyProof.available_families : availableFamilies;
-  if (!familyProof.ok) {
-    if (familyProof.checked_items.length !== 1 || !familyProof.sol_option) {
+  let familySubmenu = await revealFamily(root, r, options);
+  r = read(root, { familySurface: familySubmenu });
+  availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
+  const familyOk = r.family.checkedCount === 1 && familyIsSol(r.family.label);
+  if (!familyOk) {
+    if (r.family.checkedCount !== 1 || !r.family.solOption) {
       await closeModelPicker(root, modelButton);
       return selectionFailure(
-        base, modelButton, familyProof.state, availableFamilies,
-        familyProof.checked_items.length === 1
+        base, modelButton, legacyStateFromRead(r), availableFamilies,
+        r.family.checkedCount === 1
           ? "GPT-5.6 Sol was not visible in the family submenu"
           : "GPT-5.6 Sol family menu did not expose one checked model",
-        familyProof.checked_items.length === 1 ? "model_family_not_found" : "model_family_menu_unverified"
+        r.family.checkedCount === 1 ? "model_family_not_found" : "model_family_menu_unverified"
       );
     }
-    realClick(familyProof.sol_option);
+    realClick(r.family.solOption);
     await sleep(Number(options.actionSettleMs ?? 250));
     if (!await closeModelPicker(root, modelButton)) {
-      return selectionFailure(base, modelButton, familyProof.state, availableFamilies, "ChatGPT model picker did not close after selecting GPT-5.6 Sol", "model_picker_close_failed");
+      return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "ChatGPT model picker did not close after selecting GPT-5.6 Sol", "model_picker_close_failed");
     }
     modelButton = await waitForModelButton(root, options);
     if (!modelButton) {
@@ -1271,11 +1283,13 @@ async function selectSolChatProModel(root, options = {}) {
       await closeModelPicker(root, modelButton);
       return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "ChatGPT model picker exposed an unsupported shape after selecting GPT-5.6 Sol; refusing unverified model selection", "model_picker_shape_unsupported");
     }
-    familyProof = await readCheckedSolFamily(root, findPickerState(root), options);
-    availableFamilies = familyProof.available_families.length > 0 ? familyProof.available_families : availableFamilies;
-    if (!familyProof.ok) {
+    familySubmenu = await revealFamily(root, r, options);
+    r = read(root, { familySurface: familySubmenu });
+    availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
+    const familyOkAfterSelect = r.family.checkedCount === 1 && familyIsSol(r.family.label);
+    if (!familyOkAfterSelect) {
       await closeModelPicker(root, modelButton);
-      return selectionFailure(base, modelButton, familyProof.state, availableFamilies, "GPT-5.6 Sol family menu selection could not be verified", "model_family_selection_unverified");
+      return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "GPT-5.6 Sol family menu selection could not be verified", "model_family_selection_unverified");
     }
   }
 
@@ -1340,18 +1354,23 @@ async function selectSolChatProModel(root, options = {}) {
     }
   }
 
-  // Re-verify family + effort after the effort move. The reader may not see
-  // the family if it lives in a submenu, so re-read the authoritative family
-  // proof (as the original driver did) rather than trusting r.family.label.
-  familyProof = await readCheckedSolFamily(root, findPickerState(root), options);
-  availableFamilies = familyProof.available_families.length > 0 ? familyProof.available_families : availableFamilies;
-  const familyVerified = familyProof.ok;
+  // Re-verify family + effort after the effort move. Re-reveal the family
+  // submenu (if the family lives there) and re-read with familySurface. If
+  // revealFamily returns null (inline family or no trigger), keep the existing
+  // r which already carries the family value from the init read.
+  const reverifySubmenu = await revealFamily(root, r, options);
+  if (reverifySubmenu) {
+    familySubmenu = reverifySubmenu;
+    r = read(root, { familySurface: familySubmenu });
+    availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
+  }
+  const familyVerified = r.family.checkedCount === 1 && familyIsSol(r.family.label);
   const effortVerified = foldedModelText(r.effort.label) === "pro";
   if (!familyVerified || !effortVerified) {
     await closeModelPicker(root, modelButton);
-    return selectionFailure(base, modelButton, familyProof?.state ?? legacyStateFromRead(r), availableFamilies, "GPT-5.6 Sol at verified Pro effort could not be confirmed in one picker pass", "model_selection_verification_failed");
+    return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "GPT-5.6 Sol at verified Pro effort could not be confirmed in one picker pass", "model_selection_verification_failed");
   }
-  const state = familyProof?.state ?? legacyStateFromRead(r);
+  const state = legacyStateFromRead(r);
   state.effort_move_method = effortMoveMethod;
   const closeResult = await closeModelPickerResult(root, modelButton, state, { requireProPill: true });
   state.picker_close_method = closeResult.method;
@@ -1406,7 +1425,7 @@ async function selectSolChatProModel(root, options = {}) {
 
   return {
     status: "selected",
-    model_used: `${normalizeText(familyProof?.state?.family_label ?? r.family.label)} ${verifiedEffortLabel}`,
+    model_used: `${normalizeText(r.family.label)} ${verifiedEffortLabel}`,
     failure_reason: null,
     family_status: familyStatus,
     effort_status: combinedVerificationStatus(pickerEffortStatus, closedPill.closed_pill_effort_status),
@@ -1419,9 +1438,9 @@ async function selectSolChatProModel(root, options = {}) {
     effort_control: effortControlDiagnostics(state),
     effort_move_method: state.effort_move_method ?? null,
     pill_text: pillText,
-    family_label: familyProof?.state?.family_label ?? r.family.label,
-    family_label_candidates: familyProof?.state?.family_label_candidates ?? r.family.options,
-    family_label_source: familyProof?.state?.family_label_source ?? null,
+    family_label: r.family.label,
+    family_label_candidates: r.family.options,
+    family_label_source: r.diagnostics.family_menu_probe ? "family_menu_checked" : (r.family.checked ? "inline_family_radio" : null),
     picker_close_method: closeResult.method,
     picker_close_verification: closeResult.verification,
     available_options: r.effort.items.map((item) => textOf(item)).filter(Boolean),
@@ -1519,60 +1538,6 @@ async function openFamilyPicker(root, mainMenu, trigger, options = {}) {
   return null;
 }
 
-async function readCheckedSolFamily(root, state, options = {}) {
-  const surface = state?.surface ?? state?.menu;
-  const inline = familyMenuRadios(surface, true);
-  if (inline.length > 0) {
-    const checkedItems = inline.filter((item) => itemIsChecked(item));
-    const availableFamilies = inline.map((item) => textOf(item)).filter(Boolean);
-    const checkedLabel = checkedItems.length === 1 ? normalizeText(textOf(checkedItems[0])) : "";
-    return {
-      ok: checkedItems.length === 1 && familyIsSol(checkedLabel),
-      state: {
-        ...state,
-        family_label: checkedLabel,
-        family_label_candidates: availableFamilies,
-        family_label_source: checkedItems.length === 1 ? "inline_family_radio" : null,
-        family_label_ambiguous: checkedItems.length > 1
-      },
-      sol_option: inline.find((item) => familyIsSol(textOf(item))) ?? null,
-      checked_items: checkedItems,
-      available_families: availableFamilies
-    };
-  }
-  const familyMenu = await openFamilyPicker(root, state?.menu ?? state?.surface, state?.family_trigger, options);
-  const controlledSurface = structurallyOpenControlledSurfaceForTrigger(root, state?.family_trigger);
-  const activeView = activeFamilyView(root, state?.menu ?? state?.surface, state?.family_trigger);
-  const familyMenuStructurallyTrusted = familyMenu === controlledSurface
-    || (state?.surface_trust === "aria_controls_structural" && familyMenu === activeView)
-    || (familyMenu === activeView && expandedSelectModelView(state?.family_trigger, familyMenu));
-  const items = familyMenuRadios(familyMenu, familyMenuStructurallyTrusted);
-  const checkedItems = items.filter((item) => item.getAttribute?.("aria-checked") === "true");
-  const availableFamilies = items.map((item) => textOf(item)).filter(Boolean);
-  const checkedLabel = checkedItems.length === 1 ? normalizeText(textOf(checkedItems[0])) : "";
-  return {
-    ok: checkedItems.length === 1 && familyIsSol(checkedLabel),
-    state: {
-      ...state,
-      family_label: checkedLabel,
-      family_label_candidates: availableFamilies,
-      family_label_source: checkedItems.length === 1 ? "family_menu_checked" : null,
-      family_label_ambiguous: checkedItems.length > 1,
-      family_menu_probe: {
-        trigger_found: Boolean(state?.family_trigger),
-        trigger_is_select_model_toggle: isSelectModelViewToggle(state?.family_trigger),
-        trigger_expanded: state?.family_trigger?.getAttribute?.("aria-expanded") ?? null,
-        menu_found: Boolean(familyMenu),
-        menu_structurally_trusted: familyMenuStructurallyTrusted,
-        radio_count: items.length,
-        checked_count: checkedItems.length
-      }
-    },
-    sol_option: items.find((item) => familyIsSol(textOf(item))) ?? null,
-    checked_items: checkedItems,
-    available_families: availableFamilies
-  };
-}
 async function openWithHoverEvents(element, isOpen, options = {}) {
   const settleMs = Number(options.settleMs ?? 150);
   const phases = [
@@ -1741,7 +1706,7 @@ async function reverifyModelSelectionAfterClose(root, modelButton, options = {})
       post_close_failure_reason: "model_picker_reopen_failed"
     };
   }
-  const r = await waitForRead(root, options);
+  let r = await waitForRead(root, options);
   if (!r.shape) {
     await closeModelPicker(root, reopenedButton);
     return {
@@ -1753,9 +1718,10 @@ async function reverifyModelSelectionAfterClose(root, modelButton, options = {})
       post_close_failure_reason: "model_picker_shape_unsupported"
     };
   }
-  const familyProof = await readCheckedSolFamily(root, findPickerState(root), options);
-  const verifiedState = familyProof.state ?? legacyStateFromRead(r);
-  const familyStatus = familyProof.ok ? "verified" : "unverified";
+  const familySubmenu = await revealFamily(root, r, options);
+  r = read(root, { familySurface: familySubmenu });
+  const verifiedState = legacyStateFromRead(r);
+  const familyStatus = r.family.checkedCount === 1 && familyIsSol(r.family.label) ? "verified" : "unverified";
   const effortStatus = foldedModelText(r.effort.label) === "pro" ? "verified" : "unverified";
   const disabledPro = effortStatus === "unverified" ? r.effort.disabled ? { reason: r.effort.disabledReason } : null : null;
   const close = await closeModelPickerResult(root, reopenedButton, verifiedState, { requireProPill: true });

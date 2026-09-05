@@ -833,7 +833,7 @@ function effortIsChatProTier(state) {
 // (Wave 2).
 // ---------------------------------------------------------------------------
 
-export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
+export function readPicker(root, { pill = null, leftoverTriggers = [], familySurface = null } = {}) {
   try {
     const state = findPickerState(root, { pill, leftoverTriggers });
     if (!state) {
@@ -857,16 +857,54 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
     const trust = state.surface_trust ?? null;
     const ready = pickerStateIsReady(state);
 
-    // Family value.
-    const familyRadios = state.shape === "menu" || state.shape === "slider"
-      ? familyMenuRadios(surface, trust === "aria_controls_structural")
+    // Family value. On the main surface the reader reads inline family
+    // radios. When the family lives in a Radix submenu (menu/personal shapes)
+    // the main surface has no inline radios; the driver reveals the submenu
+    // (revealFamily, clicks only) and passes it as familySurface. The reader
+    // then reads family from familySurface with the same three-leg trust rule
+    // readCheckedSolFamily used: controlled-by-trigger, aria_controls_structural
+    // + activeView, or expandedSelectModelView.
+    let familyRadios = state.shape === "menu" || state.shape === "slider"
+      ? familyMenuRadios(surface, true)
       : [];
+    let familyMenuProbe = null;
+    if (familyRadios.length === 0 && familySurface) {
+      const trigger = state.family_trigger ?? null;
+      const controlledSurface = structurallyOpenControlledSurfaceForTrigger(root, trigger);
+      const activeView = activeFamilyView(root, surface, trigger, pill, leftoverTriggers);
+      const familyTrusted = familySurface === controlledSurface
+        || (trust === "aria_controls_structural" && familySurface === activeView)
+        || (familySurface === activeView && expandedSelectModelView(trigger, familySurface));
+      familyRadios = familyMenuRadios(familySurface, familyTrusted);
+      familyMenuProbe = {
+        trigger_found: Boolean(trigger),
+        trigger_is_select_model_toggle: isSelectModelViewToggle(trigger),
+        trigger_expanded: trigger?.getAttribute?.("aria-expanded") ?? null,
+        menu_found: Boolean(familySurface),
+        menu_structurally_trusted: familyTrusted,
+        radio_count: familyRadios.length,
+        checked_count: familyRadios.filter((item) => item?.getAttribute?.("aria-checked") === "true").length
+      };
+    }
+    // When reading from a submenu (familySurface), the checked predicate is
+    // strict aria-checked === "true" (not itemIsChecked, which also accepts
+    // data-state=checked) — matching the legacy readCheckedSolFamily submenu
+    // read. The test fixture sets aria-checked=false + data-state=checked to
+    // exercise the strict requirement.
+    const familyChecked = familyMenuProbe
+      ? (item) => item?.getAttribute?.("aria-checked") === "true"
+      : itemIsChecked;
     const familyOptions = familyRadios.map((item) => optionLabel(item)).filter(Boolean);
-    const checkedFamily = familyRadios.find((item) => itemIsChecked(item)) ?? null;
+    const checkedFamily = familyRadios.find((item) => familyChecked(item)) ?? null;
     const solOption = familyRadios.find((item) => familyIsSol(optionLabel(item))) ?? null;
-    const familyLabel = state.family_label
-      ? (state.family_label || null)
-      : (checkedFamily ? optionLabel(checkedFamily) : null);
+    // When family was read from a submenu (familySurface), the label comes
+    // from the checked radio, not state.family_label (which is the trigger
+    // text like "Model\nGPT-5.6 Sol").
+    const familyLabel = familyMenuProbe
+      ? (checkedFamily ? optionLabel(checkedFamily) : null)
+      : (state.family_label
+        ? (state.family_label || null)
+        : (checkedFamily ? optionLabel(checkedFamily) : null));
 
     // Effort value.
     let effortLabel = null;
@@ -928,7 +966,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
       : null;
     const expanded = viewToggle ? expandedSelectModelView(viewToggle, surface) : false;
 
-    const family_menu_probe = state.family_menu_probe ?? null;
+    const family_menu_probe = familyMenuProbe ?? state.family_menu_probe ?? null;
 
     return {
       shape: state.shape,
@@ -940,7 +978,7 @@ export function readPicker(root, { pill = null, leftoverTriggers = [] } = {}) {
         checked: Boolean(checkedFamily),
         options: familyOptions,
         solOption,
-        checkedCount: familyRadios.filter((item) => itemIsChecked(item)).length
+        checkedCount: familyRadios.filter((item) => familyChecked(item)).length
       },
       effort: {
         label: effortLabel,
