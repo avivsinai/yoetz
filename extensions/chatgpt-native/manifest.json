@@ -54,6 +54,7 @@
     {
       "resources": [
         "src/chatgpt-dom.js",
+        "src/chatgpt-picker-reader.js",
         "src/claude-dom.js",
         "src/sites/chatgpt.js",
         "src/sites/chatgpt-backend.js",

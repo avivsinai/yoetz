@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { test as _test } from "node:test";
+// When imported as a module for parity testing (YOETZ_PARITY_IMPORT=1), skip
+// test registration so the builders can be imported without running the suite.
+const test = process.env.YOETZ_PARITY_IMPORT === "1" ? (name, fn) => {} : _test;
 import {
   clickSend,
   clickStopGenerating,
@@ -5630,3 +5633,36 @@ function matchesSimpleSelector(element, selector) {
   }
   return text && selector === "*";
 }
+
+// Wave 2 marker: the value-based selectSolChatProModel driver path (consumes
+// readPicker) drives a quota-locked fixture to effort_options_disabled with
+// family verified — the field-observed behavior (enterprise account, the quota
+// lock is our oracle until Oct 1).
+test("Wave 2 driver: quota-locked fixture → effort_options_disabled, family verified", async () => {
+  const fixture = makeThinkingEffortListFixture({
+    effort: null,
+    effortsDisabled: true,
+    disabledReason: "Limit reached until 2026-10-01."
+  });
+  const result = await configureModelState(fixture.doc, {});
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "effort_options_disabled");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.picker_family_status, "verified");
+  assert.match(result.warning, /Limit reached until 2026-10-01/);
+});
+
+// Exported for scripts/picker-reader-fake-parity.mjs (Wave 2 T5). The test()
+// calls above register but do not execute when this file is imported as a
+// module (only the node --test runner runs them), so importing is safe.
+export {
+  FakeElement,
+  FakeDocument,
+  makeSolPickerFixture,
+  makeTwoPillComposerFixture,
+  makeHybridSimpleViewFixture,
+  makeThinkingEffortListFixture,
+  makeOpacityZeroLeftoverFixture,
+  makeSolSliderFixture,
+  makePersonalPickerFixture
+};
