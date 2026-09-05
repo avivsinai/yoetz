@@ -2919,8 +2919,7 @@ mod tests {
 
     #[test]
     fn model_selection_function_requires_verified_latest_family_and_pro_effort() {
-        let script =
-            build_model_selection_function("gpt-6-pro-chat", ChatgptModelStrategy::Select);
+        let script = build_model_selection_function("gpt-6-pro-chat", ChatgptModelStrategy::Select);
         assert!(script.contains(r#"const requested = "gpt-6-pro-chat";"#));
         assert!(script.contains(
             "classList.contains(\"__composer-pill\") && summaryMatches(pillLabel(button))"
@@ -2995,8 +2994,9 @@ mod tests {
         assert!(script.contains("await openFamilyMenu"));
         assert!(script.contains("async function waitForPill()"));
         assert!(script.contains("pill = await waitForPill();"));
-        assert!(script
-            .contains("ChatGPT composer model pill did not remount after selecting Latest"));
+        assert!(
+            script.contains("ChatGPT composer model pill did not remount after selecting Latest")
+        );
         assert!(script
             .contains("ChatGPT composer model pill did not remount after selecting Pro effort"));
         assert!(script.contains("return verification.ok;"));
