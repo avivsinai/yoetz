@@ -788,7 +788,7 @@ fn run_recipe_with_connection(
             let stdout = run_chatgpt_send(
                 match ctx.model_strategy {
                     chatgpt_recipe::ChatgptModelStrategy::Select => {
-                        crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL
+                        crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL
                     }
                     chatgpt_recipe::ChatgptModelStrategy::Current => "current",
                 },
@@ -2051,7 +2051,7 @@ fn run_chatgpt_select_model_with_surface_evidence(
     let model_strategy = _ctx.model_strategy;
     let requested_model = match model_strategy {
         chatgpt_recipe::ChatgptModelStrategy::Select => {
-            crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL
+            crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL
         }
         chatgpt_recipe::ChatgptModelStrategy::Current => "current",
     };
@@ -2506,7 +2506,7 @@ fn run_chatgpt_send(
                 let selection = result.get("modelSelection").cloned().unwrap_or(Value::Null);
                 if started_at.elapsed() >= Duration::from_millis(CHATGPT_SEND_ENABLE_TIMEOUT_MS) {
                     return Err(anyhow!(
-                        "ChatGPT GPT-5.6 Sol was not verified in the same browser operation as send. {}",
+                        "ChatGPT Latest was not verified in the same browser operation as send. {}",
                         selection
                     ));
                 }
@@ -6217,7 +6217,7 @@ mod tests {
             warnings: Vec::new(),
             vars: BTreeMap::from([(
                 "model".to_string(),
-                crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL.to_string(),
+                crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL.to_string(),
             )]),
         }
     }
@@ -6365,11 +6365,11 @@ case "$*" in
     count=$((count + 1))
     printf '%s' "$count" > "$EVAL_COUNT_PATH"
     if [ "$count" = "1" ]; then
-      printf '{"status":"selected","requested":"gpt-5-6-sol-chat-pro","modelUsed":"GPT-5.6 Sol Pro","familyStatus":"verified","effortStatus":"verified"}'
+      printf '{"status":"selected","requested":"gpt-6-pro-chat","modelUsed":"Latest Pro","familyStatus":"verified","effortStatus":"verified"}'
     elif [ "$count" = "2" ]; then
       printf '{"status":"marked"}'
     else
-      printf '%s' '{"status":"sent","assistantCountBeforeSend":0,"assistantLastLenBeforeSend":0,"finalModelSelection":{"status":"selected","modelUsed":"GPT-5.6 Sol Pro","requested":"gpt-5-6-sol-chat-pro","familyStatus":"verified","effortStatus":"verified","pickerFamilyStatus":"verified","pickerEffortStatus":"verified","pickerShape":"personal","postCloseFamilyStatus":"verified","postCloseEffortStatus":"verified","closedPillFamilyStatus":"skipped","closedPillEffortStatus":"verified","closedPillText":"Pro","pickerCloseVerification":{"picker_surface_closed":true,"model_trigger_closed":true,"family_trigger_closed":true,"closed_pill_pro":true},"clickBound":true,"clickBoundClosedPillText":"Pro","clickBoundClosedPillFamilyStatus":"skipped","clickBoundClosedPillEffortStatus":"verified","surfaceEvidenceSeen":false,"surfaceProofKind":"implicit_chat_composer_aria","surfaceVisibleToggleCount":0,"surfaceComposerAria":"Chat with ChatGPT","surfaceObservedValues":[],"surfaceChatState":null,"surfaceWorkState":null}}'
+      printf '%s' '{"status":"sent","assistantCountBeforeSend":0,"assistantLastLenBeforeSend":0,"finalModelSelection":{"status":"selected","modelUsed":"Latest Pro","requested":"gpt-6-pro-chat","familyStatus":"verified","effortStatus":"verified","pickerFamilyStatus":"verified","pickerEffortStatus":"verified","pickerShape":"personal","postCloseFamilyStatus":"verified","postCloseEffortStatus":"verified","closedPillFamilyStatus":"skipped","closedPillEffortStatus":"verified","closedPillText":"Pro","pickerCloseVerification":{"picker_surface_closed":true,"model_trigger_closed":true,"family_trigger_closed":true,"closed_pill_pro":true},"clickBound":true,"clickBoundClosedPillText":"Pro","clickBoundClosedPillFamilyStatus":"skipped","clickBoundClosedPillEffortStatus":"verified","surfaceEvidenceSeen":false,"surfaceProofKind":"implicit_chat_composer_aria","surfaceVisibleToggleCount":0,"surfaceComposerAria":"Chat with ChatGPT","surfaceObservedValues":[],"surfaceChatState":null,"surfaceWorkState":null}}'
     fi
     ;;
 esac
@@ -6396,11 +6396,11 @@ if %errorlevel%==0 (
   set /a count=count+1
   > "%EVAL_COUNT_PATH%" echo !count!
   if "!count!"=="1" (
-    echo {"status":"selected","requested":"gpt-5-6-sol-chat-pro","modelUsed":"GPT-5.6 Sol Pro","familyStatus":"verified","effortStatus":"verified"}
+    echo {"status":"selected","requested":"gpt-6-pro-chat","modelUsed":"Latest Pro","familyStatus":"verified","effortStatus":"verified"}
   ) else if "!count!"=="2" (
     echo {"status":"marked"}
   ) else (
-    echo {"status":"sent","assistantCountBeforeSend":0,"assistantLastLenBeforeSend":0,"finalModelSelection":{"status":"selected","modelUsed":"GPT-5.6 Sol Pro","requested":"gpt-5-6-sol-chat-pro","familyStatus":"verified","effortStatus":"verified","pickerFamilyStatus":"verified","pickerEffortStatus":"verified","pickerShape":"personal","postCloseFamilyStatus":"verified","postCloseEffortStatus":"verified","closedPillFamilyStatus":"skipped","closedPillEffortStatus":"verified","closedPillText":"Pro","pickerCloseVerification":{"picker_surface_closed":true,"model_trigger_closed":true,"family_trigger_closed":true,"closed_pill_pro":true},"clickBound":true,"clickBoundClosedPillText":"Pro","clickBoundClosedPillFamilyStatus":"skipped","clickBoundClosedPillEffortStatus":"verified","surfaceEvidenceSeen":false,"surfaceProofKind":"implicit_chat_composer_aria","surfaceVisibleToggleCount":0,"surfaceComposerAria":"Chat with ChatGPT","surfaceObservedValues":[],"surfaceChatState":null,"surfaceWorkState":null}}
+    echo {"status":"sent","assistantCountBeforeSend":0,"assistantLastLenBeforeSend":0,"finalModelSelection":{"status":"selected","modelUsed":"Latest Pro","requested":"gpt-6-pro-chat","familyStatus":"verified","effortStatus":"verified","pickerFamilyStatus":"verified","pickerEffortStatus":"verified","pickerShape":"personal","postCloseFamilyStatus":"verified","postCloseEffortStatus":"verified","closedPillFamilyStatus":"skipped","closedPillEffortStatus":"verified","closedPillText":"Pro","pickerCloseVerification":{"picker_surface_closed":true,"model_trigger_closed":true,"family_trigger_closed":true,"closed_pill_pro":true},"clickBound":true,"clickBoundClosedPillText":"Pro","clickBoundClosedPillFamilyStatus":"skipped","clickBoundClosedPillEffortStatus":"verified","surfaceEvidenceSeen":false,"surfaceProofKind":"implicit_chat_composer_aria","surfaceVisibleToggleCount":0,"surfaceComposerAria":"Chat with ChatGPT","surfaceObservedValues":[],"surfaceChatState":null,"surfaceWorkState":null}}
   )
 )
 "#,
@@ -7295,7 +7295,7 @@ browser_cdp = "http://evil.example.com:9222"
     fn interpolate_replaces_bundle_and_recipe_vars() {
         let ctx = recipe_context();
         let value = interpolate("open {{bundle_path}} {{model}}", &ctx, Some("ignored")).unwrap();
-        assert_eq!(value, "open /tmp/bundle.md gpt-5-6-sol-chat-pro");
+        assert_eq!(value, "open /tmp/bundle.md gpt-6-pro-chat");
     }
 
     #[test]
@@ -8261,7 +8261,7 @@ steps:
                 "action": CHATGPT_SELECT_MODEL_ACTION,
                 "stdout": {
                     "status": "ok",
-                    "model_used": "GPT-5.6 Sol Pro",
+                    "model_used": "Latest Pro",
                     "model_selection_status": "selected"
                 }
             }),
@@ -8270,11 +8270,11 @@ steps:
                 "action": CHATGPT_SEND_ACTION,
                 "stdout": {
                     "status": "ok",
-                    "model_used": "GPT-5.6 Sol Pro",
+                    "model_used": "Latest Pro",
                     "model_selection_status": "selected",
                     "final_model_selection": {
                         "status": "selected",
-                        "model_used": "GPT-5.6 Sol Pro",
+                        "model_used": "Latest Pro",
                         "click_bound": true
                     }
                 }
@@ -8298,7 +8298,7 @@ steps:
         assert_eq!(payload["transport"], "agent-browser");
         assert_eq!(payload["backend"], "agent-browser");
         assert_eq!(payload["response"], "final answer");
-        assert_eq!(payload["model_used"], "GPT-5.6 Sol Pro");
+        assert_eq!(payload["model_used"], "Latest Pro");
         assert_eq!(payload["model_selection_status"], "selected");
         assert_eq!(payload["final_model_selection"]["click_bound"], true);
         assert_eq!(payload["fallback_used"], true);

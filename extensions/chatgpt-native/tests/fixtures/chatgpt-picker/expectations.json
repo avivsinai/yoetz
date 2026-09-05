@@ -1,5 +1,17 @@
 {
   "_comment": "Expected PickerRead values per fixture, asserted by tests/chatgpt-picker-reader.test.js from Wave 1 on. Captured from live Enterprise ChatGPT tabs with the inline serializer described in docs/design/chatgpt-picker-reader.md (computed inert + display/visibility written back as attributes; script/svg/use/canvas bodies stripped).",
+  "2026-09-05-gpt6-chat-family-expanded.html": {
+    "shape": "slider",
+    "ready": true,
+    "family": { "label": "Latest", "checked": true, "checkedCount": 1, "options": ["Latest", "GPT-5.6 Sol", "GPT-5.5"] },
+    "effort": { "label": "Pro", "disabled": false, "kind": "slider", "options": [] },
+    "nav": { "expanded": true },
+    "_provenance": "Reconstructed from the native-extension probe gpt6-native-probe-selection.json (yoetz-owned Chat tab, 2026-09-05, run 20260905T144315Z_b9ff4d). NOT a live CDP serializer capture — CDP WS upgrades were wedged. Replace with a live capture when CDP recovers.",
+    "_notes": [
+      "Live labels for yz-a8c.2: family Latest CHECKED, GPT-5.6 Sol / GPT-5.5 unchecked; effort slider Pro 5 of 5 verified; closed pill '6 Pro' (effort only, no family token).",
+      "Without the isFamilyOptionLabel Latest acceptance, the reader drops the Latest radio and reports checked_count=0 on this fixture."
+    ]
+  },
   "2026-09-03-unified-quota-locked-family-expanded.html": {
     "shape": "slider",
     "ready": true,

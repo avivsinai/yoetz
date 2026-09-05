@@ -10,7 +10,7 @@ pub type ChatgptTransportPhase = web_recipe::WebRecipeTransportPhase;
 pub type ChatgptModelStrategy = web_recipe::WebModelStrategy;
 pub type ChatgptModelSelectionStatus = web_recipe::WebModelSelectionStatus;
 
-pub const CHATGPT_SOL_CHAT_PRO_MODEL: &str = "gpt-5-6-sol-chat-pro";
+pub const CHATGPT_LATEST_CHAT_PRO_MODEL: &str = "gpt-6-pro-chat";
 
 pub(crate) trait AnyhowResultExt<T> {
     fn with_chatgpt_phase(self, phase: ChatgptTransportPhase) -> Result<T, AnyhowError>;
@@ -225,7 +225,7 @@ mod tests {
             backend: "dev-browser".to_string(),
             response: "ok".to_string(),
             model_strategy: ChatgptModelStrategy::Select,
-            model_used: Some("GPT-5.6 Sol Pro".to_string()),
+            model_used: Some("Latest Pro".to_string()),
             model_selection_status: ChatgptModelSelectionStatus::Selected,
             final_model_selection: None,
             warnings: vec!["fallback".to_string()],
@@ -251,7 +251,7 @@ mod tests {
         assert_eq!(payload["backend"], "dev-browser");
         assert_eq!(payload["response"], "ok");
         assert_eq!(payload["model_strategy"], "select");
-        assert_eq!(payload["model_used"], "GPT-5.6 Sol Pro");
+        assert_eq!(payload["model_used"], "Latest Pro");
         assert_eq!(payload["model_selection_status"], "selected");
         assert_eq!(payload["warnings"], json!(["fallback"]));
         assert_eq!(payload["fallback_used"], true);

@@ -10,8 +10,10 @@ import {
   optionLabel,
   itemIsChecked,
   familyIsSol,
+  familyIsLatest,
   modelPickerTriggerIsOpen,
   pickerSurfaceIsOpen,
+  visibleMenus,
   familyMenuRadios,
   disabledProEffortOption,
   isSelectModelViewToggle,
@@ -40,8 +42,10 @@ const DEFAULT_WAIT_TIMEOUT_MS = 15000;
 const DEFAULT_WAIT_INTERVAL_MS = 250;
 const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
 const MIN_IMPLICIT_SURFACE_ABSENCE_MS = 1500;
-const CHATGPT_SOL_CHAT_PRO_MODEL = "gpt-5-6-sol-chat-pro";
-const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
+// Live probe 2026-09-05 (yz-a8c.1): Chat family radio "Latest" checked at Pro
+// effort ("6 Pro" pill); GPT-5.6 Sol / GPT-5.5 mounted unchecked. The pin
+// targets Latest and never Sol.
+const CHATGPT_LATEST_CHAT_PRO_MODEL = "gpt-6-pro-chat";
 
 // findPickerState / activeFamilyView wrappers: the driver calls these with the
 // pre-Wave-1 signature (root only). They locate the layout-dependent pill
@@ -540,7 +544,7 @@ export async function configureModelState(root, job = {}) {
       model_used: null,
       requested_model: modelSelectionStrategyForJob(job) === "current"
         ? "current"
-        : CHATGPT_SOL_CHAT_PRO_MODEL,
+        : CHATGPT_LATEST_CHAT_PRO_MODEL,
       available_options: [],
       available_families: [],
       family_status: "unverified",
@@ -610,13 +614,13 @@ export async function configureModelState(root, job = {}) {
     };
   }
 
-  const selection = await selectSolChatProModel(root, modelSelectionOptionsForJob(job));
+  const selection = await selectLatestChatProModel(root, modelSelectionOptionsForJob(job));
   const warnings = selection.warning ? [selection.warning] : [];
   return {
     hydration_signal: hydrationSignal,
     status: selection.status,
     model_used: selection.model_used,
-    requested_model: CHATGPT_SOL_CHAT_PRO_MODEL,
+    requested_model: CHATGPT_LATEST_CHAT_PRO_MODEL,
     available_options: selection.available_options ?? [],
     available_families: selection.available_families ?? [],
     family_status: selection.family_status ?? "unverified",
@@ -959,8 +963,8 @@ export function verifyChatgptModelSelectionBeforeSend(root = document, selection
     || selection.post_close_family_status === "verified";
   const closeVerification = selection.picker_close_verification;
   const selectedProofFieldsReady = selection.status === "selected"
-    && selection.requested_model === CHATGPT_SOL_CHAT_PRO_MODEL
-    && selection.model_used === "GPT-5.6 Sol Pro"
+    && selection.requested_model === CHATGPT_LATEST_CHAT_PRO_MODEL
+    && selection.model_used === "Latest Pro"
     && selection.family_status === "verified"
     && selection.effort_status === "verified"
     && selection.picker_family_status === "verified"
@@ -1167,7 +1171,7 @@ async function revealFamily(root, r, options = {}) {
   return openFamilyPicker(root, mainMenu, r.nav.familyTrigger, options);
 }
 
-async function selectSolChatProModel(root, options = {}) {
+async function selectLatestChatProModel(root, options = {}) {
   const base = {
     status: "unavailable",
     model_used: null,
@@ -1195,7 +1199,7 @@ async function selectSolChatProModel(root, options = {}) {
     return {
       ...base,
       failure_reason: "legacy_picker_detected",
-      warning: "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI",
+      warning: "legacy ChatGPT picker detected; this yoetz version requires the composer-pill picker UI",
       legacy_picker: legacyMarkers.slice(0, 10)
     };
   }
@@ -1207,14 +1211,14 @@ async function selectSolChatProModel(root, options = {}) {
       return {
         ...base,
         failure_reason: "legacy_picker_detected",
-        warning: "legacy ChatGPT picker detected; this yoetz version requires the GPT-5.6 UI",
+        warning: "legacy ChatGPT picker detected; this yoetz version requires the composer-pill picker UI",
         legacy_picker: lateLegacyMarkers.slice(0, 10)
       };
     }
     return {
       ...base,
       failure_reason: "model_control_not_found",
-      warning: "ChatGPT GPT-5.6 composer model pill not found"
+      warning: "ChatGPT composer model pill not found"
     };
   }
 
@@ -1226,7 +1230,7 @@ async function selectSolChatProModel(root, options = {}) {
       ...base,
       failure_reason: "model_picker_open_failed",
       pill_text: modelControlLabel(modelButton),
-      warning: "ChatGPT GPT-5.6 model picker did not open"
+      warning: "ChatGPT model picker did not open"
     };
   }
   let r = await waitForRead(root, options);
@@ -1240,10 +1244,10 @@ async function selectSolChatProModel(root, options = {}) {
     );
   }
 
-  // Family: ensure the family view is visible and Sol is checked. The reader
-  // reads inline family radios; when the family is in a separate submenu the
-  // driver reveals it (revealFamily, clicks only) and re-reads with
-  // familySurface so the reader sees the radios there.
+  // Family: ensure the family view is visible and Latest is checked (never
+  // Sol). The reader reads inline family radios; when the family is in a
+  // separate submenu the driver reveals it (revealFamily, clicks only) and
+  // re-reads with familySurface so the reader sees the radios there.
   if (!r.family.checked && r.nav.viewToggle && !r.nav.expanded) {
     realClick(r.nav.viewToggle);
     await sleep(Number(options.actionSettleMs ?? 250));
@@ -1253,43 +1257,48 @@ async function selectSolChatProModel(root, options = {}) {
   let familySubmenu = await revealFamily(root, r, options);
   r = read(root, { familySurface: familySubmenu });
   availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
-  const familyOk = r.family.checkedCount === 1 && familyIsSol(r.family.label);
+  const familyOk = r.family.checkedCount === 1 && familyIsLatest(r.family.label);
   if (!familyOk) {
-    if (r.family.checkedCount !== 1 || !r.family.solOption) {
+    if (r.family.checkedCount !== 1 || !r.family.latestOption) {
       await closeModelPicker(root, modelButton);
+      // A Sol-only menu fails closed here: Latest is absent so there is
+      // nothing to click, and the warning names the refused Sol fallback.
+      const checkedLabel = r.family.checkedCount === 1 ? normalizeText(r.family.label) : "";
       return selectionFailure(
         base, modelButton, legacyStateFromRead(r), availableFamilies,
         r.family.checkedCount === 1
-          ? "GPT-5.6 Sol was not visible in the family submenu"
-          : "GPT-5.6 Sol family menu did not expose one checked model",
+          ? (familyIsSol(checkedLabel)
+            ? `Latest was not visible in the family submenu (checked: ${checkedLabel}); refusing to fall back to Sol`
+            : "Latest was not visible in the family submenu")
+          : "Latest family menu did not expose one checked model",
         r.family.checkedCount === 1 ? "model_family_not_found" : "model_family_menu_unverified"
       );
     }
-    realClick(r.family.solOption);
+    realClick(r.family.latestOption);
     await sleep(Number(options.actionSettleMs ?? 250));
     if (!await closeModelPicker(root, modelButton)) {
-      return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "ChatGPT model picker did not close after selecting GPT-5.6 Sol", "model_picker_close_failed");
+      return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "ChatGPT model picker did not close after selecting Latest", "model_picker_close_failed");
     }
     modelButton = await waitForModelButton(root, options);
     if (!modelButton) {
-      return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting GPT-5.6 Sol", "model_family_remount_failed");
+      return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount after selecting Latest", "model_family_remount_failed");
     }
     if (!await openModelPicker(root, modelButton, options)) {
-      return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting GPT-5.6 Sol", "model_picker_reopen_failed");
+      return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen after selecting Latest", "model_picker_reopen_failed");
     }
     r = await waitForRead(root, options);
     availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
     if (!r.shape) {
       await closeModelPicker(root, modelButton);
-      return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "ChatGPT model picker exposed an unsupported shape after selecting GPT-5.6 Sol; refusing unverified model selection", "model_picker_shape_unsupported");
+      return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "ChatGPT model picker exposed an unsupported shape after selecting Latest; refusing unverified model selection", "model_picker_shape_unsupported");
     }
     familySubmenu = await revealFamily(root, r, options);
     r = read(root, { familySurface: familySubmenu });
     availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
-    const familyOkAfterSelect = r.family.checkedCount === 1 && familyIsSol(r.family.label);
+    const familyOkAfterSelect = r.family.checkedCount === 1 && familyIsLatest(r.family.label);
     if (!familyOkAfterSelect) {
       await closeModelPicker(root, modelButton);
-      return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "GPT-5.6 Sol family menu selection could not be verified", "model_family_selection_unverified");
+      return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "Latest family menu selection could not be verified", "model_family_selection_unverified");
     }
   }
 
@@ -1314,12 +1323,12 @@ async function selectSolChatProModel(root, options = {}) {
       if (!selected.ok) {
         await closeModelPicker(root, modelButton);
         const st = legacyStateFromRead(r, { effort_move_method: effortMoveMethod });
-        return selectionFailure(base, modelButton, st, availableFamilies, "GPT-5.6 Sol Pro effort was not visible in the personal picker", "effort_control_not_found");
+        return selectionFailure(base, modelButton, st, availableFamilies, "Latest Pro effort was not visible in the personal picker", "effort_control_not_found");
       }
     } else if (r.effort.kind === "slider") {
       if (!r.effort.control) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "GPT-5.6 Sol effort slider was not found in the Advanced picker", "effort_control_not_found");
+        return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "Latest effort slider was not found in the Advanced picker", "effort_control_not_found");
       }
       const sliderState = { shape: "slider", effort_slider: r.effort.control, surface: r.surface };
       const moved = await moveEffortSliderToProTier(root, sliderState, options);
@@ -1327,7 +1336,7 @@ async function selectSolChatProModel(root, options = {}) {
       r = read(root);
       if (!moved.ok) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, legacyStateFromRead(r, { effort_move_method: effortMoveMethod }), availableFamilies, "GPT-5.6 Sol effort slider did not move to verified Pro", "effort_slider_move_failed");
+        return selectionFailure(base, modelButton, legacyStateFromRead(r, { effort_move_method: effortMoveMethod }), availableFamilies, "Latest effort slider did not move to verified Pro", "effort_slider_move_failed");
       }
     } else {
       // rows: click the Pro tier row (found via the reader-exported helpers,
@@ -1335,7 +1344,7 @@ async function selectSolChatProModel(root, options = {}) {
       const proOption = r.effort.items.find((item) => foldedModelText(optionLabel(item)) === "pro");
       if (!proOption) {
         await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "GPT-5.6 Sol Pro effort was not visible in the effort menu", "effort_control_not_found");
+        return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "Latest Pro effort was not visible in the effort menu", "effort_control_not_found");
       }
       realClick(proOption);
       await sleep(Number(options.actionSettleMs ?? 250));
@@ -1364,11 +1373,11 @@ async function selectSolChatProModel(root, options = {}) {
     r = read(root, { familySurface: familySubmenu });
     availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
   }
-  const familyVerified = r.family.checkedCount === 1 && familyIsSol(r.family.label);
+  const familyVerified = r.family.checkedCount === 1 && familyIsLatest(r.family.label);
   const effortVerified = foldedModelText(r.effort.label) === "pro";
   if (!familyVerified || !effortVerified) {
     await closeModelPicker(root, modelButton);
-    return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "GPT-5.6 Sol at verified Pro effort could not be confirmed in one picker pass", "model_selection_verification_failed");
+    return selectionFailure(base, modelButton, legacyStateFromRead(r), availableFamilies, "Latest at verified Pro effort could not be confirmed in one picker pass", "model_selection_verification_failed");
   }
   const state = legacyStateFromRead(r);
   state.effort_move_method = effortMoveMethod;
@@ -1522,9 +1531,14 @@ async function openFamilyPicker(root, mainMenu, trigger, options = {}) {
   if (!trigger) {
     return null;
   }
+  // findFamilySubmenu locates the Latest submenu; when Latest is absent (e.g. a
+  // Sol-only account) fall back to any mounted family submenu so the
+  // fail-closed evidence names what IS there. The fallback never drives a
+  // click: the driver only clicks r.family.latestOption, null on that path.
   const opened = () => findFamilySubmenu(root, mainMenu)
     ?? activeFamilyView(root, mainMenu, trigger)
-    ?? (isSelectModelViewToggle(trigger) ? null : structurallyOpenControlledSurfaceForTrigger(root, trigger));
+    ?? (isSelectModelViewToggle(trigger) ? null : structurallyOpenControlledSurfaceForTrigger(root, trigger))
+    ?? fallbackFamilySubmenu(root, mainMenu);
   const settleMs = Number(options.settleMs ?? 150);
   for (const activate of [openWithHoverEvents, openWithPointerEvents, pressEnter, pressSpace]) {
     try {
@@ -1538,6 +1552,9 @@ async function openFamilyPicker(root, mainMenu, trigger, options = {}) {
   return null;
 }
 
+function fallbackFamilySubmenu(root, mainMenu) {
+  return visibleMenus(root).find((menu) => menu !== mainMenu && familyMenuRadios(menu, true).length > 0) ?? null;
+}
 async function openWithHoverEvents(element, isOpen, options = {}) {
   const settleMs = Number(options.settleMs ?? 150);
   const phases = [
@@ -1721,7 +1738,7 @@ async function reverifyModelSelectionAfterClose(root, modelButton, options = {})
   const familySubmenu = await revealFamily(root, r, options);
   r = read(root, { familySurface: familySubmenu });
   const verifiedState = legacyStateFromRead(r);
-  const familyStatus = r.family.checkedCount === 1 && familyIsSol(r.family.label) ? "verified" : "unverified";
+  const familyStatus = r.family.checkedCount === 1 && familyIsLatest(r.family.label) ? "verified" : "unverified";
   const effortStatus = foldedModelText(r.effort.label) === "pro" ? "verified" : "unverified";
   const disabledPro = effortStatus === "unverified" ? r.effort.disabled ? { reason: r.effort.disabledReason } : null : null;
   const close = await closeModelPickerResult(root, reopenedButton, verifiedState, { requireProPill: true });
@@ -1893,7 +1910,8 @@ async function waitForFamilyMenu(root, mainMenu, trigger, options = {}) {
   while (Date.now() - startedAt < timeoutMs) {
     const menu = findFamilySubmenu(root, mainMenu)
       ?? activeFamilyView(root, mainMenu, trigger)
-      ?? (isSelectModelViewToggle(trigger) ? null : structurallyOpenControlledSurfaceForTrigger(root, trigger));
+      ?? (isSelectModelViewToggle(trigger) ? null : structurallyOpenControlledSurfaceForTrigger(root, trigger))
+      ?? fallbackFamilySubmenu(root, mainMenu);
     if (menu) return menu;
     await sleep(intervalMs);
   }
@@ -2050,7 +2068,7 @@ function clickSliderTrackMax(slider) {
   return true;
 }
 function selectionFailure(base, modelButton, state, availableFamilies, warning, failureReason, options = {}) {
-  const pickerFamily = isSupportedPickerShape(state) && familyIsSol(state?.family_label) ? "verified" : "unverified";
+  const pickerFamily = isSupportedPickerShape(state) && familyIsLatest(state?.family_label) ? "verified" : "unverified";
   const pickerEffort = isSupportedPickerShape(state) && effortIsChatProTier(state) ? "verified" : "unverified";
   const pillText = modelControlLabel(modelButton);
   const closedPill = options.closedPill
@@ -2131,7 +2149,10 @@ function modelPillSummaryMatches(value) {
   const folded = foldedModelText(value).replace(/\s+/g, " ");
   const effort = "instant|medium|high|extra high|pro|max|light";
   return new RegExp(`^(?:${effort})$`).test(folded)
-    || new RegExp(`^\\d+(?:\\.\\d+)+(?: sol)? (?:${effort})$`).test(folded)
+    // "6 Pro" (GPT-6 generation pill, live probe 2026-09-05) alongside the
+    // older dotted "5.6 Sol Pro" form. A bare generation number corroborates
+    // effort only — never family (see closedPillDiagnostics).
+    || new RegExp(`^\\d+(?:\\.\\d+)?(?: sol)? (?:${effort})$`).test(folded)
     || /\bgpt[\s.-]*\d/.test(folded);
 }
 function dispatchSyntheticEvent(element, type, constructorName, init = {}) {
@@ -2787,8 +2808,10 @@ function isAssistantControlLine(line, options = {}) {
 function isModelStatusText(text) {
   const value = normalizeText(text);
   const effort = "instant|medium|high|extra high|pro";
-  return new RegExp(`^(sol|${effort}|pro thinking|thinking)$`, "i").test(value)
-    || new RegExp(`^\\d+(?:\\.\\d+)+(?:\\s+sol)?\\s+(?:${effort})$`, "i").test(value)
+  // "Latest" is the GPT-6 Chat family radio and "6 Pro" its closed pill
+  // (live probe 2026-09-05): both are status chrome, never answer content.
+  return new RegExp(`^(sol|latest|${effort}|pro thinking|thinking)$`, "i").test(value)
+    || new RegExp(`^\\d+(?:\\.\\d+)?(?:\\s+sol)?\\s+(?:${effort})$`, "i").test(value)
     || new RegExp(`^gpt[\\s.-]*\\d+(?:[\\s.-]*\\d+)*(?:\\s+sol)?(?:\\s+(?:${effort}|thinking))?$`, "i").test(value);
 }
 
@@ -3760,11 +3783,11 @@ export function modelSelectionDiagnostics(root = document) {
   const controlledId = modelButton?.getAttribute?.("aria-controls") ?? null;
   const controlledNode = controlledId ? root.getElementById?.(controlledId) : null;
   return {
-    requested_model: CHATGPT_SOL_CHAT_PRO_MODEL,
+    requested_model: CHATGPT_LATEST_CHAT_PRO_MODEL,
     current_model_label: modelControlLabel(modelButton),
-    current_matches_requested: Boolean(familyIsSol(state?.family_label) && effortIsChatProTier(state)),
+    current_matches_requested: Boolean(familyIsLatest(state?.family_label) && effortIsChatProTier(state)),
     surface_groups: chatSurfaceDiagnostics(root),
-    family_status: familyIsSol(state?.family_label) ? "verified" : "unverified",
+    family_status: familyIsLatest(state?.family_label) ? "verified" : "unverified",
     effort_status: effortIsChatProTier(state) ? "verified" : "unverified",
     family_label: state?.family_label ?? null,
     picker_shape: state?.shape ?? null,

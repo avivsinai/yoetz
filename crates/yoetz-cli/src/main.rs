@@ -317,7 +317,7 @@ struct BrowserRecipeArgs {
     #[arg(long)]
     recipe: PathBuf,
 
-    /// Control whether ChatGPT is pinned to Sol+Pro or left on the current model.
+    /// Control whether ChatGPT is pinned to Latest+Pro or left on the current model.
     #[arg(long, value_enum, default_value_t = chatgpt_recipe::ChatgptModelStrategy::Select)]
     model_strategy: chatgpt_recipe::ChatgptModelStrategy,
 
@@ -2526,7 +2526,7 @@ fn build_chatgpt_recipe_spec(
         bundle_path: recipe_args.bundle.clone(),
         model: match recipe_args.model_strategy {
             chatgpt_recipe::ChatgptModelStrategy::Select => {
-                chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL.to_string()
+                chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL.to_string()
             }
             chatgpt_recipe::ChatgptModelStrategy::Current => "current".to_string(),
         },
@@ -2676,7 +2676,7 @@ fn ensure_chatgpt_sol_chat_pro_only_vars(recipe_vars: &BTreeMap<String, String>)
         return Ok(());
     }
     bail!(
-        "ChatGPT recipe supports only GPT-5.6 Sol at Chat effort Pro; remove unsupported var(s): {}",
+        "ChatGPT recipe supports only Latest at Chat effort Pro; remove unsupported var(s): {}",
         unsupported.join(", ")
     )
 }
@@ -6150,7 +6150,7 @@ mod tests {
                 "conversation_id": "final-conversation"
             }),
             json!({"status": "ok"}),
-            "GPT-5.6 Sol Pro",
+            "Latest Pro",
             Instant::now(),
             OutputFormat::Text,
             Some(&prepared_thread),
@@ -8023,7 +8023,7 @@ mod tests {
 
         let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
         assert_eq!(spec.bundle_path, Some(PathBuf::from("/tmp/bundle.md")));
-        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL);
+        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL);
         assert_eq!(spec.prompt, "Review this repo");
         assert_eq!(spec.browser_context_id.as_deref(), Some("ctx-123"));
         assert_eq!(spec.profile_email.as_deref(), Some("user@example.com"));
@@ -8064,7 +8064,7 @@ mod tests {
 
         let err = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap_err();
         let message = format!("{err:#}");
-        assert!(message.contains("only GPT-5.6 Sol at Chat effort Pro"));
+        assert!(message.contains("only Latest at Chat effort Pro"));
         assert!(message.contains("model"));
         assert!(message.contains("extended"));
     }
@@ -8284,7 +8284,7 @@ mod tests {
             .expect("build recipe vars");
         let spec = build_chatgpt_recipe_spec(&recipe_args, &recipe_vars).unwrap();
 
-        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL);
+        assert_eq!(spec.model, chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL);
         assert!(!recipe_vars.contains_key("model"));
         assert!(!recipe_vars.contains_key("extended"));
     }
@@ -8551,7 +8551,7 @@ mod tests {
             backend: "dev-browser".to_string(),
             response: "ok".to_string(),
             model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
-            model_used: Some("GPT-5.6 Sol Pro".to_string()),
+            model_used: Some("Latest Pro".to_string()),
             model_selection_status: crate::chatgpt_recipe::ChatgptModelSelectionStatus::Selected,
             final_model_selection: None,
             warnings: vec!["clipboard fallback".to_string()],

@@ -109,14 +109,21 @@ test("ChatGPT adapter owns conversation and model policy", () => {
   }, provisionalConversationId, assignedConversationId), false);
   assert.equal(adapter.isAcceptableModelSelection({
     status: "selected",
-    requested_model: "gpt-5-6-sol-chat-pro",
+    requested_model: "gpt-6-pro-chat",
     family_status: "verified",
     effort_status: "verified",
-    model_used: "GPT-5.6 Sol Pro"
+    model_used: "Latest Pro"
   }), true);
   assert.equal(adapter.isAcceptableModelSelection({
     status: "selected",
-    requested_model: "gpt-5-6-sol-chat-pro",
+    requested_model: "gpt-6-pro-chat",
+    family_status: "verified",
+    effort_status: "verified",
+    model_used: "GPT-5.6 Sol Pro"
+  }), false);
+  assert.equal(adapter.isAcceptableModelSelection({
+    status: "selected",
+    requested_model: "gpt-6-pro-chat",
     family_status: "verified",
     effort_status: "verified",
     model_used: "GPT-5.6 Sol Expert"

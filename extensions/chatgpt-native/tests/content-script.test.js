@@ -143,8 +143,8 @@ export function configureModelState(_document, job) {
   hooks.events.push("configure_model");
   return hooks.configureModelResult ?? {
     status: "selected",
-    model_used: "GPT-5.6 Sol Pro",
-    requested_model: "gpt-5-6-sol-chat-pro",
+    model_used: "Latest Pro",
+    requested_model: "gpt-6-pro-chat",
     family_status: "verified",
     effort_status: "verified",
     surface_evidence_seen: Boolean(hooks.configureModelSurfaceEvidenceSeen)
@@ -232,10 +232,10 @@ export const siteAdapter = {
   },
   isAcceptableModelSelection(selection) {
     return selection?.status === "selected"
-      && selection?.requested_model === "gpt-5-6-sol-chat-pro"
+      && selection?.requested_model === "gpt-6-pro-chat"
       && selection?.family_status === "verified"
       && selection?.effort_status === "verified"
-      && selection?.model_used === "GPT-5.6 Sol Pro";
+      && selection?.model_used === "Latest Pro";
   },
   isConversationUrl(value) {
     return Boolean(this.conversationIdFromUrl(value));
@@ -614,7 +614,7 @@ test("content script inspect labels model diagnostics as current chip state", as
   try {
     globalThis.window.name = "yoetz-chatgpt-native:run-inspect:job-inspect|workspace_test|nonce-inspect";
     hooks.modelSelectionDiagnostics = {
-      modelChip: "GPT-5.6 Sol Pro",
+      modelChip: "Latest Pro",
       modelVerified: true
     };
 
@@ -960,8 +960,8 @@ test("content script rejects final ChatGPT model drift before clicking send", as
     assert.equal((await send({ type: "yoetz_prepare_job", job })).ok, true);
     hooks.configureModelResult = {
       status: "selected",
-      model_used: "GPT-5.6 Sol Expert",
-      requested_model: "gpt-5-6-sol-chat-pro",
+      model_used: "GPT-5.6 Sol Pro",
+      requested_model: "gpt-6-pro-chat",
       family_status: "verified",
       effort_status: "verified"
     };

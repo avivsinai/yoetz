@@ -326,12 +326,12 @@ async function configureModel(job, options = {}) {
     }
     throw commandError(
       "model_selection_not_verified_before_send",
-      `ChatGPT GPT-5.6 Sol Pro was not verified immediately before send: ${String(error?.message ?? error)}`,
+      `ChatGPT Latest Pro was not verified immediately before send: ${String(error?.message ?? error)}`,
       {
         phase: "send",
         side_effect_started: true,
         send_committed: false,
-        requested_model: job.model ?? "gpt-5-6-sol-chat-pro",
+        requested_model: job.model ?? "gpt-6-pro-chat",
         model_selection_error_code: error?.code ?? null
       }
     );
@@ -403,12 +403,12 @@ async function sendPrompt(job, prompt) {
       if (!adapter.isAcceptableModelSelection(finalModelSelection)) {
         throw commandError(
           "model_selection_not_verified_before_send",
-          `ChatGPT GPT-5.6 Sol Pro was not verified immediately before send: ${finalModelSelection?.failure_reason ?? finalModelSelection?.status ?? "unknown"}`,
+          `ChatGPT Latest Pro was not verified immediately before send: ${finalModelSelection?.failure_reason ?? finalModelSelection?.status ?? "unknown"}`,
           {
             phase: "send",
             side_effect_started: true,
             send_committed: false,
-            requested_model: finalModelSelection?.requested_model ?? job.model ?? "gpt-5-6-sol-chat-pro",
+            requested_model: finalModelSelection?.requested_model ?? job.model ?? "gpt-6-pro-chat",
             model_selection_status: finalModelSelection?.status ?? "unknown",
             model_selection_failure_reason: finalModelSelection?.failure_reason ?? null
           }
@@ -433,12 +433,12 @@ async function sendPrompt(job, prompt) {
       if (!proof.ok) {
         throw commandError(
           "model_selection_not_verified_before_send",
-          `ChatGPT GPT-5.6 Sol Pro proof changed or was incomplete immediately before send: ${proof.failure_reason ?? "unknown"}`,
+          `ChatGPT Latest Pro proof changed or was incomplete immediately before send: ${proof.failure_reason ?? "unknown"}`,
           {
             phase: "send",
             side_effect_started: true,
             send_committed: false,
-            requested_model: finalModelSelection?.requested_model ?? job.model ?? "gpt-5-6-sol-chat-pro",
+            requested_model: finalModelSelection?.requested_model ?? job.model ?? "gpt-6-pro-chat",
             model_selection_status: finalModelSelection?.status ?? "unknown",
             model_selection_failure_reason: proof.failure_reason,
             surface_failure_reason: proof.failure_reason,

@@ -84,18 +84,21 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 
 ## Browser Architecture
 
-- The built-in ChatGPT recipe pins GPT-5.6 Sol at Chat effort Pro. The recipe
+- The built-in ChatGPT recipe pins the `Latest` family at Chat effort Pro
+  (live probe 2026-09-05: `Latest` checked, `GPT-5.6 Sol` / `GPT-5.5` mounted
+  unchecked, closed pill `6 Pro`). The recipe
   first verifies `role=radiogroup[aria-label="Select chat surface"]`
   and forces the `Chat` radio (`data-tpp-toggle-value="chatgpt"`), then selects
-  the composer model pill. `findModelButton` prefers a grammar-matched pill,
+  the composer model pill. `findModelButton` prefers a grammar-matched pill
+  (including the `6 Pro` generation-plus-effort form),
   then a family-token pill, then any visible `__composer-pill` — including a
   mid-flow label of `Thinking effort`, which is a live model-pill string, not a
-  decoy. Default mapping: select `GPT-5.6 Sol` with the literal `Pro` effort
-  tier. The current ChatGPT simple-view picker is a hybrid surface: an effort
+  decoy. Default mapping: select `Latest` with the literal `Pro` effort
+  tier, never Sol. The current ChatGPT simple-view picker is a hybrid surface: an effort
   slider whose snapshot parses (`Pro, 5 of 5.`) plus inline family radios
-  (`GPT-5.6 Sol` / `GPT-5.5`) in the same menu, with no `Advanced`/`Effort`
+  (`Latest` / `GPT-5.6 Sol` / `GPT-5.5`) in the same menu, with no `Advanced`/`Effort`
   gating text. Classify that as the existing slider shape (legacy Advanced
-  view remains an OR). Family proof is the checked inline `GPT-5.6 Sol`
+  view remains an OR). Family proof is the checked inline `Latest`
   radio when present, else the Model-row submenu. Since September 2026 the
   family radios may instead sit collapsed behind an aria-expanded
   `Select model` menuitem inside an `inert`
@@ -145,12 +148,13 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   (aria-disabled + data-disabled, tooltip "Limit reached…"); the recipe
   fails closed with `effort_options_disabled` in both the selection and
   post-close reverification legs. A successful click is never
-  proof: reopen through `findModelButton` and re-read both legs. Already-Sol
+  proof: reopen through `findModelButton` and re-read both legs. Already-Latest
   already-Pro is verify-only. After close, the composer pill must corroborate
-  Pro effort (`Pro` or a family-plus-`Pro` suffix); family is never inferred
-  from the pill. Missing controls, Work mode, another family, or another
-  effort tier fail closed. The requested model id is
-  `gpt-5-6-sol-chat-pro`; `model_used` is `GPT-5.6 Sol Pro`. Speed and the
+  Pro effort (`Pro`, a family-plus-`Pro` suffix, or the `6 Pro` generation
+  form); family is never inferred from the pill — a Sol-worded pill fails
+  closed. Missing controls, a Sol-only menu, Work mode, another family, or
+  another effort tier fail closed. The requested model id is
+  `gpt-6-pro-chat`; `model_used` is `Latest Pro`. Speed and the
   Faster/Smarter power slider stay at the user's default. Open leftover picker
   surfaces are closed structurally (`aria-expanded` / `data-state`), including
   opacity-0 menus in background tabs.

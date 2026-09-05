@@ -1051,10 +1051,10 @@ async function completeJobWithExtraction(job, extraction, continuationEpoch = jo
       conversation_id: conversationId,
       conversation_url: conversationUrlForJob(job, conversationId),
       model_strategy: job.model_strategy ?? "select",
-      // The picker-proven label (e.g. "GPT-5.6 Sol Pro") is the authoritative
+      // The picker-proven label (e.g. "Latest Pro") is the authoritative
       // model identity yoetz already verified before send. The backend
-      // data-message-model-slug (e.g. "gpt-5.6-sol-wm") drifts with ChatGPT's
-      // internal naming, so it must not overwrite a proven label. Keep it as
+      // data-message-model-slug drifts with ChatGPT's internal naming, so it
+      // must not overwrite a proven label. Keep it as
       // observability (model_slug) and as the fallback when there was no
       // picker proof (current/kept_current/unavailable).
       model_used: ["selected", "current"].includes(job.model_selection_status) && job.model_used
@@ -1252,7 +1252,7 @@ function validateChatgptFinalModelSelectionReceipt(receipt, job) {
   if (receipt.requested_model !== expectedModel) return `requested_model=${JSON.stringify(receipt.requested_model)}`;
   if (strategy === "select") {
     for (const [key, expected] of [
-      ["model_used", "GPT-5.6 Sol Pro"],
+      ["model_used", "Latest Pro"],
       ["family_status", "verified"],
       ["effort_status", "verified"],
       ["picker_family_status", "verified"],

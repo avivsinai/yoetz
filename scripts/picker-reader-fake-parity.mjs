@@ -47,8 +47,8 @@ const oldDomMod = await import(`file://${join(TMP_DIR, "chatgpt-dom-main.js")}`)
 // --- Build the 7 fake shapes (each gets a fresh fixture for old + new) ---
 const shapes = [
   {
-    name: "SolPicker (menu, family submenu)",
-    build: () => builders.makeSolPickerFixture({ family: "GPT-5.6 Sol", effort: "Pro" })
+    name: "LatestPicker (menu, family submenu)",
+    build: () => builders.makeLatestPickerFixture({ family: "Latest", effort: "Pro" })
   },
   {
     name: "TwoPillComposer",
@@ -67,8 +67,8 @@ const shapes = [
     build: () => builders.makeOpacityZeroLeftoverFixture()
   },
   {
-    name: "SolSlider (backgroundFrozen)",
-    build: () => builders.makeSolSliderFixture({ backgroundFrozen: true, initialValue: 5 })
+    name: "LatestSlider (backgroundFrozen)",
+    build: () => builders.makeLatestSliderFixture({ backgroundFrozen: true, initialValue: 5 })
   },
   {
     name: "PersonalPicker",

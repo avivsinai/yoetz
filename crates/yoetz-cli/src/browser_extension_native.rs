@@ -1781,7 +1781,7 @@ pub fn canary(
         BuiltinWebRecipe::Chatgpt => run_chatgpt_recipe(
             &ChatgptRecipeSpec {
                 bundle_path: Some(bundle_path),
-                model: crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL.to_string(),
+                model: crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL.to_string(),
                 model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
                 prompt: "Reply with exactly OK.".to_string(),
                 browser_context_id: None,
@@ -5832,7 +5832,7 @@ mod tests {
         };
         let spec = ChatgptRecipeSpec {
             bundle_path: Some(bundle.path.clone()),
-            model: crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL.to_string(),
+            model: crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL.to_string(),
             model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
             prompt: "continue".to_string(),
             browser_context_id: None,
@@ -5958,18 +5958,18 @@ mod tests {
                                 "is_final": true,
                                 "response": "reconnected answer",
                                 "model_strategy": "select",
-                                "model_used": "GPT-5.6 Sol Pro",
+                                "model_used": "Latest Pro",
                                 "model_selection_status": "selected",
                                 "final_model_selection": {
                                     "click_bound": true,
                                     "status": "selected",
-                                    "requested_model": "gpt-5-6-sol-chat-pro",
-                                    "model_used": "GPT-5.6 Sol Pro",
+                                    "requested_model": "gpt-6-pro-chat",
+                                    "model_used": "Latest Pro",
                                     "family_status": "verified",
                                     "effort_status": "verified",
                                     "picker_family_status": "verified",
                                     "picker_effort_status": "verified",
-                                    "click_bound_closed_pill_text": "GPT-5.6 Sol Pro",
+                                    "click_bound_closed_pill_text": "Latest Pro",
                                     "click_bound_closed_pill_family_status": "verified",
                                     "click_bound_closed_pill_effort_status": "verified",
                                     "picker_shape": "personal",
@@ -6023,7 +6023,7 @@ mod tests {
         };
         let spec = ChatgptRecipeSpec {
             bundle_path: Some(bundle_path),
-            model: crate::chatgpt_recipe::CHATGPT_SOL_CHAT_PRO_MODEL.to_string(),
+            model: crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL.to_string(),
             model_strategy: ChatgptModelStrategy::Select,
             prompt: "review".to_string(),
             browser_context_id: None,
@@ -6194,13 +6194,13 @@ mod tests {
             Some("run_1".to_string()),
             json!({
                 "response": "done",
-                "model_used": "GPT-5.6 Sol Pro",
+                "model_used": "Latest Pro",
                 "model_selection_status": "selected",
                 "model_strategy": "select",
                 "final_model_selection": {
                     "status": "selected",
-                    "model_used": "GPT-5.6 Sol Pro",
-                    "requested_model": "gpt-5-6-sol-chat-pro",
+                    "model_used": "Latest Pro",
+                    "requested_model": "gpt-6-pro-chat",
                     "family_status": "verified",
                     "effort_status": "verified",
                     "picker_family_status": "verified",
@@ -6213,7 +6213,7 @@ mod tests {
                         "closed_pill_pro": true
                     },
                     "click_bound": true,
-                    "click_bound_closed_pill_text": "GPT-5.6 Sol Pro",
+                    "click_bound_closed_pill_text": "Latest Pro",
                     "click_bound_closed_pill_family_status": "verified",
                     "click_bound_closed_pill_effort_status": "verified",
                     "surface_evidence_seen": true,
@@ -6247,7 +6247,7 @@ mod tests {
         let result = parse_recipe_result(envelope, BuiltinWebRecipe::Chatgpt).unwrap();
 
         assert_eq!(result.response, "done");
-        assert_eq!(result.model_used.as_deref(), Some("GPT-5.6 Sol Pro"));
+        assert_eq!(result.model_used.as_deref(), Some("Latest Pro"));
         assert_eq!(
             result.model_selection_status,
             ChatgptModelSelectionStatus::Selected
@@ -6287,7 +6287,7 @@ mod tests {
             result.diagnostics.model_slug.as_deref(),
             Some("gpt-5.6-sol-wm")
         );
-        assert_eq!(result.model_used.as_deref(), Some("GPT-5.6 Sol Pro"));
+        assert_eq!(result.model_used.as_deref(), Some("Latest Pro"));
     }
 
     #[test]

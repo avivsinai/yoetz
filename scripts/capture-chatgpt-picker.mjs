@@ -22,15 +22,26 @@ import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 
 function parseArgs(argv) {
-  const args = { cdpUrl: process.env.YOETZ_CDP_URL ?? "", tabUrlContains: "", out: "" };
+  const args = {
+    cdpUrl: process.env.YOETZ_CDP_URL ?? "",
+    browserWs: process.env.YOETZ_BROWSER_WS ?? "",
+    tabUrlContains: "",
+    out: "",
+  };
   for (let i = 2; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--cdp-url") args.cdpUrl = argv[++i];
+    else if (a === "--browser-ws") args.browserWs = argv[++i];
     else if (a === "--tab-url-contains") args.tabUrlContains = argv[++i];
     else if (a === "--out") args.out = argv[++i];
     else if (a === "-h" || a === "--help") { usage(); process.exit(0); }
     else die(`unknown argument: ${a}`);
   }
+  // A ws://.../devtools/browser/... URL passed as --cdp-url doubles as the
+  // browser WS (Chrome 152 builds where HTTP /json/* is 404 but the browser
+  // WS from DevToolsActivePort still listens).
+  if (!args.browserWs && isBrowserWsUrl(args.cdpUrl)) args.browserWs = args.cdpUrl;
+  if (!args.cdpUrl && args.browserWs) args.cdpUrl = args.browserWs;
   if (!args.cdpUrl) die("--cdp-url is required (or set $YOETZ_CDP_URL)");
   if (!args.tabUrlContains) die("--tab-url-contains is required");
   if (!args.out) die("--out is required");
@@ -39,9 +50,18 @@ function parseArgs(argv) {
 
 function usage() {
   console.error(`usage: capture-chatgpt-picker.mjs
-  --cdp-url <url>            CDP base, e.g. http://127.0.0.1:9222 (or $YOETZ_CDP_URL)
+  --cdp-url <url>            CDP base, e.g. http://127.0.0.1:9222 (or $YOETZ_CDP_URL).
+                             A ws://.../devtools/browser/... URL also works and
+                             selects the browser-WS path automatically.
+  --browser-ws <wsurl>       browser debugger WS, e.g. ws://127.0.0.1:9222/devtools/browser/<id>
+                             (or $YOETZ_BROWSER_WS). Uses Target.getTargets +
+                             flattened attach; kept alongside /json/list fallback.
   --tab-url-contains <frag>  substring matched against page target URLs (first wins)
   --out <path>               destination HTML file`);
+}
+
+function isBrowserWsUrl(url) {
+  return typeof url === "string" && /^wss?:\/\//i.test(url) && url.includes("/devtools/browser/");
 }
 
 function die(msg) { usage(); console.error(`error: ${msg}`); process.exit(1); }
@@ -172,8 +192,112 @@ const SERIALIZER = String.raw`
 // and returns outerHTML. Computed styles are baked in because jsdom has no
 // layout engine (see docs/design/chatgpt-picker-reader.md "jsdom boundary").
 
+// Browser-WS path: for Chrome builds where HTTP /json/* is 404 but the
+// browser WS from DevToolsActivePort still listens. Never calls
+// Target.activateTarget (it wedges WS upgrades); flattened attach only.
+function cdpSession(wsUrl, { timeoutMs = 15000 } = {}) {
+  const ws = new WebSocket(wsUrl);
+  let nextId = 0;
+  const pending = new Map();
+  let openError = null;
+  const ready = new Promise((resolve, reject) => {
+    ws.onopen = () => resolve();
+    ws.onerror = () => { openError = new Error(`websocket error to ${wsUrl}`); };
+    ws.onclose = () => {
+      if (nextId === 0 && openError) reject(openError);
+    };
+    setTimeout(() => {
+      if (nextId === 0) reject(new Error(`websocket open timed out after 15s: ${wsUrl}`));
+    }, timeoutMs);
+  });
+  ws.onmessage = (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+    if (msg.id == null || !pending.has(msg.id)) return;
+    const { resolve, reject, timer } = pending.get(msg.id);
+    pending.delete(msg.id);
+    clearTimeout(timer);
+    if (msg.error) reject(new Error(`CDP error: ${JSON.stringify(msg.error)}`));
+    else resolve(msg.result ?? {});
+  };
+  async function send(method, params = {}, ms = timeoutMs) {
+    await ready;
+    const id = ++nextId;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error(`${method} timed out after ${Math.round(ms / 1000)}s`));
+      }, ms);
+      pending.set(id, { resolve, reject, timer });
+      const payload = { id, method, params };
+      if (params.sessionId) {
+        // Flattened sessions ride on the browser WS connection.
+        payload.sessionId = params.sessionId;
+        delete payload.params.sessionId;
+      }
+      ws.send(JSON.stringify(payload));
+    });
+  }
+  function close() { try { ws.close(); } catch { /* ignore */ } }
+  return { send, close };
+}
+
+async function findPageTargetViaBrowserWs(browserWsUrl, fragment) {
+  const { send, close } = cdpSession(browserWsUrl);
+  try {
+    const { targetInfos } = await send("Target.getTargets");
+    const pages = (targetInfos ?? []).filter((t) => t.type === "page");
+    const match = pages.find((t) => typeof t.url === "string" && t.url.includes(fragment));
+    if (!match) {
+      throw new Error(`no page target with url containing "${fragment}" among ${pages.length} page target(s) via browser WS`);
+    }
+    return match;
+  } finally {
+    close();
+  }
+}
+
+async function evaluateViaBrowserWs(browserWsUrl, targetId, expression) {
+  const { send, close } = cdpSession(browserWsUrl);
+  try {
+    const { sessionId } = await send("Target.attachToTarget", { targetId, flatten: true });
+    if (!sessionId) throw new Error("Target.attachToTarget returned no sessionId");
+    try {
+      const res = await send(
+        "Runtime.evaluate",
+        { sessionId, expression, returnByValue: true, awaitPromise: false },
+      );
+      if (res?.exceptionDetails) {
+        const d = res.exceptionDetails;
+        const detail = d.exception?.description ?? d.text ?? JSON.stringify(d);
+        throw new Error(`page exception: ${String(detail).split("\n")[0]}`);
+      }
+      return res?.result?.value;
+    } finally {
+      try { await send("Target.detachFromTarget", { sessionId }); } catch { /* ignore */ }
+    }
+  } finally {
+    close();
+  }
+}
+
 async function main() {
   const args = parseArgs(process.argv);
+  // Prefer the browser-WS path when available; keep /json/list as fallback.
+  if (args.browserWs) {
+    try {
+      const match = await findPageTargetViaBrowserWs(args.browserWs, args.tabUrlContains);
+      console.error(`matched target (browser WS): ${match.url}`);
+      const html = await evaluateViaBrowserWs(args.browserWs, match.targetId, `${SERIALIZER}()`);
+      if (!html) die("serializer returned an empty value");
+      mkdirSync(dirname(args.out), { recursive: true });
+      writeFileSync(args.out, html);
+      console.error(`wrote ${args.out} (${html.length} bytes)`);
+      return;
+    } catch (err) {
+      console.error(`browser-WS path failed (${err.message}); falling back to /json/list`);
+    }
+  }
   const httpBase = httpBaseFrom(args.cdpUrl);
   const target = await findPageTarget(httpBase, args.tabUrlContains);
   console.error(`matched target: ${target.url}`);
