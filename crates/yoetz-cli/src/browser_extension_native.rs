@@ -778,40 +778,29 @@ fn ensure_replaceable_extension_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+// The managed copy holds exactly the release package (manifest, host template,
+// popup, icons/, src/) — the same allow-list the release fingerprint
+// authenticates. Copying the whole source tree would drag in dev-only content
+// (tests/, package.json, node_modules/ with its .bin symlinks) that must never
+// be loaded into Chrome.
 fn copy_extension_dir_contents(source_dir: &Path, target_dir: &Path) -> Result<usize> {
     fs::create_dir_all(target_dir).with_context(|| format!("create {}", target_dir.display()))?;
     let mut copied = 0;
-    for entry in
-        fs::read_dir(source_dir).with_context(|| format!("read {}", source_dir.display()))?
-    {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target_dir.join(entry.file_name());
-        let metadata = fs::symlink_metadata(&source_path)
-            .with_context(|| format!("inspect {}", source_path.display()))?;
-        if metadata.file_type().is_symlink() {
-            bail!(
-                "extension source must not contain symlinks: {}",
-                source_path.display()
-            );
+    for relative in extension_package_file_paths(source_dir)? {
+        let source_path = source_dir.join(&relative);
+        let target_path = target_dir.join(&relative);
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("create {}", parent.display()))?;
         }
-        if metadata.is_dir() {
-            copied += copy_extension_dir_contents(&source_path, &target_path)?;
-        } else if metadata.is_file() {
-            fs::copy(&source_path, &target_path).with_context(|| {
-                format!(
-                    "copy extension file {} to {}",
-                    source_path.display(),
-                    target_path.display()
-                )
-            })?;
-            copied += 1;
-        } else {
-            bail!(
-                "extension source contains unsupported file type: {}",
-                source_path.display()
-            );
-        }
+        fs::copy(&source_path, &target_path).with_context(|| {
+            format!(
+                "copy {} -> {}",
+                source_path.display(),
+                target_path.display()
+            )
+        })?;
+        copied += 1;
     }
     Ok(copied)
 }
@@ -7281,6 +7270,46 @@ mod tests {
         let payload = serde_json::to_value(&result).unwrap();
         assert_eq!(payload["source_version"], YOETZ_CLI_VERSION);
         assert_eq!(payload["source_provenance"], "environment_override");
+    }
+
+    // Observed 2026-09-05 (yoetz#483): with jsdom installed as a devDependency,
+    // `extension update` refused the source over node_modules/.bin symlinks and
+    // the managed copy carried tests/ and package.json. The sync must copy the
+    // release package only.
+    #[test]
+    fn copy_extension_dir_contents_copies_only_the_release_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        let checkout = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("extensions/chatgpt-native");
+        copy_extension_dir_contents(&checkout, &source).unwrap();
+        fs::create_dir_all(source.join("node_modules/.bin")).unwrap();
+        fs::write(source.join("node_modules/.bin/real-tool"), "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            source.join("node_modules/.bin/real-tool"),
+            source.join("node_modules/.bin/tldts"),
+        )
+        .unwrap();
+        fs::create_dir_all(source.join("tests")).unwrap();
+        fs::write(source.join("tests/dev-only.test.js"), "// not shipped").unwrap();
+        fs::write(source.join("package.json"), "{}").unwrap();
+
+        let target = dir.path().join("managed");
+        let copied = copy_extension_dir_contents(&source, &target).unwrap();
+
+        assert_eq!(copied, extension_package_file_paths(&checkout).unwrap().len());
+        assert!(target.join("manifest.json").is_file());
+        assert!(target.join("src/chatgpt-dom.js").is_file());
+        assert!(!target.join("node_modules").exists());
+        assert!(!target.join("tests").exists());
+        assert!(!target.join("package.json").exists());
+        assert_eq!(
+            extension_package_fingerprint(&target).unwrap(),
+            extension_package_fingerprint(&checkout).unwrap()
+        );
     }
 
     #[test]
