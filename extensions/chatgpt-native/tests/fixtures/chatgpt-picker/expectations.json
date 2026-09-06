@@ -3,21 +3,85 @@
   "2026-09-05-gpt6-chat-family-expanded.html": {
     "shape": "slider",
     "ready": true,
-    "family": { "label": "Latest", "checked": true, "checkedCount": 1, "options": ["Latest", "GPT-5.6 Sol", "GPT-5.5"] },
-    "effort": { "label": "Pro", "disabled": false, "kind": "slider", "options": [] },
-    "nav": { "expanded": true },
+    "family": {
+      "label": "Latest",
+      "checked": true,
+      "checkedCount": 1,
+      "options": [
+        "Latest",
+        "GPT-5.6 Sol",
+        "GPT-5.5"
+      ]
+    },
+    "effort": {
+      "label": "Pro",
+      "disabled": false,
+      "kind": "slider",
+      "options": []
+    },
+    "nav": {
+      "expanded": true
+    },
     "_provenance": "Reconstructed from the native-extension probe gpt6-native-probe-selection.json (yoetz-owned Chat tab, 2026-09-05, run 20260905T144315Z_b9ff4d). NOT a live CDP serializer capture — CDP WS upgrades were wedged. Replace with a live capture when CDP recovers.",
     "_notes": [
       "Live labels for yz-a8c.2: family Latest CHECKED, GPT-5.6 Sol / GPT-5.5 unchecked; effort slider Pro 5 of 5 verified; closed pill '6 Pro' (effort only, no family token).",
       "Without the isFamilyOptionLabel Latest acceptance, the reader drops the Latest radio and reports checked_count=0 on this fixture."
     ]
   },
+  "2026-09-06-gpt6-chat-live-capture.html": {
+    "shape": "slider",
+    "ready": true,
+    "family": {
+      "label": "Latest",
+      "checked": true,
+      "checkedCount": 1,
+      "options": [
+        "Latest",
+        "GPT-5.6 Sol",
+        "GPT-5.5"
+      ]
+    },
+    "effort": {
+      "label": "Pro",
+      "disabled": false,
+      "kind": "slider",
+      "options": []
+    },
+    "nav": {
+      "expanded": true
+    },
+    "_provenance": "Live capture via dump_picker_html through the native-messaging channel (yoetz-owned Chat tab, 2026-09-06, run 20260906T124313Z_cc0224; content-script serializer, picker already open from the run's model_selection phase, opened_by_us=false). Reader values asserted above verified with readPicker on this file.",
+    "_notes": [
+      "First live serializer capture: Latest CHECKED, GPT-5.6 Sol / GPT-5.5 unchecked; effort slider Pro (valuenow 4 of 0..4, 'Pro, 5 of 5.').",
+      "Captured 10778 bytes; real Radix incidental structure retained (inert attributes on descendants, tooltip wrappers absent in this surface unlike the quota-locked fixture)."
+    ]
+  },
   "2026-09-03-unified-quota-locked-family-expanded.html": {
     "shape": "slider",
     "ready": true,
-    "family": { "label": "GPT-5.6 Sol", "checked": true, "checkedCount": 1, "options": ["GPT-5.6 Sol", "GPT-5.5"] },
-    "effort": { "label": null, "disabled": true, "kind": "rows", "options": ["Medium", "High", "Extra High", "Pro"] },
-    "nav": { "expanded": true },
+    "family": {
+      "label": "GPT-5.6 Sol",
+      "checked": true,
+      "checkedCount": 1,
+      "options": [
+        "GPT-5.6 Sol",
+        "GPT-5.5"
+      ]
+    },
+    "effort": {
+      "label": null,
+      "disabled": true,
+      "kind": "rows",
+      "options": [
+        "Medium",
+        "High",
+        "Extra High",
+        "Pro"
+      ]
+    },
+    "nav": {
+      "expanded": true
+    },
     "_notes": [
       "Account effort quota exhausted (Limit reached until 2026-10-01): all four tier rows carry aria-disabled=true + data-disabled; none is checked, so effort.label is null and effort.disabled is true.",
       "Tier rows carry BOTH aria-label and visible text (design assumption 'aria-label only' was wrong as of this capture; isFamilyOptionLabel on text still excludes them from the family read).",
