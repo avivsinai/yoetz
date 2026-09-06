@@ -59,4 +59,5 @@ browser-profile/
 
 # OS files
 Thumbs.db
+.tmp-parity/
 .tmp-fake-parity/
