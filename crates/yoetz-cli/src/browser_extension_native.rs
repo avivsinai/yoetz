@@ -797,8 +797,7 @@ fn copy_extension_dir_contents(source_dir: &Path, target_dir: &Path) -> Result<u
         let source_path = source_dir.join(&relative);
         let target_path = target_dir.join(&relative);
         if let Some(parent) = target_path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("create {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
         }
         fs::copy(&source_path, &target_path).with_context(|| {
             format!(
@@ -7269,7 +7268,10 @@ mod tests {
         let target = dir.path().join("managed");
         let copied = copy_extension_dir_contents(&source, &target).unwrap();
 
-        assert_eq!(copied, extension_package_file_paths(&checkout).unwrap().len());
+        assert_eq!(
+            copied,
+            extension_package_file_paths(&checkout).unwrap().len()
+        );
         assert!(target.join("manifest.json").is_file());
         assert!(target.join("src/chatgpt-dom.js").is_file());
         assert!(!target.join("node_modules").exists());
@@ -7297,10 +7299,16 @@ mod tests {
         assert!(!managed.join("tests").exists());
         assert!(!managed.join("package.json").exists());
         assert_eq!(
-            extension_package_fingerprint_with_version(&managed, Some(first.source_version.as_str()))
-                .unwrap(),
-            extension_package_fingerprint_with_version(&checkout, Some(first.source_version.as_str()))
-                .unwrap()
+            extension_package_fingerprint_with_version(
+                &managed,
+                Some(first.source_version.as_str())
+            )
+            .unwrap(),
+            extension_package_fingerprint_with_version(
+                &checkout,
+                Some(first.source_version.as_str())
+            )
+            .unwrap()
         );
 
         let second = prepare_managed_chatgpt_extension_unlocked().unwrap();
@@ -8044,6 +8052,11 @@ mod tests {
             format!(r#"{{"version":"{version}"}}"#),
         )
         .unwrap();
+        // The release-package allow-list (#484) requires every file below;
+        // copy_extension_dir_contents fails on any missing entry.
+        fs::write(path.join("native-host-manifest.template.json"), "{}\n").unwrap();
+        fs::write(path.join("popup.html"), "<!doctype html>\n").unwrap();
+        fs::write(path.join("popup.js"), "// popup\n").unwrap();
         fs::write(
             path.join("src").join("service-worker.js"),
             format!("service-worker:{version}"),
