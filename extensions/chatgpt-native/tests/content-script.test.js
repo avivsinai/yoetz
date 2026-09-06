@@ -658,6 +658,44 @@ test("content script inspect rejects a conversation-only match without durable o
   }
 });
 
+test("content script dump_picker_html serializes the open picker menu", async () => {
+  const { send, restore } = await loadContentScript(
+    "dump_picker_open_menu",
+    "https://chatgpt.com/c/conv-123?_yoetz=run-dump"
+  );
+  try {
+    globalThis.window.name = "yoetz-chatgpt-native:run-dump:job-dump|workspace_test|nonce-inspect";
+    // An open picker menu already mounted in the fake document.
+    const menuStub = {
+      outerHTML: "<div role=\"menu\" data-state=\"open\"><div role=\"menuitemradio\" aria-checked=\"true\">Latest</div></div>",
+      cloneNode() { return { outerHTML: menuStub.outerHTML, querySelectorAll: () => [], removeAttribute() {}, setAttribute() {}, style: { setProperty() {} } }; },
+      nodeType: 1
+    };
+    globalThis.document.querySelector = (selector) => (String(selector).includes("role=\"menu\"")
+      ? menuStub
+      : null);
+    globalThis.document.body = {
+      dispatchEvent: () => true
+    };
+
+    const response = await send({
+      type: "yoetz_dump_picker_html",
+      job_id: "job-dump",
+      run_id: "run-dump",
+      workspace_id: "workspace_test",
+      ownership_nonce: "nonce-inspect",
+      recipe: "chatgpt"
+    });
+
+    assert.equal(response.ok, true);
+    assert.match(response.payload.html, /role="menu"/);
+    assert.equal(response.payload.opened_by_us, false);
+    assert.ok(Number.isFinite(response.payload.bytes));
+  } finally {
+    restore();
+  }
+});
+
 test("content script resume prepare rejects a different conversation before send", async () => {
   const { send, restore } = await loadContentScript("resume_mismatch", "https://chatgpt.com/c/other?_yoetz=run_resume");
   try {
@@ -1289,9 +1327,13 @@ async function loadContentScript(label, href) {
   globalThis.document = { title: "ChatGPT", defaultView: globalThis.window };
   globalThis.location = location;
   const helperUrl = `data:text/javascript,${encodeURIComponent(helperModule)}#${label}`;
+  const moduleFileUrls = {
+    "src/picker-serializer.js": new URL("../src/picker-serializer.js", import.meta.url).href,
+    "src/chatgpt-dom.js": new URL("../src/chatgpt-dom.js", import.meta.url).href
+  };
   globalThis.chrome = {
     runtime: {
-      getURL: () => helperUrl,
+      getURL: (path) => moduleFileUrls[path] ?? helperUrl,
       getManifest: () => ({ version: "test" }),
       sendMessage: async (message) => {
         runtimeMessages.push(message);

@@ -555,6 +555,12 @@ struct BrowserExtensionInspectArgs {
     #[arg(long, alias = "run_id")]
     run_id: String,
 
+    /// Capture the ChatGPT model-picker DOM instead of running a page
+    /// inspection. Writes the serialized menu HTML to this path and reports
+    /// capture diagnostics (bytes, opened_by_us) on stderr.
+    #[arg(long, value_name = "PATH")]
+    dump_picker_html: Option<PathBuf>,
+
     /// Route to a Chrome profile email reported by extension status.
     #[arg(long, alias = "profile_email")]
     profile_email: Option<String>,
@@ -3849,7 +3855,12 @@ fn handle_browser_extension(
             );
             (
                 "browser.extension.inspect",
-                browser_extension_native::inspect_run(&args.run_id, selector, recipe)?,
+                browser_extension_native::inspect_run(
+                    &args.run_id,
+                    args.dump_picker_html.as_deref(),
+                    selector,
+                    recipe,
+                )?,
             )
         }
         BrowserExtensionCommand::GrantIdentity(args) => {

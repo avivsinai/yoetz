@@ -105,6 +105,13 @@ async function handleMessage(message) {
         include_page_text: Boolean(message.include_page_text),
         recipe: message.recipe
       });
+    case "yoetz_dump_picker_html":
+      return dumpPickerHtml(message.run_id, {
+        job_id: message.job_id,
+        workspace_id: message.workspace_id,
+        ownership_nonce: message.ownership_nonce,
+        recipe: message.recipe
+      });
     case "yoetz_auth_probe":
       return authProbe(message.recipe);
     case "yoetz_probe":
@@ -658,6 +665,95 @@ async function inspectPage(runId, options = {}) {
     result.page_text_tail = pageText.slice(-500);
   }
   return result;
+}
+
+async function dumpPickerHtml(runId, options = {}) {
+  const adapter = await siteAdapter(options.recipe);
+  const { parseOwnedWindowName } = await domHelpers(options.recipe);
+  const parsed = parseOwnedWindowName(window.name);
+  const jobId = String(options.job_id ?? "").trim();
+  const workspaceId = String(options.workspace_id ?? "").trim();
+  const ownershipNonce = String(options.ownership_nonce ?? "").trim();
+  const jobMatches = Boolean(jobId && parsed?.job_id === jobId);
+  const runMatches = Boolean(runId && parsed?.run_id === runId);
+  const workspaceMatches = Boolean(workspaceId && parsed?.workspace_id === workspaceId);
+  const nonceMatches = Boolean(ownershipNonce && parsed?.ownership_nonce === ownershipNonce);
+  if (!jobMatches || !runMatches || !workspaceMatches || !nonceMatches) {
+    throw commandError("run_mismatch", `tab is not owned by Yoetz job ${jobId || "(unknown)"}, run ${runId}, workspace ${workspaceId || "(unknown)"}`);
+  }
+  if (adapter.recipe !== "chatgpt") {
+    throw commandError("unsupported_recipe", `dump_picker_html is ChatGPT-only; recipe ${JSON.stringify(adapter.recipe)} rejected before side effects`, {
+      phase: "profile",
+      side_effect_started: false
+    });
+  }
+  const { findModelButton } = await import(chrome.runtime.getURL("src/chatgpt-dom.js"));
+  const { serializePickerMenu } = await import(chrome.runtime.getURL("src/picker-serializer.js"));
+
+  let openedByUs = false;
+  const menuOpen = () => Boolean(
+    document.querySelector('[role="menu"][data-state="open"]')
+    || document.querySelector('[role="menu"]')
+  );
+  if (!menuOpen()) {
+    openedByUs = true;
+    await openPickerMenu(findModelButton);
+  }
+  try {
+    const html = serializePickerMenu(document);
+    return {
+      html,
+      bytes: html.length,
+      opened_by_us: openedByUs
+    };
+  } finally {
+    if (openedByUs) {
+      document.body?.dispatchEvent?.(new KeyboardEvent("keydown", {
+        key: "Escape",
+        code: "Escape",
+        bubbles: true
+      }));
+      document.body?.dispatchEvent?.(new KeyboardEvent("keyup", {
+        key: "Escape",
+        code: "Escape",
+        bubbles: true
+      }));
+    }
+  }
+}
+
+// Open the model picker exactly as the driver does: activate the composer pill
+// with the full pointer sequence, then — for the hybrid picker that keeps a
+// collapsed "Select model" view toggle mounted — activate that toggle too.
+async function openPickerMenu(findModelButton) {
+  const dispatchActivation = (element) => {
+    element?.focus?.();
+    for (const [type, constructorName, init] of [
+      ["pointerdown", "PointerEvent", { button: 0, buttons: 1, pointerId: 1, pointerType: "mouse", isPrimary: true }],
+      ["mousedown", "MouseEvent", { button: 0, buttons: 1 }],
+      ["pointerup", "PointerEvent", { button: 0, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }],
+      ["mouseup", "MouseEvent", { button: 0, buttons: 0 }],
+      ["click", "MouseEvent", { button: 0, buttons: 0, detail: 1 }]
+    ]) {
+      element?.dispatchEvent?.(new constructorName(type, { bubbles: true, cancelable: true, composed: true, ...init }));
+    }
+  };
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const pill = findModelButton(document);
+  if (!pill) {
+    throw commandError("model_pill_not_found", "no ChatGPT model composer pill found to open the picker", {
+      phase: "profile",
+      side_effect_started: true
+    });
+  }
+  dispatchActivation(pill);
+  await wait(900);
+  const selectModelToggle = Array.from(document.querySelectorAll('[role="menuitem"]'))
+    .find((node) => String(node.getAttribute?.("aria-label") ?? "").toLowerCase() === "select model");
+  if (selectModelToggle && selectModelToggle.getAttribute("aria-expanded") !== "true") {
+    dispatchActivation(selectModelToggle);
+    await wait(900);
+  }
 }
 
 async function authProbe(recipe) {

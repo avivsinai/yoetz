@@ -1793,12 +1793,16 @@ pub fn canary(
 
 pub fn inspect_run(
     run_id: &str,
+    dump_picker_html: Option<&Path>,
     selector: ExtensionInstanceSelector<'_>,
     recipe: BuiltinWebRecipe,
 ) -> Result<Value> {
     let trimmed = run_id.trim();
     if trimmed.is_empty() {
         bail!("--run-id is required");
+    }
+    if let Some(out_path) = dump_picker_html {
+        return dump_picker_html_run(trimmed, out_path, selector, recipe);
     }
     let response = send_site_control_job(
         "inspect_run",
@@ -1811,6 +1815,58 @@ pub fn inspect_run(
         "transport": TRANSPORT_NAME,
         "recipe": recipe.as_str(),
         "response": response.payload,
+    }))
+}
+
+// --dump-picker-html: capture the model-picker DOM through the extension's
+// native channel instead of inspect_run. Writes the serialized menu HTML to
+// `out_path` and prints capture diagnostics to stderr; the JSON payload stays
+// small (no html field) so console output remains readable.
+fn dump_picker_html_run(
+    run_id: &str,
+    out_path: &Path,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    if recipe != BuiltinWebRecipe::Chatgpt {
+        bail!("--dump-picker-html is only supported with --chatgpt");
+    }
+    let response = send_site_control_job(
+        "dump_picker_html",
+        json!({ "run_id": run_id, "recipe": recipe.as_str() }),
+        selector,
+        recipe,
+    )?;
+    let html = response
+        .payload
+        .get("html")
+        .and_then(Value::as_str)
+        .context("dump_picker_html reply carried no html")?;
+    let bytes = html.len();
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create parent directory {}", parent.display()))?;
+    }
+    fs::write(out_path, html)
+        .with_context(|| format!("write picker capture {}", out_path.display()))?;
+    let opened_by_us = response
+        .payload
+        .get("opened_by_us")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    eprintln!(
+        "picker capture written to {} ({bytes} bytes)",
+        out_path.display()
+    );
+    eprintln!("opened_by_us: {opened_by_us}");
+    Ok(json!({
+        "status": "ok",
+        "transport": TRANSPORT_NAME,
+        "recipe": recipe.as_str(),
+        "dump_picker_html": out_path.display().to_string(),
+        "bytes": bytes,
+        "opened_by_us": opened_by_us,
+        "run_id": run_id,
     }))
 }
 
@@ -3455,7 +3511,7 @@ fn send_control_job_with_recipe(
         )
     })?;
     stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT))?;
-    let control_run_id = (kind == "inspect_run")
+    let control_run_id = (kind == "inspect_run" || kind == "dump_picker_html")
         .then(|| payload.get("run_id").and_then(Value::as_str))
         .flatten()
         .map(str::to_string);
@@ -3531,6 +3587,7 @@ fn validate_inbound_envelope(envelope: &ProtocolEnvelope) -> Result<()> {
         | "pair_complete"
         | "reconnect"
         | "inspect_run"
+        | "dump_picker_html"
         | "request_identity_permission" => {}
         other => bail!("unsupported chrome-extension-native envelope type `{other}`"),
     }
@@ -4398,6 +4455,7 @@ mod native_host_unix {
             | "pair_request"
             | "reconnect"
             | "inspect_run"
+            | "dump_picker_html"
             | "request_identity_permission" => forward_to_extension(&stdout, &forwarded),
             other => Err(anyhow!("unsupported local client message `{other}`")),
         };
@@ -4435,6 +4493,7 @@ mod native_host_unix {
                         "job_cancel"
                         | "reconnect"
                         | "inspect_run"
+                        | "dump_picker_html"
                         | "request_identity_permission" => {
                             if let Err(err) = forward_to_extension(&stdout, &forwarded) {
                                 if let Some(mut client) =

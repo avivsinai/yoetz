@@ -3038,6 +3038,63 @@ test("diagnosticPayload defensively emits page-level textContent keys even when 
   }
 });
 
+test("service worker dump_picker_html forwards to the run's tab and relays the capture", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  await storage.set({
+    "jobs.job_dump_target": inspectableJob({
+      jobId: "job_dump_target",
+      runId: "run_dump",
+      tabId: 13
+    })
+  });
+  let dumpMessage = null;
+  const captureHtml = "<div role=\"menu\" data-state=\"open\"><div role=\"menuitemradio\" aria-checked=\"true\">Latest</div></div>";
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      query: async () => [{ id: 13, url: "https://chatgpt.com/c/run", title: "Yoetz run" }],
+      sendMessage: async (_id, message) => {
+        dumpMessage = message;
+        return {
+          ok: true,
+          payload: {
+            html: captureHtml,
+            bytes: captureHtml.length,
+            opened_by_us: false
+          }
+        };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?dump_picker=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("dump_picker_html", "job_dump", { run_id: "run_dump" }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    assert.equal(dumpMessage.type, "yoetz_dump_picker_html");
+    assert.equal(dumpMessage.job_id, "job_dump_target");
+    assert.equal(dumpMessage.run_id, "run_dump");
+    assert.equal(dumpMessage.workspace_id, "workspace_test");
+    assert.equal(dumpMessage.ownership_nonce, "nonce-inspect");
+    const complete = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_dump"
+    );
+    assert.equal(complete.payload.html, captureHtml);
+    assert.equal(complete.payload.bytes, captureHtml.length);
+    assert.equal(complete.payload.opened_by_us, false);
+    assert.equal(complete.payload.run_id, "run_dump");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker inspect_run passes exact workspace identity and no conversation fallback", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
