@@ -269,6 +269,14 @@ subject is DOM shape (now covered by fixtures); keep sequencing tests.
 Remove the `querySelectorAll("*")` scans the fake forced. Done: fake suite
 ≤ ~60 tests, no test double shaping production code.
 
+> Re-scoped 2026-09-06 (review round 1, #489): the fake shrink did NOT happen
+> as this wave. Wave 3 was re-scoped by the lead to T2 (parity script baseline
+> pinned, reader asserted against expectations.json) + T3 (failures built from
+> the PickerRead value, `legacyStateFromRead` deleted), with a hard
+> "existing tests unmodified" rule. The fake shrink is deferred until more
+> live fixtures exist; `advancedViewRows` still scans `"*"` and the fake suite
+> still carries its DOM-shape tests. Update this section when it is re-planned.
+
 **Wave 4 — codify (½ day).** CLAUDE.md "Browser Architecture" paragraph
 rewritten to describe the reader/driver split and the fixture-capture
 procedure for the next drift (capture → assert → fix reader → done).
