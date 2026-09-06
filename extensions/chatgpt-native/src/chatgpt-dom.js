@@ -1644,14 +1644,7 @@ async function closeModelPickerResult(root, modelButton, state = null, options =
   }
 
   if (!verification.ok && !verification.picker_surface_closed) {
-    // Same family-trigger location pickerCloseVerification uses: the read's
-    // nav value, else re-locate inside the read surface.
-    const surface = state?.surface ?? null;
-    const familyTrigger = state?.nav?.familyTrigger
-      ?? (Array.from(surface?.querySelectorAll?.('[role="menuitem"], button') ?? [])
-        .find((item) => item.getAttribute?.("aria-haspopup") === "menu"
-          && (/\bModel\b/i.test(textOf(item)) || /^(?:gpt|o\d)\b/i.test(normalizeText(textOf(item))))))
-      ?? null;
+    const familyTrigger = locateFamilyTrigger(root, state);
     if (familyTrigger) {
       const neutral = neutralComposerArea(root, modelButton);
       verification = await tryMethod("hover_leave", () => dispatchHoverLeaveEvents(familyTrigger, neutral));
@@ -1766,17 +1759,10 @@ function pickerCloseVerification(root, modelButton, readValue, options = {}) {
   // the picker actually closed (findPickerState was fresh for this check
   // before the split).
   const freshRead = readPickerStateToRead(root);
-  // familyTrigger: the fresh read's nav value first, then the passed read's
-  // nav value, then re-locate inside either surface (nav.familyTrigger is
-  // null when the surface has no family trigger — e.g. a slider already
-  // expanded past it).
-  const locatedSurface = freshRead?.surface ?? readValue?.surface ?? null;
-  const familyTrigger = freshRead?.nav?.familyTrigger
-    ?? readValue?.nav?.familyTrigger
-    ?? (Array.from(locatedSurface?.querySelectorAll?.('[role="menuitem"], button') ?? [])
-      .find((item) => item.getAttribute?.("aria-haspopup") === "menu"
-        && (/\bModel\b/i.test(textOf(item)) || /^(?:gpt|o\d)\b/i.test(normalizeText(textOf(item))))))
-    ?? null;
+  // Family trigger: fresh read's nav value first (the passed read is a
+  // pre-close snapshot; a React remount leaves its element detached, and the
+  // deleted familyTriggerForPicker looked at the live surface first).
+  const familyTrigger = locateFamilyTrigger(root, readValue, freshRead);
   const familySurface = familySurfaceForPicker(root, familyTrigger, freshRead ?? readValue);
   const leftovers = openComposerPickerLeftovers(root);
   const leftoverOpen = leftovers.some((leftover) => leftoverSurfaceIsOpen(root, leftover.trigger));
@@ -1799,6 +1785,22 @@ function pickerCloseVerification(root, modelButton, readValue, options = {}) {
     closed_pill_text: pillText || null,
     ok: !familyTriggerOpen && !pickerSurfaceOpen && !modelTriggerOpen && !leftoverOpen && closedPillPro
   };
+}
+
+// locateFamilyTrigger: the family trigger behind the picker, per the deleted
+// familyTriggerForPicker's live-first order — the fresh read's nav value
+// first (a passed snapshot's element can be detached after a React remount),
+// then the passed read's nav value, then a re-location inside the freshest
+// available surface.
+function locateFamilyTrigger(root, readValue = null, freshRead = null) {
+  const live = freshRead ?? readPickerStateToRead(root);
+  if (live?.nav?.familyTrigger) return live.nav.familyTrigger;
+  if (readValue?.nav?.familyTrigger) return readValue.nav.familyTrigger;
+  const locatedSurface = live?.surface ?? readValue?.surface ?? null;
+  return Array.from(locatedSurface?.querySelectorAll?.('[role="menuitem"], button') ?? [])
+    .find((item) => item.getAttribute?.("aria-haspopup") === "menu"
+      && (/\bModel\b/i.test(textOf(item)) || /^(?:gpt|o\d)\b/i.test(normalizeText(textOf(item)))))
+    ?? null;
 }
 
 function familySurfaceForPicker(root, familyTrigger, readValue = null) {
@@ -1853,7 +1855,7 @@ async function selectPersonalChatProEffort(root, initialRead, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   // The PickerRead carries the effort row as effort.control (kind "row").
   const effortRow = initialRead?.effort?.kind === "row" ? initialRead.effort.control : null;
-  if (!effortRow) return { ok: false, read: initialRead, state: null, method: null };
+  if (!effortRow) return { ok: false, read: initialRead, method: null };
   realClick(effortRow);
   await sleep(settleMs);
   let read = readPickerStateToRead(root) ?? initialRead;
@@ -1861,11 +1863,11 @@ async function selectPersonalChatProEffort(root, initialRead, options = {}) {
   const submenuItems = Array.from(effortMenu?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
     .filter((item) => isVisible(item));
   const proOption = submenuItems.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === "pro");
-  if (!proOption) return { ok: false, read, state: null, method: null };
+  if (!proOption) return { ok: false, read, method: null };
   realClick(proOption);
   await sleep(settleMs);
   read = readPickerStateToRead(root) ?? read;
-  return { ok: foldedModelText(read.effort?.label) === "pro", read, state: null, method: "effort_row_select" };
+  return { ok: foldedModelText(read.effort?.label) === "pro", read, method: "effort_row_select" };
 }
 
 function personalEffortMenu(root, readValue) {
@@ -1945,27 +1947,24 @@ function combinedVerificationStatus(pickerStatus, closedStatus) {
 }
 // moveEffortSliderToPro: the driver's slider move, consuming and returning
 // PickerRead values. The control comes from read.effort.control; verification
-// re-reads via findPickerState and checks the settled value with
-// effortIsChatProTier on the derived legacy view of the fresh read.
+// re-reads the fresh value and succeeds only when the settled read still
+// carries the Pro label on a slider control.
 async function moveEffortSliderToPro(root, initialRead, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   let r = initialRead;
   const slider = initialRead?.effort?.control ?? null;
-  const toState = (readValue) => readValue && readValue.shape === "slider"
-    ? { shape: "slider", effort_slider: readValue.effort?.control ?? null, surface: readValue.surface }
-    : readValue;
   const originalSnapshot = sliderEffortSnapshot(slider, initialRead?.surface);
   const attemptKey = async (key, method) => {
     if (r?.effort?.kind !== "slider" || !r.effort.control) return null;
     pressActivationKey(r.effort.control, key);
     await sleep(settleMs);
-    // findPickerState can transiently return null or a non-slider state when
-    // the picker re-renders during settle; keep the last known read so the
-    // loop does not collapse on a stale snapshot. The final fresh re-check
-    // below is the authoritative verification.
-    r = findPickerState(root) ? readPickerStateToRead(root) ?? r : r;
+    // The reader can transiently return a null or non-slider value when the
+    // picker re-renders during settle; keep the last known read so the loop
+    // does not collapse on a stale snapshot. The final fresh re-check below
+    // is the authoritative verification.
+    r = readPickerStateToRead(root) ?? r;
     return foldedModelText(r.effort?.label) === "pro" && Boolean(r.effort.control) && r.effort.kind === "slider"
-      ? { ok: true, read: r, state: toState(r), method }
+      ? { ok: true, read: r, method }
       : null;
   };
 
@@ -1983,17 +1982,17 @@ async function moveEffortSliderToPro(root, initialRead, options = {}) {
   if (r?.effort?.kind === "slider" && r.effort.control) {
     clickSliderTrackMax(r.effort.control);
     await sleep(settleMs);
-    r = findPickerState(root) ? readPickerStateToRead(root) ?? r : r;
+    r = readPickerStateToRead(root) ?? r;
     if (foldedModelText(r.effort?.label) === "pro" && r.effort.kind === "slider") {
-      return { ok: true, read: r, state: toState(r), method: "pointer_pro" };
+      return { ok: true, read: r, method: "pointer_pro" };
     }
   }
   const finalRead = readPickerStateToRead(root) ?? r;
   r = finalRead;
   if (foldedModelText(finalRead?.effort?.label) === "pro" && finalRead.effort?.kind === "slider" && Boolean(finalRead.effort?.control)) {
-    return { ok: true, read: finalRead, state: toState(finalRead), method: "final_fresh_recheck" };
+    return { ok: true, read: finalRead, method: "final_fresh_recheck" };
   }
-  return { ok: false, read: finalRead, state: toState(finalRead), method: null };
+  return { ok: false, read: finalRead, method: null };
 }
 
 function clickSliderTrackMax(slider) {

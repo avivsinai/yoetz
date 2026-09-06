@@ -30,11 +30,16 @@ const FIXTURES_DIR = join(ROOT, "extensions/chatgpt-native/tests/fixtures/chatgp
 const TMP_DIR = join(ROOT, ".tmp-parity");
 const OLD_DOM_PATH = join(TMP_DIR, "chatgpt-dom-main.js");
 
-// Pinned to the pre-Wave-1 revision of chatgpt-dom.js. Main moved
-// findPickerState into the reader module in Wave 1 (#480), so a moving
-// ref ("main") would silently compare the reader against itself. ad76610
-// is the last commit where chatgpt-dom.js still owns findPickerState.
-const PARITY_BASELINE_COMMIT = "ad76610";
+// Pinned to the pre-Wave-1 revision of chatgpt-dom.js: 6aaa07f is the parent
+// of the Wave 1 move commit 03c442c (#480) — the last commit where
+// chatgpt-dom.js still owns findPickerState. Main moved findPickerState into
+// the reader module in Wave 1, so a moving ref ("main") would silently
+// compare the reader against itself. 15be4bc (#469) and eb46866 (#473) land
+// before 03c442c and are part of the baseline; earlier pins (e.g. ad76610)
+// predate the aria-hidden toggle + hybridFamilyView handling the unified
+// quota-locked fixture needs and wrongly turn a real parity match into a
+// "drift" INFO row.
+const PARITY_BASELINE_COMMIT = "6aaa07f";
 
 function prepareOldDom() {
   mkdirSync(TMP_DIR, { recursive: true });
@@ -52,12 +57,15 @@ function prepareOldDom() {
   // keeps it private; append a re-export without touching the original logic.
   //
   // jsdom shim: the baseline isVisible() ends with a layout gate
-  // (getClientRects().length === 0) that jsdom — which has no layout engine —
-  // always fails, so the old reader would see no menus at all in this script.
-  // In a real browser Element.checkVisibility exists and runs first, making
-  // the layout gate unreachable there; gating the layout check on
-  // checkVisibility's existence reproduces that browser behavior without
-  // changing the baseline's logic.
+  // (getClientRects().length === 0). jsdom has no layout engine — every
+  // element reports zero rects — and no checkVisibility, so as written the
+  // baseline would see no menus at all in this script. Gating the layout
+  // check on checkVisibility's existence skips only that layout gate, which
+  // is fair here: jsdom gives both readers attribute + inline-style
+  // evidence only (the new reader makes no layout calls at all), and the
+  // fixtures carry no stylesheets. This is NOT a claim of browser
+  // equivalence — in a real browser checkVisibility being true falls
+  // through to the layout gate, which stays reachable there.
   const LAYOUT_GATE = 'if (!options.allowNoLayout && typeof element.getClientRects === "function" && element.getClientRects().length === 0) {';
   const SHIMMED_LAYOUT_GATE = 'if (!options.allowNoLayout && typeof element.checkVisibility === "function" && typeof element.getClientRects === "function" && element.getClientRects().length === 0) {';
   const shimmedOldSrc = oldSrc.replace(LAYOUT_GATE, SHIMMED_LAYOUT_GATE);
@@ -123,18 +131,14 @@ if (fixtures.length === 0) {
   process.exit(0);
 }
 
-// The pinned ad76610 baseline predates the 2026-09-03/09-05 captures: it knows
-// only the Sol family (/^gpt\b|^o3$/i — no 'Latest', #485) and its
-// findSliderPickerSurface requires either a parsable effort slider or a visible
-// select-model toggle, neither of which exists in the unified quota-locked
-// fixture (aria-hidden toggle wrapper, inert min==max power slider). Rows in
-// this set are INFO when the ONLY disagreements are those baseline-vocabulary
-// gaps; the new reader is still hard-checked against expectations.json below.
+// The pinned 6aaa07f baseline predates #485: isFamilyOptionLabel there is
+// /^gpt\b|^o3$/i, so the old reader drops the Latest radio on the gpt6 fixture
+// and reports family "" where the new reader reads 'Latest' (shape and effort
+// still match). That vocabulary drift is expected and INFO-only; a shape or
+// effort disagreement on any row is a parity failure.
 const KNOWN_BASELINE_DRIFT = new Map([
   ["2026-09-05-gpt6-chat-family-expanded.html",
     "baseline predates the 'Latest' family (#485): old reader drops the Latest radio"],
-  ["2026-09-03-unified-quota-locked-family-expanded.html",
-    "baseline predates the unified quota-locked shape: no parsable effort slider, toggle hidden by an aria-hidden wrapper"],
 ]);
 
 let mismatches = 0;
@@ -194,7 +198,9 @@ for (const name of fixtures) {
   const effortMatch = String(oldResult.effort) === String(newResult.effort);
   const knownDriftReason = KNOWN_BASELINE_DRIFT.get(name);
   const identical = shapeMatch && familyMatch && effortMatch;
-  const info = !identical && Boolean(knownDriftReason);
+  // INFO only for the vocabulary gap the drift map names (family label on the
+  // gpt6 row): shape and effort must still match for INFO treatment.
+  const info = shapeMatch && effortMatch && !familyMatch && Boolean(knownDriftReason);
   const ok = identical || info;
 
   if (info) infos++;
