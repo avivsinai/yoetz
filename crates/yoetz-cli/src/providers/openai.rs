@@ -118,6 +118,26 @@ pub struct OpenAIVideoResult {
     pub usage: Usage,
 }
 
+fn is_astra_model(model: &str) -> bool {
+    model == "gpt-6-astra" || model.starts_with("gpt-6-astra-")
+}
+
+fn responses_text_format(response_format: Value) -> Value {
+    if response_format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return response_format;
+    }
+
+    let Some(schema) = response_format
+        .get("json_schema")
+        .and_then(Value::as_object)
+    else {
+        return response_format;
+    };
+    let mut format = schema.clone();
+    format.insert("type".to_string(), Value::String("json_schema".to_string()));
+    Value::Object(format)
+}
+
 pub async fn call_responses_vision(
     client: &Client,
     auth: &ProviderAuth,
@@ -133,8 +153,6 @@ pub async fn call_responses_vision(
             "openai image models are not valid for the Responses API; use a text model"
         ));
     }
-    let url = format!("{}/responses", auth.base_url.trim_end_matches('/'));
-
     let mut content = Vec::with_capacity(images.len() + 1);
     content.push(serde_json::json!({ "type": "input_text", "text": prompt }));
     for image in images {
@@ -145,18 +163,15 @@ pub async fn call_responses_vision(
         }));
     }
 
-    let mut body = serde_json::json!({
-        "model": model,
-        "input": [{ "role": "user", "content": content }],
-        "temperature": temperature,
-    });
-    if let Some(max) = max_output_tokens {
-        body["max_output_tokens"] = serde_json::json!(max);
-    }
-    if let Some(format) = response_format {
-        body["response_format"] = format;
-    }
+    let body = build_responses_vision_body(
+        model,
+        content,
+        response_format,
+        temperature,
+        max_output_tokens,
+    );
 
+    let url = format!("{}/responses", auth.base_url.trim_end_matches('/'));
     let (resp, _headers) =
         send_json::<Value>(client.post(url).bearer_auth(&auth.api_key).json(&body)).await?;
 
@@ -168,6 +183,32 @@ pub async fn call_responses_vision(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
     })
+}
+
+fn build_responses_vision_body(
+    model: &str,
+    content: Vec<Value>,
+    response_format: Option<Value>,
+    temperature: f32,
+    max_output_tokens: Option<usize>,
+) -> Value {
+    let mut body = serde_json::json!({
+        "model": model,
+        "input": [{ "role": "user", "content": content }],
+    });
+    // Astra rejects legacy sampling controls. Keep the existing default
+    // temperature for other Responses-capable models.
+    if !is_astra_model(model) {
+        body["temperature"] = serde_json::json!(temperature);
+    }
+    if let Some(max) = max_output_tokens {
+        body["max_output_tokens"] = serde_json::json!(max);
+    }
+    if let Some(format) = response_format {
+        body["text"] = serde_json::json!({ "format": responses_text_format(format) });
+    }
+
+    body
 }
 
 pub async fn generate_images(
@@ -770,5 +811,35 @@ mod tests {
         assert_eq!(usage.thoughts_tokens, Some(3));
         assert_eq!(usage.total_tokens, Some(4));
         assert_eq!(usage.cost_usd, Some(5.0));
+    }
+
+    #[test]
+    fn astra_uses_responses_text_format_and_omits_temperature() {
+        let body = build_responses_vision_body(
+            "gpt-6-astra",
+            vec![json!({"type":"input_text","text":"hi"})],
+            Some(json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {"type": "object"},
+                "strict": true
+            }
+            })),
+            0.1,
+            None,
+        );
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("response_format").is_none());
+        assert_eq!(body["text"]["format"]["name"], "answer");
+        assert_eq!(body["text"]["format"]["schema"]["type"], "object");
+        assert_eq!(body["text"]["format"]["strict"], true);
+        assert_eq!(body["text"]["format"]["type"], "json_schema");
+
+        let other = build_responses_vision_body("gpt-5.5", vec![], None, 0.1, None);
+        assert!((other["temperature"].as_f64().unwrap() - 0.1).abs() < 1e-6);
+        assert!(is_astra_model("gpt-6-astra"));
+        assert!(is_astra_model("gpt-6-astra-preview"));
+        assert!(!is_astra_model("gpt-5.5"));
     }
 }
