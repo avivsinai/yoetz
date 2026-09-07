@@ -158,11 +158,11 @@ lacks attribute selectors — which is why production code has a
 `querySelectorAll("*")` scan (2676). The fake is shaping the real thing.
 
 New: `tests/fixtures/chatgpt-picker/*.html` — serialized real picker DOM,
-captured from live tabs. **Capture mechanism: a dev-only script, not a
-protocol change.** `scripts/capture-chatgpt-picker.mjs` drives the existing
-chrome-devtools MCP / CDP session against a foreground tab: open the pill,
-expand the family view, then serialize the open `[role="menu"]` with computed
-`inert`/`aria-*`/`data-state` written back as attributes and all
+captured from live tabs. **Two capture paths share one serializer**
+(`src/picker-serializer.js`). `scripts/capture-chatgpt-picker.mjs` drives the
+existing chrome-devtools MCP / CDP session against a foreground tab: open the
+pill, expand the family view, then serialize the open `[role="menu"]` with
+computed `inert`/`aria-*`/`data-state` written back as attributes and all
 `<script>`/`<svg>` bodies stripped. The raw-CDP path never touches the
 extension or the native host; the native-channel path below does (it rides
 the Rust→SW→CS layers). One file per observed shape, named by date and

@@ -3063,7 +3063,8 @@ test("service worker dump_picker_html forwards to the run's tab and relays the c
           payload: {
             html: captureHtml,
             bytes: captureHtml.length,
-            opened_by_us: false
+            opened_by_us: false,
+            closed_after_dump: false
           }
         };
       }
@@ -3075,7 +3076,7 @@ test("service worker dump_picker_html forwards to the run's tab and relays the c
     await eventually(() => port.messages.some((message) => message.type === "hello"));
     port.messages.length = 0;
 
-    port.emit(envelope("dump_picker_html", "job_dump", { run_id: "run_dump" }));
+    port.emit(envelope("dump_picker_html", "job_dump", { run_id: "run_dump", allow_live_job: true }));
 
     await eventually(() => port.messages.some((message) => message.type === "job_complete"));
     assert.equal(dumpMessage.type, "yoetz_dump_picker_html");
@@ -3083,12 +3084,17 @@ test("service worker dump_picker_html forwards to the run's tab and relays the c
     assert.equal(dumpMessage.run_id, "run_dump");
     assert.equal(dumpMessage.workspace_id, "workspace_test");
     assert.equal(dumpMessage.ownership_nonce, "nonce-inspect");
+    // allow_live_job is threaded from the CLI payload through to the tab
+    // message (was inert in r2).
+    assert.equal(dumpMessage.allow_live_job, true);
     const complete = port.messages.find((message) =>
       message.type === "job_complete" && message.job_id === "job_dump"
     );
     assert.equal(complete.payload.html, captureHtml);
     assert.equal(complete.payload.bytes, captureHtml.length);
     assert.equal(complete.payload.opened_by_us, false);
+    // closed_after_dump is forwarded from the tab reply unchanged (was dropped in r2).
+    assert.equal(complete.payload.closed_after_dump, false);
     assert.equal(complete.payload.run_id, "run_dump");
   } finally {
     globalThis.chrome = originalChrome;

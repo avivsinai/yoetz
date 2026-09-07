@@ -2310,6 +2310,7 @@ async function handleDumpPickerHtml(message) {
       html: captured.html,
       bytes: captured.bytes,
       opened_by_us: captured.opened_by_us === true,
+      closed_after_dump: captured.closed_after_dump,
       tab_id: captured.tab_id,
       url: captured.url
     }
