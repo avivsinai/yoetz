@@ -113,24 +113,26 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   from the PickerRead value. Observed picker shapes: the simple menu, the
   legacy advanced slider, the hybrid simple-view (effort slider plus inline
   family radios), the unified list (tier rows beside the family radios), and
-  the personal picker. Classification is structural
+  the personal picker. Per-shape DOM rules live in the fixtures and tests, not
+  here: `extensions/chatgpt-native/tests/fixtures/chatgpt-picker/*.html` +
+  `expectations.json`, and `extensions/chatgpt-native/tests/fake-chatgpt.test.js`
+  — consult those before extending classification. Classification is structural
   (`aria-expanded`, `data-state`, `inert`, `aria-controls`), never opacity,
   because background tabs never animate; a retained closed menu keeps its
   toggle mounted with a stale `aria-expanded="true"`, counted as open only
   inside an open surface.
 - Drift procedure — when ChatGPT changes the picker: (a) capture the live DOM
   into `extensions/chatgpt-native/tests/fixtures/chatgpt-picker/<date>-<shape>.html`
-  via `scripts/capture-chatgpt-picker.mjs` (raw CDP); a second capture path
-  through the native extension (`yoetz browser extension inspect
-  --dump-picker-html`) is in progress, PR pending; (b) add an
+  via `scripts/capture-chatgpt-picker.mjs` (raw CDP); (b) add an
   `expectations.json` row with `_provenance`; (c) run
   `node --test tests/chatgpt-picker-reader.test.js` — it fails on the new
   fixture; (d) fix the reader only; (e) `node ../../scripts/picker-reader-parity.mjs`
   from `extensions/chatgpt-native` must exit 0 (baseline pinned to 6aaa07f;
-  rows the baseline predates print INFO); (f) one paced live run expecting
-  `effort_options_disabled` + family verified while the quota lock holds
-  (until 2026-10-01). Reconstructed fixtures are weaker than live captures;
-  prefer a capture whenever the DOM is reachable.
+  rows the baseline predates print INFO); (f) one paced live run; family must
+  verify, and effort is read from the run — Pro selected, or
+  `effort_options_disabled` while the account quota lock holds. Reconstructed
+  fixtures are weaker than live captures; prefer a capture whenever the DOM is
+  reachable.
 - Hidden-tab facts, kept: ChatGPT defers hydration in hidden tabs; a MAIN-world
   visibility shim (injected only into `?_yoetz=` tabs, stamped `data-yoetz-shim`
   at document start, `data-yoetz-hydrated` on `<html>` once a composer menu

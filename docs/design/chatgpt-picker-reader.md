@@ -236,8 +236,9 @@ Consequences for the reader — these are requirements, not suggestions:
 ## Waves (one implementer, review gate between each)
 
 Each wave is one PR, one worktree, ≤400 lines net, and must leave the full
-suite green and the live check unchanged (`effort_options_disabled`, family
-verified — the quota lock is our oracle until Oct 1).
+suite green and the live check unchanged (family verified; effort is read
+from the run — Pro selected, or `effort_options_disabled` while the account
+quota lock holds).
 
 **Wave 0 — capture (½ day).** amit-pi: add `jsdom` devDependency +
 `.gitignore`/fingerprint exclusions, a CI step that runs `npm ci` in the
@@ -290,7 +291,9 @@ Memory + release.
    against the pre-wave driver's `findPickerState` result on the same
    fixture (a one-off script; parity is the acceptance test for "moved, not
    changed").
-4. One live run, paced, expect `effort_options_disabled` + family verified.
+4. One live run, paced; family must verify, and effort is read from the run
+   — Pro selected, or `effort_options_disabled` while the account quota lock
+   holds.
 5. One batched review message. Builder does not recut until the round closes.
 
 ## Non-goals
