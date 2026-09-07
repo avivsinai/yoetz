@@ -205,14 +205,32 @@ export function classifyWaitManualHandoff({ url = "", title = "", text = "" } = 
 // fail closed with rate_limited when the modal is up. Returns the rate-limited
 // handoff ({ state, message }) or null.
 export function rateLimitedHandoff(root = document) {
-  const context = manualHandoffContext(root);
+  // The composer short-circuit in manualHandoffContext returns empty text
+  // whenever the composer is mounted, but a rate-limit overlay can leave the
+  // composer visible while suppressing interaction. Scan the interstitial
+  // surfaces plus document.body.innerText directly, without the short-circuit,
+  // so a portal-div modal (not [role=alert]/[role=dialog]/[aria-live]) still
+  // surfaces its message.
+  //
+  // Return whichever terminal manual handoff matches: a rate-limit modal with
+  // a "Log in" CTA classifies as login_required, and all three terminal states
+  // (challenge / login / rate_limited) must surface instead of the generic
+  // not-found error.
   const win = root?.defaultView ?? globalThis;
+  const hasTranscript = hasConversationResidue(root);
+  const surfaces = manualHandoffSurfaces(root, { hasTranscript });
+  const chunks = [];
+  for (const surface of surfaces) {
+    collectManualHandoffSurfaceText(surface, chunks);
+  }
+  const bodyText = normalizeText(root?.body?.innerText ?? root?.body?.textContent ?? "");
+  const text = normalizeText(chunks.join("\n")) || bodyText;
   const handoff = classifyManualHandoff({
     url: String(win.location?.href ?? ""),
-    title: context.title,
-    text: context.text
+    title: String(root?.title ?? ""),
+    text
   });
-  return handoff?.state === "rate_limited" ? handoff : null;
+  return handoff ?? null;
 }
 
 export function findComposer(root = document) {
@@ -4020,18 +4038,21 @@ function chatgptCommandError(code, message, detail = {}) {
   return error;
 }
 
-// Build a rate_limited command error from a late rate-limit modal detected at
-// a phase failure. The phase/side_effect_started come from the failing phase
-// so the worker's terminal detail reflects where the modal was observed.
+// Build a terminal manual-handoff command error from a late modal detected
+// at a phase failure. The phase/side_effect_started come from the failing
+// phase so the worker's terminal detail reflects where the modal was
+// observed. The code/state follow whatever classifyManualHandoff matched
+// (rate_limited, login_required, or challenge_required) — all three are
+// terminal manual handoffs and must surface instead of a generic not-found.
 function rateLimitedCommandError(root, { phase, side_effect_started } = {}) {
   const handoff = rateLimitedHandoff(root);
   if (!handoff) {
     return null;
   }
-  return chatgptCommandError("rate_limited", handoff.message, {
+  return chatgptCommandError(handoff.state, handoff.message, {
     phase,
     side_effect_started,
-    state: "rate_limited"
+    state: handoff.state
   });
 }
 

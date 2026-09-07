@@ -369,6 +369,25 @@ test("normalizeText trims repeated whitespace conservatively", () => {
   assert.equal(normalizeText(" hello \n\n\n world \r\n"), "hello\n\n world");
 });
 
+test("rateLimitedHandoff detects a late 'Too many requests' modal when the composer is mounted", () => {
+  // gh-471 second failure: a rate-limit overlay can leave the composer
+  // visible while suppressing interaction. manualHandoffContext short-circuits
+  // on findAuthenticatedComposer and returns empty text, so the modal is
+  // missed and the phase fails with a generic not-found. rateLimitedHandoff
+  // scans the interstitial surfaces plus body.innerText without the composer
+  // short-circuit.
+  const root = selectorRoot(new Map([
+    ["#prompt-textarea", [visibleElement({ id: "prompt-textarea" })]]
+  ]));
+  root.title = "Too many requests | ChatGPT";
+  root.body = { innerText: "Too many requests. Please wait a few minutes and try again later." };
+  root.defaultView = { location: { href: "https://chatgpt.com/?_yoetz=run_late", pathname: "/" } };
+  assert.deepEqual(rateLimitedHandoff(root), {
+    state: "rate_limited",
+    message: "ChatGPT is rate limited"
+  });
+});
+
 test("rateLimitedHandoff detects a late 'Too many requests' modal when the composer is absent", () => {
   // The field defect (gh-471): the prepare-time classifyManualHandoff scan
   // runs once before side effects, so a rate-limit modal that mounts late

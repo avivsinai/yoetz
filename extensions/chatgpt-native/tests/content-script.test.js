@@ -141,6 +141,9 @@ export async function uploadFile(_document, file, options) {
 export function configureModelState(_document, job) {
   hooks.configureModelCalls.push(job);
   hooks.events.push("configure_model");
+  if (hooks.configureModelError) {
+    throw hooks.configureModelError;
+  }
   return hooks.configureModelResult ?? {
     status: "selected",
     model_used: "Latest Pro",
@@ -982,6 +985,37 @@ test("content script rejects final ChatGPT model drift before clicking send", as
   }
 });
 
+test("content script re-stamps terminality on a rate_limited error from pre-click reselection", async () => {
+  // gh-471 blocking finding: configureModelState hardcodes
+  // side_effect_started=false on its rate_limited error, but the send-phase
+  // pre-click reselection runs after the upload committed with
+  // side_effect_started=true. The catch in configureModel must re-stamp the
+  // caller's context so the Rust job classifier marks the run terminal and
+  // does not fall to CDP and re-submit an already-uploaded prompt.
+  const { send, hooks, restore } = await loadContentScript("send_rate_limited_restamp", "https://chatgpt.com/?_yoetz=run_rate_limited_restamp");
+  try {
+    const job = { job_id: "job_rate_limited_restamp", run_id: "run_rate_limited_restamp", send_timeout_ms: 1000 };
+    assert.equal((await send({ type: "yoetz_prepare_job", job })).ok, true);
+    const rateLimited = new Error("ChatGPT is rate limited");
+    rateLimited.code = "rate_limited";
+    rateLimited.phase = "model_selection";
+    rateLimited.side_effect_started = false;
+    rateLimited.state = "rate_limited";
+    hooks.configureModelError = rateLimited;
+
+    const response = await send({ type: "yoetz_send_prompt", job, prompt: "review" });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "rate_limited");
+    assert.equal(response.phase, "send");
+    assert.equal(response.side_effect_started, true);
+    assert.equal(response.send_committed, false);
+    assert.equal(hooks.clickCommittedCalls, 0);
+  } finally {
+    restore();
+  }
+});
+
 test("content script fails closed on Claude credits before marking prepare complete", async () => {
   const { send, hooks, restore } = await loadContentScript("claude_credits_prepare", "https://claude.ai/new?_yoetz=run_credits");
   try {
@@ -1234,6 +1268,7 @@ async function loadContentScript(label, href) {
     markOwnershipCalls: [],
     uploadFileCalls: [],
     configureModelCalls: [],
+    configureModelError: null,
     events: [],
     ensureChatSurfaceCalls: [],
     verifyChatSurfaceCalls: [],
