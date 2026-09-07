@@ -22,6 +22,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `--cdp-url`) via `Target.getTargets` plus flattened attach, keeping
   HTTP `/json/list` as fallback; page-exception text now surfaces.
 
+### Fixed
+
+- The Claude model picker no longer flapped closed in a throttled hidden tab:
+  `openModelMenu` retried with a second `button.click()` when the menu did
+  not open within the attempt budget, and in a hidden tab the menu mounted
+  just after that budget, so the retry click toggled it closed. Mirroring the
+  ChatGPT #469 fix, before any retry click it now settles and re-reads the
+  structural mounted-open signal (menuitemradio items or `aria-expanded`)
+  and aborts the retry when the menu is open, with a confirm read
+  ([#472](https://github.com/avivsinai/yoetz/issues/472)).
+
 ## [0.5.67] - 2026-09-03
 ### Fixed
 

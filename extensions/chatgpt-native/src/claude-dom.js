@@ -788,10 +788,10 @@ function conversationIdFromLocation() {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-export async function openModelMenu(root, button, timeoutMs) {
-  if (button.getAttribute("aria-expanded") === "true") {
+async function openModelMenu(root, button, timeoutMs) {
+  if (menuMountedOpen(root, button)) {
     await sleep(MODEL_MENU_SETTLE_MS);
-    if (button.getAttribute("aria-expanded") === "true") {
+    if (menuMountedOpen(root, button)) {
       return;
     }
   }
@@ -800,26 +800,32 @@ export async function openModelMenu(root, button, timeoutMs) {
   for (let attempt = 0; attempt < 2; attempt += 1) {
     throwIfModelBlocked(root);
     // Mirror the ChatGPT #469 fix: in a throttled hidden tab the menu can
-    // open just after the previous attempt's bounded wait returned false. A
-    // retry click on an already-open trigger toggles it closed, so before any
-    // retry click settle briefly and re-read aria-expanded; abort the retry
-    // when the menu is open. The settle gives a late-open the window the
-    // bounded wait just missed.
+    // mount open just after the previous attempt's bounded wait returned
+    // false, and the aria-expanded attribute lags the mount. A retry click on
+    // an already-open trigger (or its mounted menu) toggles it closed, so
+    // before any retry click settle briefly and re-read the structural
+    // mounted-open signal OR the trigger attribute; abort the retry when the
+    // menu is open, then confirm with a second settle read (every other
+    // success return here is read-true -> settle -> read-true, so a flapping
+    // open is not returned to the caller).
     if (attempt > 0) {
       await sleep(MODEL_MENU_SETTLE_MS);
-      if (button.getAttribute("aria-expanded") === "true") {
-        return;
+      if (menuMountedOpen(root, button)) {
+        await sleep(MODEL_MENU_SETTLE_MS);
+        if (menuMountedOpen(root, button)) {
+          return;
+        }
       }
     }
     button.click();
     const opened = await waitForModelOptional(
       root,
-      () => button.getAttribute("aria-expanded") === "true",
+      () => menuMountedOpen(root, button),
       attemptTimeoutMs
     );
     if (opened) {
       await sleep(MODEL_MENU_SETTLE_MS);
-      if (button.getAttribute("aria-expanded") === "true") {
+      if (menuMountedOpen(root, button)) {
         return;
       }
     }
@@ -919,6 +925,16 @@ async function closeModelMenu(root, modelButton) {
 function visibleElements(root, selector) {
   return Array.from(root.querySelectorAll?.(selector) ?? [])
     .filter((element) => element.getClientRects().length > 0);
+}
+
+// Structural mounted-open signal for the Claude model menu, mirroring the
+// ChatGPT #469 openSignal: the aria-expanded attribute can lag the mount in a
+// throttled hidden tab, so accept either the trigger attribute or mounted
+// menuitemradio options (the same probe used elsewhere in this file). Opacity
+// /animation never gates this read (background tabs never animate).
+function menuMountedOpen(root, button) {
+  if (button?.getAttribute?.("aria-expanded") === "true") return true;
+  return visibleElements(root, "[role='menuitemradio']").length > 0;
 }
 
 function hasUsageCreditsCore(text) {
