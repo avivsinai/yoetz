@@ -557,9 +557,16 @@ struct BrowserExtensionInspectArgs {
 
     /// Capture the ChatGPT model-picker DOM instead of running a page
     /// inspection. Writes the serialized menu HTML to this path and reports
-    /// capture diagnostics (bytes, opened_by_us) on stderr.
+    /// capture diagnostics (bytes, opened_by_us, closed_after_dump) on stderr.
     #[arg(long, value_name = "PATH")]
     dump_picker_html: Option<PathBuf>,
+
+    /// Opt in to dumping the picker on a live (in-flight) job's tab. Without
+    /// this flag the dump is refused on a live job so a recipe mid
+    /// model_selection is not aborted by the dump's pointerdown + Escape.
+    #[arg(long, default_value_t = false)]
+    allow_live_job: bool,
+
 
     /// Route to a Chrome profile email reported by extension status.
     #[arg(long, alias = "profile_email")]
@@ -3854,10 +3861,11 @@ fn handle_browser_extension(
                 args.extension_profile_id.as_ref(),
             );
             (
-                "browser.extension.inspect",
+                "browser.extension.dump_picker",
                 browser_extension_native::inspect_run(
                     &args.run_id,
                     args.dump_picker_html.as_deref(),
+                    args.allow_live_job,
                     selector,
                     recipe,
                 )?,

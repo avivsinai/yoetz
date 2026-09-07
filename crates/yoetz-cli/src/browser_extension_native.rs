@@ -1794,6 +1794,7 @@ pub fn canary(
 pub fn inspect_run(
     run_id: &str,
     dump_picker_html: Option<&Path>,
+    allow_live_job: bool,
     selector: ExtensionInstanceSelector<'_>,
     recipe: BuiltinWebRecipe,
 ) -> Result<Value> {
@@ -1802,7 +1803,7 @@ pub fn inspect_run(
         bail!("--run-id is required");
     }
     if let Some(out_path) = dump_picker_html {
-        return dump_picker_html_run(trimmed, out_path, selector, recipe);
+        return dump_picker_html_run(trimmed, out_path, allow_live_job, selector, recipe);
     }
     let response = send_site_control_job(
         "inspect_run",
@@ -1825,6 +1826,7 @@ pub fn inspect_run(
 fn dump_picker_html_run(
     run_id: &str,
     out_path: &Path,
+    allow_live_job: bool,
     selector: ExtensionInstanceSelector<'_>,
     recipe: BuiltinWebRecipe,
 ) -> Result<Value> {
@@ -1833,7 +1835,7 @@ fn dump_picker_html_run(
     }
     let response = send_site_control_job(
         "dump_picker_html",
-        json!({ "run_id": run_id, "recipe": recipe.as_str() }),
+        json!({ "run_id": run_id, "recipe": recipe.as_str(), "allow_live_job": allow_live_job }),
         selector,
         recipe,
     )?;
@@ -1842,6 +1844,8 @@ fn dump_picker_html_run(
         .get("html")
         .and_then(Value::as_str)
         .context("dump_picker_html reply carried no html")?;
+    // Compute the UTF-8 byte length once; the content script reports the same
+    // value (TextEncoder), so the envelope and the file agree.
     let bytes = html.len();
     if let Some(parent) = out_path.parent() {
         fs::create_dir_all(parent)
@@ -1854,6 +1858,14 @@ fn dump_picker_html_run(
         .get("opened_by_us")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let closed_after_dump = response
+        .payload
+        .get("closed_after_dump");
+    if let Some(closed) = closed_after_dump.and_then(Value::as_bool) {
+        eprintln!("closed_after_dump: {closed}");
+    } else if closed_after_dump.is_some_and(Value::is_null) {
+        eprintln!("closed_after_dump: (skipped, picker was already open)");
+    }
     eprintln!(
         "picker capture written to {} ({bytes} bytes)",
         out_path.display()
@@ -1866,6 +1878,7 @@ fn dump_picker_html_run(
         "dump_picker_html": out_path.display().to_string(),
         "bytes": bytes,
         "opened_by_us": opened_by_us,
+        "closed_after_dump": closed_after_dump,
         "run_id": run_id,
     }))
 }
@@ -8228,5 +8241,31 @@ mod tests {
             with_thread_conversation_recovery_hint(err, Some("review-pr-341"))
         )
         .contains("--fresh"));
+    }
+
+    #[test]
+    fn dump_picker_html_run_bails_on_non_chatgpt_recipe_before_side_effects() {
+        // gh-490 / fold 8: --dump-picker-html is ChatGPT-only. The bail must
+        // happen before any native-messaging round-trip (no side effects on a
+        // Claude/Gemini tab), and the error names the refused recipe.
+        let tmp = TempDir::new().expect("temp dir");
+        let out = tmp.path().join("picker.html");
+        let selector = ExtensionInstanceSelector {
+            profile_email: None,
+            extension_instance_id: None,
+            extension_profile_id: None,
+        };
+        let err = dump_picker_html_run(
+            "run-490",
+            &out,
+            false,
+            selector,
+            BuiltinWebRecipe::Claude,
+        )
+        .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("--dump-picker-html is only supported with --chatgpt"));
+        // No file written on the bail path.
+        assert!(!out.exists());
     }
 }

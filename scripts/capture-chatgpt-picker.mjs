@@ -31,8 +31,10 @@ const { serializePickerMenu } = require(
 
 // In-page wrapper: runs the shared extension serializer as a pure function in
 // the page via Runtime.evaluate. Returns the outerHTML of the open picker
-// menu, or throws if none is open.
-const SERIALIZER = `(${serializePickerMenu.toString()})()`;
+// menu, or throws if none is open. The call sites append the invocation () —
+// do not invoke here or Chrome throws "is not a function" (the IIFE returns a
+// string).
+const SERIALIZER = `(${serializePickerMenu.toString()})`;
 
 function parseArgs(argv) {
   const args = {

@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (`--browser-ws` / `YOETZ_BROWSER_WS`, or a `ws://.../devtools/browser/...`
   `--cdp-url`) via `Target.getTargets` plus flattened attach, keeping
   HTTP `/json/list` as fallback; page-exception text now surfaces.
+- A second picker-fixture capture path rides the native-messaging channel
+  for when raw CDP is wedged: `yoetz browser extension inspect
+  --dump-picker-html <PATH> --chatgpt --run-id <run>` runs the shared
+  `serializePickerMenu` in the content script (one serializer, two callers).
+  It refuses a live (in-flight) job's tab unless `--allow-live-job` is set,
+  re-reads the surface after Escape and reports `closed_after_dump`, and
+  counts the capture as UTF-8 bytes.
 
 ### Fixed
 

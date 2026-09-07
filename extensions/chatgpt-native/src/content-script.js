@@ -110,7 +110,8 @@ async function handleMessage(message) {
         job_id: message.job_id,
         workspace_id: message.workspace_id,
         ownership_nonce: message.ownership_nonce,
-        recipe: message.recipe
+        recipe: message.recipe,
+        allow_live_job: message.allow_live_job === true
       });
     case "yoetz_auth_probe":
       return authProbe(message.recipe);
@@ -687,39 +688,58 @@ async function dumpPickerHtml(runId, options = {}) {
       side_effect_started: false
     });
   }
+  // Do not write into a live job's tab: a recipe mid model_selection would
+  // have its fail-closed reverification aborted by the dump's pointerdown on
+  // the pill + Escape. Accept only acknowledged tombstone jobs (not in
+  // activeJobs), or an explicit opt-in flag for a live job.
+  if (jobId && activeJobs.has(jobId) && !options.allow_live_job) {
+    throw commandError("live_job_conflict", `dump_picker_html refused on a live job ${jobId}; pass --allow-live-job to opt in`, {
+      phase: "profile",
+      side_effect_started: false
+    });
+  }
   const { findModelButton } = await import(chrome.runtime.getURL("src/chatgpt-dom.js"));
   const { serializePickerMenu } = await import(chrome.runtime.getURL("src/picker-serializer.js"));
 
   let openedByUs = false;
+  // menuOpen uses the root's data-state (a retained closed menu keeps a
+  // [role='menu'] mounted with data-state="closed"); falling back to any
+  // [role='menu'] would serialize the wrong surface and report
+  // opened_by_us=false.
   const menuOpen = () => Boolean(
     document.querySelector('[role="menu"][data-state="open"]')
-    || document.querySelector('[role="menu"]')
+    || document.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-state="open"]')
   );
   if (!menuOpen()) {
     openedByUs = true;
     await openPickerMenu(findModelButton);
   }
-  try {
-    const html = serializePickerMenu(document);
-    return {
-      html,
-      bytes: html.length,
-      opened_by_us: openedByUs
-    };
-  } finally {
-    if (openedByUs) {
-      document.body?.dispatchEvent?.(new KeyboardEvent("keydown", {
-        key: "Escape",
-        code: "Escape",
-        bubbles: true
-      }));
-      document.body?.dispatchEvent?.(new KeyboardEvent("keyup", {
-        key: "Escape",
-        code: "Escape",
-        bubbles: true
-      }));
-    }
+  const html = serializePickerMenu(document);
+  let closedAfterDump = null;
+  if (openedByUs) {
+    // Escape does not always close the picker (field run 20260906T124313Z
+    // failed model_picker_close_failed with picker_surface_closed=false);
+    // re-read the surface after Escape and report the result so the CLI
+    // can surface a stale-open capture.
+    document.body?.dispatchEvent?.(new KeyboardEvent("keydown", {
+      key: "Escape",
+      code: "Escape",
+      bubbles: true
+    }));
+    document.body?.dispatchEvent?.(new KeyboardEvent("keyup", {
+      key: "Escape",
+      code: "Escape",
+      bubbles: true
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    closedAfterDump = !menuOpen();
   }
+  return {
+    html,
+    bytes: new TextEncoder().encode(html).length,
+    opened_by_us: openedByUs,
+    closed_after_dump: closedAfterDump
+  };
 }
 
 // Open the model picker exactly as the driver does: activate the composer pill
@@ -728,6 +748,13 @@ async function dumpPickerHtml(runId, options = {}) {
 async function openPickerMenu(findModelButton) {
   const dispatchActivation = (element) => {
     element?.focus?.();
+    // Use the real constructors, not their names: `new "PointerEvent"(...)`
+    // throws TypeError. The defaultView holds the page's constructors.
+    const win = document.defaultView ?? globalThis;
+    const constructors = {
+      PointerEvent: win.PointerEvent ?? win.Event,
+      MouseEvent: win.MouseEvent ?? win.Event
+    };
     for (const [type, constructorName, init] of [
       ["pointerdown", "PointerEvent", { button: 0, buttons: 1, pointerId: 1, pointerType: "mouse", isPrimary: true }],
       ["mousedown", "MouseEvent", { button: 0, buttons: 1 }],
@@ -735,7 +762,8 @@ async function openPickerMenu(findModelButton) {
       ["mouseup", "MouseEvent", { button: 0, buttons: 0 }],
       ["click", "MouseEvent", { button: 0, buttons: 0, detail: 1 }]
     ]) {
-      element?.dispatchEvent?.(new constructorName(type, { bubbles: true, cancelable: true, composed: true, ...init }));
+      const Constructor = constructors[constructorName] ?? win.Event;
+      element?.dispatchEvent?.(new Constructor(type, { bubbles: true, cancelable: true, composed: true, ...init }));
     }
   };
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
