@@ -41,6 +41,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   structural mounted-open signal (menuitemradio items or `aria-expanded`)
   and aborts the retry when the menu is open, with a confirm read
   ([#472](https://github.com/avivsinai/yoetz/issues/472)).
+- The CDP transports (chrome-devtools-mcp, dev-browser) now verify the
+  `Latest` family behind the collapsed Select-model view. The hybrid picker
+  keeps the family radios mounted but collapsed behind a Select-model menuitem
+  whose advanced view is opacity-0 (rAF-driven, never settles in background
+  tabs) and sheds `inert` once expanded; the visible-only family read missed
+  it. The structural family proof now filters to family-option labels (so the
+  effort tier rows do not pollute the read), gates on the open surface,
+  reuses the collapsed-view branch in post-close reverification, and ignores
+  the degenerate "Instant" speed slider
+  ([#462](https://github.com/avivsinai/yoetz/issues/462)).
 
 ## [0.5.67] - 2026-09-03
 ### Fixed

@@ -2292,6 +2292,27 @@ mod tests {
     }
 
     #[test]
+    fn model_selection_script_supports_collapsed_select_model_family_view() {
+        // gh-462 / yz-gz0: the CDP transport must mirror the native #463
+        // structural family proof. build_model_selection_script delegates to
+        // chatgpt_web::build_model_selection_function, so the collapsed-view
+        // logic must flow through to the chrome-devtools-mcp transport.
+        let script = build_model_selection_script(
+            "gpt-6-pro-chat",
+            chatgpt_recipe::ChatgptModelStrategy::Select,
+        );
+        // Behaviour-carrying substrings (not declaration headers):
+        // family-option filter + open-surface gate + collapsed-view branch.
+        assert!(script.contains("const isFamilyOptionLabel = (value)"));
+        assert!(script.contains("function structuralFamilyRadios(menu)"));
+        assert!(script.contains("if (!pickerSurfaceIsOpen(view, main)) return null;"));
+        assert!(
+            script.contains("isCollapsedView ? structuralFamilyRadios(submenu) : radios(submenu)")
+        );
+        assert!(script.contains("if (fold(match[1]) === \"instant\") return null;"));
+    }
+
+    #[test]
     fn response_poll_script_looks_for_copy_buttons_on_turn_root() {
         let script = response_poll_state_script();
         assert!(script.contains("latestAssistantTurn"));

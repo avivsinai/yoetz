@@ -2709,6 +2709,32 @@ mod tests {
     }
 
     #[test]
+    fn build_chatgpt_prepare_script_supports_collapsed_select_model_family_view() {
+        // gh-462 / yz-gz0: the dev-browser (QuickJS) transport injects the same
+        // model-selection function source as the other CDP transports, so the
+        // collapsed Select-model family view (#463 mirror) must be present in
+        // the generated script. The function runs in the page's V8 via
+        // page.evaluate, so it keeps full DOM access (QuickJS only constrains
+        // the orchestration shell, not the injected function).
+        let script = build_chatgpt_prepare_script(
+            "yoetz-chatgpt-test",
+            crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL,
+            crate::chatgpt_recipe::ChatgptModelStrategy::Select,
+            "run-462",
+        );
+        assert!(script.contains("const MODEL_SELECTION_FUNCTION_SOURCE ="));
+        // Behaviour-carrying substrings (not declaration headers):
+        // family-option filter + open-surface gate + collapsed-view branch.
+        assert!(script.contains("const isFamilyOptionLabel = (value)"));
+        assert!(script.contains("function structuralFamilyRadios(menu)"));
+        assert!(script.contains("if (!pickerSurfaceIsOpen(view, main)) return null;"));
+        assert!(
+            script.contains("isCollapsedView ? structuralFamilyRadios(submenu) : radios(submenu)")
+        );
+        assert!(script.contains("if (fold(match[1]) === \\\"instant\\\") return null;"));
+    }
+
+    #[test]
     fn build_chatgpt_prepare_script_marks_a_yoetz_owned_tab() {
         let script = build_chatgpt_prepare_script(
             "yoetz-chatgpt-test",
