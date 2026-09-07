@@ -572,7 +572,12 @@ struct BrowserExtensionInspectArgs {
     /// this flag the dump is refused on a live job so a recipe mid
     /// model_selection is not aborted by the dump's pointerdown + Escape.
     /// Only meaningful with --dump-picker-html.
-    #[arg(long, default_value_t = false, requires = "dump_picker_html", hide = true)]
+    #[arg(
+        long,
+        default_value_t = false,
+        requires = "dump_picker_html",
+        hide = true
+    )]
     allow_live_job: bool,
 
     /// Route to a Chrome profile email reported by extension status.
