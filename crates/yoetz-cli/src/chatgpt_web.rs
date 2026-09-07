@@ -3100,8 +3100,7 @@ mod tests {
         // but collapsed behind a Select-model menuitem; the toggle's
         // aria-expanded="true" plus the advanced view shedding `inert` is the
         // structural open signal, and opacity never gates the read.
-        let script =
-            build_model_selection_function("gpt-6-pro-chat", ChatgptModelStrategy::Select);
+        let script = build_model_selection_function("gpt-6-pro-chat", ChatgptModelStrategy::Select);
         assert!(script.contains("function isSelectModelViewToggle(node)"));
         assert!(script.contains("function structurallyReadable(node, stopAt = null)"));
         assert!(script.contains("function expandedSelectModelView(trigger, view)"));
