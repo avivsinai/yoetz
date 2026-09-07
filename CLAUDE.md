@@ -84,80 +84,76 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 
 ## Browser Architecture
 
-- The built-in ChatGPT recipe pins the `Latest` family at Chat effort Pro
-  (live probe 2026-09-05: `Latest` checked, `GPT-5.6 Sol` / `GPT-5.5` mounted
-  unchecked, closed pill `6 Pro`). The recipe
-  first verifies `role=radiogroup[aria-label="Select chat surface"]`
-  and forces the `Chat` radio (`data-tpp-toggle-value="chatgpt"`), then selects
-  the composer model pill. `findModelButton` prefers a grammar-matched pill
-  (including the `6 Pro` generation-plus-effort form),
-  then a family-token pill, then any visible `__composer-pill` — including a
-  mid-flow label of `Thinking effort`, which is a live model-pill string, not a
-  decoy. Default mapping: select `Latest` with the literal `Pro` effort
-  tier, never Sol. The current ChatGPT simple-view picker is a hybrid surface: an effort
-  slider whose snapshot parses (`Pro, 5 of 5.`) plus inline family radios
-  (`Latest` / `GPT-5.6 Sol` / `GPT-5.5`) in the same menu, with no `Advanced`/`Effort`
-  gating text. Classify that as the existing slider shape (legacy Advanced
-  view remains an OR). Family proof is the checked inline `Latest`
-  radio when present, else the Model-row submenu. Since September 2026 the
-  family radios may instead sit collapsed behind an aria-expanded
-  `Select model` menuitem inside an `inert`
-  `composer-model-picker-slider-advanced-view`; expanding that toggle and the
-  view shedding `inert` is the structural family-proof signal — opacity never
-  gates the read because the reveal animation is rAF-driven and stays 0 in
-  background tabs, and the simple view goes `inert` while the family view is
-  expanded. A retained closed menu keeps the toggle mounted with a stale
-  `aria-expanded="true"`; close verification counts it only inside an open
-  surface. Late September 2026 unified this into one picker: the effort tier
-  rows (Medium/High/Extra High/Pro) sit as `menuitemradio` entries labeled
-  ONLY via aria-label (no text) inside the same advanced view as the family
-  radios, and the simple view's "Power" slider degenerates to a
-  single-position "Instant, 1 of 1." control that must never be read as the
-  effort slider. ChatGPT also defers hydration in hidden tabs — a MAIN-world
-  visibility shim (injected only into `?_yoetz=` tabs) makes them hydrate;
-  model selection waits for the composer pill to settle before touching the
-  page (interacting mid-hydration wedges an empty, handler-less menu, which
-  the open loop recovers by Escape + reopen). The shim stamps
-  `data-yoetz-shim` at document start and `data-yoetz-hydrated` on `<html>`
-  once a composer menu trigger carries a React fiber; with the shim marker
-  present the hydration gate waits for that flag, reserving a short
-  node-stability window at the END of the same total budget as a secondary
-  gate (the skeleton pill is stable within 3s, so stability alone is never
-  a hydration proof); the whole gate never exceeds `hydration_timeout_ms`
-  and reports `hydration_signal`. The shim also fires IntersectionObserver entries (once per
-  target, only while genuinely hidden, only during the first 90s) and backs
-  requestIdleCallback with a shrinking timer slice in yoetz tabs — Chrome
-  never delivers them to background tabs, and the Chat/Work header mounts
-  lazily behind them when the account defaults to Work; native delivery is
-  never suppressed. ChatGPT rate-limits accounts that open many
-  automation tabs quickly ("Too many requests" modal); it surfaces as
-  composer/surface not found, so pace live verification runs. Radix opens
-  on pointerdown and a trailing click on the open trigger toggles it closed, so the activation gesture must abort on the raw
-  mounted-open menu (`pickerMenuMounted`, same hallmarks as classification,
-  ancestors structurally readable) even before classification — pointerdown
-  always goes out first, so a leftover menu can never suppress activation; a
-  mounted-open menu whose pill wiring or CSS visibility has not settled is
-  classified structurally by content, and a slider-shape surface is not
-  ready until an effort control, tier rows, or the disabled ladder is
-  mounted, and a pre-expanded family view (simple
-  view inert, slider degenerate) classifies from the inline family radios
-  only when a parsable effort slider or the advanced-view container is
-  present alongside them (a bare slider would match the personal picker's
-  power control). When the account's effort
-  quota is exhausted, ChatGPT keeps the tier rows mounted but disabled
-  (aria-disabled + data-disabled, tooltip "Limit reached…"); the recipe
-  fails closed with `effort_options_disabled` in both the selection and
-  post-close reverification legs. A successful click is never
-  proof: reopen through `findModelButton` and re-read both legs. Already-Latest
-  already-Pro is verify-only. After close, the composer pill must corroborate
-  Pro effort (`Pro`, a family-plus-`Pro` suffix, or the `6 Pro` generation
-  form); family is never inferred from the pill — a Sol-worded pill fails
-  closed. Missing controls, a Sol-only menu, Work mode, another family, or
-  another effort tier fail closed. The requested model id is
-  `gpt-6-pro-chat`; `model_used` is `Latest Pro`. Speed and the
-  Faster/Smarter power slider stay at the user's default. Open leftover picker
-  surfaces are closed structurally (`aria-expanded` / `data-state`), including
-  opacity-0 menus in background tabs.
+- The built-in ChatGPT recipe selects the `Latest` family with the literal
+  `Pro` effort tier on the Chat surface (requested model id `gpt-6-pro-chat`,
+  `model_used` `Latest Pro`; never Sol, never the Faster/Smarter power slider,
+  which stays at the user's default). It first verifies the Chat surface
+  radiogroup and forces the `Chat` radio, then drives the composer model pill
+  (`findModelButton` prefers a grammar-matched pill — including the `6 Pro`
+  generation-plus-effort form — then a family-token pill, then any visible
+  `__composer-pill`; the mid-flow `Thinking effort` label is a live pill
+  string, not a decoy). A click is never proof: after every mutation the
+  picker is reopened via `findModelButton` and re-read; after close, the
+  composer pill must corroborate Pro effort (`Pro`, a family-plus-`Pro`
+  suffix, or the `6 Pro` form) — family is never inferred from the pill, so a
+  Sol-worded pill fails closed. Missing controls, Work mode, a Sol-only menu,
+  another family, another effort tier, and disabled tier rows
+  (`effort_options_disabled` — the account quota lock keeps the rows mounted
+  with `aria-disabled` + `data-disabled`) all fail closed, in both the
+  selection and post-close reverification legs. Already-Latest already-Pro is
+  verify-only.
+- The picker read is separated from the picker driver.
+  `src/chatgpt-picker-reader.js` exports `readPicker(root, { pill,
+  leftoverTriggers, familySurface })` → `PickerRead` (shape, trust, family
+  label/options, effort label/options, surface, nav, diagnostics); it never
+  locates anything itself — pill and leftover triggers are inputs — and never
+  mutates the DOM. `src/chatgpt-dom.js` is the driver: it locates the pill
+  and triggers, opens/expands/closes surfaces, and builds
+  `selectionFailure` / `closedPillDiagnostics` / `pickerCloseVerification`
+  from the PickerRead value. Observed picker shapes: the simple menu, the
+  legacy advanced slider, the hybrid simple-view (effort slider plus inline
+  family radios), the unified list (tier rows beside the family radios), and
+  the personal picker. Per-shape DOM rules live in the fixtures and tests, not
+  here: `extensions/chatgpt-native/tests/fixtures/chatgpt-picker/*.html` +
+  `expectations.json`, and `extensions/chatgpt-native/tests/fake-chatgpt.test.js`
+  — consult those before extending classification. Classification is structural
+  (`aria-expanded`, `data-state`, `inert`, `aria-controls`), never opacity,
+  because background tabs never animate; a retained closed menu keeps its
+  toggle mounted with a stale `aria-expanded="true"`, counted as open only
+  inside an open surface.
+- Drift procedure — when ChatGPT changes the picker: (a) capture the live DOM
+  into `extensions/chatgpt-native/tests/fixtures/chatgpt-picker/<date>-<shape>.html`
+  via `scripts/capture-chatgpt-picker.mjs` (raw CDP); (b) add an
+  `expectations.json` row with `_provenance`; (c) run
+  `node --test tests/chatgpt-picker-reader.test.js` — it fails on the new
+  fixture; (d) fix the reader only; (e) `node ../../scripts/picker-reader-parity.mjs`
+  from `extensions/chatgpt-native` must exit 0 (baseline pinned to 6aaa07f;
+  rows the baseline predates print INFO); (f) one paced live run; family must
+  verify, and effort is read from the run — Pro selected, or
+  `effort_options_disabled` while the account quota lock holds. Reconstructed
+  fixtures are weaker than live captures; prefer a capture whenever the DOM is
+  reachable.
+- Hidden-tab facts, kept: ChatGPT defers hydration in hidden tabs; a MAIN-world
+  visibility shim (injected only into `?_yoetz=` tabs, stamped `data-yoetz-shim`
+  at document start, `data-yoetz-hydrated` on `<html>` once a composer menu
+  trigger carries a React fiber) makes them hydrate. Model selection waits for
+  the composer pill to settle before touching the page; with the shim marker
+  present the gate waits for `data-yoetz-hydrated`, reserving a short
+  node-stability window at the end of the same total budget (stability alone
+  is never a hydration proof), never exceeds `hydration_timeout_ms`, and
+  reports `hydration_signal`. The shim also fires IntersectionObserver
+  entries (once per target, only while genuinely hidden, only during the
+  first 90s) and backs `requestIdleCallback` with a shrinking timer slice in
+  yoetz tabs — Chrome never delivers them to background tabs and the Chat/Work
+  header mounts lazily behind them; native delivery is never suppressed.
+  Radix opens on pointerdown and a trailing click on the open trigger toggles
+  it closed, so the activation gesture aborts on a mounted-open menu —
+  pointerdown always goes out first, so a leftover menu can never suppress
+  activation. Open leftover picker surfaces are closed structurally
+  (`aria-expanded` / `data-state`), including opacity-0 menus in background
+  tabs. ChatGPT rate-limits accounts that open many automation tabs quickly
+  ("Too many requests" modal) and it surfaces as composer/surface not found,
+  so pace live verification runs.
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
 - Extension-free by default. Preferred live-Chrome transport order:
