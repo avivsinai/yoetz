@@ -1587,7 +1587,7 @@ fn is_confirmed_unusable_chatgpt_auth_status(status: &str) -> bool {
     // Only hard-fail doctor on statuses that prove ChatGPT cannot be used in the profile.
     matches!(
         status,
-        "login_required" | "challenge_required" | "rate_limited"
+        "login_required" | "challenge_required" | "rate_limited" | "usage_limit_reached"
     )
 }
 
