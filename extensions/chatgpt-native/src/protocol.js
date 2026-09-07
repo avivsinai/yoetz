@@ -17,6 +17,7 @@ export const MESSAGE_TYPES = Object.freeze([
   "heartbeat",
   "reconnect",
   "inspect_run",
+  "dump_picker_html",
   "request_identity_permission",
   "terminal_ack"
 ]);

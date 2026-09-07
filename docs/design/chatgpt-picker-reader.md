@@ -158,15 +158,25 @@ lacks attribute selectors — which is why production code has a
 `querySelectorAll("*")` scan (2676). The fake is shaping the real thing.
 
 New: `tests/fixtures/chatgpt-picker/*.html` — serialized real picker DOM,
-captured from live tabs. **Capture mechanism: a dev-only script, not a
-protocol change.** `scripts/capture-chatgpt-picker.mjs` drives the existing
-chrome-devtools MCP / CDP session against a foreground tab: open the pill,
-expand the family view, then serialize the open `[role="menu"]` with computed
-`inert`/`aria-*`/`data-state` written back as attributes and all
-`<script>`/`<svg>` bodies stripped. It never touches the extension, the
-native host, or `inspect_run` (Rust→SW→CS, three layers — deliberately out of
-scope for the implementer). One file per observed shape, named by date and
-shape:
+captured from live tabs. **Two capture paths share one serializer**
+(`src/picker-serializer.js`). `scripts/capture-chatgpt-picker.mjs` drives the
+existing chrome-devtools MCP / CDP session against a foreground tab: open the
+pill, expand the family view, then serialize the open `[role="menu"]` with
+computed `inert`/`aria-*`/`data-state` written back as attributes and all
+`<script>`/`<svg>` bodies stripped. The raw-CDP path never touches the
+extension or the native host; the native-channel path below does (it rides
+the Rust→SW→CS layers). One file per observed shape, named by date and
+shape.
+
+A second capture path rides the native-messaging channel for when raw CDP is
+wedged: `yoetz browser extension inspect --dump-picker-html <PATH> --chatgpt
+--run-id <run>` runs the same `serializePickerMenu` in the content script
+(both callers import `src/picker-serializer.js` — one serializer, two callers).
+It refuses a live (in-flight) job's tab unless `--allow-live-job` is set, so a
+recipe mid model_selection is not aborted by the dump's pointerdown + Escape;
+and it re-reads the surface after Escape, reporting `closed_after_dump` so a
+stale-open capture surfaces. The serialized HTML is identical to the raw-CDP
+path.
 
 ```
 2026-08-27-personal-picker-pro.html

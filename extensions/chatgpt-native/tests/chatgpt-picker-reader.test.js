@@ -12,6 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { JSDOM } from "jsdom";
 import { readPicker } from "../src/chatgpt-picker-reader.js";
+import { serializePickerMenu } from "../src/picker-serializer.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const fixturesDir = join(__dirname, "fixtures", "chatgpt-picker");
@@ -114,4 +115,31 @@ test("readPicker ignores tier rows under inert/display:none ancestors (fail-clos
   assert.equal(read.shape, "slider");
   assert.equal(read.effort.label, null, "inert/display:none checked rows must not become effort.label");
   assert.deepEqual(read.effort.options, ["Pro"], "only the readable row should be an option");
+});
+
+test("serializePickerMenu runs on a real jsdom DOM and bakes hidden state so the reader drops it", () => {
+  // gh-490 / fold 6: the dump_picker_html path calls the real serializer
+  // (not a stub). Verify it runs on jsdom (no layout engine), bakes computed
+  // hidden state inline so the reader's attribute+inline-style predicate can
+  // see the hiding, and strips script/svg bodies. The hidden state is driven
+  // from a stylesheet (display:none) and an inert ancestor so the baking is
+  // actually exercised (literal inline attributes would pass even if sync()
+  // were a no-op).
+  const html = `<style>[data-hidden] { display: none; }</style>
+  <div role="menu" data-state="open">
+    <div role="menuitemradio" aria-checked="true">Latest</div>
+    <div inert><div role="menuitemradio" aria-checked="true">Medium</div></div>
+    <div data-hidden><div role="menuitemradio" aria-checked="true">High</div></div>
+    <script>document.body.dataset.x="1"</script>
+  </div>`;
+  const dom = new JSDOM(html, { runScripts: "dangerously" });
+  const serialized = serializePickerMenu(dom.window.document);
+  assert.match(serialized, /role="menu"/);
+  // The inert ancestor is baked as an inert attribute on the clone.
+  assert.match(serialized, /inert=""/);
+  // The stylesheet-driven display:none is baked inline so jsdom's lack of
+  // layout does not hide it from the reader.
+  assert.match(serialized, /display:\s*none/);
+  // Script bodies are stripped (no executable content in the fixture).
+  assert.doesNotMatch(serialized, /dataset\.x/);
 });

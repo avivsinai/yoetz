@@ -25,5 +25,17 @@
       "Simple view (Power slider, 'Instant, 1 of 1.') is inert; the [role=slider] has aria-valuemin=aria-valuemax=0 and must never be read as the effort control.",
       "Select-model toggle is inside an aria-hidden=true, inert wrapper with aria-expanded=true; ChatGPT now persists the expanded state, so the collapsed shape from 2026-09-01 is no longer reproducible on this account."
     ]
+  },
+  "2026-09-06-gpt6-chat-live-capture.html": {
+    "shape": "slider",
+    "ready": true,
+    "family": { "label": "Latest", "checked": true, "checkedCount": 1, "options": ["Latest", "GPT-5.6 Sol", "GPT-5.5"] },
+    "effort": { "label": "Pro", "disabled": false, "kind": "slider", "options": [] },
+    "nav": { "expanded": true },
+    "_provenance": "Live capture via dump_picker_html through the native-messaging channel (yoetz-owned Chat tab, 2026-09-06, run 20260906T124313Z_cc0224; content-script serializer, picker already open from the run's model_selection phase, opened_by_us=false). Reader values asserted above verified with readPicker on this file.",
+    "_notes": [
+      "First live serializer capture: Latest CHECKED, GPT-5.6 Sol / GPT-5.5 unchecked; effort slider Pro (valuenow 4 of 0..4, 'Pro, 5 of 5.').",
+      "Captured 10778 bytes; real Radix incidental structure retained (inert attributes on descendants, tooltip wrappers absent in this surface unlike the quota-locked fixture)."
+    ]
   }
 }

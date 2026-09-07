@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // scripts/capture-chatgpt-picker.mjs — dev-only ChatGPT picker DOM capture.
 //
+// Requires Node >= 22.12 (require() of ESM). CI pins Node 24.
+//
 // Drives a raw CDP (Chrome DevTools Protocol) session against a foreground
 // Chrome tab that already has the model picker open, serializes the open
 // [role="menu"] to a self-contained HTML file, and writes it to --out. The
@@ -20,6 +22,21 @@
 
 import { writeFileSync, mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { createRequire } from "node:module";
+
+// The serializer lives in the extension package (one serializer, two callers:
+// this dev script and the content script's dump_picker_html command).
+const require = createRequire(import.meta.url);
+const { serializePickerMenu } = require(
+  "../extensions/chatgpt-native/src/picker-serializer.js"
+);
+
+// In-page wrapper: runs the shared extension serializer as a pure function in
+// the page via Runtime.evaluate. Returns the outerHTML of the open picker
+// menu, or throws if none is open. The call sites append the invocation () —
+// do not invoke here or Chrome throws "is not a function" (the IIFE returns a
+// string).
+const SERIALIZER = `(${serializePickerMenu.toString()})`;
 
 function parseArgs(argv) {
   const args = {
@@ -115,82 +132,7 @@ function cdpEvaluate(wsUrl, expression) {
   });
 }
 
-// In-page serializer. Runs as a pure function in the page via Runtime.evaluate.
-// Returns the outerHTML of the open picker menu, or throws if none is open.
-const SERIALIZER = String.raw`
-(function () {
-  var live = document.querySelector('[role="menu"][data-state="open"]')
-          || document.querySelector('[role="menu"]');
-  if (!live) throw new Error('no [role="menu"] found in the page');
-  var clone = live.cloneNode(true);
-
-  function effectivelyInert(el) {
-    for (var node = el; node && node.nodeType === 1; node = node.parentElement) {
-      if (node.hasAttribute && node.hasAttribute('inert')) return true;
-    }
-    return false;
-  }
-
-  // Walk live and clone in parallel (same tree order) to copy live state onto
-  // the clone: computed inert as an attribute, data-state/aria-* verbatim, and
-  // computed display/visibility written inline when none/hidden (jsdom has no
-  // layout engine, so the reader's attribute+inline-style predicate cannot see
-  // stylesheet-driven display:none/visibility:hidden unless we bake them in).
-  function sync(liveEl, cloneEl) {
-    if (!liveEl || !cloneEl || cloneEl.nodeType !== 1) return;
-    if (effectivelyInert(liveEl)) cloneEl.setAttribute('inert', '');
-    else cloneEl.removeAttribute('inert');
-    // data-state and aria-* are already attributes on the clone (it was cloned
-    // from live), but re-copy to guarantee they survive any later mutation.
-    if (liveEl.hasAttribute('data-state')) {
-      cloneEl.setAttribute('data-state', liveEl.getAttribute('data-state'));
-    }
-    var ariaNames = [];
-    for (var i = 0; i < liveEl.attributes.length; i++) {
-      var name = liveEl.attributes[i].name;
-      if (name === 'data-state' || name.indexOf('aria-') === 0) ariaNames.push(name);
-    }
-    for (var j = 0; j < ariaNames.length; j++) {
-      cloneEl.setAttribute(ariaNames[j], liveEl.getAttribute(ariaNames[j]));
-    }
-    // Bake computed display/visibility inline so jsdom's attribute+inline-style
-    // readability predicate sees the same hidden state Chrome does. Only write
-    // when the computed value hides the node; never overwrite an existing
-    // inline value that already expresses the same intent.
-    var computed = liveEl.ownerDocument && liveEl.ownerDocument.defaultView
-      ? liveEl.ownerDocument.defaultView.getComputedStyle(liveEl) : null;
-    if (computed) {
-      if (computed.display === 'none') cloneEl.style.setProperty('display', 'none', 'important');
-      if (computed.visibility === 'hidden') cloneEl.style.setProperty('visibility', 'hidden', 'important');
-    }
-    var liveKids = liveEl.children, cloneKids = cloneEl.children;
-    var ci = 0;
-    for (var li = 0; li < liveKids.length && ci < cloneKids.length; li++) {
-      // Index parity holds only because cloneNode(true) preserves child order,
-      // so liveKids[i] corresponds to cloneKids[i] one-to-one.
-      sync(liveKids[li], cloneKids[ci]);
-      ci++;
-    }
-  }
-  sync(live, clone);
-
-  // Strip the bodies of <script>, <svg>, <use>, <canvas> in the clone. The
-  // element tag is kept so tree structure (and thus selector parity with live)
-  // is preserved; only their heavy/sensitive content is removed.
-  var strip = clone.querySelectorAll('script, svg, use, canvas');
-  for (var k = 0; k < strip.length; k++) {
-    while (strip[k].firstChild) strip[k].removeChild(strip[k].firstChild);
-  }
-
-  return clone.outerHTML;
-})
-`;
-
-// Serializer summary: clones the open menu, copies computed inert +
-// data-state/aria-* + computed display/visibility (when none/hidden) from the
-// live node onto the clone, strips the bodies of <script>/<svg>/<use>/<canvas>,
-// and returns outerHTML. Computed styles are baked in because jsdom has no
-// layout engine (see docs/design/chatgpt-picker-reader.md "jsdom boundary").
+// In-page serializer wrapper — see SERIALIZER above.
 
 // Browser-WS path: for Chrome builds where HTTP /json/* is 404 but the
 // browser WS from DevToolsActivePort still listens. Never calls

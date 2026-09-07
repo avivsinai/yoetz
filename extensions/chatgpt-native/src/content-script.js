@@ -105,6 +105,14 @@ async function handleMessage(message) {
         include_page_text: Boolean(message.include_page_text),
         recipe: message.recipe
       });
+    case "yoetz_dump_picker_html":
+      return dumpPickerHtml(message.run_id, {
+        job_id: message.job_id,
+        workspace_id: message.workspace_id,
+        ownership_nonce: message.ownership_nonce,
+        recipe: message.recipe,
+        allow_live_job: message.allow_live_job === true
+      });
     case "yoetz_auth_probe":
       return authProbe(message.recipe);
     case "yoetz_probe":
@@ -660,6 +668,167 @@ async function inspectPage(runId, options = {}) {
   return result;
 }
 
+async function dumpPickerHtml(runId, options = {}) {
+  const adapter = await siteAdapter(options.recipe);
+  const { parseOwnedWindowName } = await domHelpers(options.recipe);
+  const parsed = parseOwnedWindowName(window.name);
+  const jobId = String(options.job_id ?? "").trim();
+  const workspaceId = String(options.workspace_id ?? "").trim();
+  const ownershipNonce = String(options.ownership_nonce ?? "").trim();
+  const jobMatches = Boolean(jobId && parsed?.job_id === jobId);
+  const runMatches = Boolean(runId && parsed?.run_id === runId);
+  const workspaceMatches = Boolean(workspaceId && parsed?.workspace_id === workspaceId);
+  const nonceMatches = Boolean(ownershipNonce && parsed?.ownership_nonce === ownershipNonce);
+  if (!jobMatches || !runMatches || !workspaceMatches || !nonceMatches) {
+    throw commandError("run_mismatch", `tab is not owned by Yoetz job ${jobId || "(unknown)"}, run ${runId}, workspace ${workspaceId || "(unknown)"}`);
+  }
+  if (adapter.recipe !== "chatgpt") {
+    throw commandError("unsupported_recipe", `dump_picker_html is ChatGPT-only; recipe ${JSON.stringify(adapter.recipe)} rejected before side effects`, {
+      phase: "profile",
+      side_effect_started: false
+    });
+  }
+  // Do not write into a live job's tab: a recipe mid model_selection would
+  // have its fail-closed reverification aborted by the dump's pointerdown on
+  // the pill + Escape. Accept only acknowledged tombstone jobs (not in
+  // activeJobs), or an explicit opt-in flag for a live job.
+  if (jobId && activeJobs.has(jobId) && !options.allow_live_job) {
+    throw commandError("live_job_conflict", `dump_picker_html refused on a live job ${jobId}; pass --allow-live-job to opt in`, {
+      phase: "profile",
+      side_effect_started: false
+    });
+  }
+  const { findModelButton } = await import(chrome.runtime.getURL("src/chatgpt-dom.js"));
+  const { serializePickerMenu } = await import(chrome.runtime.getURL("src/picker-serializer.js"));
+  const { manualHandoffContext, classifyManualHandoff } = await domHelpers(options.recipe);
+
+  // Classify the page state so a picker-not-mounted failure names the real
+  // cause (challenge / login / rate_limited) instead of a misleading
+  // run_not_found. Falls back to "picker control not found" when the page is
+  // an authenticated composer with no picker mounted.
+  const pageState = () => {
+    const context = manualHandoffContext(document);
+    const handoff = classifyManualHandoff({
+      url: location.href,
+      title: context.title,
+      text: context.text
+    });
+    return handoff?.state ?? "composer_ready";
+  };
+
+  let openedByUs = false;
+  let html = "";
+  // menuOpen uses the root's data-state (a retained closed menu keeps a
+  // [role='menu'] mounted with data-state="closed"); falling back to any
+  // [role='menu'] would serialize the wrong surface and report
+  // opened_by_us=false.
+  const menuOpen = () => Boolean(
+    document.querySelector('[role="menu"][data-state="open"]')
+    || document.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-state="open"]')
+  );
+  try {
+    if (!menuOpen()) {
+      openedByUs = true;
+      await openPickerMenu(findModelButton);
+      // The serializer falls back to any [role='menu'], so a retained closed
+      // menu could be captured silently. Assert the surface is actually open
+      // after we opened it; otherwise fail with picker_not_open.
+      if (!menuOpen()) {
+        throw commandError(
+          "picker_not_open",
+          `dump_picker_html opened the model pill but the picker surface did not reach data-state=open (page_state=${pageState()})`,
+          {
+            phase: "profile",
+            side_effect_started: false,
+            page_state: pageState()
+          }
+        );
+      }
+    }
+    html = serializePickerMenu(document);
+  } catch (error) {
+    if (error?.code === "picker_not_open") {
+      throw error;
+    }
+    throw commandError(
+      "picker_not_mounted",
+      `dump_picker_html found no open ChatGPT model picker on this tab (page_state=${pageState()}): ${error?.message ?? error}`,
+      {
+        phase: "profile",
+        side_effect_started: false,
+        page_state: pageState()
+      }
+    );
+  }
+  let closedAfterDump = null;
+  if (openedByUs) {
+    // Escape does not always close the picker (field run 20260906T124313Z
+    // failed model_picker_close_failed with picker_surface_closed=false);
+    // re-read the surface after Escape and report the result so the CLI
+    // can surface a stale-open capture.
+    document.body?.dispatchEvent?.(new KeyboardEvent("keydown", {
+      key: "Escape",
+      code: "Escape",
+      bubbles: true
+    }));
+    document.body?.dispatchEvent?.(new KeyboardEvent("keyup", {
+      key: "Escape",
+      code: "Escape",
+      bubbles: true
+    }));
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    closedAfterDump = !menuOpen();
+  }
+  return {
+    html,
+    bytes: new TextEncoder().encode(html).length,
+    opened_by_us: openedByUs,
+    closed_after_dump: closedAfterDump
+  };
+}
+
+// Open the model picker exactly as the driver does: activate the composer pill
+// with the full pointer sequence, then — for the hybrid picker that keeps a
+// collapsed "Select model" view toggle mounted — activate that toggle too.
+async function openPickerMenu(findModelButton) {
+  const dispatchActivation = (element) => {
+    element?.focus?.();
+    // Use the real constructors, not their names: `new "PointerEvent"(...)`
+    // throws TypeError. The defaultView holds the page's constructors.
+    const win = document.defaultView ?? globalThis;
+    const constructors = {
+      PointerEvent: win.PointerEvent ?? win.Event,
+      MouseEvent: win.MouseEvent ?? win.Event
+    };
+    for (const [type, constructorName, init] of [
+      ["pointerdown", "PointerEvent", { button: 0, buttons: 1, pointerId: 1, pointerType: "mouse", isPrimary: true }],
+      ["mousedown", "MouseEvent", { button: 0, buttons: 1 }],
+      ["pointerup", "PointerEvent", { button: 0, buttons: 0, pointerId: 1, pointerType: "mouse", isPrimary: true }],
+      ["mouseup", "MouseEvent", { button: 0, buttons: 0 }],
+      ["click", "MouseEvent", { button: 0, buttons: 0, detail: 1 }]
+    ]) {
+      const Constructor = constructors[constructorName] ?? win.Event;
+      element?.dispatchEvent?.(new Constructor(type, { bubbles: true, cancelable: true, composed: true, ...init }));
+    }
+  };
+  const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const pill = findModelButton(document);
+  if (!pill) {
+    throw commandError("model_pill_not_found", "no ChatGPT model composer pill found to open the picker", {
+      phase: "profile",
+      side_effect_started: true
+    });
+  }
+  dispatchActivation(pill);
+  await wait(900);
+  const selectModelToggle = Array.from(document.querySelectorAll('[role="menuitem"]'))
+    .find((node) => String(node.getAttribute?.("aria-label") ?? "").toLowerCase() === "select model");
+  if (selectModelToggle && selectModelToggle.getAttribute("aria-expanded") !== "true") {
+    dispatchActivation(selectModelToggle);
+    await wait(900);
+  }
+}
+
 async function authProbe(recipe) {
   const adapter = await siteAdapter(recipe);
   const {
@@ -1042,6 +1211,7 @@ function errorResponse(error) {
   }
   for (const key of [
     "state",
+    "page_state",
     "provider_message",
     "provider_dom",
     "requested_model",

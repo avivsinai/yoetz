@@ -1793,12 +1793,17 @@ pub fn canary(
 
 pub fn inspect_run(
     run_id: &str,
+    dump_picker_html: Option<&Path>,
+    allow_live_job: bool,
     selector: ExtensionInstanceSelector<'_>,
     recipe: BuiltinWebRecipe,
 ) -> Result<Value> {
     let trimmed = run_id.trim();
     if trimmed.is_empty() {
         bail!("--run-id is required");
+    }
+    if let Some(out_path) = dump_picker_html {
+        return dump_picker_html_run(trimmed, out_path, allow_live_job, selector, recipe);
     }
     let response = send_site_control_job(
         "inspect_run",
@@ -1811,6 +1816,108 @@ pub fn inspect_run(
         "transport": TRANSPORT_NAME,
         "recipe": recipe.as_str(),
         "response": response.payload,
+    }))
+}
+
+// --dump-picker-html: capture the model-picker DOM through the extension's
+// native channel instead of inspect_run. Writes the serialized menu HTML to
+// `out_path` and prints capture diagnostics to stderr; the JSON payload stays
+// small (no html field) so console output remains readable.
+fn dump_picker_html_run(
+    run_id: &str,
+    out_path: &Path,
+    allow_live_job: bool,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    if recipe != BuiltinWebRecipe::Chatgpt {
+        bail!("--dump-picker-html is only supported with --chatgpt");
+    }
+    let response = send_site_control_job(
+        "dump_picker_html",
+        json!({ "run_id": run_id, "recipe": recipe.as_str(), "allow_live_job": allow_live_job }),
+        selector,
+        recipe,
+    )?;
+    finalize_picker_capture(out_path, &response.payload, run_id, recipe)
+}
+
+// Process a dump_picker_html response envelope and write the capture file.
+// Extracted from dump_picker_html_run so the happy path (envelope built + file
+// written from a stubbed response) is testable without the native-messaging
+// socket harness.
+fn finalize_picker_capture(
+    out_path: &Path,
+    payload: &Value,
+    run_id: &str,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    // A failed envelope (run_not_found / picker_not_mounted / live_job_conflict)
+    // arrives as status="failed" with a code — surface it with inspected_tabs
+    // so the operator sees which tabs were tried and why, not a generic
+    // "reply carried no html".
+    if payload.get("status").and_then(Value::as_str) == Some("failed")
+        || payload.get("code").and_then(Value::as_str).is_some()
+    {
+        let code = payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("dump_failed");
+        let msg = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("dump_picker_html failed");
+        if let Some(tabs) = payload.get("inspected_tabs").and_then(Value::as_array) {
+            let detail: Vec<String> = tabs
+                .iter()
+                .map(|t| {
+                    let tab_id = t.get("tab_id").and_then(Value::as_i64).unwrap_or(0);
+                    let code = t.get("code").and_then(Value::as_str).unwrap_or("?");
+                    let err = t.get("error").and_then(Value::as_str).unwrap_or("");
+                    format!("tab {tab_id} ({code}): {err}")
+                })
+                .collect();
+            bail!("{code}: {msg}. inspected_tabs: [{}]", detail.join("; "));
+        }
+        bail!("{code}: {msg}");
+    }
+    let html = payload
+        .get("html")
+        .and_then(Value::as_str)
+        .context("dump_picker_html reply carried no html")?;
+    // Compute the UTF-8 byte length once; the content script reports the same
+    // value (TextEncoder), so the envelope and the file agree.
+    let bytes = html.len();
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create parent directory {}", parent.display()))?;
+    }
+    fs::write(out_path, html)
+        .with_context(|| format!("write picker capture {}", out_path.display()))?;
+    let opened_by_us = payload
+        .get("opened_by_us")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let closed_after_dump = payload.get("closed_after_dump");
+    if let Some(closed) = closed_after_dump.and_then(Value::as_bool) {
+        eprintln!("closed_after_dump: {closed}");
+    } else if closed_after_dump.is_some_and(Value::is_null) {
+        eprintln!("closed_after_dump: (skipped, picker was already open)");
+    }
+    eprintln!(
+        "picker capture written to {} ({bytes} bytes)",
+        out_path.display()
+    );
+    eprintln!("opened_by_us: {opened_by_us}");
+    Ok(json!({
+        "status": "ok",
+        "transport": TRANSPORT_NAME,
+        "recipe": recipe.as_str(),
+        "dump_picker_html": out_path.display().to_string(),
+        "bytes": bytes,
+        "opened_by_us": opened_by_us,
+        "closed_after_dump": closed_after_dump,
+        "run_id": run_id,
     }))
 }
 
@@ -3455,7 +3562,7 @@ fn send_control_job_with_recipe(
         )
     })?;
     stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT))?;
-    let control_run_id = (kind == "inspect_run")
+    let control_run_id = (kind == "inspect_run" || kind == "dump_picker_html")
         .then(|| payload.get("run_id").and_then(Value::as_str))
         .flatten()
         .map(str::to_string);
@@ -3531,6 +3638,7 @@ fn validate_inbound_envelope(envelope: &ProtocolEnvelope) -> Result<()> {
         | "pair_complete"
         | "reconnect"
         | "inspect_run"
+        | "dump_picker_html"
         | "request_identity_permission" => {}
         other => bail!("unsupported chrome-extension-native envelope type `{other}`"),
     }
@@ -4398,6 +4506,7 @@ mod native_host_unix {
             | "pair_request"
             | "reconnect"
             | "inspect_run"
+            | "dump_picker_html"
             | "request_identity_permission" => forward_to_extension(&stdout, &forwarded),
             other => Err(anyhow!("unsupported local client message `{other}`")),
         };
@@ -4435,6 +4544,7 @@ mod native_host_unix {
                         "job_cancel"
                         | "reconnect"
                         | "inspect_run"
+                        | "dump_picker_html"
                         | "request_identity_permission" => {
                             if let Err(err) = forward_to_extension(&stdout, &forwarded) {
                                 if let Some(mut client) =
@@ -8169,5 +8279,52 @@ mod tests {
             with_thread_conversation_recovery_hint(err, Some("review-pr-341"))
         )
         .contains("--fresh"));
+    }
+
+    #[test]
+    fn dump_picker_html_run_bails_on_non_chatgpt_recipe_before_side_effects() {
+        // gh-490 / fold 8: --dump-picker-html is ChatGPT-only. The bail must
+        // happen before any native-messaging round-trip (no side effects on a
+        // Claude/Gemini tab), and the error names the refused recipe.
+        let tmp = TempDir::new().expect("temp dir");
+        let out = tmp.path().join("picker.html");
+        let selector = ExtensionInstanceSelector {
+            profile_email: None,
+            extension_instance_id: None,
+            extension_profile_id: None,
+        };
+        let err = dump_picker_html_run("run-490", &out, false, selector, BuiltinWebRecipe::Claude)
+            .unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("--dump-picker-html is only supported with --chatgpt"));
+        // No file written on the bail path.
+        assert!(!out.exists());
+    }
+
+    #[test]
+    fn finalize_picker_capture_writes_file_and_envelope_from_stubbed_response() {
+        // gh-490 / fold 7: happy path — a stubbed job_complete envelope (html +
+        // opened_by_us + closed_after_dump) yields a written file and a JSON
+        // envelope with the UTF-8 byte count, without the native-messaging
+        // socket harness.
+        let tmp = TempDir::new().expect("temp dir");
+        let out = tmp.path().join("picker.html");
+        let html = "<div role=\"menu\" data-state=\"open\">Latest</div>";
+        let payload = json!({
+            "status": "job_complete",
+            "html": html,
+            "opened_by_us": true,
+            "closed_after_dump": true
+        });
+        let result =
+            finalize_picker_capture(&out, &payload, "run-490-happy", BuiltinWebRecipe::Chatgpt)
+                .expect("finalize");
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["bytes"], json!(html.len()));
+        assert_eq!(result["opened_by_us"], true);
+        assert_eq!(result["closed_after_dump"], true);
+        assert_eq!(result["run_id"], "run-490-happy");
+        assert!(out.exists());
+        assert_eq!(fs::read_to_string(&out).unwrap(), html);
     }
 }
