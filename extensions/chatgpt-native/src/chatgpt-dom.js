@@ -199,6 +199,22 @@ export function classifyWaitManualHandoff({ url = "", title = "", text = "" } = 
   return classifyManualHandoff({ url, title, text });
 }
 
+// A "Too many requests" modal can mount late — after the prepare-time
+// classifyManualHandoff scan — and surface as a generic composer/surface/picker
+// not-found. Re-check the manual-handoff context at every phase failure and
+// fail closed with rate_limited when the modal is up. Returns the rate-limited
+// handoff ({ state, message }) or null.
+export function rateLimitedHandoff(root = document) {
+  const context = manualHandoffContext(root);
+  const win = root?.defaultView ?? globalThis;
+  const handoff = classifyManualHandoff({
+    url: String(win.location?.href ?? ""),
+    title: context.title,
+    text: context.text
+  });
+  return handoff?.state === "rate_limited" ? handoff : null;
+}
+
 export function findComposer(root = document) {
   return firstVisible(root, [
     "#prompt-textarea",
@@ -319,7 +335,18 @@ function ownershipMatchesJob(parsed, job) {
 }
 
 export async function insertPrompt(root, prompt, options = {}) {
-  const composer = await waitForElement(root, findComposer, "ChatGPT composer", options);
+  let composer;
+  try {
+    composer = await waitForElement(root, findComposer, "ChatGPT composer", options);
+  } catch (error) {
+    // A late "Too many requests" modal suppresses the composer; re-check the
+    // manual-handoff context and fail closed with rate_limited when it is up.
+    const rateLimited = rateLimitedCommandError(root, { phase: "send", side_effect_started: true });
+    if (rateLimited) {
+      throw rateLimited;
+    }
+    throw error;
+  }
   composer.focus();
   if ("value" in composer) {
     setInputValue(composer, prompt);
@@ -382,7 +409,16 @@ export async function ensureFreshChat(root = document, job = {}, options = {}) {
     }
   );
 
-  const composer = await waitForElement(root, findComposer, "ChatGPT composer", options);
+  let composer;
+  try {
+    composer = await waitForElement(root, findComposer, "ChatGPT composer", options);
+  } catch (error) {
+    const rateLimited = rateLimitedCommandError(root, { phase: "upload", side_effect_started: false });
+    if (rateLimited) {
+      throw rateLimited;
+    }
+    throw error;
+  }
   const composerText = editableText(composer);
   const attachments = findAttachmentTiles(root, { composerOnly: true });
   const residue = conversationResidue(root);
@@ -432,6 +468,10 @@ export async function ensureConversationLoaded(root = document, conversationId, 
   try {
     await waitForElement(root, findComposer, "ChatGPT composer", options);
   } catch (error) {
+    const rateLimited = rateLimitedCommandError(root, { phase: "upload", side_effect_started: false });
+    if (rateLimited) {
+      throw rateLimited;
+    }
     throw chatgptCommandError(
       "conversation_unavailable",
       `ChatGPT conversation ${conversationId} is unavailable; composer did not load at ${currentLocationForError(win)}: ${String(error?.message ?? error)}`,
@@ -541,6 +581,12 @@ export async function configureModelState(root, job = {}) {
   const hydrationSignal = await waitForHiddenTabHydration(root, modelSelectionOptionsForJob(job));
   const surface = await ensureChatSurface(root, modelSelectionOptionsForJob(job));
   if (!surface.ok) {
+    // A late "Too many requests" modal suppresses the Chat surface toggle;
+    // re-check the manual-handoff context and fail closed with rate_limited.
+    const rateLimited = rateLimitedCommandError(root, { phase: "model_selection", side_effect_started: false });
+    if (rateLimited) {
+      throw rateLimited;
+    }
     return {
       hydration_signal: hydrationSignal,
       status: "unavailable",
@@ -1189,6 +1235,12 @@ async function selectLatestChatProModel(root, options = {}) {
         legacy_picker: lateLegacyMarkers.slice(0, 10)
       };
     }
+    // A late "Too many requests" modal can suppress the composer model pill;
+    // re-check the manual-handoff context and fail closed with rate_limited.
+    const rateLimited = rateLimitedCommandError(root, { phase: "model_selection", side_effect_started: false });
+    if (rateLimited) {
+      throw rateLimited;
+    }
     return {
       ...base,
       failure_reason: "model_control_not_found",
@@ -1200,6 +1252,10 @@ async function selectLatestChatProModel(root, options = {}) {
   // budget expires). read(root) composes readPicker with the layout-dependent
   // pill/leftover locators that stay in this module.
   if (!await openModelPicker(root, modelButton, options)) {
+    const rateLimited = rateLimitedCommandError(root, { phase: "model_selection", side_effect_started: false });
+    if (rateLimited) {
+      throw rateLimited;
+    }
     return {
       ...base,
       failure_reason: "model_picker_open_failed",
@@ -3962,6 +4018,21 @@ function chatgptCommandError(code, message, detail = {}) {
     }
   }
   return error;
+}
+
+// Build a rate_limited command error from a late rate-limit modal detected at
+// a phase failure. The phase/side_effect_started come from the failing phase
+// so the worker's terminal detail reflects where the modal was observed.
+function rateLimitedCommandError(root, { phase, side_effect_started } = {}) {
+  const handoff = rateLimitedHandoff(root);
+  if (!handoff) {
+    return null;
+  }
+  return chatgptCommandError("rate_limited", handoff.message, {
+    phase,
+    side_effect_started,
+    state: "rate_limited"
+  });
 }
 
 function currentLocationForError(win) {

@@ -321,7 +321,10 @@ async function configureModel(job, options = {}) {
   try {
     selection = await configureModelState(document, job);
   } catch (error) {
-    if (phase !== "send") {
+    // A late rate-limit modal detected inside configureModelState is the real
+    // cause; preserve the rate_limited code instead of relabeling it as a
+    // send-time model-selection failure.
+    if (phase !== "send" || error?.code === "rate_limited") {
       throw error;
     }
     throw commandError(
