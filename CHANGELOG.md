@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.68] - 2026-09-07
 ### Changed
 
 - ChatGPT Chat recipe repinned from GPT-5.6 Sol to the `Latest` family at Pro
@@ -71,6 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reuses the collapsed-view branch in post-close reverification, and ignores
   the degenerate "Instant" speed slider
   ([#462](https://github.com/avivsinai/yoetz/issues/462)).
+
 
 ## [0.5.67] - 2026-09-03
 ### Fixed
