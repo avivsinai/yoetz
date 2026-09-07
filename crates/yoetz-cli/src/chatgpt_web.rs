@@ -423,6 +423,14 @@ async () => {{
   const fold = (value) => normalize(value).toLowerCase();
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const textOf = (node) => normalize(node?.innerText || node?.textContent || "");
+  // The September 2026 unified picker labels effort tier rows through
+  // aria-label with no text content; accept either when reading a label.
+  const optionLabel = (item) => normalize(textOf(item) || item?.getAttribute?.("aria-label") || "");
+  // Family-option filter (mirrors the native reader): "Latest" is the GPT-6
+  // Chat family radio; Sol/5.5 rows stay family options so they are never
+  // read as effort. Without this the effort tier rows (siblings of the family
+  // radios in the unified picker) pollute the family read.
+  const isFamilyOptionLabel = (value) => /^gpt\b|^o3$|^latest$/i.test(normalize(value));
 {visibility_helpers}
 
   function surfaceControls() {{
@@ -632,11 +640,12 @@ async () => {{
     return Array.from(document.querySelectorAll("[role='menu']")).filter((menu) => isVisible(menu) && pickerSurfaceIsOpen(menu));
   }}
 
-  function pickerSurfaceIsOpen(node) {{
+  function pickerSurfaceIsOpen(node, stopAt = null) {{
     let current = node;
     while (current) {{
       const state = current.getAttribute?.("data-state");
       if (state === "closed") return false;
+      if (current === stopAt) break;
       current = current.parentElement;
     }}
     return true;
@@ -679,6 +688,10 @@ async () => {{
     const total = max - min + 1;
     if (!match || !Number.isFinite(now) || !Number.isFinite(min) || !Number.isFinite(max)
       || max <= min || Number(match[2]) !== ordinal || Number(match[3]) !== total) return null;
+    // "Instant, n of m." is the speed control on the September 2026 list
+    // picker, not an effort tier; it must never be read as the effort slider
+    // (mirrors the native sliderEffortSnapshot).
+    if (fold(match[1]) === "instant") return null;
     return {{ label: fold(match[1]), display: match[1], now, min, max }};
   }}
 
@@ -735,26 +748,40 @@ async () => {{
   }}
 
   function advancedFamilyView(menu) {{
-    const surface = menu?.querySelector?.("[data-testid='composer-model-picker-slider-advanced-view']") || null;
-    return surface;
+    // Iterate and pick the view carrying family radios (a retained empty view
+    // can shadow the live one); mirrors the native activeFamilyView.
+    const views = Array.from(menu?.querySelectorAll?.("[data-testid='composer-model-picker-slider-advanced-view']") || []);
+    return views.find((view) => structuralFamilyRadios(view).length > 0) || null;
   }}
 
-  // Structural radios: read menuitemradio rows without the visible-only filter,
-  // for a surface trusted via the expanded Select-model view (collapsed family).
+  // Structural radios for a collapsed family surface: filter by the
+  // open-surface gate (pickerSurfaceIsOpen) and the attribute-only readability
+  // walker, then keep only family-option labels so the effort tier rows
+  // (siblings of the family radios in the unified picker) do not pollute the
+  // read. Mirrors the native familyMenuRadios(view, true).
+  function structuralFamilyRadios(menu) {{
+    return Array.from(menu?.querySelectorAll?.("[role='menuitemradio']") || [])
+      .filter((item) => pickerSurfaceIsOpen(item, menu) && structurallyReadable(item, menu))
+      .filter((item) => isFamilyOptionLabel(textOf(item)) || isFamilyOptionLabel(optionLabel(item)));
+  }}
+
+  // Structural radios (legacy alias kept for the collapsed-view branches that
+  // do not need the family filter).
   function structuralRadios(menu) {{
     return Array.from(menu?.querySelectorAll?.("[role='menuitemradio']") || [])
-      .filter((item) => structurallyReadable(item, menu));
+      .filter((item) => pickerSurfaceIsOpen(item, menu) && structurallyReadable(item, menu));
   }}
 
   // Find the family menu behind the collapsed Select-model view: the toggle is
-  // expanded and the advanced view shed `inert`, so read its radios structurally.
+  // expanded, the advanced view shed `inert`, and the surface is open.
   function collapsedFamilyMenu(main) {{
     if (!main) return null;
     const toggle = selectModelViewToggle(main);
     if (!toggle || toggle.getAttribute("aria-expanded") !== "true") return null;
     const view = advancedFamilyView(main);
     if (!expandedSelectModelView(toggle, view)) return null;
-    return structuralRadios(view).length > 0 ? view : null;
+    if (!pickerSurfaceIsOpen(view, view)) return null;
+    return structuralFamilyRadios(view).length > 0 ? view : null;
   }}
 
   async function activateHybridFamilyView(menu) {{
@@ -772,8 +799,9 @@ async () => {{
       const active = hybridMenu();
       if (active && radios(active).length > 0) return active;
       // The view may have expanded but stayed opacity-0 (rAF-driven); accept
-      // the structural family view without a visible-only filter.
-      const collapsedActive = collapsedFamilyMenu(menu);
+      // the structural family view without a visible-only filter. Re-run on
+      // the live hybridMenu() || menu so a pre-click node is not stale.
+      const collapsedActive = collapsedFamilyMenu(hybridMenu() || menu);
       if (collapsedActive) return collapsedActive;
       await wait(100);
     }}
@@ -799,9 +827,10 @@ async () => {{
     if (visible) return visible;
     // Collapsed Select-model family view: the advanced view carries the
     // radios but is opacity-0 / inert-shedding, so visibleMenus() misses it.
-    // Accept it structurally when the toggle is expanded (#463 mirror).
+    // Accept it structurally when the toggle is expanded and the surface is
+    // open (#463 mirror); structuralFamilyRadios filters to family labels.
     const collapsed = collapsedFamilyMenu(main);
-    if (collapsed && structuralRadios(collapsed).some((item) => fold(textOf(item)) === "latest")) {{
+    if (collapsed && structuralFamilyRadios(collapsed).some((item) => fold(textOf(item)) === "latest")) {{
       return collapsed;
     }}
     return null;
@@ -1090,7 +1119,7 @@ async () => {{
     // The active view may be the collapsed Select-model advanced view (opacity-0,
     // inert shed); read its radios structurally in that case.
     const isCollapsedView = menu && menu.getAttribute?.("data-testid") === "composer-model-picker-slider-advanced-view";
-    const items = isCollapsedView ? structuralRadios(menu) : radios(menu);
+    const items = isCollapsedView ? structuralFamilyRadios(menu) : radios(menu);
     const families = items.map(textOf).filter(Boolean);
     const latest = items.find((item) => fold(textOf(item)) === "latest");
     const state = {{ menu, effortItems: [], familyTrigger: null, familyLabel: latest ? textOf(latest) : "", familyProof: Boolean(latest && isChecked(latest)), shape: "slider" }};
@@ -1107,7 +1136,7 @@ async () => {{
     }}
     const rereadMenu = menu || hybridMenu();
     const rereadIsCollapsed = rereadMenu && rereadMenu.getAttribute?.("data-testid") === "composer-model-picker-slider-advanced-view";
-    const reread = rereadIsCollapsed ? structuralRadios(rereadMenu) : radios(rereadMenu);
+    const reread = rereadIsCollapsed ? structuralFamilyRadios(rereadMenu) : radios(rereadMenu);
     const checked = reread.filter(isChecked);
     const latestLabel = checked.length === 1 ? textOf(checked[0]) : "";
     if (checked.length !== 1 || fold(latestLabel) !== "latest") {{
@@ -1189,9 +1218,13 @@ async () => {{
 
   function readPickerCloseVerification(pill, state, options = {{}}) {{
     const familyTrigger = state?.familyTrigger;
-    // A retained closed menu keeps its Select-model toggle mounted with a stale
+    // familyTrigger is the menu-shape family submenu trigger (null for the
+    // slider shape, where familySurface below is the gate). A retained closed
+    // menu keeps its Select-model toggle mounted with a stale
     // aria-expanded="true"; the toggle only counts as open inside an open
-    // surface (#463 mirror).
+    // surface (#463 mirror). familySurface (familyMenu -> collapsedFamilyMenu)
+    // is itself gated on pickerSurfaceIsOpen, so a retained closed collapsed
+    // view no longer reads as open.
     const familyOpen = mounted(familyTrigger)
       && pickerSurfaceIsOpen(familyTrigger)
       && (familyTrigger.getAttribute("aria-expanded") === "true"
@@ -1292,7 +1325,7 @@ async () => {{
     // The family menu may be the collapsed Select-model advanced view (opacity-0,
     // inert shed); read its radios structurally instead of visible-only.
     const isCollapsedView = submenu && submenu.getAttribute?.("data-testid") === "composer-model-picker-slider-advanced-view";
-    const familyItems = isCollapsedView ? structuralRadios(submenu) : radios(submenu);
+    const familyItems = isCollapsedView ? structuralFamilyRadios(submenu) : radios(submenu);
     const checkedItems = familyItems.filter((item) => item.getAttribute("aria-checked") === "true");
     const families = familyItems.map(textOf).filter(Boolean);
     const checkedFamily = checkedItems.length === 1 ? textOf(checkedItems[0]) : "";
@@ -1325,7 +1358,12 @@ async () => {{
     }} else if (selectedState?.shape === "slider") {{
       reopened = await openHybrid(pill);
       if (reopened) {{
-        const familyItems = radios(reopened);
+        // openHybrid may return the collapsed Select-model advanced view
+        // (opacity-0, inert shed); read its radios structurally in that case
+        // so post-close reverification does not report "unverified" on the
+        // collapsed shape (#462).
+        const reopenedIsCollapsed = reopened && reopened.getAttribute?.("data-testid") === "composer-model-picker-slider-advanced-view";
+        const familyItems = reopenedIsCollapsed ? structuralFamilyRadios(reopened) : radios(reopened);
         const checkedItems = familyItems.filter(isChecked);
         const checkedFamily = checkedItems.length === 1 ? textOf(checkedItems[0]) : "";
         const slider = Array.from(reopened.querySelectorAll("[role='slider']") || [])
@@ -3100,26 +3138,40 @@ mod tests {
         // but collapsed behind a Select-model menuitem; the toggle's
         // aria-expanded="true" plus the advanced view shedding `inert` is the
         // structural open signal, and opacity never gates the read.
-        let script = build_model_selection_function("gpt-6-pro-chat", ChatgptModelStrategy::Select);
-        assert!(script.contains("function isSelectModelViewToggle(node)"));
-        assert!(script.contains("function structurallyReadable(node, stopAt = null)"));
-        assert!(script.contains("function expandedSelectModelView(trigger, view)"));
-        assert!(script.contains("function structuralRadios(menu)"));
-        assert!(script.contains("function collapsedFamilyMenu(main)"));
-        assert!(script.contains("function advancedFamilyView(menu)"));
-        // activateHybridFamilyView accepts the collapsed view before and after
-        // clicking the Select-model toggle.
-        assert!(script.contains("const collapsed = collapsedFamilyMenu(menu);"));
-        assert!(script.contains("const collapsedActive = collapsedFamilyMenu(menu);"));
-        // familyMenu falls back to the structural collapsed view.
-        assert!(script.contains("const collapsed = collapsedFamilyMenu(main);"));
-        // readFamilyProof and selectHybrid read structural radios when the
-        // active submenu is the collapsed advanced view.
-        assert!(script.contains("composer-model-picker-slider-advanced-view"));
-        assert!(script.contains("isCollapsedView ? structuralRadios(submenu) : radios(submenu)"));
-        // Close verification: a stale aria-expanded="true" on the Select-model
-        // toggle counts as open only inside an open surface.
-        assert!(script.contains("pickerSurfaceIsOpen(familyTrigger)"));
+        let script =
+            build_model_selection_function("gpt-6-pro-chat", ChatgptModelStrategy::Select);
+        // Family-option filter so the effort tier rows (siblings of the family
+        // radios in the unified picker) do not pollute the structural read.
+        assert!(script.contains("const isFamilyOptionLabel = (value)"));
+        assert!(script.contains("function structuralFamilyRadios(menu)"));
+        assert!(script.contains(
+            ".filter((item) => pickerSurfaceIsOpen(item, menu) && structurallyReadable(item, menu))"
+        ));
+        assert!(script.contains(
+            ".filter((item) => isFamilyOptionLabel(textOf(item)) || isFamilyOptionLabel(optionLabel(item)))"
+        ));
+        // collapsedFamilyMenu gates on the open surface (not just the toggle
+        // attribute) and reads family radios structurally.
+        assert!(script.contains("if (!pickerSurfaceIsOpen(view, view)) return null;"));
+        assert!(script.contains("return structuralFamilyRadios(view).length > 0 ? view : null;"));
+        // advancedFamilyView iterates and picks the view carrying family radios.
+        assert!(script.contains(
+            "views.find((view) => structuralFamilyRadios(view).length > 0) || null;"
+        ));
+        // activateHybridFamilyView re-runs on the live hybridMenu() || menu.
+        assert!(script.contains("collapsedFamilyMenu(hybridMenu() || menu);"));
+        // selectHybrid + readFamilyProof read structural family radios on the
+        // collapsed advanced view.
+        assert!(script.contains("isCollapsedView ? structuralFamilyRadios(menu) : radios(menu)"));
+        assert!(script.contains(
+            "isCollapsedView ? structuralFamilyRadios(submenu) : radios(submenu)"
+        ));
+        // Post-close reverification reuses the collapsed-view branch.
+        assert!(script.contains(
+            "reopenedIsCollapsed ? structuralFamilyRadios(reopened) : radios(reopened)"
+        ));
+        // Degenerate Instant slider guard.
+        assert!(script.contains("if (fold(match[1]) === \"instant\") return null;"));
     }
 
     #[test]

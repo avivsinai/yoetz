@@ -2301,10 +2301,15 @@ mod tests {
             "gpt-6-pro-chat",
             chatgpt_recipe::ChatgptModelStrategy::Select,
         );
-        assert!(script.contains("function collapsedFamilyMenu(main)"));
-        assert!(script.contains("function expandedSelectModelView(trigger, view)"));
-        assert!(script.contains("function structuralRadios(menu)"));
-        assert!(script.contains("composer-model-picker-slider-advanced-view"));
+        // Behaviour-carrying substrings (not declaration headers):
+        // family-option filter + open-surface gate + collapsed-view branch.
+        assert!(script.contains("const isFamilyOptionLabel = (value)"));
+        assert!(script.contains("function structuralFamilyRadios(menu)"));
+        assert!(script.contains("if (!pickerSurfaceIsOpen(view, view)) return null;"));
+        assert!(script.contains(
+            "isCollapsedView ? structuralFamilyRadios(submenu) : radios(submenu)"
+        ));
+        assert!(script.contains("if (fold(match[1]) === \"instant\") return null;"));
     }
 
     #[test]
