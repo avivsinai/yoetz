@@ -61,3 +61,9 @@ browser-profile/
 Thumbs.db
 .tmp-parity/
 .tmp-fake-parity/
+
+# Amit local state (notes store lives at repo root but is session-private)
+.pi/
+
+# Scratch capture logs
+picker-capture-session
