@@ -374,13 +374,18 @@ test("rateLimitedHandoff detects a late 'Too many requests' modal when the compo
   // visible while suppressing interaction. manualHandoffContext short-circuits
   // on findAuthenticatedComposer and returns empty text, so the modal is
   // missed and the phase fails with a generic not-found. rateLimitedHandoff
-  // scans the interstitial surfaces plus body.innerText without the composer
-  // short-circuit.
+  // scans the interstitial surfaces (here a [role=dialog]) without the
+  // composer short-circuit — the real page shape.
+  const dialogMessage = visibleElement({ role: "dialog" });
+  dialogMessage.innerText = "Too many requests. Please wait a few minutes and try again later.";
+  dialogMessage.textContent = dialogMessage.innerText;
+  dialogMessage.children = [];
   const root = selectorRoot(new Map([
-    ["#prompt-textarea", [visibleElement({ id: "prompt-textarea" })]]
+    ["#prompt-textarea", [visibleElement({ id: "prompt-textarea" })]],
+    ['[role="dialog"]', [dialogMessage]]
   ]));
-  root.title = "Too many requests | ChatGPT";
-  root.body = { innerText: "Too many requests. Please wait a few minutes and try again later." };
+  root.title = "ChatGPT";
+  root.body = { innerText: "", textContent: "" };
   root.defaultView = { location: { href: "https://chatgpt.com/?_yoetz=run_late", pathname: "/" } };
   assert.deepEqual(rateLimitedHandoff(root), {
     state: "rate_limited",

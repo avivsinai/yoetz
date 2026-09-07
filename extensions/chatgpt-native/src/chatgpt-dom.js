@@ -212,6 +212,12 @@ export function rateLimitedHandoff(root = document) {
   // so a portal-div modal (not [role=alert]/[role=dialog]/[aria-live]) still
   // surfaces its message.
   //
+  // Concatenate surfaces + body (an unrelated [role=alert] toast with text
+  // must not shadow the body modal), and gate the body scan on !hasTranscript:
+  // a yoetz prompt or transcript that contains the words "Too many requests"
+  // (we send logs) would relabel a real composer failure as rate_limited.
+  // Surfaces + title still catch the modal when a transcript is present.
+  //
   // Return whichever terminal manual handoff matches: a rate-limit modal with
   // a "Log in" CTA classifies as login_required, and all three terminal states
   // (challenge / login / rate_limited) must surface instead of the generic
@@ -223,8 +229,11 @@ export function rateLimitedHandoff(root = document) {
   for (const surface of surfaces) {
     collectManualHandoffSurfaceText(surface, chunks);
   }
-  const bodyText = normalizeText(root?.body?.innerText ?? root?.body?.textContent ?? "");
-  const text = normalizeText(chunks.join("\n")) || bodyText;
+  const surfaceText = normalizeText(chunks.join("\n"));
+  const bodyText = hasTranscript
+    ? ""
+    : normalizeText(root?.body?.innerText ?? root?.body?.textContent ?? "");
+  const text = normalizeText(`${surfaceText}\n${bodyText}`);
   const handoff = classifyManualHandoff({
     url: String(win.location?.href ?? ""),
     title: String(root?.title ?? ""),
