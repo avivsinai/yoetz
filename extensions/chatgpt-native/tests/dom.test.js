@@ -5,12 +5,16 @@ import {
   chatgptJobUrl,
   classifyManualHandoff,
   classifyWaitManualHandoff,
+  ensureConversationLoaded,
+  ensureFreshChat,
   findAuthenticatedComposer,
   findComposer,
+  insertPrompt,
   manualHandoffContext,
   normalizeText,
   ownedWindowName,
-  parseOwnedWindowName
+  parseOwnedWindowName,
+  rateLimitedHandoff
 } from "../src/chatgpt-dom.js";
 import { chatgptSiteAdapter } from "../src/sites/chatgpt.js";
 import { claudeSiteAdapter } from "../src/sites/claude.js";
@@ -364,6 +368,98 @@ test("classifyWaitManualHandoff avoids prompt and response text false positives"
 test("normalizeText trims repeated whitespace conservatively", () => {
   assert.equal(normalizeText(" hello \n\n\n world \r\n"), "hello\n\n world");
 });
+
+test("rateLimitedHandoff detects a late 'Too many requests' modal when the composer is mounted", () => {
+  // gh-471 second failure: a rate-limit overlay can leave the composer
+  // visible while suppressing interaction. manualHandoffContext short-circuits
+  // on findAuthenticatedComposer and returns empty text, so the modal is
+  // missed and the phase fails with a generic not-found. rateLimitedHandoff
+  // scans the interstitial surfaces (here a [role=dialog]) without the
+  // composer short-circuit — the real page shape.
+  const dialogMessage = visibleElement({ role: "dialog" });
+  dialogMessage.innerText = "Too many requests. Please wait a few minutes and try again later.";
+  dialogMessage.textContent = dialogMessage.innerText;
+  dialogMessage.children = [];
+  const root = selectorRoot(new Map([
+    ["#prompt-textarea", [visibleElement({ id: "prompt-textarea" })]],
+    ['[role="dialog"]', [dialogMessage]]
+  ]));
+  root.title = "ChatGPT";
+  root.body = { innerText: "", textContent: "" };
+  root.defaultView = { location: { href: "https://chatgpt.com/?_yoetz=run_late", pathname: "/" } };
+  assert.deepEqual(rateLimitedHandoff(root), {
+    state: "rate_limited",
+    message: "ChatGPT is rate limited"
+  });
+});
+
+test("rateLimitedHandoff detects a late 'Too many requests' modal when the composer is absent", () => {
+  // The field defect (gh-471): the prepare-time classifyManualHandoff scan
+  // runs once before side effects, so a rate-limit modal that mounts late
+  // surfaced as 'ChatGPT composer not found'. rateLimitedHandoff re-reads the
+  // manual-handoff context at the phase failure and returns the handoff.
+  const root = rateLimitModalRoot("https://chatgpt.com/?_yoetz=run_late");
+  assert.deepEqual(rateLimitedHandoff(root), {
+    state: "rate_limited",
+    message: "ChatGPT is rate limited"
+  });
+  // A clean ChatGPT shell with an authenticated composer is not rate-limited.
+  const cleanRoot = selectorRoot(new Map([
+    ["#prompt-textarea", [visibleElement({ id: "prompt-textarea" })]]
+  ]));
+  cleanRoot.defaultView = { location: { href: "https://chatgpt.com/?_yoetz=run_clean" } };
+  assert.equal(rateLimitedHandoff(cleanRoot), null);
+});
+
+test("ensureFreshChat fails closed with rate_limited when the late modal suppresses the composer", async () => {
+  const root = rateLimitModalRoot("https://chatgpt.com/?_yoetz=run_late");
+  await assert.rejects(
+    ensureFreshChat(root, { run_id: "run_late" }, { timeoutMs: 5, intervalMs: 5 }),
+    (error) => error.code === "rate_limited"
+      && error.state === "rate_limited"
+      && error.phase === "upload"
+      && error.side_effect_started === false
+  );
+});
+
+test("ensureConversationLoaded fails closed with rate_limited when the late modal suppresses the composer", async () => {
+  // A conversation route that loaded but whose composer never mounted because
+  // the rate-limit modal appeared: must report rate_limited, not
+  // conversation_unavailable.
+  const root = rateLimitModalRoot("https://chatgpt.com/c/conv-late?_yoetz=run_late");
+  await assert.rejects(
+    ensureConversationLoaded(root, "conv-late", { timeoutMs: 5, intervalMs: 5 }),
+    (error) => error.code === "rate_limited" && error.state === "rate_limited"
+  );
+});
+
+test("insertPrompt fails closed with rate_limited at send time when the late modal suppresses the composer", async () => {
+  // The send-phase composer lookup is post-side-effect, so the rate_limited
+  // failure carries side_effect_started=true and phase=send.
+  const root = rateLimitModalRoot("https://chatgpt.com/?_yoetz=run_late");
+  await assert.rejects(
+    insertPrompt(root, "hello", { timeoutMs: 5, intervalMs: 5 }),
+    (error) => error.code === "rate_limited"
+      && error.state === "rate_limited"
+      && error.phase === "send"
+      && error.side_effect_started === true
+  );
+});
+
+function rateLimitModalRoot(href) {
+  const pathname = (() => {
+    try {
+      return new URL(href).pathname;
+    } catch {
+      return "/";
+    }
+  })();
+  const root = selectorRoot(new Map());
+  root.title = "Too many requests | ChatGPT";
+  root.body = { innerText: "Too many requests. Please wait a few minutes and try again later." };
+  root.defaultView = { location: { href, pathname } };
+  return root;
+}
 
 function selectorRoot(selectors) {
   return {

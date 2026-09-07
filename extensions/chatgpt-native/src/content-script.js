@@ -321,6 +321,23 @@ async function configureModel(job, options = {}) {
   try {
     selection = await configureModelState(document, job);
   } catch (error) {
+    // A late terminal manual-handoff modal (rate_limited, login_required, or
+    // challenge_required) detected inside configureModelState is the real
+    // cause; preserve its code instead of relabeling it as a send-time
+    // model-selection failure. Re-stamp the caller's terminality context onto
+    // the error: configureModelState hardcodes side_effect_started=false (it
+    // cannot know whether the upload already committed), but a modal during
+    // pre-click reselection runs with side_effect_started=true; the Rust job
+    // classifier marks the run terminal only then, so a non-terminal result
+    // cannot fall to CDP and re-submit an already-uploaded prompt.
+    if (error?.code === "rate_limited"
+        || error?.code === "login_required"
+        || error?.code === "challenge_required") {
+      error.phase = phase;
+      error.side_effect_started = sideEffectStarted;
+      error.send_committed = sendCommitted;
+      throw error;
+    }
     if (phase !== "send") {
       throw error;
     }

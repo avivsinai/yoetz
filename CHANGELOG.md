@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- A late "Too many requests" modal on ChatGPT is now classified as
+  `rate_limited` at every phase failure (composer lookup, Chat surface
+  lookup, picker open), not only at the prepare-time scan. The re-check no
+  longer short-circuits on a mounted composer, so a portal-div modal that
+  leaves the composer visible still surfaces; a rate-limit modal during the
+  send-phase pre-click reselection is re-stamped with the caller's
+  `side_effect_started=true` so the run is terminal and cannot fall to CDP
+  and re-submit an already-uploaded prompt
+  ([#471](https://github.com/avivsinai/yoetz/issues/471)).
 - The Claude model picker no longer flapped closed in a throttled hidden tab:
   `openModelMenu` retried with a second `button.click()` when the menu did
   not open within the attempt budget, and in a hidden tab the menu mounted

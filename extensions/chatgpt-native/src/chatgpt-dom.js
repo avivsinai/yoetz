@@ -199,6 +199,49 @@ export function classifyWaitManualHandoff({ url = "", title = "", text = "" } = 
   return classifyManualHandoff({ url, title, text });
 }
 
+// A "Too many requests" modal can mount late — after the prepare-time
+// classifyManualHandoff scan — and surface as a generic composer/surface/picker
+// not-found. Re-check the manual-handoff context at every phase failure and
+// fail closed with rate_limited when the modal is up. Returns the rate-limited
+// handoff ({ state, message }) or null.
+export function rateLimitedHandoff(root = document) {
+  // The composer short-circuit in manualHandoffContext returns empty text
+  // whenever the composer is mounted, but a rate-limit overlay can leave the
+  // composer visible while suppressing interaction. Scan the interstitial
+  // surfaces plus document.body.innerText directly, without the short-circuit,
+  // so a portal-div modal (not [role=alert]/[role=dialog]/[aria-live]) still
+  // surfaces its message.
+  //
+  // Concatenate surfaces + body (an unrelated [role=alert] toast with text
+  // must not shadow the body modal), and gate the body scan on !hasTranscript:
+  // a yoetz prompt or transcript that contains the words "Too many requests"
+  // (we send logs) would relabel a real composer failure as rate_limited.
+  // Surfaces + title still catch the modal when a transcript is present.
+  //
+  // Return whichever terminal manual handoff matches: a rate-limit modal with
+  // a "Log in" CTA classifies as login_required, and all three terminal states
+  // (challenge / login / rate_limited) must surface instead of the generic
+  // not-found error.
+  const win = root?.defaultView ?? globalThis;
+  const hasTranscript = hasConversationResidue(root);
+  const surfaces = manualHandoffSurfaces(root, { hasTranscript });
+  const chunks = [];
+  for (const surface of surfaces) {
+    collectManualHandoffSurfaceText(surface, chunks);
+  }
+  const surfaceText = normalizeText(chunks.join("\n"));
+  const bodyText = hasTranscript
+    ? ""
+    : normalizeText(root?.body?.innerText ?? root?.body?.textContent ?? "");
+  const text = normalizeText(`${surfaceText}\n${bodyText}`);
+  const handoff = classifyManualHandoff({
+    url: String(win.location?.href ?? ""),
+    title: String(root?.title ?? ""),
+    text
+  });
+  return handoff ?? null;
+}
+
 export function findComposer(root = document) {
   return firstVisible(root, [
     "#prompt-textarea",
@@ -319,7 +362,18 @@ function ownershipMatchesJob(parsed, job) {
 }
 
 export async function insertPrompt(root, prompt, options = {}) {
-  const composer = await waitForElement(root, findComposer, "ChatGPT composer", options);
+  let composer;
+  try {
+    composer = await waitForElement(root, findComposer, "ChatGPT composer", options);
+  } catch (error) {
+    // A late "Too many requests" modal suppresses the composer; re-check the
+    // manual-handoff context and fail closed with rate_limited when it is up.
+    const rateLimited = rateLimitedCommandError(root, { phase: "send", side_effect_started: true });
+    if (rateLimited) {
+      throw rateLimited;
+    }
+    throw error;
+  }
   composer.focus();
   if ("value" in composer) {
     setInputValue(composer, prompt);
@@ -382,7 +436,16 @@ export async function ensureFreshChat(root = document, job = {}, options = {}) {
     }
   );
 
-  const composer = await waitForElement(root, findComposer, "ChatGPT composer", options);
+  let composer;
+  try {
+    composer = await waitForElement(root, findComposer, "ChatGPT composer", options);
+  } catch (error) {
+    const rateLimited = rateLimitedCommandError(root, { phase: "upload", side_effect_started: false });
+    if (rateLimited) {
+      throw rateLimited;
+    }
+    throw error;
+  }
   const composerText = editableText(composer);
   const attachments = findAttachmentTiles(root, { composerOnly: true });
   const residue = conversationResidue(root);
@@ -432,6 +495,10 @@ export async function ensureConversationLoaded(root = document, conversationId, 
   try {
     await waitForElement(root, findComposer, "ChatGPT composer", options);
   } catch (error) {
+    const rateLimited = rateLimitedCommandError(root, { phase: "upload", side_effect_started: false });
+    if (rateLimited) {
+      throw rateLimited;
+    }
     throw chatgptCommandError(
       "conversation_unavailable",
       `ChatGPT conversation ${conversationId} is unavailable; composer did not load at ${currentLocationForError(win)}: ${String(error?.message ?? error)}`,
@@ -541,6 +608,12 @@ export async function configureModelState(root, job = {}) {
   const hydrationSignal = await waitForHiddenTabHydration(root, modelSelectionOptionsForJob(job));
   const surface = await ensureChatSurface(root, modelSelectionOptionsForJob(job));
   if (!surface.ok) {
+    // A late "Too many requests" modal suppresses the Chat surface toggle;
+    // re-check the manual-handoff context and fail closed with rate_limited.
+    const rateLimited = rateLimitedCommandError(root, { phase: "model_selection", side_effect_started: false });
+    if (rateLimited) {
+      throw rateLimited;
+    }
     return {
       hydration_signal: hydrationSignal,
       status: "unavailable",
@@ -1189,6 +1262,12 @@ async function selectLatestChatProModel(root, options = {}) {
         legacy_picker: lateLegacyMarkers.slice(0, 10)
       };
     }
+    // A late "Too many requests" modal can suppress the composer model pill;
+    // re-check the manual-handoff context and fail closed with rate_limited.
+    const rateLimited = rateLimitedCommandError(root, { phase: "model_selection", side_effect_started: false });
+    if (rateLimited) {
+      throw rateLimited;
+    }
     return {
       ...base,
       failure_reason: "model_control_not_found",
@@ -1200,6 +1279,10 @@ async function selectLatestChatProModel(root, options = {}) {
   // budget expires). read(root) composes readPicker with the layout-dependent
   // pill/leftover locators that stay in this module.
   if (!await openModelPicker(root, modelButton, options)) {
+    const rateLimited = rateLimitedCommandError(root, { phase: "model_selection", side_effect_started: false });
+    if (rateLimited) {
+      throw rateLimited;
+    }
     return {
       ...base,
       failure_reason: "model_picker_open_failed",
@@ -3962,6 +4045,24 @@ function chatgptCommandError(code, message, detail = {}) {
     }
   }
   return error;
+}
+
+// Build a terminal manual-handoff command error from a late modal detected
+// at a phase failure. The phase/side_effect_started come from the failing
+// phase so the worker's terminal detail reflects where the modal was
+// observed. The code/state follow whatever classifyManualHandoff matched
+// (rate_limited, login_required, or challenge_required) — all three are
+// terminal manual handoffs and must surface instead of a generic not-found.
+function rateLimitedCommandError(root, { phase, side_effect_started } = {}) {
+  const handoff = rateLimitedHandoff(root);
+  if (!handoff) {
+    return null;
+  }
+  return chatgptCommandError(handoff.state, handoff.message, {
+    phase,
+    side_effect_started,
+    state: handoff.state
+  });
 }
 
 function currentLocationForError(win) {
