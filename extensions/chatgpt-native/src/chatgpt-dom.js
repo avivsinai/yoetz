@@ -165,6 +165,28 @@ export function classifyManualHandoff({ url = "", title = "", text = "" } = {}) 
   const conversationRoute = /^\/c\/[^/]+$/.test(pathname);
   const normalizedTitle = conversationRoute ? "" : normalizeText(title).toLowerCase();
   const normalizedText = normalizeText(text).toLowerCase();
+  // Usage-limit wall (Enterprise/Team monthly cap): the page is authenticated
+  // but the model selector is suppressed by an "Usage limit reached" overlay.
+  // Check this before challenge/login so a nav item like "security check"
+  // does not false-positive into challenge_required.
+  //
+  // Trigger ONLY on the wall-up signals — the overlay sentence "Usage limit
+  // reached" and "0% remaining" — NOT on the healthy-page usage widget
+  // ("Monthly usage limit / 43% remaining / Increase monthly limit"), which
+  // every Enterprise account carries while perfectly usable. The remaining-
+  // percent text is extracted for the message but does not itself trigger.
+  const usageLimitTitle = /^usage limit(?:\s+reached)?(?:\s*(?:\||[-—])\s*(?:chatgpt|openai))?$/.test(normalizedTitle);
+  const remainingPercent = (/\b(0\s*%\s*remaining)\b/.exec(normalizedText) || [])[1];
+  if (usageLimitTitle
+      || /\busage limit reached\b/.test(normalizedText)
+      || /\b0\s*%\s*remaining\b/.test(normalizedText)) {
+    return {
+      state: "usage_limit_reached",
+      message: remainingPercent
+        ? `ChatGPT workspace usage limit reached (${remainingPercent})`
+        : "ChatGPT workspace usage limit reached"
+    };
+  }
   const challengeRoute = /^\/cdn-cgi\/challenge-platform(?:\/|$)/.test(pathname);
   const challengeTitle = /^(?:just a moment(?:\.\.\.)?|checking your browser(?:\.\.\.)?)(?:\s*(?:\||[-—])\s*(?:chatgpt|openai))?$/.test(normalizedTitle);
   if (challengeRoute

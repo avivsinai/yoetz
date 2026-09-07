@@ -53,6 +53,63 @@ test("classifyManualHandoff detects login, challenge, and rate limits", () => {
   assert.equal(classifyManualHandoff({ text: "Message ChatGPT" }), null);
 });
 
+test("classifyManualHandoff classifies a usage-limit wall as usage_limit_reached, not challenge_required", () => {
+  // gh-496 / yz-728: an authenticated ChatGPT Work surface hit by the
+  // Enterprise/Team monthly usage cap was misclassified as challenge_required
+  // because the sidebar carried a "security check" nav item. The usage-limit
+  // check runs before the challenge check and carries the remaining-percent
+  // text. Fixture text copied from the live run-b53b19 inspect JSON (no /tmp
+  // dependency).
+  const usageLimitText = [
+    "Security Review",
+    "Adversarial Design Review",
+    "Monthly usage limit",
+    "0% remaining",
+    "Increase monthly limit",
+    "taboola-enterprise",
+    "Enterprise",
+    "Chat",
+    "Work",
+    "What should we work on?",
+    "Usage limit reached",
+    "You can keep using basic ChatGPT features or request a limit increase from your workspace admin to use more advanced features.",
+    "Request Increase",
+    "GPT-5.6 Luna",
+    "Medium"
+  ].join("\n");
+  const handoff = classifyManualHandoff({
+    url: "https://chatgpt.com/?_yoetz=run_b53b19",
+    title: "ChatGPT",
+    text: usageLimitText
+  });
+  assert.equal(handoff.state, "usage_limit_reached");
+  assert.match(handoff.message, /0% remaining/);
+});
+
+test("classifyManualHandoff does not classify a healthy usage widget as usage_limit_reached", () => {
+  // gh-496 r1: an Enterprise account carries a "Monthly usage limit —
+  // 43% remaining / Increase monthly limit" usage widget while perfectly
+  // usable. Only the wall-up signals ("Usage limit reached" / "0% remaining")
+  // trigger; the widget strings alone must return null.
+  const healthyWidgetText = [
+    "Security Review",
+    "Monthly usage limit",
+    "43% remaining",
+    "Increase monthly limit",
+    "What should we work on?",
+    "GPT-5.6 Luna",
+    "Medium"
+  ].join("\n");
+  assert.equal(
+    classifyManualHandoff({
+      url: "https://chatgpt.com/c/abc",
+      title: "ChatGPT",
+      text: healthyWidgetText
+    }),
+    null
+  );
+});
+
 test("classifyManualHandoff does not let composer authentication suppress a real handoff", () => {
   assert.equal(
     classifyManualHandoff({

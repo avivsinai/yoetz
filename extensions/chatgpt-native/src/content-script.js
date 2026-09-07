@@ -329,8 +329,9 @@ async function configureModel(job, options = {}) {
   try {
     selection = await configureModelState(document, job);
   } catch (error) {
-    // A late terminal manual-handoff modal (rate_limited, login_required, or
-    // challenge_required) detected inside configureModelState is the real
+    // A late terminal manual-handoff modal (rate_limited, login_required,
+    // challenge_required, or usage_limit_reached) detected inside
+    // configureModelState is the real
     // cause; preserve its code instead of relabeling it as a send-time
     // model-selection failure. Re-stamp the caller's terminality context onto
     // the error: configureModelState hardcodes side_effect_started=false (it
@@ -340,7 +341,8 @@ async function configureModel(job, options = {}) {
     // cannot fall to CDP and re-submit an already-uploaded prompt.
     if (error?.code === "rate_limited"
         || error?.code === "login_required"
-        || error?.code === "challenge_required") {
+        || error?.code === "challenge_required"
+        || error?.code === "usage_limit_reached") {
       error.phase = phase;
       error.side_effect_started = sideEffectStarted;
       error.send_committed = sendCommitted;

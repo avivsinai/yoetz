@@ -98,6 +98,14 @@ const CHALLENGE_MARKERS: &[&str] = &[
     "verify you are human",
     "cf-chl",
 ];
+const USAGE_LIMIT_MARKERS: &[&str] = &[
+    // Trigger ONLY on the wall-up signals — the overlay sentence "Usage
+    // limit reached" and "0% remaining" — NOT on the healthy-page usage
+    // widget ("Monthly usage limit / 43% remaining / Increase monthly
+    // limit"), which every Enterprise account carries while usable.
+    "usage limit reached",
+    "0% remaining",
+];
 const LOGIN_MARKERS: &[&str] = &[
     "log in",
     "login",
@@ -2829,6 +2837,17 @@ pub fn is_challenge_text(haystack: &str) -> bool {
 
 pub fn detect_auth_issue_text(haystack: &str, live_attach: bool) -> Option<&'static str> {
     let haystack = haystack.to_lowercase();
+    // Usage-limit wall (Enterprise/Team monthly cap): check before challenge
+    // so a nav item like "security check" does not false-positive into a
+    // cloudflare challenge. The page is authenticated but the model selector
+    // is suppressed by an "Usage limit reached" overlay.
+    if contains_any(&haystack, USAGE_LIMIT_MARKERS) {
+        return Some(if live_attach {
+            "chatgpt workspace usage limit reached in the attached Chrome session. Request a limit increase from your workspace admin and try again."
+        } else {
+            "chatgpt workspace usage limit reached. Request a limit increase from your workspace admin and try again."
+        });
+    }
     if is_challenge_text(&haystack) {
         return Some(if live_attach {
             "cloudflare challenge detected in the attached Chrome session. Solve it in your browser window and try again."
@@ -3036,6 +3055,36 @@ mod tests {
             detect_auth_issue_text("Please sign in", false),
             Some("chatgpt login required. Run `yoetz browser login` and try again.")
         );
+    }
+
+    #[test]
+    fn auth_detection_classifies_usage_limit_wall_before_challenge_false_positive() {
+        // gh-496 / yz-728: an authenticated ChatGPT Work surface hit by the
+        // Enterprise/Team monthly usage cap carries "Usage limit reached" +
+        // "0% remaining", but the sidebar also carries a "security check" nav
+        // item that would false-positive into a cloudflare challenge. The
+        // usage-limit check runs first. Fixture text copied from the live
+        // run-b53b19 inspect JSON (no /tmp dependency).
+        let usage_limit_text = "Security Review\nAdversarial Design Review\nMonthly usage limit\n0% remaining\nIncrease monthly limit\ntaboola-enterprise\nEnterprise\nChat\nWork\nWhat should we work on?\nUsage limit reached\nYou can keep using basic ChatGPT features or request a limit increase from your workspace admin to use more advanced features.\nRequest Increase\nGPT-5.6 Luna\nMedium";
+        assert_eq!(
+            detect_auth_issue_text(usage_limit_text, true),
+            Some("chatgpt workspace usage limit reached in the attached Chrome session. Request a limit increase from your workspace admin and try again.")
+        );
+        assert_eq!(
+            detect_auth_issue_text(usage_limit_text, false),
+            Some("chatgpt workspace usage limit reached. Request a limit increase from your workspace admin and try again.")
+        );
+    }
+
+    #[test]
+    fn auth_detection_does_not_classify_a_healthy_usage_widget_as_usage_limit() {
+        // gh-496 r1: an Enterprise account carries a "Monthly usage limit —
+        // 43% remaining / Increase monthly limit" usage widget while perfectly
+        // usable. Only the wall-up signals ("Usage limit reached" /
+        // "0% remaining") trigger; the widget strings alone must return None.
+        let healthy_widget_text = "Security Review\nMonthly usage limit\n43% remaining\nIncrease monthly limit\nWhat should we work on?\nGPT-5.6 Luna\nMedium";
+        assert_eq!(detect_auth_issue_text(healthy_widget_text, true), None);
+        assert_eq!(detect_auth_issue_text(healthy_widget_text, false), None);
     }
 
     #[test]
