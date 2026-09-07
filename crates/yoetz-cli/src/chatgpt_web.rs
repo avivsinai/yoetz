@@ -99,11 +99,12 @@ const CHALLENGE_MARKERS: &[&str] = &[
     "cf-chl",
 ];
 const USAGE_LIMIT_MARKERS: &[&str] = &[
+    // Trigger ONLY on the wall-up signals — the overlay sentence "Usage
+    // limit reached" and "0% remaining" — NOT on the healthy-page usage
+    // widget ("Monthly usage limit / 43% remaining / Increase monthly
+    // limit"), which every Enterprise account carries while usable.
     "usage limit reached",
-    "monthly usage limit",
-    "increase monthly limit",
-    "request a limit increase",
-    "% remaining",
+    "0% remaining",
 ];
 const LOGIN_MARKERS: &[&str] = &[
     "log in",
@@ -3073,6 +3074,17 @@ mod tests {
             detect_auth_issue_text(usage_limit_text, false),
             Some("chatgpt workspace usage limit reached. Request a limit increase from your workspace admin and try again.")
         );
+    }
+
+    #[test]
+    fn auth_detection_does_not_classify_a_healthy_usage_widget_as_usage_limit() {
+        // gh-496 r1: an Enterprise account carries a "Monthly usage limit —
+        // 43% remaining / Increase monthly limit" usage widget while perfectly
+        // usable. Only the wall-up signals ("Usage limit reached" /
+        // "0% remaining") trigger; the widget strings alone must return None.
+        let healthy_widget_text = "Security Review\nMonthly usage limit\n43% remaining\nIncrease monthly limit\nWhat should we work on?\nGPT-5.6 Luna\nMedium";
+        assert_eq!(detect_auth_issue_text(healthy_widget_text, true), None);
+        assert_eq!(detect_auth_issue_text(healthy_widget_text, false), None);
     }
 
     #[test]

@@ -36,10 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   classified as a terminal `usage_limit_reached` state, not
   `challenge_required`. The page is authenticated but the model selector is
   suppressed by the usage-limit overlay; the sidebar's "security check" nav
-  item previously false-positive into a Cloudflare challenge. The usage-limit
-  check runs before the challenge/login checks in both the content-script
-  classifier and the CDP/dev-browser `detect_auth_issue_text`, and carries
-  the remaining-percent text
+  item previously false-positive into a Cloudflare challenge. Only the
+  wall-up signals ("Usage limit reached" / "0% remaining") trigger — the
+  healthy-page usage widget ("Monthly usage limit / 43% remaining /
+  Increase monthly limit") does not. The usage-limit check runs before the
+  challenge/login checks in both the content-script classifier and the
+  CDP/dev-browser `detect_auth_issue_text`, and carries the remaining-
+  percent text
   ([#496](https://github.com/avivsinai/yoetz/issues/496)).
 - A late "Too many requests" modal on ChatGPT is now classified as
   `rate_limited` at every phase failure (composer lookup, Chat surface

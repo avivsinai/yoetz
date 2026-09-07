@@ -86,6 +86,30 @@ test("classifyManualHandoff classifies a usage-limit wall as usage_limit_reached
   assert.match(handoff.message, /0% remaining/);
 });
 
+test("classifyManualHandoff does not classify a healthy usage widget as usage_limit_reached", () => {
+  // gh-496 r1: an Enterprise account carries a "Monthly usage limit —
+  // 43% remaining / Increase monthly limit" usage widget while perfectly
+  // usable. Only the wall-up signals ("Usage limit reached" / "0% remaining")
+  // trigger; the widget strings alone must return null.
+  const healthyWidgetText = [
+    "Security Review",
+    "Monthly usage limit",
+    "43% remaining",
+    "Increase monthly limit",
+    "What should we work on?",
+    "GPT-5.6 Luna",
+    "Medium"
+  ].join("\n");
+  assert.equal(
+    classifyManualHandoff({
+      url: "https://chatgpt.com/c/abc",
+      title: "ChatGPT",
+      text: healthyWidgetText
+    }),
+    null
+  );
+});
+
 test("classifyManualHandoff does not let composer authentication suppress a real handoff", () => {
   assert.equal(
     classifyManualHandoff({
