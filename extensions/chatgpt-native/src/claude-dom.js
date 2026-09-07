@@ -788,7 +788,7 @@ function conversationIdFromLocation() {
   return match ? decodeURIComponent(match[1]) : null;
 }
 
-async function openModelMenu(root, button, timeoutMs) {
+export async function openModelMenu(root, button, timeoutMs) {
   if (button.getAttribute("aria-expanded") === "true") {
     await sleep(MODEL_MENU_SETTLE_MS);
     if (button.getAttribute("aria-expanded") === "true") {
@@ -799,6 +799,18 @@ async function openModelMenu(root, button, timeoutMs) {
   const attemptTimeoutMs = Math.max(100, Math.min(timeoutMs, 1000));
   for (let attempt = 0; attempt < 2; attempt += 1) {
     throwIfModelBlocked(root);
+    // Mirror the ChatGPT #469 fix: in a throttled hidden tab the menu can
+    // open just after the previous attempt's bounded wait returned false. A
+    // retry click on an already-open trigger toggles it closed, so before any
+    // retry click settle briefly and re-read aria-expanded; abort the retry
+    // when the menu is open. The settle gives a late-open the window the
+    // bounded wait just missed.
+    if (attempt > 0) {
+      await sleep(MODEL_MENU_SETTLE_MS);
+      if (button.getAttribute("aria-expanded") === "true") {
+        return;
+      }
+    }
     button.click();
     const opened = await waitForModelOptional(
       root,
