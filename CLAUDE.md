@@ -124,8 +124,8 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
 - Drift procedure — when ChatGPT changes the picker: (a) capture the live DOM
   into `extensions/chatgpt-native/tests/fixtures/chatgpt-picker/<date>-<shape>.html`
   via `scripts/capture-chatgpt-picker.mjs` (raw CDP), or — when raw CDP is
-  wedged — through the native channel: `yoetz browser extension inspect
-  --dump-picker-html <PATH> --chatgpt --run-id <run>` (rides the
+  wedged — through the native channel: `yoetz browser extension dump-picker
+  --chatgpt --run-id <run> --path <PATH>` (rides the
   native-messaging host; refuses a live job unless `--allow-live-job` is set,
   re-reads the surface after Escape and reports `closed_after_dump`); (b) add
   an `expectations.json` row with `_provenance`; (c) run

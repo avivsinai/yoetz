@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   hidden deprecated alias). The new subcommand takes `--run-id`, `--path`, and
   `--allow-live-job` plus the usual routing selectors; the error for a
   non-ChatGPT recipe now reads "dump-picker is only supported with --chatgpt"
-  ([yz-2gc](https://github.com/avivsinai/yoetz/issues/496)).
+  ([#499](https://github.com/avivsinai/yoetz/pull/499)).
 - ChatGPT Chat recipe repinned from GPT-5.6 Sol to the `Latest` family at Pro
   effort (live probe 2026-09-05: `Latest` checked, GPT-5.6 Sol / GPT-5.5
   unchecked, closed pill `6 Pro`). Requested model id is now

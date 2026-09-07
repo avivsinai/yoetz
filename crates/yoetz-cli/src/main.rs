@@ -565,14 +565,14 @@ struct BrowserExtensionInspectArgs {
     ///
     /// Deprecated: prefer `browser extension dump-picker`. Kept as a hidden
     /// alias for scripts that still pass `--dump-picker-html`.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", hide = true)]
     dump_picker_html: Option<PathBuf>,
 
     /// Opt in to dumping the picker on a live (in-flight) job's tab. Without
     /// this flag the dump is refused on a live job so a recipe mid
     /// model_selection is not aborted by the dump's pointerdown + Escape.
     /// Only meaningful with --dump-picker-html.
-    #[arg(long, default_value_t = false, requires = "dump_picker_html")]
+    #[arg(long, default_value_t = false, requires = "dump_picker_html", hide = true)]
     allow_live_job: bool,
 
     /// Route to a Chrome profile email reported by extension status.
