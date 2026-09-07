@@ -2727,10 +2727,10 @@ mod tests {
         // family-option filter + open-surface gate + collapsed-view branch.
         assert!(script.contains("const isFamilyOptionLabel = (value)"));
         assert!(script.contains("function structuralFamilyRadios(menu)"));
-        assert!(script.contains("if (!pickerSurfaceIsOpen(view, view)) return null;"));
-        assert!(script.contains(
-            "isCollapsedView ? structuralFamilyRadios(submenu) : radios(submenu)"
-        ));
+        assert!(script.contains("if (!pickerSurfaceIsOpen(view, main)) return null;"));
+        assert!(
+            script.contains("isCollapsedView ? structuralFamilyRadios(submenu) : radios(submenu)")
+        );
         assert!(script.contains("if (fold(match[1]) === \\\"instant\\\") return null;"));
     }
 
