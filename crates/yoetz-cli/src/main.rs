@@ -564,7 +564,8 @@ struct BrowserExtensionInspectArgs {
     /// Opt in to dumping the picker on a live (in-flight) job's tab. Without
     /// this flag the dump is refused on a live job so a recipe mid
     /// model_selection is not aborted by the dump's pointerdown + Escape.
-    #[arg(long, default_value_t = false)]
+    /// Only meaningful with --dump-picker-html.
+    #[arg(long, default_value_t = false, requires = "dump_picker_html")]
     allow_live_job: bool,
 
     /// Route to a Chrome profile email reported by extension status.
@@ -3859,8 +3860,13 @@ fn handle_browser_extension(
                 args.extension_instance_id.as_ref(),
                 args.extension_profile_id.as_ref(),
             );
+            let label = if args.dump_picker_html.is_some() {
+                "browser.extension.dump_picker"
+            } else {
+                "browser.extension.inspect"
+            };
             (
-                "browser.extension.dump_picker",
+                label,
                 browser_extension_native::inspect_run(
                     &args.run_id,
                     args.dump_picker_html.as_deref(),

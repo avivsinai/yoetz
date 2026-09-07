@@ -163,9 +163,9 @@ protocol change.** `scripts/capture-chatgpt-picker.mjs` drives the existing
 chrome-devtools MCP / CDP session against a foreground tab: open the pill,
 expand the family view, then serialize the open `[role="menu"]` with computed
 `inert`/`aria-*`/`data-state` written back as attributes and all
-`<script>`/`<svg>` bodies stripped. It never touches the extension, the
-native host, or `inspect_run` (Rust→SW→CS, three layers — deliberately out of
-scope for the implementer). One file per observed shape, named by date and
+`<script>`/`<svg>` bodies stripped. The raw-CDP path never touches the
+extension or the native host; the native-channel path below does (it rides
+the Rust→SW→CS layers). One file per observed shape, named by date and
 shape.
 
 A second capture path rides the native-messaging channel for when raw CDP is

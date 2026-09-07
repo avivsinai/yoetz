@@ -696,6 +696,45 @@ test("content script dump_picker_html serializes the open picker menu", async ()
   }
 });
 
+test("content script dump_picker_html fails with picker_not_mounted naming the page state when no picker is mounted", async () => {
+  // gh-490: a content-script exception on a page without a picker must surface
+  // as picker_not_mounted (not run_not_found), naming the page state so the
+  // operator knows the tab was found but the picker was not. A challenge page
+  // (title 'Just a moment...', body 'Verifying you are human') classifies as
+  // challenge_required via the manual-handoff classifier.
+  const { send, restore } = await loadContentScript(
+    "dump_picker_no_menu",
+    "https://chatgpt.com/?_yoetz=run-dump-no-menu"
+  );
+  try {
+    globalThis.window.name = "yoetz-chatgpt-native:run-dump-no-menu:job-dump-no-menu|workspace_test|nonce-inspect";
+    // No [role=menu], no model button — a challenge page.
+    globalThis.document.querySelector = () => null;
+    globalThis.document.body = {
+      innerText: "Verifying you are human. This may take a few seconds.",
+      textContent: "Verifying you are human.",
+      dispatchEvent: () => true
+    };
+    globalThis.document.title = "Just a moment...";
+
+    const response = await send({
+      type: "yoetz_dump_picker_html",
+      job_id: "job-dump-no-menu",
+      run_id: "run-dump-no-menu",
+      workspace_id: "workspace_test",
+      ownership_nonce: "nonce-inspect",
+      recipe: "chatgpt"
+    });
+
+    assert.equal(response.ok, false);
+    assert.equal(response.code, "picker_not_mounted");
+    assert.equal(response.page_state, "challenge_required");
+    assert.match(response.error, /page_state=challenge_required/);
+  } finally {
+    restore();
+  }
+});
+
 test("content script resume prepare rejects a different conversation before send", async () => {
   const { send, restore } = await loadContentScript("resume_mismatch", "https://chatgpt.com/c/other?_yoetz=run_resume");
   try {

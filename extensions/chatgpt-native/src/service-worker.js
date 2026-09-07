@@ -2228,6 +2228,10 @@ async function handleDumpPickerHtml(message) {
     return;
   }
   const tabs = await chrome.tabs.query({ url: adapter.tabQueryPattern });
+  // allow_live_job is threaded from the CLI payload so the content-script
+  // gate (dumpPickerHtml) sees it; without this the gate is inert and the
+  // flag is silently ignored.
+  const allowLiveJob = message.payload?.allow_live_job === true;
   let captured = null;
   const errors = [];
   for (const tab of tabs) {
@@ -2241,12 +2245,37 @@ async function handleDumpPickerHtml(message) {
         run_id: runId,
         workspace_id: message.workspace_id,
         ownership_nonce: inspectJob.ownership_nonce,
-        recipe: adapter.recipe
+        recipe: adapter.recipe,
+        allow_live_job: allowLiveJob
       });
+      // Forward closed_after_dump so the Rust envelope does not always read
+      // null (the content script computes it; the SW must pass it through).
       captured = { ...captured, tab_id: tab.id, url: tab.url ?? null, title: tab.title ?? null };
       break;
     } catch (error) {
       const isRunMismatch = error?.code === "run_mismatch";
+      // A content-script exception on an ownership-matched tab must surface
+      // as that tab's own code and message, not aggregate as run_not_found
+      // (which tells the operator the tab is gone — inspect proves it is not).
+      // picker_not_mounted (challenge / login / rate_limited / no picker) and
+      // live_job_conflict / model_pill_not_found all carry actionable detail.
+      if (!isRunMismatch && error?.code) {
+        await postTerminalMessage(
+          message,
+          errorEnvelope(messageJob(message), error.code, String(error?.message ?? error), {
+            request_id: message.request_id,
+            run_id: runId,
+            tab_id: tab.id,
+            url: tab.url ?? null,
+            title: tab.title ?? null,
+            page_state: error?.page_state,
+            phase: error?.phase ?? "profile",
+            side_effect_started: error?.side_effect_started ?? false
+          }),
+          { status: "failed", phase: error?.phase ?? "profile" }
+        );
+        return;
+      }
       errors.push({
         tab_id: tab.id,
         url: isRunMismatch ? null : (tab.url ?? null),

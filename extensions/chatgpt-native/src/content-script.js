@@ -700,8 +700,24 @@ async function dumpPickerHtml(runId, options = {}) {
   }
   const { findModelButton } = await import(chrome.runtime.getURL("src/chatgpt-dom.js"));
   const { serializePickerMenu } = await import(chrome.runtime.getURL("src/picker-serializer.js"));
+  const { manualHandoffContext, classifyManualHandoff } = await domHelpers(options.recipe);
+
+  // Classify the page state so a picker-not-mounted failure names the real
+  // cause (challenge / login / rate_limited) instead of a misleading
+  // run_not_found. Falls back to "picker control not found" when the page is
+  // an authenticated composer with no picker mounted.
+  const pageState = () => {
+    const context = manualHandoffContext(document);
+    const handoff = classifyManualHandoff({
+      url: location.href,
+      title: context.title,
+      text: context.text
+    });
+    return handoff?.state ?? "composer_ready";
+  };
 
   let openedByUs = false;
+  let html = "";
   // menuOpen uses the root's data-state (a retained closed menu keeps a
   // [role='menu'] mounted with data-state="closed"); falling back to any
   // [role='menu'] would serialize the wrong surface and report
@@ -710,11 +726,40 @@ async function dumpPickerHtml(runId, options = {}) {
     document.querySelector('[role="menu"][data-state="open"]')
     || document.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-state="open"]')
   );
-  if (!menuOpen()) {
-    openedByUs = true;
-    await openPickerMenu(findModelButton);
+  try {
+    if (!menuOpen()) {
+      openedByUs = true;
+      await openPickerMenu(findModelButton);
+      // The serializer falls back to any [role='menu'], so a retained closed
+      // menu could be captured silently. Assert the surface is actually open
+      // after we opened it; otherwise fail with picker_not_open.
+      if (!menuOpen()) {
+        throw commandError(
+          "picker_not_open",
+          `dump_picker_html opened the model pill but the picker surface did not reach data-state=open (page_state=${pageState()})`,
+          {
+            phase: "profile",
+            side_effect_started: false,
+            page_state: pageState()
+          }
+        );
+      }
+    }
+    html = serializePickerMenu(document);
+  } catch (error) {
+    if (error?.code === "picker_not_open") {
+      throw error;
+    }
+    throw commandError(
+      "picker_not_mounted",
+      `dump_picker_html found no open ChatGPT model picker on this tab (page_state=${pageState()}): ${error?.message ?? error}`,
+      {
+        phase: "profile",
+        side_effect_started: false,
+        page_state: pageState()
+      }
+    );
   }
-  const html = serializePickerMenu(document);
   let closedAfterDump = null;
   if (openedByUs) {
     // Escape does not always close the picker (field run 20260906T124313Z
@@ -1166,6 +1211,7 @@ function errorResponse(error) {
   }
   for (const key of [
     "state",
+    "page_state",
     "provider_message",
     "provider_dom",
     "requested_model",

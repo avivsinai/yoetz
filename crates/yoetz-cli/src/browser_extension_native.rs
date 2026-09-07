@@ -1839,8 +1839,49 @@ fn dump_picker_html_run(
         selector,
         recipe,
     )?;
-    let html = response
-        .payload
+    finalize_picker_capture(out_path, &response.payload, run_id, recipe)
+}
+
+// Process a dump_picker_html response envelope and write the capture file.
+// Extracted from dump_picker_html_run so the happy path (envelope built + file
+// written from a stubbed response) is testable without the native-messaging
+// socket harness.
+fn finalize_picker_capture(
+    out_path: &Path,
+    payload: &Value,
+    run_id: &str,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    // A failed envelope (run_not_found / picker_not_mounted / live_job_conflict)
+    // arrives as status="failed" with a code — surface it with inspected_tabs
+    // so the operator sees which tabs were tried and why, not a generic
+    // "reply carried no html".
+    if payload.get("status").and_then(Value::as_str) == Some("failed")
+        || payload.get("code").and_then(Value::as_str).is_some()
+    {
+        let code = payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("dump_failed");
+        let msg = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("dump_picker_html failed");
+        if let Some(tabs) = payload.get("inspected_tabs").and_then(Value::as_array) {
+            let detail: Vec<String> = tabs
+                .iter()
+                .map(|t| {
+                    let tab_id = t.get("tab_id").and_then(Value::as_i64).unwrap_or(0);
+                    let code = t.get("code").and_then(Value::as_str).unwrap_or("?");
+                    let err = t.get("error").and_then(Value::as_str).unwrap_or("");
+                    format!("tab {tab_id} ({code}): {err}")
+                })
+                .collect();
+            bail!("{code}: {msg}. inspected_tabs: [{}]", detail.join("; "));
+        }
+        bail!("{code}: {msg}");
+    }
+    let html = payload
         .get("html")
         .and_then(Value::as_str)
         .context("dump_picker_html reply carried no html")?;
@@ -1853,12 +1894,11 @@ fn dump_picker_html_run(
     }
     fs::write(out_path, html)
         .with_context(|| format!("write picker capture {}", out_path.display()))?;
-    let opened_by_us = response
-        .payload
+    let opened_by_us = payload
         .get("opened_by_us")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let closed_after_dump = response.payload.get("closed_after_dump");
+    let closed_after_dump = payload.get("closed_after_dump");
     if let Some(closed) = closed_after_dump.and_then(Value::as_bool) {
         eprintln!("closed_after_dump: {closed}");
     } else if closed_after_dump.is_some_and(Value::is_null) {
@@ -8259,5 +8299,32 @@ mod tests {
         assert!(text.contains("--dump-picker-html is only supported with --chatgpt"));
         // No file written on the bail path.
         assert!(!out.exists());
+    }
+
+    #[test]
+    fn finalize_picker_capture_writes_file_and_envelope_from_stubbed_response() {
+        // gh-490 / fold 7: happy path — a stubbed job_complete envelope (html +
+        // opened_by_us + closed_after_dump) yields a written file and a JSON
+        // envelope with the UTF-8 byte count, without the native-messaging
+        // socket harness.
+        let tmp = TempDir::new().expect("temp dir");
+        let out = tmp.path().join("picker.html");
+        let html = "<div role=\"menu\" data-state=\"open\">Latest</div>";
+        let payload = json!({
+            "status": "job_complete",
+            "html": html,
+            "opened_by_us": true,
+            "closed_after_dump": true
+        });
+        let result =
+            finalize_picker_capture(&out, &payload, "run-490-happy", BuiltinWebRecipe::Chatgpt)
+                .expect("finalize");
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["bytes"], json!(html.len()));
+        assert_eq!(result["opened_by_us"], true);
+        assert_eq!(result["closed_after_dump"], true);
+        assert_eq!(result["run_id"], "run-490-happy");
+        assert!(out.exists());
+        assert_eq!(fs::read_to_string(&out).unwrap(), html);
     }
 }

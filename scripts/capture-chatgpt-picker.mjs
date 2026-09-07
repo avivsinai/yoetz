@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 // scripts/capture-chatgpt-picker.mjs — dev-only ChatGPT picker DOM capture.
 //
+// Requires Node >= 22.12 (require() of ESM). CI pins Node 24.
+//
 // Drives a raw CDP (Chrome DevTools Protocol) session against a foreground
 // Chrome tab that already has the model picker open, serializes the open
 // [role="menu"] to a self-contained HTML file, and writes it to --out. The

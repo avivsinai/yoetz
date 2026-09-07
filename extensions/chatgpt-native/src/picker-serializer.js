@@ -3,8 +3,7 @@
 // Clones the open [role="menu"] (falling back to the first [role="menu"]),
 // bakes computed inert/display:none/visibility:hidden state inline, strips
 // script/svg/use/canvas bodies, and returns outerHTML. The output is a
-// snapshot fixture consumed by tests/chatgpt-picker-reader.test.js (jsdom) —
-// never by the extension, the native host, or inspect_run.
+// snapshot fixture consumed by tests/chatgpt-picker-reader.test.js (jsdom).
 //
 // One serializer, two callers:
 //   - scripts/capture-chatgpt-picker.mjs (raw CDP Runtime.evaluate)
@@ -16,10 +15,16 @@
 // "Snapshot fixtures replace hand-built fakes" and the "jsdom boundary".
 
 export function serializePickerMenu(root = document) {
+  // The open surface is a [role="menu"] with data-state="open", falling back
+  // to any [role="menu"]; the hybrid advanced view (which carries the family
+  // radios but is not a [role="menu"]) is the third option so a collapsed
+  // Select-model surface serializes instead of throwing.
   const live = root.querySelector('[role="menu"][data-state="open"]')
-    || root.querySelector('[role="menu"]');
+    || root.querySelector('[role="menu"]')
+    || root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-state="open"]')
+    || root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"]');
   if (!live) {
-    throw new Error('no [role="menu"] found in the page');
+    throw new Error('no [role="menu"] or advanced picker view found in the page');
   }
   const clone = live.cloneNode(true);
 
