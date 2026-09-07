@@ -1066,6 +1066,43 @@ test("fake Claude model picker refuses to proceed without a verifiable Max optio
   }
 });
 
+test("fake Claude model picker never toggles a late-opening menu closed (gh-472)", async () => {
+  // Field defect: openModelMenu retried with a second button.click() when the
+  // menu did not open within the attempt budget; in a throttled hidden tab the
+  // menu mounts just after that budget and the retry click toggled it closed.
+  // Mirror the ChatGPT #469 fix: before any retry click, settle and re-read the
+  // structural mounted-open signal (menuitemradio items OR aria-expanded),
+  // then confirm with a second settle read.
+  //
+  // delayedOpenMs schedules the first open on a timer that lands just after
+  // the attempt-0 wait (100ms) but inside the retry's settle window
+  // (MODEL_MENU_SETTLE_MS=300ms); a second click while the open is pending
+  // cancels it (toggle-close). Without the fix the retry cancels the pending
+  // open and configureModelState dies with "did not open within 100ms".
+  const fixture = makeClaudeModelFixture({ delayedOpenMs: 110 });
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  const previousKeyboardEvent = globalThis.KeyboardEvent;
+  globalThis.PointerEvent = FakePointerEvent;
+  globalThis.MouseEvent = FakeMouseEvent;
+  globalThis.KeyboardEvent = FakeKeyboardEvent;
+  try {
+    const result = await configureModelState(fixture.root, { model_selection_timeout_ms: 100 });
+
+    assert.equal(result.status, "selected", JSON.stringify(result));
+    assert.equal(result.model_used, "Fable 5 Max");
+    // configureModelState calls openModelMenu three times (open, reopen for
+    // effort, reopen for verification); each issues exactly one click. Without
+    // the fix the first call retries and cancels the pending open, so the run
+    // dies before reaching the later calls.
+    assert.equal(fixture.modelButtonClicks, 3, "no openModelMenu call may retry-click a mounted-open trigger");
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
+    globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
 test("fake Claude Thinking row keeps the response non-final until tool use and streaming stop", () => {
   const page = fakeClaudePage({
     text: "Searching the attached marker file",
@@ -1545,7 +1582,8 @@ function makeClaudeModelFixture({
   delayedSelectionClose = false,
   ignoreEscape = false,
   initiallyConfigured = false,
-  offscreenFable = false
+  offscreenFable = false,
+  delayedOpenMs = 0
 } = {}) {
   let menuOpen = false;
   let effortHovered = false;
@@ -1553,6 +1591,15 @@ function makeClaudeModelFixture({
   let sawMousePointer = false;
   let fableClicks = 0;
   let maxClicks = 0;
+  let modelButtonClicks = 0;
+  // Late-open simulation (gh-472): the first click on a closed trigger
+  // schedules the open on a timer instead of toggling synchronously, modelling
+  // a throttled hidden tab where the menu mounts just after the bounded wait
+  // times out. A second click while the open is pending cancels it (the
+  // trailing click toggles a mounted-open menu closed). Later clicks toggle
+  // synchronously so the rest of the configureModelState flow works.
+  let pendingOpenTimer = null;
+  let firstClickDelayed = delayedOpenMs > 0;
 
   const control = (attrs, text, onClick = () => {}) => ({
     attrs: { ...attrs },
@@ -1597,10 +1644,30 @@ function makeClaudeModelFixture({
     { "data-testid": "model-selector-dropdown", "aria-expanded": "false" },
     initiallyConfigured ? "Fable 5 Max" : "Sonnet 5 High",
     () => {
+      modelButtonClicks += 1;
       if (modelButton.getAttribute("aria-expanded") === "true") {
         menuOpen = false;
         effortHovered = false;
         modelButton.setAttribute("aria-expanded", "false");
+        return;
+      }
+      // First click in a delayed-open fixture schedules the open on a timer;
+      // a second click while the open is pending cancels it (toggle-close).
+      if (firstClickDelayed && pendingOpenTimer === null) {
+        const open = () => {
+          pendingOpenTimer = null;
+          menuOpen = true;
+          effortHovered = false;
+          modelButton.setAttribute("aria-expanded", "true");
+        };
+        pendingOpenTimer = setTimeout(open, delayedOpenMs);
+        firstClickDelayed = false;
+        return;
+      }
+      if (pendingOpenTimer !== null) {
+        clearTimeout(pendingOpenTimer);
+        pendingOpenTimer = null;
+        firstClickDelayed = false;
         return;
       }
       menuOpen = true;
@@ -1685,6 +1752,7 @@ function makeClaudeModelFixture({
     modelButton,
     get fableClicks() { return fableClicks; },
     get maxClicks() { return maxClicks; },
+    get modelButtonClicks() { return modelButtonClicks; },
     get hoverEvents() { return hoverEvents; },
     get sawMousePointer() { return sawMousePointer; }
   };
