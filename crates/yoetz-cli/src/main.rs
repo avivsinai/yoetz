@@ -567,7 +567,6 @@ struct BrowserExtensionInspectArgs {
     #[arg(long, default_value_t = false)]
     allow_live_job: bool,
 
-
     /// Route to a Chrome profile email reported by extension status.
     #[arg(long, alias = "profile_email")]
     profile_email: Option<String>,

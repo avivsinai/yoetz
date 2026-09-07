@@ -1858,9 +1858,7 @@ fn dump_picker_html_run(
         .get("opened_by_us")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let closed_after_dump = response
-        .payload
-        .get("closed_after_dump");
+    let closed_after_dump = response.payload.get("closed_after_dump");
     if let Some(closed) = closed_after_dump.and_then(Value::as_bool) {
         eprintln!("closed_after_dump: {closed}");
     } else if closed_after_dump.is_some_and(Value::is_null) {
@@ -8255,14 +8253,8 @@ mod tests {
             extension_instance_id: None,
             extension_profile_id: None,
         };
-        let err = dump_picker_html_run(
-            "run-490",
-            &out,
-            false,
-            selector,
-            BuiltinWebRecipe::Claude,
-        )
-        .unwrap_err();
+        let err = dump_picker_html_run("run-490", &out, false, selector, BuiltinWebRecipe::Claude)
+            .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("--dump-picker-html is only supported with --chatgpt"));
         // No file written on the bail path.
