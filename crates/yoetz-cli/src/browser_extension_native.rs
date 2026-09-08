@@ -1819,11 +1819,14 @@ pub fn inspect_run(
     }))
 }
 
-// --dump-picker-html: capture the model-picker DOM through the extension's
-// native channel instead of inspect_run. Writes the serialized menu HTML to
-// `out_path` and prints capture diagnostics to stderr; the JSON payload stays
-// small (no html field) so console output remains readable.
-fn dump_picker_html_run(
+// `browser extension dump-picker`: capture the model-picker DOM through
+// the extension's native channel. Writes the serialized menu HTML to
+// `out_path` and prints capture diagnostics to stderr; the JSON payload
+// stays small (no html field) so console output remains readable.
+//
+// Also reachable via the deprecated `browser extension inspect
+// --dump-picker-html PATH` alias.
+pub fn dump_picker_html_run(
     run_id: &str,
     out_path: &Path,
     allow_live_job: bool,
@@ -1831,7 +1834,7 @@ fn dump_picker_html_run(
     recipe: BuiltinWebRecipe,
 ) -> Result<Value> {
     if recipe != BuiltinWebRecipe::Chatgpt {
-        bail!("--dump-picker-html is only supported with --chatgpt");
+        bail!("dump-picker is only supported with --chatgpt");
     }
     let response = send_site_control_job(
         "dump_picker_html",
@@ -8296,7 +8299,7 @@ mod tests {
         let err = dump_picker_html_run("run-490", &out, false, selector, BuiltinWebRecipe::Claude)
             .unwrap_err();
         let text = format!("{err:#}");
-        assert!(text.contains("--dump-picker-html is only supported with --chatgpt"));
+        assert!(text.contains("dump-picker is only supported with --chatgpt"));
         // No file written on the bail path.
         assert!(!out.exists());
     }

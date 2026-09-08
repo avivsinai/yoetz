@@ -169,8 +169,8 @@ the Rust→SW→CS layers). One file per observed shape, named by date and
 shape.
 
 A second capture path rides the native-messaging channel for when raw CDP is
-wedged: `yoetz browser extension inspect --dump-picker-html <PATH> --chatgpt
---run-id <run>` runs the same `serializePickerMenu` in the content script
+wedged: `yoetz browser extension dump-picker --chatgpt --run-id <run>
+--path <PATH>` runs the same `serializePickerMenu` in the content script
 (both callers import `src/picker-serializer.js` — one serializer, two callers).
 It refuses a live (in-flight) job's tab unless `--allow-live-job` is set, so a
 recipe mid model_selection is not aborted by the dump's pointerdown + Escape;

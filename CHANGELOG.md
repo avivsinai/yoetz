@@ -10,6 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [0.5.68] - 2026-09-07
 ### Changed
 
+- `yoetz browser extension dump-picker` is now a first-class subcommand
+  (supersedes the `--dump-picker-html` flag on `inspect`, which is kept as a
+  hidden deprecated alias). The new subcommand takes `--run-id`, `--path`, and
+  `--allow-live-job` plus the usual routing selectors; the error for a
+  non-ChatGPT recipe now reads "dump-picker is only supported with --chatgpt"
+  ([#499](https://github.com/avivsinai/yoetz/pull/499)).
 - ChatGPT Chat recipe repinned from GPT-5.6 Sol to the `Latest` family at Pro
   effort (live probe 2026-09-05: `Latest` checked, GPT-5.6 Sol / GPT-5.5
   unchecked, closed pill `6 Pro`). Requested model id is now
