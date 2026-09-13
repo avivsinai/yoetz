@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.69] - 2026-09-13
 ### Fixed
 - ChatGPT web recipe: pace all website reads behind one profile-scoped gate
   to stop tripping OpenAI's "Too many requests — making requests too quickly"
@@ -25,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   recognized DOM `rate_limited` modal arms the same shared cooldown. Tab
   creation and render-refresh waits are bounded by the actual job deadline and
   fail/skip without navigating at expiry. (`yz-5bd`)
+
 
 ## [0.5.68] - 2026-09-07
 ### Changed
