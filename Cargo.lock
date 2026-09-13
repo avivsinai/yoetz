@@ -2491,9 +2491,9 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "1.1.4+spec-1.1.0"
+version = "1.1.6+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3aace63f4bbcdfc2c965b059de67119c89c4017a70d633be6c104910f67056f5"
+checksum = "920602543f0911ab71da12c50d59701da54c196d1a2bf5cb4b75667f137a406a"
 dependencies = [
  "indexmap",
  "serde_core",
@@ -3220,7 +3220,7 @@ checksum = "9edde0db4769d2dc68579893f2306b26c6ecfbe0ef499b013d731b7b9247e0b9"
 
 [[package]]
 name = "yoetz"
-version = "0.5.68"
+version = "0.5.69"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3252,7 +3252,7 @@ dependencies = [
 
 [[package]]
 name = "yoetz-core"
-version = "0.5.68"
+version = "0.5.69"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
