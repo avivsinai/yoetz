@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `rate_limited` and now arms the profile cooldown immediately instead of
   failing with an opaque `model_selection` error. (`yz-83b`)
 
+## [0.5.71] - 2026-09-13
 ### Fixed
 - ChatGPT web recipe: surface the typed `rate_limited` handoff during
   wait-response extraction when the "Too many requests" modal mounts after the
@@ -29,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   root), not an unconditional `isIntersecting: true`. An offscreen sentinel no
   longer receives a positive intersection that could trigger extra history
   loads in a hidden tab. (`yz-5bd`)
+
 
 ## [0.5.70] - 2026-09-13
 ### Fixed
