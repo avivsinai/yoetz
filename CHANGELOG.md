@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- Release tooling: narrow Cargo.lock repair — restore prior locked registry
+  graph and bump only local workspace package versions; `cargo update
+  --workspace --offline` now runs unconditionally in `scripts/release.sh`
+  after the version bump so `--skip-verify` cannot leave the lock file stale;
+  `scripts/check-release-version.sh` verifies Cargo.lock local packages match
+  the release version. (`yz-5bd`)
 
 ## [0.5.69] - 2026-09-13
 ### Fixed
