@@ -1791,12 +1791,6 @@ test("extractJobResponse surfaces rate_limited handoff when wait classifier retu
     // Regular wait classifier returns null (the modal is not detected by
     // the composer-scoped path).
     hooks.waitManualHandoff = null;
-    // The rate-limit detector finds the modal.
-    hooks.rateLimitedHandoff = {
-      rate_limited: true,
-      reason: "too_many_requests_modal",
-      text: "Too many requests"
-    };
     globalThis.document.title = "ChatGPT";
     const job = {
       job_id: "job_rl",
@@ -1805,7 +1799,17 @@ test("extractJobResponse surfaces rate_limited handoff when wait classifier retu
       send_timeout_ms: 1000
     };
 
+    // prepare_job must not see the rate-limit modal (it would return a handoff
+    // and skip activeJobs.set, making extract_response fail with "not active").
+    // The modal mounts during wait_response, not during prepare.
+    hooks.rateLimitedHandoff = null;
     await send({ type: "yoetz_prepare_job", job });
+    // Now the modal mounts during wait_response.
+    hooks.rateLimitedHandoff = {
+      rate_limited: true,
+      reason: "too_many_requests_modal",
+      text: "Too many requests"
+    };
     const extracted = await send({ type: "yoetz_extract_response", job });
 
     // The consumer must receive the typed rate_limited handoff.
@@ -1861,6 +1865,39 @@ test("extractJobResponse does not invoke rateLimitedHandoff when wait classifier
     // (The mock tracks calls via hooks — if it were called, it would return null
     // anyway, but we verify precedence by checking the handoff type.)
     assert.equal(extracted.payload.manual_handoff?.rate_limited, undefined);
+  } finally {
+    restore();
+  }
+});
+
+// yz-83b: prepareJob detects the rate-limit modal on a freshly loaded tab and
+// returns a typed rate_limited handoff instead of proceeding with a blocked tab.
+test("prepareJob surfaces rate_limited handoff when modal is present on tab load", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "prepare_rate_limited",
+    "https://chatgpt.com/?_yoetz=run_prep_rl"
+  );
+  try {
+    hooks.waitManualHandoff = null;
+    hooks.rateLimitedHandoff = {
+      rate_limited: true,
+      reason: "too_many_requests_modal",
+      text: "Too many requests"
+    };
+    globalThis.document.title = "ChatGPT";
+    const job = {
+      job_id: "job_prep_rl",
+      run_id: "run_prep_rl",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+
+    // prepareJob must return the typed rate_limited handoff.
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.payload.manual_handoff?.rate_limited, true);
+    assert.equal(prepared.payload.manual_handoff?.reason, "too_many_requests_modal");
   } finally {
     restore();
   }

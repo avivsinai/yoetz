@@ -668,11 +668,86 @@ async function startJob(message) {
   }
   if (prepared.manual_handoff) {
     postNative(progress(job, "manual_handoff", prepared.manual_handoff));
+    // yz-83b: Arm the cooldown for rate_limited at prepare_job too — the modal
+    // can mount on a freshly loaded tab before any send.
+    if (prepared.manual_handoff?.state === "rate_limited") {
+      await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
+    }
+    // yz-83b: Attempt ONE dismiss of the rate-limit modal at prepare_job. Unlike
+    // wait_response, there is no rendered content precondition — the modal is
+    // blocking tab initialization itself. If the dismiss succeeds, retry
+    // prepare_job once. If it fails, fail closed as rate_limited.
+    if (
+      prepared.manual_handoff?.state === "rate_limited"
+      && !job.rate_limit_modal_dismiss_attempted
+    ) {
+      job.rate_limit_modal_dismiss_attempted = true;
+      await persistJob(job);
+      let dismissResult = null;
+      try {
+        dismissResult = await sendToTab(job.tab_id, {
+          type: "yoetz_dismiss_rate_limit_modal",
+          job
+        });
+      } catch {
+        // Dismiss failed — fail closed.
+      }
+      if (dismissResult?.clicked) {
+        // Poll for the modal to unmount.
+        const DISMISS_SETTLE_STEP_MS = Number(globalThis.__YOETZ_DISMISS_SETTLE_STEP_MS ?? 250);
+        const DISMISS_SETTLE_CAP_MS = Number(globalThis.__YOETZ_DISMISS_SETTLE_CAP_MS ?? 5000);
+        const settleStartedAt = Date.now();
+        let modalClosed = false;
+        while (Date.now() - settleStartedAt <= DISMISS_SETTLE_CAP_MS) {
+          if (!jobContinuationIsLive(job, continuationEpoch)) {
+            return;
+          }
+          await sleep(DISMISS_SETTLE_STEP_MS);
+          try {
+            const state = await sendToTab(job.tab_id, {
+              type: "yoetz_rate_limit_modal_state",
+              job
+            });
+            if (!state?.open) {
+              modalClosed = true;
+              break;
+            }
+          } catch {
+            // State read failed — keep polling within the cap.
+          }
+        }
+        if (modalClosed) {
+          // Modal unmounted — retry prepare_job once.
+          job.rate_limit_modal_dismissed = true;
+          await persistJob(job);
+          const retryPrepared = await sendToTab(tab.id, { type: "yoetz_prepare_job", job });
+          if (!jobContinuationIsLive(job, continuationEpoch)) {
+            return;
+          }
+          if (!retryPrepared.manual_handoff) {
+            // Modal cleared, prepare succeeded — continue to model selection.
+            job.status = "selecting_model";
+            job.model_selection_attempt = Number(job.model_selection_attempt ?? 0) + 1;
+            job.updated_at = Date.now();
+            await persistJob(job);
+            if (!jobContinuationIsLive(job, continuationEpoch)) {
+              return;
+            }
+            await completeModelSelection(job, tab.id, job.model_selection_attempt, {}, continuationEpoch);
+            return;
+          }
+          // Modal re-appeared after dismiss — fail closed.
+          postNative(progress(job, "manual_handoff", retryPrepared.manual_handoff));
+        }
+      }
+    }
     await failJob(job, "manual_handoff", prepared.manual_handoff.message, {
       state: prepared.manual_handoff.state,
       phase: "upload",
       side_effect_started: true,
-      terminal_status: "manual_handoff"
+      terminal_status: "manual_handoff",
+      rate_limit_modal_dismissed: job.rate_limit_modal_dismissed === true ? true : undefined,
+      rate_limit_modal_recovered: false
     });
     return;
   }

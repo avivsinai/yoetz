@@ -233,6 +233,7 @@ async function cancelSend(job) {
 }
 
 async function prepareJob(job) {
+  const adapter = await siteAdapter(job);
   const {
     classifyBlockingState,
     classifyManualHandoff,
@@ -240,15 +241,24 @@ async function prepareJob(job) {
     ensureFreshChat,
     manualHandoffContext,
     markOwnership,
-    ownedWindowName
+    ownedWindowName,
+    rateLimitedHandoff
   } = await domHelpers(job);
   activeJobs.delete(job.job_id);
   const handoffContext = manualHandoffContext(document);
-  const handoff = classifyManualHandoff({
+  let handoff = classifyManualHandoff({
     url: location.href,
     title: handoffContext.title,
     text: handoffContext.text
   });
+  // yz-83b: The rate-limit modal can mount on a freshly loaded tab before any
+  // send. The composer short-circuit in manualHandoffContext can miss it. If
+  // the regular classifier returns null, check for the modal explicitly so
+  // prepareJob returns a typed rate_limited handoff instead of proceeding with
+  // a blocked tab (which would fail at model_selection with an opaque error).
+  if (!handoff && adapter.recipe === "chatgpt" && typeof rateLimitedHandoff === "function") {
+    handoff = rateLimitedHandoff(document);
+  }
   const conversationId = conversationIdForJob(job);
   if (!handoff && conversationId) {
     assertUrlRunMarker(job);
