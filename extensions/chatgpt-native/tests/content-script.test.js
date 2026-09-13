@@ -7,8 +7,7 @@ const chatgptDomModuleUrl = new URL("../src/chatgpt-dom.js", import.meta.url).hr
 const helperModule = `import { fetchConversationAnswer } from ${JSON.stringify(chatgptBackendModuleUrl)};
 import {
   classifyManualHandoff as classifyRealManualHandoff,
-  classifyWaitManualHandoff as classifyRealWaitManualHandoff,
-  rateLimitedHandoff as classifyRealRateLimitedHandoff
+  classifyWaitManualHandoff as classifyRealWaitManualHandoff
 } from ${JSON.stringify(chatgptDomModuleUrl)};
 export { fetchConversationAnswer };
 const hooks = globalThis.__contentScriptTestHooks;

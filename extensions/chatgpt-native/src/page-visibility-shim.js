@@ -110,6 +110,7 @@
       const observerCallbacks = new WeakMap();
       const observerTargets = new WeakMap();
       const observerDelivered = new WeakMap();
+      const observerMargins = new WeakMap();
       // The lazily mounted header only needs the assist during hydration;
       // after that window, background lazy-loaders (sidebar pagination,
       // media) keep their native behavior so a hidden tab cannot page
@@ -122,8 +123,9 @@
           observerTargets.set(this, new Set());
           observerDelivered.set(this, new WeakSet());
           // Parse rootMargin at construction so synthetic entries respect the
-          // observer's effective root rectangle (yz-5bd).
-          this._yoetzParsedRootMargin = parseRootMargin(init?.rootMargin);
+          // observer's effective root rectangle (yz-5bd). Stored in a WeakMap
+          // to keep the instance surface clean (no enumerable own props).
+          observerMargins.set(this, parseRootMargin(init?.rootMargin));
         }
         observe(target) {
           super.observe(target);
@@ -164,20 +166,33 @@
             } else {
               rootRect = root.getBoundingClientRect?.() ?? null;
             }
-            // Apply rootMargin (parsed from this.rootMargin at construction).
-            const margin = this._yoetzParsedRootMargin ?? { top: 0, right: 0, bottom: 0, left: 0 };
+            // Apply rootMargin (parsed from init at construction).
+            const margin = observerMargins.get(this) ?? { top: 0, right: 0, bottom: 0, left: 0 };
             if (rootRect && (margin.top || margin.right || margin.bottom || margin.left)) {
+              // Build explicitly from edges — getBoundingClientRect() returns a
+              // DOMRect whose width/height are prototype getters that do not
+              // survive { ...spread }, so we reconstruct from the four edges.
               rootRect = {
-                ...rootRect,
                 top: rootRect.top - margin.top,
                 left: rootRect.left - margin.left,
                 right: rootRect.right + margin.right,
                 bottom: rootRect.bottom + margin.bottom
               };
+              rootRect.x = rootRect.left;
+              rootRect.y = rootRect.top;
+              rootRect.width = rootRect.right - rootRect.left;
+              rootRect.height = rootRect.bottom - rootRect.top;
             }
+            // A target with an all-zero rect (display:none, unmounted, or
+            // not-yet-rendered) has no box and is NOT intersecting per spec.
+            // This is distinct from a zero-height element at a real position,
+            // which IS intersecting. ChatGPT's lazy sentinels are exactly this
+            // shape before they mount (yz-5bd).
+            const hasNoBox = rect.width === 0 && rect.height === 0
+              && rect.top === 0 && rect.left === 0 && rect.right === 0 && rect.bottom === 0;
             let intersectionRect;
             let isIntersecting;
-            if (!rootRect) {
+            if (!rootRect || hasNoBox) {
               intersectionRect = { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
               isIntersecting = false;
             } else {

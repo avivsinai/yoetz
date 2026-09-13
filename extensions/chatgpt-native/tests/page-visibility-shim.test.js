@@ -29,7 +29,13 @@ function loadShim({ hidden }) {
   doc.querySelector = () => null;
 
   class NativeIO {
-    constructor(callback) { this.callback = callback; this.observed = new Set(); this.disconnected = false; }
+    constructor(callback, init) {
+      this.callback = callback;
+      this.observed = new Set();
+      this.disconnected = false;
+      this.root = init?.root ?? null;
+      this.rootMargin = init?.rootMargin ?? "0px";
+    }
     observe(target) { this.observed.add(target); }
     unobserve(target) { this.observed.delete(target); }
     disconnect() { this.observed.clear(); this.disconnected = true; }
@@ -257,4 +263,64 @@ test("hidden tab: positive rootMargin makes offscreen target intersecting", asyn
   await tick(20);
   assert.equal(calls.length, 1);
   assert.equal(calls[0][0].isIntersecting, true, "positive rootMargin must make target within margin intersecting");
+});
+
+// yz-5bd: An unrendered/display:none target (all-zero rect) is NOT intersecting.
+// Distinct from a zero-height element at a real position, which IS intersecting.
+test("hidden tab: all-zero rect (display:none/unmounted) is not intersecting", async () => {
+  const { win } = loadShim({ hidden: true });
+  const calls = [];
+  const io = new win.IntersectionObserver((entries) => calls.push(entries));
+  const unrendered = {
+    getBoundingClientRect: () => ({ x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 })
+  };
+  io.observe(unrendered);
+  await tick(20);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0].isIntersecting, false, "all-zero rect must not be intersecting");
+  assert.equal(calls[0][0].intersectionRatio, 0);
+  assert.equal(calls[0][0].intersectionRect.width, 0);
+  assert.equal(calls[0][0].intersectionRect.height, 0);
+});
+
+// yz-5bd: rootBounds must retain width/height when rootMargin is applied to
+// an Element root. getBoundingClientRect() returns a DOMRect whose width/height
+// are prototype getters that do not survive spread.
+test("hidden tab: Element root with rootMargin produces rootBounds with correct width/height", async () => {
+  const { win } = loadShim({ hidden: true });
+  const calls = [];
+  // Element root at (0,0) 400x800
+  const rootEl = {
+    nodeType: 1,
+    getBoundingClientRect: () => ({
+      x: 0, y: 0, top: 0, left: 0, right: 400, bottom: 800, width: 400, height: 800
+    })
+  };
+  const io = new win.IntersectionObserver((entries) => calls.push(entries), {
+    root: rootEl,
+    rootMargin: "0px 0px 100px 0px"
+  });
+  const target = {
+    getBoundingClientRect: () => ({ x: 0, y: 0, width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10 })
+  };
+  io.observe(target);
+  await tick(20);
+  assert.equal(calls.length, 1);
+  const rb = calls[0][0].rootBounds;
+  assert.equal(rb.top, 0, "rootBounds top after margin");
+  assert.equal(rb.left, 0, "rootBounds left after margin");
+  assert.equal(rb.right, 400, "rootBounds right after margin");
+  assert.equal(rb.bottom, 900, "rootBounds bottom after margin (800 + 100)");
+  assert.equal(rb.width, 400, "rootBounds width preserved after margin spread");
+  assert.equal(rb.height, 900, "rootBounds height preserved after margin spread");
+});
+
+// yz-5bd: The observer instance must not expose _yoetzParsedRootMargin as an
+// enumerable own property — it lives in a WeakMap like the other per-observer
+// data, keeping the instance surface clean.
+test("hidden tab: observer instance has no _yoetzParsedRootMargin own property", () => {
+  const { win } = loadShim({ hidden: true });
+  const io = new win.IntersectionObserver(() => {}, { rootMargin: "0px 0px 100px 0px" });
+  assert.equal(Object.keys(io).includes("_yoetzParsedRootMargin"), false,
+    "_yoetzParsedRootMargin must not be an enumerable own property");
 });

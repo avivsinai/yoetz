@@ -609,12 +609,8 @@ test("rateLimitedHandoff does not false-positive on conversation content quoting
   };
   root.defaultView = { location: { href: "https://chatgpt.com/c/conv-quote?_yoetz=run_quote", pathname: "/c/conv-quote" } };
   const handoff = rateLimitedHandoff(root);
-  // The body text alone should NOT trigger rate_limited when there is no
-  // modal dialog surface. If the detector scans body text, this test verifies
-  // it does not false-positive on quoted error wording.
-  // NOTE: if rateLimitedHandoff scans body text (it does via
-  // manualHandoffSurfaces), this MAY return rate_limited. That is the point:
-  // we need to verify whether it does, and if so, that's a known limitation.
-  // For now, assert the expected behavior (null when no modal surface).
+  // Verified: rateLimitedHandoff does NOT scan body text once conversation
+  // turns are present (hasConversationResidue gates the body scan), so quoted
+  // error wording in an answer does not produce a false rate_limited handoff.
   assert.equal(handoff, null, "quoted error text in conversation content must not produce rate_limited");
 });
