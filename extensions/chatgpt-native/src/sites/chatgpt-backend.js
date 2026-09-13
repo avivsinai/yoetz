@@ -8,7 +8,8 @@ export async function fetchConversationAnswer({
   assertJobOwnership,
   expectedConversationId,
   locationHref,
-  commandError
+  commandError,
+  signal
 }) {
   assertJobOwnership(job, parseOwnedWindowName);
   const conversationId = String(requestedConversationId ?? "").trim()
@@ -17,11 +18,11 @@ export async function fetchConversationAnswer({
   if (!conversationId) {
     throw backendApiError(commandError, "backend_api_unavailable", "no conversation id available for backend-api read");
   }
-  const token = await fetchChatgptAccessToken();
+  const token = await fetchChatgptAccessToken(signal);
   if (!token) {
     throw backendApiError(commandError, "backend_api_unauthorized", "no ChatGPT access token (session expired or signed out)");
   }
-  const data = await requestConversationAnswer(conversationId, token, commandError);
+  const data = await requestConversationAnswer(conversationId, token, commandError, signal);
   return resolveBackendAnswer(job, conversationId, data);
 }
 
@@ -30,15 +31,19 @@ export async function fetchConversationAnswer({
 // with the HTTP facts (status, Retry-After parsed to ms, endpoint category) so
 // the worker can pace ALL website reads behind a shared cooldown. 401/403 keep
 // their unauthorized meaning; other non-OK statuses stay generic unavailable.
-async function requestConversationAnswer(conversationId, token, commandError) {
+async function requestConversationAnswer(conversationId, token, commandError, signal) {
   let response;
   try {
     response = await fetch(`/backend-api/conversation/${encodeURIComponent(conversationId)}`, {
       method: "GET",
       credentials: "include",
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" }
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      signal
     });
   } catch (error) {
+    if (error?.name === "AbortError") {
+      throw backendApiError(commandError, "backend_api_unavailable", "backend-api conversation read aborted at the operation deadline");
+    }
     throw backendApiError(commandError, "backend_api_unavailable", `backend-api conversation fetch failed: ${String(error?.message ?? error)}`);
   }
   if (response.status === 429) {
@@ -64,15 +69,19 @@ function backendApiError(commandError, code, message) {
 // A 429 on /api/auth/session is the same website throttle (it must NOT return
 // null, which the caller misreads as signed-out); surface it as typed
 // backend_api_throttled so the worker paces reads and auth refreshes together.
-async function fetchChatgptAccessToken() {
+async function fetchChatgptAccessToken(signal) {
   let response;
   try {
     response = await fetch("/api/auth/session", {
       method: "GET",
       credentials: "include",
-      headers: { Accept: "application/json" }
+      headers: { Accept: "application/json" },
+      signal
     });
-  } catch {
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw throttledHttpError("session", { status: 0, headers: new Headers() }, true);
+    }
     return null;
   }
   if (response.status === 429) {
@@ -105,15 +114,19 @@ export function retryAfterMs(response) {
   return Number.isFinite(date) ? Math.max(0, date - Date.now()) : 0;
 }
 
-function throttledHttpError(endpoint, response) {
-  const delayMs = retryAfterMs(response);
+function throttledHttpError(endpoint, response, aborted = false) {
+  const delayMs = aborted ? 0 : retryAfterMs(response);
   const error = new Error(
-    `ChatGPT website returned 429 for ${endpoint}; too many requests (retry after ${delayMs > 0 ? `${Math.ceil(delayMs / 1000)}s` : "unknown delay"})`
+    aborted
+      ? `ChatGPT website read for ${endpoint} was aborted at the operation deadline`
+      : `ChatGPT website returned 429 for ${endpoint}; too many requests (retry after ${delayMs > 0 ? `${Math.ceil(delayMs / 1000)}s` : "unknown delay"})`
   );
-  error.code = "backend_api_throttled";
-  error.http_status = 429;
-  error.endpoint_category = endpoint;
-  error.retry_after_ms = delayMs;
+  error.code = aborted ? "backend_api_unavailable" : "backend_api_throttled";
+  if (!aborted) {
+    error.http_status = 429;
+    error.endpoint_category = endpoint;
+    error.retry_after_ms = delayMs;
+  }
   return error;
 }
 

@@ -4066,7 +4066,8 @@ async function readBackendApiGateState(recipe) {
     next_ready_at_ms: Number(value?.next_ready_at_ms ?? 0) || 0,
     throttle_until_ms: Number(value?.throttle_until_ms ?? 0) || 0,
     throttle_level: Number(value?.throttle_level ?? 0) || 0,
-    in_flight_until_ms: Number(value?.in_flight_until_ms ?? 0) || 0
+    in_flight_until_ms: Number(value?.in_flight_until_ms ?? 0) || 0,
+    generation: Number(value?.generation ?? 0) || 0
   };
 }
 
@@ -4083,6 +4084,23 @@ const BACKEND_API_READ_LEASE_TTL_MS = Math.max(
     ? Number(globalThis.__YOETZ_BACKEND_API_READ_LEASE_TTL_MS)
     : 60000
 );
+// The whole auth+conversation operation must settle before the lease expires,
+// so abort the operation a safety margin before the TTL. This bounds
+// sendToTab and both website fetches (including response-body reads) with ONE
+// deadline that is never reset per route.
+const BACKEND_API_READ_LEASE_SAFETY_MARGIN_MS = Math.max(
+  1000,
+  Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_READ_LEASE_SAFETY_MARGIN_MS))
+    ? Number(globalThis.__YOETZ_BACKEND_API_READ_LEASE_SAFETY_MARGIN_MS)
+    : 5000
+);
+// In-memory live-operation guard: a Set of recipe strings for operations
+// that have acquired a lease and not yet settled. This is the actual
+// one-in-flight guarantee within this service-worker instance; the persisted
+// in_flight_until_ms is the crash-recovery backstop. Tracked by recipe (not
+// prospective generation) so it detects an old live operation for the same
+// profile. Release retains ownership-matched persisted release by generation.
+const backendApiLiveOperations = new Set();
 
 // Acquire an in-flight read lease that spans the whole auth+conversation
 // operation and its error handling (released by the caller in finally). This
@@ -4105,30 +4123,48 @@ async function acquireBackendApiReadLease(recipe, nowMs = Date.now()) {
     if (state.in_flight_until_ms > nowMs) {
       return { ok: false };
     }
+    // In-memory guard: another operation in THIS service-worker instance is
+    // still in flight for this profile. The persisted in_flight_until_ms is
+    // the crash-recovery backstop; this Set is the live guarantee.
+    if (backendApiLiveOperations.has(recipe)) {
+      return { ok: false };
+    }
+    const generation = Number(state.generation ?? 0) + 1;
     const earliestReady = Math.max(state.next_ready_at_ms, state.throttle_until_ms);
     if (earliestReady > nowMs) {
       return { ok: false };
     }
+    backendApiLiveOperations.add(recipe);
     const nextState = {
       ...state,
       next_ready_at_ms: nowMs + BACKEND_API_GATE_MIN_GAP_MS,
       in_flight_until_ms: nowMs + BACKEND_API_READ_LEASE_TTL_MS,
-      generation: Number(state.generation ?? 0) + 1
+      generation
     };
     await writeBackendApiGateState(recipe, nextState);
-    return { ok: true, lease: { recipe, acquired_at: nowMs } };
+    return { ok: true, lease: { recipe, generation, acquired_at: nowMs } };
   });
 }
 
 // Release an in-flight read lease. Called from finally for every acquired
-// lease, success or failure. Does not touch spacing (next_ready_at_ms stays
-// so the next read keeps the min gap) and does not clear a throttle.
+// lease, success or failure. Removes the recipe from the in-memory live guard
+// and clears the persisted in_flight_until_ms only if this lease is still the
+// current owner (by generation token) so an old, timed-out release cannot clear
+// a newer lease. Does not touch spacing (next_ready_at_ms stays so the next
+// read keeps the min gap) and does not clear a throttle.
 async function releaseBackendApiReadLease(lease) {
   if (!lease?.recipe) {
     return;
   }
+  backendApiLiveOperations.delete(lease.recipe);
   return withBackendApiGateMutex(async () => {
     const state = await readBackendApiGateState(lease.recipe);
+    // Only clear in_flight if this lease is still the current owner. A newer
+    // acquire may have already replaced the state (after a crash-reclaim);
+    // never clobber it.
+    if (Number(state.generation ?? 0) !== Number(lease.generation ?? 0)) {
+      return;
+    }
     await writeBackendApiGateState(lease.recipe, {
       ...state,
       in_flight_until_ms: 0
@@ -4148,9 +4184,12 @@ async function throttleBackendApiGate(recipe, retryAfterMsValue, nowMs = Date.no
       BACKEND_API_THROTTLE_FLOOR_MS * Math.pow(2, level - 1)
     );
     const jitter = 1 + Math.random() * BACKEND_API_THROTTLE_JITTER_RATIO;
+    // A later, shorter throttle must never reduce an earlier Retry-After floor
+    // that tab creation / render refresh are already waiting out (yz-5bd).
     const throttleUntil = Math.max(
       nowMs + policyDelay * jitter,
-      nowMs + Math.max(0, Number(retryAfterMsValue) || 0)
+      nowMs + Math.max(0, Number(retryAfterMsValue) || 0),
+      Number(state.throttle_until_ms ?? 0)
     );
     await writeBackendApiGateState(recipe, {
       ...state,
@@ -4229,7 +4268,11 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
   }
   // Mark the early confirmation as used at fetch time so a subsequent node
   // change cannot re-arm another fast confirmation this cycle (yz-5bd blocker 2).
-  if (earlyConfirmationEligible && confirmationDue && confirmation) {
+  // Track the spent state in a local boolean because the `confirmation` variable
+  // still points at the old object; the node-change branch below must see the
+  // spent state regardless of which object it reads.
+  const wasEarlyConfirmationRead = Boolean(earlyConfirmationEligible && confirmationDue && confirmation);
+  if (wasEarlyConfirmationRead) {
     job.backend_api_confirmation = {
       ...confirmation,
       early_confirmation_used: true
@@ -4238,11 +4281,21 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
   job.backend_api_last_fetch_at = now;
   job.updated_at = now;
   await persistJob(job);
+  // Bound the ENTIRE auth+conversation operation with ONE absolute deadline.
+  // The deadline is passed to the content script, which creates a single
+  // AbortController whose signal is passed to BOTH website fetches and stays
+  // active through both response-body reads. The SW no longer races a timer;
+  // it awaits actual command settlement and releases the lease in finally only
+  // after the content-script command has settled (yz-5bd blocker: HTTP abort).
+  const operationDeadlineMs = Number(acquired.lease.acquired_at)
+    + BACKEND_API_READ_LEASE_TTL_MS
+    - BACKEND_API_READ_LEASE_SAFETY_MARGIN_MS;
   try {
     const backendExtraction = await sendToTab(job.tab_id, {
       type: "yoetz_fetch_conversation",
       job,
-      conversation_id: conversationId
+      conversation_id: conversationId,
+      operation_deadline_ms: operationDeadlineMs
     });
     const normalized = normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId);
     const fresh = completion.isFreshBackendApiExtraction(normalized);
@@ -4271,7 +4324,8 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
       // the 5s cadence. After that one early confirmation, a *still-different*
       // node does NOT re-arm another fast confirmation — finality stays
       // pending and we return to the ordinary 60s cadence (yz-5bd blocker 2).
-      const earlyConfirmationAlreadyUsed = Boolean(confirmation?.early_confirmation_used);
+      const earlyConfirmationAlreadyUsed = wasEarlyConfirmationRead
+        || Boolean(confirmation?.early_confirmation_used);
       job.backend_api_confirmation = {
         node_id: nodeId,
         observed_at: Date.now(),

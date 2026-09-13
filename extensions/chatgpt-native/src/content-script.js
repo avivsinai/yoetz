@@ -92,7 +92,7 @@ async function handleMessage(message) {
     case "yoetz_extract_response":
       return extractJobResponse(message.job, message.blocking_context);
     case "yoetz_fetch_conversation":
-      return fetchSiteConversationAnswer(message.job, message.conversation_id);
+      return fetchSiteConversationAnswer(message.job, message.conversation_id, message.operation_deadline_ms);
     case "yoetz_cancel_send":
       return cancelSend(message.job);
     case "yoetz_verify_job_ownership":
@@ -615,18 +615,39 @@ async function extractJobResponse(job, blockingContext = null) {
 
 // Ask the selected adapter for a backend answer when its finality strategy supports one.
 // The worker owns when to call this fallback; the adapter owns site-specific API semantics.
-async function fetchSiteConversationAnswer(job, requestedConversationId) {
+async function fetchSiteConversationAnswer(job, requestedConversationId, operationDeadlineMs) {
   const adapter = await siteAdapter(job);
   const { parseOwnedWindowName } = adapter.dom;
-  return adapter.fetchConversationAnswer({
-    job,
-    requestedConversationId,
-    parseOwnedWindowName,
-    assertJobOwnership,
-    expectedConversationId: expectedConversationIdForJob(job),
-    locationHref: location.href,
-    commandError
-  });
+  // ONE AbortController for the whole auth+conversation operation. Its signal
+  // is passed to BOTH fetches and stays active through both response-body
+  // reads; it aborts at the operation deadline so the underlying HTTP cannot
+  // outlive the service-worker lease (yz-5bd).
+  const abortController = new AbortController();
+  let abortTimer = null;
+  if (Number.isFinite(Number(operationDeadlineMs))) {
+    const timeoutMs = Math.max(0, Number(operationDeadlineMs) - Date.now());
+    if (timeoutMs > 0) {
+      abortTimer = setTimeout(() => abortController.abort(), timeoutMs);
+    } else {
+      abortController.abort();
+    }
+  }
+  try {
+    return await adapter.fetchConversationAnswer({
+      job,
+      requestedConversationId,
+      parseOwnedWindowName,
+      assertJobOwnership,
+      expectedConversationId: expectedConversationIdForJob(job),
+      locationHref: location.href,
+      commandError,
+      signal: abortController.signal
+    });
+  } finally {
+    if (abortTimer) {
+      clearTimeout(abortTimer);
+    }
+  }
 }
 
 async function inspectPage(runId, options = {}) {
