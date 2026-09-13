@@ -274,8 +274,22 @@ export function rateLimitedHandoff(root = document) {
 // contain a 'Got it' control, or if the click does not dismiss the dialog.
 // The caller must re-read [role=dialog] state after the gesture — the click is
 // never proof.
+// yz-83b: Find the rate-limit modal dialog specifically — not just any open
+// dialog. The rate-limit modal contains 'Too many requests' wording. If another
+// dialog is open (share sheet, upload dialog, survey), we must not click inside
+// it. Both dismissRateLimitModal and rateLimitModalOpen use this helper.
+function findRateLimitDialog(root = document) {
+  const openDialogs = Array.from(
+    root?.querySelectorAll?.('[role="dialog"][data-state="open"]') ?? []
+  );
+  return openDialogs.find((dialog) => {
+    const text = normalizeText(dialog.innerText ?? dialog.textContent ?? '').toLowerCase();
+    return /too many requests/.test(text);
+  }) ?? null;
+}
+
 export function dismissRateLimitModal(root = document) {
-  const dialog = root?.querySelector?.('[role="dialog"][data-state="open"]');
+  const dialog = findRateLimitDialog(root);
   if (!dialog) {
     return null;
   }
@@ -287,10 +301,9 @@ export function dismissRateLimitModal(root = document) {
   //
   // Live observation (2026-09-13, ext_937d, run 20260913T160202Z_45bf2d):
   // The picker reader reported dialog buttons=[] but the dialog text included
-  // 'Got it'. The control was not a <button> tag — it was likely a <div> or
-  // <a> with a click handler. The actual tag/attributes were not captured
-  // because the picker reader doesn't enumerate dialog children. The fallback
-  // below handles this case.
+  // 'Got it'. The actual tag/attributes were not captured because the picker
+  // reader doesn't enumerate dialog children. The fallback below handles this
+  // case.
   const buttonCandidates = Array.from(
     dialog.querySelectorAll?.('button, [role="button"]') ?? []
   );
@@ -334,7 +347,7 @@ export function dismissRateLimitModal(root = document) {
 // The SW polls this after dismissRateLimitModal with a bounded window until
 // open===false before re-extracting.
 export function rateLimitModalOpen(root = document) {
-  const dialog = root?.querySelector?.('[role="dialog"][data-state="open"]');
+  const dialog = findRateLimitDialog(root);
   return Boolean(dialog);
 }
 

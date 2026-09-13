@@ -12101,7 +12101,7 @@ test("yz-83b: modal never closes after dismiss → fail closed as rate_limited a
     assert.equal(error.payload.state, "rate_limited");
     assert.equal(error.payload.phase, "wait_response");
     assert.equal(error.payload.rate_limit_modal_dismissed, true, "dismiss was attempted");
-    assert.equal(error.payload.rate_limit_modal_recovered, false, "modal did not close");
+
 
     // Exactly one dismiss gesture
     assert.equal(dismissCount, 1, "exactly one dismiss per job");

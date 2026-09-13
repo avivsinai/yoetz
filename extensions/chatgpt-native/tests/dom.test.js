@@ -648,16 +648,16 @@ test("dismissRateLimitModal finds the Got it button inside the open dialog", () 
   otherButton.textContent = "Send";
 
   // After the click, the dialog's data-state changes to "closed", so the
-  // querySelector for [role="dialog"][data-state="open"] must return null.
-  // Use a dynamic querySelector that checks the dialog's current state.
+  // querySelectorAll for [role="dialog"][data-state="open"] must return empty.
+  // Use a dynamic querySelectorAll that checks the dialog's current state.
   const root = selectorRoot(new Map([
     ["button", [gotItButton, otherButton]]
   ]));
-  root.querySelector = (sel) => {
+  root.querySelectorAll = (sel) => {
     if (sel === '[role="dialog"][data-state="open"]') {
-      return dialog.getAttribute("data-state") === "open" ? dialog : null;
+      return dialog.getAttribute("data-state") === "open" ? [dialog] : [];
     }
-    return null;
+    return [];
   };
   root.title = "ChatGPT";
   root.body = { innerText: dialog.innerText, textContent: dialog.innerText };
@@ -674,12 +674,14 @@ test("rateLimitModalOpen returns true when dialog is open, false when closed", (
   const dialogAttrs = { role: "dialog", "data-state": "open" };
   const dialog = visibleElement(dialogAttrs);
   dialog.setAttribute = (name, value) => { dialogAttrs[name] = value; };
+  dialog.innerText = "Too many requests";
+  dialog.textContent = dialog.innerText;
   const root = {
-    querySelector: (sel) => {
+    querySelectorAll: (sel) => {
       if (sel === '[role="dialog"][data-state="open"]') {
-        return dialogAttrs["data-state"] === "open" ? dialog : null;
+        return dialogAttrs["data-state"] === "open" ? [dialog] : [];
       }
-      return null;
+      return [];
     }
   };
   assert.equal(rateLimitModalOpen(root), true, "modal is open");
@@ -747,11 +749,11 @@ test("dismissRateLimitModal fallback finds deepest 'Got it' element when no butt
   };
 
   const root = {
-    querySelector: (sel) => {
+    querySelectorAll: (sel) => {
       if (sel === '[role="dialog"][data-state="open"]') {
-        return dialogAttrs["data-state"] === "open" ? dialog : null;
+        return dialogAttrs["data-state"] === "open" ? [dialog] : [];
       }
-      return null;
+      return [];
     }
   };
   root.title = "ChatGPT";
@@ -762,4 +764,62 @@ test("dismissRateLimitModal fallback finds deepest 'Got it' element when no butt
   assert.notEqual(result, null, "fallback must find the Got it control");
   assert.equal(result.clicked, true, "gesture was performed");
   assert.equal(result.control_text, "Got it");
+});
+
+// yz-83b: When two dialogs are open, dismissRateLimitModal must pick the one
+// whose text matches /too many requests/i, even if it is second in document
+// order. After it closes, rateLimitModalOpen returns false while the other
+// dialog stays open.
+test("dismissRateLimitModal picks the rate-limit dialog when multiple dialogs are open", () => {
+  const shareDialogAttrs = { role: "dialog", "data-state": "open" };
+  const shareDialog = visibleElement(shareDialogAttrs);
+  shareDialog.innerText = "Share conversation";
+  shareDialog.textContent = shareDialog.innerText;
+  shareDialog.click = () => {}; // should never be called
+
+  const rateDialogAttrs = { role: "dialog", "data-state": "open" };
+  const rateDialog = visibleElement(rateDialogAttrs);
+  rateDialog.setAttribute = (name, value) => { rateDialogAttrs[name] = value; };
+  rateDialog.innerText = "Too many requests. Please wait a few minutes before trying again.";
+  rateDialog.textContent = rateDialog.innerText;
+
+  const gotItButton = visibleElement({ tag: "BUTTON" });
+  gotItButton.innerText = "Got it";
+  gotItButton.textContent = "Got it";
+  gotItButton.click = () => { rateDialog.setAttribute("data-state", "closed"); };
+  rateDialog.querySelectorAll = (sel) => {
+    if (sel.includes("button")) return [gotItButton];
+    if (sel === "*") return [gotItButton];
+    return [];
+  };
+
+  // shareDialog has no buttons
+  shareDialog.querySelectorAll = () => [];
+
+  const root = {
+    querySelectorAll: (sel) => {
+      if (sel === '[role="dialog"][data-state="open"]') {
+        // shareDialog first, rateDialog second (rate-limit is second in doc order)
+        const open = [];
+        if (shareDialogAttrs["data-state"] === "open") open.push(shareDialog);
+        if (rateDialogAttrs["data-state"] === "open") open.push(rateDialog);
+        return open;
+      }
+      return [];
+    }
+  };
+  root.title = "ChatGPT";
+  root.body = { innerText: "", textContent: "" };
+  root.defaultView = { location: { href: "https://chatgpt.com/", pathname: "/" } };
+
+  // Dismiss must find the rate-limit dialog (second), not the share dialog
+  const result = dismissRateLimitModal(root);
+  assert.notEqual(result, null, "must find the rate-limit dialog");
+  assert.equal(result.clicked, true, "gesture was performed on the rate-limit dialog");
+  assert.equal(result.control_text, "Got it");
+
+  // After the rate-limit dialog closes, rateLimitModalOpen must return false
+  // even though the share dialog is still open.
+  assert.equal(rateLimitModalOpen(root), false, "rate-limit modal is closed, share dialog irrelevant");
+  assert.equal(shareDialogAttrs["data-state"], "open", "share dialog stays open");
 });

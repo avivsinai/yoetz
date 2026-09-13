@@ -3608,9 +3608,9 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
             // existing wait-loop legs. Mark the job so completeJobWithExtraction
             // carries rate_limit_modal_dismissed when it eventually completes.
             job.rate_limit_modal_dismissed = true;
-            job.rate_limit_modal_recovered = true;
             await persistJob(job);
-            last = { method: "none", text: "", is_generating: true };
+            // Do NOT fabricate a `last` observation — `last` still holds the
+            // previous honest poll and runs after this branch. Just continue.
             continue;
           }
           // Modal did not close within the cap — fail closed.
@@ -3620,7 +3620,6 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
             side_effect_started: true,
             terminal_status: "manual_handoff",
             rate_limit_modal_dismissed: true,
-            rate_limit_modal_recovered: false,
             diagnostics: diagnosticPayload(extraction.diagnostics)
           });
           return null;
