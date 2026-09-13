@@ -11766,3 +11766,225 @@ async function eventually(predicate, timeoutMs = 5000) {
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
 }
+
+// yz-83b: wait_response receives a rate_limited handoff WITH rendered assistant
+// content in diagnostics → one dismiss command is issued → re-extraction returns
+// final → job completes with rate_limit_modal_dismissed: true and the shared
+// cooldown is armed.
+test("yz-83b: rate_limited with rendered content → dismiss modal → re-extract → complete with cooldown armed", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  const sentToTabs = [];
+  let tabId = 0;
+  let extractCount = 0;
+  let dismissCount = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_83b_dismiss" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        sentToTabs.push({ id: _id, message: command });
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedLatestProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            return { ok: true, payload: { sent: true, conversation_id: "conv-83b", final_model_selection: { ...verifiedLatestProSelection(), click_bound: true } } };
+          case "yoetz_extract_response": {
+            extractCount++;
+            if (extractCount === 1) {
+              // First extraction: rate_limited handoff WITH rendered content
+              return {
+                ok: true,
+                payload: {
+                  manual_handoff: { state: "rate_limited", message: "Too many requests" },
+                  is_final: false,
+                  method: "page_text_fallback",
+                  text: "",
+                  assistant_count: 0,
+                  conversation_id: "conv-83b",
+                  diagnostics: {
+                    page_text_chars: 0,
+                    page_text_content_chars: 0,
+                    counts: { assistant_roles: 1, conversation_turns: 2, markdown: 3 },
+                    markdown_snippets: [{ tag: "div", text: "rendered answer" }],
+                    assistant_turn_snippets: [{ tag: "div", text: "rendered answer" }]
+                  }
+                }
+              };
+            }
+            // Second extraction (after dismiss): final answer
+            return {
+              ok: true,
+              payload: {
+                manual_handoff: null,
+                is_final: true,
+                method: "assistant_dom_fallback",
+                text: "The answer that was rendered before the modal.",
+                assistant_count: 1,
+                copy_button_count: 1,
+                has_copy_button: true,
+                turn_index: 0,
+                conversation_id: "conv-83b",
+                model_slug: "gpt-5-6-pro"
+              }
+            };
+          }
+          case "yoetz_dismiss_rate_limit_modal":
+            dismissCount++;
+            return { ok: true, payload: { dismissed: true, control_text: "Got it" } };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz83b_dismiss=${Date.now()}`);
+    port.emit(envelope("job_start", "job_83b_dismiss", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_83b_dismiss", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_83b_dismiss.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((m) => m.type === "job_complete"));
+    const complete = port.messages.find((m) => m.type === "job_complete");
+
+    // Job completed successfully
+    assert.equal(complete.payload.code, undefined, "job should complete, not error");
+    assert.equal(complete.payload.rate_limit_modal_dismissed, true, "must record the dismiss");
+    assert.equal(complete.payload.text, "The answer that was rendered before the modal.");
+
+    // Exactly one dismiss command was issued
+    assert.equal(dismissCount, 1, "exactly one dismiss per job");
+
+    // The shared cooldown is armed (throttleBackendApiGateFromRateLimit)
+    // We verify via the progress messages: the rate_limited handoff should
+    // have been reported before the complete.
+    const handoffProgress = port.messages.find((m) =>
+      m.type === "job_progress" && m.payload?.manual_handoff?.state === "rate_limited"
+    );
+    assert.notEqual(handoffProgress, null, "rate_limited handoff must be reported");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+// yz-83b: rate_limited handoff with ZERO rendered content → no dismiss, job
+// fails rate_limited as today.
+test("yz-83b: rate_limited with zero rendered content → no dismiss, job fails rate_limited", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+  let dismissCount = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_83b_nodismiss" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedLatestProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            return { ok: true, payload: { sent: true, conversation_id: "conv-83b-no", final_model_selection: { ...verifiedLatestProSelection(), click_bound: true } } };
+          case "yoetz_extract_response":
+            // rate_limited handoff with ZERO rendered content
+            return {
+              ok: true,
+              payload: {
+                manual_handoff: { state: "rate_limited", message: "Too many requests" },
+                is_final: false,
+                method: "page_text_fallback",
+                text: "",
+                assistant_count: 0,
+                conversation_id: "conv-83b-no",
+                diagnostics: {
+                  page_text_chars: 0,
+                  page_text_content_chars: 0,
+                  counts: { assistant_roles: 0, conversation_turns: 0, markdown: 0 },
+                  markdown_snippets: [],
+                  assistant_turn_snippets: []
+                }
+              }
+            };
+          case "yoetz_dismiss_rate_limit_modal":
+            dismissCount++;
+            return { ok: true, payload: { dismissed: true } };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz83b_nodismiss=${Date.now()}`);
+    port.emit(envelope("job_start", "job_83b_nodismiss", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_83b_nodismiss", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_83b_nodismiss.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((m) => m.type === "job_error"));
+    const error = port.messages.find((m) => m.type === "job_error");
+
+    // Job failed as rate_limited (not completed)
+    assert.equal(error.payload.code, "manual_handoff");
+    assert.equal(error.payload.state, "rate_limited");
+    assert.equal(error.payload.phase, "wait_response");
+    assert.equal(error.payload.rate_limit_modal_dismissed, undefined, "no dismiss should be recorded");
+
+    // No dismiss command was issued
+    assert.equal(dismissCount, 0, "no dismiss when zero rendered content");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
