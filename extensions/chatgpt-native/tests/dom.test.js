@@ -715,3 +715,51 @@ test("dismissRateLimitModal returns null when dialog has data-state=closed", () 
   const result = dismissRateLimitModal(root);
   assert.equal(result, null, "closed dialog must not be dismissed");
 });
+
+// yz-83b: When the 'Got it' control is not a <button> or [role="button"],
+// the fallback finds the DEEPEST element whose own text is 'got it'.
+test("dismissRateLimitModal fallback finds deepest 'Got it' element when no button exists", () => {
+  const dialogAttrs = { role: "dialog", "data-state": "open" };
+  const dialog = visibleElement(dialogAttrs);
+  dialog.setAttribute = (name, value) => { dialogAttrs[name] = value; };
+  dialog.innerText = "Too many requests\nGot it";
+  dialog.textContent = dialog.innerText;
+
+  // Outer wrapper and inner leaf — both have textContent 'Got it'
+  const outer = visibleElement({});
+  outer.innerText = "Got it";
+  outer.textContent = "Got it";
+  outer.click = () => { dialog.setAttribute("data-state", "closed"); };
+  const inner = visibleElement({});
+  inner.innerText = "Got it";
+  inner.textContent = "Got it";
+  inner.click = () => { dialog.setAttribute("data-state", "closed"); };
+
+  // querySelectorAll returns in document order: outer first, inner second
+  dialog.querySelectorAll = (sel) => {
+    if (sel === "button, [role=\"button\"]") return [];
+    if (sel === "*") return [outer, inner];
+    return [];
+  };
+  dialog.querySelector = (sel) => {
+    if (sel === '[role="dialog"][data-state="open"]') return dialogAttrs["data-state"] === "open" ? dialog : null;
+    return null;
+  };
+
+  const root = {
+    querySelector: (sel) => {
+      if (sel === '[role="dialog"][data-state="open"]') {
+        return dialogAttrs["data-state"] === "open" ? dialog : null;
+      }
+      return null;
+    }
+  };
+  root.title = "ChatGPT";
+  root.body = { innerText: dialog.innerText, textContent: dialog.innerText };
+  root.defaultView = { location: { href: "https://chatgpt.com/", pathname: "/" } };
+
+  const result = dismissRateLimitModal(root);
+  assert.notEqual(result, null, "fallback must find the Got it control");
+  assert.equal(result.clicked, true, "gesture was performed");
+  assert.equal(result.control_text, "Got it");
+});

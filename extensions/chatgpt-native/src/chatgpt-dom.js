@@ -279,17 +279,36 @@ export function dismissRateLimitModal(root = document) {
   if (!dialog) {
     return null;
   }
-  // Find the 'Got it' control inside the dialog. Match by text content to be
-  // resilient to markup changes. ChatGPT's Radix dialog may use <button>,
-  // <div role="button">, or any clickable element with a click handler.
-  // Use a tree walker to scan all elements, not just specific tags.
-  const allElements = Array.from(dialog.querySelectorAll?.('*') ?? []);
-  const gotIt = allElements.find((el) => {
-    // Only check leaf-ish elements (no child elements with their own text)
-    // to avoid matching a container that includes 'Got it' among other text.
-    const ownText = normalizeText(el.innerText ?? el.textContent ?? '').toLowerCase();
-    return ownText === 'got it' || ownText.trim() === 'got it';
+  // Find the 'Got it' control inside the dialog. Try button/[role=button]
+  // first (the common case). If that finds nothing, fall back to the DEEPEST
+  // element whose own text is exactly 'got it' — not the first, because
+  // querySelectorAll('*') returns in document order and every ancestor wrapper
+  // whose textContent is 'Got it' would match first.
+  //
+  // Live observation (2026-09-13, ext_937d, run 20260913T160202Z_45bf2d):
+  // The picker reader reported dialog buttons=[] but the dialog text included
+  // 'Got it'. The control was not a <button> tag — it was likely a <div> or
+  // <a> with a click handler. The actual tag/attributes were not captured
+  // because the picker reader doesn't enumerate dialog children. The fallback
+  // below handles this case.
+  const buttonCandidates = Array.from(
+    dialog.querySelectorAll?.('button, [role="button"]') ?? []
+  );
+  let gotIt = buttonCandidates.find((btn) => {
+    const text = normalizeText(btn.innerText ?? btn.textContent ?? '').toLowerCase();
+    return text === 'got it' || text.startsWith('got it');
   });
+  if (!gotIt) {
+    // Fallback: scan all elements, pick the DEEPEST (last in document order)
+    // whose own text is exactly 'got it'. This avoids clicking an outer
+    // wrapper when the actual control is a leaf element inside it.
+    const allElements = Array.from(dialog.querySelectorAll?.('*') ?? []);
+    const matches = allElements.filter((el) => {
+      const ownText = normalizeText(el.innerText ?? el.textContent ?? '').toLowerCase().trim();
+      return ownText === 'got it';
+    });
+    gotIt = matches.length > 0 ? matches[matches.length - 1] : null;
+  }
   if (!gotIt) {
     return null;
   }
