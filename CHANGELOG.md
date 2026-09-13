@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.72] - 2026-09-13
 ### Added
 - ChatGPT web recipe: when the "Too many requests" modal mounts after the
   answer is already rendered, the run now dismisses the modal's "Got it"
@@ -16,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the result. A modal on a fresh tab (before any send) still fails closed as
   `rate_limited` and now arms the profile cooldown immediately instead of
   failing with an opaque `model_selection` error. (`yz-83b`)
+
 
 ## [0.5.71] - 2026-09-13
 ### Fixed
