@@ -1688,3 +1688,72 @@ test("backend-api read surfaces a 401 as backend_api_unauthorized so the SW can 
     restore();
   }
 });
+
+// yz-5bd: an explicit 429 from either website route must surface as typed
+// backend_api_throttled carrying the HTTP facts (status, endpoint category,
+// Retry-After parsed to ms) so the service worker can pace the whole profile.
+// These are SIMULATED 429s exercising the adapter error path; they are NOT a
+// reproduction of the unknown field incident.
+function installBackendFetchWithHeaders({ token = "tok-123", conversationStatus = 200, conversationHeaders = {}, sessionStatus = 200, sessionHeaders = {} } = {}) {
+  const original = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.startsWith("/api/auth/session")) {
+      return {
+        ok: sessionStatus >= 200 && sessionStatus < 300,
+        status: sessionStatus,
+        headers: { get: (name) => sessionHeaders[name.toLowerCase()] ?? null },
+        json: async () => ({ accessToken: token })
+      };
+    }
+    if (u.startsWith("/backend-api/conversation/")) {
+      return {
+        ok: conversationStatus >= 200 && conversationStatus < 300,
+        status: conversationStatus,
+        headers: { get: (name) => conversationHeaders[name.toLowerCase()] ?? null },
+        json: async () => ({})
+      };
+    }
+    throw new Error(`unexpected fetch ${u}`);
+  };
+  return () => { globalThis.fetch = original; };
+}
+
+test("backend-api read surfaces a conversation-route 429 as typed backend_api_throttled with HTTP facts", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_429_conv", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const restoreFetch = installBackendFetchWithHeaders({ conversationStatus: 429, conversationHeaders: { "retry-after": "12" } });
+  try {
+    const job = fetchJob(0);
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, "backend_api_throttled");
+    assert.equal(res.http_status, 429);
+    assert.equal(res.endpoint_category, "conversation");
+    assert.equal(res.retry_after_ms, 12000);
+    assert.match(res.error, /429/);
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
+
+test("backend-api read surfaces a session-route 429 as typed backend_api_throttled, not signed-out", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_429_session", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  // Session 429 must NOT collapse to the null-token signed-out path; it must
+  // throw typed backend_api_throttled so the SW paces auth refreshes too.
+  const restoreFetch = installBackendFetchWithHeaders({ sessionStatus: 429, sessionHeaders: { "retry-after": "5" } });
+  try {
+    const job = fetchJob(0);
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, false);
+    assert.equal(res.code, "backend_api_throttled");
+    assert.equal(res.http_status, 429);
+    assert.equal(res.endpoint_category, "session");
+    assert.equal(res.retry_after_ms, 5000);
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});

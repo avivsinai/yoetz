@@ -7,6 +7,10 @@ const TEST_CONTENT_SCRIPT_BUILD = "0.5.68";
 globalThis.__YOETZ_MIN_STABLE_IDLE_MS = 100;
 globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER = 0;
 globalThis.__YOETZ_BACKEND_API_CONFIRMATION_MS = 50;
+// Production keeps a 5s profile-wide minimum gap between website read
+// operations (yz-5bd gate); tests confirm finality in milliseconds, so shrink
+// the gap knob alongside the confirmation knob above.
+globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS = 25;
 
 test("service worker routes reconnect and multiplexes two native jobs", async () => {
   const originalChrome = globalThis.chrome;
@@ -5287,7 +5291,7 @@ test("service worker does not complete when ChatGPT idles before final assistant
   }
 });
 
-test("service worker completes with backend-api text when the DOM answer turn never paints", async () => {
+test("service worker PROBE single-job gate clone", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();
   let tabId = 0;
@@ -5397,6 +5401,8 @@ test("service worker completes with backend-api text when the DOM answer turn ne
     globalThis.chrome = originalChrome;
   }
 });
+
+
 
 test("service worker accepts fresh backend finality when the DOM generating heuristic stays stuck", async () => {
   const originalChrome = globalThis.chrome;
@@ -11446,6 +11452,310 @@ function chromeStub({ port, tabs, connectNative = null, profileEmail = "", profi
     }
   };
 }
+
+
+// ---------------------------------------------------------------------------
+// Profile-scoped website-read pacing gate (yz-5bd).
+//
+// NOTE: the 429s below are SIMULATED responses used to exercise the pacing
+// machinery. They are NOT a reproduction of the unknown incident that produced
+// the field "Too many requests" modal; no network trace of that incident
+// exists (see docs/design/chatgpt-web-rate-limit-fix.md).
+// ---------------------------------------------------------------------------
+
+function throttledFetchConversationPayload(error) {
+  return { ok: false, error: String(error?.message ?? error), code: error?.code ?? "backend_api_throttled", http_status: 429, endpoint_category: "conversation", retry_after_ms: Number(error?.retry_after_ms ?? 0) || 0 };
+}
+
+test("service worker paces profile website reads behind the shared gate on a simulated 429 and resumes with the same answer", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousGap = globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS;
+  const previousFloor = globalThis.__YOETZ_BACKEND_API_THROTTLE_FLOOR_MS;
+  const previousCooldown = globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS;
+  globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS = 25;
+  globalThis.__YOETZ_BACKEND_API_THROTTLE_FLOOR_MS = 200;
+  globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS = 100;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  let fetchCount = 0;
+  let throttledCount = 0;
+  let throttleProgress = null;
+  const FINAL = "The paced retry returned the same completed answer.";
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/conv-throttle?_yoetz=run_job_backend_gate_429" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedLatestProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, conversation_id: "conv-throttle", submitted_assistant_count: 1 } };
+          case "yoetz_fetch_conversation":
+            fetchCount += 1;
+            if (fetchCount === 1) {
+              throttledCount += 1;
+              return throttledFetchConversationPayload({ retry_after_ms: 0 });
+            }
+            return {
+              ok: true,
+              payload: {
+                method: "backend_api",
+                text: FINAL,
+                is_generating: false,
+                node_fresh: true,
+                node_id: "answer-gate",
+                conversation_id: "conv-throttle",
+                assistant_count: 1,
+                turn_index: 0,
+                copy_button_count: 0,
+                has_copy_button: false
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? {
+                    method: "assistant_dom_fallback",
+                    text: "I",
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 1,
+                    preceding_user_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: false,
+                    turn_index: 0,
+                    conversation_id: "conv-throttle",
+                    diagnostics: { counts: { stop_controls: 0, copy_buttons: 1 } }
+                  }
+                : {
+                    method: "copy_scope_dom_fallback",
+                    text: "previous answer",
+                    is_generating: false,
+                    assistant_count: 1,
+                    user_count: 0,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: 0,
+                    conversation_id: "conv-throttle"
+                  }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?backend_gate_429=${Date.now()}`);
+    port.emit(envelope("job_start", "job_backend_gate_429", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 8000
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_backend_gate_429", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_backend_gate_429.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "backend_api_throttled"), 6000);
+    throttleProgress = port.messages.find((message) => message.payload?.phase === "backend_api_throttled");
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"), 9000);
+    const complete = port.messages.find((message) => message.type === "job_complete");
+    // The throttle pauses website reads for the whole profile; finality is
+    // preserved (pending DOM bar held) and the same answer completes after
+    // the cooldown floor passes — no DOM-only completion, no resubmission.
+    assert.equal(sent, true, "exactly one send; no prompt resubmission during recovery");
+    assert.ok(throttledCount >= 1, "the simulated 429 must have been observed");
+    assert.equal(throttleProgress.payload.http_status, 429);
+    assert.equal(throttleProgress.payload.endpoint_category, "conversation");
+    assert.ok(Number(throttleProgress.payload.cooldown_ms) > 0, "throttle progress must carry the applied cooldown");
+    assert.match(throttleProgress.payload.message, /pausing website reads/);
+    assert.equal(complete.payload.response, FINAL, "the same answer completes after the gate reopens");
+    assert.equal(complete.payload.extraction_method, "backend_api");
+    assert.equal(port.messages.some((message) => message.type === "job_error"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousGap === undefined) {
+      delete globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS;
+    } else {
+      globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS = previousGap;
+    }
+    if (previousFloor === undefined) {
+      delete globalThis.__YOETZ_BACKEND_API_THROTTLE_FLOOR_MS;
+    } else {
+      globalThis.__YOETZ_BACKEND_API_THROTTLE_FLOOR_MS = previousFloor;
+    }
+    if (previousCooldown === undefined) {
+      delete globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS;
+    } else {
+      globalThis.__YOETZ_BACKEND_API_FETCH_COOLDOWN_MS = previousCooldown;
+    }
+  }
+});
+
+test("service worker shares one profile gate between jobs: reads stay spaced by the gate gap", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousGap = globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS;
+  globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS = 250;
+  const port = makePort();
+  let tabId = 0;
+  let sentA = false;
+  let sentB = false;
+  const fetchTimestamps = [];
+  const FINAL = "Gate-shared answer.";
+  const makeTabHandler = (jobId, convId) => async (_id, message) => {
+    const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+    switch (command.type) {
+      case "yoetz_probe":
+        return { ok: true, payload: {} };
+      case "yoetz_prepare_job":
+        return { ok: true, payload: { manual_handoff: null } };
+      case "yoetz_configure_model":
+        return { ok: true, payload: verifiedLatestProSelection() };
+      case "yoetz_upload_file":
+        return { ok: true, payload: { filename: command.file.filename, size: 4 } };
+      case "yoetz_send_prompt":
+        if (command.job.job_id === "job_gate_a") sentA = true; else sentB = true;
+        return { ok: true, payload: { sent: true, conversation_id: convId, submitted_assistant_count: 1 } };
+      case "yoetz_fetch_conversation":
+        fetchTimestamps.push(Date.now());
+        return {
+          ok: true,
+          payload: {
+            method: "backend_api",
+            text: FINAL,
+            is_generating: false,
+            node_fresh: true,
+            node_id: `answer-${command.job.job_id}`,
+            conversation_id: convId,
+            assistant_count: 1,
+            turn_index: 0,
+            copy_button_count: 0,
+            has_copy_button: false
+          }
+        };
+      case "yoetz_extract_response":
+        return {
+          ok: true,
+          payload: (command.job.job_id === "job_gate_a" ? sentA : sentB)
+            ? {
+                method: "assistant_dom_fallback",
+                text: "I",
+                is_generating: false,
+                assistant_count: 1,
+                user_count: 1,
+                preceding_user_count: 1,
+                copy_button_count: 1,
+                has_copy_button: false,
+                turn_index: 0,
+                conversation_id: convId,
+                diagnostics: { counts: { stop_controls: 0, copy_buttons: 1 } }
+              }
+            : {
+                method: "copy_scope_dom_fallback",
+                text: "previous answer",
+                is_generating: false,
+                assistant_count: 1,
+                user_count: 0,
+                copy_button_count: 1,
+                has_copy_button: true,
+                turn_index: 0,
+                conversation_id: convId
+              }
+        };
+      default:
+        throw new Error(`unexpected tab message ${command.type}`);
+    }
+  };
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/conv-gate?_yoetz=run_gate_shared" }),
+      sendMessage: (id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        const isA = command.job?.job_id === "job_gate_a";
+        return makeTabHandler(isA ? "job_gate_a" : "job_gate_b", isA ? "conv-gate-a" : "conv-gate-b")(id, message);
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?backend_gate_shared=${Date.now()}`);
+    port.emit(envelope("job_start", "job_gate_a", {
+      prompt: "prompt a",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 10000
+    }));
+    await eventually(() => port.messages.some((message) => message.job_id === "job_gate_a" && message.payload?.phase === "ready_for_file"), 6000);
+    port.emit(envelope("job_file_chunk", "job_gate_a", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_gate_a.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    port.emit(envelope("job_start", "job_gate_b", {
+      prompt: "prompt b",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 12000
+    }));
+    await eventually(() => port.messages.some((message) => message.job_id === "job_gate_b" && message.payload?.phase === "ready_for_file"), 6000);
+    port.emit(envelope("job_file_chunk", "job_gate_b", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_gate_b.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.filter((message) => message.type === "job_complete").length >= 2, 15000);
+    // Two jobs sharing one profile gate must not both hammer the website:
+    // reads stay spaced by at least the configured minimum gap.
+    assert.ok(fetchTimestamps.length >= 2, `expected at least two website reads, saw ${fetchTimestamps.length}`);
+    for (let index = 1; index < fetchTimestamps.length; index += 1) {
+      const gap = fetchTimestamps[index] - fetchTimestamps[index - 1];
+      assert.ok(gap >= 200, `website reads must stay >= the gate gap apart; saw ${gap}ms between reads ${index - 1} and ${index}`);
+    }
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousGap === undefined) {
+      delete globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS;
+    } else {
+      globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS = previousGap;
+    }
+  }
+});
+
+test("service worker session-route 429 carries typed throttle facts instead of the signed-out fallback", async () => {
+  const { retryAfterMs } = await import("../src/sites/chatgpt-backend.js");
+  const headers = new Headers({ "retry-after": "7" });
+  assert.equal(retryAfterMs({ headers }), 7000);
+  const httpDate = new Date(Date.now() + 3000).toUTCString();
+  const parsedDate = retryAfterMs({ headers: new Headers({ "retry-after": httpDate }) });
+  assert.ok(parsedDate > 0 && parsedDate <= 3000, `HTTP-date Retry-After must parse to 0..3000ms, saw ${parsedDate}`);
+  assert.equal(retryAfterMs({ headers: new Headers() }), 0);
+  assert.equal(retryAfterMs({ headers: new Headers({ "retry-after": "not-a-date" }) }), 0);
+});
+
 
 async function eventually(predicate, timeoutMs = 5000) {
   const start = Date.now();
