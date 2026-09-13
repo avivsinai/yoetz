@@ -127,6 +127,37 @@ const BACKEND_API_CONFIRMATION_MS = Math.max(
     : 5000
 );
 const MAX_BACKEND_API_CONSECUTIVE_FAILURES = 3;
+// Profile-scoped website-request pacing (yz-5bd). All jobs in this Chrome
+// profile share one gate: at most one website read operation in flight and at
+// least BACKEND_API_GATE_MIN_GAP_MS between operations, regardless of how many
+// jobs are polling. This is OUR fallback policy (not a published ChatGPT web
+// limit); explicit 429s widen the gate with the server's Retry-After as floor.
+const BACKEND_API_GATE_STORAGE_KEY = "backend-api-gate.";
+const BACKEND_API_GATE_MIN_GAP_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS))
+    ? Number(globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS)
+    : 5000
+);
+const BACKEND_API_THROTTLE_FLOOR_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_THROTTLE_FLOOR_MS))
+    ? Number(globalThis.__YOETZ_BACKEND_API_THROTTLE_FLOOR_MS)
+    : 60000
+);
+const BACKEND_API_THROTTLE_MAX_MS = Math.max(
+  BACKEND_API_THROTTLE_FLOOR_MS,
+  Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_THROTTLE_MAX_MS))
+    ? Number(globalThis.__YOETZ_BACKEND_API_THROTTLE_MAX_MS)
+    : 240000
+);
+const BACKEND_API_THROTTLE_JITTER_RATIO = 0.2;
+const CHATGPT_RATE_LIMITED_COOLDOWN_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_CHATGPT_RATE_LIMITED_COOLDOWN_MS))
+    ? Number(globalThis.__YOETZ_CHATGPT_RATE_LIMITED_COOLDOWN_MS)
+    : 60000
+);
 const CHATGPT_DOM_ONLY_FINALITY_WARNING = "ChatGPT finality_anchor=dom_only: backend API positive-finality proof was unavailable; response relied on DOM-only completion";
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
@@ -570,6 +601,33 @@ async function startJob(message) {
   const url = job.expected_conversation_id
     ? adapter.conversationJobUrl(job.expected_conversation_id, job.run_id)
     : adapter.jobUrl(job.run_id);
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
+  // Profile-wide 429 cooldown (yz-5bd): new automated tab creation is itself
+  // website traffic (page load + its owned requests), so while the shared
+  // throttle holds in this profile, the job waits with its tab unopened
+  // instead of adding a navigation burst on top of the throttled reads. The
+  // wait is bounded by the job's own upload deadline; cancellation stays
+  // effective. At deadline expiry the job fails honestly WITHOUT opening a
+  // tab, so no navigation happens while the throttle can still be active.
+  const uploadDeadlineMs = Number(job.started_at ?? Date.now())
+    + Math.max(0, Number(job.upload_timeout_ms ?? 120000));
+  while (await backendApiGateThrottled(adapterRecipeKey(job))) {
+    if (!jobContinuationIsLive(job, continuationEpoch)) {
+      return;
+    }
+    if (Date.now() >= uploadDeadlineMs) {
+      await failJob(job, "backend_api_throttled", `ChatGPT website throttle still active at the upload deadline; not opening a new tab while the profile cooldown holds. Inspect the owned profile before rerunning.`, {
+        phase: "upload",
+        side_effect_started: false,
+        http_status: 429,
+        endpoint_category: "profile_cooldown"
+      });
+      return;
+    }
+    await sleep(1000);
+  }
   if (!jobContinuationIsLive(job, continuationEpoch)) {
     return;
   }
@@ -2818,7 +2876,14 @@ function errorContextForJob(job, error = null) {
     "content_script_build",
     "expected_content_script_build",
     "expected_content_script_recipe",
-    "content_script_recipe"
+    "content_script_recipe",
+    "http_status",
+    "endpoint_category",
+    "retry_after_ms",
+    "requested_conversation_id",
+    "current_conversation_id",
+    "current_url",
+    "current_pathname"
   ]) {
     if (error?.[key] !== undefined) {
       detail[key] = error[key];
@@ -3382,6 +3447,9 @@ function tabCommandError(response) {
     "expected_content_script_build",
     "expected_content_script_recipe",
     "content_script_recipe",
+    "http_status",
+    "endpoint_category",
+    "retry_after_ms",
     "requested_conversation_id",
     "current_conversation_id",
     "current_url",
@@ -3464,6 +3532,13 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
     }
     if (extraction?.manual_handoff) {
       postNative(progress(job, "manual_handoff", extraction.manual_handoff));
+      // A recognized rate_limited DOM outcome is the same website throttle seen
+      // through the page: arm the profile-wide shared cooldown so website
+      // reads, new tab creation, and render refresh all pause. The affected
+      // job keeps its existing terminal handling (below).
+      if (extraction.manual_handoff?.state === "rate_limited") {
+        await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
+      }
       await failJob(job, "manual_handoff", extraction.manual_handoff.message, {
         state: extraction.manual_handoff.state,
         phase: "wait_response",
@@ -3730,7 +3805,14 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
     } else {
       extractionFailureSinceMs = 0;
     }
-    const nextDelay = job.backend_api_confirmation
+    // Fast (5s) confirmation cadence only for the ONE early confirmation per
+    // ordinary cycle. After that early confirmation (or when the node changed
+    // and we returned to ordinary cadence), poll at the ordinary interval.
+    const earlyConfirmationPending = Boolean(
+      job.backend_api_confirmation
+      && !job.backend_api_confirmation.early_confirmation_used
+    );
+    const nextDelay = earlyConfirmationPending
       ? Math.min(interval, Math.max(50, BACKEND_API_CONFIRMATION_MS))
       : finalAffordance
       // Poll fast while confirming a latched final affordance so the short confirm
@@ -3948,6 +4030,155 @@ async function extractDomResponseForJob(job) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Profile-scoped website-read pacing gate (yz-5bd).
+//
+// All website read operations in this Chrome profile (conversation reads, auth
+// session reads) share one gate persisted at BACKEND_API_GATE_STORAGE_KEY in
+// chrome.storage.session: { next_ready_at_ms, generation }.
+//
+// Reservation is serialized through an in-module mutex: chrome.storage.session
+// read-then-write alone is not a mutex, so every admission takes the async
+// mutex FIRST, then restores the gate from storage, then decides. A skipped
+// job does not charge the gate. The gate is profile-scoped: it coordinates
+// jobs in this Chrome profile only, not other profiles or devices that share
+// the ChatGPT account.
+// ---------------------------------------------------------------------------
+let backendApiGateMutex = Promise.resolve();
+
+function backendApiGateStorageKey(recipe) {
+  return `${BACKEND_API_GATE_STORAGE_KEY}${recipe}`;
+}
+
+function withBackendApiGateMutex(task) {
+  const run = backendApiGateMutex.then(task, task);
+  // Keep the chain alive when a task rejects: the rejection belongs to the
+  // caller, not to the mutex itself.
+  backendApiGateMutex = run.then(() => undefined, () => undefined);
+  return run;
+}
+
+async function readBackendApiGateState(recipe) {
+  const key = backendApiGateStorageKey(recipe);
+  const stored = await chrome.storage.session.get(key);
+  const value = stored?.[key];
+  return {
+    next_ready_at_ms: Number(value?.next_ready_at_ms ?? 0) || 0,
+    throttle_until_ms: Number(value?.throttle_until_ms ?? 0) || 0,
+    throttle_level: Number(value?.throttle_level ?? 0) || 0,
+    in_flight_until_ms: Number(value?.in_flight_until_ms ?? 0) || 0
+  };
+}
+
+async function writeBackendApiGateState(recipe, state) {
+  const key = backendApiGateStorageKey(recipe);
+  await chrome.storage.session.set({ [key]: state });
+}
+
+// Safety cap on a single read lease. A read that outlives this window is
+// assumed crashed and the lease self-clears so it cannot wedge the profile.
+const BACKEND_API_READ_LEASE_TTL_MS = Math.max(
+  BACKEND_API_GATE_MIN_GAP_MS,
+  Number.isFinite(Number(globalThis.__YOETZ_BACKEND_API_READ_LEASE_TTL_MS))
+    ? Number(globalThis.__YOETZ_BACKEND_API_READ_LEASE_TTL_MS)
+    : 60000
+);
+
+// Acquire an in-flight read lease that spans the whole auth+conversation
+// operation and its error handling (released by the caller in finally). This
+// is the actual one-in-flight guarantee: a read lasting over the min gap can-
+// not overlap another job because the lease stays held until release. A
+// crashed lease self-clears after BACKEND_API_READ_LEASE_TTL_MS.
+//
+// Returns { ok: true, lease } or { ok: false } when the caller must skip
+// WITHOUT charging the gate (throttled, in-flight, or spacing not elapsed).
+// The spacing (next_ready_at_ms) is set on acquisition so two near-simul-
+// taneous acquires cannot both pass.
+async function acquireBackendApiReadLease(recipe, nowMs = Date.now()) {
+  return withBackendApiGateMutex(async () => {
+    const state = await readBackendApiGateState(recipe);
+    if (state.throttle_until_ms > nowMs) {
+      return { ok: false };
+    }
+    // A live lease (not yet expired) blocks overlap; an expired lease is a
+    // crashed prior read and is reclaimed.
+    if (state.in_flight_until_ms > nowMs) {
+      return { ok: false };
+    }
+    const earliestReady = Math.max(state.next_ready_at_ms, state.throttle_until_ms);
+    if (earliestReady > nowMs) {
+      return { ok: false };
+    }
+    const nextState = {
+      ...state,
+      next_ready_at_ms: nowMs + BACKEND_API_GATE_MIN_GAP_MS,
+      in_flight_until_ms: nowMs + BACKEND_API_READ_LEASE_TTL_MS,
+      generation: Number(state.generation ?? 0) + 1
+    };
+    await writeBackendApiGateState(recipe, nextState);
+    return { ok: true, lease: { recipe, acquired_at: nowMs } };
+  });
+}
+
+// Release an in-flight read lease. Called from finally for every acquired
+// lease, success or failure. Does not touch spacing (next_ready_at_ms stays
+// so the next read keeps the min gap) and does not clear a throttle.
+async function releaseBackendApiReadLease(lease) {
+  if (!lease?.recipe) {
+    return;
+  }
+  return withBackendApiGateMutex(async () => {
+    const state = await readBackendApiGateState(lease.recipe);
+    await writeBackendApiGateState(lease.recipe, {
+      ...state,
+      in_flight_until_ms: 0
+    });
+  });
+}
+
+// Apply a throttle observed by any job: Retry-After is the floor, then our
+// exponential fallback policy (60s -> 120s -> 240s) with +0..20%% jitter that
+// can only lengthen the wait. Levels advance only on repeated throttles.
+async function throttleBackendApiGate(recipe, retryAfterMsValue, nowMs = Date.now()) {
+  return withBackendApiGateMutex(async () => {
+    const state = await readBackendApiGateState(recipe);
+    const level = Math.min(3, Number(state.throttle_level ?? 0) + 1);
+    const policyDelay = Math.min(
+      BACKEND_API_THROTTLE_MAX_MS,
+      BACKEND_API_THROTTLE_FLOOR_MS * Math.pow(2, level - 1)
+    );
+    const jitter = 1 + Math.random() * BACKEND_API_THROTTLE_JITTER_RATIO;
+    const throttleUntil = Math.max(
+      nowMs + policyDelay * jitter,
+      nowMs + Math.max(0, Number(retryAfterMsValue) || 0)
+    );
+    await writeBackendApiGateState(recipe, {
+      ...state,
+      throttle_until_ms: throttleUntil,
+      next_ready_at_ms: Math.max(state.next_ready_at_ms, throttleUntil),
+      throttle_level: level
+    });
+    return throttleUntil - nowMs;
+  });
+}
+
+// Observe a recognized rate_limited DOM outcome (the 'Too many requests'
+// modal): it is the same website throttle seen through the page, so the shared
+// cooldown covers website reads, new tab creation, and render refresh.
+async function throttleBackendApiGateFromRateLimit(recipe, nowMs = Date.now()) {
+  return throttleBackendApiGate(recipe, CHATGPT_RATE_LIMITED_COOLDOWN_MS, nowMs);
+}
+
+// True while the profile-wide 429 cooldown holds. Tab creation and render
+// refresh consult this so those paths cannot keep generating traffic while
+// website reads wait.
+async function backendApiGateThrottled(recipe, nowMs = Date.now()) {
+  return withBackendApiGateMutex(async () => {
+    const state = await readBackendApiGateState(recipe);
+    return state.throttle_until_ms > nowMs;
+  });
+}
+
 async function maybeBackendApiExtractionForJob(job, domExtraction) {
   const completion = adapterForJob(job).completion;
   if (!completion.supportsBackendApiFallback || job?.backend_api_disabled) {
@@ -3964,15 +4195,45 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
   const now = Date.now();
   const lastFetchAt = Number(job.backend_api_last_fetch_at ?? 0);
   const confirmation = job.backend_api_confirmation;
+  // Fast (5s) confirmation is allowed only for the one early confirmation per
+  // ordinary cycle. After that early confirmation (or after a node change that
+  // returned us to ordinary cadence), the confirmation object stays but its
+  // fast path is spent: we fall back to the ordinary per-job cooldown.
+  const earlyConfirmationEligible = Boolean(confirmation && !confirmation.early_confirmation_used);
   const confirmationDue = Boolean(
-    confirmation
+    earlyConfirmationEligible
     && now - Number(confirmation.observed_at ?? 0) >= BACKEND_API_CONFIRMATION_MS
   );
-  if ((confirmation && !confirmationDue)
-      || (!confirmation && now - lastFetchAt < BACKEND_API_FETCH_COOLDOWN_MS)) {
+  const ordinaryReadDue = (!confirmation || !earlyConfirmationEligible)
+    ? now - lastFetchAt >= BACKEND_API_FETCH_COOLDOWN_MS
+    : false;
+  if ((earlyConfirmationEligible && !confirmationDue)
+      || (!earlyConfirmationEligible && !ordinaryReadDue)) {
     return job.backend_api_pending
       ? backendApiPendingExtraction(domExtraction, null)
       : null;
+  }
+  // Profile-scoped shared gate (yz-5bd): acquire an in-flight read lease that
+  // spans the whole auth+conversation operation and error handling, so a read
+  // lasting over the min gap cannot overlap another job. A job that cannot
+  // acquire (gate throttled, another read in flight, or spacing not elapsed)
+  // skips WITHOUT being charged as if it fetched; its pending state holds the
+  // DOM bar exactly as today. Finality semantics are unchanged: pending keeps
+  // blocking DOM completion until the positive anchor is re-proven or the run
+  // deadline ends the wait honestly.
+  const acquired = await acquireBackendApiReadLease(adapterRecipeKey(job), now);
+  if (!acquired.ok) {
+    return job.backend_api_pending
+      ? backendApiPendingExtraction(domExtraction, null)
+      : null;
+  }
+  // Mark the early confirmation as used at fetch time so a subsequent node
+  // change cannot re-arm another fast confirmation this cycle (yz-5bd blocker 2).
+  if (earlyConfirmationEligible && confirmationDue && confirmation) {
+    job.backend_api_confirmation = {
+      ...confirmation,
+      early_confirmation_used: true
+    };
   }
   job.backend_api_last_fetch_at = now;
   job.updated_at = now;
@@ -4005,13 +4266,25 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
       });
     }
     if (!confirmation || String(confirmation.node_id ?? "") !== nodeId) {
-      job.backend_api_confirmation = { node_id: nodeId, observed_at: Date.now() };
+      // A fresh node that differs from the one we already saw (or the first
+      // fresh node): observe it and wait for one early confirmation read at
+      // the 5s cadence. After that one early confirmation, a *still-different*
+      // node does NOT re-arm another fast confirmation — finality stays
+      // pending and we return to the ordinary 60s cadence (yz-5bd blocker 2).
+      const earlyConfirmationAlreadyUsed = Boolean(confirmation?.early_confirmation_used);
+      job.backend_api_confirmation = {
+        node_id: nodeId,
+        observed_at: Date.now(),
+        early_confirmation_used: earlyConfirmationAlreadyUsed
+      };
       job.backend_api_pending = true;
       job.updated_at = Date.now();
       await persistJob(job);
       return backendApiPendingExtraction(domExtraction, {
         ...normalized,
-        backend_api_detail: `awaiting confirmation of backend answer node ${nodeId}`
+        backend_api_detail: earlyConfirmationAlreadyUsed
+          ? `backend answer node ${nodeId} changed after the early confirmation; returning to ordinary cadence without DOM finality`
+          : `awaiting confirmation of backend answer node ${nodeId}`
       });
     }
     job.backend_api_confirmation = null;
@@ -4022,6 +4295,38 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
   } catch (error) {
     if (!completion.isBackendApiFallbackError(error)) {
       throw error;
+    }
+    if (error?.code === "backend_api_throttled") {
+      // The website told us we are making requests too quickly: widen the
+      // shared gate for ALL jobs in this profile (Retry-After is the floor,
+      // our 60/120/240s fallback policy with lengthening jitter otherwise),
+      // and LATCH this job pending so a later denied gate cannot let DOM
+      // finality through. No disable, no DOM-only downgrade — the run
+      // deadline remains the honest end of the wait.
+      const waitMs = await throttleBackendApiGate(
+        adapterRecipeKey(job),
+        Number(error?.retry_after_ms ?? 0),
+        Date.now()
+      );
+      job.backend_api_confirmation = null;
+      job.backend_api_pending = true;
+      job.updated_at = Date.now();
+      await persistJob(job);
+      postNative(progress(job, "backend_api_throttled", {
+        http_status: 429,
+        endpoint_category: error?.endpoint_category ?? "conversation",
+        retry_after_ms: Number(error?.retry_after_ms ?? 0) || 0,
+        cooldown_ms: Math.max(0, Math.round(waitMs)),
+        message: `ChatGPT website throttled backend reads (429); pausing website reads for this Chrome profile for ${formatDurationForMessage(Math.max(0, Math.round(waitMs)))}`
+      }));
+      return backendApiPendingExtraction(domExtraction, {
+        method: "backend_api",
+        text: "",
+        is_generating: true,
+        node_fresh: false,
+        conversation_id: conversationId,
+        backend_api_detail: error?.message ?? "backend_api_throttled"
+      });
     }
     if (job.backend_api_pending) {
       // Do not silently downgrade to DOM finality after the backend has already
@@ -4050,7 +4355,18 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
     job.updated_at = Date.now();
     await persistJob(job);
     return null;
+  } finally {
+    // The in-flight read lease spans the whole operation including error
+    // handling (yz-5bd blocker 1). Release it last so a slow read can never
+    // overlap another job in this profile. This never clears a throttle.
+    await releaseBackendApiReadLease(acquired.lease);
   }
+}
+
+// The gate is keyed by recipe (chatgpt vs claude) because the two sites have
+// separate website rate budgets even when the browser profile is shared.
+function adapterRecipeKey(job) {
+  return String(job?.recipe ?? "chatgpt").trim() || "chatgpt";
 }
 
 function backendApiPendingExtraction(domExtraction, backendExtraction) {
@@ -4353,6 +4669,31 @@ async function refreshFrozenRender(job, extraction, stableForMs, continuationEpo
     extraction_method: extraction?.method ?? "none",
     message: `refreshing owned ${adapter.displayName} conversation render after idle short response stayed frozen for ${formatDurationForMessage(stableForMs)}`
   }));
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
+  // Profile-wide 429 cooldown (yz-5bd): a render refresh is a full page
+  // navigation with its normal startup request burst, so while the shared
+  // throttle holds in this profile the refresh waits instead of adding
+  // traffic on top of throttled reads. Bounded by the job's own response
+  // wait deadline; at expiry the refresh is skipped (NOT navigated) and the
+  // response wait loop ends honestly at its deadline.
+  const responseDeadlineMs = Number(job.response_wait_started_at ?? job.started_at ?? Date.now())
+    + Math.max(0, responseWaitTimeoutMs(job));
+  while (await backendApiGateThrottled(adapterRecipeKey(job))) {
+    if (!jobContinuationIsLive(job, continuationEpoch)) {
+      return;
+    }
+    if (Date.now() >= responseDeadlineMs) {
+      postNative(progress(job, "render_refresh_skipped_throttled", {
+        tab_id: job.tab_id,
+        cooldown_remaining_ms: 0,
+        message: `skipped render refresh: ChatGPT website throttle still active at the response deadline; not navigating while the profile cooldown holds`
+      }));
+      return;
+    }
+    await sleep(1000);
+  }
   if (!jobContinuationIsLive(job, continuationEpoch)) {
     return;
   }

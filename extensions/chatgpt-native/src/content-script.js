@@ -1234,7 +1234,10 @@ function errorResponse(error) {
     "current_pathname",
     "surface_failure_reason",
     "surface_state",
-    "surface_observed_values"
+    "surface_observed_values",
+    "http_status",
+    "endpoint_category",
+    "retry_after_ms"
   ]) {
     if (error?.[key] !== undefined) {
       response[key] = error[key];
