@@ -571,7 +571,8 @@ async function extractJobResponse(job, blockingContext = null) {
     classifyWaitManualHandoff,
     extractResponse,
     manualHandoffContext,
-    parseOwnedWindowName
+    parseOwnedWindowName,
+    rateLimitedHandoff
   } = await domHelpers(job);
   assertJobOwnership(job, parseOwnedWindowName, { adapter });
   const blockingDetail = blockingContext === "pre_send_baseline"
@@ -615,11 +616,8 @@ async function extractJobResponse(job, blockingContext = null) {
   // answer) as non-final diagnostics. Do NOT downgrade pending backend anchors
   // or accept diagnostic snippets as final (yz-5bd).
   let waitHandoff = handoff;
-  if (!waitHandoff && adapter.recipe === "chatgpt") {
-    const { rateLimitedHandoff } = await domHelpers(job);
-    if (typeof rateLimitedHandoff === "function") {
-      waitHandoff = rateLimitedHandoff(document);
-    }
+  if (!waitHandoff && adapter.recipe === "chatgpt" && typeof rateLimitedHandoff === "function") {
+    waitHandoff = rateLimitedHandoff(document);
   }
   return {
     ...extraction,

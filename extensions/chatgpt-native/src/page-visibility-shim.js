@@ -28,6 +28,20 @@
     define("visibilityState", "visible");
     define("webkitHidden", false);
     define("webkitVisibilityState", "visible");
+
+    // Parse a CSS margin shorthand (e.g. "0px 0px 100px 0px") into px values.
+    // Used by the synthetic IntersectionObserver to respect rootMargin.
+    function parseRootMargin(value) {
+      const parts = String(value ?? "0px").trim().split(/\s+/);
+      const nums = parts.map((p) => parseFloat(p) || 0);
+      // CSS shorthand: 1=val, 2=v h, 3=t h b, 4=t r b l
+      let top, right, bottom, left;
+      if (nums.length === 1) { top = right = bottom = left = nums[0]; }
+      else if (nums.length === 2) { top = bottom = nums[0]; right = left = nums[1]; }
+      else if (nums.length === 3) { top = nums[0]; right = left = nums[1]; bottom = nums[2]; }
+      else { top = nums[0]; right = nums[1]; bottom = nums[2]; left = nums[3]; }
+      return { top, right, bottom, left };
+    }
     const swallow = (event) => event.stopImmediatePropagation();
     window.addEventListener("visibilitychange", swallow, true);
     document.addEventListener("visibilitychange", swallow, true);
@@ -107,6 +121,9 @@
           observerCallbacks.set(this, callback);
           observerTargets.set(this, new Set());
           observerDelivered.set(this, new WeakSet());
+          // Parse rootMargin at construction so synthetic entries respect the
+          // observer's effective root rectangle (yz-5bd).
+          this._yoetzParsedRootMargin = parseRootMargin(init?.rootMargin);
         }
         observe(target) {
           super.observe(target);
@@ -126,31 +143,67 @@
             // history pagination trigger below the fold) must NOT receive a
             // positive intersection, which could trigger extra history loads
             // in a hidden tab (yz-5bd).
-            const rootElement = this.root ?? null;
-            const rootRect = rootElement
-              ? (rootElement.getBoundingClientRect?.() ?? null)
-              : { x: 0, y: 0, top: 0, left: 0, width: window.innerWidth, height: window.innerHeight, right: window.innerWidth, bottom: window.innerHeight };
-            const intersectionRect = rootRect
-              ? {
-                  x: Math.max(rect.x, rootRect.x),
-                  y: Math.max(rect.y, rootRect.y),
-                  top: Math.max(rect.top, rootRect.top),
-                  left: Math.max(rect.left, rootRect.left),
-                  right: Math.min(rect.right, rootRect.right),
-                  bottom: Math.min(rect.bottom, rootRect.bottom)
-                }
-              : { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0 };
-            intersectionRect.width = Math.max(0, intersectionRect.right - intersectionRect.left);
-            intersectionRect.height = Math.max(0, intersectionRect.bottom - intersectionRect.top);
-            const isIntersecting = intersectionRect.width > 0 && intersectionRect.height > 0;
-            const targetArea = Math.max(1, rect.width * rect.height);
-            const intersectionArea = intersectionRect.width * intersectionRect.height;
-            const intersectionRatio = isIntersecting ? Math.min(1, intersectionArea / targetArea) : 0;
-            const viewport = {
+            //
+            // Intersection status is independent of positive intersection area:
+            // a zero-height element or edge-contact target is still
+            // "intersecting" per the W3C spec. We compute status from the
+            // overlap interval (>= 0), not from positive area (> 0).
+            const viewportRect = {
               x: 0, y: 0, top: 0, left: 0,
               width: window.innerWidth, height: window.innerHeight,
               right: window.innerWidth, bottom: window.innerHeight
             };
+            // Resolve the effective root rect. root can be null (viewport),
+            // an Element, or a Document. A Document root uses the viewport.
+            const root = this.root ?? null;
+            let rootRect;
+            if (root === null) {
+              rootRect = viewportRect;
+            } else if (root.nodeType === 9) { // Document.DOCUMENT_NODE
+              rootRect = viewportRect;
+            } else {
+              rootRect = root.getBoundingClientRect?.() ?? null;
+            }
+            // Apply rootMargin (parsed from this.rootMargin at construction).
+            const margin = this._yoetzParsedRootMargin ?? { top: 0, right: 0, bottom: 0, left: 0 };
+            if (rootRect && (margin.top || margin.right || margin.bottom || margin.left)) {
+              rootRect = {
+                ...rootRect,
+                top: rootRect.top - margin.top,
+                left: rootRect.left - margin.left,
+                right: rootRect.right + margin.right,
+                bottom: rootRect.bottom + margin.bottom
+              };
+            }
+            let intersectionRect;
+            let isIntersecting;
+            if (!rootRect) {
+              intersectionRect = { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+              isIntersecting = false;
+            } else {
+              const ix = Math.max(rect.left ?? rect.x ?? 0, rootRect.left);
+              const iy = Math.max(rect.top ?? rect.y ?? 0, rootRect.top);
+              const ir = Math.min(rect.right ?? (rect.x + rect.width) ?? 0, rootRect.right);
+              const ib = Math.min(rect.bottom ?? (rect.y + rect.height) ?? 0, rootRect.bottom);
+              // Intersection status: intervals overlap (>= 0), independent of
+              // positive area. A zero-height element at a valid position is
+              // still intersecting per spec.
+              const xOverlap = ir - ix;
+              const yOverlap = ib - iy;
+              isIntersecting = xOverlap >= 0 && yOverlap >= 0;
+              const cw = Math.max(0, xOverlap);
+              const ch = Math.max(0, yOverlap);
+              // Per spec: when not intersecting, intersectionRect is all zeros.
+              intersectionRect = isIntersecting
+                ? { x: ix, y: iy, top: iy, left: ix, right: ir, bottom: ib, width: cw, height: ch }
+                : { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 };
+            }
+            // Compute ratio without corrupting subpixel denominators.
+            const targetArea = rect.width * rect.height;
+            const intersectionArea = intersectionRect.width * intersectionRect.height;
+            const intersectionRatio = targetArea > 0
+              ? Math.min(1, intersectionArea / targetArea)
+              : (isIntersecting ? 1 : 0);
             try {
               observerCallbacks.get(this)?.call(this, [{
                 target,
@@ -158,8 +211,8 @@
                 intersectionRatio,
                 time: performance.now(),
                 boundingClientRect: rect,
-                intersectionRect: isIntersecting ? intersectionRect : { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 },
-                rootBounds: rootElement ? rootRect : viewport
+                intersectionRect,
+                rootBounds: rootRect ?? null
               }], this);
             } catch {
               // A throwing observer callback must not break the shim.

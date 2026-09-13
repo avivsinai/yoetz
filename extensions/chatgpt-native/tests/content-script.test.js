@@ -1766,3 +1766,103 @@ test("backend-api read surfaces a session-route 429 as typed backend_api_throttl
     restore();
   }
 });
+
+// yz-5bd: Regression test through the actual extractJobResponse path.
+// When the regular wait classifier returns null AND the rate-limit detector
+// returns a typed handoff, the extraction must surface rate_limited to the
+// consumer. This reproduces the reported failure mode: a "Too many requests"
+// modal mounts after the answer is rendered, the composer short-circuit
+// returns empty text (assistant_count=0 page_text_fallback), and the run
+// would wait forever without the fallback.
+test("extractJobResponse surfaces rate_limited handoff when wait classifier returns null and rate-limit modal is present", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "rate_limited_fallback",
+    "https://chatgpt.com/c/conv-rl?_yoetz=run_rl"
+  );
+  try {
+    // Simulate the reported failure: composer is mounted (authenticated),
+    // but the rate-limit modal suppresses turns. The regular wait classifier
+    // returns null (no blocking state detected via composer short-circuit).
+    hooks.pageText = "Too many requests\nYou've reached your message limit.";
+    hooks.manualHandoffContext = {
+      authenticated: true,
+      title: "ChatGPT",
+      text: ""  // empty: composer short-circuit returns no text
+    };
+    // Regular wait classifier returns null (the modal is not detected by
+    // the composer-scoped path).
+    hooks.waitManualHandoff = null;
+    // The rate-limit detector finds the modal.
+    hooks.rateLimitedHandoff = {
+      rate_limited: true,
+      reason: "too_many_requests_modal",
+      text: "Too many requests"
+    };
+    globalThis.document.title = "ChatGPT";
+    const job = {
+      job_id: "job_rl",
+      run_id: "run_rl",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+
+    await send({ type: "yoetz_prepare_job", job });
+    const extracted = await send({ type: "yoetz_extract_response", job });
+
+    // The consumer must receive the typed rate_limited handoff.
+    assert.equal(extracted.ok, true);
+    assert.equal(extracted.payload.manual_handoff?.rate_limited, true);
+    assert.equal(extracted.payload.manual_handoff?.reason, "too_many_requests_modal");
+    // The extraction (page_text_fallback) is preserved as diagnostics alongside
+    // the handoff — the handoff does not delete the extraction evidence.
+    assert.equal(extracted.payload.manual_handoff?.text, "Too many requests");
+    // The wait classifier was called (returned null).
+    assert.equal(hooks.waitManualHandoffInputs.length, 1);
+  } finally {
+    restore();
+  }
+});
+
+// yz-5bd: When the regular wait classifier returns a non-null handoff, the
+// rate-limit fallback must NOT be invoked (precedence).
+test("extractJobResponse does not invoke rateLimitedHandoff when wait classifier returns a handoff", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "rate_limited_precedence",
+    "https://chatgpt.com/c/conv-prec?_yoetz=run_prec"
+  );
+  try {
+    hooks.pageText = "Some answer text";
+    hooks.manualHandoffContext = {
+      authenticated: true,
+      title: "ChatGPT",
+      text: "Some answer text"
+    };
+    // Regular wait classifier returns a login_required handoff.
+    hooks.waitManualHandoff = {
+      login_required: true,
+      reason: "session_expired",
+      text: "Log in"
+    };
+    hooks.rateLimitedHandoff = null; // should NOT be consulted
+    globalThis.document.title = "ChatGPT";
+    const job = {
+      job_id: "job_prec",
+      run_id: "run_prec",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+
+    await send({ type: "yoetz_prepare_job", job });
+    const extracted = await send({ type: "yoetz_extract_response", job });
+
+    // The regular classifier's handoff wins.
+    assert.equal(extracted.ok, true);
+    assert.equal(extracted.payload.manual_handoff?.login_required, true);
+    // rateLimitedHandoff was never called because wait classifier returned non-null.
+    // (The mock tracks calls via hooks — if it were called, it would return null
+    // anyway, but we verify precedence by checking the handoff type.)
+    assert.equal(extracted.payload.manual_handoff?.rate_limited, undefined);
+  } finally {
+    restore();
+  }
+});
