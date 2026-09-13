@@ -571,7 +571,8 @@ async function extractJobResponse(job, blockingContext = null) {
     classifyWaitManualHandoff,
     extractResponse,
     manualHandoffContext,
-    parseOwnedWindowName
+    parseOwnedWindowName,
+    rateLimitedHandoff
   } = await domHelpers(job);
   assertJobOwnership(job, parseOwnedWindowName, { adapter });
   const blockingDetail = blockingContext === "pre_send_baseline"
@@ -605,9 +606,22 @@ async function extractJobResponse(job, blockingContext = null) {
     text: handoffContext.text,
     extraction
   });
+  // A "Too many requests" modal can mount during wait_response AFTER the
+  // answer is rendered. The composer short-circuit in manualHandoffContext can
+  // miss the modal when a transcript is present, so re-check with
+  // rateLimitedHandoff which scans surfaces + body without the short-circuit.
+  // This is a ChatGPT-specific function; guard availability so Claude and any
+  // other recipe without it are unaffected. Surface the typed rate_limited
+  // handoff so the run cannot wait forever; preserve the extraction (partial
+  // answer) as non-final diagnostics. Do NOT downgrade pending backend anchors
+  // or accept diagnostic snippets as final (yz-5bd).
+  let waitHandoff = handoff;
+  if (!waitHandoff && adapter.recipe === "chatgpt" && typeof rateLimitedHandoff === "function") {
+    waitHandoff = rateLimitedHandoff(document);
+  }
   return {
     ...extraction,
-    manual_handoff: handoff,
+    manual_handoff: waitHandoff,
     url: location.href,
     conversation_id: conversationId
   };
