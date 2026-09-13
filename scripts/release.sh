@@ -217,6 +217,12 @@ while IFS= read -r SKILL_MD; do
   fi
 done < <(find skills -mindepth 2 -maxdepth 2 -name SKILL.md | sort)
 
+# Update local workspace entries in Cargo.lock without touching registry deps.
+# This MUST run unconditionally (even with --skip-verify) so the lock file's
+# yoetz/yoetz-core versions match the bumped Cargo.toml without a broad
+# registry update (yz-5bd).
+cargo update --workspace --offline
+
 if [[ "$skip_verify" -eq 0 ]]; then
   cargo check --workspace
   cargo test --workspace

@@ -75,6 +75,21 @@ else:
     if not re.search(pattern, text):
         mismatches.append(("CHANGELOG.md", "<missing release heading>"))
 
+# Cargo.lock local workspace packages must match the release version (yz-5bd).
+# This catches stale local versions that fail --locked builds.
+cargo_lock = pathlib.Path("Cargo.lock")
+if not cargo_lock.exists():
+    mismatches.append(("Cargo.lock", "<missing>"))
+else:
+    lock_text = cargo_lock.read_text()
+    for pkg in ("yoetz", "yoetz-core"):
+        pattern = rf'(?m)^name = "{re.escape(pkg)}"\nversion = "([^"]+)"'
+        match = re.search(pattern, lock_text)
+        if not match:
+            mismatches.append((f"Cargo.lock:{pkg}", "<missing package>"))
+        elif match.group(1) != version:
+            mismatches.append((f"Cargo.lock:{pkg}", match.group(1)))
+
 if mismatches:
     print(f"release metadata version mismatch for {version}:")
     for path, actual in mismatches:
