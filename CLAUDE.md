@@ -158,6 +158,17 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   tabs. ChatGPT rate-limits accounts that open many automation tabs quickly
   ("Too many requests" modal) and it surfaces as composer/surface not found,
   so pace live verification runs.
+- The "Too many requests" modal is a conversation-HISTORY read limit, not a
+  message or model quota: it says access to your conversations is limited, it
+  mounts on a freshly loaded tab before any send, and it suppresses the whole
+  conversation surface, so an account can hold Pro and still be walled. Every
+  page load is a history read, so probing whether the limit has cleared is
+  itself the thing that sustains it. A typed `rate_limited` is a HARD STOP that
+  ends the loop and asks a human — never a backoff-and-retry condition. A
+  watchdog keyed on "the run produced no text" cannot tell this modal from a
+  hang, because the modal produces exactly no text; key the stop on the typed
+  error instead. Repeated retries against a fail-closed `model_selection` are
+  how the limit latches, and once latched it can outlast hours of quiet.
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
 - Extension-free by default. Preferred live-Chrome transport order:
