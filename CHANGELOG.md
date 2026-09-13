@@ -6,6 +6,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- ChatGPT web recipe: when the "Too many requests" modal mounts after the
+  answer is already rendered, the run now dismisses the modal's "Got it"
+  control once (gesture-only), polls for the dialog to unmount within a bounded
+  window, then continues into the normal finality legs — recovering the
+  already-paid-for answer without lifting the server-side throttle. The
+  profile cooldown stays armed, and `rate_limit_modal_dismissed` is carried in
+  the result. A modal on a fresh tab (before any send) still fails closed as
+  `rate_limited` and now arms the profile cooldown immediately instead of
+  failing with an opaque `model_selection` error. (`yz-83b`)
 
 ## [0.5.71] - 2026-09-13
 ### Fixed

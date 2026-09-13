@@ -91,6 +91,10 @@ async function handleMessage(message) {
       return sendPrompt(message.job, message.prompt);
     case "yoetz_extract_response":
       return extractJobResponse(message.job, message.blocking_context);
+    case "yoetz_dismiss_rate_limit_modal":
+      return dismissRateLimitModalForJob(message.job);
+    case "yoetz_rate_limit_modal_state":
+      return rateLimitModalStateForJob(message.job);
     case "yoetz_fetch_conversation":
       return fetchSiteConversationAnswer(message.job, message.conversation_id, message.operation_deadline_ms);
     case "yoetz_cancel_send":
@@ -229,6 +233,7 @@ async function cancelSend(job) {
 }
 
 async function prepareJob(job) {
+  const adapter = await siteAdapter(job);
   const {
     classifyBlockingState,
     classifyManualHandoff,
@@ -236,15 +241,24 @@ async function prepareJob(job) {
     ensureFreshChat,
     manualHandoffContext,
     markOwnership,
-    ownedWindowName
+    ownedWindowName,
+    rateLimitedHandoff
   } = await domHelpers(job);
   activeJobs.delete(job.job_id);
   const handoffContext = manualHandoffContext(document);
-  const handoff = classifyManualHandoff({
+  let handoff = classifyManualHandoff({
     url: location.href,
     title: handoffContext.title,
     text: handoffContext.text
   });
+  // yz-83b: The rate-limit modal can mount on a freshly loaded tab before any
+  // send. The composer short-circuit in manualHandoffContext can miss it. If
+  // the regular classifier returns null, check for the modal explicitly so
+  // prepareJob returns a typed rate_limited handoff instead of proceeding with
+  // a blocked tab (which would fail at model_selection with an opaque error).
+  if (!handoff && adapter.recipe === "chatgpt" && typeof rateLimitedHandoff === "function") {
+    handoff = rateLimitedHandoff(document);
+  }
   const conversationId = conversationIdForJob(job);
   if (!handoff && conversationId) {
     assertUrlRunMarker(job);
@@ -562,6 +576,29 @@ async function sendPrompt(job, prompt) {
       }
       : {})
   };
+}
+
+// yz-83b: Dismiss the 'Too many requests' modal by clicking its 'Got it'
+// button. The modal has hidden an already-rendered answer; dismissing it
+// once makes the answer readable. Fail-closed: returns null if no open dialog
+// is found or the click does not dismiss it. The service worker re-extracts
+// after this returns and treats the result as proof, not the click itself.
+async function dismissRateLimitModalForJob(job) {
+  const { dismissRateLimitModal } = await domHelpers(job);
+  if (typeof dismissRateLimitModal !== "function") {
+    return null;
+  }
+  return dismissRateLimitModal(document);
+}
+
+// yz-83b: Read-only check whether the rate-limit modal is still open. The SW
+// polls this after the dismiss gesture with a bounded window before re-extracting.
+async function rateLimitModalStateForJob(job) {
+  const { rateLimitModalOpen } = await domHelpers(job);
+  if (typeof rateLimitModalOpen !== "function") {
+    return { open: false };
+  }
+  return { open: rateLimitModalOpen(document) };
 }
 
 async function extractJobResponse(job, blockingContext = null) {

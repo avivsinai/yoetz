@@ -14,7 +14,9 @@ import {
   normalizeText,
   ownedWindowName,
   parseOwnedWindowName,
-  rateLimitedHandoff
+  rateLimitedHandoff,
+  dismissRateLimitModal,
+  rateLimitModalOpen
 } from "../src/chatgpt-dom.js";
 import { chatgptSiteAdapter } from "../src/sites/chatgpt.js";
 import { claudeSiteAdapter } from "../src/sites/claude.js";
@@ -613,4 +615,211 @@ test("rateLimitedHandoff does not false-positive on conversation content quoting
   // turns are present (hasConversationResidue gates the body scan), so quoted
   // error wording in an answer does not produce a false rate_limited handoff.
   assert.equal(handoff, null, "quoted error text in conversation content must not produce rate_limited");
+});
+
+// yz-83b: The dismiss locator must find the 'Got it' control inside
+// [role=dialog][data-state=open] and nothing else.
+test("dismissRateLimitModal finds the Got it button inside the open dialog", () => {
+  // Build the captured modal shape: [role=dialog][data-state=open] containing
+  // 'Too many requests' text and a 'Got it' button.
+  const dialogAttrs = { role: "dialog", "data-state": "open" };
+  const dialog = visibleElement(dialogAttrs);
+  dialog.setAttribute = (name, value) => { dialogAttrs[name] = value; };
+  dialog.innerText = "Too many requests — We've temporarily limited access to your conversations to protect your data. Please wait a few minutes before trying again.";
+  dialog.textContent = dialog.innerText;
+
+  const gotItButton = visibleElement({ tag: "BUTTON" });
+  gotItButton.innerText = "Got it";
+  gotItButton.textContent = "Got it";
+  gotItButton.click = () => { dialog.setAttribute("data-state", "closed"); };
+  dialog.appendChild = (child) => { dialog.children = [...(dialog.children || []), child]; };
+  dialog.children = [gotItButton];
+  dialog.querySelector = (sel) => {
+    if (sel.includes("button") || sel === "*") return gotItButton;
+    return null;
+  };
+  dialog.querySelectorAll = (sel) => {
+    if (sel.includes("button") || sel === "*") return [gotItButton];
+    return [];
+  };
+
+  const otherButton = visibleElement({ tag: "BUTTON" });
+  otherButton.innerText = "Send";
+  otherButton.textContent = "Send";
+
+  // After the click, the dialog's data-state changes to "closed", so the
+  // querySelectorAll for [role="dialog"][data-state="open"] must return empty.
+  // Use a dynamic querySelectorAll that checks the dialog's current state.
+  const root = selectorRoot(new Map([
+    ["button", [gotItButton, otherButton]]
+  ]));
+  root.querySelectorAll = (sel) => {
+    if (sel === '[role="dialog"][data-state="open"]') {
+      return dialog.getAttribute("data-state") === "open" ? [dialog] : [];
+    }
+    return [];
+  };
+  root.title = "ChatGPT";
+  root.body = { innerText: dialog.innerText, textContent: dialog.innerText };
+  root.defaultView = { location: { href: "https://chatgpt.com/c/conv-83b?_yoetz=run_83b", pathname: "/c/conv-83b" } };
+
+  const result = dismissRateLimitModal(root);
+  assert.notEqual(result, null, "dismiss locator must find the Got it button");
+  assert.equal(result.clicked, true, "gesture was performed");
+  assert.equal(result.control_text, "Got it");
+});
+
+// yz-83b: rateLimitModalOpen returns true when the dialog is open, false after.
+test("rateLimitModalOpen returns true when dialog is open, false when closed", () => {
+  const dialogAttrs = { role: "dialog", "data-state": "open" };
+  const dialog = visibleElement(dialogAttrs);
+  dialog.setAttribute = (name, value) => { dialogAttrs[name] = value; };
+  dialog.innerText = "Too many requests";
+  dialog.textContent = dialog.innerText;
+  const root = {
+    querySelectorAll: (sel) => {
+      if (sel === '[role="dialog"][data-state="open"]') {
+        return dialogAttrs["data-state"] === "open" ? [dialog] : [];
+      }
+      return [];
+    }
+  };
+  assert.equal(rateLimitModalOpen(root), true, "modal is open");
+  dialog.setAttribute("data-state", "closed");
+  assert.equal(rateLimitModalOpen(root), false, "modal is closed");
+});
+
+// yz-83b: The dismiss locator returns null when no open dialog is present.
+test("dismissRateLimitModal returns null when no open dialog is present", () => {
+  const root = selectorRoot(new Map([]));
+  root.title = "ChatGPT";
+  root.body = { innerText: "", textContent: "" };
+  root.defaultView = { location: { href: "https://chatgpt.com/c/conv-none?_yoetz=run_none", pathname: "/c/conv-none" } };
+  const result = dismissRateLimitModal(root);
+  assert.equal(result, null, "no open dialog means no dismiss");
+});
+
+// yz-83b: The dismiss locator does NOT match a closed dialog.
+test("dismissRateLimitModal returns null when dialog has data-state=closed", () => {
+  const closedDialog = visibleElement({ role: "dialog", "data-state": "closed" });
+  closedDialog.innerText = "Too many requests";
+  closedDialog.textContent = closedDialog.innerText;
+  closedDialog.querySelector = () => null;
+  closedDialog.querySelectorAll = () => [];
+
+  const root = selectorRoot(new Map([
+    ['[role="dialog"][data-state="open"]', []],
+    ['[role="dialog"]', [closedDialog]]
+  ]));
+  root.title = "ChatGPT";
+  root.body = { innerText: "", textContent: "" };
+  root.defaultView = { location: { href: "https://chatgpt.com/", pathname: "/" } };
+  const result = dismissRateLimitModal(root);
+  assert.equal(result, null, "closed dialog must not be dismissed");
+});
+
+// yz-83b: When the 'Got it' control is not a <button> or [role="button"],
+// the fallback finds the DEEPEST element whose own text is 'got it'.
+test("dismissRateLimitModal fallback finds deepest 'Got it' element when no button exists", () => {
+  const dialogAttrs = { role: "dialog", "data-state": "open" };
+  const dialog = visibleElement(dialogAttrs);
+  dialog.setAttribute = (name, value) => { dialogAttrs[name] = value; };
+  dialog.innerText = "Too many requests\nGot it";
+  dialog.textContent = dialog.innerText;
+
+  // Outer wrapper and inner leaf — both have textContent 'Got it'
+  const outer = visibleElement({});
+  outer.innerText = "Got it";
+  outer.textContent = "Got it";
+  outer.click = () => { dialog.setAttribute("data-state", "closed"); };
+  const inner = visibleElement({});
+  inner.innerText = "Got it";
+  inner.textContent = "Got it";
+  inner.click = () => { dialog.setAttribute("data-state", "closed"); };
+
+  // querySelectorAll returns in document order: outer first, inner second
+  dialog.querySelectorAll = (sel) => {
+    if (sel === "button, [role=\"button\"]") return [];
+    if (sel === "*") return [outer, inner];
+    return [];
+  };
+  dialog.querySelector = (sel) => {
+    if (sel === '[role="dialog"][data-state="open"]') return dialogAttrs["data-state"] === "open" ? dialog : null;
+    return null;
+  };
+
+  const root = {
+    querySelectorAll: (sel) => {
+      if (sel === '[role="dialog"][data-state="open"]') {
+        return dialogAttrs["data-state"] === "open" ? [dialog] : [];
+      }
+      return [];
+    }
+  };
+  root.title = "ChatGPT";
+  root.body = { innerText: dialog.innerText, textContent: dialog.innerText };
+  root.defaultView = { location: { href: "https://chatgpt.com/", pathname: "/" } };
+
+  const result = dismissRateLimitModal(root);
+  assert.notEqual(result, null, "fallback must find the Got it control");
+  assert.equal(result.clicked, true, "gesture was performed");
+  assert.equal(result.control_text, "Got it");
+});
+
+// yz-83b: When two dialogs are open, dismissRateLimitModal must pick the one
+// whose text matches /too many requests/i, even if it is second in document
+// order. After it closes, rateLimitModalOpen returns false while the other
+// dialog stays open.
+test("dismissRateLimitModal picks the rate-limit dialog when multiple dialogs are open", () => {
+  const shareDialogAttrs = { role: "dialog", "data-state": "open" };
+  const shareDialog = visibleElement(shareDialogAttrs);
+  shareDialog.innerText = "Share conversation";
+  shareDialog.textContent = shareDialog.innerText;
+  shareDialog.click = () => {}; // should never be called
+
+  const rateDialogAttrs = { role: "dialog", "data-state": "open" };
+  const rateDialog = visibleElement(rateDialogAttrs);
+  rateDialog.setAttribute = (name, value) => { rateDialogAttrs[name] = value; };
+  rateDialog.innerText = "Too many requests. Please wait a few minutes before trying again.";
+  rateDialog.textContent = rateDialog.innerText;
+
+  const gotItButton = visibleElement({ tag: "BUTTON" });
+  gotItButton.innerText = "Got it";
+  gotItButton.textContent = "Got it";
+  gotItButton.click = () => { rateDialog.setAttribute("data-state", "closed"); };
+  rateDialog.querySelectorAll = (sel) => {
+    if (sel.includes("button")) return [gotItButton];
+    if (sel === "*") return [gotItButton];
+    return [];
+  };
+
+  // shareDialog has no buttons
+  shareDialog.querySelectorAll = () => [];
+
+  const root = {
+    querySelectorAll: (sel) => {
+      if (sel === '[role="dialog"][data-state="open"]') {
+        // shareDialog first, rateDialog second (rate-limit is second in doc order)
+        const open = [];
+        if (shareDialogAttrs["data-state"] === "open") open.push(shareDialog);
+        if (rateDialogAttrs["data-state"] === "open") open.push(rateDialog);
+        return open;
+      }
+      return [];
+    }
+  };
+  root.title = "ChatGPT";
+  root.body = { innerText: "", textContent: "" };
+  root.defaultView = { location: { href: "https://chatgpt.com/", pathname: "/" } };
+
+  // Dismiss must find the rate-limit dialog (second), not the share dialog
+  const result = dismissRateLimitModal(root);
+  assert.notEqual(result, null, "must find the rate-limit dialog");
+  assert.equal(result.clicked, true, "gesture was performed on the rate-limit dialog");
+  assert.equal(result.control_text, "Got it");
+
+  // After the rate-limit dialog closes, rateLimitModalOpen must return false
+  // even though the share dialog is still open.
+  assert.equal(rateLimitModalOpen(root), false, "rate-limit modal is closed, share dialog irrelevant");
+  assert.equal(shareDialogAttrs["data-state"], "open", "share dialog stays open");
 });

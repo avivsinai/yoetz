@@ -264,6 +264,93 @@ export function rateLimitedHandoff(root = document) {
   return handoff ?? null;
 }
 
+// yz-83b: Dismiss the 'Too many requests' modal by clicking its 'Got it'
+// button. The modal is [role=dialog][data-state=open] containing the rate-limit
+// text and a 'Got it' control. Dismissing removes the overlay and the inert
+// attribute on the conversation container, making the already-rendered answer
+// readable. This does NOT lift the server-side throttle.
+//
+// Fail-closed: returns null if no open dialog is found, if the dialog does not
+// contain a 'Got it' control, or if the click does not dismiss the dialog.
+// The caller must re-read [role=dialog] state after the gesture — the click is
+// never proof.
+// yz-83b: Find the rate-limit modal dialog specifically — not just any open
+// dialog. The rate-limit modal contains 'Too many requests' wording. If another
+// dialog is open (share sheet, upload dialog, survey), we must not click inside
+// it. Both dismissRateLimitModal and rateLimitModalOpen use this helper.
+function findRateLimitDialog(root = document) {
+  const openDialogs = Array.from(
+    root?.querySelectorAll?.('[role="dialog"][data-state="open"]') ?? []
+  );
+  return openDialogs.find((dialog) => {
+    const text = normalizeText(dialog.innerText ?? dialog.textContent ?? '').toLowerCase();
+    return /too many requests/.test(text);
+  }) ?? null;
+}
+
+export function dismissRateLimitModal(root = document) {
+  const dialog = findRateLimitDialog(root);
+  if (!dialog) {
+    return null;
+  }
+  // Find the 'Got it' control inside the dialog. Try button/[role=button]
+  // first (the common case). If that finds nothing, fall back to the DEEPEST
+  // element whose own text is exactly 'got it' — not the first, because
+  // querySelectorAll('*') returns in document order and every ancestor wrapper
+  // whose textContent is 'Got it' would match first.
+  //
+  // Live observation (2026-09-13, ext_937d, run 20260913T160202Z_45bf2d):
+  // The picker reader reported dialog buttons=[] but the dialog text included
+  // 'Got it'. The actual tag/attributes were not captured because the picker
+  // reader doesn't enumerate dialog children. The fallback below handles this
+  // case.
+  const buttonCandidates = Array.from(
+    dialog.querySelectorAll?.('button, [role="button"]') ?? []
+  );
+  let gotIt = buttonCandidates.find((btn) => {
+    const text = normalizeText(btn.innerText ?? btn.textContent ?? '').toLowerCase();
+    return text === 'got it' || text.startsWith('got it');
+  });
+  if (!gotIt) {
+    // Fallback: scan all elements, pick the DEEPEST (last in document order)
+    // whose own text is exactly 'got it'. This avoids clicking an outer
+    // wrapper when the actual control is a leaf element inside it.
+    const allElements = Array.from(dialog.querySelectorAll?.('*') ?? []);
+    const matches = allElements.filter((el) => {
+      const ownText = normalizeText(el.innerText ?? el.textContent ?? '').toLowerCase().trim();
+      return ownText === 'got it';
+    });
+    gotIt = matches.length > 0 ? matches[matches.length - 1] : null;
+  }
+  if (!gotIt) {
+    return null;
+  }
+  // Gesture only — do NOT re-read dialog state in the same tick. ChatGPT's
+  // dialog is Radix: click schedules a React state update; data-state flips
+  // to 'closed' on the next commit, and the node unmounts later still
+  // (Presence waits for the exit animation — in a background tab that
+  // transition never runs). A synchronous re-read always sees the dialog
+  // still open and returns null, making the dismiss a no-op live.
+  // The caller polls rateLimitModalOpen() with a bounded window after this.
+  try {
+    gotIt.click?.();
+  } catch {
+    return null;
+  }
+  return {
+    clicked: true,
+    control_text: normalizeText(gotIt.innerText ?? gotIt.textContent ?? '')
+  };
+}
+
+// yz-83b: Read-only check whether the rate-limit modal dialog is still open.
+// The SW polls this after dismissRateLimitModal with a bounded window until
+// open===false before re-extracting.
+export function rateLimitModalOpen(root = document) {
+  const dialog = findRateLimitDialog(root);
+  return Boolean(dialog);
+}
+
 export function findComposer(root = document) {
   return firstVisible(root, [
     "#prompt-textarea",

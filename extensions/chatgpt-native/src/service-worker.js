@@ -33,7 +33,9 @@ const SECURE_CONTENT_SCRIPT_COMMANDS = new Set([
   "yoetz_send_prompt",
   "yoetz_extract_response",
   "yoetz_fetch_conversation",
-  "yoetz_cancel_send"
+  "yoetz_cancel_send",
+  "yoetz_dismiss_rate_limit_modal",
+  "yoetz_rate_limit_modal_state"
 ]);
 const ADVERTISED_CAPABILITIES = Object.freeze([
   TERMINAL_ACK_CAPABILITY,
@@ -668,6 +670,13 @@ async function startJob(message) {
   }
   if (prepared.manual_handoff) {
     postNative(progress(job, "manual_handoff", prepared.manual_handoff));
+    // yz-83b: Arm the cooldown for rate_limited at prepare_job too — the modal
+    // can mount on a freshly loaded tab before any send. A modal on a fresh tab
+    // means the account is already walled; do NOT dismiss or retry — fail
+    // closed and let the cooldown clear.
+    if (prepared.manual_handoff?.state === "rate_limited") {
+      await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
+    }
     await failJob(job, "manual_handoff", prepared.manual_handoff.message, {
       state: prepared.manual_handoff.state,
       phase: "upload",
@@ -1131,7 +1140,10 @@ async function completeJobWithExtraction(job, extraction, continuationEpoch = jo
         extractionWarnings: adapter.completion.extractionWarnings?.(extraction),
         finalityAnchor,
         domOnlyFinalityWarning: CHATGPT_DOM_ONLY_FINALITY_WARNING
-      })
+      }),
+      // yz-83b: Set when the job completed after dismissing the rate-limit
+      // modal to recover an already-rendered answer. The cooldown stays armed.
+      rate_limit_modal_dismissed: job.rate_limit_modal_dismissed === true ? true : undefined,
     }
   });
   if (await cancellationFence(job) || !jobContinuationIsLive(job, continuationEpoch)) {
@@ -3539,6 +3551,80 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
       if (extraction.manual_handoff?.state === "rate_limited") {
         await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
       }
+      // yz-83b: If the rate_limit modal mounted over an already-rendered
+      // answer, attempt ONE dismiss of the 'Got it' button to recover the
+      // paid-for answer. Fail-closed constraints: wait_response only, rendered
+      // content present, one dismiss per job, click is never proof, cooldown
+      // stays armed, never pre-send, do not read /backend-api/conversation.
+      if (
+        extraction.manual_handoff?.state === "rate_limited"
+        && !job.rate_limit_modal_dismiss_attempted
+        && extractionHasRenderedContent(extraction)
+      ) {
+        job.rate_limit_modal_dismiss_attempted = true;
+        await persistJob(job);
+        let dismissResult = null;
+        try {
+          dismissResult = await sendToTab(job.tab_id, {
+            type: "yoetz_dismiss_rate_limit_modal",
+            job
+          });
+        } catch {
+          // Dismiss failed (content script error, tab gone, etc.) — fail closed.
+        }
+        if (dismissResult?.clicked) {
+          // Poll the read-only modal state with a bounded window. The dialog is
+          // Radix: data-state flips to 'closed' on the next React commit, and
+          // the node unmounts later still (Presence exit animation — in a
+          // background tab that transition never runs, so rely on the fallback).
+          // Settle pacing like the picker choreography: ~250ms steps, ~5s cap.
+          const DISMISS_SETTLE_STEP_MS = Number(globalThis.__YOETZ_DISMISS_SETTLE_STEP_MS ?? 250);
+          const DISMISS_SETTLE_CAP_MS = Number(globalThis.__YOETZ_DISMISS_SETTLE_CAP_MS ?? 5000);
+          const settleStartedAt = Date.now();
+          let modalClosed = false;
+          while (Date.now() - settleStartedAt <= DISMISS_SETTLE_CAP_MS) {
+            if (!jobContinuationIsLive(job, continuationEpoch)) {
+              return null;
+            }
+            await sleep(DISMISS_SETTLE_STEP_MS);
+            try {
+              const state = await sendToTab(job.tab_id, {
+                type: "yoetz_rate_limit_modal_state",
+                job
+              });
+              if (!state?.open) {
+                modalClosed = true;
+                break;
+              }
+            } catch {
+              // State read failed — keep polling within the cap.
+            }
+          }
+          if (modalClosed) {
+            // The modal unmounted. Clear the handoff and continue the wait loop
+            // so the normal finality legs (completion_reason, persistent-stop,
+            // final-affordance) judge the re-extraction. Do NOT complete here —
+            // there is no is_final field on extractions; finality lives in the
+            // existing wait-loop legs. Mark the job so completeJobWithExtraction
+            // carries rate_limit_modal_dismissed when it eventually completes.
+            job.rate_limit_modal_dismissed = true;
+            await persistJob(job);
+            // Do NOT fabricate a `last` observation — `last` still holds the
+            // previous honest poll and runs after this branch. Just continue.
+            continue;
+          }
+          // Modal did not close within the cap — fail closed.
+          await failJob(job, "manual_handoff", extraction.manual_handoff.message, {
+            state: extraction.manual_handoff.state,
+            phase: "wait_response",
+            side_effect_started: true,
+            terminal_status: "manual_handoff",
+            rate_limit_modal_dismissed: true,
+            diagnostics: diagnosticPayload(extraction.diagnostics)
+          });
+          return null;
+        }
+      }
       await failJob(job, "manual_handoff", extraction.manual_handoff.message, {
         state: extraction.manual_handoff.state,
         phase: "wait_response",
@@ -3984,6 +4070,21 @@ function formatDurationForMessage(ms) {
 function diagnosticSummary(diagnostics) {
   const payload = diagnosticPayload(diagnostics);
   return payload ? JSON.stringify(payload) : "none";
+}
+
+// yz-83b: Check whether the extraction diagnostics show rendered assistant
+// content — the precondition for attempting a modal dismiss. The bead says:
+// markdown_snippets non-empty, or assistant_roles > 0, or conversation_turns > 0.
+function extractionHasRenderedContent(extraction) {
+  const diagnostics = extraction?.diagnostics;
+  if (!diagnostics) {
+    return false;
+  }
+  const counts = diagnostics.counts ?? {};
+  const snippets = diagnostics.markdown_snippets ?? [];
+  return snippets.length > 0
+    || (counts.assistant_roles ?? 0) > 0
+    || (counts.conversation_turns ?? 0) > 0;
 }
 
 function diagnosticPayload(diagnostics) {
