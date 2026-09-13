@@ -621,7 +621,9 @@ test("rateLimitedHandoff does not false-positive on conversation content quoting
 test("dismissRateLimitModal finds the Got it button inside the open dialog", () => {
   // Build the captured modal shape: [role=dialog][data-state=open] containing
   // 'Too many requests' text and a 'Got it' button.
-  const dialog = visibleElement({ role: "dialog", "data-state": "open" });
+  const dialogAttrs = { role: "dialog", "data-state": "open" };
+  const dialog = visibleElement(dialogAttrs);
+  dialog.setAttribute = (name, value) => { dialogAttrs[name] = value; };
   dialog.innerText = "Too many requests — We've temporarily limited access to your conversations to protect your data. Please wait a few minutes before trying again.";
   dialog.textContent = dialog.innerText;
 
@@ -644,10 +646,18 @@ test("dismissRateLimitModal finds the Got it button inside the open dialog", () 
   otherButton.innerText = "Send";
   otherButton.textContent = "Send";
 
+  // After the click, the dialog's data-state changes to "closed", so the
+  // querySelector for [role="dialog"][data-state="open"] must return null.
+  // Use a dynamic querySelector that checks the dialog's current state.
   const root = selectorRoot(new Map([
-    ["[role='dialog'][data-state='open']", [dialog]],
     ["button", [gotItButton, otherButton]]
   ]));
+  root.querySelector = (sel) => {
+    if (sel === '[role="dialog"][data-state="open"]') {
+      return dialog.getAttribute("data-state") === "open" ? dialog : null;
+    }
+    return null;
+  };
   root.title = "ChatGPT";
   root.body = { innerText: dialog.innerText, textContent: dialog.innerText };
   root.defaultView = { location: { href: "https://chatgpt.com/c/conv-83b?_yoetz=run_83b", pathname: "/c/conv-83b" } };
@@ -677,8 +687,8 @@ test("dismissRateLimitModal returns null when dialog has data-state=closed", () 
   closedDialog.querySelectorAll = () => [];
 
   const root = selectorRoot(new Map([
-    ["[role='dialog'][data-state='open']", []],
-    ["[role='dialog']", [closedDialog]]
+    ['[role="dialog"][data-state="open"]', []],
+    ['[role="dialog"]', [closedDialog]]
   ]));
   root.title = "ChatGPT";
   root.body = { innerText: "", textContent: "" };

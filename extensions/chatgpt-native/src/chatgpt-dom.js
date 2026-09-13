@@ -264,6 +264,51 @@ export function rateLimitedHandoff(root = document) {
   return handoff ?? null;
 }
 
+// yz-83b: Dismiss the 'Too many requests' modal by clicking its 'Got it'
+// button. The modal is [role=dialog][data-state=open] containing the rate-limit
+// text and a 'Got it' control. Dismissing removes the overlay and the inert
+// attribute on the conversation container, making the already-rendered answer
+// readable. This does NOT lift the server-side throttle.
+//
+// Fail-closed: returns null if no open dialog is found, if the dialog does not
+// contain a 'Got it' control, or if the click does not dismiss the dialog.
+// The caller must re-read [role=dialog] state after the gesture — the click is
+// never proof.
+export function dismissRateLimitModal(root = document) {
+  const dialog = root?.querySelector?.('[role="dialog"][data-state="open"]');
+  if (!dialog) {
+    return null;
+  }
+  // Find the 'Got it' button inside the dialog. Match by text content to be
+  // resilient to markup changes — the control is a <button> whose visible text
+  // is 'Got it' (case-insensitive).
+  const buttons = Array.from(dialog.querySelectorAll?.('button') ?? []);
+  const gotIt = buttons.find((btn) => {
+    const text = normalizeText(btn.innerText ?? btn.textContent ?? '').toLowerCase();
+    return text === 'got it' || text.startsWith('got it');
+  });
+  if (!gotIt) {
+    return null;
+  }
+  // Click the control. The click itself is not proof — the caller re-reads
+  // dialog state after this returns.
+  try {
+    gotIt.click?.();
+  } catch {
+    return null;
+  }
+  // Verify the dialog is no longer open. If the click did not dismiss it,
+  // return null so the caller fails closed.
+  const stillOpen = root?.querySelector?.('[role="dialog"][data-state="open"]');
+  if (stillOpen) {
+    return null;
+  }
+  return {
+    dismissed: true,
+    control_text: normalizeText(gotIt.innerText ?? gotIt.textContent ?? '')
+  };
+}
+
 export function findComposer(root = document) {
   return firstVisible(root, [
     "#prompt-textarea",

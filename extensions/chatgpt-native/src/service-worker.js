@@ -1131,7 +1131,10 @@ async function completeJobWithExtraction(job, extraction, continuationEpoch = jo
         extractionWarnings: adapter.completion.extractionWarnings?.(extraction),
         finalityAnchor,
         domOnlyFinalityWarning: CHATGPT_DOM_ONLY_FINALITY_WARNING
-      })
+      }),
+      // yz-83b: Set when the job completed after dismissing the rate-limit
+      // modal to recover an already-rendered answer. The cooldown stays armed.
+      rate_limit_modal_dismissed: extraction.rate_limit_modal_dismissed === true ? true : undefined
     }
   });
   if (await cancellationFence(job) || !jobContinuationIsLive(job, continuationEpoch)) {
@@ -3539,6 +3542,50 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
       if (extraction.manual_handoff?.state === "rate_limited") {
         await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
       }
+      // yz-83b: If the rate_limit modal mounted over an already-rendered
+      // answer, attempt ONE dismiss of the 'Got it' button to recover the
+      // paid-for answer. Fail-closed constraints: wait_response only, rendered
+      // content present, one dismiss per job, click is never proof, cooldown
+      // stays armed, never pre-send, do not read /backend-api/conversation.
+      if (
+        extraction.manual_handoff?.state === "rate_limited"
+        && !job.rate_limit_modal_dismiss_attempted
+        && extractionHasRenderedContent(extraction)
+      ) {
+        job.rate_limit_modal_dismiss_attempted = true;
+        let dismissResult = null;
+        try {
+          dismissResult = await sendToTab(job.tab_id, {
+            type: "yoetz_dismiss_rate_limit_modal",
+            job
+          });
+        } catch {
+          // Dismiss failed (content script error, tab gone, etc.) — fail closed.
+        }
+        if (dismissResult?.dismissed) {
+          // Re-extract once after the dismiss. Do NOT use backend-api fallback
+          // (that is the request class being throttled).
+          const reExtraction = await extractDomResponseForJob(job);
+          if (reExtraction && !reExtraction.manual_handoff && isFinalExtraction(reExtraction)) {
+            await completeJobWithExtraction(job, {
+              ...reExtraction,
+              rate_limit_modal_dismissed: true
+            });
+            return null;
+          }
+          // Re-extraction was not final or still rate_limited — fail closed.
+          await failJob(job, "manual_handoff", extraction.manual_handoff.message, {
+            state: extraction.manual_handoff.state,
+            phase: "wait_response",
+            side_effect_started: true,
+            terminal_status: "manual_handoff",
+            rate_limit_modal_dismissed: true,
+            rate_limit_modal_dismiss_failed: true,
+            diagnostics: diagnosticPayload(reExtraction?.diagnostics ?? extraction.diagnostics)
+          });
+          return null;
+        }
+      }
       await failJob(job, "manual_handoff", extraction.manual_handoff.message, {
         state: extraction.manual_handoff.state,
         phase: "wait_response",
@@ -3986,6 +4033,31 @@ function diagnosticSummary(diagnostics) {
   return payload ? JSON.stringify(payload) : "none";
 }
 
+// yz-83b: Check whether the extraction diagnostics show rendered assistant
+// content — the precondition for attempting a modal dismiss. The bead says:
+// markdown_snippets non-empty, or assistant_roles > 0, or conversation_turns > 0.
+function extractionHasRenderedContent(extraction) {
+  const diagnostics = extraction?.diagnostics;
+  if (!diagnostics) {
+    return false;
+  }
+  const counts = diagnostics.counts ?? {};
+  const snippets = diagnostics.markdown_snippets ?? [];
+  return snippets.length > 0
+    || (counts.assistant_roles ?? 0) > 0
+    || (counts.conversation_turns ?? 0) > 0;
+}
+
+// yz-83b: Check whether an extraction is final (has a real answer). Used to
+// decide if the re-extraction after a modal dismiss can complete the job.
+function isFinalExtraction(extraction) {
+  if (!extraction) {
+    return false;
+  }
+  return extraction.is_final === true
+    || (extraction.assistant_count ?? 0) > 0 && extraction.text;
+}
+
 function diagnosticPayload(diagnostics) {
   if (!diagnostics) {
     return null;
@@ -4019,6 +4091,7 @@ async function extractDomResponseForJob(job) {
     forgetSettledSuccessfulRecovery(job.job_id);
     return extraction;
   } catch (error) {
+    console.error("YZ83B DEBUG6: sendToTab threw:", String(error?.message ?? error).slice(0, 200));
     if (
       !isRecoverableContentScriptError(error)
       || Number(job.content_script_recovery_incidents ?? 0) >= MAX_CONTENT_SCRIPT_RECOVERY_INCIDENTS

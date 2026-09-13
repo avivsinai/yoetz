@@ -91,6 +91,8 @@ async function handleMessage(message) {
       return sendPrompt(message.job, message.prompt);
     case "yoetz_extract_response":
       return extractJobResponse(message.job, message.blocking_context);
+    case "yoetz_dismiss_rate_limit_modal":
+      return dismissRateLimitModalForJob(message.job);
     case "yoetz_fetch_conversation":
       return fetchSiteConversationAnswer(message.job, message.conversation_id, message.operation_deadline_ms);
     case "yoetz_cancel_send":
@@ -562,6 +564,19 @@ async function sendPrompt(job, prompt) {
       }
       : {})
   };
+}
+
+// yz-83b: Dismiss the 'Too many requests' modal by clicking its 'Got it'
+// button. The modal has hidden an already-rendered answer; dismissing it
+// once makes the answer readable. Fail-closed: returns null if no open dialog
+// is found or the click does not dismiss it. The service worker re-extracts
+// after this returns and treats the result as proof, not the click itself.
+async function dismissRateLimitModalForJob(job) {
+  const { dismissRateLimitModal } = await domHelpers(job);
+  if (typeof dismissRateLimitModal !== "function") {
+    return null;
+  }
+  return dismissRateLimitModal(document);
 }
 
 async function extractJobResponse(job, blockingContext = null) {

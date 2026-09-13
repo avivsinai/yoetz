@@ -11802,8 +11802,17 @@ test("yz-83b: rate_limited with rendered content → dismiss modal → re-extrac
             return { ok: true, payload: { sent: true, conversation_id: "conv-83b", final_model_selection: { ...verifiedLatestProSelection(), click_bound: true } } };
           case "yoetz_extract_response": {
             extractCount++;
+            // Call 1: pre-send baseline (no content, no handoff)
+            // Call 2: wait_response — rate_limited handoff WITH rendered content
+            // Call 3: re-extraction after dismiss — final answer
             if (extractCount === 1) {
-              // First extraction: rate_limited handoff WITH rendered content
+              return {
+                ok: true,
+                payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1, conversation_id: "conv-83b" }
+              };
+            }
+            if (extractCount === 2) {
+              // wait_response: rate_limited handoff WITH rendered content
               return {
                 ok: true,
                 payload: {
@@ -11823,7 +11832,7 @@ test("yz-83b: rate_limited with rendered content → dismiss modal → re-extrac
                 }
               };
             }
-            // Second extraction (after dismiss): final answer
+            // Call 3+: re-extraction after dismiss — final answer
             return {
               ok: true,
               payload: {
@@ -11876,7 +11885,7 @@ test("yz-83b: rate_limited with rendered content → dismiss modal → re-extrac
     // Job completed successfully
     assert.equal(complete.payload.code, undefined, "job should complete, not error");
     assert.equal(complete.payload.rate_limit_modal_dismissed, true, "must record the dismiss");
-    assert.equal(complete.payload.text, "The answer that was rendered before the modal.");
+    assert.equal(complete.payload.response, "The answer that was rendered before the modal.");
 
     // Exactly one dismiss command was issued
     assert.equal(dismissCount, 1, "exactly one dismiss per job");
