@@ -1134,7 +1134,7 @@ async function completeJobWithExtraction(job, extraction, continuationEpoch = jo
       }),
       // yz-83b: Set when the job completed after dismissing the rate-limit
       // modal to recover an already-rendered answer. The cooldown stays armed.
-      rate_limit_modal_dismissed: extraction.rate_limit_modal_dismissed === true ? true : undefined
+      rate_limit_modal_dismissed: job.rate_limit_modal_dismissed === true ? true : undefined,
     }
   });
   if (await cancellationFence(job) || !jobContinuationIsLive(job, continuationEpoch)) {
@@ -3553,6 +3553,7 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
         && extractionHasRenderedContent(extraction)
       ) {
         job.rate_limit_modal_dismiss_attempted = true;
+        await persistJob(job);
         let dismissResult = null;
         try {
           dismissResult = await sendToTab(job.tab_id, {
@@ -3562,26 +3563,56 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
         } catch {
           // Dismiss failed (content script error, tab gone, etc.) — fail closed.
         }
-        if (dismissResult?.dismissed) {
-          // Re-extract once after the dismiss. Do NOT use backend-api fallback
-          // (that is the request class being throttled).
-          const reExtraction = await extractDomResponseForJob(job);
-          if (reExtraction && !reExtraction.manual_handoff && isFinalExtraction(reExtraction)) {
-            await completeJobWithExtraction(job, {
-              ...reExtraction,
-              rate_limit_modal_dismissed: true
-            });
-            return null;
+        if (dismissResult?.clicked) {
+          // Poll the read-only modal state with a bounded window. The dialog is
+          // Radix: data-state flips to 'closed' on the next React commit, and
+          // the node unmounts later still (Presence exit animation — in a
+          // background tab that transition never runs, so rely on the fallback).
+          // Settle pacing like the picker choreography: ~250ms steps, ~5s cap.
+          const DISMISS_SETTLE_STEP_MS = Number(globalThis.__YOETZ_DISMISS_SETTLE_STEP_MS ?? 250);
+          const DISMISS_SETTLE_CAP_MS = Number(globalThis.__YOETZ_DISMISS_SETTLE_CAP_MS ?? 5000);
+          const settleStartedAt = Date.now();
+          let modalClosed = false;
+          while (Date.now() - settleStartedAt <= DISMISS_SETTLE_CAP_MS) {
+            if (!jobContinuationIsLive(job, continuationEpoch)) {
+              return null;
+            }
+            await sleep(DISMISS_SETTLE_STEP_MS);
+            try {
+              const state = await sendToTab(job.tab_id, {
+                type: "yoetz_rate_limit_modal_state",
+                job
+              });
+              if (!state?.open) {
+                modalClosed = true;
+                break;
+              }
+            } catch {
+              // State read failed — keep polling within the cap.
+            }
           }
-          // Re-extraction was not final or still rate_limited — fail closed.
+          if (modalClosed) {
+            // The modal unmounted. Clear the handoff and continue the wait loop
+            // so the normal finality legs (completion_reason, persistent-stop,
+            // final-affordance) judge the re-extraction. Do NOT complete here —
+            // there is no is_final field on extractions; finality lives in the
+            // existing wait-loop legs. Mark the job so completeJobWithExtraction
+            // carries rate_limit_modal_dismissed when it eventually completes.
+            job.rate_limit_modal_dismissed = true;
+            job.rate_limit_modal_recovered = true;
+            await persistJob(job);
+            last = { method: "none", text: "", is_generating: true };
+            continue;
+          }
+          // Modal did not close within the cap — fail closed.
           await failJob(job, "manual_handoff", extraction.manual_handoff.message, {
             state: extraction.manual_handoff.state,
             phase: "wait_response",
             side_effect_started: true,
             terminal_status: "manual_handoff",
             rate_limit_modal_dismissed: true,
-            rate_limit_modal_dismiss_failed: true,
-            diagnostics: diagnosticPayload(reExtraction?.diagnostics ?? extraction.diagnostics)
+            rate_limit_modal_recovered: false,
+            diagnostics: diagnosticPayload(extraction.diagnostics)
           });
           return null;
         }
@@ -4048,16 +4079,6 @@ function extractionHasRenderedContent(extraction) {
     || (counts.conversation_turns ?? 0) > 0;
 }
 
-// yz-83b: Check whether an extraction is final (has a real answer). Used to
-// decide if the re-extraction after a modal dismiss can complete the job.
-function isFinalExtraction(extraction) {
-  if (!extraction) {
-    return false;
-  }
-  return extraction.is_final === true
-    || (extraction.assistant_count ?? 0) > 0 && extraction.text;
-}
-
 function diagnosticPayload(diagnostics) {
   if (!diagnostics) {
     return null;
@@ -4091,7 +4112,6 @@ async function extractDomResponseForJob(job) {
     forgetSettledSuccessfulRecovery(job.job_id);
     return extraction;
   } catch (error) {
-    console.error("YZ83B DEBUG6: sendToTab threw:", String(error?.message ?? error).slice(0, 200));
     if (
       !isRecoverableContentScriptError(error)
       || Number(job.content_script_recovery_incidents ?? 0) >= MAX_CONTENT_SCRIPT_RECOVERY_INCIDENTS

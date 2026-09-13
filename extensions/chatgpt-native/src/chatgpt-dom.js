@@ -290,23 +290,30 @@ export function dismissRateLimitModal(root = document) {
   if (!gotIt) {
     return null;
   }
-  // Click the control. The click itself is not proof — the caller re-reads
-  // dialog state after this returns.
+  // Gesture only — do NOT re-read dialog state in the same tick. ChatGPT's
+  // dialog is Radix: click schedules a React state update; data-state flips
+  // to 'closed' on the next commit, and the node unmounts later still
+  // (Presence waits for the exit animation — in a background tab that
+  // transition never runs). A synchronous re-read always sees the dialog
+  // still open and returns null, making the dismiss a no-op live.
+  // The caller polls rateLimitModalOpen() with a bounded window after this.
   try {
     gotIt.click?.();
   } catch {
     return null;
   }
-  // Verify the dialog is no longer open. If the click did not dismiss it,
-  // return null so the caller fails closed.
-  const stillOpen = root?.querySelector?.('[role="dialog"][data-state="open"]');
-  if (stillOpen) {
-    return null;
-  }
   return {
-    dismissed: true,
+    clicked: true,
     control_text: normalizeText(gotIt.innerText ?? gotIt.textContent ?? '')
   };
+}
+
+// yz-83b: Read-only check whether the rate-limit modal dialog is still open.
+// The SW polls this after dismissRateLimitModal with a bounded window until
+// open===false before re-extracting.
+export function rateLimitModalOpen(root = document) {
+  const dialog = root?.querySelector?.('[role="dialog"][data-state="open"]');
+  return Boolean(dialog);
 }
 
 export function findComposer(root = document) {

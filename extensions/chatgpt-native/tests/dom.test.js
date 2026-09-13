@@ -15,7 +15,8 @@ import {
   ownedWindowName,
   parseOwnedWindowName,
   rateLimitedHandoff,
-  dismissRateLimitModal
+  dismissRateLimitModal,
+  rateLimitModalOpen
 } from "../src/chatgpt-dom.js";
 import { chatgptSiteAdapter } from "../src/sites/chatgpt.js";
 import { claudeSiteAdapter } from "../src/sites/claude.js";
@@ -664,8 +665,26 @@ test("dismissRateLimitModal finds the Got it button inside the open dialog", () 
 
   const result = dismissRateLimitModal(root);
   assert.notEqual(result, null, "dismiss locator must find the Got it button");
-  assert.equal(result.dismissed, true, "modal was dismissed");
+  assert.equal(result.clicked, true, "gesture was performed");
   assert.equal(result.control_text, "Got it");
+});
+
+// yz-83b: rateLimitModalOpen returns true when the dialog is open, false after.
+test("rateLimitModalOpen returns true when dialog is open, false when closed", () => {
+  const dialogAttrs = { role: "dialog", "data-state": "open" };
+  const dialog = visibleElement(dialogAttrs);
+  dialog.setAttribute = (name, value) => { dialogAttrs[name] = value; };
+  const root = {
+    querySelector: (sel) => {
+      if (sel === '[role="dialog"][data-state="open"]') {
+        return dialogAttrs["data-state"] === "open" ? dialog : null;
+      }
+      return null;
+    }
+  };
+  assert.equal(rateLimitModalOpen(root), true, "modal is open");
+  dialog.setAttribute("data-state", "closed");
+  assert.equal(rateLimitModalOpen(root), false, "modal is closed");
 });
 
 // yz-83b: The dismiss locator returns null when no open dialog is present.

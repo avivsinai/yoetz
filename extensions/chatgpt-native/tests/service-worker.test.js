@@ -11832,14 +11832,15 @@ test("yz-83b: rate_limited with rendered content → dismiss modal → re-extrac
                 }
               };
             }
-            // Call 3+: re-extraction after dismiss — final answer
+            // Call 3+: re-extraction after dismiss — final answer judged by
+            // the normal wait-loop finality legs (copy button + stable text).
             return {
               ok: true,
               payload: {
                 manual_handoff: null,
-                is_final: true,
                 method: "assistant_dom_fallback",
                 text: "The answer that was rendered before the modal.",
+                is_generating: false,
                 assistant_count: 1,
                 copy_button_count: 1,
                 has_copy_button: true,
@@ -11851,7 +11852,9 @@ test("yz-83b: rate_limited with rendered content → dismiss modal → re-extrac
           }
           case "yoetz_dismiss_rate_limit_modal":
             dismissCount++;
-            return { ok: true, payload: { dismissed: true, control_text: "Got it" } };
+            return { ok: true, payload: { clicked: true, control_text: "Got it" } };
+          case "yoetz_rate_limit_modal_state":
+            return { ok: true, payload: { open: false } };
           default:
             throw new Error(`unexpected tab message ${command.type}`);
         }
@@ -11953,7 +11956,7 @@ test("yz-83b: rate_limited with zero rendered content → no dismiss, job fails 
             };
           case "yoetz_dismiss_rate_limit_modal":
             dismissCount++;
-            return { ok: true, payload: { dismissed: true } };
+            return { ok: true, payload: { clicked: true } };
           default:
             throw new Error(`unexpected tab message ${command.type}`);
         }
@@ -11995,5 +11998,119 @@ test("yz-83b: rate_limited with zero rendered content → no dismiss, job fails 
   } finally {
     globalThis.chrome = originalChrome;
     globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+// yz-83b: When the modal never closes after the dismiss gesture (Radix Presence
+// exit animation stalls in a background tab), the job fails closed as
+// rate_limited after the bounded settle window.
+test("yz-83b: modal never closes after dismiss → fail closed as rate_limited after cap", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+  let dismissCount = 0;
+  let statePollCount = 0;
+  let extractCount = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.__YOETZ_DISMISS_SETTLE_STEP_MS = 10;
+  globalThis.__YOETZ_DISMISS_SETTLE_CAP_MS = 50;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_83b_noclose" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedLatestProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            return { ok: true, payload: { sent: true, conversation_id: "conv-83b-nc", final_model_selection: { ...verifiedLatestProSelection(), click_bound: true } } };
+          case "yoetz_extract_response": {
+            extractCount++;
+            if (extractCount === 1) {
+              return { ok: true, payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1, conversation_id: "conv-83b-nc" } };
+            }
+            // wait_response: rate_limited with rendered content
+            return {
+              ok: true,
+              payload: {
+                manual_handoff: { state: "rate_limited", message: "Too many requests" },
+                is_final: false,
+                method: "page_text_fallback",
+                text: "",
+                assistant_count: 0,
+                conversation_id: "conv-83b-nc",
+                diagnostics: {
+                  page_text_chars: 0,
+                  page_text_content_chars: 0,
+                  counts: { assistant_roles: 1, conversation_turns: 2, markdown: 3 },
+                  markdown_snippets: [{ tag: "div", text: "rendered answer" }],
+                  assistant_turn_snippets: [{ tag: "div", text: "rendered answer" }]
+                }
+              }
+            };
+          }
+          case "yoetz_dismiss_rate_limit_modal":
+            dismissCount++;
+            return { ok: true, payload: { clicked: true, control_text: "Got it" } };
+          case "yoetz_rate_limit_modal_state":
+            statePollCount++;
+            // Never closes — always open
+            return { ok: true, payload: { open: true } };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz83b_noclose=${Date.now()}`);
+    port.emit(envelope("job_start", "job_83b_noclose", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 10000
+    }));
+
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_83b_noclose", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_83b_noclose.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((m) => m.type === "job_error"));
+    const error = port.messages.find((m) => m.type === "job_error");
+
+    // Job failed as rate_limited
+    assert.equal(error.payload.code, "manual_handoff");
+    assert.equal(error.payload.state, "rate_limited");
+    assert.equal(error.payload.phase, "wait_response");
+    assert.equal(error.payload.rate_limit_modal_dismissed, true, "dismiss was attempted");
+    assert.equal(error.payload.rate_limit_modal_recovered, false, "modal did not close");
+
+    // Exactly one dismiss gesture
+    assert.equal(dismissCount, 1, "exactly one dismiss per job");
+    // State was polled multiple times before the cap
+    assert.ok(statePollCount > 1, "state was polled multiple times before cap");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+    delete globalThis.__YOETZ_DISMISS_SETTLE_STEP_MS;
+    delete globalThis.__YOETZ_DISMISS_SETTLE_CAP_MS;
   }
 });

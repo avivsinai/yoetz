@@ -93,6 +93,8 @@ async function handleMessage(message) {
       return extractJobResponse(message.job, message.blocking_context);
     case "yoetz_dismiss_rate_limit_modal":
       return dismissRateLimitModalForJob(message.job);
+    case "yoetz_rate_limit_modal_state":
+      return rateLimitModalStateForJob(message.job);
     case "yoetz_fetch_conversation":
       return fetchSiteConversationAnswer(message.job, message.conversation_id, message.operation_deadline_ms);
     case "yoetz_cancel_send":
@@ -577,6 +579,16 @@ async function dismissRateLimitModalForJob(job) {
     return null;
   }
   return dismissRateLimitModal(document);
+}
+
+// yz-83b: Read-only check whether the rate-limit modal is still open. The SW
+// polls this after the dismiss gesture with a bounded window before re-extracting.
+async function rateLimitModalStateForJob(job) {
+  const { rateLimitModalOpen } = await domHelpers(job);
+  if (typeof rateLimitModalOpen !== "function") {
+    return { open: false };
+  }
+  return { open: rateLimitModalOpen(document) };
 }
 
 async function extractJobResponse(job, blockingContext = null) {
