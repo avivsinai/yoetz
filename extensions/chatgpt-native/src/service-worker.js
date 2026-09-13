@@ -33,7 +33,9 @@ const SECURE_CONTENT_SCRIPT_COMMANDS = new Set([
   "yoetz_send_prompt",
   "yoetz_extract_response",
   "yoetz_fetch_conversation",
-  "yoetz_cancel_send"
+  "yoetz_cancel_send",
+  "yoetz_dismiss_rate_limit_modal",
+  "yoetz_rate_limit_modal_state"
 ]);
 const ADVERTISED_CAPABILITIES = Object.freeze([
   TERMINAL_ACK_CAPABILITY,
