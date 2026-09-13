@@ -552,3 +552,33 @@ function visibleElement(attributes = {}) {
     }
   };
 }
+
+// yz-5bd: During wait_response, a "Too many requests" modal can mount after
+// the answer is rendered. rateLimitedHandoff must detect it from the modal
+// dialog text (not just the title) so the extraction path can surface the
+// typed handoff instead of waiting forever on a zero-turn page_text_fallback.
+// The page text (partial answer) stays non-final diagnostics.
+test("rateLimitedHandoff detects the wait_response modal from dialog text when page text contains the answer", () => {
+  // Observed shape: a [role=dialog] with the modal text, a mounted composer
+  // (so manualHandoffContext would short-circuit), and body text that includes
+  // both the modal text and the answer.
+  const dialogMessage = visibleElement({ role: "dialog" });
+  dialogMessage.innerText = "Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data.";
+  dialogMessage.textContent = dialogMessage.innerText;
+  dialogMessage.children = [];
+  const root = selectorRoot(new Map([
+    ["#prompt-textarea", [visibleElement({ id: "prompt-textarea" })]],
+    ['[role="dialog"]', [dialogMessage]]
+  ]));
+  root.title = "ChatGPT";
+  root.body = {
+    innerText: "Too many requests. Yoetz is a command-line tool that orchestrates AI models.",
+    textContent: "Too many requests. Yoetz is a command-line tool that orchestrates AI models."
+  };
+  root.defaultView = { location: { href: "https://chatgpt.com/c/conv-rl-modal?_yoetz=run_wait_rl", pathname: "/c/conv-rl-modal" } };
+  const handoff = rateLimitedHandoff(root);
+  assert.deepEqual(handoff, {
+    state: "rate_limited",
+    message: "ChatGPT is rate limited"
+  });
+});

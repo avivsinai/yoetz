@@ -187,3 +187,32 @@ test("cancelIdleCallback suppresses both fallback and native delivery", async ()
   await tick(400);
   assert.equal(calls, 0);
 });
+
+// yz-5bd: A synthetic IntersectionObserver entry must reflect the actual
+// geometry of the target rect vs the viewport. An offscreen sentinel (e.g. a
+// history pagination trigger below the fold) must not receive a positive
+// intersection that could trigger extra history loads in a hidden tab.
+test("hidden tab: offscreen sentinel observed after an on-screen target receives no positive intersection", async () => {
+  const { win } = loadShim({ hidden: true });
+  const calls = [];
+  const io = new win.IntersectionObserver((entries) => calls.push(entries));
+  // On-screen target receives a positive intersection (existing behavior).
+  const onScreen = () => ({
+    getBoundingClientRect: () => ({ x: 0, y: 0, width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10 })
+  });
+  io.observe(onScreen());
+  await tick(20);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0].isIntersecting, true, "on-screen target must intersect");
+  // Offscreen sentinel observed later must NOT receive a positive intersection.
+  const offScreen = () => ({
+    getBoundingClientRect: () => ({ x: 0, y: 9000, width: 10, height: 10, top: 9000, left: 0, right: 10, bottom: 9010 })
+  });
+  io.observe(offScreen());
+  await tick(20);
+  assert.equal(calls.length, 2, "callback fires for the offscreen target");
+  assert.equal(calls[1][0].isIntersecting, false, "offscreen sentinel must not be intersecting");
+  assert.equal(calls[1][0].intersectionRatio, 0);
+  assert.equal(calls[1][0].intersectionRect.width, 0);
+  assert.equal(calls[1][0].intersectionRect.height, 0);
+});

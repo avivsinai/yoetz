@@ -7,7 +7,8 @@ const chatgptDomModuleUrl = new URL("../src/chatgpt-dom.js", import.meta.url).hr
 const helperModule = `import { fetchConversationAnswer } from ${JSON.stringify(chatgptBackendModuleUrl)};
 import {
   classifyManualHandoff as classifyRealManualHandoff,
-  classifyWaitManualHandoff as classifyRealWaitManualHandoff
+  classifyWaitManualHandoff as classifyRealWaitManualHandoff,
+  rateLimitedHandoff as classifyRealRateLimitedHandoff
 } from ${JSON.stringify(chatgptDomModuleUrl)};
 export { fetchConversationAnswer };
 const hooks = globalThis.__contentScriptTestHooks;
@@ -69,6 +70,13 @@ export function classifyWaitManualHandoff(input) {
   return hooks.waitManualHandoff === undefined
     ? classifyRealWaitManualHandoff(input)
     : hooks.waitManualHandoff;
+}
+
+export function rateLimitedHandoff(root) {
+  // In the test harness the document is a stub without real DOM surfaces;
+  // default to null (no modal detected) unless the test explicitly sets
+  // hooks.rateLimitedHandoff.
+  return hooks.rateLimitedHandoff ?? null;
 }
 
 export function classifyBlockingState() {
@@ -199,6 +207,7 @@ const dom = {
   manualHandoffContext,
   classifyManualHandoff,
   classifyWaitManualHandoff,
+  rateLimitedHandoff,
   classifyBlockingState,
   ensureFreshChat,
   ensureChatSurface,

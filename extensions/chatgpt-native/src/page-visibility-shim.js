@@ -120,6 +120,32 @@
             observerDelivered.get(this)?.add(target);
             const rect = target?.getBoundingClientRect?.()
               ?? { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
+            // Compute the actual intersection of the target rect with the
+            // observer root (or the viewport when root is null). A synthetic
+            // entry must reflect real geometry: an offscreen sentinel (e.g. a
+            // history pagination trigger below the fold) must NOT receive a
+            // positive intersection, which could trigger extra history loads
+            // in a hidden tab (yz-5bd).
+            const rootElement = this.root ?? null;
+            const rootRect = rootElement
+              ? (rootElement.getBoundingClientRect?.() ?? null)
+              : { x: 0, y: 0, top: 0, left: 0, width: window.innerWidth, height: window.innerHeight, right: window.innerWidth, bottom: window.innerHeight };
+            const intersectionRect = rootRect
+              ? {
+                  x: Math.max(rect.x, rootRect.x),
+                  y: Math.max(rect.y, rootRect.y),
+                  top: Math.max(rect.top, rootRect.top),
+                  left: Math.max(rect.left, rootRect.left),
+                  right: Math.min(rect.right, rootRect.right),
+                  bottom: Math.min(rect.bottom, rootRect.bottom)
+                }
+              : { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0 };
+            intersectionRect.width = Math.max(0, intersectionRect.right - intersectionRect.left);
+            intersectionRect.height = Math.max(0, intersectionRect.bottom - intersectionRect.top);
+            const isIntersecting = intersectionRect.width > 0 && intersectionRect.height > 0;
+            const targetArea = Math.max(1, rect.width * rect.height);
+            const intersectionArea = intersectionRect.width * intersectionRect.height;
+            const intersectionRatio = isIntersecting ? Math.min(1, intersectionArea / targetArea) : 0;
             const viewport = {
               x: 0, y: 0, top: 0, left: 0,
               width: window.innerWidth, height: window.innerHeight,
@@ -128,12 +154,12 @@
             try {
               observerCallbacks.get(this)?.call(this, [{
                 target,
-                isIntersecting: true,
-                intersectionRatio: 1,
+                isIntersecting,
+                intersectionRatio,
                 time: performance.now(),
                 boundingClientRect: rect,
-                intersectionRect: rect,
-                rootBounds: viewport
+                intersectionRect: isIntersecting ? intersectionRect : { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0 },
+                rootBounds: rootElement ? rootRect : viewport
               }], this);
             } catch {
               // A throwing observer callback must not break the shim.

@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- ChatGPT web recipe: surface the typed `rate_limited` handoff during
+  wait-response extraction when the "Too many requests" modal mounts after the
+  answer is rendered, so the run cannot wait forever on a zero-turn
+  `page_text_fallback`. The extraction (partial answer) is preserved as
+  non-final diagnostics; pending backend anchors are not downgraded.
+  (`yz-5bd`)
+- page-visibility-shim: synthetic `IntersectionObserver` entries now reflect
+  the actual intersection of the target rect with the viewport (or observer
+  root), not an unconditional `isIntersecting: true`. An offscreen sentinel no
+  longer receives a positive intersection that could trigger extra history
+  loads in a hidden tab. (`yz-5bd`)
 
 ## [0.5.70] - 2026-09-13
 ### Fixed
