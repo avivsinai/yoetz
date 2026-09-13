@@ -635,11 +635,11 @@ test("dismissRateLimitModal finds the Got it button inside the open dialog", () 
   dialog.appendChild = (child) => { dialog.children = [...(dialog.children || []), child]; };
   dialog.children = [gotItButton];
   dialog.querySelector = (sel) => {
-    if (sel === "button") return gotItButton;
+    if (sel.includes("button") || sel === "*") return gotItButton;
     return null;
   };
   dialog.querySelectorAll = (sel) => {
-    if (sel === "button") return [gotItButton];
+    if (sel.includes("button") || sel === "*") return [gotItButton];
     return [];
   };
 

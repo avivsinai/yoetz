@@ -279,13 +279,16 @@ export function dismissRateLimitModal(root = document) {
   if (!dialog) {
     return null;
   }
-  // Find the 'Got it' button inside the dialog. Match by text content to be
-  // resilient to markup changes — the control is a <button> whose visible text
-  // is 'Got it' (case-insensitive).
-  const buttons = Array.from(dialog.querySelectorAll?.('button') ?? []);
-  const gotIt = buttons.find((btn) => {
-    const text = normalizeText(btn.innerText ?? btn.textContent ?? '').toLowerCase();
-    return text === 'got it' || text.startsWith('got it');
+  // Find the 'Got it' control inside the dialog. Match by text content to be
+  // resilient to markup changes. ChatGPT's Radix dialog may use <button>,
+  // <div role="button">, or any clickable element with a click handler.
+  // Use a tree walker to scan all elements, not just specific tags.
+  const allElements = Array.from(dialog.querySelectorAll?.('*') ?? []);
+  const gotIt = allElements.find((el) => {
+    // Only check leaf-ish elements (no child elements with their own text)
+    // to avoid matching a container that includes 'Got it' among other text.
+    const ownText = normalizeText(el.innerText ?? el.textContent ?? '').toLowerCase();
+    return ownText === 'got it' || ownText.trim() === 'got it';
   });
   if (!gotIt) {
     return null;
