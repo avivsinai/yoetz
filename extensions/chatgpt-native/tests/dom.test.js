@@ -552,3 +552,69 @@ function visibleElement(attributes = {}) {
     }
   };
 }
+
+// yz-5bd: During wait_response, a "Too many requests" modal can mount after
+// the answer is rendered. rateLimitedHandoff must detect it from the modal
+// dialog text (not just the title) so the extraction path can surface the
+// typed handoff instead of waiting forever on a zero-turn page_text_fallback.
+// The page text (partial answer) stays non-final diagnostics.
+test("rateLimitedHandoff detects the wait_response modal from dialog text when page text contains the answer", () => {
+  // Observed shape: a [role=dialog] with the modal text, a mounted composer
+  // (so manualHandoffContext would short-circuit), and body text that includes
+  // both the modal text and the answer.
+  const dialogMessage = visibleElement({ role: "dialog" });
+  dialogMessage.innerText = "Too many requests. You're making requests too quickly. We've temporarily limited access to your conversations to protect your data.";
+  dialogMessage.textContent = dialogMessage.innerText;
+  dialogMessage.children = [];
+  const root = selectorRoot(new Map([
+    ["#prompt-textarea", [visibleElement({ id: "prompt-textarea" })]],
+    ['[role="dialog"]', [dialogMessage]]
+  ]));
+  root.title = "ChatGPT";
+  root.body = {
+    innerText: "Too many requests. Yoetz is a command-line tool that orchestrates AI models.",
+    textContent: "Too many requests. Yoetz is a command-line tool that orchestrates AI models."
+  };
+  root.defaultView = { location: { href: "https://chatgpt.com/c/conv-rl-modal?_yoetz=run_wait_rl", pathname: "/c/conv-rl-modal" } };
+  const handoff = rateLimitedHandoff(root);
+  assert.deepEqual(handoff, {
+    state: "rate_limited",
+    message: "ChatGPT is rate limited"
+  });
+});
+
+// yz-5bd: An answer or prompt that quotes "Too many requests" in ordinary
+// conversation content must NOT produce a false rate_limited handoff. The
+// detector must require a modal/dialog surface, not just body text matching.
+test("rateLimitedHandoff does not false-positive on conversation content quoting the modal text", () => {
+  // No dialog/modal surface; body text contains the answer which quotes the
+  // error wording. A real conversation with an authenticated composer and
+  // conversation turns (so hasConversationResidue is true and body text is
+  // NOT scanned by rateLimitedHandoff).
+  const assistantTurn = visibleElement({ "data-message-author-role": "assistant" });
+  assistantTurn.innerText = "The error said 'Too many requests' but the answer is here.";
+  assistantTurn.textContent = assistantTurn.innerText;
+  const userTurn = visibleElement({ "data-message-author-role": "user" });
+  userTurn.innerText = "What does the error mean?";
+  userTurn.textContent = userTurn.innerText;
+  const root = selectorRoot(new Map([
+    ["#prompt-textarea", [visibleElement({ id: "prompt-textarea" })]],
+    ['[data-message-author-role="assistant"]', [assistantTurn]],
+    ['[data-message-author-role="user"]', [userTurn]]
+  ]));
+  root.title = "ChatGPT";
+  root.body = {
+    innerText: "The error said 'Too many requests' but the answer is here. Yoetz is a CLI tool.",
+    textContent: "The error said 'Too many requests' but the answer is here. Yoetz is a CLI tool."
+  };
+  root.defaultView = { location: { href: "https://chatgpt.com/c/conv-quote?_yoetz=run_quote", pathname: "/c/conv-quote" } };
+  const handoff = rateLimitedHandoff(root);
+  // The body text alone should NOT trigger rate_limited when there is no
+  // modal dialog surface. If the detector scans body text, this test verifies
+  // it does not false-positive on quoted error wording.
+  // NOTE: if rateLimitedHandoff scans body text (it does via
+  // manualHandoffSurfaces), this MAY return rate_limited. That is the point:
+  // we need to verify whether it does, and if so, that's a known limitation.
+  // For now, assert the expected behavior (null when no modal surface).
+  assert.equal(handoff, null, "quoted error text in conversation content must not produce rate_limited");
+});

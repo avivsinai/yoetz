@@ -187,3 +187,74 @@ test("cancelIdleCallback suppresses both fallback and native delivery", async ()
   await tick(400);
   assert.equal(calls, 0);
 });
+
+// yz-5bd: A synthetic IntersectionObserver entry must reflect the actual
+// geometry of the target rect vs the viewport. An offscreen sentinel (e.g. a
+// history pagination trigger below the fold) must not receive a positive
+// intersection that could trigger extra history loads in a hidden tab.
+test("hidden tab: offscreen sentinel observed after an on-screen target receives no positive intersection", async () => {
+  const { win } = loadShim({ hidden: true });
+  const calls = [];
+  const io = new win.IntersectionObserver((entries) => calls.push(entries));
+  // On-screen target receives a positive intersection (existing behavior).
+  const onScreen = { getBoundingClientRect: () => ({ x: 0, y: 0, width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10 }) };
+  io.observe(onScreen);
+  await tick(20);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0].isIntersecting, true, "on-screen target must intersect");
+  // Offscreen sentinel observed later must NOT receive a positive intersection.
+  const offScreen = { getBoundingClientRect: () => ({ x: 0, y: 9000, width: 10, height: 10, top: 9000, left: 0, right: 10, bottom: 9010 }) };
+  io.observe(offScreen);
+  await tick(20);
+  assert.equal(calls.length, 2, "callback fires for the offscreen target");
+  assert.equal(calls[1][0].isIntersecting, false, "offscreen sentinel must not be intersecting");
+  assert.equal(calls[1][0].intersectionRatio, 0);
+  assert.equal(calls[1][0].intersectionRect.width, 0);
+  assert.equal(calls[1][0].intersectionRect.height, 0);
+});
+
+// yz-5bd: A zero-height rendered element is still intersecting per spec.
+test("hidden tab: zero-height rendered element is intersecting with ratio 1", async () => {
+  const { win } = loadShim({ hidden: true });
+  const calls = [];
+  const io = new win.IntersectionObserver((entries) => calls.push(entries));
+  const zeroHeight = () => ({
+    getBoundingClientRect: () => ({ x: 20, y: 20, width: 100, height: 0, top: 20, left: 20, right: 120, bottom: 20 })
+  });
+  io.observe(zeroHeight());
+  await tick(20);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0].isIntersecting, true, "zero-height rendered element is intersecting");
+  assert.equal(calls[0][0].intersectionRatio, 1);
+});
+
+// yz-5bd: A subpixel target (0.5x0.5) fully visible must report ratio 1.
+test("hidden tab: subpixel target fully visible reports ratio 1", async () => {
+  const { win } = loadShim({ hidden: true });
+  const calls = [];
+  const io = new win.IntersectionObserver((entries) => calls.push(entries));
+  const subpixel = () => ({
+    getBoundingClientRect: () => ({ x: 0, y: 0, width: 0.5, height: 0.5, top: 0, left: 0, right: 0.5, bottom: 0.5 })
+  });
+  io.observe(subpixel());
+  await tick(20);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0].isIntersecting, true);
+  assert.equal(calls[0][0].intersectionRatio, 1, "subpixel fully visible must report ratio 1, not 0.25");
+});
+
+// yz-5bd: Positive rootMargin expands the effective root so an offscreen
+// target within the margin is intersecting.
+test("hidden tab: positive rootMargin makes offscreen target intersecting", async () => {
+  const { win } = loadShim({ hidden: true });
+  const calls = [];
+  const io = new win.IntersectionObserver((entries) => calls.push(entries), { rootMargin: "0px 0px 100px 0px" });
+  // Target at y=650, viewport height 600, bottom margin 100px → within margin
+  const target = () => ({
+    getBoundingClientRect: () => ({ x: 0, y: 650, width: 10, height: 10, top: 650, left: 0, right: 10, bottom: 660 })
+  });
+  io.observe(target());
+  await tick(20);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0][0].isIntersecting, true, "positive rootMargin must make target within margin intersecting");
+});
