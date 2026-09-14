@@ -16,7 +16,8 @@ import {
   parseOwnedWindowName,
   rateLimitedHandoff,
   dismissRateLimitModal,
-  rateLimitModalOpen
+  rateLimitModalOpen,
+  isResponseGenerating
 } from "../src/chatgpt-dom.js";
 import { chatgptSiteAdapter } from "../src/sites/chatgpt.js";
 import { claudeSiteAdapter } from "../src/sites/claude.js";
@@ -822,4 +823,78 @@ test("dismissRateLimitModal picks the rate-limit dialog when multiple dialogs ar
   // even though the share dialog is still open.
   assert.equal(rateLimitModalOpen(root), false, "rate-limit modal is closed, share dialog irrelevant");
   assert.equal(shareDialogAttrs["data-state"], "open", "share dialog stays open");
+});
+
+// yz-91m: isResponseGenerating must detect ChatGPT Pro's Stop button
+// (data-testid="stop-button", aria-label="Stop answering") and the
+// [data-streaming-response-status] interstitial marker.
+test("yz-91m: isResponseGenerating returns true for Pro stop-button and streaming-response-status", async () => {
+  const stopButtonHtml = await import("node:fs").then(fs =>
+    fs.promises.readFile(new URL("./fixtures/chatgpt-conversation/2026-09-14-stop-button.html", import.meta.url), "utf8")
+  );
+  const agentTurnHtml = await import("node:fs").then(fs =>
+    fs.promises.readFile(new URL("./fixtures/chatgpt-conversation/2026-09-14-pro-long-think-agent-turn.html", import.meta.url), "utf8")
+  );
+
+  // Build a minimal DOM root with the stop button and agent-turn.
+  // jsdom is not available; use a stub element that satisfies firstVisible.
+  const stopButton = visibleElement({
+    "data-testid": "stop-button",
+    "aria-label": "Stop answering",
+    "aria-disabled": "false"
+  });
+  stopButton.disabled = false;
+  stopButton.tagName = "BUTTON";
+  stopButton.type = "submit";
+
+  const root = {
+    querySelectorAll: (sel) => {
+      if (sel.includes('button[data-testid*="stop"]') || sel.includes("stop")) return [stopButton];
+      if (sel.includes("[data-streaming-response-status]")) return [{}];
+      return [];
+    },
+    querySelector: () => null,
+    defaultView: { location: { href: "https://chatgpt.com/", pathname: "/" } }
+  };
+  root.title = "ChatGPT";
+  root.body = { innerText: "", textContent: "" };
+
+  // The stop button must be detected as generating.
+  assert.equal(isResponseGenerating(root), true,
+    "isResponseGenerating must return true when data-testid=stop-button is present");
+});
+
+// yz-91m: isResponseGenerating must detect [data-streaming-response-status]
+// inside the latest agent-turn, even without a stop button.
+test("yz-91m: isResponseGenerating returns true for data-streaming-response-status interstitial", async () => {
+  const streamingMarker = visibleElement({});
+  streamingMarker.tagName = "DIV";
+  streamingMarker.getAttribute = (name) => {
+    if (name === "data-streaming-response-status") return "";
+    return null;
+  };
+
+  const agentTurn = visibleElement({});
+  agentTurn.tagName = "DIV";
+  agentTurn.className = "agent-turn";
+  agentTurn.querySelectorAll = (sel) => {
+    if (sel === "button") return [];
+    if (sel.includes("data-streaming-response-status")) return [streamingMarker];
+    return [];
+  };
+
+  const root = {
+    querySelectorAll: (sel) => {
+      if (sel.includes("agent-turn") || sel.includes("turn-messages")) return [agentTurn];
+      if (sel.includes("stop")) return [];
+      return [];
+    },
+    querySelector: () => null,
+    defaultView: { location: { href: "https://chatgpt.com/", pathname: "/" } }
+  };
+  root.title = "ChatGPT";
+  root.body = { innerText: "", textContent: "" };
+
+  assert.equal(isResponseGenerating(root), true,
+    "isResponseGenerating must return true when data-streaming-response-status is present in the latest agent-turn");
 });
