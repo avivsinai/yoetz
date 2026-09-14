@@ -837,10 +837,28 @@ test("yz-gcd: clickSend throws send_deadline_exceeded when beforeClick overruns 
   let clicked = false;
   sendButton.click = () => { clicked = true; };
 
-  const root = {
+  // Composer scope: findComposer returns a composer element whose closest('form')
+  // is the scope that querySelectorAll finds the send button in.
+  const formScope = {
     querySelector: () => null,
     querySelectorAll: (sel) => {
       if (sel.includes("send-button") || sel === "button") return [sendButton];
+      return [];
+    }
+  };
+  const composer = visibleElement({});
+  composer.closest = (sel) => {
+    if (sel === "form") return formScope;
+    return null;
+  };
+
+  const root = {
+    querySelector: () => null,
+    querySelectorAll: (sel) => {
+      // findComposer (via firstVisible/firstMatching) looks for these
+      if (sel.includes("prompt-textarea") || sel.includes("contenteditable") || sel.includes("textarea")) {
+        return [composer];
+      }
       return [];
     },
     defaultView: { location: { href: "https://chatgpt.com/", pathname: "/" } }
