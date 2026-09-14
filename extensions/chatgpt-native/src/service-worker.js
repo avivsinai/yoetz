@@ -3683,6 +3683,9 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
     // immediately, preserve the tab (an operator may appeal or rephrase), do
     // NOT retry, do NOT resubmit. Arm nothing (this is not a throttle).
     if (extraction?.content_policy_flagged) {
+      if (!jobContinuationIsLive(job, continuationEpoch)) {
+        return null;
+      }
       const inspectCommand = inspectCommandForJob(job);
       const adapter = adapterForJob(job);
       await failJob(

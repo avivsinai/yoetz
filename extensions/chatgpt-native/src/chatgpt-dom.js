@@ -2480,11 +2480,16 @@ export function extractResponse(root = document) {
   // outcome. The flagged turn appears as an agent-turn with the policy text but
   // no assistant role marker, no streaming marker, and no stop control. Check
   // the latest agent-turn (or the latest assistant turn if one exists).
-  const latestAgentTurn = Array.from(root.querySelectorAll('[class*="agent-turn"]')).at(-1);
+  // Use the structural error-banner marker (text-token-text-error) as the
+  // primary signal to avoid false positives from a user prompt that quotes the
+  // policy phrase. Exclude user turns.
+  const latestAgentTurn = Array.from(root.querySelectorAll('[class*="agent-turn"]')).filter((n) => !isInsideUserTurn(n)).at(-1);
   const contentPolicyFlagged = Boolean(
     !latestAssistant
     && latestAgentTurn
-    && isContentPolicyFlagged(latestAgentTurn)
+    && !isInsideUserTurn(latestAgentTurn)
+    && (isContentPolicyFlagged(latestAgentTurn)
+      || Boolean(latestAgentTurn.querySelector?.('[class*="text-token-text-error"]')))
   );
   const latestTextConversation = latestTextEntry?.node ? responseConversationScope(latestTextEntry.node, latestUser) : null;
   const latestTextHasCopyButton = latestTextEntry?.node
