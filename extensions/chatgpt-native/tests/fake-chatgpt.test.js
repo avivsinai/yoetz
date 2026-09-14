@@ -5858,7 +5858,10 @@ test("yz-dl0: an in-progress label inside the composer still blocks the upload",
     // (The structural markers -- [role="progressbar"] and friends -- are
     // unchanged in logic and only re-scoped; the fake DOM's selector engine
     // has no generic attribute matcher, so they are not expressible here.)
-    const label = new FakeElement("span", {}, "Uploading\u2026");
+    // Built with an inline child, which is the shape leaf-only matching missed:
+    // the outer span has children, and the inner leaf's text is just the dots.
+    const label = new FakeElement("span", {}, "Uploading")
+      .append(new FakeElement("span", { class: "dots" }, "\u2026"));
     const { doc } = makeComposerWithSidebar({ inComposer: label });
     const file = new File(["bundle"], "bundle.md", { type: "text/markdown" });
 

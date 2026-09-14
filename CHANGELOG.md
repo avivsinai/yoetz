@@ -21,7 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   document-wide, because a read-only probe of a live tab found upload inputs
   and file tiles mounted outside the composer form; scoping those would risk a
   false negative, which is worse than the false positive being fixed since it
-  would send the prompt before the attachment commits. (`yz-dl0`)
+  would send the prompt before the attachment commits. The text fallback
+  matches a node's OWN text (its direct text-node children) rather than
+  requiring a leaf: `<span>Uploading<span>…</span></span>` has children on the
+  outer span and only "…" on the inner leaf, so leaf-only matching would have
+  missed a real progress label purely because of markup nesting. (`yz-dl0`)
 - ChatGPT model selection: the post-close reverification-failed branch passed
   an undefined identifier (`state`) to `selectionFailure`, so a genuine
   post-close failure — including the `effort_options_disabled` quota lock —
