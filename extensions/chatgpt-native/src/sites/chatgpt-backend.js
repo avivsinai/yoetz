@@ -178,7 +178,9 @@ function resolveBackendAnswer(job, conversationId, data) {
   }
   const vetoId = activeLineageInprogressNode(mapping, data.current_node);
   if (vetoId !== null) {
-    return notReady(`active lineage or descendant is in progress (node ${vetoId})`);
+    return notReady(vetoId === "__cycle_or_missing__"
+      ? "active lineage is cyclic or broken (fail closed)"
+      : `active lineage or descendant is in progress (node ${vetoId})`);
   }
   if (lineageAnswerCount <= baseline) {
     return notReady(`assistant answer not fresh past baseline (active-lineage ${lineageAnswerCount} <= ${baseline})`);
