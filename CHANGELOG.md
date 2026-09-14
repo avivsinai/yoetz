@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- ChatGPT `isResponseGenerating` no longer misses ChatGPT Pro's Stop button
+  (`data-testid="stop-button"`, `aria-label="Stop answering"`) or the
+  `[data-streaming-response-status]` interstitial ("Our systems are thinking a
+  bit more about this request before responding..."). Pro long-think runs were
+  reporting `is_generating: false` while still generating, causing the 90 min
+  wait deadline to fire with a misleading "did not reach stable completion"
+  error. The stop-control selector list is now shared between
+  `isResponseGenerating` and `extractionDiagnostics` so the count and boolean
+  stay in sync. Diagnostics now include `generation_state`
+  (`idle`/`stop_button`/`long_think`/`streaming`/`answer_now`). The wait
+  deadline error now says "was still generating at the deadline" and carries
+  `still_generating: true` when a generation marker is present at timeout.
+  (`yz-91m`)
 - Any typed `rate_limited` outcome at any phase (prepare, model_selection,
   upload, send, wait_response) now arms the profile-wide cooldown
   immediately, instead of only the wait_response extraction and HTTP 429

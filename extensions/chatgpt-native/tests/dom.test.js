@@ -874,9 +874,17 @@ test("yz-91m: isResponseGenerating returns true for data-streaming-response-stat
     return null;
   };
 
-  const agentTurn = visibleElement({});
+  const agentTurn = visibleElement({ "data-message-author-role": "assistant", "class": "agent-turn" });
   agentTurn.tagName = "DIV";
   agentTurn.className = "agent-turn";
+  agentTurn.closest = (sel) => {
+    if (sel.includes("data-message-author-role") || sel.includes("agent-turn") || sel.includes("turn-messages")) return agentTurn;
+    return null;
+  };
+  agentTurn.querySelector = (sel) => {
+    if (sel.includes("data-streaming-response-status")) return streamingMarker;
+    return null;
+  };
   agentTurn.querySelectorAll = (sel) => {
     if (sel === "button") return [];
     if (sel.includes("data-streaming-response-status")) return [streamingMarker];
@@ -885,11 +893,17 @@ test("yz-91m: isResponseGenerating returns true for data-streaming-response-stat
 
   const root = {
     querySelectorAll: (sel) => {
-      if (sel.includes("agent-turn") || sel.includes("turn-messages")) return [agentTurn];
+      // findAssistantTurns uses [data-message-author-role="assistant"],
+      // [class*="agent-turn"], and other selectors
+      if (sel.includes("data-message-author-role") || sel.includes("agent-turn") || sel.includes("turn-messages")) return [agentTurn];
       if (sel.includes("stop")) return [];
       return [];
     },
-    querySelector: () => null,
+    querySelector: (sel) => {
+      // isResponseGenerating checks querySelector for [data-streaming-response-status]
+      if (sel.includes("data-streaming-response-status")) return streamingMarker;
+      return null;
+    },
     defaultView: { location: { href: "https://chatgpt.com/", pathname: "/" } }
   };
   root.title = "ChatGPT";
