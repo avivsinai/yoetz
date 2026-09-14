@@ -64,6 +64,49 @@
         left: resolve(margin.left, rootRect.width)
       };
     }
+    // yz-634: The synthetic entry used to intersect the target rect against the
+    // root rect only. A target can sit inside the browser viewport while an
+    // ancestor with overflow hidden/scroll/auto clips it out of view, and the
+    // native observer reports that as not intersecting. ChatGPT's history
+    // sidebar is exactly this shape: a scrollport 1121px tall inside a 1187px
+    // viewport leaves a 66px band where a list item is below its scroll pane
+    // but still inside the viewport (measured on a live tab, 2026-09-14).
+    // Walk the ancestors and clip by every one that is not overflow:visible.
+    function intersectRects(a, b) {
+      const top = Math.max(a.top, b.top);
+      const left = Math.max(a.left, b.left);
+      const right = Math.min(a.right, b.right);
+      const bottom = Math.min(a.bottom, b.bottom);
+      return {
+        top, left, right, bottom,
+        x: left, y: top,
+        width: right - left,
+        height: bottom - top
+      };
+    }
+    function clipRectByAncestors(target, rootElement, baseRect) {
+      if (!baseRect) return baseRect;
+      let clip = baseRect;
+      let node = target?.parentElement ?? null;
+      let depth = 0;
+      // Bounded: a runaway or cyclic parent chain must not stall a frame.
+      while (node && depth < 32) {
+        if (rootElement && node === rootElement) break;
+        let style = null;
+        try {
+          style = window.getComputedStyle?.(node) ?? null;
+        } catch {
+          style = null;
+        }
+        if (style && (style.overflowX !== "visible" || style.overflowY !== "visible")) {
+          const ancestorRect = node.getBoundingClientRect?.();
+          if (ancestorRect) clip = intersectRects(clip, ancestorRect);
+        }
+        node = node.parentElement;
+        depth += 1;
+      }
+      return clip;
+    }
     const swallow = (event) => event.stopImmediatePropagation();
     window.addEventListener("visibilitychange", swallow, true);
     document.addEventListener("visibilitychange", swallow, true);
@@ -220,6 +263,16 @@
               rootRect.y = rootRect.top;
               rootRect.width = rootRect.right - rootRect.left;
               rootRect.height = rootRect.bottom - rootRect.top;
+            }
+            // yz-634: clip the effective root by every clipping ancestor
+            // between the target and the root. Applied after rootMargin so the
+            // margin still expands the root, not the ancestor clip.
+            if (rootRect) {
+              rootRect = clipRectByAncestors(
+                target,
+                root && root.nodeType === 1 ? root : null,
+                rootRect
+              );
             }
             // A target with an all-zero rect (display:none, unmounted, or
             // not-yet-rendered) has no box and is NOT intersecting per spec.
