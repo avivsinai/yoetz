@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- ChatGPT upload: `hasUploadPending` no longer scans the whole document for
+  the words uploading/attaching/processing/scanning. It scanned `document`
+  using subtree text with `div` in the candidate set, so one occurrence of any
+  of those words anywhere visible on the page — a sidebar conversation title,
+  a rendered answer that merely discusses uploads — made every ancestor `div`
+  match and pinned `pending` true for the life of the tab. The observed field
+  failure had exactly that shape: `attached=true, pending=true,
+  send_enabled=true` repeating until the deadline, with the file genuinely
+  attached and Send genuinely enabled. The predicate is now scoped to the
+  composer, and its text fallback matches leaf nodes only. Markers that
+  declare themselves an upload or attachment in a loading state stay
+  document-wide, because a read-only probe of a live tab found upload inputs
+  and file tiles mounted outside the composer form; scoping those would risk a
+  false negative, which is worse than the false positive being fixed since it
+  would send the prompt before the attachment commits. The text fallback
+  matches a node's OWN text (its direct text-node children) rather than
+  requiring a leaf: `<span>Uploading<span>…</span></span>` has children on the
+  outer span and only "…" on the inner leaf, so leaf-only matching would have
+  missed a real progress label purely because of markup nesting. (`yz-dl0`)
 - ChatGPT rate-limit cooldown: the escalation level now counts
   expiry-then-re-trip *cycles* only. A trip that lands while a cooldown is
   still holding keeps the current level instead of incrementing it. Since
