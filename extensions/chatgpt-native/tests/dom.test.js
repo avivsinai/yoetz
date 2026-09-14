@@ -18,7 +18,9 @@ import {
   dismissRateLimitModal,
   rateLimitModalOpen,
   clickSend,
-  isResponseGenerating
+  isResponseGenerating,
+  extractResponse,
+  isContentPolicyFlagged
 } from "../src/chatgpt-dom.js";
 import { chatgptSiteAdapter } from "../src/sites/chatgpt.js";
 import { claudeSiteAdapter } from "../src/sites/claude.js";
@@ -981,4 +983,74 @@ test("yz-gcd: clickSend throws send_deadline_exceeded when beforeClick overruns 
   // The button must NOT have been clicked.
   assert.equal(clicked, false, "button must not be clicked after the deadline");
   assert.equal(beforeClickCalled, true, "beforeClick must have been called");
+});
+
+// yz-5bc: A latest agent-turn whose text matches /may violate our usage policies/i
+// is a terminal server-side outcome. extractResponse must classify it as
+// content_policy_flagged so the wait loop fails fast instead of waiting to the
+// deadline.
+test("yz-5bc: extractResponse classifies usage-policy-flagged agent turn as content_policy_flagged", async () => {
+  const fs = await import("node:fs");
+  const flaggedHtml = await fs.promises.readFile(
+    new URL("./fixtures/chatgpt-conversation/2026-09-14-usage-policy-flagged-agent-turn.html", import.meta.url),
+    "utf8"
+  );
+
+  // Build a DOM root with the flagged agent turn as the latest turn.
+  // The fixture has no [data-message-author-role="assistant"], no streaming
+  // marker, no stop control — exactly the field shape.
+  const root = {
+    querySelectorAll: (sel) => {
+      if (sel.includes("article")) return [];
+      if (sel.includes("data-message-author-role=\"assistant\"")) return [];
+      if (sel.includes("data-message-author-role=\"user\"")) return [];
+      if (sel.includes("markdown")) return [];
+      if (sel.includes("conversation-turn")) return [];
+      if (sel.includes("agent-turn")) return [flaggedAgentTurn];
+      if (sel.includes("stop")) return [];
+      if (sel.includes("Copy") || sel.includes("copy")) return [];
+      return [];
+    },
+    querySelector: () => null,
+    title: "ChatGPT",
+    body: {
+      innerText: "This content may violate our usage policies.\nCalled tool",
+      textContent: "This content may violate our usage policies.\nCalled tool"
+    },
+    defaultView: { location: { href: "https://chatgpt.com/c/conv-5bc", pathname: "/c/conv-5bc" } }
+  };
+
+  // The flagged agent turn node — visible, with the policy-flag text.
+  const flaggedAgentTurn = visibleElement({ class: "agent-turn" });
+  flaggedAgentTurn.tagName = "DIV";
+  flaggedAgentTurn.innerHTML = flaggedHtml;
+  flaggedAgentTurn.innerText = "This content may violate our usage policies.\nCalled tool";
+  flaggedAgentTurn.textContent = "This content may violate our usage policies.\nCalled tool";
+  flaggedAgentTurn.closest = (sel) => {
+    if (sel.includes("agent-turn") || sel.includes("turn-messages")) return flaggedAgentTurn;
+    return null;
+  };
+  flaggedAgentTurn.querySelector = () => null;
+  flaggedAgentTurn.querySelectorAll = (sel) => {
+    if (sel === "button") return [];
+    return [];
+  };
+
+  const extraction = extractResponse(root);
+  assert.equal(extraction.content_policy_flagged, true,
+    "extractResponse must set content_policy_flagged: true for a usage-policy-flagged agent turn");
+  assert.ok(extraction.text.length > 0, "extraction must include the flagged text");
+  assert.match(extraction.text, /may violate our usage policies/i);
+});
+
+// yz-5bc: isContentPolicyFlagged detects the policy-flag text in a node.
+test("yz-5bc: isContentPolicyFlagged returns true for policy-flag text", () => {
+  const flagNode = visibleElement({});
+  flagNode.textContent = "This content may violate our usage policies.";
+  flagNode.innerText = "This content may violate our usage policies.";
+  assert.equal(isContentPolicyFlagged(flagNode), true);
+
+  const normalNode = visibleElement({});
+  normalNode.textContent = "Here is the answer to your question.";
+  assert.equal(isContentPolicyFlagged(normalNode), false);
 });

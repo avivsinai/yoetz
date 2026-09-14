@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   deadline error now says "was still generating at the deadline" and carries
   `still_generating: true` when a generation marker is present at timeout.
   (`yz-91m`)
+- ChatGPT wait loop: a latest agent-turn whose text matches /may violate our
+  usage policies/i (with no assistant message role, no streaming marker, no
+  stop control) is now classified as a typed `content_policy_flagged` terminal
+  outcome. The job fails immediately within one poll, preserving the tab for an
+  operator to inspect or rephrase. No retry, no resubmit, no cooldown armed
+  (this is not a throttle). (`yz-5bc`)
 - Any typed `rate_limited` outcome at any phase (prepare, model_selection,
   upload, send, wait_response) now arms the profile-wide cooldown
   immediately, instead of only the wait_response extraction and HTTP 429
