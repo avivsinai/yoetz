@@ -12114,3 +12114,261 @@ test("yz-83b: modal never closes after dismiss → fail closed as rate_limited a
     delete globalThis.__YOETZ_DISMISS_SETTLE_CAP_MS;
   }
 });
+
+// =========================================================================
+// yz-er5: any typed rate_limited arms the profile cooldown, and the cooldown
+// is visible and refusing, not a silent sleep.
+// =========================================================================
+
+// Helper: read the cooldown gate state from chrome.storage.session.
+async function readCooldownState(recipe = "chatgpt") {
+  const key = `backend-api-gate.${recipe}`;
+  const stored = await globalThis.chrome.storage.session.get(key);
+  return stored?.[key] ?? null;
+}
+
+// Test 1: a rate_limited manual handoff at prepare_job arms the cooldown.
+test("yz-er5: rate_limited handoff at prepare_job arms the cooldown", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_er5_prep" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: { state: "rate_limited", message: "Too many requests" } } };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_er5_prep=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+    port.emit(envelope("job_start", "job_er5_prep", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    // Wait for the job to fail as rate_limited
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "manual_handoff"
+    ));
+    const failed = port.messages.find((m) => m.type === "job_error");
+    assert.equal(failed.payload.state, "rate_limited");
+
+    // The cooldown must be armed: throttle_until_ms > now
+    const cooldown = await readCooldownState("chatgpt");
+    assert.notEqual(cooldown, null, "cooldown state must exist in storage.session");
+    assert.ok(
+      cooldown.throttle_until_ms > Date.now(),
+      "throttle_until_ms must be in the future (cooldown armed)"
+    );
+
+    // No tab should have been opened (prepare_job fails before any tab work
+    // beyond the initial tab — but prepare runs on the tab, so a tab IS opened.
+    // The key assertion is the cooldown is armed.)
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+// Test 2: a rate_limited error thrown from model_selection (via
+// handlePollerError) arms the cooldown — not just prepare_job and
+// wait_response.
+test("yz-er5: rate_limited error from model_selection arms the cooldown", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_er5_model" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            // Simulate the content script throwing rate_limited during model
+            // selection (the modal is up on the tab). tabCommandError reads
+            // code/error from the top level.
+            return { ok: false, code: "rate_limited", error: "Too many requests" };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_er5_model=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+    port.emit(envelope("job_start", "job_er5_model", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    // Wait for the job to fail — the error code should be rate_limited
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "rate_limited"
+    ), 5000);
+
+    // The cooldown must be armed
+    const cooldown = await readCooldownState("chatgpt");
+    assert.notEqual(cooldown, null, "cooldown state must exist");
+    assert.ok(
+      cooldown.throttle_until_ms > Date.now(),
+      "throttle_until_ms must be in the future (cooldown armed from model_selection)"
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+// Test 3: job_start while the cooldown holds fails immediately with
+// rate_limit_cooldown_active carrying cooldown_remaining_ms, and opens no tab.
+test("yz-er5: job_start during cooldown refuses immediately with rate_limit_cooldown_active, no tab opened", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabCreateCount = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => { tabCreateCount++; return { id: 999, ...opts }; },
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async () => { throw new Error("should not reach tab messages"); }
+    }
+  });
+
+  try {
+    // Pre-arm the cooldown by writing directly to storage.session
+    const cooldownMs = 60000;
+    const throttleUntil = Date.now() + cooldownMs;
+    await globalThis.chrome.storage.session.set({
+      "backend-api-gate.chatgpt": {
+        next_ready_at_ms: throttleUntil,
+        throttle_until_ms: throttleUntil,
+        throttle_level: 1,
+        in_flight_until_ms: 0,
+        generation: 1
+      }
+    });
+
+    await import(`../src/service-worker.js?yz_er5_refuse=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+    port.emit(envelope("job_start", "job_er5_refuse", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    // The job must fail immediately with rate_limit_cooldown_active
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "rate_limit_cooldown_active"
+    ), 5000);
+
+    const failed = port.messages.find((m) =>
+      m.type === "job_error" && m.payload?.code === "rate_limit_cooldown_active"
+    );
+    assert.ok(
+      typeof failed.payload.cooldown_remaining_ms === "number" && failed.payload.cooldown_remaining_ms > 0,
+      "must carry cooldown_remaining_ms > 0"
+    );
+    assert.equal(
+      failed.payload.side_effect_started, false,
+      "side_effect_started must be false (no tab was opened)"
+    );
+
+    // No tab should have been created
+    assert.equal(tabCreateCount, 0, "no tab should be opened during cooldown");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+// Test 4 (yz-er5 d): after arming the cooldown, the next heartbeat carries
+// cooldown_until_ms > now for the chatgpt recipe key.
+test("yz-er5: heartbeat carries cooldown_until_ms after arming", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_er5_hb" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: { state: "rate_limited", message: "Too many requests" } } };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_er5_hb=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+
+    // Arm the cooldown via a prepare_job rate_limited handoff
+    port.emit(envelope("job_start", "job_er5_hb", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "manual_handoff"
+    ));
+
+    // Clear messages, then emit a heartbeat
+    port.messages.length = 0;
+    port.emit(envelope("heartbeat", "job_er5_hb"));
+
+    await eventually(() => port.messages.some((m) => m.type === "heartbeat"));
+    const hb = port.messages.find((m) => m.type === "heartbeat");
+    assert.ok(hb.payload?.cooldown_until_ms, "heartbeat must carry cooldown_until_ms");
+    const chatgptCooldown = hb.payload.cooldown_until_ms?.chatgpt;
+    assert.ok(
+      typeof chatgptCooldown === "number" && chatgptCooldown > Date.now(),
+      "chatgpt cooldown_until_ms must be a future timestamp"
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});

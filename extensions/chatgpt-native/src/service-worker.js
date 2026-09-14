@@ -314,7 +314,7 @@ async function handleContentLifecycle(message, sender) {
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === HEARTBEAT_ALARM) {
     if (nativePort) {
-      postNative(makeEnvelope("heartbeat", { payload: { status: "alive" } }));
+      void postHeartbeat();
       void retryPendingTerminalJobs();
     } else {
       connectNative();
@@ -443,7 +443,7 @@ async function handleNativeMessage(message, sourcePort = nativePort, sourceGener
         await completePairing(message);
         break;
       case "heartbeat":
-        postNative(makeEnvelope("heartbeat", { payload: { status: "alive" } }));
+        await postHeartbeat();
         break;
       case "reconnect":
         await handleReconnect(message);
@@ -606,29 +606,25 @@ async function startJob(message) {
   if (!jobContinuationIsLive(job, continuationEpoch)) {
     return;
   }
-  // Profile-wide 429 cooldown (yz-5bd): new automated tab creation is itself
-  // website traffic (page load + its owned requests), so while the shared
-  // throttle holds in this profile, the job waits with its tab unopened
-  // instead of adding a navigation burst on top of the throttled reads. The
-  // wait is bounded by the job's own upload deadline; cancellation stays
-  // effective. At deadline expiry the job fails honestly WITHOUT opening a
-  // tab, so no navigation happens while the throttle can still be active.
-  const uploadDeadlineMs = Number(job.started_at ?? Date.now())
-    + Math.max(0, Number(job.upload_timeout_ms ?? 120000));
-  while (await backendApiGateThrottled(adapterRecipeKey(job))) {
+  // yz-er5: While the profile cooldown holds, refuse immediately with a
+  // typed rate_limit_cooldown_active error instead of sleeping silently until
+  // the upload deadline. Waiting is the caller's decision — the operator or
+  // agent must be able to tell "account is in cooldown, N s remaining" from
+  // "hung". No tab is opened.
+  if (await backendApiGateThrottled(adapterRecipeKey(job))) {
     if (!jobContinuationIsLive(job, continuationEpoch)) {
       return;
     }
-    if (Date.now() >= uploadDeadlineMs) {
-      await failJob(job, "backend_api_throttled", `ChatGPT website throttle still active at the upload deadline; not opening a new tab while the profile cooldown holds. Inspect the owned profile before rerunning.`, {
-        phase: "upload",
-        side_effect_started: false,
-        http_status: 429,
-        endpoint_category: "profile_cooldown"
-      });
-      return;
-    }
-    await sleep(1000);
+    const gateState = await readBackendApiGateState(adapterRecipeKey(job));
+    const cooldownUntilMs = Number(gateState?.throttle_until_ms ?? 0);
+    const cooldownRemainingMs = Math.max(0, cooldownUntilMs - Date.now());
+    await failJob(job, "rate_limit_cooldown_active", `ChatGPT website throttle cooldown is active (${cooldownRemainingMs}ms remaining); not opening a new tab. Retry after the cooldown clears.`, {
+      phase: "profile",
+      side_effect_started: false,
+      cooldown_until_ms: cooldownUntilMs || undefined,
+      cooldown_remaining_ms: cooldownRemainingMs
+    });
+    return;
   }
   if (!jobContinuationIsLive(job, continuationEpoch)) {
     return;
@@ -1477,6 +1473,17 @@ async function handlePollerError(job, error) {
     return;
   }
   const detail = errorContextForJob(job, error);
+  // yz-er5: Any typed rate_limited error from a content-script phase
+  // (model_selection, upload, send) arms the profile cooldown before the job
+  // fails, so the next job_start is refused immediately instead of opening a
+  // tab against an already-walled account.
+  if (code === "rate_limited") {
+    try {
+      await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
+    } catch {
+      // Best-effort: the cooldown is a guard, not a correctness requirement.
+    }
+  }
   await failJob(job, code, jobErrorMessage(job, error, code, detail), detail);
 }
 
@@ -2958,11 +2965,44 @@ function isConversationFailureCode(code) {
   return String(code ?? "").startsWith("conversation_");
 }
 
+// yz-er5: Read the cooldown state for all advertised recipes and return a
+// map of recipe -> cooldown_until_ms (null when not armed). Used in hello and
+// heartbeat payloads so the native host / CLI can report cooldown status.
+async function recipeCooldowns() {
+  const result = {};
+  for (const recipe of ADVERTISED_RECIPES) {
+    try {
+      const state = await readBackendApiGateState(recipe);
+      const until = Number(state?.throttle_until_ms ?? 0);
+      result[recipe] = until > Date.now() ? until : null;
+    } catch {
+      result[recipe] = null;
+    }
+  }
+  return result;
+}
+
+// yz-er5: Heartbeat includes cooldown_until_ms per recipe key so the native
+// host / CLI can distinguish "account is in cooldown" from "hung".
+async function postHeartbeat() {
+  if (!nativePort) {
+    return;
+  }
+  const cooldowns = await recipeCooldowns().catch(() => ({}));
+  postNative(makeEnvelope("heartbeat", {
+    payload: {
+      status: "alive",
+      cooldown_until_ms: cooldowns
+    }
+  }));
+}
+
 function postHello() {
-  extensionIdentity().then((identity) => {
+  extensionIdentity().then(async (identity) => {
     if (!nativePort) {
       return;
     }
+    const cooldowns = await recipeCooldowns();
     postNative(makeEnvelope("hello", {
       payload: {
         extension_id: EXTENSION_ID,
@@ -2972,7 +3012,8 @@ function postHello() {
         profile_email: identity.profile_email || null,
         profile_id: identity.profile_id || null,
         recipes: [...ADVERTISED_RECIPES],
-        capabilities: [...ADVERTISED_CAPABILITIES]
+        capabilities: [...ADVERTISED_CAPABILITIES],
+        cooldown_until_ms: cooldowns
       }
     }));
   }).catch(async (error) => {
@@ -2986,6 +3027,7 @@ function postHello() {
     } catch {
       // Keep hello best-effort even if local storage is unavailable.
     }
+    const cooldowns = await recipeCooldowns().catch(() => ({}));
     postNative(makeEnvelope("hello", {
       payload: {
         extension_id: EXTENSION_ID,
@@ -2995,7 +3037,8 @@ function postHello() {
         profile_email: null,
         profile_id: null,
         recipes: [...ADVERTISED_RECIPES],
-        capabilities: [...ADVERTISED_CAPABILITIES]
+        capabilities: [...ADVERTISED_CAPABILITIES],
+        cooldown_until_ms: cooldowns
       }
     }));
   });
