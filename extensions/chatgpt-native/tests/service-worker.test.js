@@ -12626,7 +12626,7 @@ test("yz-zpj: completed job resets escalation to base", async () => {
 });
 
 // yz-zpj: A re-trip while a cooldown is STILL ACTIVE must escalate, not erase.
-test("yz-zpj: re-trip during active cooldown escalates, does not erase", async () => {
+test("yz-esc: re-trip during an active cooldown holds the level, neither erases nor increments", async () => {
   const originalChrome = globalThis.chrome;
   const originalSetTimeout = globalThis.setTimeout;
   const port = makePort();
@@ -12662,7 +12662,7 @@ test("yz-zpj: re-trip during active cooldown escalates, does not erase", async (
       throttle_until_ms: now - 1000,
       next_ready_at_ms: now - 1000,
       throttle_level: 0,
-      rate_limit_escalation: 0,
+      rate_limit_escalation: 2,
       rate_limit_last_until_ms: now + 14 * 60 * 1000,
       in_flight_until_ms: 0,
       generation: 1
@@ -12681,9 +12681,11 @@ test("yz-zpj: re-trip during active cooldown escalates, does not erase", async (
     ));
 
     const cooldown = await readCooldownState(recipe);
-    assert.ok(cooldown.rate_limit_escalation > 0, "re-trip during active cooldown must escalate, not erase");
+    assert.equal(cooldown.rate_limit_escalation, 2,
+      "same wall event seen twice must hold the level: not erased to 0, not incremented to 3");
     const cooldownMs = cooldown.throttle_until_ms - now;
-    assert.ok(cooldownMs >= 29 * 60 * 1000,
+    // Level 2 => 15 min * 2^2 = 60 min, and throttle_until never shrinks.
+    assert.ok(cooldownMs >= 59 * 60 * 1000,
       `re-trip cooldown should be ~30 min, got ${cooldownMs}ms`);
   } finally {
     globalThis.chrome = originalChrome;
@@ -13048,6 +13050,137 @@ test("yz-0fd: two back-to-back job_starts inside the min-gap window create exact
     assert.equal(tabCreateCount, 1, "exactly one tab must be created for two back-to-back starts");
   } finally {
     globalThis.__YOETZ_TAB_PACING_MIN_GAP_MS = originalMinGap;
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("yz-esc: a job completing while a cooldown is still holding does not reset the escalation", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+  const sentJobs = new Set();
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_esc1" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedLatestProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: command.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            sentJobs.add(command.job.job_id);
+            // The wall rises AFTER this job got its tab. job_start would
+            // refuse a new job now, so this in-flight job is the only kind
+            // that can still reach completion during the cooldown.
+            await writeGateState("chatgpt", {
+              throttle_until_ms: Date.now() + 10 * 60 * 1000,
+              next_ready_at_ms: Date.now() + 10 * 60 * 1000,
+              throttle_level: 1,
+              rate_limit_escalation: 3,
+              rate_limit_last_until_ms: Date.now() + 10 * 60 * 1000,
+              in_flight_until_ms: 0,
+              generation: 1
+            });
+            return {
+              ok: true,
+              payload: {
+                sent: true,
+                conversation_id: `conv-${command.job.job_id}`,
+                final_model_selection: {
+                  ...verifiedLatestProSelection(),
+                  click_bound: true
+                }
+              }
+            };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sentJobs.has(command.job.job_id)
+                ? {
+                    method: "assistant_dom_fallback",
+                    text: `answer ${command.job.job_id}`,
+                    is_generating: false,
+                    assistant_count: 1,
+                    copy_button_count: 1,
+                    has_copy_button: true,
+                    turn_index: 0,
+                    conversation_id: `conv-${command.job.job_id}`,
+                    model_slug: "gpt-5-6-pro"
+                  }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+            };
+          case "yoetz_fetch_conversation":
+            throw new Error("backend API unavailable");
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    const recipe = "chatgpt";
+    const now = Date.now();
+    // Pre-arm an escalated state. throttle_until_ms is in the past so job_start
+    // does not refuse, but rate_limit_escalation and rate_limit_last_until_ms
+    // carry the escalation that a completed job must reset.
+    await writeGateState(recipe, {
+      throttle_until_ms: now - 1000,
+      next_ready_at_ms: now - 1000,
+      throttle_level: 0,
+      rate_limit_escalation: 2,
+      rate_limit_last_until_ms: now + 60 * 60 * 1000,
+      in_flight_until_ms: 0,
+      generation: 1
+    });
+
+    // Verify the escalated state is in place
+    const stateBefore = await readCooldownState(recipe);
+    assert.ok(stateBefore.rate_limit_escalation > 0, "must be escalated before reset");
+
+    // Load the service worker
+    await import(`../src/service-worker.js?yz_zpj3=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+
+    // Start a job that will complete successfully
+    port.emit(envelope("job_start", "job_zpj3", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    // Wait for the file gate, deliver the file, then wait for job_complete
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_zpj3", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_zpj3.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((m) => m.type === "job_complete"));
+
+    // Verify escalation was reset
+    const stateAfter = await readCooldownState(recipe);
+    assert.equal(stateAfter.rate_limit_escalation, 3,
+      "the wall is still holding, so this completion is not evidence it cleared for a new tab");
+    assert.ok(stateAfter.rate_limit_last_until_ms > 0,
+      "the cooldown anchor must survive too, or the next trip would read as a first trip");
+  } finally {
     globalThis.chrome = originalChrome;
     globalThis.setTimeout = originalSetTimeout;
   }
