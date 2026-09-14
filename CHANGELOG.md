@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- Visibility shim: the assistance deadline (`assistUntil`) is now rechecked
+  at delivery time in both the synthetic IntersectionObserver callback and
+  the `requestIdleCallback` fallback, not only at scheduling time. A callback
+  scheduled just before the 90 s assistance window ends no longer delivers a
+  synthetic entry after it has closed. `parseRootMargin` now resolves
+  percentage values against the root rect dimensions instead of treating them
+  as raw pixels. (`yz-718`)
 - ChatGPT rate-limit cooldown now escalates per recipe key instead of a flat
   60s. The first typed `rate_limited` arms a 15-minute base cooldown; each
   further `rate_limited` inside the escalation window doubles it (capped at 4

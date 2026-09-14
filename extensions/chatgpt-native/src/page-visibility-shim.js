@@ -31,9 +31,19 @@
 
     // Parse a CSS margin shorthand (e.g. "0px 0px 100px 0px") into px values.
     // Used by the synthetic IntersectionObserver to respect rootMargin.
+    // yz-718: Percentage values (e.g. "-50%") are stored as { px, pct } pairs
+    // and resolved against the root rect dimensions at delivery time, not
+    // treated as raw pixels.
     function parseRootMargin(value) {
       const parts = String(value ?? "0px").trim().split(/\s+/);
-      const nums = parts.map((p) => parseFloat(p) || 0);
+      const parse = (p) => {
+        const s = String(p).trim();
+        if (s.endsWith("%")) {
+          return { pct: parseFloat(s) || 0, px: 0 };
+        }
+        return { pct: 0, px: parseFloat(s) || 0 };
+      };
+      const nums = parts.map(parse);
       // CSS shorthand: 1=val, 2=v h, 3=t h b, 4=t r b l
       let top, right, bottom, left;
       if (nums.length === 1) { top = right = bottom = left = nums[0]; }
@@ -41,6 +51,18 @@
       else if (nums.length === 3) { top = nums[0]; right = left = nums[1]; bottom = nums[2]; }
       else { top = nums[0]; right = nums[1]; bottom = nums[2]; left = nums[3]; }
       return { top, right, bottom, left };
+    }
+    // yz-718: Resolve a parsed margin against a root rect, converting
+    // percentage values to pixels based on the root's dimensions.
+    function resolveRootMargin(margin, rootRect) {
+      if (!rootRect) return { top: 0, right: 0, bottom: 0, left: 0 };
+      const resolve = (m, dim) => m.px + (m.pct ? (m.pct / 100) * dim : 0);
+      return {
+        top: resolve(margin.top, rootRect.height),
+        right: resolve(margin.right, rootRect.width),
+        bottom: resolve(margin.bottom, rootRect.height),
+        left: resolve(margin.left, rootRect.width)
+      };
     }
     const swallow = (event) => event.stopImmediatePropagation();
     window.addEventListener("visibilitychange", swallow, true);
@@ -106,16 +128,14 @@
     // target was unobserved or the observer disconnected in the meantime —
     // and back requestIdleCallback with a short timer so those gates open.
     const NativeIntersectionObserver = window.IntersectionObserver;
+    // yz-718: The assistance deadline is shared between the IntersectionObserver
+    // and the idle-callback fallback so both paths recheck it at delivery time.
+    const assistUntil = performance.now() + 90000;
     if (typeof NativeIntersectionObserver === "function") {
       const observerCallbacks = new WeakMap();
       const observerTargets = new WeakMap();
       const observerDelivered = new WeakMap();
       const observerMargins = new WeakMap();
-      // The lazily mounted header only needs the assist during hydration;
-      // after that window, background lazy-loaders (sidebar pagination,
-      // media) keep their native behavior so a hidden tab cannot page
-      // itself into the account rate limit.
-      const assistUntil = performance.now() + 90000;
       window.IntersectionObserver = class YoetzIntersectionObserver extends NativeIntersectionObserver {
         constructor(callback, init) {
           super(callback, init);
@@ -134,6 +154,11 @@
           if (observerDelivered.get(this)?.has(target)) return;
           setTimeout(() => {
             if (!reallyHidden()) return;
+            // yz-718: Recheck the assistance deadline at delivery time, not
+            // only at scheduling time. A callback scheduled just before the
+            // assistance window ends must not deliver a synthetic entry after
+            // it has closed.
+            if (performance.now() > assistUntil) return;
             if (!observerTargets.get(this)?.has(target)) return;
             if (observerDelivered.get(this)?.has(target)) return;
             const rect = target?.getBoundingClientRect?.()
@@ -166,7 +191,10 @@
               rootRect = root.getBoundingClientRect?.() ?? null;
             }
             // Apply rootMargin (parsed from init at construction).
-            const margin = observerMargins.get(this) ?? { top: 0, right: 0, bottom: 0, left: 0 };
+            // yz-718: Resolve percentage margins against the root rect
+            // dimensions, not as raw pixels.
+            const rawMargin = observerMargins.get(this) ?? { top: { px: 0, pct: 0 }, right: { px: 0, pct: 0 }, bottom: { px: 0, pct: 0 }, left: { px: 0, pct: 0 } };
+            const margin = resolveRootMargin(rawMargin, rootRect);
             if (rootRect && (margin.top || margin.right || margin.bottom || margin.left)) {
               // Build explicitly from edges — getBoundingClientRect() returns a
               // DOMRect whose width/height are prototype getters that do not
@@ -268,6 +296,15 @@
         }, options);
         const timer = reallyHidden()
           ? setTimeout(() => {
+            // yz-718: Recheck the assistance deadline and visibility at
+            // delivery time, BEFORE any destructive cleanup. A timer
+            // scheduled just before the assistance window ends must not
+            // deliver synthetic idle work after it has closed, and a tab that
+            // became visible must defer to the native idle callback. Moving
+            // this guard above idleRequests.delete + nativeCancelIdle ensures
+            // a trip leaves the native registration intact so the native
+            // callback fires normally.
+            if (!reallyHidden() || performance.now() > assistUntil) return;
             if (!idleRequests.delete(nativeId)) return;
             nativeCancelIdle?.(nativeId);
             // Present a normal, shrinking idle slice (not a timed-out one) so
