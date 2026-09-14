@@ -690,7 +690,7 @@ async function startJob(message) {
       return;
     }
     if (pacing) {
-      await failJob(job, "tab_pacing_active", `ChatGPT tab pacing is active (${pacing.reason}; ${pacing.activeJobs} active job(s)); not opening a new tab. Retry after the limit clears.`, {
+      await failJob(job, "tab_pacing_active", `ChatGPT tab pacing is active (${pacing.reason}; ${pacing.activeJobs} active job(s)); not opening a new tab. Wait ${pacing.waitRemainingMs}ms then retry.`, {
         phase: "profile",
         side_effect_started: false,
         reason: pacing.reason,
@@ -714,8 +714,8 @@ async function startJob(message) {
   if (!jobContinuationIsLive(job, continuationEpoch)) {
     return;
   }
-  // yz-0fd: durable min-gap anchor for the NEXT tab on this recipe key.
-  await recordTabCreation(adapterRecipeKey(job));
+  // yz-0fd: the min-gap anchor was already reserved inside checkTabPacing's
+  // mutex section when this job was allowed; no post-hoc recording here.
   const inspectCommand = inspectCommandForJob(job);
   if (!postNative(progress(job, "tab_opened", {
     tab_id: tab.id,
@@ -4369,6 +4369,14 @@ function countActiveJobsForRecipe(recipe, excludeJobId = null) {
 // { reason: "min_gap" | "max_concurrent", waitRemainingMs, activeJobs } if the
 // job should be refused. The reason is explicit because waitRemainingMs 0 on
 // max_concurrent must not read as "wait zero and proceed".
+// yz-0fd recut: when the check ALLOWS, the min-gap anchor is reserved in the
+// SAME mutex section (last_tab_created_at_ms = nowMs) before returning null.
+// check-then-act with the act outside the mutex would let two job_starts in
+// the same second both read the old anchor and both open tabs — the exact
+// pattern this pacing exists to stop. A failed createJobTab leaves the
+// anchor standing: the next caller waits out the gap for a tab that never
+// opened. That is acceptable over-pacing; the attempt was a navigation
+// attempt.
 async function checkTabPacing(recipe, { excludeJobId = null, nowMs = Date.now() } = {}) {
   return withBackendApiGateMutex(async () => {
     const state = await readTabPacingState(recipe);
@@ -4383,7 +4391,6 @@ async function checkTabPacing(recipe, { excludeJobId = null, nowMs = Date.now() 
     }
     // Max concurrent check
     const activeCount = countActiveJobsForRecipe(recipe, excludeJobId);
-    console.log("DBG_SW", JSON.stringify({ recipe, excludeJobId, activeCount, statuses: [...jobs.values()].map(j => [j.job_id, j.status]) }));
     if (activeCount >= TAB_PACING_MAX_CONCURRENT) {
       return {
         reason: "max_concurrent",
@@ -4391,19 +4398,12 @@ async function checkTabPacing(recipe, { excludeJobId = null, nowMs = Date.now() 
         activeJobs: activeCount
       };
     }
-    return null;
-  });
-}
-
-// Record a tab creation timestamp for pacing. Only the timestamp is durable;
-// concurrency is counted from the rehydratable activeJobs map, so there is no
-// write-only tab-id list to drift out of sync.
-async function recordTabCreation(recipe, nowMs = Date.now()) {
-  return withBackendApiGateMutex(async () => {
-    const state = await readTabPacingState(recipe);
+    // Reserve: the anchor is written inside this mutex section so a second
+    // job_start arriving before createJobTab finishes still sees it.
     await writeTabPacingState(recipe, {
       last_tab_created_at_ms: nowMs
     });
+    return null;
   });
 }
 

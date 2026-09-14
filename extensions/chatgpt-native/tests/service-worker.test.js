@@ -12908,14 +12908,9 @@ test("yz-0fd: second concurrent job refuses with tab_pacing_active reason=max_co
       wait_interval_ms: 50,
       wait_timeout_ms: 5000
     }));
-    try {
-      await eventually(() => port.messages.some((m) =>
-        m.type === "job_error" && m.job_id === "job_0fd_refused" && m.payload?.code === "tab_pacing_active"
-      ), 5000);
-    } catch (e) {
-      console.log("DBGLIVE", JSON.stringify(port.messages.map((m) => [m.type, m.job_id, m.payload?.code ?? m.payload?.phase, String(m.payload?.message ?? "").slice(0, 150)])));
-      throw e;
-    }
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.job_id === "job_0fd_refused" && m.payload?.code === "tab_pacing_active"
+    ), 5000);
 
     const refused = port.messages.find((m) =>
       m.type === "job_error" && m.payload?.code === "tab_pacing_active"
@@ -12983,6 +12978,76 @@ test("yz-0fd: TAB_PACING_MAX_CONCURRENT override of 0 is floored at 1", async ()
     assert.equal(refused, undefined, "floor of 1 must not refuse a job when nothing is active");
   } finally {
     globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT = originalMax;
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("yz-0fd: two back-to-back job_starts inside the min-gap window create exactly one tab (reservation is inside the mutex)", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalMinGap = globalThis.__YOETZ_TAB_PACING_MIN_GAP_MS;
+  const port = makePort();
+  let tabCreateCount = 0;
+  let resolveTabCreate = null;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.__YOETZ_TAB_PACING_MIN_GAP_MS = 30000;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      // createJobTab resolves on a later tick: the second job_start must hit
+      // the RESERVED anchor, not the pre-tab state.
+      create: async (opts) => {
+        tabCreateCount++;
+        await new Promise((resolve) => { resolveTabCreate = resolve; });
+        resolveTabCreate = null;
+        return { id: tabCreateCount, ...opts };
+      },
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async () => { throw new Error("should not reach tab messages"); }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_0fd_race=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+
+    // First job: passes pacing, its tab creation is pending (parked).
+    port.emit(envelope("job_start", "job_0fd_race_a", {
+      prompt: "a",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => tabCreateCount === 1, 5000);
+
+    // Second job starts BEFORE the first tab creation resolves.
+    port.emit(envelope("job_start", "job_0fd_race_b", {
+      prompt: "b",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.job_id === "job_0fd_race_b" && m.payload?.code === "tab_pacing_active"
+    ), 5000);
+
+    const refused = port.messages.find((m) =>
+      m.type === "job_error" && m.job_id === "job_0fd_race_b" && m.payload?.code === "tab_pacing_active"
+    );
+    assert.equal(refused.payload.reason, "min_gap", "the back-to-back second start must hit the reserved anchor");
+    assert.ok(
+      typeof refused.payload.wait_remaining_ms === "number" && refused.payload.wait_remaining_ms > 0,
+      `must carry wait_remaining_ms > 0, got ${refused.payload.wait_remaining_ms}`
+    );
+    assert.ok(refused.payload.message.includes(String(refused.payload.wait_remaining_ms)),
+      "refusal message must include wait_remaining_ms for CLI operators");
+
+    // Release the parked tab creation; only one tab may exist.
+    resolveTabCreate?.();
+    await new Promise((resolve) => originalSetTimeout(resolve, 0));
+    assert.equal(tabCreateCount, 1, "exactly one tab must be created for two back-to-back starts");
+  } finally {
+    globalThis.__YOETZ_TAB_PACING_MIN_GAP_MS = originalMinGap;
     globalThis.chrome = originalChrome;
     globalThis.setTimeout = originalSetTimeout;
   }
