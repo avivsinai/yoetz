@@ -1596,7 +1596,7 @@ async function selectLatestChatProModel(root, options = {}) {
     if (!postClose.ok) {
       const quotaLocked = postClose.post_close_failure_reason === "effort_options_disabled";
       return selectionFailure(
-        base, modelButton, state, availableFamilies,
+        base, modelButton, r, availableFamilies,
         quotaLocked
           ? (postClose.post_close_disabled_reason
             ? `ChatGPT Pro effort is disabled: ${postClose.post_close_disabled_reason}`

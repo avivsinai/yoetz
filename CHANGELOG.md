@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Chrome throttles `setTimeout` to >=1s in a background tab, which is the
   reason this pump exists, so waiting out the frame interval with a timer would
   drop a hidden tab's rAF to about 1fps. (`yz-8rw`)
+- ChatGPT model selection: the post-close reverification-failed branch passed
+  an undefined identifier (`state`) to `selectionFailure`, so a genuine
+  post-close failure — including the `effort_options_disabled` quota lock —
+  threw `ReferenceError: state is not defined` instead of returning the
+  structured refusal the caller reads quota state from. It now passes the
+  picker read `r`, matching every sibling call site. No test reached this
+  branch before; one now does. (`yz-2mf`)
 - Visibility shim: the assistance deadline (`assistUntil`) is now rechecked
   at delivery time in both the synthetic IntersectionObserver callback and
   the `requestIdleCallback` fallback, not only at scheduling time. A callback
@@ -33,6 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   synthetic entry after it has closed. `parseRootMargin` now resolves
   percentage values against the root rect dimensions instead of treating them
   as raw pixels. (`yz-718`)
+- ChatGPT rate-limit cooldown now escalates per recipe key instead of a flat
+  60s. The first typed `rate_limited` arms a 15-minute base cooldown; each
+  further `rate_limited` inside the escalation window doubles it (capped at 4
+  hours); a completed job resets to base. The 'Too many requests' modal is a
+  conversation-history read limit that can last hours — a 60s cooldown let the
+  next caller re-probe and re-latch the wall. The refusal contract is
+  unchanged: `job_start` still fails immediately with
+  `rate_limit_cooldown_active` and opens no tab. All three constants are
+  `__YOETZ_` overridable. (`yz-zpj`)
 - Visibility shim: a target whose first synthetic sample has an all-zero
   rect (not yet rendered) is no longer permanently marked as delivered.
   The delivered-once mark is now scoped to targets with a real box; a target
