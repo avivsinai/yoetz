@@ -4569,7 +4569,11 @@ function makeHybridSimpleViewFixture({
   leftoverHiddenFamilyMenu = false,
   leftoverBareFamilyMenu = false,
   leftoverWrappedHiddenMenu = false,
-  advancedViewInitiallyEmpty = false
+  advancedViewInitiallyEmpty = false,
+  // yz-2mf: from this open onward the family radios are absent, so a reopen
+  // reads no checked family. Models ChatGPT re-rendering the picker without
+  // the family view, which is what drives post-close reverification failure.
+  familyRadiosMissingFromOpen = 0
 } = {}) {
   const composer = new FakeElement("textarea", { placeholder: "Ask anything" });
   const form = new FakeElement("form", { "data-testid": "composer", class: "group/composer w-full relative z-1" }, "").append(composer);
@@ -4690,7 +4694,8 @@ function makeHybridSimpleViewFixture({
       "data-state": "open",
       style: `opacity:${opacity}`
     }).append(simple, familyView);
-    for (const radioLabel of families) {
+    const familyRadiosPresent = !(familyRadiosMissingFromOpen > 0 && openCount >= familyRadiosMissingFromOpen);
+    for (const radioLabel of familyRadiosPresent ? families : []) {
       (familyWrapper ?? familyView).append(new FakeElement("div", {
         role: "menuitemradio",
         "aria-checked": String(radioLabel === currentFamily),
@@ -5783,4 +5788,22 @@ test("yz-kio: waitForSendAccepted does not accept a user-turn increase from befo
     () => waitForSendAccepted(doc, baseline, { timeoutMs: 30, intervalMs: 10 }),
     /did not accept the prompt/
   );
+});
+
+// yz-2mf: the post-close reverification-failed branch passed an undefined
+// identifier to selectionFailure, so a genuine post-close failure (including
+// the effort_options_disabled quota lock) threw a ReferenceError instead of
+// returning the structured refusal the caller reads quota state from. No test
+// reached this branch before, which is how it survived a review and CI.
+test("yz-2mf: post-close reverification failure returns a structured refusal, not a ReferenceError", async () => {
+  // Open 1 verifies Latest + Pro. The picker reopens for post-close
+  // reverification without the family radios, so the family cannot be re-read
+  // and reverifyModelSelectionAfterClose reports ok:false.
+  const fixture = makeHybridSimpleViewFixture({ familyRadiosMissingFromOpen: 2 });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable", JSON.stringify(result));
+  assert.equal(result.failure_reason, "post_close_model_reverification_failed");
+  assert.equal(result.post_close_family_status, "unverified");
 });
