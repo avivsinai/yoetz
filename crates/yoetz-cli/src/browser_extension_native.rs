@@ -2022,6 +2022,12 @@ fn acquire_extension_recipe_lease(
     if recipe == BuiltinWebRecipe::Claude {
         ensure_instance_supports_recipe(&instance, "claude")?;
     }
+    let recipe_str = if recipe == BuiltinWebRecipe::Claude {
+        "claude"
+    } else {
+        "chatgpt"
+    };
+    ensure_recipe_not_in_cooldown(&instance, recipe_str)?;
     Ok(ExtensionRecipeLease {
         _lifecycle_lock: lifecycle_lock,
         paths,
@@ -2233,6 +2239,8 @@ fn reconnect_recipe_stream(
             if recipe == BuiltinWebRecipe::Claude {
                 ensure_instance_supports_recipe(&instance, "claude")?;
             }
+            let recipe_str = if recipe == BuiltinWebRecipe::Claude { "claude" } else { "chatgpt" };
+            ensure_recipe_not_in_cooldown(&instance, recipe_str)?;
             let mut stream = connect_socket(&instance.socket_path)
                 .with_context(|| format!("connect {}", instance.socket_path.display()))?;
             set_recipe_read_timeout(&stream, wait_timeout_ms)?;
@@ -2805,6 +2813,25 @@ fn ensure_instance_supports_recipe(instance: &ExtensionInstanceStatus, recipe: &
             .as_deref()
             .unwrap_or(instance.native_instance_id.as_str())
     )
+}
+
+/// yz-er5: Refuse to send job_start while the profile cooldown is active.
+/// Returns the same typed error code as the service worker so callers see one
+/// vocabulary. No tab is opened; waiting is the caller's decision.
+fn ensure_recipe_not_in_cooldown(instance: &ExtensionInstanceStatus, recipe: &str) -> Result<()> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let (active, _until_ms, remaining) = check_recipe_cooldown(instance, recipe, now);
+    if !active {
+        return Ok(());
+    }
+    let remaining_secs = (remaining as f64) / 1000.0;
+    bail!(
+        "rate_limit_cooldown_active: ChatGPT website throttle cooldown is active ({:.1}s remaining); not sending job_start. Retry after the cooldown clears.",
+        remaining_secs,
+    );
 }
 
 fn ensure_instance_supports_capability(
@@ -3582,6 +3609,7 @@ fn send_control_job_with_recipe(
         && payload.get("intent").and_then(Value::as_str) == Some("reload_extension");
     if let Some(recipe) = required_recipe {
         ensure_instance_supports_recipe(&instance, recipe)?;
+        ensure_recipe_not_in_cooldown(&instance, recipe)?;
     }
     if !reload_request {
         ensure_instance_matches_managed_copy(&instance)?;
@@ -5239,9 +5267,9 @@ mod native_host_unix {
                         "profile_id": envelope.payload.get("profile_id").cloned().unwrap_or(Value::Null),
                         "recipes": envelope.payload.get("recipes").cloned().unwrap_or_else(|| json!(default_extension_recipes())),
                         "capabilities": envelope.payload.get("capabilities").cloned().unwrap_or_else(|| json!([])),
-                        "cooldown_until_ms": envelope.payload.get("cooldown_until_ms").cloned().unwrap_or_else(|| json!({})),
                         "seen_at_ms": now_millis(),
                     },
+                    "cooldown_until_ms": envelope.payload.get("cooldown_until_ms").cloned().unwrap_or_else(|| json!({})),
                     "version_mismatch": Value::Null,
                     "last_manual_handoff": Value::Null,
                 }),
@@ -5250,9 +5278,7 @@ mod native_host_unix {
                 &paths.status_path,
                 json!({
                     "last_heartbeat_ms": now_millis(),
-                    "extension": {
-                        "cooldown_until_ms": envelope.payload.get("cooldown_until_ms").cloned().unwrap_or_else(|| json!({})),
-                    },
+                    "cooldown_until_ms": envelope.payload.get("cooldown_until_ms").cloned().unwrap_or_else(|| json!({})),
                 }),
             ),
             _ => Ok(()),
@@ -5274,9 +5300,16 @@ mod native_host_unix {
                     "recipes": envelope.payload.get("recipes").cloned().unwrap_or_else(|| json!(default_extension_recipes())),
                     "capabilities": envelope.payload.get("capabilities").cloned().unwrap_or_else(|| json!([])),
                     "protocol_version": envelope.payload.get("protocol_version").cloned().unwrap_or(json!(PROTOCOL_VERSION)),
+                    "cooldown_until_ms": envelope.payload.get("cooldown_until_ms").cloned().unwrap_or_else(|| json!({})),
                 }),
             ),
-            "heartbeat" | "job_progress" | "job_file_chunk_ack" | "job_complete" | "job_error" => {
+            "heartbeat" => write_instance_status(
+                runtime,
+                json!({
+                    "cooldown_until_ms": envelope.payload.get("cooldown_until_ms").cloned().unwrap_or_else(|| json!({})),
+                }),
+            ),
+            "job_progress" | "job_file_chunk_ack" | "job_complete" | "job_error" => {
                 write_instance_status(runtime, json!({}))
             }
             _ => Ok(()),
@@ -8388,8 +8421,6 @@ mod tests {
         assert!(out.exists());
         assert_eq!(fs::read_to_string(&out).unwrap(), html);
     }
-}
-
     // yz-er5: unit tests for check_recipe_cooldown pure function
     fn test_instance(cooldowns: Option<Value>) -> ExtensionInstanceStatus {
         ExtensionInstanceStatus {
@@ -8459,3 +8490,24 @@ mod tests {
         assert_eq!(until_ms, None);
         assert_eq!(remaining, 0);
     }
+
+    #[test]
+    fn yz_er5_ensure_recipe_not_in_cooldown_allows_when_inactive() {
+        let instance = test_instance(None);
+        assert!(ensure_recipe_not_in_cooldown(&instance, "chatgpt").is_ok());
+    }
+
+    #[test]
+    fn yz_er5_ensure_recipe_not_in_cooldown_refuses_when_active() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let until = now + 60000;
+        let instance = test_instance(Some(json!({"chatgpt": until})));
+        let result = ensure_recipe_not_in_cooldown(&instance, "chatgpt");
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("rate_limit_cooldown_active"), "msg: {msg}");
+    }
+}
