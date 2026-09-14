@@ -2239,8 +2239,6 @@ fn reconnect_recipe_stream(
             if recipe == BuiltinWebRecipe::Claude {
                 ensure_instance_supports_recipe(&instance, "claude")?;
             }
-            let recipe_str = if recipe == BuiltinWebRecipe::Claude { "claude" } else { "chatgpt" };
-            ensure_recipe_not_in_cooldown(&instance, recipe_str)?;
             let mut stream = connect_socket(&instance.socket_path)
                 .with_context(|| format!("connect {}", instance.socket_path.display()))?;
             set_recipe_read_timeout(&stream, wait_timeout_ms)?;
@@ -3609,7 +3607,6 @@ fn send_control_job_with_recipe(
         && payload.get("intent").and_then(Value::as_str) == Some("reload_extension");
     if let Some(recipe) = required_recipe {
         ensure_instance_supports_recipe(&instance, recipe)?;
-        ensure_recipe_not_in_cooldown(&instance, recipe)?;
     }
     if !reload_request {
         ensure_instance_matches_managed_copy(&instance)?;
