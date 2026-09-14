@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- ChatGPT model selection: the post-close reverification-failed branch passed
+  an undefined identifier (`state`) to `selectionFailure`, so a genuine
+  post-close failure — including the `effort_options_disabled` quota lock —
+  threw `ReferenceError: state is not defined` instead of returning the
+  structured refusal the caller reads quota state from. It now passes the
+  picker read `r`, matching every sibling call site. No test reached this
+  branch before; one now does. (`yz-2mf`)
 - Visibility shim: the assistance deadline (`assistUntil`) is now rechecked
   at delivery time in both the synthetic IntersectionObserver callback and
   the `requestIdleCallback` fallback, not only at scheduling time. A callback
