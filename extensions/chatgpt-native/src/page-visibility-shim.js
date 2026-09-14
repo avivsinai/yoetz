@@ -136,7 +136,6 @@
             if (!reallyHidden()) return;
             if (!observerTargets.get(this)?.has(target)) return;
             if (observerDelivered.get(this)?.has(target)) return;
-            observerDelivered.get(this)?.add(target);
             const rect = target?.getBoundingClientRect?.()
               ?? { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 };
             // Compute the actual intersection of the target rect with the
@@ -190,6 +189,14 @@
             // shape before they mount (yz-5bd).
             const hasNoBox = rect.width === 0 && rect.height === 0
               && rect.top === 0 && rect.left === 0 && rect.right === 0 && rect.bottom === 0;
+            // yz-qei: Only mark as delivered when the target had a real box.
+            // A target with an all-zero rect (not yet rendered) must get
+            // another sample when it acquires real geometry and observe() is
+            // called again. Marking it delivered here would permanently block
+            // the later hydration signal.
+            if (!hasNoBox) {
+              observerDelivered.get(this)?.add(target);
+            }
             let intersectionRect;
             let isIntersecting;
             if (!rootRect || hasNoBox) {
