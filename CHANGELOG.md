@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.73] - 2026-09-14
 ### Fixed
 - ChatGPT `isResponseGenerating` no longer misses ChatGPT Pro's Stop button
   (`data-testid="stop-button"`, `aria-label="Stop answering"`) or the
@@ -52,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `children`), and fails closed if the chain is broken or cyclic. An
   in-progress node on the active lineage or below `current_node` still
   vetoes; an abandoned sibling no longer does. (`yz-1ek`)
+
 
 ## [0.5.72] - 2026-09-13
 ### Added
