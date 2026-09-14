@@ -154,11 +154,36 @@ const BACKEND_API_THROTTLE_MAX_MS = Math.max(
     : 240000
 );
 const BACKEND_API_THROTTLE_JITTER_RATIO = 0.2;
-const CHATGPT_RATE_LIMITED_COOLDOWN_MS = Math.max(
+// yz-zpj: Escalating rate-limit cooldown. The 'Too many requests' modal is a
+// conversation-history read limit, not a message quota — it can last hours.
+// A flat 60s cooldown let the next caller re-probe and re-latch the wall.
+// Base 15 min, double per recurrence, cap 4 hours. A completed job resets to
+// base. All three are __YOETZ_ overridable for tuning without a release.
+const RATE_LIMIT_COOLDOWN_BASE_MS = Math.max(
   0,
-  Number.isFinite(Number(globalThis.__YOETZ_CHATGPT_RATE_LIMITED_COOLDOWN_MS))
-    ? Number(globalThis.__YOETZ_CHATGPT_RATE_LIMITED_COOLDOWN_MS)
-    : 60000
+  Number.isFinite(Number(globalThis.__YOETZ_RATE_LIMIT_COOLDOWN_BASE_MS))
+    ? Number(globalThis.__YOETZ_RATE_LIMIT_COOLDOWN_BASE_MS)
+    : 15 * 60 * 1000
+);
+const RATE_LIMIT_COOLDOWN_MULTIPLIER = Math.max(
+  1,
+  Number.isFinite(Number(globalThis.__YOETZ_RATE_LIMIT_COOLDOWN_MULTIPLIER))
+    ? Number(globalThis.__YOETZ_RATE_LIMIT_COOLDOWN_MULTIPLIER)
+    : 2
+);
+const RATE_LIMIT_COOLDOWN_CAP_MS = Math.max(
+  RATE_LIMIT_COOLDOWN_BASE_MS,
+  Number.isFinite(Number(globalThis.__YOETZ_RATE_LIMIT_COOLDOWN_CAP_MS))
+    ? Number(globalThis.__YOETZ_RATE_LIMIT_COOLDOWN_CAP_MS)
+    : 4 * 60 * 60 * 1000
+);
+// History window for escalation: a rate_limited inside this window after the
+// previous cooldown expiry counts as a recurrence and escalates.
+const RATE_LIMIT_ESCALATION_WINDOW_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_RATE_LIMIT_ESCALATION_WINDOW_MS))
+    ? Number(globalThis.__YOETZ_RATE_LIMIT_ESCALATION_WINDOW_MS)
+    : RATE_LIMIT_COOLDOWN_CAP_MS
 );
 const CHATGPT_DOM_ONLY_FINALITY_WARNING = "ChatGPT finality_anchor=dom_only: backend API positive-finality proof was unavailable; response relied on DOM-only completion";
 const JOBS_KEY_PREFIX = "jobs.";
@@ -1187,6 +1212,9 @@ async function completeJobWithExtraction(job, extraction, continuationEpoch = jo
     return;
   }
   job.status = "complete";
+  // yz-zpj: A clean completed job means the rate-limit wall has cleared.
+  // Reset the escalation so the next rate_limited on this key starts at base.
+  await resetRateLimitEscalation(adapterRecipeKey(job)).catch(() => {});
   forgetContentScriptRecovery(job.job_id);
   rememberTerminalJob(job.job_id);
   await postTerminalJob(job, completeEnvelope, { status: "complete", phase: "wait_response" });
@@ -4252,6 +4280,8 @@ async function readBackendApiGateState(recipe) {
     next_ready_at_ms: Number(value?.next_ready_at_ms ?? 0) || 0,
     throttle_until_ms: Number(value?.throttle_until_ms ?? 0) || 0,
     throttle_level: Number(value?.throttle_level ?? 0) || 0,
+    rate_limit_escalation: Number(value?.rate_limit_escalation ?? 0) || 0,
+    rate_limit_last_until_ms: Number(value?.rate_limit_last_until_ms ?? 0) || 0,
     in_flight_until_ms: Number(value?.in_flight_until_ms ?? 0) || 0,
     generation: Number(value?.generation ?? 0) || 0
   };
@@ -4387,11 +4417,62 @@ async function throttleBackendApiGate(recipe, retryAfterMsValue, nowMs = Date.no
   });
 }
 
-// Observe a recognized rate_limited DOM outcome (the 'Too many requests'
-// modal): it is the same website throttle seen through the page, so the shared
-// cooldown covers website reads, new tab creation, and render refresh.
+// yz-zpj: Observe a recognized rate_limited DOM outcome (the 'Too many
+// requests' modal). The cooldown escalates: base 15 min on the first trip,
+// double per recurrence inside the escalation window, capped at 4 hours. A
+// completed job resets to base. This is a conversation-history read limit,
+// not a message quota — it can last hours, so a flat 60s cooldown let the next
+// caller re-probe and re-latch the wall.
 async function throttleBackendApiGateFromRateLimit(recipe, nowMs = Date.now()) {
-  return throttleBackendApiGate(recipe, CHATGPT_RATE_LIMITED_COOLDOWN_MS, nowMs);
+  return withBackendApiGateMutex(async () => {
+    const state = await readBackendApiGateState(recipe);
+    // Escalate if the previous rate-limit cooldown expired recently (inside
+    // the escalation window). Otherwise reset to base (first trip or the
+    // window has passed since the last trip).
+    const lastUntil = Number(state.rate_limit_last_until_ms ?? 0);
+    const expiredRecently = lastUntil > 0
+      && lastUntil <= nowMs
+      && (nowMs - lastUntil) < RATE_LIMIT_ESCALATION_WINDOW_MS;
+    const escalation = expiredRecently
+      ? Math.min(
+          (Number(state.rate_limit_escalation ?? 0) + 1),
+          Math.ceil(Math.log2(RATE_LIMIT_COOLDOWN_CAP_MS / RATE_LIMIT_COOLDOWN_BASE_MS)) + 1
+        )
+      : 0;
+    const cooldownMs = Math.min(
+      RATE_LIMIT_COOLDOWN_CAP_MS,
+      RATE_LIMIT_COOLDOWN_BASE_MS * Math.pow(RATE_LIMIT_COOLDOWN_MULTIPLIER, escalation)
+    );
+    const throttleUntil = Math.max(
+      nowMs + cooldownMs,
+      Number(state.throttle_until_ms ?? 0)
+    );
+    await writeBackendApiGateState(recipe, {
+      ...state,
+      throttle_until_ms: throttleUntil,
+      next_ready_at_ms: Math.max(state.next_ready_at_ms, throttleUntil),
+      rate_limit_escalation: escalation,
+      rate_limit_last_until_ms: throttleUntil
+    });
+    return throttleUntil - nowMs;
+  });
+}
+
+// yz-zpj: Reset the rate-limit escalation when a job completes successfully.
+// A clean completed job on a recipe key means the wall has cleared; the next
+// rate_limited on that key starts at base again.
+async function resetRateLimitEscalation(recipe, nowMs = Date.now()) {
+  return withBackendApiGateMutex(async () => {
+    const state = await readBackendApiGateState(recipe);
+    if (Number(state.rate_limit_escalation ?? 0) === 0 && Number(state.rate_limit_last_until_ms ?? 0) === 0) {
+      return;
+    }
+    await writeBackendApiGateState(recipe, {
+      ...state,
+      rate_limit_escalation: 0,
+      rate_limit_last_until_ms: 0
+    });
+  });
 }
 
 // True while the profile-wide 429 cooldown holds. Tab creation and render

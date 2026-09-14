@@ -12372,3 +12372,130 @@ test("yz-er5: heartbeat carries cooldown_until_ms after arming", async () => {
     globalThis.setTimeout = originalSetTimeout;
   }
 });
+
+// =========================================================================
+// yz-zpj: Escalating rate-limit cooldown per recipe key.
+// First typed rate_limited arms base (15 min), second inside the escalation
+// window arms escalated (double), completed job resets to base.
+// =========================================================================
+
+// Helper: write a prior rate-limit gate state to simulate a previous trip.
+async function writeGateState(recipe, state) {
+  const key = `backend-api-gate.${recipe}`;
+  await globalThis.chrome.storage.session.set({ [key]: state });
+}
+
+test("yz-zpj: first rate_limited arms base cooldown (~15 min)", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_zpj1" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: { state: "rate_limited", message: "Too many requests" } } };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_zpj1=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+    port.emit(envelope("job_start", "job_zpj1", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "manual_handoff"
+    ));
+
+    const cooldown = await readCooldownState("chatgpt");
+    assert.ok(cooldown, "cooldown state must exist");
+    assert.ok(cooldown.throttle_until_ms > Date.now(), "cooldown armed");
+    const cooldownMs = cooldown.throttle_until_ms - Date.now();
+    assert.ok(cooldownMs >= 14 * 60 * 1000,
+      `first cooldown should be ~15 min, got ${cooldownMs}ms`);
+    assert.equal(cooldown.rate_limit_escalation, 0, "first trip: escalation level 0");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("yz-zpj: second rate_limited inside escalation window arms escalated cooldown", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_zpj2" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: { state: "rate_limited", message: "Too many requests" } } };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    // Simulate a prior rate-limit trip: cooldown expired recently (inside window)
+    const now = Date.now();
+    const priorUntil = now - 60000; // expired 60s ago
+    await writeGateState("chatgpt", {
+      throttle_until_ms: priorUntil,
+      next_ready_at_ms: priorUntil,
+      throttle_level: 1,
+      rate_limit_escalation: 0,
+      rate_limit_last_until_ms: priorUntil,
+      in_flight_until_ms: 0,
+      generation: 1
+    });
+
+    await import(`../src/service-worker.js?yz_zpj2=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+    port.emit(envelope("job_start", "job_zpj2", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "manual_handoff"
+    ));
+
+    const cooldown = await readCooldownState("chatgpt");
+    assert.ok(cooldown, "cooldown state must exist");
+    assert.ok(cooldown.rate_limit_escalation > 0, "second trip must escalate");
+    const cooldownMs = cooldown.throttle_until_ms - now;
+    // Escalated: base * 2^1 = 30 min
+    assert.ok(cooldownMs >= 29 * 60 * 1000,
+      `escalated cooldown should be ~30 min, got ${cooldownMs}ms`);
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});

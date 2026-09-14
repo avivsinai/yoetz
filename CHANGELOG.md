@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- ChatGPT rate-limit cooldown now escalates per recipe key instead of a flat
+  60s. The first typed `rate_limited` arms a 15-minute base cooldown; each
+  further `rate_limited` inside the escalation window doubles it (capped at 4
+  hours); a completed job resets to base. The 'Too many requests' modal is a
+  conversation-history read limit that can last hours — a 60s cooldown let the
+  next caller re-probe and re-latch the wall. The refusal contract is
+  unchanged: `job_start` still fails immediately with
+  `rate_limit_cooldown_active` and opens no tab. All three constants are
+  `__YOETZ_` overridable. (`yz-zpj`)
 - Visibility shim: a target whose first synthetic sample has an all-zero
   rect (not yet rendered) is no longer permanently marked as delivered.
   The delivered-once mark is now scoped to targets with a real box; a target
