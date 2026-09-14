@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- ChatGPT upload: `hasUploadPending` no longer scans the whole document for
+  the words uploading/attaching/processing/scanning. It scanned `document`
+  using subtree text with `div` in the candidate set, so one occurrence of any
+  of those words anywhere visible on the page — a sidebar conversation title,
+  a rendered answer that merely discusses uploads — made every ancestor `div`
+  match and pinned `pending` true for the life of the tab. The observed field
+  failure had exactly that shape: `attached=true, pending=true,
+  send_enabled=true` repeating until the deadline, with the file genuinely
+  attached and Send genuinely enabled. The predicate is now scoped to the
+  composer, and its text fallback matches leaf nodes only. (`yz-dl0`)
 - ChatGPT model selection: the post-close reverification-failed branch passed
   an undefined identifier (`state`) to `selectionFailure`, so a genuine
   post-close failure — including the `effort_options_disabled` quota lock —

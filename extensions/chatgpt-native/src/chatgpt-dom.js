@@ -3526,18 +3526,48 @@ function attachmentNodeKey(node) {
   ].filter(Boolean).join("|");
 }
 
+const UPLOAD_PENDING_MARKERS = [
+  '[role="progressbar"]',
+  '[aria-busy="true"]',
+  '[data-testid*="upload"][data-state*="loading"]',
+  '[data-testid*="attachment"][data-state*="loading"]'
+];
+const UPLOAD_PROGRESS_TEXT = /\b(uploading|attaching|processing|scanning)\b/i;
+
+// yz-dl0: whether THIS composer still has an upload in flight.
+//
+// This used to scan the whole document -- root is document -- for four English
+// words, using subtree text (textOf returns innerText) with div in the
+// candidate set. So one occurrence of "uploading", "attaching", "processing"
+// or "scanning" anywhere visible on the page made every ancestor div match and
+// pinned pending true forever: a sidebar conversation title, a rendered answer
+// that merely discusses uploads, the user's own prompt. A live probe counted
+// 1078 visible candidates under that selector on an ordinary conversation.
+//
+// The observed field failure had exactly that shape -- attached=true,
+// pending=true, send_enabled=true repeating until the deadline, with the file
+// genuinely attached and Send genuinely enabled.
+//
+// The invariant we actually want is narrow: this composer's own attachment
+// chrome is not showing an in-progress state. So scope to the composer and,
+// for the text fallback, match only LEAF nodes -- an ancestor's subtree text
+// is not evidence that the ancestor is a progress indicator.
 function hasUploadPending(root) {
-  const pending = firstVisible(root, [
-    '[role="progressbar"]',
-    '[aria-busy="true"]',
-    '[data-testid*="upload"][data-state*="loading"]',
-    '[data-testid*="attachment"][data-state*="loading"]'
-  ]);
-  if (pending) {
+  const scopes = composerScopes(root, { includeRoot: false });
+  if (scopes.length === 0) {
+    // No composer: nothing to judge. hasAttachmentNamed is scoped the same
+    // way and will also be false, so the caller keeps waiting rather than
+    // treating this as a committed upload.
+    return false;
+  }
+  if (scopes.some((scope) => firstVisible(scope, UPLOAD_PENDING_MARKERS))) {
     return true;
   }
-  const candidates = Array.from(root.querySelectorAll("[aria-label], [role], [data-testid], button, span, div"));
-  return candidates.some((node) => isVisible(node) && /\b(uploading|attaching|processing|scanning)\b/i.test(textOf(node)));
+  return scopes.some((scope) => Array.from(
+    scope.querySelectorAll("[aria-label], [role], [data-testid], button, span, div")
+  ).some((node) => node.children?.length === 0
+    && isVisible(node)
+    && UPLOAD_PROGRESS_TEXT.test(textOf(node))));
 }
 
 function uploadErrorText(root) {
