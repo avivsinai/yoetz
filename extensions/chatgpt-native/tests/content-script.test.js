@@ -1465,7 +1465,7 @@ function asstTextNode(id, parent, text, opts = {}) {
   return {
     id,
     parent,
-    children: [],
+    children: opts.children ?? [],
     message: {
       id,
       author: { role: "assistant" },
@@ -1591,18 +1591,14 @@ test("backend-api read does not accept an answer buried below a later current no
   }
 });
 
-test("backend-api read rejects an end_turn caption while an active-lineage child message is in progress", async () => {
+test("backend-api read rejects an end_turn caption while any mapping message is in progress", async () => {
   const { send, hooks, restore } = await loadContentScript("backend_in_progress_caption", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
   const CAPTION = "I'll compare both mechanisms across failure recovery, takeover safety, and implementation guardrails.";
   const restoreFetch = installBackendFetch({ conv: {
-    // yz-1ek: current_node points to the in-flight tool node, which is a child
-    // of a_caption on the active lineage. The parent chain walk visits
-    // tool_in_flight -> a_caption -> u1, finds tool_in_flight in_progress,
-    // and correctly holds pending.
-    current_node: "tool_in_flight",
+    current_node: "a_caption",
     mapping: {
       u1: { id: "u1", parent: null, children: ["a_caption"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["compare"] }, end_turn: null } },
-      a_caption: asstTextNode("a_caption", "u1", CAPTION),
+      a_caption: asstTextNode("a_caption", "u1", CAPTION, { children: ["tool_in_flight"] }),
       tool_in_flight: {
         id: "tool_in_flight",
         parent: "a_caption",
@@ -1623,7 +1619,7 @@ test("backend-api read rejects an end_turn caption while an active-lineage child
     assert.equal(res.payload.node_fresh, false);
     assert.equal(res.payload.is_generating, true);
     assert.equal(res.payload.text, "");
-    assert.match(res.payload.backend_api_detail, /current_node|in.progress/i);
+    assert.match(res.payload.backend_api_detail, /in.progress/i);
   } finally {
     restoreFetch();
     restore();

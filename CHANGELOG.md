@@ -11,9 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   conversation mapping for `status=in_progress` messages. An abandoned
   sibling branch (e.g. a regenerated or edited turn) left with
   `in_progress` status used to veto a completed, fresh `current_node`
-  answer indefinitely. The check now walks only the active lineage
-  (`current_node` parent chain) and fails closed if the chain is broken or
-  cyclic. (`yz-1ek`)
+  answer indefinitely. The check now walks the active lineage
+  (`current_node` parent chain) AND descendants of `current_node` (BFS over
+  `children`), and fails closed if the chain is broken or cyclic. An
+  in-progress node on the active lineage or below `current_node` still
+  vetoes; an abandoned sibling no longer does. (`yz-1ek`)
 
 ## [0.5.72] - 2026-09-13
 ### Added
