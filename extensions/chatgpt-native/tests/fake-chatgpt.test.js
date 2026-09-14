@@ -5750,3 +5750,37 @@ export {
   makeLatestSliderFixture,
   makePersonalPickerFixture
 };
+
+// yz-kio: A user-turn count increase from unrelated history loading during
+// beforeClick (before the actual Send click fires) must not be accepted as a
+// submission signal. The baseline must be captured immediately before the
+// click, not before model reconfiguration or prompt insertion.
+test("yz-kio: waitForSendAccepted does not accept a user-turn increase from before the click", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT", value: "Review this" });
+  const send = new FakeElement("button", { "aria-label": "Send prompt" }, "Send");
+  const body = new FakeElement("body", {}, "Review this").append(composer, send);
+  const doc = new FakeDocument(body);
+
+  // Simulate: history loads during beforeClick, adding a user turn BEFORE
+  // the click fires. The baseline is captured AFTER this load (immediately
+  // before the click), so the pre-click user turn is in the baseline and
+  // does not count as acceptance.
+  await clickSend(doc, {
+    timeoutMs: 250,
+    intervalMs: 10,
+    beforeClick: async () => {
+      // Unrelated history loads during model reconfiguration
+      body.append(new FakeElement("article", { "data-message-author-role": "user" }, "old history"));
+    }
+  });
+
+  // Capture baseline AFTER beforeClick, immediately before the click
+  const baseline = sendAcceptanceBaseline(doc);
+  assert.equal(baseline.user_count, 1, "baseline must include the pre-click history turn");
+
+  // No post-click signal — the click was a no-op
+  await assert.rejects(
+    () => waitForSendAccepted(doc, baseline, { timeoutMs: 30, intervalMs: 10 }),
+    /did not accept the prompt/
+  );
+});

@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- ChatGPT send: the send-acceptance baseline is now captured immediately
+  before the verified click, not before prompt insertion or model
+  reconfiguration. A resumed conversation that finishes loading older history
+  during `beforeClick` could increase the user-turn count before the click
+  fired; a stale baseline would accept that unrelated increase as a submission
+  signal. (`yz-kio`)
 
 ## [0.5.73] - 2026-09-14
 ### Fixed
