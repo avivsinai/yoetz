@@ -123,8 +123,9 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   inside an open surface.
 - Drift procedure — when ChatGPT changes the picker: (a) capture the live DOM
   into `extensions/chatgpt-native/tests/fixtures/chatgpt-picker/<date>-<shape>.html`
-  via `scripts/capture-chatgpt-picker.mjs` (raw CDP), or — when raw CDP is
-  wedged — through the native channel: `yoetz browser extension dump-picker
+  via `scripts/capture-chatgpt-picker.mjs` (raw CDP), through a read-only
+  AppleScript JS probe of the tab, or — when raw CDP is wedged — through the
+  native channel: `yoetz browser extension dump-picker
   --chatgpt --run-id <run> --path <PATH>` (rides the
   native-messaging host; refuses a live job unless `--allow-live-job` is set,
   re-reads the surface after Escape and reports `closed_after_dump`); (b) add
@@ -169,6 +170,20 @@ recipe flows, treat `dev-browser` as a QuickJS/WASM runner, not Node.js:
   hang, because the modal produces exactly no text; key the stop on the typed
   error instead. Repeated retries against a fail-closed `model_selection` are
   how the limit latches, and once latched it can outlast hours of quiet.
+  Any typed `rate_limited` at any phase arms a profile-wide cooldown; while it
+  holds, `job_start` fails at once with `rate_limit_cooldown_active` and
+  `cooldown_remaining_ms` (no tab is opened), and `extension status --chatgpt`
+  reports `cooldown_until_ms` per recipe. That refusal is the same hard stop:
+  waiting is the caller's decision, never a retry loop.
+- Read-only DOM probes of a live ChatGPT tab in the user's own Chrome:
+  `osascript` → `tell application "Google Chrome"` → `execute <tab> javascript`
+  returns the JS result as a string and needs neither CDP nor the
+  remote-debugging approval. Use it to check generation state before judging a
+  run stuck (a `Stop answering` button or a `[data-streaming-response-status]`
+  turn means ChatGPT is still working), to recover a rendered answer from a
+  preserved tab, and to capture extractor or picker fixtures. Read-only only:
+  never click, type, or navigate through it. A DOM read is not a request to
+  OpenAI, so it is safe under a rate-limit cooldown.
 - Treat yoetz as a thin wrapper over the underlying browser transport unless
   yoetz must own behavior for correctness or UX.
 - Extension-free by default. Preferred live-Chrome transport order:
