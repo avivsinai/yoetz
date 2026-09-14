@@ -69,7 +69,21 @@ function loadShim({ hidden, now }) {
     window: win,
     document: doc,
     Document: FakeDocumentBase,
-    MessageChannel: class { constructor() { this.port1 = {}; this.port2 = { postMessage: () => { this.port1.onmessage?.(); } }; } },
+    // A real MessageChannel delivers as a task, never synchronously. The
+    // previous synchronous stub ran the rAF pump before the caller could
+    // register a second callback, so "two callbacks in one pump pass" was not
+    // expressible. Unref'd so the pump cannot hold the test runner open.
+    MessageChannel: class {
+      constructor() {
+        this.port1 = {};
+        this.port2 = {
+          postMessage: () => {
+            const t = setTimeout(() => this.port1.onmessage?.(), 0);
+            t.unref?.();
+          }
+        };
+      }
+    },
     performance: fakeNow,
     // Unref'd so the shim's long-lived hydration poll cannot hold the test
     // runner open.
@@ -397,4 +411,24 @@ test("yz-718: idle fallback does not drop native callback when tab becomes visib
   await tick(350);
 
   assert.equal(callbackInvocations, 1, "native idle callback must fire exactly once");
+});
+
+// yz-8rw: the pump snapshots pending callbacks before the loop runs, so a
+// callback that cancels a later one in the same pass used to have no effect --
+// the loop deleted unconditionally and invoked the canceled callback anyway.
+// Native rAF checks that a snapshotted handle is still registered first.
+test("yz-8rw: a callback canceled during the same pump pass is not invoked", async () => {
+  const { win } = loadShim({ hidden: true });
+  const invoked = [];
+
+  const idB = { current: 0 };
+  win.requestAnimationFrame(() => {
+    invoked.push("A");
+    win.cancelAnimationFrame(idB.current);
+  });
+  idB.current = win.requestAnimationFrame(() => { invoked.push("B"); });
+
+  await tick(80);
+
+  assert.deepEqual(invoked, ["A"], "B was canceled by A within the same pass and must not run");
 });

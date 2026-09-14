@@ -89,7 +89,12 @@
       if (now - lastFrameAt >= 16) {
         lastFrameAt = now;
         for (const [id, entry] of Array.from(pending)) {
-          pending.delete(id);
+          // yz-8rw: the snapshot is taken before the loop runs, so an earlier
+          // callback in this same pass may have canceled a later one. Native
+          // rAF checks that a snapshotted handle is still registered before
+          // invoking it; delete() reports that for us. If it returns false the
+          // entry was already canceled, so skip it instead of invoking it.
+          if (!pending.delete(id)) continue;
           nativeCancelRaf(entry.nativeId);
           try {
             entry.callback(now);
@@ -98,6 +103,12 @@
           }
         }
       }
+      // The repost is deliberately unconditional and deliberately NOT a timer.
+      // Chrome throttles setTimeout to >=1s in a background tab, which is the
+      // whole reason this pump exists; MessageChannel is not throttled. Waiting
+      // out the remaining frame interval with a timer would drop a hidden tab's
+      // rAF to about 1fps and defeat the shim. Spinning the message loop
+      // between frames is the price of an unthrottled clock here.
       channel.port2.postMessage(0);
     };
     window.requestAnimationFrame = (callback) => {
