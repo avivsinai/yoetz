@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- Visibility shim: a target whose first synthetic sample has an all-zero
+  rect (not yet rendered) is no longer permanently marked as delivered.
+  The delivered-once mark is now scoped to targets with a real box; a target
+  that starts with an empty box gets another sample when it acquires real
+  geometry and `observe()` is called again, instead of being permanently
+  suppressed. (`yz-qei`)
 - ChatGPT send: the send-acceptance baseline is now captured immediately
   before the verified click, not before prompt insertion or model
   reconfiguration. A resumed conversation that finishes loading older history

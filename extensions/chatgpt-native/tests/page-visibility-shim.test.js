@@ -324,3 +324,36 @@ test("hidden tab: observer instance has no _yoetzParsedRootMargin own property",
   assert.equal(Object.keys(io).includes("_yoetzParsedRootMargin"), false,
     "_yoetzParsedRootMargin must not be an enumerable own property");
 });
+
+// yz-qei: A target whose first sample has an all-zero rect (not yet rendered)
+// must NOT be permanently marked as delivered. When the target later acquires
+// real intersecting geometry and observe() is called again, a second synthetic
+// entry must be delivered reflecting the new geometry.
+test("yz-qei: unrendered target's first sample does not block later resample", async () => {
+  const { win } = loadShim({ hidden: true });
+  const calls = [];
+  const io = new win.IntersectionObserver((entries) => { calls.push(...entries); });
+
+  // Target starts with an all-zero rect (not yet rendered)
+  const target = {
+    rect: { x: 0, y: 0, width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 },
+    getBoundingClientRect() { return this.rect; }
+  };
+
+  // First observe: target has no box → isIntersecting false
+  io.observe(target);
+  await tick(20);
+  assert.equal(calls.length, 1, "first sample delivered");
+  assert.equal(calls[0].isIntersecting, false, "first sample is not intersecting (no box)");
+
+  // Target later renders with real intersecting geometry
+  target.rect = { x: 0, y: 0, width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10 };
+
+  // Observe again on the same observer instance
+  io.observe(target);
+  await tick(20);
+
+  // A second entry must be delivered reflecting the new geometry
+  assert.equal(calls.length, 2, "second sample must be delivered after resample");
+  assert.equal(calls[1].isIntersecting, true, "second sample reflects real intersecting geometry");
+});
