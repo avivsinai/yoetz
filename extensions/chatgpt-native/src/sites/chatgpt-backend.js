@@ -176,8 +176,8 @@ function resolveBackendAnswer(job, conversationId, data) {
   if (currentNode !== answerNode) {
     return notReady("latest assistant answer is not the conversation current_node (later reasoning / tool work is still active)");
   }
-  if (hasInProgressMessage(mapping)) {
-    return notReady("conversation mapping still contains a status=in_progress message");
+  if (!activeLineageIsSettled(mapping, data.current_node)) {
+    return notReady("active lineage is in progress or could not be verified");
   }
   if (lineageAnswerCount <= baseline) {
     return notReady(`assistant answer not fresh past baseline (active-lineage ${lineageAnswerCount} <= ${baseline})`);
@@ -239,10 +239,29 @@ function collectLineageAnswerNodes(mapping, currentNodeId) {
   return { answerNode, count };
 }
 
-function hasInProgressMessage(mapping) {
-  return Object.values(mapping).some((node) =>
-    String(node?.message?.status ?? "").toLowerCase() === "in_progress"
-  );
+// yz-1ek (B3): Check only the active lineage (current_node parent chain)
+// for in_progress status, not the entire mapping. An abandoned sibling
+// branch left with status=in_progress (e.g. a regenerated or edited turn)
+// is not on the active lineage and must not veto a completed, fresh
+// current answer. Fail closed (not settled) if the chain is broken or cyclic.
+function activeLineageIsSettled(mapping, currentNodeId) {
+  const seen = new Set();
+  let id = currentNodeId;
+  while (id) {
+    if (seen.has(id) || seen.size >= 2000) {
+      return false;
+    }
+    seen.add(id);
+    const node = mapping[id];
+    if (!node) {
+      return false;
+    }
+    if (String(node.message?.status ?? "").toLowerCase() === "in_progress") {
+      return false;
+    }
+    id = node.parent;
+  }
+  return seen.size > 0;
 }
 
 function nonNegativeInt(value) {

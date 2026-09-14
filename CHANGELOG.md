@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- ChatGPT backend poll: the readiness check no longer scans the entire
+  conversation mapping for `status=in_progress` messages. An abandoned
+  sibling branch (e.g. a regenerated or edited turn) left with
+  `in_progress` status used to veto a completed, fresh `current_node`
+  answer indefinitely. The check now walks only the active lineage
+  (`current_node` parent chain) and fails closed if the chain is broken or
+  cyclic. (`yz-1ek`)
 
 ## [0.5.72] - 2026-09-13
 ### Added
