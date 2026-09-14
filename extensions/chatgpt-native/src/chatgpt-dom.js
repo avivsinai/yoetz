@@ -3038,12 +3038,18 @@ function isThoughtStatusLine(line) {
     || /^show\s+(more|reasoning)$/i.test(value);
 }
 
+// yz-91m: Shared selector list for stop controls. isResponseGenerating and
+// extractionDiagnostics both use this so the count and the boolean stay in sync.
+const STOP_CONTROL_SELECTORS = [
+  'button[data-testid*="stop"]',
+  'button[aria-label*="Stop generating" i]',
+  'button[aria-label*="Stop streaming" i]',
+  // yz-91m: ChatGPT Pro's Stop button uses aria-label="Stop answering".
+  'button[aria-label*="Stop answering" i]'
+];
+
 export function isResponseGenerating(root = document) {
-  if (firstVisible(root, [
-    'button[data-testid*="stop"]',
-    'button[aria-label*="Stop generating" i]',
-    'button[aria-label*="Stop streaming" i]'
-  ])) {
+  if (firstVisible(root, STOP_CONTROL_SELECTORS)) {
     return true;
   }
 
@@ -3052,9 +3058,22 @@ export function isResponseGenerating(root = document) {
   // an exact "Answer now" control visible; treating the disabled Stop button as
   // idle otherwise lets the waiter return the preceding interim markdown.
   const latestAssistantTurn = findAssistantTurns(root).at(-1);
-  return Boolean(latestAssistantTurn && Array.from(latestAssistantTurn.querySelectorAll("button"))
-    .some((button) => normalizeText(textOf(button)) === "Answer now"
-      && isVisible(button, { allowDisabled: true, allowNoLayout: true })));
+  if (latestAssistantTurn) {
+    if (Array.from(latestAssistantTurn.querySelectorAll("button"))
+      .some((button) => normalizeText(textOf(button)) === "Answer now"
+        && isVisible(button, { allowDisabled: true, allowNoLayout: true }))) {
+      return true;
+    }
+    // yz-91m: ChatGPT Pro long-think renders a [data-streaming-response-status]
+    // interstitial inside the latest agent-turn while still generating, even
+    // when the composer Stop button is not visible or is in a transitional
+    // state. This is a positive "still streaming" signal independent of the
+    // composer button.
+    if (latestAssistantTurn.querySelector?.("[data-streaming-response-status]")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Best-effort: click ChatGPT's visible stop-streaming/stop-generating control if
@@ -3064,11 +3083,7 @@ export function isResponseGenerating(root = document) {
 // Page teardown remains best-effort; an explicit beforeStopClick authorization
 // failure propagates so the caller can report that ownership was unverified.
 function findStopGenerating(root = document) {
-  return firstVisible(root, [
-    'button[data-testid*="stop"]',
-    'button[aria-label*="Stop generating" i]',
-    'button[aria-label*="Stop streaming" i]'
-  ]);
+  return firstVisible(root, STOP_CONTROL_SELECTORS);
 }
 
 export function clickStopGenerating(root = document) {
@@ -3936,10 +3951,13 @@ function extractionDiagnostics(root, assistantTurns, copyButtons) {
   // recovered by the textContent body reader); if both are tiny, the model genuinely produced
   // little text.
   const pageTextContentChars = normalizeText(root.body?.textContent ?? root.documentElement?.textContent ?? "").length;
+  const stopControlSelector = STOP_CONTROL_SELECTORS.join(",");
+  const generationState = generationStateForDiagnostics(root, assistantTurns);
   return {
     page_text_chars: pageText.length,
     page_text_content_chars: pageTextContentChars,
     body_text_tail: pageText.slice(-500),
+    generation_state: generationState,
     counts: {
       articles: root.querySelectorAll("article").length,
       assistant_roles: root.querySelectorAll('[data-message-author-role="assistant"]').length,
@@ -3947,15 +3965,41 @@ function extractionDiagnostics(root, assistantTurns, copyButtons) {
       markdown: root.querySelectorAll('[class*="markdown"]').length,
       conversation_turns: root.querySelectorAll('[data-testid*="conversation-turn"]').length,
       agent_turns: root.querySelectorAll('[class*="agent-turn"]').length,
-      stop_controls: root.querySelectorAll('button[data-testid*="stop"], button[aria-label*="Stop generating" i], button[aria-label*="Stop streaming" i]').length,
+      stop_controls: root.querySelectorAll(stopControlSelector).length,
       copy_buttons: copyButtons.length,
       assistant_turns: assistantTurns.length
     },
     assistant_turn_snippets: assistantTurns.slice(-3).map(elementSummary),
     article_snippets: Array.from(root.querySelectorAll("article")).slice(-5).map(elementSummary),
     markdown_snippets: Array.from(root.querySelectorAll('[class*="markdown"]')).slice(-5).map(elementSummary),
-    stop_control_snippets: Array.from(root.querySelectorAll('button[data-testid*="stop"], button[aria-label*="Stop generating" i], button[aria-label*="Stop streaming" i]')).slice(0, 5).map(elementSummary)
+    stop_control_snippets: Array.from(root.querySelectorAll(stopControlSelector)).slice(0, 5).map(elementSummary)
   };
+}
+
+// yz-91m: Classify the generation state for diagnostics. Returns one of:
+// "idle" (no generation markers), "stop_button" (composer stop control visible),
+// "long_think" (data-streaming-response-status interstitial in the latest agent-turn),
+// "answer_now" (Pro reasoning transition control), or "streaming" (other streaming marker).
+function generationStateForDiagnostics(root, assistantTurns) {
+  if (firstVisible(root, STOP_CONTROL_SELECTORS)) {
+    return "stop_button";
+  }
+  const latestAssistantTurn = (assistantTurns ?? findAssistantTurns(root)).at(-1);
+  if (latestAssistantTurn) {
+    if (latestAssistantTurn.querySelector?.("[data-streaming-response-status]")) {
+      const interstitialText = normalizeText(textOf(latestAssistantTurn.querySelector("[data-streaming-response-status]")));
+      if (/thinking a bit more about this request/i.test(interstitialText)) {
+        return "long_think";
+      }
+      return "streaming";
+    }
+    if (Array.from(latestAssistantTurn.querySelectorAll("button"))
+      .some((button) => normalizeText(textOf(button)) === "Answer now"
+        && isVisible(button, { allowDisabled: true, allowNoLayout: true }))) {
+      return "answer_now";
+    }
+  }
+  return "idle";
 }
 
 function elementSummary(node) {

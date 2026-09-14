@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- ChatGPT `isResponseGenerating` no longer misses ChatGPT Pro's Stop button
+  (`data-testid="stop-button"`, `aria-label="Stop answering"`) or the
+  `[data-streaming-response-status]` interstitial ("Our systems are thinking a
+  bit more about this request before responding..."). Pro long-think runs were
+  reporting `is_generating: false` while still generating, causing the 90 min
+  wait deadline to fire with a misleading "did not reach stable completion"
+  error. The stop-control selector list is now shared between
+  `isResponseGenerating` and `extractionDiagnostics` so the count and boolean
+  stay in sync. Diagnostics now include `generation_state`
+  (`idle`/`stop_button`/`long_think`/`streaming`/`answer_now`). The wait
+  deadline error now says "was still generating at the deadline" and carries
+  `still_generating: true` when a generation marker is present at timeout.
+  (`yz-91m`)
 - ChatGPT wait loop: a latest agent-turn whose text matches /may violate our
   usage policies/i (with no assistant message role, no streaming marker, no
   stop control) is now classified as a typed `content_policy_flagged` terminal
@@ -30,6 +43,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and `verifyBeforeClick` run. If the deadline has passed, it throws
   `send_deadline_exceeded` instead of clicking after the caller's timeout.
   (`yz-gcd`)
+- ChatGPT backend poll: the readiness check no longer scans the entire
+  conversation mapping for `status=in_progress` messages. An abandoned
+  sibling branch (e.g. a regenerated or edited turn) left with
+  `in_progress` status used to veto a completed, fresh `current_node`
+  answer indefinitely. The check now walks the active lineage
+  (`current_node` parent chain) AND descendants of `current_node` (BFS over
+  `children`), and fails closed if the chain is broken or cyclic. An
+  in-progress node on the active lineage or below `current_node` still
+  vetoes; an abandoned sibling no longer does. (`yz-1ek`)
 
 ## [0.5.72] - 2026-09-13
 ### Added

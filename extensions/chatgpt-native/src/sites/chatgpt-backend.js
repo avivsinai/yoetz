@@ -176,8 +176,11 @@ function resolveBackendAnswer(job, conversationId, data) {
   if (currentNode !== answerNode) {
     return notReady("latest assistant answer is not the conversation current_node (later reasoning / tool work is still active)");
   }
-  if (hasInProgressMessage(mapping)) {
-    return notReady("conversation mapping still contains a status=in_progress message");
+  const vetoId = activeLineageInprogressNode(mapping, data.current_node);
+  if (vetoId !== null) {
+    return notReady(vetoId === "__cycle_or_missing__"
+      ? "active lineage is cyclic or broken (fail closed)"
+      : `active lineage or descendant is in progress (node ${vetoId})`);
   }
   if (lineageAnswerCount <= baseline) {
     return notReady(`assistant answer not fresh past baseline (active-lineage ${lineageAnswerCount} <= ${baseline})`);
@@ -239,10 +242,59 @@ function collectLineageAnswerNodes(mapping, currentNodeId) {
   return { answerNode, count };
 }
 
-function hasInProgressMessage(mapping) {
-  return Object.values(mapping).some((node) =>
-    String(node?.message?.status ?? "").toLowerCase() === "in_progress"
-  );
+// yz-1ek (B3): Check only the active lineage (current_node parent chain)
+// for in_progress status, not the entire mapping. An abandoned sibling
+// branch left with status=in_progress (e.g. a regenerated or edited turn)
+// is not on the active lineage and must not veto a completed, fresh
+// current answer. Fail closed (not settled) if the chain is broken or cyclic.
+// yz-1ek/#515: Returns the id of the first in_progress node on the active
+// lineage (ancestors of current_node) or its descendants (BFS below
+// current_node), or null if the active sub-tree is settled. An abandoned
+// sibling (a child of an ancestor that is not itself an ancestor of
+// current_node and not a descendant of current_node) is never reached, so it
+// no longer vetoes. Returns a non-null sentinel ("__cycle_or_missing__") if
+// the chain is broken or cyclic (fail closed).
+function activeLineageInprogressNode(mapping, currentNodeId) {
+  const seen = new Set();
+  // Walk ancestors of current_node (the active lineage).
+  let id = currentNodeId;
+  while (id) {
+    if (seen.has(id) || seen.size >= 2000) {
+      return "__cycle_or_missing__";
+    }
+    seen.add(id);
+    const node = mapping[id];
+    if (!node) {
+      return "__cycle_or_missing__";
+    }
+    if (String(node.message?.status ?? "").toLowerCase() === "in_progress") {
+      return id;
+    }
+    id = node.parent;
+  }
+  // yz-91m/#515: Also BFS descendants of current_node. current_node can lag an
+  // in-flight continuation (e.g. a tool call child still running). An
+  // in_progress node below current_node is on the active sub-tree and must
+  // veto — that is the #323 shape.
+  const queue = Array.isArray(mapping[currentNodeId]?.children) ? [...mapping[currentNodeId].children] : [];
+  while (queue.length > 0) {
+    const childId = queue.shift();
+    if (seen.has(childId) || seen.size >= 2000) {
+      return "__cycle_or_missing__";
+    }
+    seen.add(childId);
+    const childNode = mapping[childId];
+    if (!childNode) {
+      continue;
+    }
+    if (String(childNode.message?.status ?? "").toLowerCase() === "in_progress") {
+      return childId;
+    }
+    if (Array.isArray(childNode.children)) {
+      queue.push(...childNode.children);
+    }
+  }
+  return null;
 }
 
 function nonNegativeInt(value) {
