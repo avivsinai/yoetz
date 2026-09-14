@@ -2373,6 +2373,17 @@ export async function clickSend(root, options = {}) {
           enabledTicks = 0;
           continue;
         }
+        // yz-gcd (B7): recheck the deadline immediately before the
+        // irreversible click. beforeClick (model reconfiguration) and
+        // verifyBeforeClick can consume the remaining budget; without this
+        // check the click fires after the caller's deadline has passed.
+        if (Date.now() - startedAt >= timeoutMs) {
+          throw chatgptCommandError(
+            "send_deadline_exceeded",
+            "ChatGPT send deadline expired before the click",
+            { phase: "send", side_effect_started: true, send_committed: false }
+          );
+        }
         verifiedButton.click();
         return true;
       }

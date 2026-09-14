@@ -17,6 +17,7 @@ import {
   rateLimitedHandoff,
   dismissRateLimitModal,
   rateLimitModalOpen,
+  clickSend,
   isResponseGenerating
 } from "../src/chatgpt-dom.js";
 import { chatgptSiteAdapter } from "../src/sites/chatgpt.js";
@@ -911,4 +912,73 @@ test("yz-91m: isResponseGenerating returns true for data-streaming-response-stat
 
   assert.equal(isResponseGenerating(root), true,
     "isResponseGenerating must return true when data-streaming-response-status is present in the latest agent-turn");
+});
+
+// yz-gcd (B7): clickSend must not fire the click after the send deadline.
+// The timeout is checked at the top of the while loop, but beforeClick (model
+// reconfiguration) and verifyBeforeClick can consume the remaining budget.
+// The click must be rechecked immediately before the irreversible click.
+test("yz-gcd: clickSend throws send_deadline_exceeded when beforeClick overruns the timeout, does not click", async () => {
+  const sendButton = visibleElement({ "data-testid": "send-button" });
+  sendButton.disabled = false;
+  sendButton.innerText = "Send";
+  sendButton.textContent = "Send";
+  let clicked = false;
+  sendButton.click = () => { clicked = true; };
+
+  // Composer scope: findComposer returns a composer element whose closest('form')
+  // is the scope that querySelectorAll finds the send button in.
+  const formScope = {
+    querySelector: () => null,
+    querySelectorAll: (sel) => {
+      if (sel.includes("send-button") || sel === "button") return [sendButton];
+      return [];
+    }
+  };
+  const composer = visibleElement({});
+  composer.closest = (sel) => {
+    if (sel === "form") return formScope;
+    return null;
+  };
+
+  const root = {
+    querySelector: () => null,
+    querySelectorAll: (sel) => {
+      // findComposer (via firstVisible/firstMatching) looks for these
+      if (sel.includes("prompt-textarea") || sel.includes("contenteditable") || sel.includes("textarea")) {
+        return [composer];
+      }
+      return [];
+    },
+    defaultView: { location: { href: "https://chatgpt.com/", pathname: "/" } }
+  };
+  root.title = "ChatGPT";
+  root.body = { innerText: "", textContent: "" };
+
+  // 20ms timeout, beforeClick takes 60ms — the deadline passes during beforeClick.
+  let beforeClickCalled = false;
+  await assert.rejects(
+    clickSend(root, {
+      timeoutMs: 20,
+      minTimeoutMs: 0,
+      intervalMs: 1,
+      requiredStableTicks: 1,
+      beforeClick: async () => {
+        beforeClickCalled = true;
+        await new Promise((r) => setTimeout(r, 60));
+      },
+      verifyBeforeClick: () => {}
+    }),
+    (error) => {
+      // Must throw send_deadline_exceeded, not click the button.
+      assert.equal(error.code, "send_deadline_exceeded");
+      assert.equal(error.side_effect_started, true);
+      assert.equal(error.send_committed, false);
+      return true;
+    }
+  );
+
+  // The button must NOT have been clicked.
+  assert.equal(clicked, false, "button must not be clicked after the deadline");
+  assert.equal(beforeClickCalled, true, "beforeClick must have been called");
 });
