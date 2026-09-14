@@ -3985,11 +3985,20 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
     return null;
   }
   const adapter = adapterForJob(job);
-  const timeoutSummary = `${adapter.displayName} response did not reach stable completion before timeout (baseline_assistant_count=${job.response_baseline?.assistant_count ?? 0}, best_method=${best.method}, best_text_chars=${best.text?.length ?? 0}, best_assistant_count=${best.assistant_count ?? 0}, best_turn_index=${best.turn_index ?? -1}, best_copy_button_count=${best.copy_button_count ?? 0}, best_is_generating=${Boolean(best.is_generating)}, last_method=${last.method}, last_text_chars=${last.text?.length ?? 0}, last_assistant_count=${last.assistant_count ?? 0}, last_turn_index=${last.turn_index ?? -1}, last_copy_button_count=${last.copy_button_count ?? 0}, last_is_generating=${Boolean(last.is_generating)}, last_diagnostics=${diagnosticSummary(last.diagnostics)}). The owned ${adapter.displayName} tab is left open; if it finishes later, recover with: ${inspectCommand}`;
+  // yz-91m: When the deadline expires while is_generating is true, the error
+  // must state that ChatGPT was still generating (not "did not reach stable
+  // completion"), and carry still_generating:true so the CLI can print the
+  // recommended --var wait_timeout_ms / --var conversation= resume path.
+  const stillGenerating = Boolean(last.is_generating || best.is_generating);
+  const generationDetail = stillGenerating
+    ? `${adapter.displayName} was still generating at the deadline (stop control or streaming marker present); the answer will render in the preserved tab. Resume with --var conversation=${job.conversation_id ?? "<id>"} or rerun with --var wait_timeout_ms=`
+    : `${adapter.displayName} response did not reach stable completion before timeout`;
+  const timeoutSummary = `${generationDetail} (baseline_assistant_count=${job.response_baseline?.assistant_count ?? 0}, best_method=${best.method}, best_text_chars=${best.text?.length ?? 0}, best_assistant_count=${best.assistant_count ?? 0}, best_turn_index=${best.turn_index ?? -1}, best_copy_button_count=${best.copy_button_count ?? 0}, best_is_generating=${Boolean(best.is_generating)}, last_method=${last.method}, last_text_chars=${last.text?.length ?? 0}, last_assistant_count=${last.assistant_count ?? 0}, last_turn_index=${last.turn_index ?? -1}, last_copy_button_count=${last.copy_button_count ?? 0}, last_is_generating=${Boolean(last.is_generating)}, last_diagnostics=${diagnosticSummary(last.diagnostics)}). The owned ${adapter.displayName} tab is left open; if it finishes later, recover with: ${inspectCommand}`;
   await failJob(job, "response_timeout", timeoutSummary, {
     phase: "wait_response",
     side_effect_started: true,
     completion_reason: "timeout",
+    still_generating: stillGenerating,
     timeout_ms: timeoutMs,
     inspect_command: inspectCommand,
     baseline_method: job.response_baseline?.method ?? "none",
