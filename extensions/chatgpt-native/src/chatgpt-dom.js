@@ -226,6 +226,29 @@ export function classifyWaitManualHandoff({ url = "", title = "", text = "" } = 
 // not-found. Re-check the manual-handoff context at every phase failure and
 // fail closed with rate_limited when the modal is up. Returns the rate-limited
 // handoff ({ state, message }) or null.
+// yz-er5: Blocking-state classifier for the ChatGPT recipe. The content
+// script's assertNoBlockingState guard calls classifyBlockingState?.(root,
+// { forceScan }) at every phase boundary (prepare, model_selection, upload,
+// send, wait_response). Without this export, dom.classifyBlockingState is
+// undefined for the ChatGPT adapter (which imports from chatgpt-dom.js, not
+// claude-dom.js), so the guard is a no-op and a rate-limit modal that mounts
+// mid-phase is missed until the next extraction.
+//
+// Map rateLimitedHandoff to the shape assertNoBlockingState throws:
+// { code, message, state } or null. forceScan is accepted but ignored —
+// rateLimitedHandoff already scans surfaces + body with the right gates.
+export function classifyBlockingState(root = document, { forceScan = false } = {}) {
+  const handoff = rateLimitedHandoff(root);
+  if (!handoff) {
+    return null;
+  }
+  return {
+    code: handoff.state ?? "rate_limited",
+    message: handoff.message ?? handoff.text ?? "Too many requests",
+    state: handoff.state ?? "rate_limited"
+  };
+}
+
 export function rateLimitedHandoff(root = document) {
   // The composer short-circuit in manualHandoffContext returns empty text
   // whenever the composer is mounted, but a rate-limit overlay can leave the

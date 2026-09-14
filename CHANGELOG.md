@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- Any typed `rate_limited` outcome at any phase (prepare, model_selection,
+  upload, send, wait_response) now arms the profile-wide cooldown
+  immediately, instead of only the wait_response extraction and HTTP 429
+  paths. While the cooldown holds, `job_start` refuses immediately with a
+  typed `rate_limit_cooldown_active` error carrying `cooldown_remaining_ms`
+  and `cooldown_until_ms`, and opens no tab — instead of sleeping silently
+  until the upload deadline. The hello and heartbeat payloads now include
+  `cooldown_until_ms` per recipe key, and `yoetz browser extension status
+  --chatgpt` surfaces it in JSON. The ChatGPT DOM module now exports
+  `classifyBlockingState`, so the `assertNoBlockingState` guard at every
+  phase boundary detects a rate-limit modal the moment it mounts instead of
+  being a no-op. (`yz-er5`)
 - ChatGPT web recipe: `clickSend` now rechecks the send deadline immediately
   before the irreversible click, after `beforeClick` (model reconfiguration)
   and `verifyBeforeClick` run. If the deadline has passed, it throws

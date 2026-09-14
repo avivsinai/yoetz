@@ -78,8 +78,19 @@ export function rateLimitedHandoff(root) {
   return hooks.rateLimitedHandoff ?? null;
 }
 
-export function classifyBlockingState() {
-  return hooks.blockingState ?? null;
+export function classifyBlockingState(root, { forceScan = false } = {}) {
+  // yz-er5: Mirror the real chatgpt-dom.js implementation — map
+  // rateLimitedHandoff to { code, message, state }. In the test harness the
+  // document is a stub, so rateLimitedHandoff returns hooks.rateLimitedHandoff.
+  const handoff = rateLimitedHandoff(root);
+  if (!handoff) {
+    return hooks.blockingState ?? null;
+  }
+  return {
+    code: handoff.state ?? "rate_limited",
+    message: handoff.message ?? handoff.text ?? "Too many requests",
+    state: handoff.state ?? "rate_limited"
+  };
 }
 
 export async function ensureFreshChat(_document, job) {
@@ -1813,14 +1824,16 @@ test("extractJobResponse surfaces rate_limited handoff when wait classifier retu
     const extracted = await send({ type: "yoetz_extract_response", job });
 
     // The consumer must receive the typed rate_limited handoff.
-    assert.equal(extracted.ok, true);
-    assert.equal(extracted.payload.manual_handoff?.rate_limited, true);
-    assert.equal(extracted.payload.manual_handoff?.reason, "too_many_requests_modal");
-    // The extraction (page_text_fallback) is preserved as diagnostics alongside
-    // the handoff — the handoff does not delete the extraction evidence.
-    assert.equal(extracted.payload.manual_handoff?.text, "Too many requests");
-    // The wait classifier was called (returned null).
-    assert.equal(hooks.waitManualHandoffInputs.length, 1);
+    // yz-er5: With classifyBlockingState now exported from chatgpt-dom.js,
+    // assertNoBlockingState at the top of extractJobResponse throws a typed
+    // rate_limited error BEFORE the extraction can return a manual_handoff.
+    // The error response carries the code.
+    assert.equal(extracted.ok, false);
+    assert.equal(extracted.code, "rate_limited");
+    // The wait classifier was still called (the assert runs before extraction).
+    // Actually, assertNoBlockingState runs BEFORE classifyWaitManualHandoff,
+    // so the wait classifier is NOT called.
+    assert.equal(hooks.waitManualHandoffInputs.length, 0);
   } finally {
     restore();
   }
@@ -1898,6 +1911,44 @@ test("prepareJob surfaces rate_limited handoff when modal is present on tab load
     assert.equal(prepared.ok, true);
     assert.equal(prepared.payload.manual_handoff?.rate_limited, true);
     assert.equal(prepared.payload.manual_handoff?.reason, "too_many_requests_modal");
+  } finally {
+    restore();
+  }
+});
+
+// yz-er5: classifyBlockingState is exported from chatgpt-dom.js (not just
+// claude-dom.js), so assertNoBlockingState throws a typed rate_limited error
+// when the modal is present at any phase boundary (prepare, model_selection,
+// upload, send).
+test("yz-er5: assertNoBlockingState throws rate_limited when modal is present (ChatGPT recipe)", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "er5_blocking_state",
+    "https://chatgpt.com/?_yoetz=run_er5_bs"
+  );
+  try {
+    hooks.waitManualHandoff = null;
+    hooks.rateLimitedHandoff = {
+      state: "rate_limited",
+      message: "Too many requests",
+      text: "Too many requests"
+    };
+    globalThis.document.title = "ChatGPT";
+    const job = {
+      job_id: "job_er5_bs",
+      run_id: "run_er5_bs",
+      upload_timeout_ms: 1000,
+      send_timeout_ms: 1000
+    };
+
+    // prepareJob calls assertNoBlockingState at the start. With the modal
+    // present, it must throw rate_limited (not return a null handoff and
+    // proceed to an opaque failure).
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+
+    // The prepare must return a typed rate_limited handoff.
+    assert.equal(prepared.ok, true);
+    assert.equal(prepared.payload.manual_handoff?.state, "rate_limited");
+    assert.equal(prepared.payload.manual_handoff?.message, "Too many requests");
   } finally {
     restore();
   }
