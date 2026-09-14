@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- Visibility shim: synthetic IntersectionObserver entries now account for
+  ancestor clipping. The entry previously intersected the target rect against
+  the root rect only, so a target clipped out of view by an `overflow`
+  hidden/scroll/auto ancestor was reported as intersecting while the native
+  observer reports it as not intersecting. Measured on a live ChatGPT tab: the
+  history sidebar's scrollport is 1121px tall inside a 1187px viewport, leaving
+  a 66px band where a list item is below its own scroll pane yet still inside
+  the browser viewport. The shim now walks the ancestor chain (bounded) and
+  clips the effective root by every ancestor that is not `overflow: visible`,
+  after `rootMargin` is applied. (`yz-634`)
 - Visibility shim: the rAF pump no longer invokes a callback that an earlier
   callback canceled during the same pass. The pump snapshots pending entries
   before iterating, then deleted each one unconditionally and invoked it;

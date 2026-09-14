@@ -9,7 +9,7 @@ const shimSource = await readFile(new URL("../src/page-visibility-shim.js", impo
 // exercised for real), a stub IntersectionObserver whose native delivery is
 // controlled by the test, and a stub requestIdleCallback that fires on a timer
 // the test can wait for.
-function loadShim({ hidden, now }) {
+function loadShim({ hidden, now, innerWidth = 1280, innerHeight = 800 }) {
   const state = { visibility: hidden ? "hidden" : "visible", nativeIdleFires: [] };
   const fakeNow = now ? { now } : performance;
   class FakeDocumentBase {}
@@ -45,8 +45,11 @@ function loadShim({ hidden, now }) {
   const nativeIdleTimers = new Map();
   const win = {
     addEventListener: () => {},
-    innerWidth: 1280,
-    innerHeight: 800,
+    innerWidth,
+    innerHeight,
+    // yz-634: the shim clips by ancestors with a non-visible overflow. Fake
+    // elements carry their own __style; anything without one is visible.
+    getComputedStyle: (el) => el?.__style ?? { overflowX: "visible", overflowY: "visible" },
     requestAnimationFrame: (cb) => setTimeout(() => cb(performance.now()), 16),
     cancelAnimationFrame: (id) => clearTimeout(id),
     IntersectionObserver: NativeIO,
@@ -431,4 +434,68 @@ test("yz-8rw: a callback canceled during the same pump pass is not invoked", asy
   await tick(80);
 
   assert.deepEqual(invoked, ["A"], "B was canceled by A within the same pass and must not run");
+});
+
+// yz-634: geometry captured from a live ChatGPT tab on 2026-09-14 via a
+// read-only osascript DOM probe (no CDP, no mutation). The history sidebar is
+// a scrollport 1121px tall inside a 1187px viewport, so a list item at y=1128
+// is below its own scroll pane while still inside the browser viewport. The
+// native observer reports that as NOT intersecting; the shim used to report
+// intersecting with ratio 1 because it only intersected target against root.
+function makeSidebarClipFixture() {
+  const rect = (left, top, width, height) => ({
+    x: left, y: top, left, top, width, height,
+    right: left + width, bottom: top + height
+  });
+  const slideover = {
+    __style: { overflowX: "hidden", overflowY: "hidden" },
+    getBoundingClientRect: () => rect(0, 0, 260, 1187),
+    parentElement: null
+  };
+  const inner = {
+    __style: { overflowX: "visible", overflowY: "visible" },
+    getBoundingClientRect: () => rect(0, 0, 259, 1187),
+    parentElement: slideover
+  };
+  const scrollport = {
+    __style: { overflowX: "auto", overflowY: "auto" },
+    getBoundingClientRect: () => rect(0, 0, 260, 1121),
+    parentElement: inner
+  };
+  return {
+    scrollport,
+    // "Review Safety Changes" — measured at 0,1128,260,36 on the live tab.
+    clipped: { getBoundingClientRect: () => rect(0, 1128, 260, 36), parentElement: scrollport },
+    // A sibling inside the visible part of the same scrollport.
+    visible: { getBoundingClientRect: () => rect(0, 200, 260, 36), parentElement: scrollport }
+  };
+}
+
+test("yz-634: a target clipped by a scroll ancestor is not intersecting, even inside the viewport", async () => {
+  const { win } = loadShim({ hidden: true, innerWidth: 2560, innerHeight: 1187 });
+  const fixture = makeSidebarClipFixture();
+  const calls = [];
+  const io = new win.IntersectionObserver((entries) => { calls.push(...entries); });
+
+  io.observe(fixture.clipped);
+  await tick(20);
+
+  assert.equal(calls.length, 1, "one synthetic entry");
+  assert.equal(calls[0].isIntersecting, false,
+    "target is below its scrollport's bottom edge (1128 > 1121) so it is clipped out of view");
+  assert.equal(calls[0].intersectionRatio, 0);
+});
+
+test("yz-634: a target inside the same scroll ancestor's visible area still intersects", async () => {
+  const { win } = loadShim({ hidden: true, innerWidth: 2560, innerHeight: 1187 });
+  const fixture = makeSidebarClipFixture();
+  const calls = [];
+  const io = new win.IntersectionObserver((entries) => { calls.push(...entries); });
+
+  io.observe(fixture.visible);
+  await tick(20);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].isIntersecting, true, "ancestor clipping must not suppress a genuinely visible target");
+  assert.equal(calls[0].intersectionRatio, 1);
 });
