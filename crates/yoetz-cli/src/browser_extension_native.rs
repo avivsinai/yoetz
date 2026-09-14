@@ -153,6 +153,10 @@ pub struct ExtensionInstanceStatus {
     pub capabilities: Vec<String>,
     pub protocol_version: u32,
     pub last_seen_ms: u128,
+    /// yz-er5: Per-recipe cooldown_until_ms map from hello/heartbeat. Null when
+    /// not armed. Keyed by recipe ("chatgpt", "claude").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_until_ms: Option<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -3088,7 +3092,34 @@ fn connect_legacy_socket_instance(paths: &ExtensionPaths) -> Result<ExtensionIns
         capabilities: Vec::new(),
         protocol_version: PROTOCOL_VERSION,
         last_seen_ms: 0,
+        cooldown_until_ms: None,
     })
+}
+
+/// yz-er5: Check whether a recipe cooldown is active for a given instance.
+/// Returns (is_active, cooldown_until_ms, cooldown_remaining_ms).
+/// Pure function — unit-testable without IO.
+pub fn check_recipe_cooldown(
+    instance: &ExtensionInstanceStatus,
+    recipe: &str,
+    now_ms: u128,
+) -> (bool, Option<u128>, u128) {
+    let cooldowns = match &instance.cooldown_until_ms {
+        Some(Value::Object(map)) => map,
+        _ => return (false, None, 0),
+    };
+    let until = match cooldowns.get(recipe) {
+        Some(Value::Number(n)) => match n.as_u64() {
+            Some(v) => v as u128,
+            None => return (false, None, 0),
+        },
+        _ => return (false, None, 0),
+    };
+    if until > now_ms {
+        (true, Some(until), until - now_ms)
+    } else {
+        (false, Some(until), 0)
+    }
 }
 
 fn observed_extension_profiles(instances: &[ExtensionInstanceStatus]) -> String {
@@ -5208,6 +5239,7 @@ mod native_host_unix {
                         "profile_id": envelope.payload.get("profile_id").cloned().unwrap_or(Value::Null),
                         "recipes": envelope.payload.get("recipes").cloned().unwrap_or_else(|| json!(default_extension_recipes())),
                         "capabilities": envelope.payload.get("capabilities").cloned().unwrap_or_else(|| json!([])),
+                        "cooldown_until_ms": envelope.payload.get("cooldown_until_ms").cloned().unwrap_or_else(|| json!({})),
                         "seen_at_ms": now_millis(),
                     },
                     "version_mismatch": Value::Null,
@@ -5218,6 +5250,9 @@ mod native_host_unix {
                 &paths.status_path,
                 json!({
                     "last_heartbeat_ms": now_millis(),
+                    "extension": {
+                        "cooldown_until_ms": envelope.payload.get("cooldown_until_ms").cloned().unwrap_or_else(|| json!({})),
+                    },
                 }),
             ),
             _ => Ok(()),
@@ -5992,6 +6027,7 @@ mod tests {
                     capabilities: vec![NATIVE_JOB_COMMANDS_CAPABILITY.to_string()],
                     protocol_version: PROTOCOL_VERSION,
                     last_seen_ms: 1,
+                    cooldown_until_ms: None,
                 },
             );
 
@@ -6089,6 +6125,7 @@ mod tests {
                 capabilities: vec![NATIVE_JOB_COMMANDS_CAPABILITY.to_string()],
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
+                cooldown_until_ms: None,
             },
             recipe: BuiltinWebRecipe::Chatgpt,
         };
@@ -6171,6 +6208,7 @@ mod tests {
             capabilities: Vec::new(),
             protocol_version: PROTOCOL_VERSION,
             last_seen_ms: 1,
+            cooldown_until_ms: None,
         };
 
         ensure_instance_supports_recipe(&instance, "chatgpt").unwrap();
@@ -6198,6 +6236,7 @@ mod tests {
             capabilities: vec![NATIVE_JOB_COMMANDS_CAPABILITY.to_string()],
             protocol_version: PROTOCOL_VERSION,
             last_seen_ms: 1,
+            cooldown_until_ms: None,
         };
 
         ensure_instance_supports_capability(&instance, NATIVE_JOB_COMMANDS_CAPABILITY).unwrap();
@@ -6222,6 +6261,7 @@ mod tests {
             capabilities: Vec::new(),
             protocol_version: PROTOCOL_VERSION,
             last_seen_ms: 1,
+            cooldown_until_ms: None,
         };
 
         assert!(!extension_update_is_active(
@@ -6679,6 +6719,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
+                cooldown_until_ms: None,
             },
             socket_binding_version: INSTANCE_SOCKET_BINDING_VERSION,
             socket_base_path: base,
@@ -6903,6 +6944,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1234,
+                cooldown_until_ms: None,
             },
         );
 
@@ -6978,6 +7020,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 5678,
+                cooldown_until_ms: None,
             },
         );
 
@@ -7002,6 +7045,7 @@ mod tests {
             capabilities: Vec::new(),
             protocol_version: PROTOCOL_VERSION,
             last_seen_ms: 1,
+            cooldown_until_ms: None,
         };
         assert!(instance_advertises_recipe(
             &instance,
@@ -7043,6 +7087,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1234,
+                cooldown_until_ms: None,
             },
         );
 
@@ -7105,6 +7150,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1234,
+                cooldown_until_ms: None,
             },
         );
 
@@ -7294,6 +7340,7 @@ mod tests {
             capabilities: Vec::new(),
             protocol_version: PROTOCOL_VERSION,
             last_seen_ms: 1,
+            cooldown_until_ms: None,
         };
         assert!(ensure_reload_can_reach_managed_copy(&loaded_before_restamp, &result).is_ok());
     }
@@ -7608,6 +7655,7 @@ mod tests {
                 capabilities: vec![NATIVE_JOB_COMMANDS_CAPABILITY.to_string()],
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
+                cooldown_until_ms: None,
             },
         );
 
@@ -7660,6 +7708,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
+                cooldown_until_ms: None,
             },
         );
 
@@ -7705,6 +7754,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1234,
+                cooldown_until_ms: None,
             },
         );
 
@@ -7753,6 +7803,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
+                cooldown_until_ms: None,
             },
         );
         drop(socket_guard);
@@ -7797,6 +7848,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
+                cooldown_until_ms: None,
             },
         );
 
@@ -7831,6 +7883,7 @@ mod tests {
             capabilities: Vec::new(),
             protocol_version: PROTOCOL_VERSION,
             last_seen_ms: 1,
+            cooldown_until_ms: None,
         };
         let record_path = paths.instances_dir.join("native_legacy_shared.json");
         fs::write(
@@ -7896,6 +7949,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 2,
+                cooldown_until_ms: None,
             },
         );
         write_instance_fixture(
@@ -7912,6 +7966,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
+                cooldown_until_ms: None,
             },
         );
 
@@ -7944,6 +7999,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 3,
+                cooldown_until_ms: None,
             },
         );
         let err =
@@ -8002,6 +8058,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 2,
+                cooldown_until_ms: None,
             },
         );
         write_instance_fixture(
@@ -8018,6 +8075,7 @@ mod tests {
                 capabilities: Vec::new(),
                 protocol_version: PROTOCOL_VERSION,
                 last_seen_ms: 1,
+                cooldown_until_ms: None,
             },
         );
 
@@ -8331,3 +8389,73 @@ mod tests {
         assert_eq!(fs::read_to_string(&out).unwrap(), html);
     }
 }
+
+    // yz-er5: unit tests for check_recipe_cooldown pure function
+    fn test_instance(cooldowns: Option<Value>) -> ExtensionInstanceStatus {
+        ExtensionInstanceStatus {
+            native_instance_id: "test".to_string(),
+            socket_path: PathBuf::from("/tmp/test.sock"),
+            pid: 12345,
+            extension_instance_id: Some("ext_test".to_string()),
+            extension_version: Some("0.5.72".to_string()),
+            profile_email: Some("test@example.com".to_string()),
+            profile_id: Some("profile_test".to_string()),
+            recipes: default_extension_recipes(),
+            capabilities: Vec::new(),
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1000,
+            cooldown_until_ms: cooldowns,
+        }
+    }
+
+    #[test]
+    fn yz_er5_check_recipe_cooldown_active() {
+        let now = 1000u128;
+        let until = 5000u64;
+        let instance = test_instance(Some(json!({"chatgpt": until})));
+        let (active, until_ms, remaining) = check_recipe_cooldown(&instance, "chatgpt", now);
+        assert!(active);
+        assert_eq!(until_ms, Some(until as u128));
+        assert_eq!(remaining, 4000);
+    }
+
+    #[test]
+    fn yz_er5_check_recipe_cooldown_expired() {
+        let now = 10000u128;
+        let until = 5000u64;
+        let instance = test_instance(Some(json!({"chatgpt": until})));
+        let (active, until_ms, remaining) = check_recipe_cooldown(&instance, "chatgpt", now);
+        assert!(!active);
+        assert_eq!(until_ms, Some(until as u128));
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn yz_er5_check_recipe_cooldown_missing_recipe() {
+        let now = 1000u128;
+        let instance = test_instance(Some(json!({"claude": 5000u64})));
+        let (active, until_ms, remaining) = check_recipe_cooldown(&instance, "chatgpt", now);
+        assert!(!active);
+        assert_eq!(until_ms, None);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn yz_er5_check_recipe_cooldown_no_cooldowns() {
+        let now = 1000u128;
+        let instance = test_instance(None);
+        let (active, until_ms, remaining) = check_recipe_cooldown(&instance, "chatgpt", now);
+        assert!(!active);
+        assert_eq!(until_ms, None);
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn yz_er5_check_recipe_cooldown_null_value() {
+        let now = 1000u128;
+        let instance = test_instance(Some(json!({"chatgpt": Value::Null})));
+        let (active, until_ms, remaining) = check_recipe_cooldown(&instance, "chatgpt", now);
+        assert!(!active);
+        assert_eq!(until_ms, None);
+        assert_eq!(remaining, 0);
+    }
