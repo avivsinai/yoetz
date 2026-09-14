@@ -4430,14 +4430,14 @@ async function throttleBackendApiGateFromRateLimit(recipe, nowMs = Date.now()) {
     // the escalation window). Otherwise reset to base (first trip or the
     // window has passed since the last trip).
     const lastUntil = Number(state.rate_limit_last_until_ms ?? 0);
-    const expiredRecently = lastUntil > 0
-      && lastUntil <= nowMs
+    // yz-zpj recut: a re-trip while a cooldown is STILL ACTIVE must escalate,
+    // not erase. Drop the lastUntil <= nowMs clause: when lastUntil is in the
+    // future, (nowMs - lastUntil) is negative, which is < WINDOW, so the same
+    // expression covers both "still active" and "expired recently".
+    const hadRecentTrip = lastUntil > 0
       && (nowMs - lastUntil) < RATE_LIMIT_ESCALATION_WINDOW_MS;
-    const escalation = expiredRecently
-      ? Math.min(
-          (Number(state.rate_limit_escalation ?? 0) + 1),
-          Math.ceil(Math.log2(RATE_LIMIT_COOLDOWN_CAP_MS / RATE_LIMIT_COOLDOWN_BASE_MS)) + 1
-        )
+    const escalation = hadRecentTrip
+      ? (Number(state.rate_limit_escalation ?? 0) + 1)
       : 0;
     const cooldownMs = Math.min(
       RATE_LIMIT_COOLDOWN_CAP_MS,
