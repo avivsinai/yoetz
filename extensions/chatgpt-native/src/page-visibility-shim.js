@@ -296,14 +296,17 @@
         }, options);
         const timer = reallyHidden()
           ? setTimeout(() => {
+            // yz-718: Recheck the assistance deadline and visibility at
+            // delivery time, BEFORE any destructive cleanup. A timer
+            // scheduled just before the assistance window ends must not
+            // deliver synthetic idle work after it has closed, and a tab that
+            // became visible must defer to the native idle callback. Moving
+            // this guard above idleRequests.delete + nativeCancelIdle ensures
+            // a trip leaves the native registration intact so the native
+            // callback fires normally.
+            if (!reallyHidden() || performance.now() > assistUntil) return;
             if (!idleRequests.delete(nativeId)) return;
             nativeCancelIdle?.(nativeId);
-            // yz-718: Recheck the assistance deadline and visibility at
-            // delivery time. A timer scheduled just before the assistance
-            // window ends must not deliver synthetic idle work after it has
-            // closed, and a tab that became visible must defer to the native
-            // idle callback.
-            if (!reallyHidden() || performance.now() > assistUntil) return;
             // Present a normal, shrinking idle slice (not a timed-out one) so
             // callers do the real work and their time-slicing loops end.
             const sliceStart = performance.now();

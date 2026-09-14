@@ -9,8 +9,9 @@ const shimSource = await readFile(new URL("../src/page-visibility-shim.js", impo
 // exercised for real), a stub IntersectionObserver whose native delivery is
 // controlled by the test, and a stub requestIdleCallback that fires on a timer
 // the test can wait for.
-function loadShim({ hidden }) {
+function loadShim({ hidden, now }) {
   const state = { visibility: hidden ? "hidden" : "visible", nativeIdleFires: [] };
+  const fakeNow = now ? { now } : performance;
   class FakeDocumentBase {}
   Object.defineProperty(FakeDocumentBase.prototype, "visibilityState", {
     get() { return state.visibility; },
@@ -69,7 +70,7 @@ function loadShim({ hidden }) {
     document: doc,
     Document: FakeDocumentBase,
     MessageChannel: class { constructor() { this.port1 = {}; this.port2 = { postMessage: () => { this.port1.onmessage?.(); } }; } },
-    performance,
+    performance: fakeNow,
     // Unref'd so the shim's long-lived hydration poll cannot hold the test
     // runner open.
     setTimeout: (fn, ms, ...args) => { const t = setTimeout(fn, ms, ...args); t.unref?.(); return t; },
@@ -360,25 +361,40 @@ test("yz-qei: unrendered target's first sample does not block later resample", a
 
 // yz-718: A synthetic IntersectionObserver delivery scheduled just before
 // assistUntil expires must not deliver after the assistance window has closed.
-test("yz-qei: synthetic entry not delivered after assistUntil expires", async () => {
-  const { win } = loadShim({ hidden: true });
+// The shim captures assistUntil = performance.now() + 90000 at load time.
+// We inject a fake clock that starts at 0 (so assistUntil = 90000), then
+// advance it past 90000 before the setTimeout callback fires.
+test("yz-718: synthetic IO entry not delivered after assistUntil expires", async () => {
+  let clock = 0;
+  const { win } = loadShim({ hidden: true, now: () => clock });
   const calls = [];
   const io = new win.IntersectionObserver((entries) => { calls.push(...entries); });
 
-  // Override performance.now to simulate time passing beyond assistUntil.
-  // The shim captures assistUntil at load time as performance.now() + 90000.
-  // We can't easily mock performance.now, so we test the recheck logic by
-  // using a target that would intersect, and verifying the recheck prevents
-  // delivery when assistUntil has passed. Instead, test the idle-callback
-  // path which has a similar recheck.
+  const target = {
+    getBoundingClientRect: () => ({ x: 0, y: 0, width: 10, height: 10, top: 0, left: 0, right: 10, bottom: 10 })
+  };
 
-  // Actually, test the IntersectionObserver recheck by using a delayed setTimeout.
-  // The shim uses setTimeout(fn, 0), so we can't easily delay it past assistUntil
-  // in a real test. Instead, verify the code path exists by checking that the
-  // shim source contains the assistUntil recheck.
-  const shimSrc = await readFile(new URL("../src/page-visibility-shim.js", import.meta.url), "utf8");
-  assert.ok(shimSrc.includes("performance.now() > assistUntil) return"),
-    "shim must recheck assistUntil at delivery time in the observe callback");
-  assert.ok(shimSrc.includes("if (!reallyHidden() || performance.now() > assistUntil) return"),
-    "shim must recheck assistUntil at delivery time in the idle-callback fallback");
+  // observe() schedules a setTimeout(fn, 0). Before it fires, advance the
+  // clock past assistUntil (90000ms).
+  io.observe(target);
+  clock = 90001;
+  await tick(20);
+
+  assert.equal(calls.length, 0, "no synthetic entry delivered after assistUntil expired");
+});
+
+// yz-718 regression: hidden tab, requestIdleCallback fallback timer fires,
+// but the tab became visible before it fired. The native callback must still
+// be invoked exactly once — the guard must not drop the native registration.
+test("yz-718: idle fallback does not drop native callback when tab becomes visible", async () => {
+  const { win, state } = loadShim({ hidden: true });
+  let callbackInvocations = 0;
+
+  win.requestIdleCallback(() => { callbackInvocations += 1; });
+
+  // Tab becomes visible before the fallback timer fires
+  state.visibility = "visible";
+  await tick(350);
+
+  assert.equal(callbackInvocations, 1, "native idle callback must fire exactly once");
 });
