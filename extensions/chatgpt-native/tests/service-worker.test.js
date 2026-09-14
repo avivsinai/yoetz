@@ -11,6 +11,11 @@ globalThis.__YOETZ_BACKEND_API_CONFIRMATION_MS = 50;
 // operations (yz-5bd gate); tests confirm finality in milliseconds, so shrink
 // the gap knob alongside the confirmation knob above.
 globalThis.__YOETZ_BACKEND_API_GATE_MIN_GAP_MS = 25;
+// yz-0fd: production tab pacing (30s min gap / 2 concurrent) would refuse the
+// suite's rapid-fire job starts. Pacing tests opt in per-test by overriding
+// these knobs; the suite default disables pacing entirely.
+globalThis.__YOETZ_TAB_PACING_MIN_GAP_MS = 0;
+globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT = 10000;
 
 test("service worker routes reconnect and multiplexes two native jobs", async () => {
   const originalChrome = globalThis.chrome;
@@ -12686,3 +12691,299 @@ test("yz-zpj: re-trip during active cooldown escalates, does not erase", async (
   }
 });
 
+// ---------------------------------------------------------------------------
+// yz-0fd: per-profile tab pacing. Three tests:
+//   1. min-gap refusal: typed tab_pacing_active, reason "min_gap", no tab.
+//   2. max-concurrent refusal: reason "max_concurrent", wait_remaining_ms 0,
+//      active_jobs counted from the rehydratable jobs map.
+//   3. override floor: TAB_PACING_MAX_CONCURRENT=0 is floored at 1 so an
+//      operator cannot configure the extension into refusing every job.
+// ---------------------------------------------------------------------------
+
+function yz0fdTabStub({ port, sentJobs = null } = {}) {
+  let tabId = 0;
+  return {
+    create: async (opts) => ({ id: ++tabId, ...opts }),
+    get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_0fd" }),
+    sendMessage: async (_id, message) => {
+      const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+      switch (command.type) {
+        case "yoetz_probe":
+          return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+        case "yoetz_prepare_job":
+          return { ok: true, payload: { manual_handoff: null } };
+        case "yoetz_configure_model":
+          return { ok: true, payload: verifiedLatestProSelection() };
+        case "yoetz_upload_file":
+          return { ok: true, payload: { filename: command.file.filename, size: 4 } };
+        case "yoetz_send_prompt":
+          sentJobs?.add(command.job.job_id);
+          return {
+            ok: true,
+            payload: { sent: true, conversation_id: `conv-${command.job.job_id}` }
+          };
+        case "yoetz_extract_response":
+          return {
+            ok: true,
+            payload: sentJobs?.has(command.job.job_id)
+              ? {
+                  method: "assistant_dom_fallback",
+                  text: `answer ${command.job.job_id}`,
+                  is_generating: false,
+                  assistant_count: 1,
+                  copy_button_count: 1,
+                  has_copy_button: true,
+                  turn_index: 0,
+                  conversation_id: `conv-${command.job.job_id}`
+                }
+              : { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1 }
+          };
+        default:
+          throw new Error(`unexpected tab message ${command.type}`);
+      }
+    }
+  };
+}
+
+test("yz-0fd: job_start inside the min-gap window refuses with tab_pacing_active reason=min_gap, no tab opened", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalMinGap = globalThis.__YOETZ_TAB_PACING_MIN_GAP_MS;
+  const port = makePort();
+  let tabCreateCount = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.__YOETZ_TAB_PACING_MIN_GAP_MS = 30000;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => { tabCreateCount++; return { id: 999, ...opts }; },
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async () => { throw new Error("should not reach tab messages"); }
+    }
+  });
+
+  try {
+    // Pre-arm a recent tab creation so the min-gap check trips.
+    const now = Date.now();
+    await globalThis.chrome.storage.session.set({
+      "tab-pacing.chatgpt": { last_tab_created_at_ms: now - 1000 }
+    });
+
+    await import(`../src/service-worker.js?yz_0fd_min_gap=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+    port.emit(envelope("job_start", "job_0fd_min_gap", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "tab_pacing_active"
+    ), 5000);
+
+    const refused = port.messages.find((m) =>
+      m.type === "job_error" && m.payload?.code === "tab_pacing_active"
+    );
+    assert.equal(refused.payload.reason, "min_gap", "reason must say WHICH limit tripped");
+    assert.ok(
+      typeof refused.payload.wait_remaining_ms === "number" && refused.payload.wait_remaining_ms > 0,
+      `must carry wait_remaining_ms > 0, got ${refused.payload.wait_remaining_ms}`
+    );
+    assert.equal(refused.payload.side_effect_started, false, "no side effect before pacing clears");
+    assert.equal(tabCreateCount, 0, "no tab should be opened while pacing refuses");
+  } finally {
+    globalThis.__YOETZ_TAB_PACING_MIN_GAP_MS = originalMinGap;
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("yz-0fd: second concurrent job refuses with tab_pacing_active reason=max_concurrent, active_jobs counted from jobs map", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalMax = globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT;
+  const port = makePort();
+  let tabCreateCount = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT = 1;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: yz0fdTabStub({ port, sentJobs: new Set() })
+  });
+
+  try {
+    // Replace tabs.create so we can count creations.
+    let innerCreate = globalThis.chrome.tabs.create;
+    const countingStub = globalThis.chrome;
+    countingStub.tabs.create = async (opts) => { tabCreateCount++; return innerCreate(opts); };
+
+    await import(`../src/service-worker.js?yz_0fd_max=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+
+    // First job runs to completion (releases its slot).
+    port.emit(envelope("job_start", "job_0fd_first", {
+      prompt: "first",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    ), 5000);
+    port.emit(envelope("job_file_chunk", "job_0fd_first", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_0fd_first.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_complete" && m.job_id === "job_0fd_first"
+    ), 5000);
+
+    // Restart pacing clock at zero so only the concurrent limit can trip:
+    // backdate the last tab creation beyond the 30s default min gap.
+    const pacingKey = "tab-pacing.chatgpt";
+    const pacingState = await globalThis.chrome.storage.session.get(pacingKey);
+    await globalThis.chrome.storage.session.set({
+      [pacingKey]: { ...(pacingState?.[pacingKey] ?? {}), last_tab_created_at_ms: Date.now() - 60000 }
+    });
+
+    // Second job: no active jobs remain, so this must NOT refuse...
+    port.messages.length = 0;
+    port.emit(envelope("job_start", "job_0fd_ok", {
+      prompt: "second",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    ), 5000);
+    port.emit(envelope("job_file_chunk", "job_0fd_ok", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_0fd_ok.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_complete" && m.job_id === "job_0fd_ok"
+    ), 5000);
+    port.messages.length = 0;
+
+    // ...but with the concurrent cap raised against a LIVE job it must refuse.
+    // Open a long-running job that stays active (extraction never finalizes).
+    const savedSendMessage = globalThis.chrome.tabs.sendMessage;
+    globalThis.chrome.tabs.sendMessage = async (_id, message) => {
+      const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+      if (command.type === "yoetz_extract_response") {
+        return { ok: true, payload: { method: "assistant_dom_fallback", text: "partial", is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0, conversation_id: `conv-${command.job.job_id}` } };
+      }
+      return savedSendMessage(_id, message);
+    };
+    port.emit(envelope("job_start", "job_0fd_live", {
+      prompt: "live",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 120000
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    ), 5000);
+    port.emit(envelope("job_file_chunk", "job_0fd_live", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_0fd_live.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.job_id === "job_0fd_live" && m.payload?.phase === "prompt_sent"
+    ), 5000);
+    port.emit(envelope("job_start", "job_0fd_refused", {
+      prompt: "refused",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    try {
+      await eventually(() => port.messages.some((m) =>
+        m.type === "job_error" && m.job_id === "job_0fd_refused" && m.payload?.code === "tab_pacing_active"
+      ), 5000);
+    } catch (e) {
+      console.log("DBGLIVE", JSON.stringify(port.messages.map((m) => [m.type, m.job_id, m.payload?.code ?? m.payload?.phase, String(m.payload?.message ?? "").slice(0, 150)])));
+      throw e;
+    }
+
+    const refused = port.messages.find((m) =>
+      m.type === "job_error" && m.payload?.code === "tab_pacing_active"
+    );
+    assert.equal(refused.payload.reason, "max_concurrent", "reason must say WHICH limit tripped");
+    assert.equal(refused.payload.wait_remaining_ms, 0, "concurrent refusal carries wait_remaining_ms 0");
+    assert.ok(refused.payload.active_jobs >= 1, "must carry active_jobs >= 1");
+    assert.equal(refused.payload.side_effect_started, false, "no side effect before pacing clears");
+
+    // Cancel the hung job so the test does not leak a timer.
+    port.emit(envelope("job_cancel", "job_0fd_live"));
+    await eventually(() => port.messages.some((m) =>
+      m.job_id === "job_0fd_live"
+      && (m.type === "job_error" || m.type === "job_complete" || m.type === "job_cancel"
+        || m.payload?.phase === "cancelled")
+    ), 5000);
+  } finally {
+    globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT = originalMax;
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("yz-0fd: TAB_PACING_MAX_CONCURRENT override of 0 is floored at 1", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const originalMax = globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT;
+  const port = makePort();
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: yz0fdTabStub({ port, sentJobs: new Set() })
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_0fd_floor=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+
+    // With the cap floored at 1 and no active jobs, a job must be allowed.
+    port.emit(envelope("job_start", "job_0fd_floor", {
+      prompt: "floor",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    ), 5000);
+    port.emit(envelope("job_file_chunk", "job_0fd_floor", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_0fd_floor.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_complete" && m.job_id === "job_0fd_floor"
+    ), 5000);
+
+    const refused = port.messages.find((m) =>
+      m.type === "job_error" && m.payload?.code === "tab_pacing_active"
+    );
+    assert.equal(refused, undefined, "floor of 1 must not refuse a job when nothing is active");
+  } finally {
+    globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT = originalMax;
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
