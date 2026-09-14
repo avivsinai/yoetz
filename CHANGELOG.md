@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- ChatGPT rate-limit cooldown: the escalation level now counts
+  expiry-then-re-trip *cycles* only. A trip that lands while a cooldown is
+  still holding keeps the current level instead of incrementing it. Since
+  `job_start` refuses once a cooldown is armed, the only trips that can land
+  during one are jobs already in flight when the wall rose, and a single job
+  seeing the modal twice (the wait_response branch trips before the one-shot
+  dismiss guard) — neither is a caller re-probing, so neither should double the
+  lockout. `throttle_until_ms` still only ever extends. Separately,
+  `resetRateLimitEscalation` no longer fires for a job that completes while a
+  cooldown is still holding: such a job started before the wall rose, so its
+  success is not evidence the wall cleared for a new tab. (`yz-esc`)
 - Visibility shim: synthetic IntersectionObserver entries now account for
   ancestor clipping. The entry previously intersected the target rect against
   the root rect only, so a target clipped out of view by an `overflow`
