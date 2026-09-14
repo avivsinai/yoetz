@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- Visibility shim: the rAF pump no longer invokes a callback that an earlier
+  callback canceled during the same pass. The pump snapshots pending entries
+  before iterating, then deleted each one unconditionally and invoked it;
+  native `requestAnimationFrame` checks that a snapshotted handle is still
+  registered first. The pump now skips an entry whose `delete()` reports it was
+  already removed. The unconditional `postMessage` repost is deliberately kept:
+  Chrome throttles `setTimeout` to >=1s in a background tab, which is the
+  reason this pump exists, so waiting out the frame interval with a timer would
+  drop a hidden tab's rAF to about 1fps. (`yz-8rw`)
 - ChatGPT model selection: the post-close reverification-failed branch passed
   an undefined identifier (`state`) to `selectionFailure`, so a genuine
   post-close failure — including the `effort_options_disabled` quota lock —
