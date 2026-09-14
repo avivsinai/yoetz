@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- ChatGPT send: the send-acceptance baseline is now captured at the END of
+  `verifyBeforeClick` — inside the `clickSend` loop, after `beforeClick`
+  (model reconfiguration) and immediately before the click — not before
+  `clickSend` is called. The yz-kio capture point was a no-op for its own
+  scenario: both hooks execute inside the `clickSend` loop, so a resumed
+  conversation whose older history finished loading during `beforeClick`
+  still landed after the baseline, and `waitForSendAccepted` accepted that
+  unrelated user-turn increase as a submission signal. Adapters without a
+  pre-click hook (Claude) keep the pre-`clickSend` capture.
+- ChatGPT send: `verifyBeforeClick` now consults `uploadErrorText` and
+  fails with a typed `upload_failed_before_send` error when an upload
+  error banner is up. The upload loop consults it only while waiting for
+  commit, so a bundle whose upload failed AFTER the upload phase committed
+  could previously be sent as a text-only prompt with no attachment. No
+  click is committed past this error. (`yz-ad7`)
 - Visibility shim: synthetic IntersectionObserver entries now account for
   ancestor clipping. The entry previously intersected the target rect against
   the root rect only, so a target clipped out of view by an `overflow`
