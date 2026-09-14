@@ -2456,6 +2456,16 @@ export async function waitForSendAccepted(root, baseline = {}, options = {}) {
   throw new Error(`ChatGPT did not accept the prompt after send click (${sendReadinessDiagnostics(root)})`);
 }
 
+// yz-5bc: Detect ChatGPT's 'This content may violate our usage policies' terminal
+// outcome. This is a server-side terminal state: ChatGPT will not produce an
+// answer in this turn. The wait loop must fail fast instead of waiting to the
+// deadline. Returns true when the node's text matches the policy-flag phrase.
+export function isContentPolicyFlagged(node) {
+  if (!node) return false;
+  const text = normalizeText(textOf(node));
+  return /may violate our usage policies/i.test(text);
+}
+
 export function extractResponse(root = document) {
   const userTurns = findUserTurns(root);
   const assistantTurns = findAssistantTurns(root);
@@ -2466,6 +2476,16 @@ export function extractResponse(root = document) {
   const latestAssistant = latestTextEntry?.turn ?? assistantTurns.at(-1);
   const turnIndex = latestTextEntry?.index ?? (latestAssistant ? assistantTurns.length - 1 : -1);
   const latestUser = userTurns.at(-1);
+  // yz-5bc: Detect ChatGPT's 'This content may violate our usage policies' terminal
+  // outcome. The flagged turn appears as an agent-turn with the policy text but
+  // no assistant role marker, no streaming marker, and no stop control. Check
+  // the latest agent-turn (or the latest assistant turn if one exists).
+  const latestAgentTurn = Array.from(root.querySelectorAll('[class*="agent-turn"]')).at(-1);
+  const contentPolicyFlagged = Boolean(
+    !latestAssistant
+    && latestAgentTurn
+    && isContentPolicyFlagged(latestAgentTurn)
+  );
   const latestTextConversation = latestTextEntry?.node ? responseConversationScope(latestTextEntry.node, latestUser) : null;
   const latestTextHasCopyButton = latestTextEntry?.node
     ? Boolean(
@@ -2492,6 +2512,7 @@ export function extractResponse(root = document) {
       has_copy_button: latestTurnHasCopyButton,
       turn_index: turnIndex,
       model_slug: messageModelSlug(latestAssistant ?? latestTextEntry?.node),
+      content_policy_flagged: contentPolicyFlagged,
       diagnostics
     };
   }
@@ -2510,6 +2531,7 @@ export function extractResponse(root = document) {
       has_copy_button: standalone.hasCopyButton,
       turn_index: assistantCount - 1,
       model_slug: messageModelSlug(standalone.node),
+      content_policy_flagged: contentPolicyFlagged,
       diagnostics
     };
   }
@@ -2528,6 +2550,7 @@ export function extractResponse(root = document) {
       has_copy_button: true,
       turn_index: assistantCount - 1,
       model_slug: messageModelSlug(copyScopedStandalone.node),
+      content_policy_flagged: contentPolicyFlagged,
       diagnostics
     };
   }
@@ -2543,6 +2566,7 @@ export function extractResponse(root = document) {
     has_copy_button: copyButtonCount > 0,
     turn_index: -1,
     model_slug: messageModelSlug(latestAssistant),
+    content_policy_flagged: contentPolicyFlagged,
     diagnostics
   };
 }

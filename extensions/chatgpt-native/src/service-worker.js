@@ -3678,6 +3678,36 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
       return null;
     }
     last = extraction ?? last;
+    // yz-5bc: A content_policy_flagged extraction is a terminal server-side
+    // outcome. ChatGPT will not produce an answer in this turn. Fail the job
+    // immediately, preserve the tab (an operator may appeal or rephrase), do
+    // NOT retry, do NOT resubmit. Arm nothing (this is not a throttle).
+    if (extraction?.content_policy_flagged) {
+      const inspectCommand = inspectCommandForJob(job);
+      const adapter = adapterForJob(job);
+      await failJob(
+        job,
+        "content_policy_flagged",
+        `${adapter.displayName} flagged the response under its usage policies; no answer will be produced. The owned ${adapter.displayName} tab is left open; inspect or rephrase with: ${inspectCommand}. Do not rerun the same prompt.`,
+        {
+          phase: "wait_response",
+          side_effect_started: true,
+          completion_reason: "content_policy_flagged",
+          send_committed: true,
+          flagged_text: extraction.text,
+          conversation_id: job.conversation_id ?? null,
+          extraction_method: extraction.method,
+          response_length: extraction.text.length,
+          assistant_count: extraction.assistant_count ?? 0,
+          turn_index: extraction.turn_index ?? -1,
+          copy_button_count: extraction.copy_button_count ?? 0,
+          has_copy_button: Boolean(extraction.has_copy_button),
+          inspect_command: inspectCommand,
+          diagnostics: diagnosticPayload(extraction.diagnostics)
+        }
+      );
+      return null;
+    }
     const postSend = isPostSendExtraction(job, extraction);
     const postSendAssistantActivity = isPostSendAssistantActivity(job, extraction, true);
     const currentFinalityStallSignature = isClaudeFinalityConflict(job, extraction)
