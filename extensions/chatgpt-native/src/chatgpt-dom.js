@@ -3526,11 +3526,22 @@ function attachmentNodeKey(node) {
   ].filter(Boolean).join("|");
 }
 
-const UPLOAD_PENDING_MARKERS = [
-  '[role="progressbar"]',
-  '[aria-busy="true"]',
+// Unambiguous wherever they render: a node that declares itself an upload or
+// attachment in a loading state is about an upload no matter where ChatGPT
+// mounts it. A read-only probe of a live tab found upload inputs and file
+// tiles OUTSIDE the composer form, so these stay document-wide; scoping them
+// would risk a false NEGATIVE, which is worse than the false positive this
+// bead fixes because it would send the prompt before the attachment commits.
+const UPLOAD_SPECIFIC_MARKERS = [
   '[data-testid*="upload"][data-state*="loading"]',
   '[data-testid*="attachment"][data-state*="loading"]'
+];
+// Generic busy markers say nothing about uploads on their own -- a loading
+// sidebar or a modal carries them too -- so they are trusted only inside the
+// composer.
+const GENERIC_BUSY_MARKERS = [
+  '[role="progressbar"]',
+  '[aria-busy="true"]'
 ];
 const UPLOAD_PROGRESS_TEXT = /\b(uploading|attaching|processing|scanning)\b/i;
 
@@ -3553,6 +3564,9 @@ const UPLOAD_PROGRESS_TEXT = /\b(uploading|attaching|processing|scanning)\b/i;
 // for the text fallback, match only LEAF nodes -- an ancestor's subtree text
 // is not evidence that the ancestor is a progress indicator.
 function hasUploadPending(root) {
+  if (firstVisible(root, UPLOAD_SPECIFIC_MARKERS)) {
+    return true;
+  }
   const scopes = composerScopes(root, { includeRoot: false });
   if (scopes.length === 0) {
     // No composer: nothing to judge. hasAttachmentNamed is scoped the same
@@ -3560,7 +3574,7 @@ function hasUploadPending(root) {
     // treating this as a committed upload.
     return false;
   }
-  if (scopes.some((scope) => firstVisible(scope, UPLOAD_PENDING_MARKERS))) {
+  if (scopes.some((scope) => firstVisible(scope, GENERIC_BUSY_MARKERS))) {
     return true;
   }
   return scopes.some((scope) => Array.from(

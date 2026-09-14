@@ -5871,3 +5871,31 @@ test("yz-dl0: an in-progress label inside the composer still blocks the upload",
     globalThis.DataTransfer = previousDataTransfer;
   }
 });
+
+test("yz-dl0: an upload-specific loading marker outside the composer still blocks", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    // A read-only probe of a live ChatGPT tab found upload inputs and file
+    // tiles mounted OUTSIDE the composer form. So a node that declares itself
+    // an attachment in a loading state must be honoured wherever it renders:
+    // scoping these to the composer would risk a false negative, which is
+    // worse than the false positive this bead fixes, because it would send the
+    // prompt before the attachment commits.
+    const { doc, form } = makeComposerWithSidebar({});
+    const body = form.parentElement;
+    body.append(new FakeElement("div", {
+      "data-testid": "attachment-upload",
+      "data-state": "loading"
+    }, ""));
+    const file = new File(["bundle"], "bundle.md", { type: "text/markdown" });
+
+    await assert.rejects(
+      () => uploadFile(doc, file, { timeoutMs: 200, intervalMs: 10, attachmentMenuDelayMs: 0 }),
+      /upload|attach|timed out|did not/i,
+      "an attachment marked loading outside the composer must keep the upload pending"
+    );
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
