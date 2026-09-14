@@ -3043,11 +3043,7 @@ export function isResponseGenerating(root = document) {
 // Page teardown remains best-effort; an explicit beforeStopClick authorization
 // failure propagates so the caller can report that ownership was unverified.
 function findStopGenerating(root = document) {
-  return firstVisible(root, [
-    'button[data-testid*="stop"]',
-    'button[aria-label*="Stop generating" i]',
-    'button[aria-label*="Stop streaming" i]'
-  ]);
+  return firstVisible(root, STOP_CONTROL_SELECTORS);
 }
 
 export function clickStopGenerating(root = document) {
