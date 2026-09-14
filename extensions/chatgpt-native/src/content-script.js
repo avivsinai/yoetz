@@ -416,7 +416,12 @@ async function sendPrompt(job, prompt) {
   let surfaceEvidenceSeen = job.surface_evidence_seen === true
     || activeJobs.get(job.job_id)?.surface_evidence_seen === true;
   job.surface_evidence_seen = surfaceEvidenceSeen;
-  const baseline = sendAcceptanceBaseline(document);
+  // yz-kio: The send-acceptance baseline is captured immediately before the
+  // click, NOT before insertPrompt/beforeClick. A resumed conversation that
+  // finishes loading older history during model reconfiguration can increase
+  // the user-turn count; a baseline captured before that load would accept
+  // the stale increase as a submission signal.
+  let baseline;
   await insertPrompt(document, prompt, { timeoutMs: 20000 });
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send", adapter));
   assertNoBlockingState(classifyBlockingState, {
@@ -509,6 +514,10 @@ async function sendPrompt(job, prompt) {
       return proof;
     };
   }
+  // yz-kio: Capture the acceptance baseline immediately before the click,
+  // after beforeClick/verifyBeforeClick have run. This ensures any history
+  // that loaded during model reconfiguration is already in the baseline.
+  baseline = sendAcceptanceBaseline(document);
   await clickSend(document, clickOptions);
   let accepted;
   try {
