@@ -1902,3 +1902,53 @@ test("prepareJob surfaces rate_limited handoff when modal is present on tab load
     restore();
   }
 });
+
+// yz-1ek (B3): An abandoned sibling branch left with status=in_progress must
+// not veto a completed, fresh current_node answer. hasInProgressMessage scans
+// the entire mapping; it should only check the active lineage.
+test("yz-1ek: abandoned sibling in_progress does not veto a fresh current answer", async () => {
+  const { send, hooks, restore } = await loadContentScript(
+    "backend_sibling_in_progress",
+    "https://chatgpt.com/c/conv-1ek?_yoetz=run_1ek"
+  );
+  const FINAL = "The completed answer on the active lineage.";
+  const restoreFetch = installBackendFetch({ conv: {
+    current_node: "a_final",
+    mapping: {
+      root: { id: "root", parent: null, children: ["u1"], message: { author: { role: "system" }, content: { content_type: "text", parts: [""] } } },
+      u1: { id: "u1", parent: "root", children: ["a_interim", "sibling_abandoned"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["review this"] }, end_turn: null } },
+      a_interim: asstTextNode("a_interim", "u1", "I'll review the bundled diff as the source of truth"),
+      a_final: asstTextNode("a_final", "a_interim", FINAL),
+      // Abandoned sibling: a child of u1 (same parent as a_interim) but NOT on
+      // the active lineage (a_final -> a_interim -> u1 -> root). Its status is
+      // in_progress, which would veto hasInProgressMessage if it scanned all nodes.
+      sibling_abandoned: {
+        id: "sibling_abandoned",
+        parent: "u1",
+        children: [],
+        message: {
+          id: "sibling_abandoned",
+          author: { role: "assistant" },
+          content: { content_type: "text", parts: ["abandoned regeneration"] },
+          end_turn: true,
+          recipient: "all",
+          status: "in_progress"
+        }
+      }
+    }
+  }});
+  try {
+    const job = { ...fetchJob(0), run_id: "run_1ek", conversation_id: "conv-1ek", expected_conversation_id: "conv-1ek" };
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-1ek" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    // The answer must be returned — the abandoned sibling must not veto it.
+    assert.equal(res.payload.method, "backend_api");
+    assert.equal(res.payload.node_fresh, true);
+    assert.equal(res.payload.text, FINAL);
+    assert.equal(res.payload.is_generating, false);
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
