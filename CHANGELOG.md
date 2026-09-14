@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- Visibility shim: the assistance deadline (`assistUntil`) is now rechecked
+  at delivery time in both the synthetic IntersectionObserver callback and
+  the `requestIdleCallback` fallback, not only at scheduling time. A callback
+  scheduled just before the 90 s assistance window ends no longer delivers a
+  synthetic entry after it has closed. `parseRootMargin` now resolves
+  percentage values against the root rect dimensions instead of treating them
+  as raw pixels. (`yz-718`)
 - Visibility shim: a target whose first synthetic sample has an all-zero
   rect (not yet rendered) is no longer permanently marked as delivered.
   The delivered-once mark is now scoped to targets with a real box; a target
