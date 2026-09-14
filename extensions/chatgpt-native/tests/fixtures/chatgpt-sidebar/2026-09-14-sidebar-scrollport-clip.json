@@ -1,0 +1,44 @@
+{
+  "_provenance": {
+    "captured": "2026-09-14T12:45Z",
+    "method": "read-only osascript execute-javascript probe of a live ChatGPT tab in the user's own Chrome (gmail profile); no CDP, no mutation, no navigation",
+    "url": "https://chatgpt.com/c/6aa6f5e0-0ae8-83eb-9b6e-a8af79ae0d69",
+    "purpose": "yz-634: real nesting for the ancestor-clipping false positive. Geometry is measured, not reconstructed."
+  },
+  "viewport": { "width": 2560, "height": 1187 },
+  "scrollport": {
+    "selector": "nav.group/scrollport.relative.flex",
+    "overflowX": "auto",
+    "overflowY": "auto",
+    "rect": { "left": 0, "top": 0, "width": 260, "height": 1121 },
+    "scrollHeight": 1616,
+    "clientHeight": 1121,
+    "scrollTop": 0
+  },
+  "clippingAncestorAboveScrollport": {
+    "selector": "div#stage-slideover-sidebar",
+    "overflowX": "hidden",
+    "overflowY": "hidden",
+    "rect": { "left": 0, "top": 0, "width": 260, "height": 1187 }
+  },
+  "falsePositiveBand": {
+    "fromY": 1121,
+    "toY": 1187,
+    "heightPx": 66,
+    "note": "A target here is below the scrollport's bottom edge (clipped, genuinely invisible) yet fully inside the browser viewport."
+  },
+  "clippedTarget": {
+    "selector": "li.list-none",
+    "text": "Review Safety Changes",
+    "rect": { "left": 0, "top": 1128, "width": 260, "height": 36 },
+    "nativeIntersectionObserverVerdict": "not intersecting",
+    "currentShimVerdict": "intersecting, ratio 1",
+    "why": "The shim intersects the target rect against the viewport root rect only. 1128 + 36 = 1164 < 1187, so it is inside the viewport; but 1128 > 1121, so it is entirely outside its own scroll pane."
+  },
+  "ancestorChainToClip": [
+    { "selector": "li.list-none", "overflowX": "visible", "overflowY": "visible" },
+    { "selector": "nav.group/scrollport.relative.flex", "overflowX": "auto", "overflowY": "auto", "clips": true },
+    { "selector": "div.relative.flex.h-full", "overflowX": "visible", "overflowY": "visible" },
+    { "selector": "div#stage-slideover-sidebar", "overflowX": "hidden", "overflowY": "hidden", "clips": true }
+  ]
+}
