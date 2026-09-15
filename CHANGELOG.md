@@ -46,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   JWT-shape guard replaces survivors with `[REDACTED_JWT]` and reports the
   redaction count on the reply payload; the CLI prints a warning when > 0
   (`yz-7iu`).
+- Browser extension: `yoetz browser extension update` no longer returns while
+  the reloaded service worker is still reconnecting. It captures the pre-reload
+  instance identity and waits, bounded, until a NEW instance is connected at
+  the installed version (the version verification itself); on timeout it
+  exits non-zero with the last observed status instead of a silent success
+  (`yz-7xv`). The instance-id/profile-id selector rejection now names the
+  actual reason instead of always advising reinstall: not installed → run
+  setup; installed but not connected yet → "the reloaded extension is still
+  reconnecting - retry in a few seconds"; connected but transport pinned
+  away → names the pin and the instance (`yz-7xv`).
 
 ## [0.5.76] - 2026-09-15
 ### Added

@@ -1695,6 +1695,47 @@ fn recipe_uses_extension_instance_selector(
         || recipe_var_present(recipe_vars)("extension_profile_id")
 }
 
+/// yz-7xv: The instance-id/profile-id selectors are only valid when the
+/// recipe funnels through chrome-extension-native. When it does not, the
+/// reason matters: "not installed" and "installed but not connected yet"
+/// have opposite remediations. Right after `extension update` the reloaded
+/// worker needs a few seconds to reconnect, and telling the operator to run
+/// setup at that moment pushes them into churning the managed copy for no
+/// reason (yz-7xv field repro: update at 09:39:30Z, recipe at 09:39:5x
+/// failed, identical command at 09:40:22Z succeeded).
+fn extension_instance_selector_unavailable_message(site_flag: &str) -> String {
+    match browser_extension_native::status() {
+        Ok(status) if status.status == "not_installed" => format!(
+            "extension_instance_id and extension_profile_id selectors require chrome-extension-native, which is not installed; run `yoetz browser extension setup {site_flag}` or pass --transport chrome-extension-native"
+        ),
+        Ok(status) if status.status == "connected" => format!(
+            "extension_instance_id and extension_profile_id selectors require chrome-extension-native, but the recipe transport was pinned away from it (recipe `transports` pin, --transport, or an explicit browser target); the extension IS connected (instance {}). Re-run without the transport pin or pass --transport chrome-extension-native",
+            status
+                .extension_instance_id
+                .as_deref()
+                .unwrap_or("<unknown>")
+        ),
+        Ok(status)
+            if matches!(
+                status.status,
+                "disconnected" | "missing_extension" | "manual_handoff"
+            ) =>
+        {
+            format!(
+                "extension_instance_id and extension_profile_id selectors require chrome-extension-native, but no extension instance is reachable yet (status: {}). If you just ran `yoetz browser extension update`, the reloaded extension is still reconnecting - retry in a few seconds; otherwise run `yoetz browser extension status {site_flag}` to diagnose",
+                status.status
+            )
+        }
+        Ok(status) => format!(
+            "extension_instance_id and extension_profile_id selectors require chrome-extension-native; current extension status is `{}` ({}). Run `yoetz browser extension status {site_flag}` to diagnose or pass --transport chrome-extension-native",
+            status.status, status.detail
+        ),
+        Err(error) => format!(
+            "extension_instance_id and extension_profile_id selectors require chrome-extension-native, but the extension status probe failed: {error}. Run `yoetz browser extension status {site_flag}` to diagnose"
+        ),
+    }
+}
+
 fn recipe_uses_conversation_selector(
     recipe_vars: &std::collections::BTreeMap<String, String>,
 ) -> bool {
@@ -5066,7 +5107,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             {
                 let site_flag = if is_claude { "--claude" } else { "--chatgpt" };
                 bail!(
-                    "extension_instance_id and extension_profile_id selectors require chrome-extension-native; install or update the Yoetz Chrome extension (`yoetz browser extension setup {site_flag}`) or pass --transport chrome-extension-native"
+                    "{}",
+                    extension_instance_selector_unavailable_message(site_flag)
                 );
             }
             if is_chatgpt {
