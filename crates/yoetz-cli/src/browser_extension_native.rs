@@ -1431,40 +1431,60 @@ pub fn status() -> Result<ExtensionStatus> {
 /// without a verified new-version hello.
 pub fn wait_for_reloaded_instance(
     recipe: BuiltinWebRecipe,
-    pre_instance_id: &str,
+    pre_native_instance_id: &str,
+    target_extension_instance_id: &str,
     expected_version: &str,
 ) -> Result<ExtensionStatus> {
     let deadline = Instant::now() + EXTENSION_RELOAD_VERIFY_TIMEOUT;
-    // Assigned on every non-matching iteration before the timeout bail reads
-    // it; clippy's "never read" is wrong only for a single-iteration view.
-    #[allow(unused_assignments)]
-    let mut last_state = String::new();
+    // Deferred init: every path through the match assigns it before the
+    // timeout bail reads it, and if the bail were ever reached before an
+    // assignment the error reading "last status: <empty>" would be
+    // unrepresentable.
+    let mut last_state;
     loop {
         match status() {
             Ok(status) => {
-                let version_matches = status.extension_version.as_deref() == Some(expected_version);
-                let instance_id = status.extension_instance_id.as_deref().unwrap_or("");
+                // yz-7xv recut 2: extension_instance_id is STABLE across a
+                // reload (it is the profile selector; today's experiment
+                // measured native_18d5753f... -> native_18d57805... at +5s
+                // while ext_937d... stayed fixed). So the identity that
+                // changes is native_instance_id. Select the profile's entry
+                // by extension_instance_id, and release only when THAT
+                // entry's native id differs from the pre-reload capture AND
+                // the version matches.
+                let entry = if !target_extension_instance_id.is_empty() {
+                    status.connected_instances.iter().find(|entry| {
+                        entry.extension_instance_id.as_deref() == Some(target_extension_instance_id)
+                    })
+                } else {
+                    None
+                };
+                let version_matches = entry
+                    .map(|entry| entry.extension_version.as_deref() == Some(expected_version))
+                    .unwrap_or(false);
+                let native_id = entry.map(|entry| entry.native_instance_id.as_str());
                 let recipe_ready = match recipe {
-                    BuiltinWebRecipe::Claude => status.claude_ready,
+                    BuiltinWebRecipe::Claude => {
+                        status.claude_ready
+                            || entry
+                                .is_some_and(|entry| entry.recipes.iter().any(|r| r == "claude"))
+                    }
                     BuiltinWebRecipe::Chatgpt => true,
                 };
                 if status.status == "connected"
                     && recipe_ready
                     && version_matches
-                    && !instance_id.is_empty()
-                    && instance_id != pre_instance_id
+                    && native_id.is_some_and(|id| !id.is_empty() && id != pre_native_instance_id)
                 {
                     return Ok(status);
                 }
                 last_state = format!(
-                    "status: {}, instance: {}, version: {}",
+                    "status: {}, selected-entry native id: {}, version: {}",
                     status.status,
-                    if instance_id.is_empty() {
-                        "<none>"
-                    } else {
-                        instance_id
-                    },
-                    status.extension_version.as_deref().unwrap_or("<none>")
+                    native_id.unwrap_or("<entry not found>"),
+                    entry
+                        .and_then(|entry| entry.extension_version.as_deref())
+                        .unwrap_or("<none>")
                 );
             }
             Err(error) => {
@@ -1866,13 +1886,13 @@ pub fn update_extension(
         .as_deref()
         .context("managed extension copy has no stamped manifest version")?;
     ensure_reload_can_reach_managed_copy(&previous_instance, &update)?;
-    // yz-7xv: capture the pre-reload identity BEFORE issuing the reload. The
-    // post-reload wait keys on this baseline: "connected" alone cannot tell
-    // the old worker (still holding its port) from the reloaded one.
-    let pre_instance_id = previous_instance
-        .extension_instance_id
-        .clone()
-        .unwrap_or_else(|| previous_instance.native_instance_id.clone());
+    // yz-7xv: capture the pre-reload identity BEFORE issuing the reload.
+    // The post-reload wait selects the profile's entry by
+    // extension_instance_id (stable across reloads) and compares that
+    // entry's native_instance_id (what actually changes on a reload)
+    // against this baseline.
+    let pre_native_instance_id = previous_instance.native_instance_id.clone();
+    let target_extension_instance_id = previous_instance.extension_instance_id.clone();
     let reload = reload_extension_unlocked(selector)?;
     let instance = wait_for_extension_update(
         &paths,
@@ -1892,7 +1912,12 @@ pub fn update_extension(
     // the reload window and reject the instance-id selector. The new-instance
     // wait IS the version verification (instance id differs from the pre
     // reload baseline AND version == expected_version).
-    let site_status = wait_for_reloaded_instance(recipe, &pre_instance_id, expected_version)?;
+    let site_status = wait_for_reloaded_instance(
+        recipe,
+        &pre_native_instance_id,
+        target_extension_instance_id.as_deref().unwrap_or(""),
+        expected_version,
+    )?;
     Ok(json!({
         "status": "updated",
         "transport": TRANSPORT_NAME,
@@ -9055,28 +9080,53 @@ mod yz_7xv_wait_tests {
             .as_millis() as u64
     }
 
-    /// yz-7xv: `update` must not release while only the OLD instance is
-    /// connected. The wait is keyed on baseline identity (instance id differs
-    /// from the pre-reload id) AND the expected version. A hello from the OLD
-    /// id — even connected at the expected version — must not satisfy the
-    /// wait, and no qualifying hello within the bound must surface the
-    /// timeout error.
-    #[test]
-    #[serial]
-    fn yz_7xv_wait_releases_only_on_new_instance_at_expected_version() {
-        let dir = TempDir::new_in("/tmp").unwrap();
-        let state_dir = dir.path().join("st");
-        // Managed copy with the expected stamped version, so status() treats
-        // a hello at that version as connected rather than
-        // managed_copy_mismatch.
-        let expected_managed_version = format!("{YOETZ_CLI_VERSION}.1");
-        let managed_dir = state_dir.join("chatgpt-native-extension");
-        fs::create_dir_all(managed_dir.join("src")).unwrap();
+    fn instance_record(
+        native_id: &str,
+        socket_path: &std::path::Path,
+        socket_base: &std::path::Path,
+        extension_instance_id: &str,
+        extension_version: &str,
+        last_seen_ms: u64,
+    ) -> Value {
+        json!({
+            "native_instance_id": native_id,
+            "socket_path": socket_path,
+            "socket_base_path": socket_base,
+            "socket_binding_version": INSTANCE_SOCKET_BINDING_VERSION,
+            "pid": std::process::id(),
+            "extension_instance_id": extension_instance_id,
+            "extension_version": extension_version,
+            "profile_email": Value::Null,
+            "profile_id": Value::Null,
+            "recipes": default_extension_recipes(),
+            "capabilities": Vec::<String>::new(),
+            "protocol_version": PROTOCOL_VERSION,
+            "last_seen_ms": last_seen_ms,
+        })
+    }
+
+    fn write_record(instances_dir: &std::path::Path, native_id: &str, record: &Value) {
         fs::write(
-            managed_dir.join("manifest.json"),
-            format!(r#"{{"version":"{expected_managed_version}"}}"#),
+            instances_dir.join(format!("{native_id}.json")),
+            serde_json::to_string(record).unwrap(),
         )
         .unwrap();
+    }
+
+    /// yz-7xv recut 2: extension_instance_id is the STABLE profile selector;
+    /// native_instance_id is what changes on a reload. The wait must select
+    /// the profile's entry by ext id and release on native id + version.
+    ///
+    /// Real shapes (from the 10:33Z experiment):
+    /// - stale hello: same native id, version ALREADY reads the new one ->
+    ///   must NOT release (the old worker re-announced; nothing reloaded).
+    /// - reloaded hello: same ext id, NEW native id, new version -> release.
+    /// - nothing reconnected -> timeout Err naming the reconnect bound.
+    #[test]
+    #[serial]
+    fn yz_7xv_wait_releases_only_on_new_native_id_at_expected_version() {
+        let dir = TempDir::new_in("/tmp").unwrap();
+        let state_dir = dir.path().join("st");
         let native_dir = state_dir.join("chrome-extension-native");
         let instances_dir = native_dir.join(INSTANCES_DIRNAME);
         fs::create_dir_all(&instances_dir).unwrap();
@@ -9099,124 +9149,113 @@ mod yz_7xv_wait_tests {
             env::remove_var("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET");
             old
         };
-
-        // Live Unix socket so status() reports the instance as reachable.
-        let listener = UnixListener::bind(instances_dir.join("native_old.sock")).unwrap();
-        let now_ms = test_now_millis();
-        let old_record = json!({
-            "native_instance_id": "native_old",
-            "socket_path": instances_dir.join("native_old.sock"),
-            "socket_base_path": dir.path().join("old.sock"),
-            "socket_binding_version": INSTANCE_SOCKET_BINDING_VERSION,
-            "pid": std::process::id(),
-            "extension_instance_id": "ext_old",
-            "extension_version": format!("{YOETZ_CLI_VERSION}.0"),
-            "profile_email": Value::Null,
-            "profile_id": Value::Null,
-            "recipes": default_extension_recipes(),
-            "capabilities": Vec::<String>::new(),
-            "protocol_version": PROTOCOL_VERSION,
-            "last_seen_ms": now_ms,
-        });
+        // Managed copy with the expected stamped version, so status() treats
+        // a hello at that version as connected rather than
+        // managed_copy_mismatch.
+        let expected_version = format!("{YOETZ_CLI_VERSION}.1");
+        let managed_dir = state_dir.join("chatgpt-native-extension");
+        fs::create_dir_all(managed_dir.join("src")).unwrap();
         fs::write(
-            instances_dir.join("native_old.json"),
-            serde_json::to_string(&old_record).unwrap(),
+            managed_dir.join("manifest.json"),
+            format!(r#"{{"version":"{expected_version}"}}"#),
         )
         .unwrap();
 
-        let expected_version = expected_managed_version.clone();
-        let expected_version_for_thread = expected_version.clone();
-        // The old worker is still alive and connected when the wait starts:
-        // this is exactly the window the HIGH finding described. Run the wait
-        // on a short-deadline clone of the state (we shrink the bound by
-        // racing the real one: the wait must NOT return Ok while the only
-        // connected instance is ext_old, and must time out with the new
-        // error instead).
-        let wait_result = {
-            // Direct call with the old id as the baseline.
-            let pre = "ext_old".to_string();
-            // Shrink the effective deadline by launching a thread that
-            // removes the listener's reachability... actually the wait bound
-            // is the 20s constant; instead of waiting 20s, assert the
-            // predicate directly against the current state first: the wait
-            // with the OLD baseline must not be satisfiable by this state.
-            // We run it in a thread and abort after a short grace period.
+        let ext_id = "ext_profile_stable"; // STABLE across reloads
+        let old_listener = UnixListener::bind(instances_dir.join("native_old.sock")).unwrap();
+        write_record(
+            &instances_dir,
+            "native_old",
+            &instance_record(
+                "native_old",
+                &instances_dir.join("native_old.sock"),
+                &dir.path().join("old-base.sock"),
+                ext_id,
+                &expected_version,
+                test_now_millis(),
+            ),
+        );
+
+        // CASE 1 (the stale-hello shape that broke recut 1): same native id,
+        // version already reads the new one. The predicate must NOT release
+        // while only this shape is connected.
+        let stale_released = {
+            let expected_version = expected_version.clone();
             let handle = thread::spawn(move || {
-                // Override the timeout by computing the predicate the wait
-                // uses, via a 2s-bounded poll of status() replicating the
-                // wait's predicate. This keeps the test fast while proving
-                // the discrimination: connected + version-matched still does
-                // not release when the instance id equals the baseline.
+                // Replicate the wait's predicate on a 2s bound to keep the
+                // test fast: the release condition requires native id change.
                 let deadline = Instant::now() + Duration::from_secs(2);
-                let mut released = false;
                 while Instant::now() < deadline {
                     if let Ok(status) = status() {
-                        let id = status.extension_instance_id.as_deref().unwrap_or("");
-                        if status.status == "connected"
-                            && status.extension_version.as_deref()
-                                == Some(expected_version_for_thread.as_str())
-                            && !id.is_empty()
-                            && id != pre
-                        {
-                            released = true;
-                            break;
+                        let entry = status.connected_instances.iter().find(|entry| {
+                            entry.extension_instance_id.as_deref() == Some("ext_profile_stable")
+                        });
+                        if let Some(entry) = entry {
+                            if entry.native_instance_id != "native_old"
+                                && entry.extension_version.as_deref()
+                                    == Some(expected_version.as_str())
+                            {
+                                return true;
+                            }
                         }
                     }
                     thread::sleep(Duration::from_millis(50));
                 }
-                released
+                false
             });
             handle.join().unwrap()
         };
         assert!(
-            !wait_result,
-            "the wait predicate must NOT release while only the OLD instance (baseline id) is connected, even at the expected version — this is the yz-7xv HIGH discrimination"
+            !stale_released,
+            "a hello with the SAME native id but the NEW version must not satisfy the release predicate — that is the old worker re-announcing, not a reload"
         );
 
-        // Now a NEW instance record at the expected version appears (the
-        // reload landed): the predicate must release.
+        // CASE 2 (the reload): same ext id, NEW native id, new version ->
+        // the wait must release and report the new instance.
         let new_listener = UnixListener::bind(instances_dir.join("native_new.sock")).unwrap();
-        let new_record = json!({
-            "native_instance_id": "native_new",
-            "socket_path": instances_dir.join("native_new.sock"),
-            "socket_base_path": dir.path().join("new.sock"),
-            "socket_binding_version": INSTANCE_SOCKET_BINDING_VERSION,
-            "pid": std::process::id(),
-            "extension_instance_id": "ext_new",
-            "extension_version": expected_version,
-            "profile_email": Value::Null,
-            "profile_id": Value::Null,
-            "recipes": default_extension_recipes(),
-            "capabilities": Vec::<String>::new(),
-            "protocol_version": PROTOCOL_VERSION,
-            "last_seen_ms": test_now_millis(),
-        });
-        fs::write(
-            instances_dir.join("native_new.json"),
-            serde_json::to_string(&new_record).unwrap(),
-        )
-        .unwrap();
-
-        let released =
-            wait_for_reloaded_instance(BuiltinWebRecipe::Chatgpt, "ext_old", &expected_version);
+        write_record(
+            &instances_dir,
+            "native_new",
+            &instance_record(
+                "native_new",
+                &instances_dir.join("native_new.sock"),
+                &dir.path().join("new-base.sock"),
+                ext_id,
+                &expected_version,
+                test_now_millis(),
+            ),
+        );
+        let released = wait_for_reloaded_instance(
+            BuiltinWebRecipe::Chatgpt,
+            "native_old",
+            ext_id,
+            &expected_version,
+        );
         assert!(
             released.is_ok(),
-            "the wait must release when a NEW instance id is connected at the expected version; got {released:?}"
+            "the wait must release when the selected entry's native id changes at the expected version; got {released:?}"
         );
         assert_eq!(
-            released.unwrap().extension_instance_id.as_deref(),
-            Some("ext_new")
+            released
+                .unwrap()
+                .connected_instances
+                .iter()
+                .find(|entry| { entry.extension_instance_id.as_deref() == Some(ext_id) })
+                .map(|entry| entry.native_instance_id.as_str()),
+            Some("native_new"),
+            "the reported instance must be the reloaded worker"
         );
 
-        // And with an unreachable/no-new-instance state, the wait must fail
-        // with the yz-7xv timeout error (bounded check via the predicate:
-        // assert the error text shape by calling with an impossible baseline
-        // while no state can satisfy it — using a fresh empty instances dir).
+        // CASE 3: unsatisfiable state -> timeout Err with the yz-7xv message.
         drop(new_listener);
-        drop(listener);
+        drop(old_listener);
         fs::remove_dir_all(&instances_dir).unwrap();
-        let timeout_error =
-            wait_for_reloaded_instance(BuiltinWebRecipe::Chatgpt, "ext_never", &expected_version);
+        let timeout_error = wait_for_reloaded_instance(
+            BuiltinWebRecipe::Chatgpt,
+            "native_old",
+            ext_id,
+            &expected_version,
+        );
         let error_text = timeout_error.unwrap_err().to_string();
         assert!(
             error_text.contains("did not reconnect within"),
