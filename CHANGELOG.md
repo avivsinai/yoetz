@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.74] - 2026-09-15
 ### Added
 - ChatGPT tab pacing: per-profile pacing of automated chatgpt.com tab
   creation. A job_start that would exceed the limits is refused immediately
@@ -125,6 +127,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   during `beforeClick` could increase the user-turn count before the click
   fired; a stale baseline would accept that unrelated increase as a submission
   signal. (`yz-kio`)
+
 
 ## [0.5.73] - 2026-09-14
 ### Fixed
