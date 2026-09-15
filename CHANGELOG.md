@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.75] - 2026-09-15
 ### Fixed
 - ChatGPT rate-limit classification: the no-transcript body fallback in
   `rateLimitedHandoff` no longer reads raw `document.body.innerText` — it goes
@@ -14,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   healthy, composer-visible page as `rate_limited`. A portal-div modal
   appended to the body — the shape the fallback exists for — still surfaces.
   (`yz-2fz`)
+
 
 ## [0.5.74] - 2026-09-15
 ### Added
