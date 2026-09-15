@@ -4590,7 +4590,7 @@ mod native_host_unix {
         stream: UnixStream,
         owner_id: String,
         job_id: String,
-        run_id: Option<String>,
+        pub(super) run_id: Option<String>,
         workspace_id: Option<String>,
         pub(super) chunks: Vec<Value>,
         pub(super) next_chunk: usize,
@@ -5154,27 +5154,9 @@ mod native_host_unix {
                     return Ok(());
                 }
                 update_client_effect_state(client, &envelope);
-                // yz-91o: epoch handling is idempotent. A replay whose
-                // generation is not NEWER than the one the client already
-                // holds is stale news - an old epoch can only come from a
-                // late duplicate of an announcement the client already
-                // acted on, and adopting it (or rewinding next_chunk for
-                // it) would desync the stream it is currently sending.
-                if should_replay_upload_from_start(&envelope) {
-                    let generation = upload_generation_of(&envelope);
-                    if generation > client.upload_generation {
-                        client.next_chunk = 0;
-                        // Adopt the worker's generation so the restarted
-                        // stream is distinguishable from the one it
-                        // abandoned.
-                        client.upload_generation = generation;
-                    } else {
-                        eprintln!(
-                            "yoetz chrome native ignored stale upload replay for job {job_id}: generation {generation} is not newer than {}",
-                            client.upload_generation
-                        );
-                    }
-                }
+                // yz-91o: epoch handling is idempotent (see
+                // apply_upload_replay_if_newer for the contract).
+                apply_upload_replay_if_newer(client, &envelope, &job_id);
                 let stream = match client.stream.try_clone() {
                     Ok(stream) => stream,
                     Err(err) => {
@@ -5611,6 +5593,35 @@ mod native_host_unix {
     /// announcement for an epoch already adopted) is ignored by the caller, so
     /// it cannot rewind a stream that is already sending on that epoch and it
     /// cannot start a concurrent second sender.
+    /// yz-91o: epoch handling is idempotent. A replay whose generation is not
+    /// NEWER than the one the client already holds is stale news - an old epoch
+    /// can only come from a late duplicate of an announcement the client
+    /// already acted on, and adopting it (or rewinding next_chunk for it)
+    /// would desync the stream it is currently sending. Extracted verbatim
+    /// from the router so the yz-91o epoch tests execute THIS transition, not
+    /// a test-local copy (review finding 3, round 2): a production-only
+    /// mutation of this block is what the tests must catch.
+    pub(super) fn apply_upload_replay_if_newer(
+        client: &mut ClientJob,
+        envelope: &ProtocolEnvelope,
+        job_id: &str,
+    ) {
+        if should_replay_upload_from_start(envelope) {
+            let generation = upload_generation_of(envelope);
+            if generation > client.upload_generation {
+                client.next_chunk = 0;
+                // Adopt the worker's generation so the restarted stream is
+                // distinguishable from the one it abandoned.
+                client.upload_generation = generation;
+            } else {
+                eprintln!(
+                    "yoetz chrome native ignored stale upload replay for job {job_id}: generation {generation} is not newer than {}",
+                    client.upload_generation
+                );
+            }
+        }
+    }
+
     pub(super) fn should_replay_upload_from_start(envelope: &ProtocolEnvelope) -> bool {
         envelope.kind == "job_progress"
             && envelope
@@ -8837,33 +8848,15 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn newer_epoch_replay_adopts_generation_and_rewinds_stream() {
-        // yz-91o (i), review finding 3: the test must exercise the PRODUCTION
-        // caller transition, not just the pure helpers — reverting the caller
-        // guard (or flipping > to >=) must fail here. We replicate the exact
-        // caller block from handle_native_message against a real ClientJob and
-        // assert the state transition it produces.
-        fn replay_caller_transition(
-            client: &mut native_host_unix::ClientJob,
-            envelope: &ProtocolEnvelope,
-        ) -> bool {
-            // EXACT copy of the caller guard in native_host_unix envelope
-            // routing (~5136). If the caller changes, this test must change
-            // with it — that coupling is the point.
-            if native_host_unix::should_replay_upload_from_start(envelope) {
-                let generation = native_host_unix::upload_generation_of(envelope);
-                if generation > client.upload_generation {
-                    client.next_chunk = 0;
-                    client.upload_generation = generation;
-                    return true;
-                }
-            }
-            false
-        }
-
+        // yz-91o (i), review finding 3 (round 2): the test calls the REAL
+        // production transition (apply_upload_replay_if_newer) — the same
+        // function the envelope router executes. A production-only mutation
+        // (unconditional adoption, > flipped to >=, rewind removed, adoption
+        // removed) changes what these assertions observe.
         let replay = ProtocolEnvelope::new(
             "job_progress",
             Some("job_epoch_newer".to_string()),
-            Some("run_epoch_newer".to_string()),
+            Some("run_job_epoch_newer".to_string()),
             json!({
                 "phase": "ready_for_file",
                 "restored": true,
@@ -8873,10 +8866,10 @@ mod tests {
             }),
         );
         let mut client = native_host_unix::test_client("job_epoch_newer", 2);
+        client.run_id = Some("run_job_epoch_newer".to_string());
         client.upload_generation = 1;
 
-        let adopted = replay_caller_transition(&mut client, &replay);
-        assert!(adopted, "a strictly newer epoch must be adopted");
+        native_host_unix::apply_upload_replay_if_newer(&mut client, &replay, "job_epoch_newer");
         assert_eq!(
             client.upload_generation, 5,
             "the new generation must be held"
@@ -8905,28 +8898,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn older_epoch_replay_does_not_adopt_generation_or_rewind_stream() {
-        // yz-91o (ii), review finding 3: an OLDER announcement must leave the
-        // production client state untouched — no rewind, no adoption. Reverting
-        // the caller guard to unconditional adoption must fail this test.
-        fn replay_caller_transition(
-            client: &mut native_host_unix::ClientJob,
-            envelope: &ProtocolEnvelope,
-        ) -> bool {
-            if native_host_unix::should_replay_upload_from_start(envelope) {
-                let generation = native_host_unix::upload_generation_of(envelope);
-                if generation > client.upload_generation {
-                    client.next_chunk = 0;
-                    client.upload_generation = generation;
-                    return true;
-                }
-            }
-            false
-        }
-
+        // yz-91o (ii), review finding 3 (round 2): an OLDER announcement must
+        // leave the production client state untouched — no rewind, no
+        // adoption. Making production adoption unconditional must fail here.
         let stale = ProtocolEnvelope::new(
             "job_progress",
             Some("job_epoch_old".to_string()),
-            Some("run_epoch_old".to_string()),
+            Some("run_job_epoch_old".to_string()),
             json!({
                 "phase": "ready_for_file",
                 "restored": true,
@@ -8935,11 +8913,11 @@ mod tests {
                 "upload_generation": 3,
             }),
         );
-        let mut client = native_host_unix::test_client("job_epoch_old", 2); // mid-stream: next_chunk 2 of 3
+        let mut client = native_host_unix::test_client("job_epoch_old", 2); // mid-stream: next_chunk 2
+        client.run_id = Some("run_job_epoch_old".to_string());
         client.upload_generation = 5;
 
-        let adopted = replay_caller_transition(&mut client, &stale);
-        assert!(!adopted, "an older epoch must NOT be adopted");
+        native_host_unix::apply_upload_replay_if_newer(&mut client, &stale, "job_epoch_old");
         assert_eq!(client.upload_generation, 5, "held generation unchanged");
         assert_eq!(
             client.next_chunk, 2,
@@ -8950,28 +8928,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn same_epoch_replay_is_not_newer_so_stream_is_left_alone() {
-        // yz-91o (iii), review finding 3: a REPEATED same-generation restored
-        // announcement must leave the production client state untouched —
-        // reverting the caller to unconditional rewind must fail this test.
-        fn replay_caller_transition(
-            client: &mut native_host_unix::ClientJob,
-            envelope: &ProtocolEnvelope,
-        ) -> bool {
-            if native_host_unix::should_replay_upload_from_start(envelope) {
-                let generation = native_host_unix::upload_generation_of(envelope);
-                if generation > client.upload_generation {
-                    client.next_chunk = 0;
-                    client.upload_generation = generation;
-                    return true;
-                }
-            }
-            false
-        }
-
+        // yz-91o (iii), review finding 3 (round 2): a REPEATED same-generation
+        // restored announcement must leave the production client state
+        // untouched. Flipping the production comparison to >= must fail here.
         let repeat = ProtocolEnvelope::new(
             "job_progress",
             Some("job_epoch_repeat".to_string()),
-            Some("run_epoch_repeat".to_string()),
+            Some("run_job_epoch_repeat".to_string()),
             json!({
                 "phase": "ready_for_file",
                 "restored": true,
@@ -8981,10 +8944,10 @@ mod tests {
             }),
         );
         let mut client = native_host_unix::test_client("job_epoch_repeat", 2); // mid-stream on epoch 2
+        client.run_id = Some("run_job_epoch_repeat".to_string());
         client.upload_generation = 2;
 
-        let adopted = replay_caller_transition(&mut client, &repeat);
-        assert!(!adopted, "a same-epoch repeat must NOT replay");
+        native_host_unix::apply_upload_replay_if_newer(&mut client, &repeat, "job_epoch_repeat");
         assert_eq!(client.upload_generation, 2, "held generation unchanged");
         assert_eq!(
             client.next_chunk, 2,

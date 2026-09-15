@@ -2083,8 +2083,13 @@ async function handleTargetedReconnect(message, job) {
       // and the exact allocated value is what persistence and the
       // announcement carry, so an overlapping reconnect (review BLOCKER)
       // can only publish an epoch that a completed persistence actually
-      // recorded; the continuation-live re-check above plus the shared
-      // continuation fence drops a superseded handler before it announces.
+      // recorded. The liveness re-check below rejects a job that was
+      // replaced, cancelled, or terminal while this handler was suspended.
+      // It is NOT a reconnect-supersession fence: an overlapping older
+      // handler may still announce its own already-persisted allocation.
+      // Safety for that overlap comes from the client side, which adopts
+      // only strictly newer generations and ignores older/equal announcements
+      // (apply_upload_replay_if_newer).
       const allocatedGeneration = Number(job.upload_generation ?? 0) + 1;
       job.upload_generation = allocatedGeneration;
       await persistJob(job);
