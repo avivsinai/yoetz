@@ -5379,6 +5379,20 @@ mod native_host_unix {
             return Ok(false);
         }
         if envelope.kind == "job_file_chunk_ack" {
+            // yz-y5p: a nack for a chunk from the stream an upload restart
+            // abandoned. It carries the sequence of the ABANDONED stream, which
+            // is unrelated to where the restarted stream has got to, so it must
+            // be ignored before the sequence arithmetic below — that arithmetic
+            // would read it as an ack running ahead of the restarted stream and
+            // bail, killing in the client the job the worker just saved.
+            if envelope
+                .payload
+                .get("stale")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                return Ok(false);
+            }
             if envelope
                 .payload
                 .get("complete")
@@ -5796,6 +5810,76 @@ mod native_host_unix {
 
     #[cfg(test)]
     mod tests {
+
+        /// yz-y5p: a minimal ClientJob for the chunk-ack predicate tests. Only
+        /// next_chunk matters here; ClientJob owns a stream, so use a socketpair.
+        fn y5p_client(job_id: &str, next_chunk: usize) -> super::ClientJob {
+            let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            std::mem::forget(peer);
+            super::ClientJob {
+                stream,
+                owner_id: format!("owner_{job_id}"),
+                job_id: job_id.to_string(),
+                run_id: Some(format!("run_{job_id}")),
+                workspace_id: None,
+                chunks: Vec::new(),
+                next_chunk,
+                upload_generation: 1,
+                side_effect_started: false,
+                fallback_phase: None,
+                cancel_on_disconnect: false,
+            }
+        }
+
+        #[test]
+        fn y5p_stale_chunk_nack_is_ignored_instead_of_bailing_the_client() {
+            // The worker nacks a late chunk from the abandoned stream. Its
+            // sequence belongs to THAT stream, so without the `stale` check the
+            // arithmetic reads it as an ack ahead of the restarted stream and
+            // bails - killing in the client the job the worker just rescued.
+            let mut client = y5p_client("job_stale", 1);
+            let nack = super::super::ProtocolEnvelope::new(
+                "job_file_chunk_ack",
+                Some("job_stale".to_string()),
+                Some("run_job_stale".to_string()),
+                serde_json::json!({
+                    "stale": true,
+                    "complete": false,
+                    "sequence": 3,
+                    "upload_generation": 1,
+                    "chunk_upload_generation": 0,
+                }),
+            );
+            assert!(
+                !super::should_send_next_chunk(&client, &nack).unwrap(),
+                "a stale nack must be ignored, not drive the stream"
+            );
+
+            client.next_chunk = 0;
+            assert!(
+                !super::should_send_next_chunk(&client, &nack).unwrap(),
+                "a stale nack at next_chunk 0 must be ignored, not bail"
+            );
+        }
+
+        #[test]
+        fn y5p_non_stale_ack_ahead_of_the_stream_still_bails() {
+            // Guard: ignoring stale nacks must not soften the real protocol check
+            // that an ack cannot run ahead of what the client actually sent.
+            let client = y5p_client("job_ahead", 1);
+            let ahead = super::super::ProtocolEnvelope::new(
+                "job_file_chunk_ack",
+                Some("job_ahead".to_string()),
+                Some("run_job_ahead".to_string()),
+                serde_json::json!({ "complete": false, "sequence": 3 }),
+            );
+            let error = super::should_send_next_chunk(&client, &ahead)
+                .expect_err("an ack ahead of the stream must still fail");
+            assert!(
+                error.to_string().contains("ahead of expected"),
+                "unexpected error: {error}"
+            );
+        }
         use super::*;
 
         #[test]
