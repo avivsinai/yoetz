@@ -1435,7 +1435,10 @@ pub fn wait_for_reloaded_instance(
     expected_version: &str,
 ) -> Result<ExtensionStatus> {
     let deadline = Instant::now() + EXTENSION_RELOAD_VERIFY_TIMEOUT;
-    let mut last_state = String::from("no status observed yet");
+    // Assigned on every non-matching iteration before the timeout bail reads
+    // it; clippy's "never read" is wrong only for a single-iteration view.
+    #[allow(unused_assignments)]
+    let mut last_state = String::new();
     loop {
         match status() {
             Ok(status) => {
@@ -9091,7 +9094,7 @@ mod yz_7xv_wait_tests {
             format!(r#"{{"name":"{NATIVE_HOST_NAME}"}}"#),
         )
         .unwrap();
-        let socket_env_guard = {
+        let _socket_env_guard = {
             let old = env::var("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET").ok();
             env::remove_var("YOETZ_CHROME_EXTENSION_NATIVE_SOCKET");
             old
