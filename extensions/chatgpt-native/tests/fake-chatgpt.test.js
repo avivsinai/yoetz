@@ -20,6 +20,7 @@ import {
   sendAcceptanceBaseline,
   verifyChatgptModelSelectionBeforeSend,
   verifyChatSurface,
+  rateLimitedHandoff,
   uploadFile,
   waitForSendAccepted
 } from "../src/chatgpt-dom.js";
@@ -5540,6 +5541,7 @@ function matchesSimpleSelector(element, selector) {
   if (selector === "div") return tag === "div";
   if (selector === "span") return tag === "span";
   if (selector === "header") return tag === "header";
+  if (selector === "nav") return tag === "nav";
   if (selector === "article") return tag === "article";
   if (selector === "pre") return tag === "pre";
   if (selector === "code") return tag === "code";
@@ -5912,4 +5914,57 @@ test("yz-dl0: an upload-specific loading marker outside the composer still block
   } finally {
     globalThis.DataTransfer = previousDataTransfer;
   }
+});
+
+// yz-2fz: rateLimitedHandoff's no-transcript body fallback read raw
+// body.innerText. On the healthy page the shell (nav/aside/header/sidebar)
+// carries conversation-history titles, so a title merely containing "rate
+// limit" classified the page rate_limited with no wall present — and the
+// composer-visible guard did not help, because the false text arrives WITH a
+// visible composer. The fallback must go through the same shell-skipping
+// collector as the surface scan, while a portal-div modal appended to body
+// (the shape the fallback exists for) still surfaces its text.
+test("yz-2fz: a sidebar conversation title containing 'rate limit' does not classify the page rate_limited", () => {
+  const composer = new FakeElement("div", {
+    id: "prompt-textarea",
+    "data-testid": "composer",
+    contenteditable: "true"
+  });
+  const nav = new FakeElement("nav", {}, "");
+  nav.append(new FakeElement("div", {}, "").append(
+    new FakeElement("a", {}, "Rate limit policy drafting")
+  ));
+  const main = new FakeElement("main", {}, "");
+  main.append(composer);
+  const body = new FakeElement("body", {}, "").append(nav, main);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.href = "https://chatgpt.com/?_yoetz=run_2fz_sidebar";
+  doc.title = "ChatGPT";
+
+  assert.equal(rateLimitedHandoff(doc), null);
+});
+
+test("yz-2fz: a portal-div rate-limit modal on the body still classifies rate_limited", () => {
+  // No transcript (no user/assistant turns, no copy buttons) and no
+  // [role=alert]/[role=dialog]/[aria-live] markers: the modal is a plain div
+  // appended to body — the exact shape the no-transcript body fallback exists
+  // for. It must still surface after the fallback stops reading the shell.
+  const modal = new FakeElement("div", { class: "portal-overlay" },
+    "Too many requests. Please wait a few minutes and try again later.");
+  const composer = new FakeElement("div", {
+    id: "prompt-textarea",
+    "data-testid": "composer",
+    contenteditable: "true"
+  });
+  const main = new FakeElement("main", {}, "");
+  main.append(composer);
+  const body = new FakeElement("body", {}, "").append(main, modal);
+  const doc = new FakeDocument(body);
+  doc.defaultView.location.href = "https://chatgpt.com/?_yoetz=run_2fz_portal";
+  doc.title = "ChatGPT";
+
+  assert.deepEqual(rateLimitedHandoff(doc), {
+    state: "rate_limited",
+    message: "ChatGPT is rate limited"
+  });
 });
