@@ -3526,18 +3526,82 @@ function attachmentNodeKey(node) {
   ].filter(Boolean).join("|");
 }
 
+// Unambiguous wherever they render: a node that declares itself an upload or
+// attachment in a loading state is about an upload no matter where ChatGPT
+// mounts it. A read-only probe of a live tab found upload inputs and file
+// tiles OUTSIDE the composer form, so these stay document-wide; scoping them
+// would risk a false NEGATIVE, which is worse than the false positive this
+// bead fixes because it would send the prompt before the attachment commits.
+const UPLOAD_SPECIFIC_MARKERS = [
+  '[data-testid*="upload"][data-state*="loading"]',
+  '[data-testid*="attachment"][data-state*="loading"]'
+];
+// Generic busy markers say nothing about uploads on their own -- a loading
+// sidebar or a modal carries them too -- so they are trusted only inside the
+// composer.
+const GENERIC_BUSY_MARKERS = [
+  '[role="progressbar"]',
+  '[aria-busy="true"]'
+];
+// A node's own text: its direct text-node children only, excluding any text
+// contributed by descendant elements.
+function ownText(node) {
+  const kids = node?.childNodes;
+  if (!kids) {
+    // A node that exposes no childNodes cannot be carrying descendant text
+    // through them, so its textContent is already its own text.
+    return String(node?.textContent ?? "");
+  }
+  let out = "";
+  for (const child of Array.from(kids)) {
+    if (child?.nodeType === 3) out += child.nodeValue ?? "";
+  }
+  return out;
+}
+const UPLOAD_PROGRESS_TEXT = /\b(uploading|attaching|processing|scanning)\b/i;
+
+// yz-dl0: whether THIS composer still has an upload in flight.
+//
+// This used to scan the whole document -- root is document -- for four English
+// words, using subtree text (textOf returns innerText) with div in the
+// candidate set. So one occurrence of "uploading", "attaching", "processing"
+// or "scanning" anywhere visible on the page made every ancestor div match and
+// pinned pending true forever: a sidebar conversation title, a rendered answer
+// that merely discusses uploads, the user's own prompt. A live probe counted
+// 1078 visible candidates under that selector on an ordinary conversation.
+//
+// The observed field failure had exactly that shape -- attached=true,
+// pending=true, send_enabled=true repeating until the deadline, with the file
+// genuinely attached and Send genuinely enabled.
+//
+// The invariant we actually want is narrow: this composer's own attachment
+// chrome is not showing an in-progress state. So scope to the composer and,
+// for the text fallback, match only LEAF nodes -- an ancestor's subtree text
+// is not evidence that the ancestor is a progress indicator.
 function hasUploadPending(root) {
-  const pending = firstVisible(root, [
-    '[role="progressbar"]',
-    '[aria-busy="true"]',
-    '[data-testid*="upload"][data-state*="loading"]',
-    '[data-testid*="attachment"][data-state*="loading"]'
-  ]);
-  if (pending) {
+  if (firstVisible(root, UPLOAD_SPECIFIC_MARKERS)) {
     return true;
   }
-  const candidates = Array.from(root.querySelectorAll("[aria-label], [role], [data-testid], button, span, div"));
-  return candidates.some((node) => isVisible(node) && /\b(uploading|attaching|processing|scanning)\b/i.test(textOf(node)));
+  const scopes = composerScopes(root, { includeRoot: false });
+  if (scopes.length === 0) {
+    // No composer: nothing to judge. hasAttachmentNamed is scoped the same
+    // way and will also be false, so the caller keeps waiting rather than
+    // treating this as a committed upload.
+    return false;
+  }
+  if (scopes.some((scope) => firstVisible(scope, GENERIC_BUSY_MARKERS))) {
+    return true;
+  }
+  // Match a node's OWN text, not its subtree text and not leaf-ness. Subtree
+  // text was the original bug: an ancestor div inherited a descendant's word.
+  // Leaf-only over-corrects -- <span>Uploading<span>...</span></span> has
+  // children on the outer span, and the inner leaf reads "...", so a real
+  // progress label would be missed purely because of markup nesting. An
+  // ancestor's own text is whitespace, so own-text keeps the false positive
+  // fixed while catching a label that contains an inline child.
+  return scopes.some((scope) => Array.from(
+    scope.querySelectorAll("[aria-label], [role], [data-testid], button, span, div")
+  ).some((node) => isVisible(node) && UPLOAD_PROGRESS_TEXT.test(ownText(node))));
 }
 
 function uploadErrorText(root) {
