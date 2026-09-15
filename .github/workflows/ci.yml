@@ -111,6 +111,26 @@ jobs:
         with:
           args: -color
 
+  # yz-lc1: a PR's CHANGELOG.md additions must land under ## [Unreleased].
+  # Release notes are generated from Unreleased, so an entry misfiled under an
+  # already-released section (observed on the yz-eld merge, fixed by #538)
+  # silently disappears from the next release's notes. Release PRs are exempt:
+  # release.sh itself moves the Unreleased section into the version heading.
+  # Not a required check — informational guard for reviewers.
+  changelog-placement:
+    name: Changelog Placement
+    if: "${{ github.event_name == 'pull_request' && !startsWith(github.event.pull_request.title, 'chore(release):') }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Added CHANGELOG lines must fall under [Unreleased]
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: ./scripts/check-changelog-placement.sh "$PR_BASE_SHA"
+
   release-commit-fast-path:
     name: Release Commit Fast Path
     needs: changes
