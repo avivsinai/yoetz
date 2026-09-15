@@ -50,6 +50,8 @@ test("all required native message types are declared", () => {
     "job_error",
     "heartbeat",
     "reconnect",
+    "inspect_run",
+    "list_jobs",
     "terminal_ack"
   ]) {
     assert.ok(MESSAGE_TYPES.includes(type), `${type} missing`);

@@ -13585,3 +13585,132 @@ test("yz-esc: a job completing while a cooldown is still holding does not reset 
     globalThis.setTimeout = originalSetTimeout;
   }
 });
+
+test("service worker list_jobs returns active jobs and the exact inspect command (yz-eld)", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousWaitingProgressInterval = globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
+  globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = 100;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedLatestProSelection() };
+          case "yoetz_upload_file":
+            return {
+              ok: true,
+              payload: { filename: message.file.filename, size: 4, upload_commit_signal: "empty_composer_variant" }
+            };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, conversation_id: "conv-yz-eld" } };
+          case "yoetz_extract_response":
+            return {
+              ok: true,
+              payload: sent
+                ? { method: "none", text: "", is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0, conversation_id: "conv-yz-eld" }
+                : { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+            };
+          case "yoetz_cancel_send":
+            return { ok: true, payload: { stopped: true, confirmed_idle: true } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_eld=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+
+    // No active jobs yet: the listing is empty and still terminal-complete.
+    port.messages.length = 0;
+    port.emit(envelope("list_jobs", "job_list_empty", {}));
+    await eventually(() => port.messages.some((m) => m.type === "job_complete" && m.job_id === "job_list_empty"));
+    const empty = port.messages.find((m) => m.type === "job_complete" && m.job_id === "job_list_empty");
+    assert.deepEqual(empty.payload.jobs, []);
+
+    // Start a job and drive it into waiting_response.
+    port.messages.length = 0;
+    port.emit(envelope("job_start", "job_yz_eld", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1200
+    }));
+    await eventually(() => port.messages.some((m) => m.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_yz_eld", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_yz_eld.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((m) => m.type === "job_progress" && m.payload?.phase === "waiting_response"));
+
+    port.messages.length = 0;
+    port.emit(envelope("list_jobs", "job_list_one", {}));
+    await eventually(() => port.messages.some((m) => m.type === "job_complete" && m.job_id === "job_list_one"));
+    const listing = port.messages.find((m) => m.type === "job_complete" && m.job_id === "job_list_one");
+    assert.equal(listing.payload.response, "active_jobs");
+    assert.equal(listing.payload.jobs.length, 1);
+    const listed = listing.payload.jobs[0];
+    assert.equal(listed.job_id, "job_yz_eld");
+    assert.equal(listed.run_id, "run_job_yz_eld");
+    assert.equal(listed.recipe, "chatgpt");
+    assert.equal(listed.status, "waiting_response");
+    assert.equal(listed.phase, "wait_response");
+    assert.equal(listed.tab_id, 1);
+    assert.equal(listed.conversation_id, "conv-yz-eld");
+    assert.ok(Number.isFinite(listed.started_at), "started_at epoch ms must be present");
+    assert.match(listed.started_at_iso, /^\d{4}-\d{2}-\d{2}T/);
+    assert.equal(
+      listed.inspect_command,
+      "yoetz browser extension inspect --chatgpt --run-id run_job_yz_eld"
+    );
+
+    // Recipe filter: an unknown recipe still answers, with a filtered listing.
+    port.messages.length = 0;
+    port.emit(envelope("list_jobs", "job_list_filtered", { recipe: "claude" }));
+    await eventually(() => port.messages.some((m) => m.type === "job_complete" && m.job_id === "job_list_filtered"));
+    const filtered = port.messages.find((m) => m.type === "job_complete" && m.job_id === "job_list_filtered");
+    assert.deepEqual(filtered.payload.jobs, []);
+
+    // list_jobs is read-only: a second listing still reports the live job
+    // with unchanged status, and no tab commands were re-issued for it.
+    port.messages.length = 0;
+    port.emit(envelope("list_jobs", "job_list_again", {}));
+    await eventually(() => port.messages.some((m) => m.type === "job_complete" && m.job_id === "job_list_again"));
+    const relisted = port.messages.find((m) => m.type === "job_complete" && m.job_id === "job_list_again");
+    assert.equal(relisted.payload.jobs.length, 1);
+    assert.equal(relisted.payload.jobs[0].status, "waiting_response");
+
+    // Cancel the live job; the listing must then be empty again.
+    port.messages.length = 0;
+    port.emit(envelope("job_cancel", "job_yz_eld", { reason: "yz-eld test teardown" }));
+    await eventually(() => port.messages.some((m) => m.type === "job_cancel" && m.job_id === "job_yz_eld"));
+    port.messages.length = 0;
+    port.emit(envelope("list_jobs", "job_list_after_cancel", {}));
+    await eventually(() => port.messages.some((m) => m.type === "job_complete" && m.job_id === "job_list_after_cancel"));
+    const afterCancel = port.messages.find((m) => m.type === "job_complete" && m.job_id === "job_list_after_cancel");
+    assert.deepEqual(afterCancel.payload.jobs, []);
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousWaitingProgressInterval === undefined) {
+      delete globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
+    } else {
+      globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = previousWaitingProgressInterval;
+    }
+  }
+});
