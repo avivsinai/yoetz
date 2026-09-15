@@ -368,6 +368,38 @@ impl LocalClient {
         }
     }
 
+    // yz-eld: connect with an arbitrary control envelope as the FIRST frame —
+    // exercises the validator allowlist (site 1) and the first-frame forward
+    // match (site 2) for control kinds that are not job_start.
+    fn connect_control(
+        socket_path: &Path,
+        job_id: &str,
+        token: &str,
+        kind: &str,
+        payload: Value,
+    ) -> Self {
+        let mut stream = UnixStream::connect(socket_path).unwrap();
+        stream.set_read_timeout(Some(FRAME_TIMEOUT)).unwrap();
+        write_frame(
+            &mut stream,
+            &json!({
+                "protocol_version": 1,
+                "transport": "chrome-extension-native",
+                "request_id": format!("req_start_{job_id}"),
+                "job_id": job_id,
+                "run_id": format!("run_{job_id}"),
+                "workspace_id": "workspace_test",
+                "capability_token": token,
+                "type": kind,
+                "payload": payload
+            }),
+        );
+        Self {
+            stream,
+            job_id: job_id.to_string(),
+        }
+    }
+
     fn take(&self, kind: &str) -> Value {
         let frame = read_frame(&mut &self.stream);
         assert_eq!(
@@ -556,20 +588,33 @@ fn try_read_frame(reader: &mut impl Read) -> std::io::Result<Value> {
     serde_json::from_slice(&bytes).map_err(std::io::Error::other)
 }
 
-// yz-eld: a `list_jobs` control message must be forwarded to the extension and
-// its job_complete reply routed back to the requesting local client, even while
-// another job is being multiplexed on the same host.
+// yz-eld: a `list_jobs` control message must be accepted as the client's
+// FIRST frame (validator allowlist site 1 + first-frame forward match site 2),
+// forwarded to the extension, and its job_complete reply routed back to the
+// requesting local client. Regression: 69cc53e shipped site 3 (the steady-
+// state control loop) but missed sites 1 and 2, so a first-frame list_jobs was
+// rejected by the validator before it could ever reach the forward match.
 #[test]
 fn native_host_forwards_list_jobs_and_routes_the_reply() {
     let mut host = NativeHost::start();
     let token = wait_for_token(&host.token_path);
 
-    let bundle = write_bundle(host.temp.path(), "eld.md", 4, b'e');
-    let client = LocalClient::connect(&host.socket_path, "job_eld", &bundle, &token);
-    host.output.take("job_start", "job_eld");
+    // The control request's FIRST frame is a list_jobs envelope — no job_start
+    // precedes it.
+    let client = LocalClient::connect_control(
+        &host.socket_path,
+        "job_eld",
+        &token,
+        "list_jobs",
+        json!({"recipe": "chatgpt"}),
+    );
 
-    // The extension answers the forwarded list_jobs with a terminal
-    // job_complete carrying the active-job listing for the same job_id.
+    // The fake extension asserts it RECEIVED the forwarded list_jobs: it
+    // answers with a terminal job_complete carrying the active-job listing for
+    // the same job_id, which only makes sense in reply to the listing request.
+    let forwarded = host.output.take("list_jobs", "job_eld");
+    assert_eq!(forwarded["payload"]["recipe"], "chatgpt");
+
     host.send(extension_frame(
         "job_complete",
         "job_eld",

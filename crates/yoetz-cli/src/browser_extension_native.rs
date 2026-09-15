@@ -3839,6 +3839,7 @@ fn validate_inbound_envelope(envelope: &ProtocolEnvelope) -> Result<()> {
         | "pair_complete"
         | "reconnect"
         | "inspect_run"
+        | "list_jobs"
         | "dump_picker_html"
         | "request_identity_permission" => {}
         other => bail!("unsupported chrome-extension-native envelope type `{other}`"),
@@ -4707,6 +4708,7 @@ mod native_host_unix {
             | "pair_request"
             | "reconnect"
             | "inspect_run"
+            | "list_jobs"
             | "dump_picker_html"
             | "request_identity_permission" => forward_to_extension(&stdout, &forwarded),
             other => Err(anyhow!("unsupported local client message `{other}`")),

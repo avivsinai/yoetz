@@ -11763,10 +11763,6 @@ test("service worker session-route 429 carries typed throttle facts instead of t
 
 
 async function eventually(predicate, timeoutMs = 5000) {
-  if (process.env.YOETZ_ELD_DEBUG) {
-    const orig = predicate;
-    predicate = async () => { const r = await orig(); if (!r && Date.now() % 500 < 30) console.error('ELD eventually pending'); return r; };
-  }
   const start = Date.now();
   while (!(await predicate())) {
     if (Date.now() - start > timeoutMs) {

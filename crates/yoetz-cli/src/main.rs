@@ -3917,8 +3917,9 @@ fn handle_browser_extension(
                     args.extension_instance_id.as_ref(),
                     args.extension_profile_id.as_ref(),
                 );
-                let listing =
-                    browser_extension_native::list_active_jobs(selector, None).map_err(|error| {
+                let recipe = extension_site_scope(args.chatgpt, args.claude)?;
+                let listing = browser_extension_native::list_active_jobs(selector, Some(recipe))
+                    .map_err(|error| {
                         eprintln!("yoetz: could not list active extension jobs: {error:#}");
                         error
                     });
@@ -3927,7 +3928,13 @@ fn handle_browser_extension(
                     Err(_) => std::process::exit(2),
                 };
                 let payload = serde_json::json!({ "active_jobs": listing });
-                maybe_write_output(ctx, &payload)?;
+                if let Err(err) = maybe_write_output(ctx, &payload) {
+                    // yz-eld: listing mode exits 2 even when the side-file
+                    // write fails — the listing is not a page inspection
+                    // result, and scripts must never mistake it for one.
+                    eprintln!("yoetz: could not write output for active extension jobs: {err:#}");
+                    std::process::exit(2);
+                }
                 match format {
                     OutputFormat::Json | OutputFormat::Jsonl => {
                         write_json(&payload)?;
