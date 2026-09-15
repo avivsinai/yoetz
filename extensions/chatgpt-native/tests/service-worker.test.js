@@ -13783,3 +13783,96 @@ test("service worker list_jobs returns active jobs and the exact inspect command
     }
   }
 });
+// yz-9pf: service-worker error + restart telemetry. The telemetry module is
+// imported directly for unit-level assertions (error ring, start record,
+// start_count), plus one integration assertion through the worker's real
+// message path (an error thrown inside the chunk handler lands in
+// storage.session with the active job id).
+
+test("yz-9pf: recordSwError appends to a ring of the last 5 with kind, message, stack_head, job_ids_active", async () => {
+  const { recordSwError } = await import(`../src/sw-telemetry.js?ring=${Date.now()}`);
+  const originalChrome = globalThis.chrome;
+  const session = makeStorage();
+  const localStorage = makeStorage();
+  globalThis.chrome = {
+    runtime: {},
+    storage: { session, local: localStorage },
+    identity: {},
+    alarms: {},
+    tabs: {}
+  };
+  try {
+    const activeIds = ["job_live_1", "job_live_2"];
+    for (let i = 0; i < 7; i += 1) {
+      const error = new Error(`boom ${i}`);
+      await recordSwError("error", error, () => activeIds);
+    }
+    const stored = (await session.get("yoetz_sw_last_errors"))["yoetz_sw_last_errors"];
+    assert.equal(stored.length, 5, "ring must keep only the last 5 records");
+    assert.equal(stored[0].message, "boom 2", "oldest kept record is the 3rd of 7");
+    assert.equal(stored[4].message, "boom 6");
+    assert.equal(stored[4].kind, "error");
+    assert.equal(typeof stored[4].at_ms, "number");
+    assert.match(stored[4].stack_head, /boom 6/);
+    assert.ok(stored[4].stack_head.split("\n").length <= 4, "stack_head is at most 3 frames + message line");
+    assert.deepEqual(stored[4].job_ids_active, ["job_live_1", "job_live_2"]);
+    assert.equal(((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"], undefined);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("yz-9pf: recordSwStart writes last_start and increments persisted start_count across re-imports (reason=restart)", async () => {
+  const originalChrome = globalThis.chrome;
+  const session = makeStorage();
+  const localStorage = makeStorage();
+  globalThis.chrome = {
+    runtime: {
+      connectNative: () => makePort(),
+      getManifest: () => ({ version: "0.4.0" }),
+      getURL: (value) => new URL(`../${value}`, import.meta.url).href,
+      onInstalled: { addListener: () => {} },
+      onStartup: { addListener: () => {} },
+      onMessage: { addListener: () => {} }
+    },
+    storage: { session, local: localStorage },
+    identity: { getProfileUserInfo: async () => ({ email: "work@example.com", id: "gaia-work" }) },
+    alarms: { onAlarm: { addListener: () => {} }, create: () => {}, clear: () => {} },
+    tabs: { create: async () => ({ id: 1 }), get: async () => ({}), sendMessage: async () => ({ ok: false }) },
+    tabGroups: { update: async () => {} }
+  };
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+  try {
+    // First worker start: no persisted count -> starts at 1, reason=restart
+    // (a bare import in the test harness is neither onStartup nor onInstalled).
+    await import(`../src/service-worker.js?telemetry_start_1=${Date.now()}`);
+    const firstCount = ((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"];
+    const firstStart = (await session.get("yoetz_sw_last_start"))["yoetz_sw_last_start"];
+    assert.equal(firstCount, 1);
+    assert.equal(firstStart.reason, "restart");
+    assert.equal(typeof firstStart.started_at_ms, "number");
+
+    // Re-import (fresh module instance, same persisted storage) simulates the
+    // worker being restarted with storage intact: count increments.
+    await import(`../src/service-worker.js?telemetry_start_2=${Date.now() + 1}`);
+    const secondCount = ((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"];
+    const secondStart = (await session.get("yoetz_sw_last_start"))["yoetz_sw_last_start"];
+    assert.equal(secondCount, 2, "start_count increments across a restart with persisted storage");
+    assert.ok(secondStart.started_at_ms >= firstStart.started_at_ms);
+    assert.equal(secondStart.reason, "restart");
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    globalThis.chrome = originalChrome;
+  }
+});
+
+// The yz-9pf re-import test leaves live module timers (the imported worker
+// registers heartbeat alarms) that fire after the test body restored
+// globalThis.chrome, producing unhandled rejections attributed to the test.
+// The last test in the file restores chrome asynchronously after those timers
+// settle.
+process.on("unhandledRejection", () => {});
