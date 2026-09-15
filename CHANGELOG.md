@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.76] - 2026-09-15
 ### Added
 - Browser extension/CLI: active-job discovery for operators who lost the run
   id. The extension answers a read-only `list_jobs` control message with its
@@ -35,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   trace. The wait_response manual-handoff arm site is kept so the yz-83b
   modal-dismissed-successfully continuation (which never reaches `failJob`)
   still arms.
+
 
 ## [0.5.75] - 2026-09-15
 ### Fixed
