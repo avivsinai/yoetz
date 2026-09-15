@@ -556,8 +556,16 @@ struct BrowserExtensionInspectArgs {
     claude: bool,
 
     /// Yoetz run id from a failed/manual-recovery browser recipe message.
+    /// Optional: when omitted, inspect lists the active jobs for the connected
+    /// extension instance (with the exact inspect command per job) and exits 2
+    /// instead of running any page inspection.
     #[arg(long, alias = "run_id")]
-    run_id: String,
+    run_id: Option<String>,
+
+    /// List the active jobs for the connected extension instance without a
+    /// --run-id and exit 2. Implied whenever --run-id is omitted.
+    #[arg(long)]
+    list: bool,
 
     /// Capture the ChatGPT model-picker DOM instead of running a page
     /// inspection. Writes the serialized menu HTML to this path and reports
@@ -3900,12 +3908,50 @@ fn handle_browser_extension(
             )
         }
         BrowserExtensionCommand::Inspect(args) => {
+            if args.run_id.is_none() || args.list {
+                // yz-eld: listing mode. Read-only discovery of active jobs for
+                // the connected instance; exits 2 so scripts never mistake the
+                // listing for a page inspection result.
+                let selector = extension_selector_from_parts(
+                    args.profile_email.as_ref(),
+                    args.extension_instance_id.as_ref(),
+                    args.extension_profile_id.as_ref(),
+                );
+                let listing =
+                    browser_extension_native::list_active_jobs(selector, None).map_err(|error| {
+                        eprintln!("yoetz: could not list active extension jobs: {error:#}");
+                        error
+                    });
+                let listing = match listing {
+                    Ok(listing) => listing,
+                    Err(_) => std::process::exit(2),
+                };
+                let payload = serde_json::json!({ "active_jobs": listing });
+                maybe_write_output(ctx, &payload)?;
+                match format {
+                    OutputFormat::Json | OutputFormat::Jsonl => {
+                        write_json(&payload)?;
+                    }
+                    OutputFormat::Text | OutputFormat::Markdown => {
+                        println!("{}", format_active_jobs(&listing));
+                    }
+                }
+                let _ = io::Write::flush(&mut io::stdout());
+                std::process::exit(2);
+            }
             let recipe = extension_site_scope(args.chatgpt, args.claude)?;
             let selector = extension_selector_from_parts(
                 args.profile_email.as_ref(),
                 args.extension_instance_id.as_ref(),
                 args.extension_profile_id.as_ref(),
             );
+            let run_id = args
+                .run_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("--run-id is required unless --list is passed")?
+                .to_string();
             let label = if args.dump_picker_html.is_some() {
                 "browser.extension.dump_picker"
             } else {
@@ -3914,7 +3960,7 @@ fn handle_browser_extension(
             (
                 label,
                 browser_extension_native::inspect_run(
-                    &args.run_id,
+                    &run_id,
                     args.dump_picker_html.as_deref(),
                     args.allow_live_job,
                     selector,
@@ -4172,7 +4218,52 @@ fn format_extension_status(
             ));
         }
     }
+    lines.extend(format_active_jobs_lines(&status.active_jobs));
     lines.join("\n")
+}
+
+/// yz-eld: Render the active-job listing as operator-facing text. The inspect
+/// command is printed verbatim so a lost run id is recoverable by copy-paste.
+fn format_active_jobs(jobs: &[browser_extension_native::ActiveExtensionJob]) -> String {
+    if jobs.is_empty() {
+        return "no active yoetz extension jobs".to_string();
+    }
+    let mut lines = vec![format!("active yoetz extension jobs ({}):", jobs.len())];
+    lines.extend(format_active_jobs_lines(jobs));
+    lines.join("\n")
+}
+
+fn format_active_jobs_lines(jobs: &[browser_extension_native::ActiveExtensionJob]) -> Vec<String> {
+    if jobs.is_empty() {
+        return vec!["active_jobs: none".to_string()];
+    }
+    let mut lines = vec![format!("active_jobs: {}", jobs.len())];
+    for job in jobs {
+        let started_label = job
+            .started_at_iso
+            .clone()
+            .or_else(|| job.started_at.map(|value| value.to_string()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let mut line = format!(
+            "  - run_id={} job_id={} recipe={} status={} started_at={}",
+            job.run_id,
+            job.job_id,
+            job.recipe,
+            job.status.as_deref().unwrap_or("<unknown>"),
+            started_label
+        );
+        if let Some(tab_id) = job.tab_id {
+            line.push_str(&format!(" tab_id={tab_id}"));
+        }
+        if let Some(conversation_id) = &job.conversation_id {
+            line.push_str(&format!(" conversation_id={conversation_id}"));
+        }
+        lines.push(line);
+        if let Some(inspect_command) = &job.inspect_command {
+            lines.push(format!("    inspect with: {inspect_command}"));
+        }
+    }
+    lines
 }
 
 fn format_extension_doctor(
@@ -9749,3 +9840,42 @@ fn parse_cost(value: Option<&Value>) -> Option<f64> {
 }
 
 // defaults moved to providers module
+
+#[cfg(test)]
+mod yz_eld_format_tests {
+    use super::*;
+
+    #[test]
+    fn format_active_jobs_renders_the_inspect_command_per_job() {
+        let jobs = vec![browser_extension_native::ActiveExtensionJob {
+            job_id: "job_fmt".to_string(),
+            run_id: "run_fmt".to_string(),
+            recipe: "chatgpt".to_string(),
+            status: Some("waiting_response".to_string()),
+            phase: Some("wait_response".to_string()),
+            started_at: Some(1_767_000_000_000),
+            started_at_iso: Some("2025-12-29T00:00:00.000Z".to_string()),
+            tab_id: Some(3),
+            conversation_id: Some("conv_fmt".to_string()),
+            inspect_command: Some(
+                "yoetz browser extension inspect --chatgpt --run-id run_fmt".to_string(),
+            ),
+        }];
+        let text = format_active_jobs(&jobs);
+        assert!(text.contains("run_id=run_fmt"), "text: {text}");
+        assert!(text.contains("status=waiting_response"), "text: {text}");
+        assert!(text.contains("tab_id=3"), "text: {text}");
+        assert!(text.contains("conversation_id=conv_fmt"), "text: {text}");
+        assert!(
+            text.contains(
+                "inspect with: yoetz browser extension inspect --chatgpt --run-id run_fmt"
+            ),
+            "text: {text}"
+        );
+    }
+
+    #[test]
+    fn format_active_jobs_empty_listing_is_explicit() {
+        assert_eq!(format_active_jobs(&[]), "no active yoetz extension jobs");
+    }
+}

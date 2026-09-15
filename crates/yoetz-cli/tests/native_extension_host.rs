@@ -555,3 +555,45 @@ fn try_read_frame(reader: &mut impl Read) -> std::io::Result<Value> {
     reader.read_exact(&mut bytes)?;
     serde_json::from_slice(&bytes).map_err(std::io::Error::other)
 }
+
+// yz-eld: a `list_jobs` control message must be forwarded to the extension and
+// its job_complete reply routed back to the requesting local client, even while
+// another job is being multiplexed on the same host.
+#[test]
+fn native_host_forwards_list_jobs_and_routes_the_reply() {
+    let mut host = NativeHost::start();
+    let token = wait_for_token(&host.token_path);
+
+    let bundle = write_bundle(host.temp.path(), "eld.md", 4, b'e');
+    let client = LocalClient::connect(&host.socket_path, "job_eld", &bundle, &token);
+    host.output.take("job_start", "job_eld");
+
+    // The extension answers the forwarded list_jobs with a terminal
+    // job_complete carrying the active-job listing for the same job_id.
+    host.send(extension_frame(
+        "job_complete",
+        "job_eld",
+        json!({
+            "response": "active_jobs",
+            "jobs": [
+                {
+                    "job_id": "job_live",
+                    "run_id": "run_live",
+                    "recipe": "chatgpt",
+                    "status": "waiting_response",
+                    "phase": "wait_response",
+                    "started_at": 1767000000000_u64,
+                    "tab_id": 12,
+                    "inspect_command": "yoetz browser extension inspect --chatgpt --run-id run_live"
+                }
+            ]
+        }),
+    ));
+    let reply = client.take("job_complete");
+    assert_eq!(reply["payload"]["response"], "active_jobs");
+    assert_eq!(reply["payload"]["jobs"][0]["run_id"], "run_live");
+    assert_eq!(reply["payload"]["jobs"][0]["tab_id"], 12);
+
+    // The listing is terminal for the control request: no further frames.
+    client.assert_no_frame();
+}

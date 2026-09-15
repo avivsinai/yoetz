@@ -500,6 +500,9 @@ async function handleNativeMessage(message, sourcePort = nativePort, sourceGener
       case "inspect_run":
         await handleInspectRun(message);
         break;
+      case "list_jobs":
+        await handleListJobs(message);
+        break;
       case "dump_picker_html":
         await handleDumpPickerHtml(message);
         break;
@@ -2308,6 +2311,78 @@ async function handleInspectRun(message) {
       // refresh on extension reload even when the SW does.
       service_worker_build: serviceWorkerBuild(),
       tabs: matches
+    }
+  }), { status: "complete", phase: "profile" });
+}
+
+// yz-eld: Read-only discovery for operators who lost the run id. Mirrors
+// inspect_run's terminal-reply contract (fresh control job_id, routed back by
+// the native host) but never touches a tab and never mutates job state: the
+// listing is derived from the in-memory jobs map only. Non-terminal jobs are
+// reported with the exact inspect command so the next step is copy-pasteable.
+function activeJobListing(recipeFilter) {
+  const listing = [];
+  for (const job of jobs.values()) {
+    if (!job?.job_id || !job.run_id) {
+      continue;
+    }
+    if (TERMINAL_STATUSES.has(job.status)) {
+      continue;
+    }
+    const recipe = adapterRecipeKey(job);
+    if (recipeFilter && recipe !== recipeFilter) {
+      continue;
+    }
+    let inspectCommand = null;
+    try {
+      inspectCommand = inspectCommandForJob(job);
+    } catch {
+      // An invalid recipe must not break the whole listing.
+    }
+    listing.push({
+      job_id: job.job_id,
+      run_id: job.run_id,
+      recipe,
+      status: job.status,
+      phase: phaseForStatus(job.status) ?? null,
+      started_at: Number.isFinite(job.started_at) ? job.started_at : null,
+      started_at_iso: Number.isFinite(job.started_at) ? new Date(job.started_at).toISOString() : null,
+      tab_id: Number.isInteger(job.tab_id) ? job.tab_id : null,
+      conversation_id: conversationIdForJob(job),
+      inspect_command: inspectCommand
+    });
+  }
+  listing.sort((a, b) => (a.started_at ?? 0) - (b.started_at ?? 0));
+  return listing;
+}
+
+async function handleListJobs(message) {
+  const requestedRecipe = typeof message.payload?.recipe === "string"
+    ? message.payload.recipe.trim().toLowerCase()
+    : null;
+  let listing;
+  try {
+    listing = activeJobListing(requestedRecipe);
+  } catch (error) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), error?.code ?? "list_jobs_failed", String(error?.message ?? error), {
+        request_id: message.request_id,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
+    return;
+  }
+  await postTerminalMessage(message, makeEnvelope("job_complete", {
+    request_id: message.request_id,
+    job_id: message.job_id,
+    run_id: message.run_id,
+    workspace_id: message.workspace_id,
+    payload: {
+      response: "active_jobs",
+      jobs: listing
     }
   }), { status: "complete", phase: "profile" });
 }

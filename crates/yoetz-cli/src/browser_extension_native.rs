@@ -102,7 +102,7 @@ pub struct InstallHostResult {
     pub token_path: PathBuf,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExtensionStatus {
     pub status: &'static str,
     pub native_host_name: &'static str,
@@ -128,6 +128,11 @@ pub struct ExtensionStatus {
     pub status_file_present: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub connected_instances: Vec<ExtensionInstanceStatus>,
+    /// yz-eld: Active (non-terminal) jobs on the newest hello instance. Empty
+    /// when the extension is unreachable or the listing request fails; the
+    /// listing is best-effort and must never make `status` itself fail.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_jobs: Vec<ActiveExtensionJob>,
     pub recipes: Vec<String>,
     pub claude_ready: bool,
     pub protocol_version: u32,
@@ -157,6 +162,96 @@ pub struct ExtensionInstanceStatus {
     /// not armed. Keyed by recipe ("chatgpt", "claude").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cooldown_until_ms: Option<Value>,
+}
+
+/// yz-eld: One active (non-terminal) job as reported by the extension's
+/// `list_jobs` reply. Read-only operator discovery: the exact `inspect`
+/// command is included so a lost run id can be recovered by copy-paste.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ActiveExtensionJob {
+    pub job_id: String,
+    pub run_id: String,
+    pub recipe: String,
+    pub status: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at_iso: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tab_id: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inspect_command: Option<String>,
+}
+
+fn parse_active_jobs(payload: &Value) -> Vec<ActiveExtensionJob> {
+    payload
+        .get("jobs")
+        .and_then(Value::as_array)
+        .map(|jobs| {
+            jobs.iter()
+                .filter_map(|job| {
+                    let job_id = job
+                        .get("job_id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())?
+                        .to_string();
+                    let run_id = job
+                        .get("run_id")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())?
+                        .to_string();
+                    let recipe = job
+                        .get("recipe")
+                        .and_then(Value::as_str)
+                        .unwrap_or("chatgpt")
+                        .to_string();
+                    Some(ActiveExtensionJob {
+                        job_id,
+                        run_id,
+                        recipe,
+                        status: job
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        phase: job.get("phase").and_then(Value::as_str).map(str::to_string),
+                        started_at: job.get("started_at").and_then(Value::as_u64).or_else(|| {
+                            job.get("started_at")
+                                .and_then(Value::as_f64)
+                                .filter(|value| value.is_finite() && *value >= 0.0)
+                                .map(|value| value as u64)
+                        }),
+                        started_at_iso: job
+                            .get("started_at_iso")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        tab_id: job.get("tab_id").and_then(Value::as_i64).or_else(|| {
+                            job.get("tab_id").and_then(Value::as_f64).and_then(|value| {
+                                if value.is_finite() && value.fract() == 0.0 {
+                                    Some(value as i64)
+                                } else {
+                                    None
+                                }
+                            })
+                        }),
+                        conversation_id: job
+                            .get("conversation_id")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .map(str::to_string),
+                        inspect_command: job
+                            .get("inspect_command")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Debug)]
@@ -1306,12 +1401,59 @@ pub fn status() -> Result<ExtensionStatus> {
         token_present,
         status_path: paths.status_path,
         status_file_present,
-        connected_instances,
+        active_jobs: latest_instance_with_hello
+            .map(|instance| fetch_active_jobs_for_instance(instance, None))
+            .unwrap_or_default(),
+        connected_instances: connected_instances.clone(),
         recipes,
         claude_ready,
         protocol_version: PROTOCOL_VERSION,
         detail,
     })
+}
+
+/// yz-eld: Ask the newest hello instance for its active (non-terminal) jobs.
+/// Read-only discovery for operators who lost the run id: the reply carries
+/// run_id, phase/status, started_at, tab_id and the exact `inspect` command.
+/// Best-effort: any transport or parse failure returns an empty listing with
+/// the error swallowed so status/inspect listing paths can degrade gracefully.
+fn fetch_active_jobs_for_instance(
+    instance: &ExtensionInstanceStatus,
+    recipe: Option<BuiltinWebRecipe>,
+) -> Vec<ActiveExtensionJob> {
+    let payload = match recipe {
+        Some(recipe) => json!({ "recipe": recipe.as_str() }),
+        None => json!({}),
+    };
+    let selector = ExtensionInstanceSelector {
+        profile_email: instance.profile_email.as_deref(),
+        extension_instance_id: instance.extension_instance_id.as_deref(),
+        extension_profile_id: instance.profile_id.as_deref(),
+    };
+    match send_control_job_with_recipe(
+        "list_jobs",
+        payload,
+        selector,
+        recipe.map(|recipe| recipe.as_str()),
+    ) {
+        Ok(response) => parse_active_jobs(&response.payload),
+        Err(_) => Vec::new(),
+    }
+}
+
+pub fn list_active_jobs(
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: Option<BuiltinWebRecipe>,
+) -> Result<Vec<ActiveExtensionJob>> {
+    let response = send_control_job_with_recipe(
+        "list_jobs",
+        recipe
+            .map(|recipe| json!({ "recipe": recipe.as_str() }))
+            .unwrap_or_else(|| json!({})),
+        selector,
+        recipe.map(|recipe| recipe.as_str()),
+    )?;
+    Ok(parse_active_jobs(&response.payload))
 }
 
 pub fn prune_stale_instance_records() -> Result<usize> {
@@ -4603,6 +4745,7 @@ mod native_host_unix {
                         "job_cancel"
                         | "reconnect"
                         | "inspect_run"
+                        | "list_jobs"
                         | "dump_picker_html"
                         | "request_identity_permission" => {
                             if let Err(err) = forward_to_extension(&stdout, &forwarded) {
@@ -8506,5 +8649,167 @@ mod tests {
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("rate_limit_cooldown_active"), "msg: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod yz_eld_tests {
+    use super::*;
+
+    #[test]
+    fn parse_active_jobs_reads_full_listing_payload() {
+        let payload = json!({
+            "response": "active_jobs",
+            "jobs": [
+                {
+                    "job_id": "job_1",
+                    "run_id": "run_1",
+                    "recipe": "chatgpt",
+                    "status": "waiting_response",
+                    "phase": "wait_response",
+                    "started_at": 1767000000000_u64,
+                    "started_at_iso": "2025-12-29T00:00:00.000Z",
+                    "tab_id": 42_i64,
+                    "conversation_id": "conv_1",
+                    "inspect_command": "yoetz browser extension inspect --chatgpt --run-id run_1"
+                },
+                {
+                    "job_id": "job_2",
+                    "run_id": "run_2",
+                    "recipe": "claude",
+                    "status": "uploading_file"
+                }
+            ]
+        });
+        let jobs = parse_active_jobs(&payload);
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].job_id, "job_1");
+        assert_eq!(jobs[0].run_id, "run_1");
+        assert_eq!(jobs[0].recipe, "chatgpt");
+        assert_eq!(jobs[0].status.as_deref(), Some("waiting_response"));
+        assert_eq!(jobs[0].phase.as_deref(), Some("wait_response"));
+        assert_eq!(jobs[0].started_at, Some(1_767_000_000_000));
+        assert_eq!(jobs[0].tab_id, Some(42));
+        assert_eq!(jobs[0].conversation_id.as_deref(), Some("conv_1"));
+        assert_eq!(
+            jobs[0].inspect_command.as_deref(),
+            Some("yoetz browser extension inspect --chatgpt --run-id run_1")
+        );
+        assert_eq!(jobs[1].status.as_deref(), Some("uploading_file"));
+        assert_eq!(jobs[1].phase, None);
+        assert_eq!(jobs[1].tab_id, None);
+    }
+
+    #[test]
+    fn parse_active_jobs_defaults_and_skips_malformed_entries() {
+        // Missing payload / missing jobs array degrade to empty, not an error.
+        assert!(parse_active_jobs(&json!({})).is_empty());
+        assert!(parse_active_jobs(&json!({ "jobs": "not-an-array" })).is_empty());
+        // Entries missing job_id or run_id are skipped; recipe defaults to chatgpt.
+        let jobs = parse_active_jobs(&json!({
+            "jobs": [
+                { "run_id": "run_missing_job" },
+                { "job_id": "job_missing_run" },
+                { "job_id": "job_ok", "run_id": "run_ok" }
+            ]
+        }));
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].job_id, "job_ok");
+        assert_eq!(jobs[0].recipe, "chatgpt");
+    }
+
+    #[test]
+    fn active_extension_job_round_trips_through_status_json() {
+        let job = ActiveExtensionJob {
+            job_id: "job_json".to_string(),
+            run_id: "run_json".to_string(),
+            recipe: "chatgpt".to_string(),
+            status: Some("waiting_response".to_string()),
+            phase: Some("wait_response".to_string()),
+            started_at: Some(1_767_000_000_000),
+            started_at_iso: Some("2025-12-29T00:00:00.000Z".to_string()),
+            tab_id: Some(7),
+            conversation_id: Some("conv_json".to_string()),
+            inspect_command: Some(
+                "yoetz browser extension inspect --chatgpt --run-id run_json".to_string(),
+            ),
+        };
+        let status = ExtensionStatus {
+            status: "connected",
+            native_host_name: NATIVE_HOST_NAME,
+            extension_id: EXTENSION_ID,
+            hello_seen: true,
+            extension_version: None,
+            extension_instance_id: None,
+            extension_profile_email: None,
+            extension_profile_id: None,
+            manifest_path: PathBuf::from("/tmp/manifest.json"),
+            manifest_installed: true,
+            wrapper_path: PathBuf::from("/tmp/wrapper.sh"),
+            wrapper_installed: true,
+            socket_path: PathBuf::from("/tmp/yoetz.sock"),
+            socket_reachable: true,
+            token_path: PathBuf::from("/tmp/token"),
+            token_present: true,
+            status_path: PathBuf::from("/tmp/status.json"),
+            status_file_present: true,
+            connected_instances: Vec::new(),
+            active_jobs: vec![job],
+            recipes: vec!["chatgpt".to_string()],
+            claude_ready: false,
+            protocol_version: PROTOCOL_VERSION,
+            detail: "test".to_string(),
+        };
+        let serialized = serde_json::to_value(&status).unwrap();
+        let active = serialized
+            .get("active_jobs")
+            .and_then(Value::as_array)
+            .expect("active_jobs must serialize");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0]["run_id"], "run_json");
+        assert_eq!(active[0]["phase"], "wait_response");
+        assert_eq!(active[0]["tab_id"], 7);
+        assert_eq!(
+            active[0]["inspect_command"],
+            "yoetz browser extension inspect --chatgpt --run-id run_json"
+        );
+        // Round trip through JSON keeps the job data.
+        let parsed: serde_json::Map<String, Value> = serde_json::from_value(serialized).unwrap();
+        let round_tripped: Vec<ActiveExtensionJob> =
+            serde_json::from_value(parsed.get("active_jobs").cloned().unwrap()).unwrap();
+        assert_eq!(round_tripped.len(), 1);
+        assert_eq!(round_tripped[0].job_id, "job_json");
+    }
+
+    #[test]
+    fn extension_status_omits_empty_active_jobs() {
+        let status = ExtensionStatus {
+            status: "not_installed",
+            native_host_name: NATIVE_HOST_NAME,
+            extension_id: EXTENSION_ID,
+            hello_seen: false,
+            extension_version: None,
+            extension_instance_id: None,
+            extension_profile_email: None,
+            extension_profile_id: None,
+            manifest_path: PathBuf::from("/tmp/manifest.json"),
+            manifest_installed: false,
+            wrapper_path: PathBuf::from("/tmp/wrapper.sh"),
+            wrapper_installed: false,
+            socket_path: PathBuf::from("/tmp/yoetz.sock"),
+            socket_reachable: false,
+            token_path: PathBuf::from("/tmp/token"),
+            token_present: false,
+            status_path: PathBuf::from("/tmp/status.json"),
+            status_file_present: false,
+            connected_instances: Vec::new(),
+            active_jobs: Vec::new(),
+            recipes: vec!["chatgpt".to_string()],
+            claude_ready: false,
+            protocol_version: PROTOCOL_VERSION,
+            detail: "test".to_string(),
+        };
+        let serialized = serde_json::to_value(&status).unwrap();
+        assert!(serialized.get("active_jobs").is_none());
     }
 }
