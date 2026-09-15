@@ -957,23 +957,22 @@ async function acceptFileChunk(message) {
   if (!jobContinuationIsLive(job, continuationEpoch)) {
     return;
   }
-  if (!["waiting_for_file", "receiving_file"].includes(job.status)) {
-    await failJob(job, "unexpected_chunk", `job ${job.job_id} is not accepting file chunks in status ${job.status}`, {
-      phase: "upload",
-      side_effect_started: Boolean(job.tab_id)
-    });
-    return;
-  }
-
-  // yz-y5p: after an upload restart the job carries a bumped upload_generation
-  // and the client echoes it on every chunk. A chunk from the pre-restart stream
-  // therefore arrives with a stale generation and is rejected rather than
-  // interleaving with the restarted stream. Chunks with no generation are the
-  // pre-yz-y5p wire shape and are accepted only while the job has never been
-  // restarted, so an older client keeps working but cannot corrupt a restart.
+  // yz-91o (fix A): the stale-generation check MUST precede the phase check.
+  // After a restart rescues the job into a later phase (file_received,
+  // uploading_file, waiting_response), a late chunk from the abandoned
+  // generation used to hit the "unexpected_chunk" failJob below and kill the
+  // rescued job — the exact job the restart exists to save. Abandoned-stream
+  // chunks are EXPECTED artifacts of a restart and are always harmless:
+  // classify and drop them first, whatever phase the job is in now. A chunk
+  // with NO generation is the pre-yz-y5p wire shape and only ever valid while
+  // the job has never been restarted (upload_generation 0); once any restart
+  // has happened, a generation-less chunk is stale by definition.
   const jobUploadGeneration = Number(job.upload_generation ?? 0);
   const chunkUploadGeneration = Number(message.payload?.upload_generation ?? 0);
-  if (chunkUploadGeneration < jobUploadGeneration) {
+  if (
+    chunkUploadGeneration < jobUploadGeneration
+    || (message.payload?.upload_generation === undefined && jobUploadGeneration > 0)
+  ) {
     // A late chunk from the stream the restart abandoned. This is the EXPECTED
     // artifact of an upload restart, not an error: the client was mid-flight when
     // the worker re-emitted ready_for_file. Failing here would kill exactly the
@@ -994,6 +993,13 @@ async function acceptFileChunk(message) {
         chunk_upload_generation: chunkUploadGeneration
       }
     }));
+    return;
+  }
+  if (!["waiting_for_file", "receiving_file"].includes(job.status)) {
+    await failJob(job, "unexpected_chunk", `job ${job.job_id} is not accepting file chunks in status ${job.status}`, {
+      phase: "upload",
+      side_effect_started: Boolean(job.tab_id)
+    });
     return;
   }
   if (chunkUploadGeneration > jobUploadGeneration) {
