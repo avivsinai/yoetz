@@ -10334,12 +10334,21 @@ test("service worker resumes waiting_for_file jobs after service-worker restart"
     const bindIndex = sentToTabs.findIndex((item) => item.message.type === "yoetz_bind_job");
     assert.ok(bindIndex >= 0);
 
+    // yz-91o: restored readiness always carries a fresh upload epoch (fix B),
+    // so the client echoes the announced upload_generation on its chunks (the
+    // shipped native client does this via next_bundle_chunk_envelope). A
+    // generation-less chunk is the pre-yz-y5p wire shape and is nacked as
+    // stale once any restart has happened (fix A).
+    const restoreGeneration = Number(restoredReady?.payload.upload_generation ?? 0);
+    assert.ok(restoreGeneration >= 1, "restored readiness must announce an upload_generation");
+
     port.emit(envelope("job_file_chunk", "job_restore_waiting", {
       sequence: 0,
       total_chunks: 1,
       total_bytes: 4,
       filename: "job_restore_waiting.md",
       mime_type: "text/markdown",
+      upload_generation: restoreGeneration,
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
 

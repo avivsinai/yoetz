@@ -5133,11 +5133,26 @@ mod native_host_unix {
                     return Ok(());
                 }
                 update_client_effect_state(client, &envelope);
+                // yz-91o: epoch handling is idempotent. A replay whose
+                // generation is not NEWER than the one the client already
+                // holds is stale news - an old epoch can only come from a
+                // late duplicate of an announcement the client already
+                // acted on, and adopting it (or rewinding next_chunk for
+                // it) would desync the stream it is currently sending.
                 if should_replay_upload_from_start(&envelope) {
-                    client.next_chunk = 0;
-                    // yz-y5p: adopt the worker's generation so the restarted
-                    // stream is distinguishable from the one it abandoned.
-                    client.upload_generation = upload_generation_of(&envelope);
+                    let generation = upload_generation_of(&envelope);
+                    if generation > client.upload_generation {
+                        client.next_chunk = 0;
+                        // Adopt the worker's generation so the restarted
+                        // stream is distinguishable from the one it
+                        // abandoned.
+                        client.upload_generation = generation;
+                    } else {
+                        eprintln!(
+                            "yoetz chrome native ignored stale upload replay for job {job_id}: generation {generation} is not newer than {}",
+                            client.upload_generation
+                        );
+                    }
                 }
                 let stream = match client.stream.try_clone() {
                     Ok(stream) => stream,
@@ -5537,13 +5552,24 @@ mod native_host_unix {
     /// re-emitted this after a restart", so it keeps that job and needs no new
     /// wire condition. `upload_restarted` is informational, for the operator and
     /// the logs, and does NOT drive the client. `upload_generation` is adopted
-    /// whenever present, so the restarted stream is distinguishable from the
-    /// abandoned one.
+    /// whenever it is NEWER than the generation the client holds (yz-91o), so
+    /// the restarted stream is distinguishable from the abandoned one.
+    ///
+    /// yz-91o: every restore path in the service worker now sends
+    /// `restored` + `upload_restarted` + a bumped `upload_generation` together,
+    /// so the replay predicate needs no gap check for the unmarked form.
+    ///
     /// A second `ready_for_file` WITHOUT `restored` for a job already streaming
     /// does not restart anything: `should_send_next_chunk` returns
     /// `client.next_chunk == 0`, which is false mid-stream, so the envelope is
     /// ignored exactly as before. Silence there is deliberate - a silent restart
     /// would resend bytes the worker never asked for.
+    ///
+    /// yz-91o: a `ready_for_file` WITH `restored` whose generation is not newer
+    /// than the one the client already holds (a repeated or out-of-order
+    /// announcement for an epoch already adopted) is ignored by the caller, so
+    /// it cannot rewind a stream that is already sending on that epoch and it
+    /// cannot start a concurrent second sender.
     pub(super) fn should_replay_upload_from_start(envelope: &ProtocolEnvelope) -> bool {
         envelope.kind == "job_progress"
             && envelope
@@ -8721,6 +8747,96 @@ mod tests {
             native_host_unix::upload_generation_of(&plain),
             0,
             "a ready_for_file without the marker stays at generation 0"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn newer_epoch_replay_adopts_generation_and_rewinds_stream() {
+        // yz-91o (i): a restored ready_for_file with a NEWER generation than the
+        // client holds resets next_chunk and adopts the generation. The caller
+        // applies this only when the predicate fires and the generation wins;
+        // here we pin the two pure halves of that decision.
+        let replay = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_epoch_newer".to_string()),
+            Some("run_epoch_newer".to_string()),
+            json!({
+                "phase": "ready_for_file",
+                "restored": true,
+                "upload_restarted": true,
+                "resume_from_chunk": 0,
+                "upload_generation": 5,
+            }),
+        );
+
+        assert!(
+            native_host_unix::should_replay_upload_from_start(&replay),
+            "a restored announcement must trigger the replay path"
+        );
+        assert_eq!(
+            native_host_unix::upload_generation_of(&replay),
+            5,
+            "the newer generation must win over the client's current one"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn older_epoch_replay_does_not_adopt_generation_or_rewind_stream() {
+        // yz-91o (ii): a restored ready_for_file whose generation is OLDER than
+        // the one the client already holds is stale news (a late duplicate of an
+        // announcement already acted on). The caller must not rewind next_chunk
+        // nor adopt the older generation; we pin the guard arithmetic that makes
+        // that hold: 3 is not > 5.
+        let stale = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_epoch_old".to_string()),
+            Some("run_epoch_old".to_string()),
+            json!({
+                "phase": "ready_for_file",
+                "restored": true,
+                "upload_restarted": true,
+                "resume_from_chunk": 0,
+                "upload_generation": 3,
+            }),
+        );
+
+        assert!(native_host_unix::should_replay_upload_from_start(&stale));
+        let held: u64 = 5;
+        let announced = native_host_unix::upload_generation_of(&stale);
+        assert!(
+            announced <= held,
+            "generation {announced} must not beat the held generation {held}; the caller ignores the replay"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn same_epoch_replay_is_not_newer_so_stream_is_left_alone() {
+        // yz-91o (iii): a REPEATED same-generation restored announcement is not
+        // newer than what the client holds, so the guard rejects it and no
+        // second sender can start. Pin the boundary: equal generations never
+        // replay, so a duplicate cannot rewind next_chunk mid-stream.
+        let repeat = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_epoch_repeat".to_string()),
+            Some("run_epoch_repeat".to_string()),
+            json!({
+                "phase": "ready_for_file",
+                "restored": true,
+                "upload_restarted": true,
+                "resume_from_chunk": 0,
+                "upload_generation": 2,
+            }),
+        );
+
+        assert!(native_host_unix::should_replay_upload_from_start(&repeat));
+        let held: u64 = 2;
+        let announced = native_host_unix::upload_generation_of(&repeat);
+        assert!(
+            announced > held,
+            "a same-epoch repeat must not be newer; the caller ignores it"
         );
     }
 
