@@ -21,13 +21,18 @@ section=""
 
 # Walk the unified diff of CHANGELOG.md and track which ## heading each added
 # line falls under. Blank lines and headings themselves are not "additions".
+# Context lines (-U0 still emits the hunk header's pre-image anchor) are not
+# needed; only + lines are additions.
 while IFS= read -r line; do
   case "$line" in
     '+++'* | '---'*)
       # File header; nothing to track.
       ;;
     '@@'*)
-      changed=0
+      # Position unknown at hunk start; the next '## ' added or context line
+      # establishes it. -U0 drops context, so also accept ' ' lines in case
+      # callers raise the context level.
+      section=""
       ;;
     '+'*)
       line="${line#+}"
@@ -42,6 +47,12 @@ while IFS= read -r line; do
         echo "CHANGELOG.md: added line under '${section:-<no section>}' (must be under '## [Unreleased]'):" >&2
         echo "  + $line" >&2
         changed=1
+      fi
+      ;;
+    ' '*)
+      line="${line# }"
+      if [[ "$line" == '## '* ]]; then
+        section="$line"
       fi
       ;;
   esac

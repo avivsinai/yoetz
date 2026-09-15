@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- CI guard: a PR's CHANGELOG.md additions must land under `## [Unreleased]`
+  (`yz-lc1`). A pull_request-only job diffs CHANGELOG.md against the base and
+  fails when any added line falls under an already-released heading, printing
+  the offending line and its section — release notes come from Unreleased
+  only, so a misfiled entry would silently vanish from the next release
+  (observed on the yz-eld merge, fixed by #538). Release PRs are exempt.
 ### Fixed
 - ChatGPT rate-limit cooldown arming is now centralized inside `failJob`, the
   single terminal emitter (`yz-tpo`). The yz-er5 contract — any typed
