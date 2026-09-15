@@ -275,9 +275,17 @@ export function rateLimitedHandoff(root = document) {
     collectManualHandoffSurfaceText(surface, chunks);
   }
   const surfaceText = normalizeText(chunks.join("\n"));
-  const bodyText = hasTranscript
-    ? ""
-    : normalizeText(root?.body?.innerText ?? root?.body?.textContent ?? "");
+  // yz-2fz: The no-transcript body fallback exists for portal-div modals that
+  // are not [role=dialog]/[role=alert]/[aria-live]. Raw body.innerText carried
+  // the whole page shell, so a sidebar conversation title containing "rate
+  // limit" classified a healthy page as rate_limited with no wall present.
+  // The fallback must never read navigation/history regions, so it goes
+  // through the shell-skipping collector (nav/aside/header/footer/sidebar,
+  // conversation turns, and editable nodes are excluded) while portal modals
+  // appended to body still surface their text.
+  const bodyChunks = [];
+  if (!hasTranscript) collectManualHandoffSurfaceText(root?.body, bodyChunks);
+  const bodyText = normalizeText(bodyChunks.join("\n"));
   const text = normalizeText(`${surfaceText}\n${bodyText}`);
   const handoff = classifyManualHandoff({
     url: String(win.location?.href ?? ""),
