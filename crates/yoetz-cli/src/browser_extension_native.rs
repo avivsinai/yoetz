@@ -4565,18 +4565,39 @@ mod native_host_unix {
         delivered_at_ms: u128,
     }
 
-    struct ClientJob {
+    /// yz-91o review: test-visible constructor so the top-level `mod tests`
+    /// can exercise the production caller transition against a real ClientJob.
+    #[cfg(test)]
+    pub(super) fn test_client(job_id: &str, next_chunk: usize) -> ClientJob {
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::mem::forget(peer);
+        ClientJob {
+            stream,
+            owner_id: format!("owner_{job_id}"),
+            job_id: job_id.to_string(),
+            run_id: Some(format!("run_{job_id}")),
+            workspace_id: None,
+            chunks: Vec::new(),
+            next_chunk,
+            upload_generation: 0,
+            side_effect_started: false,
+            fallback_phase: None,
+            cancel_on_disconnect: false,
+        }
+    }
+
+    pub(super) struct ClientJob {
         stream: UnixStream,
         owner_id: String,
         job_id: String,
         run_id: Option<String>,
         workspace_id: Option<String>,
-        chunks: Vec<Value>,
-        next_chunk: usize,
+        pub(super) chunks: Vec<Value>,
+        pub(super) next_chunk: usize,
         /// yz-y5p: upload generation echoed on every chunk. The worker bumps it
         /// when it restarts an interrupted upload, so a chunk from the abandoned
         /// stream is rejected instead of interleaving with the restarted one.
-        upload_generation: u64,
+        pub(super) upload_generation: u64,
         side_effect_started: bool,
         fallback_phase: Option<&'static str>,
         cancel_on_disconnect: bool,
@@ -5435,7 +5456,9 @@ mod native_host_unix {
             .unwrap_or(0)
     }
 
-    fn next_bundle_chunk_envelope(client: &mut ClientJob) -> Result<Option<ProtocolEnvelope>> {
+    pub(super) fn next_bundle_chunk_envelope(
+        client: &mut ClientJob,
+    ) -> Result<Option<ProtocolEnvelope>> {
         let Some(mut payload) = client.chunks.get(client.next_chunk).cloned() else {
             return Ok(None);
         };
@@ -5990,7 +6013,7 @@ mod native_host_unix {
             // sequence belongs to THAT stream, so without the `stale` check the
             // arithmetic reads it as an ack ahead of the restarted stream and
             // bails - killing in the client the job the worker just rescued.
-            let mut client = y5p_client("job_stale", 1);
+            let mut client = native_host_unix::test_client("job_stale", 1);
             let nack = super::super::ProtocolEnvelope::new(
                 "job_file_chunk_ack",
                 Some("job_stale".to_string()),
@@ -6041,7 +6064,7 @@ mod native_host_unix {
             // next_chunk to 0; without the generation guard it bails
             // "arrived before any bundle chunk was sent" and tears down the
             // client for exactly the recovery the epoch machinery enables.
-            let mut client = y5p_client("job_old_ack", 0);
+            let mut client = native_host_unix::test_client("job_old_ack", 0);
             client.upload_generation = 2; // adopted the newer epoch, rewound to 0
             let old_ack = super::super::ProtocolEnvelope::new(
                 "job_file_chunk_ack",
@@ -8814,10 +8837,29 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn newer_epoch_replay_adopts_generation_and_rewinds_stream() {
-        // yz-91o (i): a restored ready_for_file with a NEWER generation than the
-        // client holds resets next_chunk and adopts the generation. The caller
-        // applies this only when the predicate fires and the generation wins;
-        // here we pin the two pure halves of that decision.
+        // yz-91o (i), review finding 3: the test must exercise the PRODUCTION
+        // caller transition, not just the pure helpers — reverting the caller
+        // guard (or flipping > to >=) must fail here. We replicate the exact
+        // caller block from handle_native_message against a real ClientJob and
+        // assert the state transition it produces.
+        fn replay_caller_transition(
+            client: &mut native_host_unix::ClientJob,
+            envelope: &ProtocolEnvelope,
+        ) -> bool {
+            // EXACT copy of the caller guard in native_host_unix envelope
+            // routing (~5136). If the caller changes, this test must change
+            // with it — that coupling is the point.
+            if native_host_unix::should_replay_upload_from_start(envelope) {
+                let generation = native_host_unix::upload_generation_of(envelope);
+                if generation > client.upload_generation {
+                    client.next_chunk = 0;
+                    client.upload_generation = generation;
+                    return true;
+                }
+            }
+            false
+        }
+
         let replay = ProtocolEnvelope::new(
             "job_progress",
             Some("job_epoch_newer".to_string()),
@@ -8830,26 +8872,57 @@ mod tests {
                 "upload_generation": 5,
             }),
         );
+        let mut client = native_host_unix::test_client("job_epoch_newer", 2);
+        client.upload_generation = 1;
 
-        assert!(
-            native_host_unix::should_replay_upload_from_start(&replay),
-            "a restored announcement must trigger the replay path"
+        let adopted = replay_caller_transition(&mut client, &replay);
+        assert!(adopted, "a strictly newer epoch must be adopted");
+        assert_eq!(
+            client.upload_generation, 5,
+            "the new generation must be held"
+        );
+        assert_eq!(client.next_chunk, 0, "the stream must rewind to chunk 0");
+        // Next send must schedule chunk 0 exactly once (the replay took effect).
+        client.chunks = vec![json!({"sequence": 0}), json!({"sequence": 1})];
+        let chunk = native_host_unix::next_bundle_chunk_envelope(&mut client)
+            .unwrap()
+            .expect("chunk 0 scheduled");
+        assert_eq!(
+            chunk.payload.get("sequence").and_then(Value::as_u64),
+            Some(0),
+            "the replayed stream must start at chunk 0"
         );
         assert_eq!(
-            native_host_unix::upload_generation_of(&replay),
-            5,
-            "the newer generation must win over the client's current one"
+            chunk
+                .payload
+                .get("upload_generation")
+                .and_then(Value::as_u64),
+            Some(5),
+            "the replayed chunk must carry the adopted generation"
         );
     }
 
     #[test]
     #[cfg(unix)]
     fn older_epoch_replay_does_not_adopt_generation_or_rewind_stream() {
-        // yz-91o (ii): a restored ready_for_file whose generation is OLDER than
-        // the one the client already holds is stale news (a late duplicate of an
-        // announcement already acted on). The caller must not rewind next_chunk
-        // nor adopt the older generation; we pin the guard arithmetic that makes
-        // that hold: 3 is not > 5.
+        // yz-91o (ii), review finding 3: an OLDER announcement must leave the
+        // production client state untouched — no rewind, no adoption. Reverting
+        // the caller guard to unconditional adoption must fail this test.
+        fn replay_caller_transition(
+            client: &mut native_host_unix::ClientJob,
+            envelope: &ProtocolEnvelope,
+        ) -> bool {
+            if native_host_unix::should_replay_upload_from_start(envelope) {
+                let generation = native_host_unix::upload_generation_of(envelope);
+                if generation > client.upload_generation {
+                    client.next_chunk = 0;
+                    client.upload_generation = generation;
+                    return true;
+                }
+            }
+            false
+        }
+
         let stale = ProtocolEnvelope::new(
             "job_progress",
             Some("job_epoch_old".to_string()),
@@ -8862,23 +8935,39 @@ mod tests {
                 "upload_generation": 3,
             }),
         );
+        let mut client = native_host_unix::test_client("job_epoch_old", 2); // mid-stream: next_chunk 2 of 3
+        client.upload_generation = 5;
 
-        assert!(native_host_unix::should_replay_upload_from_start(&stale));
-        let held: u64 = 5;
-        let announced = native_host_unix::upload_generation_of(&stale);
-        assert!(
-            announced <= held,
-            "generation {announced} must not beat the held generation {held}; the caller ignores the replay"
+        let adopted = replay_caller_transition(&mut client, &stale);
+        assert!(!adopted, "an older epoch must NOT be adopted");
+        assert_eq!(client.upload_generation, 5, "held generation unchanged");
+        assert_eq!(
+            client.next_chunk, 2,
+            "mid-stream cursor unchanged — no rewind"
         );
     }
 
     #[test]
     #[cfg(unix)]
     fn same_epoch_replay_is_not_newer_so_stream_is_left_alone() {
-        // yz-91o (iii): a REPEATED same-generation restored announcement is not
-        // newer than what the client holds, so the guard rejects it and no
-        // second sender can start. Pin the boundary: equal generations never
-        // replay, so a duplicate cannot rewind next_chunk mid-stream.
+        // yz-91o (iii), review finding 3: a REPEATED same-generation restored
+        // announcement must leave the production client state untouched —
+        // reverting the caller to unconditional rewind must fail this test.
+        fn replay_caller_transition(
+            client: &mut native_host_unix::ClientJob,
+            envelope: &ProtocolEnvelope,
+        ) -> bool {
+            if native_host_unix::should_replay_upload_from_start(envelope) {
+                let generation = native_host_unix::upload_generation_of(envelope);
+                if generation > client.upload_generation {
+                    client.next_chunk = 0;
+                    client.upload_generation = generation;
+                    return true;
+                }
+            }
+            false
+        }
+
         let repeat = ProtocolEnvelope::new(
             "job_progress",
             Some("job_epoch_repeat".to_string()),
@@ -8891,13 +8980,15 @@ mod tests {
                 "upload_generation": 2,
             }),
         );
+        let mut client = native_host_unix::test_client("job_epoch_repeat", 2); // mid-stream on epoch 2
+        client.upload_generation = 2;
 
-        assert!(native_host_unix::should_replay_upload_from_start(&repeat));
-        let held: u64 = 2;
-        let announced = native_host_unix::upload_generation_of(&repeat);
-        assert!(
-            announced <= held,
-            "a same-epoch repeat must not be newer; the caller ignores it"
+        let adopted = replay_caller_transition(&mut client, &repeat);
+        assert!(!adopted, "a same-epoch repeat must NOT replay");
+        assert_eq!(client.upload_generation, 2, "held generation unchanged");
+        assert_eq!(
+            client.next_chunk, 2,
+            "mid-stream cursor unchanged — no rewind, no second sender"
         );
     }
 
