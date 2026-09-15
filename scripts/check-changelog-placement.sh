@@ -4,6 +4,11 @@
 # an entry misfiled under an already-released section silently disappears from
 # the next release's notes (observed on the yz-eld merge, fixed by #538).
 #
+# Known false positive: any added line under a released heading trips this,
+# including a legitimate typo fix in old release notes. Acceptable: the check
+# is advisory (not a required check), so a false positive only surfaces the
+# edit for review.
+#
 # Usage: check-changelog-placement.sh <base-sha>
 # Exempt (callers skip before invoking): release PRs whose title or head
 # commit message starts with chore(release): — release.sh moves the Unreleased
