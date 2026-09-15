@@ -17,9 +17,21 @@
 
 const REDACTED_JWT = "[REDACTED_JWT]";
 const JWT_SHAPE = /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\./g;
-// Any attribute VALUE carrying a JWT prefix or a secret= key is dropped.
-const SECRET_VALUE_SHAPE =
-  /eyJ[A-Za-z0-9_-]{20,}\.|(^|[?&;\s])(token|access_token|id_token|refresh_token|authorization|session|secret|api[_-]?key)\s*[=:]/i;
+// Any attribute VALUE carrying a JWT prefix or a secret-bearing key is dropped.
+// `=` always assigns, so it needs no qualification. `:` is ambiguous - it also
+// separates ordinary prose ("Session: today" in an aria-label, "Secret: hidden"
+// in a chat title) - so a colon counts only when what follows looks like a
+// serialized value: a quote, a brace, or a JWT prefix. Without that qualifier the
+// denylist drops benign labels, which costs exactly the diagnostic evidence a
+// capture exists to preserve. (`yz-y5p`, folded in from the yz-7iu review.)
+const SECRET_KEYS = "token|access_token|id_token|refresh_token|authorization|session|secret|api[_-]?key";
+const SECRET_VALUE_SHAPE = new RegExp(
+  `eyJ[A-Za-z0-9_-]{20,}\\.`
+  + `|(^|[?&;\\s])(${SECRET_KEYS})\\s*=`
+  + `|(^|[?&;\\s])(${SECRET_KEYS})\\s*:\\s*["'{[]`
+  + `|(^|[?&;\\s])(${SECRET_KEYS})\\s*:\\s*eyJ`,
+  "i"
+);
 // Form controls keep their element (tree structure) but lose their value.
 const STRIP_VALUE_SELECTOR = "input, textarea, select";
 // Bodies stripped wholesale: heavy, sensitive, or non-serializable content.
