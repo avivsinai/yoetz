@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- Browser extension/CLI: `yoetz browser extension dump-conversation` — a
+  read-only recovery capture, sibling of `dump-picker` (`yz-7iu`). It
+  serializes the ChatGPT conversation container through the extension native
+  channel with the same baked hidden-state treatment as the picker
+  serializer, writes the HTML to `--path`, and prints the extractor's view
+  (chars + method) next to the raw innerText length so extractor drift is
+  visible at capture time. Ownership-checked like every capture command and
+  refuses a live job unless `--allow-live-job` (`yz-7iu`).
 ### Fixed
 - Upload interrupted by a service-worker restart now restarts its chunk stream
   instead of terminating the job. The `ChunkAssembler` lives only in memory, so a
@@ -25,16 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   so benign prose such as an `aria-label="Session: today"` is no longer dropped.
   Over-broad redaction costs exactly the diagnostic evidence a capture exists to
   preserve. (`yz-y5p`)
-### Added
-- Browser extension/CLI: `yoetz browser extension dump-conversation` — a
-  read-only recovery capture, sibling of `dump-picker` (`yz-7iu`). It
-  serializes the ChatGPT conversation container through the extension native
-  channel with the same baked hidden-state treatment as the picker
-  serializer, writes the HTML to `--path`, and prints the extractor's view
-  (chars + method) next to the raw innerText length so extractor drift is
-  visible at capture time. Ownership-checked like every capture command and
-  refuses a live job unless `--allow-live-job` (`yz-7iu`).
-### Fixed
+
 - Browser extension: DOM captures are sanitized before they reach disk.
   Both `dump-picker` and `dump-conversation` now run a shared
   `capture-sanitizer.js` pass: script/style/template/noscript/iframe/object/
