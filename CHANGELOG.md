@@ -7,6 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- Dependencies: bump rustls past RUSTSEC-2026-0285.
 - ChatGPT upload: `hasUploadPending` no longer scans the whole document for
   the words uploading/attaching/processing/scanning. It scanned `document`
   using subtree text with `div` in the candidate set, so one occurrence of any
