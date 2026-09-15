@@ -751,13 +751,10 @@ async function startJob(message) {
   }
   if (prepared.manual_handoff) {
     postNative(progress(job, "manual_handoff", prepared.manual_handoff));
-    // yz-83b: Arm the cooldown for rate_limited at prepare_job too — the modal
-    // can mount on a freshly loaded tab before any send. A modal on a fresh tab
-    // means the account is already walled; do NOT dismiss or retry — fail
-    // closed and let the cooldown clear.
-    if (prepared.manual_handoff?.state === "rate_limited") {
-      await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
-    }
+    // yz-83b: A rate_limited modal at prepare_job means the account is already
+    // walled; do NOT dismiss or retry — fail closed and let the cooldown
+    // clear. yz-tpo: the cooldown itself is armed inside failJob, the single
+    // terminal emitter — no scattered arm here anymore.
     await failJob(job, "manual_handoff", prepared.manual_handoff.message, {
       state: prepared.manual_handoff.state,
       phase: "upload",
@@ -1561,17 +1558,11 @@ async function handlePollerError(job, error) {
     return;
   }
   const detail = errorContextForJob(job, error);
-  // yz-er5: Any typed rate_limited error from a content-script phase
-  // (model_selection, upload, send) arms the profile cooldown before the job
-  // fails, so the next job_start is refused immediately instead of opening a
-  // tab against an already-walled account.
-  if (code === "rate_limited") {
-    try {
-      await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
-    } catch {
-      // Best-effort: the cooldown is a guard, not a correctness requirement.
-    }
-  }
+  // yz-er5: Any typed rate_limited error from a content-script phase arms the
+  // profile cooldown before the job fails, so the next job_start is refused
+  // immediately. yz-tpo: that arm lives inside failJob now — this call ends
+  // there, so the arm happens on this path too (including the early-return
+  // branches above that previously bypassed it).
   await failJob(job, code, jobErrorMessage(job, error, code, detail), detail);
 }
 
@@ -3749,8 +3740,14 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
       postNative(progress(job, "manual_handoff", extraction.manual_handoff));
       // A recognized rate_limited DOM outcome is the same website throttle seen
       // through the page: arm the profile-wide shared cooldown so website
-      // reads, new tab creation, and render refresh all pause. The affected
-      // job keeps its existing terminal handling (below).
+      // reads, new tab creation, and render refresh all pause.
+      // yz-tpo: this is an OBSERVATION site, not a terminal — the yz-83b
+      // dismiss-success path below continues the wait loop without ever
+      // reaching failJob, so failJob's arm alone would leave the cooldown
+      // unarmed when a dismiss salvages the answer (the wall stays live for
+      // the next job_start). Arm here exactly as main did, before the dismiss
+      // attempt; the later failJob arm on the failed path is idempotent under
+      // yz-esc (a trip inside an active cooldown holds the escalation level).
       if (extraction.manual_handoff?.state === "rate_limited") {
         await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
       }
@@ -5567,6 +5564,39 @@ async function postTerminalJob(job, envelope, { status, phase } = {}) {
 }
 
 async function failJob(job, code, message, detail = {}) {
+  // yz-tpo: failJob is the single terminal emitter, so it is the one place
+  // that arms the rate-limit cooldown. The yz-er5 contract is "any typed
+  // rate_limited at any phase arms the profile-wide cooldown": arming here
+  // (before the early returns) covers every path that lands a rate-limited
+  // terminal — including handlePollerError's early branches (pending
+  // content-script recovery, already-terminal job) that returned before the
+  // old scattered arm could run; that is the likely path for run fd4a47
+  // (typed rate_limited at model_selection with no cooldown armed), though
+  // its exact emit path was not reproducible from code. The signal
+  // is the rate-limit signal only, in both shapes it arrives: the typed
+  // content-script error code, and the manual-handoff state field (copied
+  // from the prepare_job check). NEVER arm for rate_limit_cooldown_active or
+  // tab_pacing_active — those are refusals we generated, not a wall; arming
+  // on them would make every refusal re-arm and escalate itself.
+  const handoffState = detail?.state ?? null;
+  if (code === "rate_limited"
+      || (code === "manual_handoff" && handoffState === "rate_limited")) {
+    // yz-tpo observability: report what the arm actually wrote on the terminal
+    // payload, so the next rate_limited terminal is diagnosable from the
+    // receipt instead of a trace (run fd4a47 showed a typed rate_limited with
+    // cooldown_until_ms null). When the code is rate_limited but no arm
+    // happened (should be impossible after this change), say so explicitly.
+    try {
+      await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
+      const armedState = await readBackendApiGateState(adapterRecipeKey(job));
+      detail.cooldown_until_ms = armedState.throttle_until_ms || undefined;
+    } catch {
+      // Best-effort: the cooldown is a guard, not a correctness requirement.
+      if (code === "rate_limited") {
+        detail.cooldown_armed = false;
+      }
+    }
+  }
   // Cancellation owns the terminal outcome once its in-memory fence is set.
   // Do not mutate status or replace the cancellation envelope from a poller
   // error that resumes after the cancellation request.

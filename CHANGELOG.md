@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- ChatGPT rate-limit cooldown arming is now centralized inside `failJob`, the
+  single terminal emitter (`yz-tpo`). The yz-er5 contract — any typed
+  `rate_limited` arms the profile-wide cooldown — was previously enforced by
+  three scattered call sites (prepare_job manual handoff, poller error,
+  wait_response manual handoff), and terminal paths that bypassed those sites
+  could emit a typed `rate_limited` with `cooldown_until_ms` still null (the
+  likely path for run fd4a47; its exact emit path was not reproducible from
+  code). The arm now runs in `failJob` before its early returns, keyed on
+  the rate-limit signal in both shapes it arrives (`code === "rate_limited"`
+  or a `manual_handoff` terminal with `state: "rate_limited"`) — never for
+  `rate_limit_cooldown_active` or `tab_pacing_active` refusals, which would
+  otherwise re-arm and escalate themselves. The rate-limited terminal payload
+  now reports `cooldown_until_ms` (or `cooldown_armed: false` when the arm
+  fails), so the next occurrence is diagnosable from the receipt instead of a
+  trace. The wait_response manual-handoff arm site is kept so the yz-83b
+  modal-dismissed-successfully continuation (which never reaches `failJob`)
+  still arms.
 
 ## [0.5.75] - 2026-09-15
 ### Fixed
