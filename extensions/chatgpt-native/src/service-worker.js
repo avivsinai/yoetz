@@ -2064,20 +2064,39 @@ async function handleTargetedReconnect(message, job) {
     await persistJob(job);
     if (job.status === "waiting_response") {
       scheduleNativeReconnectResume(job);
-    } else {
+    } else if (
+      // yz-91o review finding (SHOULD-FIX): the eligibility check ran BEFORE
+      // the awaits above. A pre-attachment job could cross the attachment
+      // boundary while this handler was suspended (an in-flight final chunk
+      // transitions it to file_received), and replaying upload readiness
+      // after that would lure the client into an unexpected_chunk failure of
+      // the rescued job. Revalidate: only waiting_for_file is replayable
+      // here (receiving_file is excluded at the eligibility gate and
+      // anything at/past file_received must not restart).
+      job.status === "waiting_for_file"
+      && jobContinuationIsLive(job, job.continuation_epoch)
+    ) {
       // yz-91o (fix B): a targeted reconnect reaching a pre-attachment job is
       // also a fresh epoch — same replay contract as worker-restart recovery:
       // the client must re-learn the authoritative generation or an older
-      // announcement can pass for current state. Persist BEFORE announcing so
-      // a crash here cannot announce an epoch the worker never recorded.
-      job.upload_generation = Number(job.upload_generation ?? 0) + 1;
+      // announcement can pass for current state. The epoch is allocated ONCE
+      // and the exact allocated value is what persistence and the
+      // announcement carry, so an overlapping reconnect (review BLOCKER)
+      // can only publish an epoch that a completed persistence actually
+      // recorded; the continuation-live re-check above plus the shared
+      // continuation fence drops a superseded handler before it announces.
+      const allocatedGeneration = Number(job.upload_generation ?? 0) + 1;
+      job.upload_generation = allocatedGeneration;
       await persistJob(job);
+      if (!jobContinuationIsLive(job, job.continuation_epoch)) {
+        return;
+      }
       postNative(progress(job, "ready_for_file", {
         tab_id: job.tab_id,
         restored: true,
         upload_restarted: true,
         resume_from_chunk: 0,
-        upload_generation: job.upload_generation,
+        upload_generation: allocatedGeneration,
         message: `${adapterForJob(job).displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
       }));
     }
@@ -2915,16 +2934,21 @@ async function recoverJobs(message) {
     // yz-91o (fix B): recoverJobs readiness is a replay too — re-announce the
     // authoritative epoch so a client that missed the original restart marker
     // (or restarted its native process) still learns the current generation.
-    // Persist the bump BEFORE announcing so a crash here cannot announce an
-    // epoch the worker never persisted.
-    job.upload_generation = Number(job.upload_generation ?? 0) + 1;
+    // The epoch is allocated ONCE and the exact allocated value is both what
+    // persistence records and what the announcement carries (review BLOCKER:
+    // re-reading the mutable job field after the persist could publish an
+    // epoch a later, superseded persist never recorded). jobs is a Map keyed
+    // by job_id, so the for-of iteration cannot observe the same job twice
+    // within one recoverJobs pass.
+    const allocatedGeneration = Number(job.upload_generation ?? 0) + 1;
+    job.upload_generation = allocatedGeneration;
     await persistJob(job);
     postNative(progress(job, "ready_for_file", {
       tab_id: job.tab_id,
       restored: true,
       upload_restarted: true,
       resume_from_chunk: 0,
-      upload_generation: job.upload_generation,
+      upload_generation: allocatedGeneration,
       message: `${adapter.displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
     }));
   }
@@ -3123,7 +3147,12 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
       // new one. The marker is the ONLY signal the client restarts on. yz-91o:
       // now unconditional for every restored pre-attachment job.
       chunks.discard(job.job_id);
-      job.upload_generation = Number(job.upload_generation ?? 0) + 1;
+      // yz-91o review (BLOCKER): allocate the epoch once and publish the exact
+      // allocated value, not a re-read of the mutable job field after the
+      // persist — an overlapping restore of the same job could otherwise
+      // publish a generation its completed persistence never recorded.
+      const allocatedGeneration = Number(job.upload_generation ?? 0) + 1;
+      job.upload_generation = allocatedGeneration;
       job.status = "waiting_for_file";
       await persistJob(job);
       postNative(progress(job, "ready_for_file", {
@@ -3131,7 +3160,7 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
         restored: true,
         upload_restarted: true,
         resume_from_chunk: 0,
-        upload_generation: job.upload_generation,
+        upload_generation: allocatedGeneration,
         message: `${adapterForJob(job).displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
       }));
       continue;
