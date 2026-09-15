@@ -1,8 +1,8 @@
 // Lint config for the chatgpt-native extension sources.
 // Scope: no-undef only — this exists to stop undefined identifiers reaching
 // runtime (yz-2mf: `selectionFailure(state, ...)` with no `state` in scope).
-// No stylistic rules, no formatting, no opinionated preset: `linterOptions`
-// disables every recommended rule category, then `no-undef` alone is enabled.
+// No preset is extended, so no other rule is active; `no-undef` is the only
+// rule enabled.
 import globals from "globals";
 
 export default [
