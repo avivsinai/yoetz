@@ -6,6 +6,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- Browser extension/CLI: active-job discovery for operators who lost the run
+  id. The extension answers a read-only `list_jobs` control message with its
+  non-terminal jobs — job_id, run_id, recipe, status/phase, started_at
+  (epoch ms + ISO), tab_id, conversation_id when known, and the exact
+  `inspect` command for each. `yoetz browser extension status` now reports
+  the newest connected instance's active jobs as `active_jobs`, and
+  `yoetz browser extension inspect` without `--run-id` (or with `--list`)
+  prints the listing and exits 2 so scripts never mistake it for a page
+  inspection. The listing never touches a tab and never mutates job state.
+  (`yz-eld`)
 ### Fixed
 - ChatGPT rate-limit cooldown arming is now centralized inside `failJob`, the
   single terminal emitter (`yz-tpo`). The yz-er5 contract — any typed
@@ -38,16 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [0.5.74] - 2026-09-15
 ### Added
-- Browser extension/CLI: active-job discovery for operators who lost the run
-  id. The extension answers a read-only `list_jobs` control message with its
-  non-terminal jobs — job_id, run_id, recipe, status/phase, started_at
-  (epoch ms + ISO), tab_id, conversation_id when known, and the exact
-  `inspect` command for each. `yoetz browser extension status` now reports
-  the newest connected instance's active jobs as `active_jobs`, and
-  `yoetz browser extension inspect` without `--run-id` (or with `--list`)
-  prints the listing and exits 2 so scripts never mistake it for a page
-  inspection. The listing never touches a tab and never mutates job state.
-  (`yz-eld`)
 - ChatGPT tab pacing: per-profile pacing of automated chatgpt.com tab
   creation. A job_start that would exceed the limits is refused immediately
   with a typed `tab_pacing_active` error — `reason` (`min_gap` or
