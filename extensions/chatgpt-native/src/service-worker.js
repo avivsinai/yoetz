@@ -2540,6 +2540,7 @@ async function handleDumpPickerHtml(message) {
       service_worker_build: serviceWorkerBuild(),
       html: captured.html,
       bytes: captured.bytes,
+      redactions: captured.redactions ?? 0,
       opened_by_us: captured.opened_by_us === true,
       closed_after_dump: captured.closed_after_dump,
       tab_id: captured.tab_id,
@@ -2708,6 +2709,7 @@ async function handleDumpConversation(message) {
       extracted_text: captured.extracted_text,
       extraction_method: captured.extraction_method,
       extracted_chars: captured.extracted_chars,
+      redactions: captured.redactions ?? 0,
       raw_inner_text_chars: captured.raw_inner_text_chars,
       tab_id: captured.tab_id,
       url: captured.url

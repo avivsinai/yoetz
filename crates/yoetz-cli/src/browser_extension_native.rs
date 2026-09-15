@@ -2149,6 +2149,10 @@ fn finalize_conversation_capture(
         .get("raw_inner_text_chars")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    let redactions = payload
+        .get("redactions")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let extraction_method = payload
         .get("extraction_method")
         .and_then(Value::as_str)
@@ -2160,12 +2164,18 @@ fn finalize_conversation_capture(
     eprintln!(
         "extracted_text: {extracted_chars} chars ({extraction_method}); raw innerText: {raw_inner_text_chars} chars"
     );
+    if redactions > 0 {
+        eprintln!(
+            "warning: {redactions} JWT-shaped string(s) redacted as [REDACTED_JWT] in the capture"
+        );
+    }
     Ok(json!({
         "status": "ok",
         "transport": TRANSPORT_NAME,
         "recipe": recipe.as_str(),
         "dump_conversation": out_path.display().to_string(),
         "bytes": bytes,
+        "redactions": redactions,
         "conversation_id": payload.get("conversation_id"),
         "extraction_method": extraction_method,
         "extracted_chars": extracted_chars,

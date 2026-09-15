@@ -1,9 +1,10 @@
 // picker-serializer.js — shared ChatGPT model-picker menu serializer.
 //
 // Clones the open [role="menu"] (falling back to the first [role="menu"]),
-// bakes computed inert/display:none/visibility:hidden state inline, strips
-// script/svg/use/canvas bodies, and returns outerHTML. The output is a
-// snapshot fixture consumed by tests/chatgpt-picker-reader.test.js (jsdom).
+// bakes computed inert/display:none/visibility:hidden state inline, and
+// returns sanitized outerHTML (capture-sanitizer.js, shared with the
+// conversation serializer — yz-7iu). The output is a snapshot fixture
+// consumed by tests/chatgpt-picker-reader.test.js (jsdom).
 //
 // One serializer, two callers:
 //   - scripts/capture-chatgpt-picker.mjs (raw CDP Runtime.evaluate)
@@ -13,6 +14,8 @@
 // reader's attribute+inline-style visibility predicate cannot see
 // stylesheet-driven hiding. See docs/design/chatgpt-picker-reader.md,
 // "Snapshot fixtures replace hand-built fakes" and the "jsdom boundary".
+
+import { redactSecrets, sanitizeCaptureClone } from "./capture-sanitizer.js";
 
 export function serializePickerMenu(root = document) {
   // The open surface is a [role="menu"] with data-state="open", falling back
@@ -84,13 +87,11 @@ export function serializePickerMenu(root = document) {
   }
   sync(live, clone);
 
-  // Strip the bodies of <script>, <svg>, <use>, <canvas> in the clone. The
-  // element tag is kept so tree structure (and thus selector parity with live)
-  // is preserved; only their heavy/sensitive content is removed.
-  const strip = clone.querySelectorAll("script, svg, use, canvas");
-  for (const node of strip) {
-    while (node.firstChild) node.removeChild(node.firstChild);
-  }
-
-  return clone.outerHTML;
+  // Shared redaction pass (see capture-sanitizer.js): strip sensitive bodies,
+  // non-allowlisted attributes, and form-control values, then replace any
+  // surviving JWT-shaped string and report the count.
+  sanitizeCaptureClone(clone);
+  const { html, redactions } = redactSecrets(clone.outerHTML);
+  serializePickerMenu.lastRedactions = redactions;
+  return html;
 }

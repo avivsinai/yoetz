@@ -2,14 +2,20 @@
 // serializer for the dump-conversation capture command (yz-7iu).
 //
 // Sibling of picker-serializer.js: clones the main conversation container,
-// bakes computed inert/display:none/visibility:hidden state inline, strips
-// script/svg/use/canvas bodies, and returns outerHTML. Read-only: it never
-// mutates the live page (all edits happen on the clone).
+// bakes computed inert/display:none/visibility:hidden state inline, and
+// returns sanitized outerHTML. Read-only: it never mutates the live page
+// (all edits happen on the clone).
 //
+// Sanitization lives in capture-sanitizer.js and is shared with the picker
+// serializer: a conversation dump serializes <main> (or body on a degraded
+// page) and can carry session secrets — hidden input values, template
+// fragments, style blocks, data-* token attributes, JWT-shaped strings.
 // The output is both an operator recovery artifact (a rendered answer on a
 // preserved tab that the extractor under-reads) and an extractor-drift
 // fixture: the same page is reported through the current extractor next to
 // the raw innerText length so the two can be compared.
+
+import { redactSecrets, sanitizeCaptureClone } from "./capture-sanitizer.js";
 
 export function serializeConversation(root = document) {
   // The conversation surface: ChatGPT renders the transcript inside <main>
@@ -72,13 +78,11 @@ export function serializeConversation(root = document) {
   }
   sync(live, clone);
 
-  // Strip the bodies of <script>, <svg>, <use>, <canvas> in the clone. The
-  // element tag is kept so tree structure is preserved; only their
-  // heavy/sensitive content is removed.
-  const strip = clone.querySelectorAll("script, svg, use, canvas");
-  for (const node of strip) {
-    while (node.firstChild) node.removeChild(node.firstChild);
-  }
-
-  return clone.outerHTML;
+  // Shared redaction pass (see capture-sanitizer.js): strip sensitive bodies,
+  // non-allowlisted attributes, and form-control values, then replace any
+  // surviving JWT-shaped string and report the count.
+  sanitizeCaptureClone(clone);
+  const { html, redactions } = redactSecrets(clone.outerHTML);
+  serializeConversation.lastRedactions = redactions;
+  return html;
 }
