@@ -957,23 +957,22 @@ async function acceptFileChunk(message) {
   if (!jobContinuationIsLive(job, continuationEpoch)) {
     return;
   }
-  if (!["waiting_for_file", "receiving_file"].includes(job.status)) {
-    await failJob(job, "unexpected_chunk", `job ${job.job_id} is not accepting file chunks in status ${job.status}`, {
-      phase: "upload",
-      side_effect_started: Boolean(job.tab_id)
-    });
-    return;
-  }
-
-  // yz-y5p: after an upload restart the job carries a bumped upload_generation
-  // and the client echoes it on every chunk. A chunk from the pre-restart stream
-  // therefore arrives with a stale generation and is rejected rather than
-  // interleaving with the restarted stream. Chunks with no generation are the
-  // pre-yz-y5p wire shape and are accepted only while the job has never been
-  // restarted, so an older client keeps working but cannot corrupt a restart.
+  // yz-91o (fix A): the stale-generation check MUST precede the phase check.
+  // After a restart rescues the job into a later phase (file_received,
+  // uploading_file, waiting_response), a late chunk from the abandoned
+  // generation used to hit the "unexpected_chunk" failJob below and kill the
+  // rescued job — the exact job the restart exists to save. Abandoned-stream
+  // chunks are EXPECTED artifacts of a restart and are always harmless:
+  // classify and drop them first, whatever phase the job is in now. A chunk
+  // with NO generation is the pre-yz-y5p wire shape and only ever valid while
+  // the job has never been restarted (upload_generation 0); once any restart
+  // has happened, a generation-less chunk is stale by definition.
   const jobUploadGeneration = Number(job.upload_generation ?? 0);
   const chunkUploadGeneration = Number(message.payload?.upload_generation ?? 0);
-  if (chunkUploadGeneration < jobUploadGeneration) {
+  if (
+    chunkUploadGeneration < jobUploadGeneration
+    || (message.payload?.upload_generation === undefined && jobUploadGeneration > 0)
+  ) {
     // A late chunk from the stream the restart abandoned. This is the EXPECTED
     // artifact of an upload restart, not an error: the client was mid-flight when
     // the worker re-emitted ready_for_file. Failing here would kill exactly the
@@ -994,6 +993,13 @@ async function acceptFileChunk(message) {
         chunk_upload_generation: chunkUploadGeneration
       }
     }));
+    return;
+  }
+  if (!["waiting_for_file", "receiving_file"].includes(job.status)) {
+    await failJob(job, "unexpected_chunk", `job ${job.job_id} is not accepting file chunks in status ${job.status}`, {
+      phase: "upload",
+      side_effect_started: Boolean(job.tab_id)
+    });
     return;
   }
   if (chunkUploadGeneration > jobUploadGeneration) {
@@ -2058,11 +2064,45 @@ async function handleTargetedReconnect(message, job) {
     await persistJob(job);
     if (job.status === "waiting_response") {
       scheduleNativeReconnectResume(job);
-    } else {
+    } else if (
+      // yz-91o review finding (SHOULD-FIX): the eligibility check ran BEFORE
+      // the awaits above. A pre-attachment job could cross the attachment
+      // boundary while this handler was suspended (an in-flight final chunk
+      // transitions it to file_received), and replaying upload readiness
+      // after that would lure the client into an unexpected_chunk failure of
+      // the rescued job. Revalidate: only waiting_for_file is replayable
+      // here (receiving_file is excluded at the eligibility gate and
+      // anything at/past file_received must not restart).
+      job.status === "waiting_for_file"
+      && jobContinuationIsLive(job, job.continuation_epoch)
+    ) {
+      // yz-91o (fix B): a targeted reconnect reaching a pre-attachment job is
+      // also a fresh epoch — same replay contract as worker-restart recovery:
+      // the client must re-learn the authoritative generation or an older
+      // announcement can pass for current state. The epoch is allocated ONCE
+      // and the exact allocated value is what persistence and the
+      // announcement carry, so an overlapping reconnect (review BLOCKER)
+      // can only publish an epoch that a completed persistence actually
+      // recorded. The liveness re-check below rejects a job that was
+      // replaced, cancelled, or terminal while this handler was suspended.
+      // It is NOT a reconnect-supersession fence: an overlapping older
+      // handler may still announce its own already-persisted allocation.
+      // Safety for that overlap comes from the client side, which adopts
+      // only strictly newer generations and ignores older/equal announcements
+      // (apply_upload_replay_if_newer).
+      const allocatedGeneration = Number(job.upload_generation ?? 0) + 1;
+      job.upload_generation = allocatedGeneration;
+      await persistJob(job);
+      if (!jobContinuationIsLive(job, job.continuation_epoch)) {
+        return;
+      }
       postNative(progress(job, "ready_for_file", {
         tab_id: job.tab_id,
         restored: true,
-        message: `${adapterForJob(job).displayName} tab is ready for bundle upload`
+        upload_restarted: true,
+        resume_from_chunk: 0,
+        upload_generation: allocatedGeneration,
+        message: `${adapterForJob(job).displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
       }));
     }
   }
@@ -2896,10 +2936,25 @@ async function recoverJobs(message) {
       continue;
     }
     const adapter = adapterForJob(job);
+    // yz-91o (fix B): recoverJobs readiness is a replay too — re-announce the
+    // authoritative epoch so a client that missed the original restart marker
+    // (or restarted its native process) still learns the current generation.
+    // The epoch is allocated ONCE and the exact allocated value is both what
+    // persistence records and what the announcement carries (review BLOCKER:
+    // re-reading the mutable job field after the persist could publish an
+    // epoch a later, superseded persist never recorded). jobs is a Map keyed
+    // by job_id, so the for-of iteration cannot observe the same job twice
+    // within one recoverJobs pass.
+    const allocatedGeneration = Number(job.upload_generation ?? 0) + 1;
+    job.upload_generation = allocatedGeneration;
+    await persistJob(job);
     postNative(progress(job, "ready_for_file", {
       tab_id: job.tab_id,
       restored: true,
-      message: `${adapter.displayName} tab is ready for bundle upload`
+      upload_restarted: true,
+      resume_from_chunk: 0,
+      upload_generation: allocatedGeneration,
+      message: `${adapter.displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
     }));
   }
   postNative(makeEnvelope("reconnect", {
@@ -3046,7 +3101,26 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
       // still reach a terminal: before yz-y5p it always failed state_lost here,
       // and trading a guaranteed terminal for a silent hang would be worse than
       // the bug being fixed.
-      const uploadRestarted = job.status === "receiving_file";
+      // yz-y5p: remember whether this job was caught mid-upload BEFORE the probe
+      // can mutate status. A restart candidate that cannot reach its tab must
+      // still reach a terminal: before yz-y5p it always failed state_lost here,
+      // and trading a guaranteed terminal for a silent hang would be worse than
+      // the bug being fixed.
+      const wasMidUpload = job.status === "receiving_file";
+      // yz-91o (fix B): EVERY restored pre-attachment readiness establishes a
+      // fresh upload epoch and replays the restart instruction. The old logic
+      // marked only the receiving_file recovery, leaving two confirmed crash
+      // windows where the client never learns the stream reset: (i) recovery
+      // persisted waiting_for_file but died before the marker was delivered —
+      // the next recovery saw waiting_for_file and emitted plain readiness;
+      // (ii) the worker posted a partial-chunk ACK before persisting
+      // waiting_for_file -> receiving_file, so a crash in that window restored
+      // waiting_for_file though the client had already advanced. Bumping the
+      // generation unconditionally on restored readiness is safe: a restored
+      // readiness always restarts the stream from chunk 0, stale-epoch chunks
+      // are nacked (fix A), and a v0.5.77 client adopts the generation
+      // whenever it appears on a restored readiness.
+      const uploadRestarted = true;
       job.connection_generation = connectionGeneration;
       job.updated_at = Date.now();
       jobs.set(job.job_id, job);
@@ -3059,7 +3133,7 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
         recordContentScriptContract(job, contentScriptProbe);
         await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
       } catch (error) {
-        if (uploadRestarted) {
+        if (wasMidUpload) {
           chunks.discard(job.job_id);
           await failJob(job, "state_lost", `job ${job.job_id} lost in-memory extension state after service-worker restart and could not rebind its tab to restart the upload: ${String(error?.message ?? error)}`, {
             phase: "upload",
@@ -3075,26 +3149,24 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
       // partial assembler (the restart already destroyed it; this also clears any
       // entry a racing late chunk created) and bump upload_generation so chunks
       // from the pre-restart stream are rejected instead of interleaving with the
-      // new one. The marker is the ONLY signal the client restarts on.
-      if (uploadRestarted) {
-        chunks.discard(job.job_id);
-        job.upload_generation = Number(job.upload_generation ?? 0) + 1;
-        job.status = "waiting_for_file";
-      }
+      // new one. The marker is the ONLY signal the client restarts on. yz-91o:
+      // now unconditional for every restored pre-attachment job.
+      chunks.discard(job.job_id);
+      // yz-91o review (BLOCKER): allocate the epoch once and publish the exact
+      // allocated value, not a re-read of the mutable job field after the
+      // persist — an overlapping restore of the same job could otherwise
+      // publish a generation its completed persistence never recorded.
+      const allocatedGeneration = Number(job.upload_generation ?? 0) + 1;
+      job.upload_generation = allocatedGeneration;
+      job.status = "waiting_for_file";
       await persistJob(job);
       postNative(progress(job, "ready_for_file", {
         tab_id: job.tab_id,
         restored: true,
-        ...(uploadRestarted
-          ? {
-              upload_restarted: true,
-              resume_from_chunk: 0,
-              upload_generation: job.upload_generation
-            }
-          : {}),
-        message: uploadRestarted
-          ? `${adapterForJob(job).displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
-          : `${adapterForJob(job).displayName} tab is ready for bundle upload`
+        upload_restarted: true,
+        resume_from_chunk: 0,
+        upload_generation: allocatedGeneration,
+        message: `${adapterForJob(job).displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
       }));
       continue;
     }

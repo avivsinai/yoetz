@@ -4565,18 +4565,39 @@ mod native_host_unix {
         delivered_at_ms: u128,
     }
 
-    struct ClientJob {
+    /// yz-91o review: test-visible constructor so the top-level `mod tests`
+    /// can exercise the production caller transition against a real ClientJob.
+    #[cfg(test)]
+    pub(super) fn test_client(job_id: &str, next_chunk: usize) -> ClientJob {
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        std::mem::forget(peer);
+        ClientJob {
+            stream,
+            owner_id: format!("owner_{job_id}"),
+            job_id: job_id.to_string(),
+            run_id: Some(format!("run_{job_id}")),
+            workspace_id: None,
+            chunks: Vec::new(),
+            next_chunk,
+            upload_generation: 0,
+            side_effect_started: false,
+            fallback_phase: None,
+            cancel_on_disconnect: false,
+        }
+    }
+
+    pub(super) struct ClientJob {
         stream: UnixStream,
         owner_id: String,
         job_id: String,
-        run_id: Option<String>,
+        pub(super) run_id: Option<String>,
         workspace_id: Option<String>,
-        chunks: Vec<Value>,
-        next_chunk: usize,
+        pub(super) chunks: Vec<Value>,
+        pub(super) next_chunk: usize,
         /// yz-y5p: upload generation echoed on every chunk. The worker bumps it
         /// when it restarts an interrupted upload, so a chunk from the abandoned
         /// stream is rejected instead of interleaving with the restarted one.
-        upload_generation: u64,
+        pub(super) upload_generation: u64,
         side_effect_started: bool,
         fallback_phase: Option<&'static str>,
         cancel_on_disconnect: bool,
@@ -5133,12 +5154,9 @@ mod native_host_unix {
                     return Ok(());
                 }
                 update_client_effect_state(client, &envelope);
-                if should_replay_upload_from_start(&envelope) {
-                    client.next_chunk = 0;
-                    // yz-y5p: adopt the worker's generation so the restarted
-                    // stream is distinguishable from the one it abandoned.
-                    client.upload_generation = upload_generation_of(&envelope);
-                }
+                // yz-91o: epoch handling is idempotent (see
+                // apply_upload_replay_if_newer for the contract).
+                apply_upload_replay_if_newer(client, &envelope, &job_id);
                 let stream = match client.stream.try_clone() {
                     Ok(stream) => stream,
                     Err(err) => {
@@ -5420,7 +5438,9 @@ mod native_host_unix {
             .unwrap_or(0)
     }
 
-    fn next_bundle_chunk_envelope(client: &mut ClientJob) -> Result<Option<ProtocolEnvelope>> {
+    pub(super) fn next_bundle_chunk_envelope(
+        client: &mut ClientJob,
+    ) -> Result<Option<ProtocolEnvelope>> {
         let Some(mut payload) = client.chunks.get(client.next_chunk).cloned() else {
             return Ok(None);
         };
@@ -5510,6 +5530,24 @@ mod native_host_unix {
             {
                 return Ok(false);
             }
+            // yz-91o review finding: the stale FLAG is not the only marker of an
+            // abandoned-epoch ack. A normal (stale-flag-free) ack echoes the
+            // generation the worker validated under, and a rewind (newer-epoch
+            // adoption, next_chunk -> 0) can leave an in-flight ack from the old
+            // epoch behind it on the socket. Without a generation guard that ack
+            // hits the "arrived before any bundle chunk" bail below and tears
+            // down the client connection for exactly the recovery the epoch
+            // machinery exists to enable. An ack from a generation OLDER than
+            // the client holds is stale news regardless of the flag: ignore it.
+            if let Some(ack_generation) = envelope
+                .payload
+                .get("upload_generation")
+                .and_then(Value::as_u64)
+            {
+                if ack_generation < client.upload_generation {
+                    return Ok(false);
+                }
+            }
             let sequence = envelope
                 .payload
                 .get("sequence")
@@ -5530,20 +5568,62 @@ mod native_host_unix {
         Ok(false)
     }
 
-    /// yz-y5p upload-replay contract, stated once because three fields are
-    /// involved and only one of them is the trigger.
+    /// yz-91o upload-replay contract (supersedes the yz-y5p "restored is THE
+    /// signal" contract, which is deleted rather than amended per review: a
+    /// stale contract comment that reads as considered is worse than none).
     ///
-    /// `restored` is THE replay signal: it already meant "the service worker
-    /// re-emitted this after a restart", so it keeps that job and needs no new
-    /// wire condition. `upload_restarted` is informational, for the operator and
-    /// the logs, and does NOT drive the client. `upload_generation` is adopted
-    /// whenever present, so the restarted stream is distinguishable from the
-    /// abandoned one.
-    /// A second `ready_for_file` WITHOUT `restored` for a job already streaming
-    /// does not restart anything: `should_send_next_chunk` returns
-    /// `client.next_chunk == 0`, which is false mid-stream, so the envelope is
-    /// ignored exactly as before. Silence there is deliberate - a silent restart
-    /// would resend bytes the worker never asked for.
+    /// The EPOCH is the replay trigger: a `ready_for_file` carrying an
+    /// `upload_generation` NEWER than the generation the client holds replaces
+    /// the stream and restarts from chunk 0. An OLDER epoch is ignored (a late
+    /// duplicate of an announcement already acted on). The SAME epoch repeated
+    /// is a no-op — it can neither rewind a sending stream nor start a
+    /// concurrent second sender. `restored`/`upload_restarted` are
+    /// informational, for the operator and the logs, and do NOT drive the
+    /// client. A `ready_for_file` with NO epoch does not replay: the client
+    /// has no authority to act on unversioned readiness, and silence there is
+    /// deliberate — a silent restart would resend bytes the worker never
+    /// asked for. All readiness the current worker emits carries the epoch
+    /// (first start = 0, restore/reconnect = fresh bump).
+    /// yz-91o: epoch handling is idempotent. A replay whose generation is not
+    /// NEWER than the one the client already holds is stale news - an old epoch
+    /// can only come from a late duplicate of an announcement the client
+    /// already acted on, and adopting it (or rewinding next_chunk for it)
+    /// would desync the stream it is currently sending. Extracted verbatim
+    /// from the router so the yz-91o epoch tests execute THIS transition, not
+    /// a test-local copy (review finding 3, round 2): a production-only
+    /// mutation of this block is what the tests must catch.
+    pub(super) fn apply_upload_replay_if_newer(
+        client: &mut ClientJob,
+        envelope: &ProtocolEnvelope,
+        job_id: &str,
+    ) {
+        if should_replay_upload_from_start(envelope) {
+            let generation = upload_generation_of(envelope);
+            if generation > client.upload_generation {
+                client.next_chunk = 0;
+                // Adopt the worker's generation so the restarted stream is
+                // distinguishable from the one it abandoned.
+                client.upload_generation = generation;
+            } else {
+                eprintln!(
+                    "yoetz chrome native ignored stale upload replay for job {job_id}: generation {generation} is not newer than {}",
+                    client.upload_generation
+                );
+            }
+        }
+    }
+
+    /// yz-91o (claude's design B5): the EPOCH is the replay trigger, not the
+    /// restored marker. Any ready_for_file carrying an upload_generation NEWER
+    /// than the client holds replaces the stream; the marker fields
+    /// (restored/upload_restarted) are informational. This supersedes the
+    /// earlier "restored is THE signal" contract, which made the client
+    /// depend on WHICH recovery path emitted readiness rather than on the
+    /// authoritative state. Compatibility: a v0.5.77 worker announces epochs
+    /// only on restored readiness, so the epoch trigger covers it; a fresh
+    /// first-start announcement carries generation 0, which never beats the
+    /// client's held epoch (also 0), so first start is not a replay — the
+    /// stream is simply not started yet.
     pub(super) fn should_replay_upload_from_start(envelope: &ProtocolEnvelope) -> bool {
         envelope.kind == "job_progress"
             && envelope
@@ -5551,11 +5631,7 @@ mod native_host_unix {
                 .get("phase")
                 .and_then(Value::as_str)
                 .is_some_and(|phase| phase == "ready_for_file")
-            && envelope
-                .payload
-                .get("restored")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
+            && envelope.payload.get("upload_generation").is_some()
     }
 
     fn local_client_disconnected_cancel(client: &ClientJob) -> ProtocolEnvelope {
@@ -5946,7 +6022,7 @@ mod native_host_unix {
             // sequence belongs to THAT stream, so without the `stale` check the
             // arithmetic reads it as an ack ahead of the restarted stream and
             // bails - killing in the client the job the worker just rescued.
-            let mut client = y5p_client("job_stale", 1);
+            let mut client = native_host_unix::test_client("job_stale", 1);
             let nack = super::super::ProtocolEnvelope::new(
                 "job_file_chunk_ack",
                 Some("job_stale".to_string()),
@@ -5987,6 +6063,49 @@ mod native_host_unix {
             assert!(
                 error.to_string().contains("ahead of expected"),
                 "unexpected error: {error}"
+            );
+        }
+
+        #[test]
+        fn yz91o_old_epoch_ack_after_rewind_is_ignored_not_fatal() {
+            // A normal (stale-flag-free) ack for a chunk of an OLD generation
+            // arriving after the client adopted a newer epoch rewinds
+            // next_chunk to 0; without the generation guard it bails
+            // "arrived before any bundle chunk was sent" and tears down the
+            // client for exactly the recovery the epoch machinery enables.
+            let mut client = native_host_unix::test_client("job_old_ack", 0);
+            client.upload_generation = 2; // adopted the newer epoch, rewound to 0
+            let old_ack = super::super::ProtocolEnvelope::new(
+                "job_file_chunk_ack",
+                Some("job_old_ack".to_string()),
+                Some("run_job_old_ack".to_string()),
+                serde_json::json!({
+                    "stale": false,
+                    "complete": false,
+                    "sequence": 0,
+                    "upload_generation": 1,
+                }),
+            );
+            assert!(
+                !super::should_send_next_chunk(&client, &old_ack).unwrap(),
+                "an old-epoch ack after a rewind must be ignored, not bail"
+            );
+            // A same-epoch ack still drives the stream: the guard is bounded.
+            client.next_chunk = 1;
+            let same_epoch_ack = super::super::ProtocolEnvelope::new(
+                "job_file_chunk_ack",
+                Some("job_old_ack".to_string()),
+                Some("run_job_old_ack".to_string()),
+                serde_json::json!({
+                    "stale": false,
+                    "complete": false,
+                    "sequence": 0,
+                    "upload_generation": 2,
+                }),
+            );
+            assert!(
+                super::should_send_next_chunk(&client, &same_epoch_ack).unwrap(),
+                "a same-epoch ack must still be processed"
             );
         }
         use super::*;
@@ -8667,7 +8786,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn unmarked_ready_for_file_mid_stream_does_not_restart_the_upload() {
-        // yz-y5p Q2: only `restored` replays. A bare ready_for_file arriving while
+        // yz-91o: only an EPOCH-bearing ready_for_file replays (and only a
+        // strictly newer epoch adopts). A bare ready_for_file arriving while
         // the client is already streaming must be ignored, never treated as a
         // restart, or the client would resend bytes the worker never asked for.
         let bare = ProtocolEnvelope::new(
@@ -8726,7 +8846,121 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn newer_epoch_replay_adopts_generation_and_rewinds_stream() {
+        // yz-91o (i), review finding 3 (round 2): the test calls the REAL
+        // production transition (apply_upload_replay_if_newer) — the same
+        // function the envelope router executes. A production-only mutation
+        // (unconditional adoption, > flipped to >=, rewind removed, adoption
+        // removed) changes what these assertions observe.
+        let replay = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_epoch_newer".to_string()),
+            Some("run_job_epoch_newer".to_string()),
+            json!({
+                "phase": "ready_for_file",
+                "restored": true,
+                "upload_restarted": true,
+                "resume_from_chunk": 0,
+                "upload_generation": 5,
+            }),
+        );
+        let mut client = native_host_unix::test_client("job_epoch_newer", 2);
+        client.run_id = Some("run_job_epoch_newer".to_string());
+        client.upload_generation = 1;
+
+        native_host_unix::apply_upload_replay_if_newer(&mut client, &replay, "job_epoch_newer");
+        assert_eq!(
+            client.upload_generation, 5,
+            "the new generation must be held"
+        );
+        assert_eq!(client.next_chunk, 0, "the stream must rewind to chunk 0");
+        // Next send must schedule chunk 0 exactly once (the replay took effect).
+        client.chunks = vec![json!({"sequence": 0}), json!({"sequence": 1})];
+        let chunk = native_host_unix::next_bundle_chunk_envelope(&mut client)
+            .unwrap()
+            .expect("chunk 0 scheduled");
+        assert_eq!(
+            chunk.payload.get("sequence").and_then(Value::as_u64),
+            Some(0),
+            "the replayed stream must start at chunk 0"
+        );
+        assert_eq!(
+            chunk
+                .payload
+                .get("upload_generation")
+                .and_then(Value::as_u64),
+            Some(5),
+            "the replayed chunk must carry the adopted generation"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn older_epoch_replay_does_not_adopt_generation_or_rewind_stream() {
+        // yz-91o (ii), review finding 3 (round 2): an OLDER announcement must
+        // leave the production client state untouched — no rewind, no
+        // adoption. Making production adoption unconditional must fail here.
+        let stale = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_epoch_old".to_string()),
+            Some("run_job_epoch_old".to_string()),
+            json!({
+                "phase": "ready_for_file",
+                "restored": true,
+                "upload_restarted": true,
+                "resume_from_chunk": 0,
+                "upload_generation": 3,
+            }),
+        );
+        let mut client = native_host_unix::test_client("job_epoch_old", 2); // mid-stream: next_chunk 2
+        client.run_id = Some("run_job_epoch_old".to_string());
+        client.upload_generation = 5;
+
+        native_host_unix::apply_upload_replay_if_newer(&mut client, &stale, "job_epoch_old");
+        assert_eq!(client.upload_generation, 5, "held generation unchanged");
+        assert_eq!(
+            client.next_chunk, 2,
+            "mid-stream cursor unchanged — no rewind"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn same_epoch_replay_is_not_newer_so_stream_is_left_alone() {
+        // yz-91o (iii), review finding 3 (round 2): a REPEATED same-generation
+        // restored announcement must leave the production client state
+        // untouched. Flipping the production comparison to >= must fail here.
+        let repeat = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_epoch_repeat".to_string()),
+            Some("run_job_epoch_repeat".to_string()),
+            json!({
+                "phase": "ready_for_file",
+                "restored": true,
+                "upload_restarted": true,
+                "resume_from_chunk": 0,
+                "upload_generation": 2,
+            }),
+        );
+        let mut client = native_host_unix::test_client("job_epoch_repeat", 2); // mid-stream on epoch 2
+        client.run_id = Some("run_job_epoch_repeat".to_string());
+        client.upload_generation = 2;
+
+        native_host_unix::apply_upload_replay_if_newer(&mut client, &repeat, "job_epoch_repeat");
+        assert_eq!(client.upload_generation, 2, "held generation unchanged");
+        assert_eq!(
+            client.next_chunk, 2,
+            "mid-stream cursor unchanged — no rewind, no second sender"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn restored_ready_for_file_replays_upload_from_start() {
+        // yz-91o (claude's design B5): the EPOCH is the replay trigger. A
+        // ready_for_file carrying upload_generation replays (newer wins,
+        // per apply_upload_replay_if_newer); one without a generation does
+        // not. restored/upload_restarted are informational only.
         let restored = ProtocolEnvelope::new(
             "job_progress",
             Some("job_restore".to_string()),
@@ -8734,6 +8968,7 @@ mod tests {
             json!({
                 "phase": "ready_for_file",
                 "restored": true,
+                "upload_generation": 3,
             }),
         );
         let fresh = ProtocolEnvelope::new(
@@ -8744,9 +8979,23 @@ mod tests {
                 "phase": "ready_for_file",
             }),
         );
+        let marked_but_unnumbered = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_marked".to_string()),
+            Some("run_marked".to_string()),
+            json!({
+                "phase": "ready_for_file",
+                "restored": true,
+                "upload_restarted": true,
+            }),
+        );
 
         assert!(native_host_unix::should_replay_upload_from_start(&restored));
         assert!(!native_host_unix::should_replay_upload_from_start(&fresh));
+        assert!(
+            !native_host_unix::should_replay_upload_from_start(&marked_but_unnumbered),
+            "markers without an epoch are informational only — no replay"
+        );
     }
 
     #[test]

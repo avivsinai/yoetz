@@ -10334,12 +10334,21 @@ test("service worker resumes waiting_for_file jobs after service-worker restart"
     const bindIndex = sentToTabs.findIndex((item) => item.message.type === "yoetz_bind_job");
     assert.ok(bindIndex >= 0);
 
+    // yz-91o: restored readiness always carries a fresh upload epoch (fix B),
+    // so the client echoes the announced upload_generation on its chunks (the
+    // shipped native client does this via next_bundle_chunk_envelope). A
+    // generation-less chunk is the pre-yz-y5p wire shape and is nacked as
+    // stale once any restart has happened (fix A).
+    const restoreGeneration = Number(restoredReady?.payload.upload_generation ?? 0);
+    assert.ok(restoreGeneration >= 1, "restored readiness must announce an upload_generation");
+
     port.emit(envelope("job_file_chunk", "job_restore_waiting", {
       sequence: 0,
       total_chunks: 1,
       total_bytes: 4,
       filename: "job_restore_waiting.md",
       mime_type: "text/markdown",
+      upload_generation: restoreGeneration,
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
 
@@ -13926,6 +13935,136 @@ test("yz-y5p: a restart mid-upload restarts the chunk stream instead of failing 
     ), 5000);
     const done = port.messages.find((m) => m.type === "job_file_chunk_ack" && m.payload?.complete === true);
     assert.equal(done.payload.upload_generation, generation, "the completing ack carries the active generation");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+test("yz-91o: a stale chunk arriving after the upload completes is dropped, not fatal (claude's A regression)", async () => {
+  // The exact blind spot claude named: the old y5p survival test injected the
+  // stale chunk while the job was still IN upload, so it passed and proved
+  // nothing about the phase after assembly. Here gen1's assembly completes and
+  // the job moves past it; a late gen0 chunk then arrives. On main the phase
+  // check runs first and failJobs unexpected_chunk, killing the rescued job;
+  // with the fix the generation classification precedes the phase check and
+  // the chunk is nacked stale with no terminal and no extra attachment.
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  await storage.set({
+    "jobs.job_91o_late": {
+      job_id: "job_91o_late",
+      run_id: "run_job_91o_late",
+      workspace_id: "workspace_test",
+      status: "receiving_file",
+      prompt: "prompt",
+      tab_id: 91,
+      model: "gpt-6-pro-chat",
+      model_strategy: "select",
+      started_at: now,
+      updated_at: now
+    }
+  });
+
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_91o_late" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        if (command.type === "yoetz_probe") {
+          return {
+            ok: true,
+            payload: {
+              recipe: "chatgpt",
+              content_script_instance_id: "cs-91o-late",
+              content_script_build: TEST_CONTENT_SCRIPT_BUILD,
+              capabilities: ["native_job_commands_v1", "chatgpt_click_bound_send_receipt_v1"]
+            }
+          };
+        }
+        if (command.type === "yoetz_bind_job") return { ok: true, payload: { rebound: true } };
+        // Keep the job LIVE past the upload so the late-chunk scenario is the
+        // NON-TERMINAL one the review described (uploading/waiting_response),
+        // not a terminal job where chunks are silently ignored.
+        if (command.type === "yoetz_upload_file") return { ok: true, payload: { filename: command.file.filename, size: 4 } };
+        if (command.type === "yoetz_send_prompt") {
+          return {
+            ok: true,
+            payload: {
+              sent: true,
+              conversation_id: "conv-91o-late",
+              final_model_selection: { ...verifiedLatestProSelection(), click_bound: true }
+            }
+          };
+        }
+        if (command.type === "yoetz_extract_response") {
+          return { ok: true, payload: { method: "assistant_dom_fallback", text: "partial", is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0, conversation_id: "conv-91o-late" } };
+        }
+        throw new Error(`unexpected tab message ${command.type}`);
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_91o_late=${Date.now()}`);
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    ), 5000);
+    const ready = port.messages.find((m) => m.type === "job_progress" && m.payload?.phase === "ready_for_file");
+    const generation = ready.payload.upload_generation;
+
+    // Drive gen1's stream to completion so the job leaves the upload phase.
+    port.messages.length = 0;
+    port.emit(envelope("job_file_chunk", "job_91o_late", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      upload_generation: generation,
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_file_chunk_ack" && m.payload?.complete === true
+    ), 5000);
+    // acceptFileChunk has synchronously transitioned the job past the upload
+    // phase (file_received) and into runJobWithFile by now; the stubbed tab
+    // may fail the job later with extension_error — that is a DIFFERENT
+    // failure than the unexpected_chunk this regression guards against.
+
+    // NOW inject the late gen0 chunk — the phase the old tests never exercised.
+    // First prove the job actually reached a live post-upload phase: the
+    // prompt_sent progress fires once the job is heading into waiting_response.
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "prompt_sent"
+    ), 5000);
+    port.messages.length = 0;
+    port.emit(envelope("job_file_chunk", "job_91o_late", {
+      sequence: 0,
+      total_chunks: 2,
+      total_bytes: 8,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      upload_generation: 0,
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("late"))
+    }));
+    await eventually(() => port.messages.some((m) => m.type === "job_file_chunk_ack"), 5000);
+    const nack = port.messages.find((m) => m.type === "job_file_chunk_ack");
+    assert.equal(nack.payload.stale, true, "the post-completion stale chunk is nacked");
+    assert.equal(nack.payload.chunk_upload_generation, 0, "the nack reports the stale generation");
+    assert.equal(nack.payload.upload_generation, generation, "the nack reports the active generation");
+    assert.equal(
+      port.messages.find((m) => m.type === "job_error" && m.payload?.code === "unexpected_chunk"),
+      undefined,
+      "a late chunk after assembly must NOT fail the rescued job with unexpected_chunk (the pre-fix behavior on main)"
+    );
   } finally {
     globalThis.chrome = originalChrome;
     globalThis.setTimeout = originalSetTimeout;
