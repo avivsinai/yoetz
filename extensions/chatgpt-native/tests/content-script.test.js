@@ -113,6 +113,15 @@ export function verifyChatSurface(_document, options) {
 
 export function verifyChatgptModelSelectionBeforeSend(_document, selection) {
   hooks.verifyChatgptModelSelectionCalls.push(selection);
+  // yz-ad7: the sendPrompt capture runs at the END of the caller's
+  // verifyBeforeClick closure — after this stub returns — so the "inside"
+  // window must extend from this call until clickSend commits. The stub
+  // clickSend clears the window when it records the commit.
+  hooks.__insideVerifyBeforeClick = true;
+  return verifyChatgptModelSelectionBeforeSendInner(_document, selection);
+}
+
+function verifyChatgptModelSelectionBeforeSendInner(_document, selection) {
   return hooks.verifyChatgptModelSelectionResult ?? {
     ok: true,
     surface_evidence_seen: selection?.surface_evidence_seen === true,
@@ -174,6 +183,9 @@ export function configureModelState(_document, job) {
 
 export function sendAcceptanceBaseline() {
   hooks.sendAcceptanceBaselineCalls += 1;
+  if (hooks.__insideVerifyBeforeClick) {
+    hooks.baselineCapturedInsideVerify = (hooks.baselineCapturedInsideVerify ?? 0) + 1;
+  }
   return { user_count: 1, assistant_count: 2 };
 }
 
@@ -187,6 +199,7 @@ export async function clickSend(_document, options) {
   hooks.clickSendCalls.push(options);
   await options.beforeClick?.();
   options.verifyBeforeClick?.();
+  hooks.__insideVerifyBeforeClick = false;
   hooks.clickCommittedCalls += 1;
 }
 
@@ -228,6 +241,10 @@ const dom = {
   uploadFile,
   configureModelState,
   sendAcceptanceBaseline,
+  // yz-ad7: stubbed like the other dom helpers; tests set hooks.uploadErrorText.
+  uploadErrorText() {
+    return hooks.uploadErrorText ?? "";
+  },
   insertPrompt,
   clickSend,
   waitForSendAccepted,
@@ -335,6 +352,65 @@ test("content script probe advertises the generic command contract for each reci
     assert.deepEqual(response.payload.capabilities, ["native_job_commands_v1"]);
   } finally {
     claude.restore();
+  }
+});
+
+// yz-ad7: the yz-kio baseline capture point (before clickSend) was a no-op
+// for its own scenario — beforeClick and verifyBeforeClick run INSIDE the
+// clickSend loop, so history loading during beforeClick still landed after
+// the baseline. The capture must happen at the END of verifyBeforeClick.
+test("yz-ad7: send-acceptance baseline is captured inside verifyBeforeClick, after beforeClick", async () => {
+  const { send, hooks, restore } = await loadContentScript("yz_ad7_baseline", "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+  try {
+    const job = resumeJob();
+    const prepared = await send({ type: "yoetz_prepare_job", job });
+    assert.equal(prepared.ok, true);
+
+    const sent = await send({ type: "yoetz_send_prompt", job, prompt: "continue" });
+    (await import("node:fs")).default.writeFileSync("/tmp/ad7_sent.json", JSON.stringify(sent));
+
+    // The observable that discriminates: the yz-kio code captured the
+    // baseline BEFORE clickSend, so the clickSend options object was fully
+    // built (including verifyBeforeClick) while the baseline was already
+    // frozen — the capture could not see anything beforeClick did. With the
+    // yz-ad7 fix the capture runs INSIDE verifyBeforeClick, so the stub
+    // clickSend's ordering (beforeClick -> verifyBeforeClick -> commit)
+    // puts the second capture after configure_model in the events log and
+    // before the commit. We assert ordering via the stub's recorded
+    // verifyBeforeClick receipt: it must observe a baseline that INCLUDES
+    // what beforeClick changed, i.e. the capture must happen inside the
+    // loop. The stub records baseline snapshots at each hook; the fix
+    // yields exactly one capture inside verifyBeforeClick and one after the
+    // send (the submitted snapshot). HEAD's code yields a capture BEFORE
+    // clickSend instead, so the in-loop capture count differs.
+    assert.equal(hooks.clickCommittedCalls, 1, "the click must have committed");
+    // Exactly one of the two captures must happen inside the clickSend loop
+    // (recorded via the verifyBeforeClick observation window the stub
+    // exposes); HEAD captures both outside it.
+    assert.equal(hooks.baselineCapturedInsideVerify, 1,
+      `exactly one baseline capture must happen inside verifyBeforeClick, got ${hooks.baselineCapturedInsideVerify}`);
+  } finally {
+    restore();
+  }
+});
+
+// yz-ad7 residual hole from the #526 review: uploadErrorText was consulted
+// only inside the upload loop, so an error banner that appears AFTER the
+// upload phase committed let the job go out as a text-only prompt.
+test("yz-ad7: verifyBeforeClick throws upload_failed_before_send when an upload error banner is up", async () => {
+  const { send, hooks, restore } = await loadContentScript("yz_ad7_upload_error", "https://chatgpt.com/c/conv-123?_yoetz=run_resume");
+  try {
+    const job = resumeJob();
+    assert.equal((await send({ type: "yoetz_prepare_job", job })).ok, true);
+
+    hooks.uploadErrorText = "File upload failed";
+    const sent = await send({ type: "yoetz_send_prompt", job, prompt: "continue" });
+    assert.equal(sent.ok, false, "send must fail when an upload error banner is up");
+    assert.equal(sent.code, "upload_failed_before_send");
+    assert.match(sent.error, /File upload failed/);
+    assert.equal(hooks.clickCommittedCalls, 0, "no click may be committed past an upload error");
+  } finally {
+    restore();
   }
 });
 
