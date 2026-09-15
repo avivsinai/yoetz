@@ -8835,7 +8835,7 @@ mod tests {
         let held: u64 = 2;
         let announced = native_host_unix::upload_generation_of(&repeat);
         assert!(
-            announced > held,
+            announced <= held,
             "a same-epoch repeat must not be newer; the caller ignores it"
         );
     }
