@@ -12694,6 +12694,223 @@ test("yz-esc: re-trip during an active cooldown holds the level, neither erases 
 });
 
 // ---------------------------------------------------------------------------
+// yz-tpo: the cooldown arm lives inside failJob, the single terminal emitter.
+// Field evidence run 20260915T064306Z_fd4a47: a typed job_error code
+// rate_limited at phase model_selection landed and cooldown_until_ms stayed
+// null — handlePollerError returned early (pending recovery / already-
+// terminal branches) before the old scattered arm could run. The arm now sits
+// in failJob before its early returns, keyed on the rate-limit signal only.
+
+// Test 1: a rate_limited content-script error while a content-script recovery
+// is PENDING for the job still arms the cooldown. On main this path returns
+// through failJob without arming (the blind spot), so it must fail there.
+test("yz-tpo: a typed rate_limited failure at model_selection arms the cooldown (fd4a47)", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_tpo_model" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            // The rate-limit wall goes up between prepare and the picker
+            // choreography: the content script answers the model command with
+            // a typed rate_limited error. No scattered arm site covered this
+            // phase on main — the arm must come from failJob.
+            return { ok: false, code: "rate_limited", error: "Too many requests", phase: "model_selection", side_effect_started: false };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_tpo_model=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+    port.emit(envelope("job_start", "job_tpo_model", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "rate_limited"
+    ), 8000);
+
+    // yz-tpo observability: the terminal payload itself must report the
+    // cooldown the arm wrote. This assertion discriminates: main's
+    // rate_limited terminal payload carries no cooldown_until_ms field.
+    const terminal = port.messages.find((m) =>
+      m.type === "job_error" && m.payload?.code === "rate_limited"
+    );
+    assert.ok(
+      Number(terminal.payload.cooldown_until_ms) > Date.now(),
+      "the rate_limited terminal payload must carry the armed cooldown_until_ms"
+    );
+
+    const cooldown = await readCooldownState("chatgpt");
+    assert.notEqual(cooldown, null, "cooldown state must exist in storage.session");
+    assert.ok(
+      cooldown.throttle_until_ms > Date.now(),
+      "throttle_until_ms must be in the future: the rate_limited terminal at model_selection must arm the cooldown (fd4a47 left it null on main)"
+    );
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+// Test 2: the cooldown refusal itself (rate_limit_cooldown_active) must NOT
+// re-arm or escalate. Pre-arm an active cooldown, refuse a job_start, and
+// assert the gate state is byte-identical: no extension, no level change.
+// Arming unconditionally inside failJob would fail this on the branch.
+test("yz-tpo: a rate_limit_cooldown_active refusal leaves the gate state exactly as it was", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: 999, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async () => { throw new Error("should not reach tab messages"); }
+    }
+  });
+
+  try {
+    const recipe = "chatgpt";
+    const now = Date.now();
+    const before = {
+      throttle_until_ms: now + 60000,
+      next_ready_at_ms: now + 60000,
+      throttle_level: 1,
+      rate_limit_escalation: 3,
+      rate_limit_last_until_ms: now + 60000,
+      in_flight_until_ms: 0,
+      generation: 1
+    };
+    await writeGateState(recipe, { ...before });
+
+    await import(`../src/service-worker.js?yz_tpo_refuse=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+    port.emit(envelope("job_start", "job_tpo_refuse", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "rate_limit_cooldown_active"
+    ), 5000);
+
+    const after = await readCooldownState(recipe);
+    assert.equal(after.rate_limit_escalation, before.rate_limit_escalation,
+      "the refusal must not escalate: it is our own guard, not a wall");
+    assert.equal(after.throttle_until_ms, before.throttle_until_ms,
+      "the refusal must not extend the cooldown");
+    assert.equal(after.rate_limit_last_until_ms, before.rate_limit_last_until_ms,
+      "the refusal must not move the last-until anchor");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+// Test 3: a non-rate-limited failure (response timeout) must leave the gate
+// state untouched — throttle_until_ms unset and status cooldown_until_ms null.
+// Arming unconditionally inside failJob would fail this on the branch.
+test("yz-tpo: a response_timeout failure arms nothing — cooldown stays unset", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_tpo_timeout" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedLatestProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            return { ok: true, payload: { sent: true } };
+          case "yoetz_extract_response":
+            // The page stays generating forever: the wait loop runs out and
+            // the job fails with response_timeout — not a rate-limit signal.
+            return { ok: true, payload: { method: "assistant_dom_fallback", text: "partial answer", is_generating: true, assistant_count: 1, turn_index: 0 } };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_tpo_timeout=${Date.now()}`);
+    await eventually(() => port.messages.some((m) => m.type === "hello"));
+    port.emit(envelope("job_start", "job_tpo_timeout", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 200
+    }));
+    await eventually(() => port.messages.some((m) => m.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_tpo_timeout", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_tpo_timeout.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "response_timeout"
+    ), 8000);
+
+    const cooldown = await readCooldownState("chatgpt");
+    assert.equal(
+      cooldown?.throttle_until_ms > Date.now(), false,
+      "a response_timeout failure must not arm the cooldown"
+    );
+
+    // Status must report cooldown_until_ms null: emit a heartbeat and read it.
+    port.messages.length = 0;
+    port.emit(envelope("heartbeat", "job_tpo_timeout_hb"));
+    await eventually(() => port.messages.some((m) => m.type === "heartbeat"));
+    const hb = port.messages.find((m) => m.type === "heartbeat");
+    assert.equal(hb.payload?.cooldown_until_ms?.chatgpt ?? null, null,
+      "status cooldown_until_ms must stay null after a non-rate-limited failure");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
+// ---------------------------------------------------------------------------
 // yz-0fd: per-profile tab pacing. Three tests:
 //   1. min-gap refusal: typed tab_pacing_active, reason "min_gap", no tab.
 //   2. max-concurrent refusal: reason "max_concurrent", wait_remaining_ms 0,
