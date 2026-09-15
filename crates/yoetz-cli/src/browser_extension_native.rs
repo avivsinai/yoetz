@@ -5422,14 +5422,14 @@ mod native_host_unix {
     }
 
     /// yz-y5p upload-replay contract, stated once because three fields are
-    /// involved and only one of them is the trigger:
-    ///   - `restored`          THE replay signal. It already meant "the service
-    ///                         worker re-emitted this after a restart", so it
-    ///                         keeps that job and needs no new wire condition.
-    ///   - `upload_restarted`  informational, for the operator and the logs; it
-    ///                         does NOT drive the client.
-    ///   - `upload_generation` adopted whenever present, so the restarted stream
-    ///                         is distinguishable from the abandoned one.
+    /// involved and only one of them is the trigger.
+    ///
+    /// `restored` is THE replay signal: it already meant "the service worker
+    /// re-emitted this after a restart", so it keeps that job and needs no new
+    /// wire condition. `upload_restarted` is informational, for the operator and
+    /// the logs, and does NOT drive the client. `upload_generation` is adopted
+    /// whenever present, so the restarted stream is distinguishable from the
+    /// abandoned one.
     /// A second `ready_for_file` WITHOUT `restored` for a job already streaming
     /// does not restart anything: `should_send_next_chunk` returns
     /// `client.next_chunk == 0`, which is false mid-stream, so the envelope is
@@ -8557,7 +8557,6 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    #[test]
     fn unmarked_ready_for_file_mid_stream_does_not_restart_the_upload() {
         // yz-y5p Q2: only `restored` replays. A bare ready_for_file arriving while
         // the client is already streaming must be ignored, never treated as a
@@ -8575,6 +8574,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn upload_restart_marker_carries_the_generation_the_client_stamps() {
         // yz-y5p: a restarted ready_for_file carries the worker's bumped
         // upload_generation; the client adopts it so the restarted stream is
@@ -8616,6 +8616,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn restored_ready_for_file_replays_upload_from_start() {
         let restored = ProtocolEnvelope::new(
             "job_progress",
