@@ -25,6 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   exists to prevent; it now says to wait for one of the active jobs to
   finish. (`yz-0fd`)
 ### Fixed
+- Dependencies: bump rustls past RUSTSEC-2026-0285.
 - ChatGPT send: the send-acceptance baseline is now captured at the END of
   `verifyBeforeClick` — inside the `clickSend` loop, after `beforeClick`
   (model reconfiguration) and immediately before the click — not before
