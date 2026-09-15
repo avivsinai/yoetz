@@ -965,6 +965,24 @@ async function acceptFileChunk(message) {
     return;
   }
 
+  // yz-y5p: after an upload restart the job carries a bumped upload_generation
+  // and the client echoes it on every chunk. A chunk from the pre-restart stream
+  // therefore arrives with a stale generation and is rejected rather than
+  // interleaving with the restarted stream. Chunks with no generation are the
+  // pre-yz-y5p wire shape and are accepted only while the job has never been
+  // restarted, so an older client keeps working but cannot corrupt a restart.
+  const jobUploadGeneration = Number(job.upload_generation ?? 0);
+  const chunkUploadGeneration = Number(message.payload?.upload_generation ?? 0);
+  if (chunkUploadGeneration !== jobUploadGeneration) {
+    await failJob(job, "stale_upload_chunk", `job ${job.job_id} received a chunk from upload generation ${chunkUploadGeneration} while generation ${jobUploadGeneration} is active`, {
+      phase: "upload",
+      side_effect_started: Boolean(job.tab_id),
+      upload_generation: jobUploadGeneration,
+      chunk_upload_generation: chunkUploadGeneration
+    });
+    return;
+  }
+
   let ack;
   try {
     ack = chunks.accept(message);
@@ -982,7 +1000,9 @@ async function acceptFileChunk(message) {
     run_id: job.run_id,
     workspace_id: job.workspace_id,
     capability_token: job.capability_token,
-    payload: ack
+    // Echo the generation so the client can tell an ack for the restarted stream
+    // from a late ack for the stream the restart abandoned.
+    payload: { ...ack, upload_generation: jobUploadGeneration }
   }));
   if (!ackDelivered) {
     chunks.discard(job.job_id);
@@ -2995,6 +3015,12 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
     }
     if (canResumeJobAfterWorkerRestart(job)) {
       const adapter = adapterForJob(job);
+      // yz-y5p: remember whether this job was caught mid-upload BEFORE the probe
+      // can mutate status. A restart candidate that cannot reach its tab must
+      // still reach a terminal: before yz-y5p it always failed state_lost here,
+      // and trading a guaranteed terminal for a silent hang would be worse than
+      // the bug being fixed.
+      const uploadRestarted = job.status === "receiving_file";
       job.connection_generation = connectionGeneration;
       job.updated_at = Date.now();
       jobs.set(job.job_id, job);
@@ -3007,14 +3033,42 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
         recordContentScriptContract(job, contentScriptProbe);
         await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
       } catch (error) {
+        if (uploadRestarted) {
+          chunks.discard(job.job_id);
+          await failJob(job, "state_lost", `job ${job.job_id} lost in-memory extension state after service-worker restart and could not rebind its tab to restart the upload: ${String(error?.message ?? error)}`, {
+            phase: "upload",
+            side_effect_started: Boolean(job.tab_id),
+            terminal_status: "state_lost"
+          });
+          continue;
+        }
         await handlePollerError(job, error);
         continue;
+      }
+      // yz-y5p: a job caught mid-upload restarts its chunk stream. Drop the
+      // partial assembler (the restart already destroyed it; this also clears any
+      // entry a racing late chunk created) and bump upload_generation so chunks
+      // from the pre-restart stream are rejected instead of interleaving with the
+      // new one. The marker is the ONLY signal the client restarts on.
+      if (uploadRestarted) {
+        chunks.discard(job.job_id);
+        job.upload_generation = Number(job.upload_generation ?? 0) + 1;
+        job.status = "waiting_for_file";
       }
       await persistJob(job);
       postNative(progress(job, "ready_for_file", {
         tab_id: job.tab_id,
         restored: true,
-        message: `${adapterForJob(job).displayName} tab is ready for bundle upload`
+        ...(uploadRestarted
+          ? {
+              upload_restarted: true,
+              resume_from_chunk: 0,
+              upload_generation: job.upload_generation
+            }
+          : {}),
+        message: uploadRestarted
+          ? `${adapterForJob(job).displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
+          : `${adapterForJob(job).displayName} tab is ready for bundle upload`
       }));
       continue;
     }
@@ -3126,10 +3180,17 @@ async function reconcileAcknowledgedTerminalTombstones() {
 }
 
 function canResumeJobAfterWorkerRestart(job) {
-  // The tab is prepared and no file chunks have been accepted yet. There is no
-  // in-memory ChunkAssembler state to reconstruct, so the native process can
-  // continue by sending the first chunk after reconnect.
-  return job.status === "waiting_for_file"
+  // The tab is prepared and the file has NOT been attached to the page yet, so
+  // there is no page side effect to reconcile and the upload can simply start
+  // over. Two statuses qualify:
+  //   waiting_for_file  - nothing was sent; the native process sends chunk 0.
+  //   receiving_file    - chunks were accepted into the in-memory ChunkAssembler,
+  //                       which the restart destroyed. yz-y5p: rather than fail
+  //                       state_lost, drop the partial assembler and restart the
+  //                       stream from chunk 0 (see resumeUploadFromZero).
+  // Anything at or past file_received has attached (or is attaching) the file and
+  // must stay state_lost: restarting there could duplicate a page side effect.
+  return ["waiting_for_file", "receiving_file"].includes(job.status)
     && Boolean(job.tab_id)
     && !cancellationIsPending(job);
 }

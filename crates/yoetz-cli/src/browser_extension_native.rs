@@ -4464,6 +4464,10 @@ mod native_host_unix {
         workspace_id: Option<String>,
         chunks: Vec<Value>,
         next_chunk: usize,
+        /// yz-y5p: upload generation echoed on every chunk. The worker bumps it
+        /// when it restarts an interrupted upload, so a chunk from the abandoned
+        /// stream is rejected instead of interleaving with the restarted one.
+        upload_generation: u64,
         side_effect_started: bool,
         fallback_phase: Option<&'static str>,
         cancel_on_disconnect: bool,
@@ -4775,6 +4779,7 @@ mod native_host_unix {
             workspace_id: envelope.workspace_id.clone(),
             chunks,
             next_chunk: 0,
+            upload_generation: 0,
             side_effect_started: false,
             fallback_phase: None,
             cancel_on_disconnect: envelope.kind == "job_start",
@@ -5021,6 +5026,9 @@ mod native_host_unix {
                 update_client_effect_state(client, &envelope);
                 if should_replay_upload_from_start(&envelope) {
                     client.next_chunk = 0;
+                    // yz-y5p: adopt the worker's generation so the restarted
+                    // stream is distinguishable from the one it abandoned.
+                    client.upload_generation = upload_generation_of(&envelope);
                 }
                 let stream = match client.stream.try_clone() {
                     Ok(stream) => stream,
@@ -5293,10 +5301,26 @@ mod native_host_unix {
         forward_to_extension(stdout, &ack)
     }
 
+    /// yz-y5p: the `upload_generation` a restarted `ready_for_file` carries, or 0
+    /// when the worker did not restart an upload (the ordinary first-start case).
+    pub(super) fn upload_generation_of(envelope: &ProtocolEnvelope) -> u64 {
+        envelope
+            .payload
+            .get("upload_generation")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+    }
+
     fn next_bundle_chunk_envelope(client: &mut ClientJob) -> Result<Option<ProtocolEnvelope>> {
-        let Some(payload) = client.chunks.get(client.next_chunk).cloned() else {
+        let Some(mut payload) = client.chunks.get(client.next_chunk).cloned() else {
             return Ok(None);
         };
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "upload_generation".to_string(),
+                Value::from(client.upload_generation),
+            );
+        }
         let chunk = ProtocolEnvelope::new_with_workspace(
             "job_file_chunk",
             Some(client.job_id.clone()),
@@ -5818,6 +5842,7 @@ mod native_host_unix {
                     workspace_id: None,
                     chunks: Vec::new(),
                     next_chunk: 0,
+                    upload_generation: 0,
                     side_effect_started: true,
                     fallback_phase: Some("wait_response"),
                     cancel_on_disconnect: true,
@@ -5874,6 +5899,7 @@ mod native_host_unix {
                 workspace_id: None,
                 chunks: Vec::new(),
                 next_chunk: 0,
+                upload_generation: 0,
                 side_effect_started: false,
                 fallback_phase: None,
                 cancel_on_disconnect: true,
@@ -5973,6 +5999,7 @@ mod native_host_unix {
                     workspace_id: None,
                     chunks: Vec::new(),
                     next_chunk: 0,
+                    upload_generation: 0,
                     side_effect_started: true,
                     fallback_phase: Some("wait_response"),
                     cancel_on_disconnect: false,
@@ -6008,6 +6035,7 @@ mod native_host_unix {
                     workspace_id: None,
                     chunks: Vec::new(),
                     next_chunk: 0,
+                    upload_generation: 0,
                     side_effect_started: true,
                     fallback_phase: Some("wait_response"),
                     cancel_on_disconnect: false,
@@ -6047,6 +6075,7 @@ mod native_host_unix {
                     workspace_id: None,
                     chunks: Vec::new(),
                     next_chunk: 0,
+                    upload_generation: 0,
                     side_effect_started: true,
                     fallback_phase: Some("wait_response"),
                     cancel_on_disconnect: true,
@@ -6123,6 +6152,7 @@ mod native_host_unix {
                     workspace_id: None,
                     chunks: Vec::new(),
                     next_chunk: 0,
+                    upload_generation: 0,
                     side_effect_started: false,
                     fallback_phase: None,
                     cancel_on_disconnect: true,
@@ -8429,6 +8459,48 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    #[test]
+    fn upload_restart_marker_carries_the_generation_the_client_stamps() {
+        // yz-y5p: a restarted ready_for_file carries the worker's bumped
+        // upload_generation; the client adopts it so the restarted stream is
+        // distinguishable from the one the restart abandoned. A ready_for_file
+        // without the marker keeps generation 0 (the ordinary first-start case),
+        // so an old worker and a new client still agree.
+        let restarted = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_restart".to_string()),
+            Some("run_restart".to_string()),
+            json!({
+                "phase": "ready_for_file",
+                "restored": true,
+                "upload_restarted": true,
+                "resume_from_chunk": 0,
+                "upload_generation": 3,
+            }),
+        );
+        let plain = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_plain".to_string()),
+            Some("run_plain".to_string()),
+            json!({ "phase": "ready_for_file" }),
+        );
+
+        assert!(native_host_unix::should_replay_upload_from_start(
+            &restarted
+        ));
+        assert_eq!(
+            native_host_unix::upload_generation_of(&restarted),
+            3,
+            "the client must adopt the worker's upload generation"
+        );
+        assert_eq!(
+            native_host_unix::upload_generation_of(&plain),
+            0,
+            "a ready_for_file without the marker stays at generation 0"
+        );
+    }
+
+    #[test]
     fn restored_ready_for_file_replays_upload_from_start() {
         let restored = ProtocolEnvelope::new(
             "job_progress",

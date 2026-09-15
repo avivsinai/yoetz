@@ -10635,8 +10635,21 @@ test("service worker restores a waiting_response shard persisted while a poller 
   }
 });
 
-test("service worker still fails receiving_file jobs after service-worker restart", async () => {
+// yz-y5p: a mid-upload restart now tries to RESTART the upload (see the yz-y5p
+// test below), but only when the owned tab can still be rebound. When the tab is
+// gone the job must still reach a terminal: before yz-y5p this path failed
+// state_lost immediately, and trading a guaranteed terminal for a silent hang
+// would be worse than the bug being fixed. The probe budget is spent first now,
+// which is the cost of attempting the restart at all.
+test("service worker still fails receiving_file jobs after a restart when the tab cannot be rebound", async () => {
   const originalChrome = globalThis.chrome;
+  const originalAttempts = globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS;
+  const originalDelay = globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS;
+  // The restart attempt spends the content-script probe budget before giving up;
+  // production keeps the full 40x500ms (same budget the waiting_for_file resume
+  // path already spends), so shrink it here rather than waiting 20s in the suite.
+  globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS = 2;
+  globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS = 1;
   const port = makePort();
   const storage = makeStorage();
   const now = Date.now();
@@ -10663,13 +10676,17 @@ test("service worker still fails receiving_file jobs after service-worker restar
 
   try {
     await import(`../src/service-worker.js?restore_receiving_file=${Date.now()}`);
-    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.job_id === "job_restore_receiving"));
+    // Budget for the content-script probe retries: the restart attempt is made
+    // first, and only its failure produces the terminal.
+    await eventually(() => port.messages.some((message) => message.type === "job_error" && message.job_id === "job_restore_receiving"), 20000);
     const error = port.messages.find((message) => message.type === "job_error" && message.job_id === "job_restore_receiving");
     assert.equal(error.payload.code, "state_lost");
     assert.equal(error.payload.phase, "upload");
     assert.equal(error.payload.side_effect_started, true);
     assert.equal((await storage.get("jobs.job_restore_receiving"))["jobs.job_restore_receiving"].status, "state_lost");
   } finally {
+    globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS = originalAttempts;
+    globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_DELAY_MS = originalDelay;
     globalThis.chrome = originalChrome;
   }
 });
@@ -13781,5 +13798,110 @@ test("service worker list_jobs returns active jobs and the exact inspect command
     } else {
       globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = previousWaitingProgressInterval;
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// yz-y5p: a service-worker restart that lands mid-upload used to end the job with
+// state_lost, because the ChunkAssembler is in-memory only and the persisted job
+// sat in `receiving_file`. The file has NOT been attached to the page at that
+// point, so there is no side effect to reconcile and the upload can simply start
+// over. The worker now drops the partial assembler, bumps upload_generation and
+// re-emits ready_for_file with the restart marker; the client resends from chunk
+// 0 stamping that generation, and a chunk from the abandoned stream is rejected.
+// ---------------------------------------------------------------------------
+
+test("yz-y5p: a restart mid-upload restarts the chunk stream instead of failing state_lost", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  const storage = makeStorage();
+  const now = Date.now();
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  // A job caught mid-upload: chunk 0 of 2 was accepted before the restart, so the
+  // persisted status is receiving_file and the assembler is gone.
+  await storage.set({
+    "jobs.job_y5p": {
+      job_id: "job_y5p",
+      run_id: "run_job_y5p",
+      workspace_id: "workspace_test",
+      status: "receiving_file",
+      prompt: "prompt",
+      tab_id: 77,
+      started_at: now,
+      updated_at: now
+    }
+  });
+
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_y5p" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        if (command.type === "yoetz_probe") {
+          return {
+            ok: true,
+            payload: {
+              recipe: "chatgpt",
+              content_script_instance_id: "cs-y5p",
+              content_script_build: TEST_CONTENT_SCRIPT_BUILD,
+              capabilities: ["native_job_commands_v1", "chatgpt_click_bound_send_receipt_v1"]
+            }
+          };
+        }
+        if (command.type === "yoetz_bind_job") return { ok: true, payload: { rebound: true } };
+        throw new Error(`unexpected tab message ${command.type}`);
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_y5p=${Date.now()}`);
+
+    // Wait for the restored job to be DECIDED either way - offered a restart, or
+    // terminated. Waiting only for ready_for_file would turn "the job was killed"
+    // into a timeout, which reads like a hang instead of the regression it is.
+    await eventually(() => port.messages.some((m) =>
+      (m.type === "job_progress" && m.payload?.phase === "ready_for_file")
+      || (m.type === "job_error" && m.payload?.code)
+    ), 5000);
+
+    const lost = port.messages.find((m) => m.type === "job_error" && m.payload?.code === "state_lost");
+    assert.equal(
+      lost, undefined,
+      "a mid-upload restart must restart the upload, not terminate the job with state_lost"
+    );
+
+    const ready = port.messages.find((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    );
+    assert.equal(ready.payload.upload_restarted, true, "the restart marker must be set");
+    assert.equal(ready.payload.resume_from_chunk, 0, "the client must be told to resend from chunk 0");
+    const generation = ready.payload.upload_generation;
+    assert.ok(Number(generation) >= 1, `upload_generation must be bumped, got ${generation}`);
+
+    // A chunk from the ABANDONED stream (stale generation) must be rejected.
+    port.messages.length = 0;
+    port.emit(envelope("job_file_chunk", "job_y5p", {
+      sequence: 0,
+      total_chunks: 2,
+      total_bytes: 8,
+      filename: "bundle.md",
+      mime_type: "text/markdown",
+      upload_generation: 0,
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("aaaa"))
+    }));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_error" && m.payload?.code === "stale_upload_chunk"
+    ), 5000);
+    const stale = port.messages.find((m) => m.type === "job_error" && m.payload?.code === "stale_upload_chunk");
+    assert.equal(stale.payload.chunk_upload_generation, 0, "the refusal reports the stale generation");
+    assert.equal(stale.payload.upload_generation, generation, "the refusal reports the active generation");
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
   }
 });
