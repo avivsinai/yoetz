@@ -5568,31 +5568,22 @@ mod native_host_unix {
         Ok(false)
     }
 
-    /// yz-y5p upload-replay contract, stated once because three fields are
-    /// involved and only one of them is the trigger.
+    /// yz-91o upload-replay contract (supersedes the yz-y5p "restored is THE
+    /// signal" contract, which is deleted rather than amended per review: a
+    /// stale contract comment that reads as considered is worse than none).
     ///
-    /// `restored` is THE replay signal: it already meant "the service worker
-    /// re-emitted this after a restart", so it keeps that job and needs no new
-    /// wire condition. `upload_restarted` is informational, for the operator and
-    /// the logs, and does NOT drive the client. `upload_generation` is adopted
-    /// whenever it is NEWER than the generation the client holds (yz-91o), so
-    /// the restarted stream is distinguishable from the abandoned one.
-    ///
-    /// yz-91o: every restore path in the service worker now sends
-    /// `restored` + `upload_restarted` + a bumped `upload_generation` together,
-    /// so the replay predicate needs no gap check for the unmarked form.
-    ///
-    /// A second `ready_for_file` WITHOUT `restored` for a job already streaming
-    /// does not restart anything: `should_send_next_chunk` returns
-    /// `client.next_chunk == 0`, which is false mid-stream, so the envelope is
-    /// ignored exactly as before. Silence there is deliberate - a silent restart
-    /// would resend bytes the worker never asked for.
-    ///
-    /// yz-91o: a `ready_for_file` WITH `restored` whose generation is not newer
-    /// than the one the client already holds (a repeated or out-of-order
-    /// announcement for an epoch already adopted) is ignored by the caller, so
-    /// it cannot rewind a stream that is already sending on that epoch and it
-    /// cannot start a concurrent second sender.
+    /// The EPOCH is the replay trigger: a `ready_for_file` carrying an
+    /// `upload_generation` NEWER than the generation the client holds replaces
+    /// the stream and restarts from chunk 0. An OLDER epoch is ignored (a late
+    /// duplicate of an announcement already acted on). The SAME epoch repeated
+    /// is a no-op — it can neither rewind a sending stream nor start a
+    /// concurrent second sender. `restored`/`upload_restarted` are
+    /// informational, for the operator and the logs, and do NOT drive the
+    /// client. A `ready_for_file` with NO epoch does not replay: the client
+    /// has no authority to act on unversioned readiness, and silence there is
+    /// deliberate — a silent restart would resend bytes the worker never
+    /// asked for. All readiness the current worker emits carries the epoch
+    /// (first start = 0, restore/reconnect = fresh bump).
     /// yz-91o: epoch handling is idempotent. A replay whose generation is not
     /// NEWER than the one the client already holds is stale news - an old epoch
     /// can only come from a late duplicate of an announcement the client
@@ -5622,6 +5613,17 @@ mod native_host_unix {
         }
     }
 
+    /// yz-91o (claude's design B5): the EPOCH is the replay trigger, not the
+    /// restored marker. Any ready_for_file carrying an upload_generation NEWER
+    /// than the client holds replaces the stream; the marker fields
+    /// (restored/upload_restarted) are informational. This supersedes the
+    /// earlier "restored is THE signal" contract, which made the client
+    /// depend on WHICH recovery path emitted readiness rather than on the
+    /// authoritative state. Compatibility: a v0.5.77 worker announces epochs
+    /// only on restored readiness, so the epoch trigger covers it; a fresh
+    /// first-start announcement carries generation 0, which never beats the
+    /// client's held epoch (also 0), so first start is not a replay — the
+    /// stream is simply not started yet.
     pub(super) fn should_replay_upload_from_start(envelope: &ProtocolEnvelope) -> bool {
         envelope.kind == "job_progress"
             && envelope
@@ -5629,11 +5631,7 @@ mod native_host_unix {
                 .get("phase")
                 .and_then(Value::as_str)
                 .is_some_and(|phase| phase == "ready_for_file")
-            && envelope
-                .payload
-                .get("restored")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
+            && envelope.payload.get("upload_generation").is_some()
     }
 
     fn local_client_disconnected_cancel(client: &ClientJob) -> ProtocolEnvelope {
@@ -8788,7 +8786,8 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn unmarked_ready_for_file_mid_stream_does_not_restart_the_upload() {
-        // yz-y5p Q2: only `restored` replays. A bare ready_for_file arriving while
+        // yz-91o: only an EPOCH-bearing ready_for_file replays (and only a
+        // strictly newer epoch adopts). A bare ready_for_file arriving while
         // the client is already streaming must be ignored, never treated as a
         // restart, or the client would resend bytes the worker never asked for.
         let bare = ProtocolEnvelope::new(
@@ -8958,6 +8957,10 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn restored_ready_for_file_replays_upload_from_start() {
+        // yz-91o (claude's design B5): the EPOCH is the replay trigger. A
+        // ready_for_file carrying upload_generation replays (newer wins,
+        // per apply_upload_replay_if_newer); one without a generation does
+        // not. restored/upload_restarted are informational only.
         let restored = ProtocolEnvelope::new(
             "job_progress",
             Some("job_restore".to_string()),
@@ -8965,6 +8968,7 @@ mod tests {
             json!({
                 "phase": "ready_for_file",
                 "restored": true,
+                "upload_generation": 3,
             }),
         );
         let fresh = ProtocolEnvelope::new(
@@ -8975,9 +8979,23 @@ mod tests {
                 "phase": "ready_for_file",
             }),
         );
+        let marked_but_unnumbered = ProtocolEnvelope::new(
+            "job_progress",
+            Some("job_marked".to_string()),
+            Some("run_marked".to_string()),
+            json!({
+                "phase": "ready_for_file",
+                "restored": true,
+                "upload_restarted": true,
+            }),
+        );
 
         assert!(native_host_unix::should_replay_upload_from_start(&restored));
         assert!(!native_host_unix::should_replay_upload_from_start(&fresh));
+        assert!(
+            !native_host_unix::should_replay_upload_from_start(&marked_but_unnumbered),
+            "markers without an epoch are informational only — no replay"
+        );
     }
 
     #[test]
