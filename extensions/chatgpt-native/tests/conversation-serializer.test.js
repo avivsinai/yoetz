@@ -55,6 +55,27 @@ function assertSanitized(html, label, redactions) {
   assert.ok(!html.includes("jwt in template"), `${label}: template content must not survive`);
 }
 
+// yz-y5p: the value denylist must not eat benign prose. `=` always assigns, but a
+// colon also separates ordinary label text, so "Session: today" in an aria-label
+// is not a secret; dropping it costs the diagnostic evidence a capture exists to
+// preserve. A colon counts only when a serialized value follows.
+test("yz-y5p: benign 'Session: today' prose survives while a real colon assignment is dropped", () => {
+  const dom = secretLadenDocument(`
+    <main>
+      <div aria-label="Session: today" data-testid="session-list" title="Secret: hidden">history</div>
+      <div data-auth='session: "abc123"'>bearer</div>
+      <div data-q="?access_token=zzz">query</div>
+    </main>
+  `);
+  const html = serializeConversation(dom.window.document);
+
+  assert.ok(html.includes('aria-label="Session: today"'), "a prose colon is not a secret");
+  assert.ok(html.includes('data-testid="session-list"'), "a benign testid value survives");
+  assert.ok(html.includes('title="Secret: hidden"'), "a prose colon in a title is not a secret");
+  assert.ok(!html.includes("abc123"), "a quoted assignment after the colon IS a secret");
+  assert.ok(!html.includes("zzz"), "an access_token= query value is still dropped");
+});
+
 test("conversation serializer redacts secrets but keeps the assistant turn and unknown data-*", () => {
   const dom = secretLadenDocument(`
     <main>

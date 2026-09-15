@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- Upload interrupted by a service-worker restart now restarts its chunk stream
+  instead of terminating the job. The `ChunkAssembler` lives only in memory, so a
+  restart after the first chunk and before the upload completed left the persisted
+  job in `receiving_file` with no way to reconstruct it, and the job died
+  `state_lost` (observed on a 202 KB bundle, run `20260915T094022Z_fd61b5`). At
+  that point the file has not been attached to the page, so there is no side
+  effect to reconcile: the worker now drops the partial assembler, bumps a
+  per-job `upload_generation`, and re-emits `ready_for_file` carrying
+  `upload_restarted: true`, `resume_from_chunk: 0` and that generation. The client
+  resends from chunk 0 stamping the generation, and a chunk from the abandoned
+  stream is refused with `stale_upload_chunk` instead of interleaving. Anything at
+  or past `file_received` still fails `state_lost`, because restarting there could
+  duplicate a page side effect. (`yz-y5p`)
+- Capture sanitizer: a secret-shaped attribute value is matched on `=` always but
+  on `:` only when a serialized value follows (a quote, a brace, or a JWT prefix),
+  so benign prose such as an `aria-label="Session: today"` is no longer dropped.
+  Over-broad redaction costs exactly the diagnostic evidence a capture exists to
+  preserve. (`yz-y5p`)
 ### Added
 - Browser extension/CLI: `yoetz browser extension dump-conversation` — a
   read-only recovery capture, sibling of `dump-picker` (`yz-7iu`). It
