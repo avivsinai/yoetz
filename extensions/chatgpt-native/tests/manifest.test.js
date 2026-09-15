@@ -28,6 +28,7 @@ test("manifest is one multi-site transport package", () => {
       "src/chatgpt-dom.js",
       "src/chatgpt-picker-reader.js",
       "src/picker-serializer.js",
+      "src/conversation-serializer.js",
       "src/claude-dom.js",
       "src/sites/chatgpt.js",
       "src/sites/chatgpt-backend.js",

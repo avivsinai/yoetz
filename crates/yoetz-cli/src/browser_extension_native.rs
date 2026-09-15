@@ -2070,6 +2070,110 @@ fn finalize_picker_capture(
     }))
 }
 
+// `browser extension dump-conversation` (yz-7iu): read-only recovery capture,
+// sibling of dump-picker. Writes the serialized conversation-container HTML to
+// `out_path` and reports the extractor's view next to the raw innerText length
+// so the two can be compared (extractor-drift fixture + operator recovery).
+// Never mutates the page; refuses a live job unless --allow-live-job (the
+// gate lives in the content script, like dump-picker).
+pub fn dump_conversation_run(
+    run_id: &str,
+    out_path: &Path,
+    allow_live_job: bool,
+    selector: ExtensionInstanceSelector<'_>,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    if recipe != BuiltinWebRecipe::Chatgpt {
+        bail!("dump-conversation is only supported with --chatgpt");
+    }
+    let response = send_site_control_job(
+        "dump_conversation",
+        json!({ "run_id": run_id, "recipe": recipe.as_str(), "allow_live_job": allow_live_job }),
+        selector,
+        recipe,
+    )?;
+    finalize_conversation_capture(out_path, &response.payload, run_id, recipe)
+}
+
+// Process a dump_conversation response envelope and write the capture file.
+fn finalize_conversation_capture(
+    out_path: &Path,
+    payload: &Value,
+    run_id: &str,
+    recipe: BuiltinWebRecipe,
+) -> Result<Value> {
+    // A failed envelope (run_not_found / live_job_conflict / ...) arrives as
+    // status="failed" with a code — surface it with inspected_tabs so the
+    // operator sees which tabs were tried and why.
+    if payload.get("status").and_then(Value::as_str) == Some("failed")
+        || payload.get("code").and_then(Value::as_str).is_some()
+    {
+        let code = payload
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or("dump_failed");
+        let msg = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("dump_conversation failed");
+        if let Some(tabs) = payload.get("inspected_tabs").and_then(Value::as_array) {
+            let detail: Vec<String> = tabs
+                .iter()
+                .map(|t| {
+                    let tab_id = t.get("tab_id").and_then(Value::as_i64).unwrap_or(0);
+                    let code = t.get("code").and_then(Value::as_str).unwrap_or("?");
+                    let err = t.get("error").and_then(Value::as_str).unwrap_or("");
+                    format!("tab {tab_id} ({code}): {err}")
+                })
+                .collect();
+            bail!("{code}: {msg}. inspected_tabs: [{}]", detail.join("; "));
+        }
+        bail!("{code}: {msg}");
+    }
+    let html = payload
+        .get("html")
+        .and_then(Value::as_str)
+        .context("dump_conversation reply carried no html")?;
+    let bytes = html.len();
+    if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create parent directory {}", parent.display()))?;
+    }
+    fs::write(out_path, html)
+        .with_context(|| format!("write conversation capture {}", out_path.display()))?;
+    let extracted_chars = payload
+        .get("extracted_chars")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let raw_inner_text_chars = payload
+        .get("raw_inner_text_chars")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let extraction_method = payload
+        .get("extraction_method")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    eprintln!(
+        "conversation capture written to {} ({bytes} bytes)",
+        out_path.display()
+    );
+    eprintln!(
+        "extracted_text: {extracted_chars} chars ({extraction_method}); raw innerText: {raw_inner_text_chars} chars"
+    );
+    Ok(json!({
+        "status": "ok",
+        "transport": TRANSPORT_NAME,
+        "recipe": recipe.as_str(),
+        "dump_conversation": out_path.display().to_string(),
+        "bytes": bytes,
+        "conversation_id": payload.get("conversation_id"),
+        "extraction_method": extraction_method,
+        "extracted_chars": extracted_chars,
+        "raw_inner_text_chars": raw_inner_text_chars,
+        "run_id": run_id,
+    }))
+}
+
 pub fn grant_identity_permission(selector: ExtensionInstanceSelector<'_>) -> Result<Value> {
     let response = send_control_job("request_identity_permission", json!({}), selector)?;
     Ok(json!({
@@ -3763,10 +3867,11 @@ fn send_control_job_with_recipe(
         )
     })?;
     stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT))?;
-    let control_run_id = (kind == "inspect_run" || kind == "dump_picker_html")
-        .then(|| payload.get("run_id").and_then(Value::as_str))
-        .flatten()
-        .map(str::to_string);
+    let control_run_id =
+        (kind == "inspect_run" || kind == "dump_picker_html" || kind == "dump_conversation")
+            .then(|| payload.get("run_id").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_string);
     let envelope = ProtocolEnvelope::new_with_workspace(
         kind,
         Some(job_id),
@@ -3841,6 +3946,7 @@ fn validate_inbound_envelope(envelope: &ProtocolEnvelope) -> Result<()> {
         | "inspect_run"
         | "list_jobs"
         | "dump_picker_html"
+        | "dump_conversation"
         | "request_identity_permission" => {}
         other => bail!("unsupported chrome-extension-native envelope type `{other}`"),
     }
@@ -4710,6 +4816,7 @@ mod native_host_unix {
             | "inspect_run"
             | "list_jobs"
             | "dump_picker_html"
+            | "dump_conversation"
             | "request_identity_permission" => forward_to_extension(&stdout, &forwarded),
             other => Err(anyhow!("unsupported local client message `{other}`")),
         };
@@ -4749,6 +4856,7 @@ mod native_host_unix {
                         | "inspect_run"
                         | "list_jobs"
                         | "dump_picker_html"
+                        | "dump_conversation"
                         | "request_identity_permission" => {
                             if let Err(err) = forward_to_extension(&stdout, &forwarded) {
                                 if let Some(mut client) =

@@ -3110,6 +3110,75 @@ test("service worker dump_picker_html forwards to the run's tab and relays the c
   }
 });
 
+// yz-7iu: dump_conversation forwards the read-only capture command to the
+// run's owned tab and relays the capture result (HTML + extractor-vs-raw
+// comparison) as a terminal job_complete.
+test("service worker dump_conversation forwards to the run's tab and relays the capture", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  await storage.set({
+    "jobs.job_dump_target": inspectableJob({
+      jobId: "job_dump_target",
+      runId: "run_dump",
+      tabId: 13
+    })
+  });
+  let dumpMessage = null;
+  const captureHtml = "<main><div class=\"markdown\">the recovered answer</div></main>";
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      query: async () => [{ id: 13, url: "https://chatgpt.com/c/run", title: "Yoetz run" }],
+      sendMessage: async (_id, message) => {
+        dumpMessage = message;
+        return {
+          ok: true,
+          payload: {
+            html: captureHtml,
+            bytes: captureHtml.length,
+            conversation_id: "conv-7iu",
+            extracted_text: "the recovered answer",
+            extraction_method: "assistant_dom_fallback",
+            extracted_chars: 19,
+            raw_inner_text_chars: 10449
+          }
+        };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?dump_conversation=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("dump_conversation", "job_dump", { run_id: "run_dump", allow_live_job: false }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    assert.equal(dumpMessage.type, "yoetz_dump_conversation");
+    assert.equal(dumpMessage.job_id, "job_dump_target");
+    assert.equal(dumpMessage.run_id, "run_dump");
+    assert.equal(dumpMessage.workspace_id, "workspace_test");
+    assert.equal(dumpMessage.ownership_nonce, "nonce-inspect");
+    assert.equal(dumpMessage.allow_live_job, false);
+    const complete = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_dump"
+    );
+    assert.equal(complete.payload.html, captureHtml);
+    assert.equal(complete.payload.bytes, captureHtml.length);
+    assert.equal(complete.payload.conversation_id, "conv-7iu");
+    assert.equal(complete.payload.extracted_text, "the recovered answer");
+    assert.equal(complete.payload.extraction_method, "assistant_dom_fallback");
+    assert.equal(complete.payload.extracted_chars, 19);
+    assert.equal(complete.payload.raw_inner_text_chars, 10449);
+    assert.equal(complete.payload.run_id, "run_dump");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker inspect_run passes exact workspace identity and no conversation fallback", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

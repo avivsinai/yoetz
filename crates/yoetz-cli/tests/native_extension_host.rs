@@ -642,3 +642,65 @@ fn native_host_forwards_list_jobs_and_routes_the_reply() {
     // The listing is terminal for the control request: no further frames.
     client.assert_no_frame();
 }
+
+// yz-7iu: a `dump_conversation` control message must be accepted as the
+// client's FIRST frame — validator allowlist (site 1), first-frame forward
+// match (site 2), and follow-up control match (site 3) all take the kind —
+// forwarded to the extension, and its job_complete reply routed back to the
+// requesting local client. Sibling of dump-picker; read-only recovery capture.
+#[test]
+fn native_host_forwards_dump_conversation_and_routes_the_reply() {
+    let mut host = NativeHost::start();
+    let token = wait_for_token(&host.token_path);
+
+    // The capture request's FIRST frame is a dump_conversation envelope — no
+    // job_start precedes it.
+    let client = LocalClient::connect_control(
+        &host.socket_path,
+        "job_7iu",
+        &token,
+        "dump_conversation",
+        json!({"run_id": "run_1846dc", "recipe": "chatgpt", "allow_live_job": false}),
+    );
+
+    // The fake extension asserts it RECEIVED the forwarded dump_conversation:
+    // it answers with a terminal job_complete carrying the serialized
+    // conversation HTML plus the extractor-vs-raw comparison, which only makes
+    // sense in reply to the capture request.
+    let forwarded = host.output.take("dump_conversation", "job_7iu");
+    assert_eq!(forwarded["payload"]["run_id"], "run_1846dc");
+    assert_eq!(forwarded["payload"]["recipe"], "chatgpt");
+    assert_eq!(forwarded["payload"]["allow_live_job"], false);
+
+    host.send(extension_frame(
+        "job_complete",
+        "job_7iu",
+        json!({
+            "payload": {
+                "run_id": "run_1846dc",
+                "html": "<main><div class=\"markdown\">the recovered answer</div></main>",
+                "bytes": 55_u64,
+                "conversation_id": "conv-1846dc",
+                "extracted_text": "the recovered answer",
+                "extraction_method": "assistant_dom_fallback",
+                "extracted_chars": 19_u64,
+                "raw_inner_text_chars": 10_449_u64,
+                "tab_id": 12
+            }
+        }),
+    ));
+    let reply = client.take("job_complete");
+    // The extension's capture result rides in payload.payload (mirroring
+    // makeEnvelope's job_complete shape in the service worker); the host
+    // relays it verbatim.
+    assert_eq!(reply["payload"]["payload"]["run_id"], "run_1846dc");
+    assert_eq!(reply["payload"]["payload"]["extracted_chars"], 19);
+    assert_eq!(reply["payload"]["payload"]["raw_inner_text_chars"], 10_449);
+    assert_eq!(
+        reply["payload"]["payload"]["extraction_method"],
+        "assistant_dom_fallback"
+    );
+
+    // The capture is terminal for the control request: no further frames.
+    client.assert_no_frame();
+}
