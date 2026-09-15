@@ -11,6 +11,7 @@ import {
   validateEnvelope
 } from "./protocol.js";
 import { advertisedRecipes, siteAdapterForRecipe } from "./sites/index.js";
+import { recordSwError, recordSwStart, swStartReason, SW_TELEMETRY_KEYS } from "./sw-telemetry.js";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 90 * 60 * 1000;
 const JOB_TTL_MS = 3 * 60 * 60 * 1000;
@@ -246,13 +247,41 @@ let nativePort = null;
 let extensionIdentityPromise = null;
 let connectionGeneration = 0;
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
+  void recordSwStart(swStartReason({ onInstalledReason: details?.reason }));
   connectNative();
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  void recordSwStart(swStartReason({ onStartupFired: true }));
   connectNative();
 });
+
+// yz-9pf: a worker start that is neither onStartup nor onInstalled is a
+// restart (MV3 idle kill, crash, or a yz-4hr-style trigger) — record it so
+// `status` can show the restart trail. Emitted from module init so every
+// start path (including a bare import in the test harness) is counted.
+void recordSwStart(swStartReason({}));
+
+// yz-9pf: error + unhandledrejection telemetry (ring of last 5 in
+// chrome.storage.session, with the active job ids). No behaviour change.
+// Guarded on `self` because the node test harness imports this module
+// without a service-worker global.
+function activeJobIdsForTelemetry() {
+  return [...jobs.entries()]
+    .filter(([, job]) => !TERMINAL_STATUSES.has(job.status))
+    .map(([jobId]) => jobId);
+}
+
+if (typeof self !== "undefined" && self?.addEventListener) {
+  self.addEventListener("error", (event) => {
+    void recordSwError("error", event?.error ?? event?.message, activeJobIdsForTelemetry);
+  });
+
+  self.addEventListener("unhandledrejection", (event) => {
+    void recordSwError("unhandledrejection", event?.reason, activeJobIdsForTelemetry);
+  });
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "yoetz_popup_status") {
