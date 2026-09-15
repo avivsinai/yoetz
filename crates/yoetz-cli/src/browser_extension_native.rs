@@ -5525,6 +5525,24 @@ mod native_host_unix {
             {
                 return Ok(false);
             }
+            // yz-91o review finding: the stale FLAG is not the only marker of an
+            // abandoned-epoch ack. A normal (stale-flag-free) ack echoes the
+            // generation the worker validated under, and a rewind (newer-epoch
+            // adoption, next_chunk -> 0) can leave an in-flight ack from the old
+            // epoch behind it on the socket. Without a generation guard that ack
+            // hits the "arrived before any bundle chunk" bail below and tears
+            // down the client connection for exactly the recovery the epoch
+            // machinery exists to enable. An ack from a generation OLDER than
+            // the client holds is stale news regardless of the flag: ignore it.
+            if let Some(ack_generation) = envelope
+                .payload
+                .get("upload_generation")
+                .and_then(Value::as_u64)
+            {
+                if ack_generation < client.upload_generation {
+                    return Ok(false);
+                }
+            }
             let sequence = envelope
                 .payload
                 .get("sequence")
@@ -6013,6 +6031,49 @@ mod native_host_unix {
             assert!(
                 error.to_string().contains("ahead of expected"),
                 "unexpected error: {error}"
+            );
+        }
+
+        #[test]
+        fn yz91o_old_epoch_ack_after_rewind_is_ignored_not_fatal() {
+            // A normal (stale-flag-free) ack for a chunk of an OLD generation
+            // arriving after the client adopted a newer epoch rewinds
+            // next_chunk to 0; without the generation guard it bails
+            // "arrived before any bundle chunk was sent" and tears down the
+            // client for exactly the recovery the epoch machinery enables.
+            let mut client = y5p_client("job_old_ack", 0);
+            client.upload_generation = 2; // adopted the newer epoch, rewound to 0
+            let old_ack = super::super::ProtocolEnvelope::new(
+                "job_file_chunk_ack",
+                Some("job_old_ack".to_string()),
+                Some("run_job_old_ack".to_string()),
+                serde_json::json!({
+                    "stale": false,
+                    "complete": false,
+                    "sequence": 0,
+                    "upload_generation": 1,
+                }),
+            );
+            assert!(
+                !super::should_send_next_chunk(&client, &old_ack).unwrap(),
+                "an old-epoch ack after a rewind must be ignored, not bail"
+            );
+            // A same-epoch ack still drives the stream: the guard is bounded.
+            client.next_chunk = 1;
+            let same_epoch_ack = super::super::ProtocolEnvelope::new(
+                "job_file_chunk_ack",
+                Some("job_old_ack".to_string()),
+                Some("run_job_old_ack".to_string()),
+                serde_json::json!({
+                    "stale": false,
+                    "complete": false,
+                    "sequence": 0,
+                    "upload_generation": 2,
+                }),
+            );
+            assert!(
+                super::should_send_next_chunk(&client, &same_epoch_ack).unwrap(),
+                "a same-epoch ack must still be processed"
             );
         }
         use super::*;
