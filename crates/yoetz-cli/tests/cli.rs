@@ -1007,3 +1007,81 @@ fn ask_help_documents_no_session() {
         .success()
         .stdout(predicate::str::contains("--no-session"));
 }
+
+// yz-7xv: the extension_instance_id/extension_profile_id selector error must
+// be reachable in both the "installed but nothing connected" and the
+// "not installed" states, and must name the actual reason. The first test
+// pins the "not connected yet / just reloaded" wording (the yz-7xv field
+// repro), the second pins "not installed". Both fail on main, which has a
+// single undiscriminated "install or update the Yoetz Chrome extension"
+// message for every state.
+#[test]
+fn yz_7xv_selector_error_discriminates_not_connected_from_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    let state_dir = dir.path().join("state");
+    let native_dir = state_dir.join("chrome-extension-native");
+    fs::create_dir_all(&native_dir).unwrap();
+    // Installed: manifest, wrapper, and token present, but no instance
+    // records and no reachable socket -> status "disconnected".
+    fs::write(native_dir.join("chatgpt-native.token"), b"test-token").unwrap();
+    fs::write(native_dir.join("yoetz-chrome-native-host"), b"#!/bin/sh\n").unwrap();
+    let manifest_dir = dir.path().join("native-hosts");
+    fs::create_dir_all(&manifest_dir).unwrap();
+    fs::write(
+        manifest_dir.join("com.yoetz.chatgpt_native.json"),
+        "{\"name\":\"com.yoetz.chatgpt_native\"}",
+    )
+    .unwrap();
+    yoetz()
+        .args([
+            "browser",
+            "recipe",
+            "--recipe",
+            "chatgpt",
+            "--var",
+            "extension_instance_id=ext_yz7xv_test",
+        ])
+        .env("YOETZ_DIR", &state_dir)
+        .env("YOETZ_CHROME_NATIVE_MESSAGING_DIR", &manifest_dir)
+        .env(
+            "YOETZ_CHROME_EXTENSION_NATIVE_SOCKET",
+            dir.path().join("absent.sock"),
+        )
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no extension instance is reachable yet (status: disconnected)",
+        ))
+        .stderr(predicate::str::contains(
+            "still reconnecting - retry in a few seconds",
+        ));
+}
+
+#[test]
+fn yz_7xv_selector_error_discriminates_not_installed() {
+    let dir = tempfile::tempdir().unwrap();
+    // Fresh empty state dir: nothing installed -> status "not_installed".
+    let state_dir = dir.path().join("empty-state");
+    let manifest_dir = dir.path().join("native-hosts");
+    fs::create_dir_all(&manifest_dir).unwrap();
+    yoetz()
+        .args([
+            "browser",
+            "recipe",
+            "--recipe",
+            "chatgpt",
+            "--var",
+            "extension_instance_id=ext_yz7xv_test",
+        ])
+        .env("YOETZ_DIR", &state_dir)
+        .env("YOETZ_CHROME_NATIVE_MESSAGING_DIR", &manifest_dir)
+        .env(
+            "YOETZ_CHROME_EXTENSION_NATIVE_SOCKET",
+            dir.path().join("absent.sock"),
+        )
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "which is not installed; run `yoetz browser extension setup --chatgpt`",
+        ));
+}

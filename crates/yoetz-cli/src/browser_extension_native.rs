@@ -1412,7 +1412,60 @@ pub fn status() -> Result<ExtensionStatus> {
     })
 }
 
-/// yz-eld: Ask the newest hello instance for its active (non-terminal) jobs.
+/// yz-7xv: extension update reloads the service worker; for a short window
+/// (measured ~5s) afterwards the site status is not yet "connected", so an
+/// immediately following `yoetz browser recipe` declines to auto-select
+/// chrome-extension-native and rejects the instance-id selector. `update`
+/// therefore waits here until the reloaded instance is reachable again (same
+/// status gate the recipe funnel uses) before reporting success.
+/// Bounded by EXTENSION_RELOAD_VERIFY_TIMEOUT; a timeout returns Ok with the
+/// observed non-connected status so the update result is not lost — the
+/// subsequent recipe failure carries the discriminated selector error.
+pub fn wait_for_site_connection(recipe: BuiltinWebRecipe) -> ExtensionStatus {
+    let deadline = Instant::now() + EXTENSION_RELOAD_VERIFY_TIMEOUT;
+    loop {
+        let status = status();
+        let connected = matches!(&status, Ok(status) if status.status == "connected"
+        && match recipe {
+            BuiltinWebRecipe::Claude => status.claude_ready,
+            BuiltinWebRecipe::Chatgpt => true,
+        });
+        if connected {
+            return status.expect("connected status checked above");
+        }
+        if Instant::now() >= deadline {
+            return status.unwrap_or_else(|_| ExtensionStatus {
+                status: "disconnected",
+                native_host_name: NATIVE_HOST_NAME,
+                extension_id: EXTENSION_ID,
+                hello_seen: false,
+                extension_version: None,
+                extension_instance_id: None,
+                extension_profile_email: None,
+                extension_profile_id: None,
+                manifest_path: PathBuf::new(),
+                manifest_installed: false,
+                wrapper_path: PathBuf::new(),
+                wrapper_installed: false,
+                socket_path: PathBuf::new(),
+                socket_reachable: false,
+                token_path: PathBuf::new(),
+                token_present: false,
+                status_path: PathBuf::new(),
+                status_file_present: false,
+                connected_instances: Vec::new(),
+                active_jobs: Vec::new(),
+                recipes: Vec::new(),
+                claude_ready: false,
+                protocol_version: PROTOCOL_VERSION,
+                detail: "extension status probe failed while waiting for reconnect".to_string(),
+            });
+        }
+        thread::sleep(EXTENSION_RELOAD_VERIFY_INTERVAL);
+    }
+}
+
+/// yz-7xv: Ask the newest hello instance for its active (non-terminal) jobs.
 /// Read-only discovery for operators who lost the run id: the reply carries
 /// run_id, phase/status, started_at, tab_id and the exact `inspect` command.
 /// Best-effort: any transport or parse failure returns an empty listing with
@@ -1811,6 +1864,10 @@ pub fn update_extension(
             update.source_dir.display()
         )
     })?;
+    // yz-7xv: do not return while the reloaded worker is still reconnecting —
+    // the next command in the release runbook (update-then-run) would race the
+    // reload window and reject the instance-id selector.
+    let site_status = wait_for_site_connection(recipe);
     Ok(json!({
         "status": "updated",
         "transport": TRANSPORT_NAME,
@@ -1825,6 +1882,8 @@ pub fn update_extension(
         "copied_files": update.copied_files,
         "reload": reload,
         "extension_instance": instance,
+        "site_status": site_status.status,
+        "site_status_detail": site_status.detail,
     }))
 }
 
