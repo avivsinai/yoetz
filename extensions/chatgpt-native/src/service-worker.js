@@ -3664,10 +3664,18 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
     if (extraction?.manual_handoff) {
       postNative(progress(job, "manual_handoff", extraction.manual_handoff));
       // A recognized rate_limited DOM outcome is the same website throttle seen
-      // through the page: the profile-wide shared cooldown is armed inside
-      // failJob (yz-tpo, the single terminal emitter) so website reads, new
-      // tab creation, and render refresh all pause. The affected job keeps its
-      // existing terminal handling (below).
+      // through the page: arm the profile-wide shared cooldown so website
+      // reads, new tab creation, and render refresh all pause.
+      // yz-tpo: this is an OBSERVATION site, not a terminal — the yz-83b
+      // dismiss-success path below continues the wait loop without ever
+      // reaching failJob, so failJob's arm alone would leave the cooldown
+      // unarmed when a dismiss salvages the answer (the wall stays live for
+      // the next job_start). Arm here exactly as main did, before the dismiss
+      // attempt; the later failJob arm on the failed path is idempotent under
+      // yz-esc (a trip inside an active cooldown holds the escalation level).
+      if (extraction.manual_handoff?.state === "rate_limited") {
+        await throttleBackendApiGateFromRateLimit(adapterRecipeKey(job));
+      }
       // yz-83b: If the rate_limit modal mounted over an already-rendered
       // answer, attempt ONE dismiss of the 'Got it' button to recover the
       // paid-for answer. Fail-closed constraints: wait_response only, rendered
@@ -5487,8 +5495,9 @@ async function failJob(job, code, message, detail = {}) {
   // (before the early returns) covers every path that lands a rate-limited
   // terminal — including handlePollerError's early branches (pending
   // content-script recovery, already-terminal job) that returned before the
-  // old scattered arm could run, which is exactly how run fd4a47 emitted a
-  // typed rate_limited at model_selection with no cooldown armed. The signal
+  // old scattered arm could run; that is the likely path for run fd4a47
+  // (typed rate_limited at model_selection with no cooldown armed), though
+  // its exact emit path was not reproducible from code. The signal
   // is the rate-limit signal only, in both shapes it arrives: the typed
   // content-script error code, and the manual-handoff state field (copied
   // from the prepare_job check). NEVER arm for rate_limit_cooldown_active or

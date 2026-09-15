@@ -11911,6 +11911,143 @@ test("yz-83b: rate_limited with rendered content → dismiss modal → re-extrac
   }
 });
 
+// yz-tpo test 4: the wait_response rate_limited modal observation arms the
+// cooldown even when the yz-83b dismiss salvages the answer — the
+// dismiss-success path continues the wait loop and completes without ever
+// reaching failJob, so without the observation-site arm nothing would arm and
+// the next job_start would open a tab against a live wall.
+test("yz-tpo: dismiss-success at wait_response still arms the cooldown (observation site)", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalSetTimeout = globalThis.setTimeout;
+  const port = makePort();
+  let tabId = 0;
+  let extractCount = 0;
+
+  globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/?_yoetz=run_job_tpo_dismiss" }),
+      sendMessage: async (_id, message) => {
+        const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+        switch (command.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: { recipe: "chatgpt", content_script_instance_id: "test-cs", content_script_build: TEST_CONTENT_SCRIPT_BUILD } };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedLatestProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename, size: 4 } };
+          case "yoetz_send_prompt":
+            return { ok: true, payload: { sent: true, conversation_id: "conv-tpo-d", final_model_selection: { ...verifiedLatestProSelection(), click_bound: true } } };
+          case "yoetz_extract_response": {
+            extractCount++;
+            // Call 1: pre-send baseline; call 2: rate_limited handoff with
+            // rendered content; call 3+: salvaged final answer.
+            if (extractCount === 1) {
+              return {
+                ok: true,
+                payload: { method: "none", text: "", is_generating: false, assistant_count: 0, turn_index: -1, conversation_id: "conv-tpo-d" }
+              };
+            }
+            if (extractCount === 2) {
+              return {
+                ok: true,
+                payload: {
+                  manual_handoff: { state: "rate_limited", message: "Too many requests" },
+                  is_final: false,
+                  method: "page_text_fallback",
+                  text: "",
+                  assistant_count: 0,
+                  conversation_id: "conv-tpo-d",
+                  diagnostics: {
+                    page_text_chars: 0,
+                    page_text_content_chars: 0,
+                    counts: { assistant_roles: 1, conversation_turns: 2, markdown: 3 },
+                    markdown_snippets: [{ tag: "div", text: "rendered answer" }],
+                    assistant_turn_snippets: [{ tag: "div", text: "rendered answer" }]
+                  }
+                }
+              };
+            }
+            return {
+              ok: true,
+              payload: {
+                manual_handoff: null,
+                method: "assistant_dom_fallback",
+                text: "The answer that was rendered before the modal.",
+                is_generating: false,
+                assistant_count: 1,
+                copy_button_count: 1,
+                has_copy_button: true,
+                turn_index: 0,
+                conversation_id: "conv-tpo-d",
+                model_slug: "gpt-5-6-pro"
+              }
+            };
+          }
+          case "yoetz_dismiss_rate_limit_modal":
+            return { ok: true, payload: { clicked: true, control_text: "Got it" } };
+          case "yoetz_rate_limit_modal_state":
+            return { ok: true, payload: { open: false } };
+          default:
+            throw new Error(`unexpected tab message ${command.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yztpo_dismiss=${Date.now()}`);
+    port.emit(envelope("job_start", "job_tpo_dismiss", {
+      prompt: "test prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+
+    await eventually(() => port.messages.some((m) =>
+      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+    ));
+    port.emit(envelope("job_file_chunk", "job_tpo_dismiss", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_tpo_dismiss.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    // The dismiss salvages the answer: the job COMPLETES (never reaches
+    // failJob).
+    await eventually(() => port.messages.some((m) => m.type === "job_complete"), 8000);
+    const complete = port.messages.find((m) => m.type === "job_complete");
+    assert.equal(complete.payload.code, undefined, "job should complete, not error");
+    assert.equal(complete.payload.rate_limit_modal_dismissed, true, "must record the dismiss");
+
+    // The observation-site arm must have armed the cooldown despite the
+    // success: storage throttle_until_ms in the future.
+    const cooldown = await readCooldownState("chatgpt");
+    assert.notEqual(cooldown, null, "cooldown state must exist in storage.session");
+    assert.ok(
+      cooldown.throttle_until_ms > Date.now(),
+      "throttle_until_ms must be in the future: a dismissed-but-real wall must still arm the cooldown"
+    );
+
+    // And the heartbeat/status must report the armed cooldown.
+    port.messages.length = 0;
+    port.emit(envelope("heartbeat", "hb-tpo-dismiss"));
+    await eventually(() => port.messages.some((m) =>
+      m.type === "heartbeat"
+      && m.payload?.cooldown_until_ms?.chatgpt != null
+    ), 5000);
+  } finally {
+    globalThis.chrome = originalChrome;
+    globalThis.setTimeout = originalSetTimeout;
+  }
+});
+
 // yz-83b: rate_limited handoff with ZERO rendered content → no dismiss, job
 // fails rate_limited as today.
 test("yz-83b: rate_limited with zero rendered content → no dismiss, job fails rate_limited", async () => {
@@ -12695,16 +12832,14 @@ test("yz-esc: re-trip during an active cooldown holds the level, neither erases 
 
 // ---------------------------------------------------------------------------
 // yz-tpo: the cooldown arm lives inside failJob, the single terminal emitter.
-// Field evidence run 20260915T064306Z_fd4a47: a typed job_error code
-// rate_limited at phase model_selection landed and cooldown_until_ms stayed
-// null — handlePollerError returned early (pending recovery / already-
-// terminal branches) before the old scattered arm could run. The arm now sits
-// in failJob before its early returns, keyed on the rate-limit signal only.
+// The emitter-level arm is the invariant fix for the fd4a47 field evidence (a
+// typed rate_limited terminal with cooldown_until_ms null); its exact emit
+// path was not reproducible from code — main also arms on the ordinary
+// poller path, so test 1 below is the happy-path + observability test, and
+// test 4 (the wait_response dismiss-success regression) is the only
+// regression test in this PR.
 
-// Test 1: a rate_limited content-script error while a content-script recovery
-// is PENDING for the job still arms the cooldown. On main this path returns
-// through failJob without arming (the blind spot), so it must fail there.
-test("yz-tpo: a typed rate_limited failure at model_selection arms the cooldown (fd4a47)", async () => {
+test("yz-tpo: a typed rate_limited failure arms the cooldown and reports cooldown_until_ms in the terminal payload", async () => {
   const originalChrome = globalThis.chrome;
   const originalSetTimeout = globalThis.setTimeout;
   const port = makePort();
@@ -12726,8 +12861,8 @@ test("yz-tpo: a typed rate_limited failure at model_selection arms the cooldown 
           case "yoetz_configure_model":
             // The rate-limit wall goes up between prepare and the picker
             // choreography: the content script answers the model command with
-            // a typed rate_limited error. No scattered arm site covered this
-            // phase on main — the arm must come from failJob.
+            // a typed rate_limited error. failJob's emitter-level arm must
+            // fire and report cooldown_until_ms on the terminal payload.
             return { ok: false, code: "rate_limited", error: "Too many requests", phase: "model_selection", side_effect_started: false };
           default:
             throw new Error(`unexpected tab message ${command.type}`);
@@ -12750,7 +12885,7 @@ test("yz-tpo: a typed rate_limited failure at model_selection arms the cooldown 
     ), 8000);
 
     // yz-tpo observability: the terminal payload itself must report the
-    // cooldown the arm wrote. This assertion discriminates: main's
+    // cooldown the arm wrote. This is the observability proof — main's
     // rate_limited terminal payload carries no cooldown_until_ms field.
     const terminal = port.messages.find((m) =>
       m.type === "job_error" && m.payload?.code === "rate_limited"
@@ -12764,7 +12899,7 @@ test("yz-tpo: a typed rate_limited failure at model_selection arms the cooldown 
     assert.notEqual(cooldown, null, "cooldown state must exist in storage.session");
     assert.ok(
       cooldown.throttle_until_ms > Date.now(),
-      "throttle_until_ms must be in the future: the rate_limited terminal at model_selection must arm the cooldown (fd4a47 left it null on main)"
+      "throttle_until_ms must be in the future: the rate_limited terminal at model_selection must arm the cooldown"
     );
   } finally {
     globalThis.chrome = originalChrome;

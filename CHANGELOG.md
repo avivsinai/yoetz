@@ -12,8 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `rate_limited` arms the profile-wide cooldown — was previously enforced by
   three scattered call sites (prepare_job manual handoff, poller error,
   wait_response manual handoff), and terminal paths that bypassed those sites
-  could emit a typed `rate_limited` with `cooldown_until_ms` still null (run
-  fd4a47). The arm now runs in `failJob` before its early returns, keyed on
+  could emit a typed `rate_limited` with `cooldown_until_ms` still null (the
+  likely path for run fd4a47; its exact emit path was not reproducible from
+  code). The arm now runs in `failJob` before its early returns, keyed on
   the rate-limit signal in both shapes it arrives (`code === "rate_limited"`
   or a `manual_handoff` terminal with `state: "rate_limited"`) — never for
   `rate_limit_cooldown_active` or `tab_pacing_active` refusals, which would
