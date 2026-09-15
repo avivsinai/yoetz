@@ -16,7 +16,15 @@
 // which is exactly the evidence a drift capture exists to preserve.
 
 const REDACTED_JWT = "[REDACTED_JWT]";
-const JWT_SHAPE = /eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\./g;
+// yz-djy: a JWT is three base64url segments; the old pattern quantified 20+
+// chars into the FIRST segment only, so the 19-char HS256 header
+// ("eyJhbGciOiJIUzI1NiJ9") escaped the guard entirely, and it stopped at the
+// second period, leaving the signature segment appended after [REDACTED_JWT].
+// The signature alone is not the original credential, but whole-token
+// redaction is what this guard claims to do. A trailing negative lookahead
+// anchors the match at the token end (a real token is followed by a
+// non-base64url char or the end of the string), so trailing prose survives.
+const JWT_SHAPE = /eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*(?![A-Za-z0-9_-])/g;
 // Any attribute VALUE carrying a JWT prefix or a secret-bearing key is dropped.
 // `=` always assigns, so it needs no qualification. `:` is ambiguous - it also
 // separates ordinary prose ("Session: today" in an aria-label, "Secret: hidden"
@@ -59,6 +67,15 @@ function attributeIsSafe(name, value) {
 // secret-bearing attribute values, and empties form controls.
 export function sanitizeCaptureClone(clone) {
   for (const node of clone.querySelectorAll(STRIP_BODY_SELECTOR)) {
+    // yz-beb: <template> children live in node.content, NOT childNodes —
+    // emptying childNodes left the parsed fragment intact and it serializes
+    // through outerHTML edits. Remove the element entirely, as the selector
+    // comment always claimed. (querySelectorAll("*") does not descend into
+    // template.content either.)
+    if (node.tagName === "TEMPLATE") {
+      node.remove();
+      continue;
+    }
     while (node.firstChild) node.removeChild(node.firstChild);
   }
   for (const element of [clone, ...clone.querySelectorAll("*")]) {
@@ -71,6 +88,11 @@ export function sanitizeCaptureClone(clone) {
     }
     if (element.matches?.(STRIP_VALUE_SELECTOR)) {
       element.removeAttribute("value");
+      // yz-beb: .value is the live value; serialization renders the CHILD
+      // TEXT of a textarea (its default value). Clear both.
+      if (element.tagName === "TEXTAREA") {
+        while (element.firstChild) element.removeChild(element.firstChild);
+      }
       try {
         element.value = "";
       } catch {
