@@ -2065,10 +2065,20 @@ async function handleTargetedReconnect(message, job) {
     if (job.status === "waiting_response") {
       scheduleNativeReconnectResume(job);
     } else {
+      // yz-91o (fix B): a targeted reconnect reaching a pre-attachment job is
+      // also a fresh epoch — same replay contract as worker-restart recovery:
+      // the client must re-learn the authoritative generation or an older
+      // announcement can pass for current state. Persist BEFORE announcing so
+      // a crash here cannot announce an epoch the worker never recorded.
+      job.upload_generation = Number(job.upload_generation ?? 0) + 1;
+      await persistJob(job);
       postNative(progress(job, "ready_for_file", {
         tab_id: job.tab_id,
         restored: true,
-        message: `${adapterForJob(job).displayName} tab is ready for bundle upload`
+        upload_restarted: true,
+        resume_from_chunk: 0,
+        upload_generation: job.upload_generation,
+        message: `${adapterForJob(job).displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
       }));
     }
   }
@@ -2902,10 +2912,20 @@ async function recoverJobs(message) {
       continue;
     }
     const adapter = adapterForJob(job);
+    // yz-91o (fix B): recoverJobs readiness is a replay too — re-announce the
+    // authoritative epoch so a client that missed the original restart marker
+    // (or restarted its native process) still learns the current generation.
+    // Persist the bump BEFORE announcing so a crash here cannot announce an
+    // epoch the worker never persisted.
+    job.upload_generation = Number(job.upload_generation ?? 0) + 1;
+    await persistJob(job);
     postNative(progress(job, "ready_for_file", {
       tab_id: job.tab_id,
       restored: true,
-      message: `${adapter.displayName} tab is ready for bundle upload`
+      upload_restarted: true,
+      resume_from_chunk: 0,
+      upload_generation: job.upload_generation,
+      message: `${adapter.displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
     }));
   }
   postNative(makeEnvelope("reconnect", {
@@ -3052,7 +3072,26 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
       // still reach a terminal: before yz-y5p it always failed state_lost here,
       // and trading a guaranteed terminal for a silent hang would be worse than
       // the bug being fixed.
-      const uploadRestarted = job.status === "receiving_file";
+      // yz-y5p: remember whether this job was caught mid-upload BEFORE the probe
+      // can mutate status. A restart candidate that cannot reach its tab must
+      // still reach a terminal: before yz-y5p it always failed state_lost here,
+      // and trading a guaranteed terminal for a silent hang would be worse than
+      // the bug being fixed.
+      const wasMidUpload = job.status === "receiving_file";
+      // yz-91o (fix B): EVERY restored pre-attachment readiness establishes a
+      // fresh upload epoch and replays the restart instruction. The old logic
+      // marked only the receiving_file recovery, leaving two confirmed crash
+      // windows where the client never learns the stream reset: (i) recovery
+      // persisted waiting_for_file but died before the marker was delivered —
+      // the next recovery saw waiting_for_file and emitted plain readiness;
+      // (ii) the worker posted a partial-chunk ACK before persisting
+      // waiting_for_file -> receiving_file, so a crash in that window restored
+      // waiting_for_file though the client had already advanced. Bumping the
+      // generation unconditionally on restored readiness is safe: a restored
+      // readiness always restarts the stream from chunk 0, stale-epoch chunks
+      // are nacked (fix A), and a v0.5.77 client adopts the generation
+      // whenever it appears on a restored readiness.
+      const uploadRestarted = true;
       job.connection_generation = connectionGeneration;
       job.updated_at = Date.now();
       jobs.set(job.job_id, job);
@@ -3065,7 +3104,7 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
         recordContentScriptContract(job, contentScriptProbe);
         await sendToTab(job.tab_id, { type: "yoetz_bind_job", job });
       } catch (error) {
-        if (uploadRestarted) {
+        if (wasMidUpload) {
           chunks.discard(job.job_id);
           await failJob(job, "state_lost", `job ${job.job_id} lost in-memory extension state after service-worker restart and could not rebind its tab to restart the upload: ${String(error?.message ?? error)}`, {
             phase: "upload",
@@ -3081,26 +3120,19 @@ async function restoreJobsFromStorage({ emitLostState = false } = {}) {
       // partial assembler (the restart already destroyed it; this also clears any
       // entry a racing late chunk created) and bump upload_generation so chunks
       // from the pre-restart stream are rejected instead of interleaving with the
-      // new one. The marker is the ONLY signal the client restarts on.
-      if (uploadRestarted) {
-        chunks.discard(job.job_id);
-        job.upload_generation = Number(job.upload_generation ?? 0) + 1;
-        job.status = "waiting_for_file";
-      }
+      // new one. The marker is the ONLY signal the client restarts on. yz-91o:
+      // now unconditional for every restored pre-attachment job.
+      chunks.discard(job.job_id);
+      job.upload_generation = Number(job.upload_generation ?? 0) + 1;
+      job.status = "waiting_for_file";
       await persistJob(job);
       postNative(progress(job, "ready_for_file", {
         tab_id: job.tab_id,
         restored: true,
-        ...(uploadRestarted
-          ? {
-              upload_restarted: true,
-              resume_from_chunk: 0,
-              upload_generation: job.upload_generation
-            }
-          : {}),
-        message: uploadRestarted
-          ? `${adapterForJob(job).displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
-          : `${adapterForJob(job).displayName} tab is ready for bundle upload`
+        upload_restarted: true,
+        resume_from_chunk: 0,
+        upload_generation: job.upload_generation,
+        message: `${adapterForJob(job).displayName} tab is ready for bundle upload; restarting the interrupted upload from chunk 0`
       }));
       continue;
     }
