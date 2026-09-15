@@ -973,7 +973,33 @@ async function acceptFileChunk(message) {
   // restarted, so an older client keeps working but cannot corrupt a restart.
   const jobUploadGeneration = Number(job.upload_generation ?? 0);
   const chunkUploadGeneration = Number(message.payload?.upload_generation ?? 0);
-  if (chunkUploadGeneration !== jobUploadGeneration) {
+  if (chunkUploadGeneration < jobUploadGeneration) {
+    // A late chunk from the stream the restart abandoned. This is the EXPECTED
+    // artifact of an upload restart, not an error: the client was mid-flight when
+    // the worker re-emitted ready_for_file. Failing here would kill exactly the
+    // job the restart exists to save. The generation check already keeps it out
+    // of the assembler, so dropping it is sufficient; it is nacked so the client
+    // can log it and so a sequence ack is never mistaken for progress.
+    postNative(makeEnvelope("job_file_chunk_ack", {
+      request_id: message.request_id,
+      job_id: job.job_id,
+      run_id: job.run_id,
+      workspace_id: job.workspace_id,
+      capability_token: job.capability_token,
+      payload: {
+        stale: true,
+        complete: false,
+        sequence: Number(message.payload?.sequence ?? -1),
+        upload_generation: jobUploadGeneration,
+        chunk_upload_generation: chunkUploadGeneration
+      }
+    }));
+    return;
+  }
+  if (chunkUploadGeneration > jobUploadGeneration) {
+    // Impossible from a single well-behaved client: the worker owns the counter
+    // and only ever raises it. A higher generation means a second client is
+    // streaming into this job, so fail closed rather than accept either stream.
     await failJob(job, "stale_upload_chunk", `job ${job.job_id} received a chunk from upload generation ${chunkUploadGeneration} while generation ${jobUploadGeneration} is active`, {
       phase: "upload",
       side_effect_started: Boolean(job.tab_id),

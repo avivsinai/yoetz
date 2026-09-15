@@ -13883,7 +13883,10 @@ test("yz-y5p: a restart mid-upload restarts the chunk stream instead of failing 
     const generation = ready.payload.upload_generation;
     assert.ok(Number(generation) >= 1, `upload_generation must be bumped, got ${generation}`);
 
-    // A chunk from the ABANDONED stream (stale generation) must be rejected.
+    // A late chunk from the ABANDONED stream must be DROPPED, not fatal. It is the
+    // expected artifact of a restart (the client was mid-flight when the worker
+    // re-emitted ready_for_file), so failing here would kill the job the restart
+    // exists to save. It is nacked so the client can tell it apart from progress.
     port.messages.length = 0;
     port.emit(envelope("job_file_chunk", "job_y5p", {
       sequence: 0,
@@ -13894,12 +13897,35 @@ test("yz-y5p: a restart mid-upload restarts the chunk stream instead of failing 
       upload_generation: 0,
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("aaaa"))
     }));
+    await eventually(() => port.messages.some((m) => m.type === "job_file_chunk_ack"), 5000);
+    const nack = port.messages.find((m) => m.type === "job_file_chunk_ack");
+    assert.equal(nack.payload.stale, true, "a late chunk from the abandoned stream is nacked as stale");
+    assert.equal(nack.payload.complete, false, "a stale nack is never completion");
+    assert.equal(nack.payload.chunk_upload_generation, 0, "the nack reports the stale generation");
+    assert.equal(nack.payload.upload_generation, generation, "the nack reports the active generation");
+    assert.equal(
+      port.messages.find((m) => m.type === "job_error"), undefined,
+      "a late chunk from the abandoned stream must NOT fail the job it was restarted to save"
+    );
+
+    // The restarted stream still completes: the job survived the stale chunk.
+    port.messages.length = 0;
+    for (const [sequence, text] of [[0, "aa"], [1, "bb"]]) {
+      port.emit(envelope("job_file_chunk", "job_y5p", {
+        sequence,
+        total_chunks: 2,
+        total_bytes: 4,
+        filename: "bundle.md",
+        mime_type: "text/markdown",
+        upload_generation: generation,
+        bytes_base64: uint8ArrayToBase64(new TextEncoder().encode(text))
+      }));
+    }
     await eventually(() => port.messages.some((m) =>
-      m.type === "job_error" && m.payload?.code === "stale_upload_chunk"
+      m.type === "job_file_chunk_ack" && m.payload?.complete === true
     ), 5000);
-    const stale = port.messages.find((m) => m.type === "job_error" && m.payload?.code === "stale_upload_chunk");
-    assert.equal(stale.payload.chunk_upload_generation, 0, "the refusal reports the stale generation");
-    assert.equal(stale.payload.upload_generation, generation, "the refusal reports the active generation");
+    const done = port.messages.find((m) => m.type === "job_file_chunk_ack" && m.payload?.complete === true);
+    assert.equal(done.payload.upload_generation, generation, "the completing ack carries the active generation");
   } finally {
     globalThis.chrome = originalChrome;
     globalThis.setTimeout = originalSetTimeout;
