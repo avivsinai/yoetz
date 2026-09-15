@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/release.sh <version> [options]
+Usage: ./scripts/release.sh [options] <version>
 
 Examples:
   ./scripts/release.sh 0.2.24
