@@ -12698,8 +12698,8 @@ test("yz-esc: re-trip during an active cooldown holds the level, neither erases 
 //   1. min-gap refusal: typed tab_pacing_active, reason "min_gap", no tab.
 //   2. max-concurrent refusal: reason "max_concurrent", wait_remaining_ms 0,
 //      active_jobs counted from the rehydratable jobs map.
-//   3. override floor: TAB_PACING_MAX_CONCURRENT=0 is floored at 1 so an
-//      operator cannot configure the extension into refusing every job.
+//   3. override floor: TAB_PACING_MAX_CONCURRENT=0 is floored at 1 — two jobs,
+//      because one job alone cannot tell a floor of 1 from no cap at all.
 // ---------------------------------------------------------------------------
 
 function yz0fdTabStub({ port, sentJobs = null } = {}) {
@@ -12941,8 +12941,10 @@ test("yz-0fd: TAB_PACING_MAX_CONCURRENT override of 0 is floored at 1", async ()
   const originalSetTimeout = globalThis.setTimeout;
   const originalMax = globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT;
   const port = makePort();
+  let tabCreateCount = 0;
 
   globalThis.setTimeout = (fn, _ms, ...args) => originalSetTimeout(fn, 0, ...args);
+  // The suite default min gap is 0, so only the concurrent cap can trip here.
   globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT = 0;
   globalThis.chrome = chromeStub({
     port,
@@ -12950,34 +12952,80 @@ test("yz-0fd: TAB_PACING_MAX_CONCURRENT override of 0 is floored at 1", async ()
   });
 
   try {
+    const innerCreate = globalThis.chrome.tabs.create;
+    globalThis.chrome.tabs.create = async (opts) => { tabCreateCount++; return innerCreate(opts); };
+    // Job A must stay ACTIVE while job B starts, so its extraction never
+    // finalizes. One job on its own proves nothing here: with no active job to
+    // collide with, an unlimited cap and a cap floored at 1 behave identically.
+    const savedSendMessage = globalThis.chrome.tabs.sendMessage;
+    globalThis.chrome.tabs.sendMessage = async (_id, message) => {
+      const command = message?.type === "yoetz_secure_command" ? message.payload : message;
+      if (command.type === "yoetz_extract_response") {
+        return { ok: true, payload: { method: "assistant_dom_fallback", text: "partial", is_generating: true, assistant_count: 1, copy_button_count: 0, has_copy_button: false, turn_index: 0, conversation_id: `conv-${command.job.job_id}` } };
+      }
+      return savedSendMessage(_id, message);
+    };
+
     await import(`../src/service-worker.js?yz_0fd_floor=${Date.now()}`);
     await eventually(() => port.messages.some((m) => m.type === "hello"));
 
-    // With the cap floored at 1 and no active jobs, a job must be allowed.
-    port.emit(envelope("job_start", "job_0fd_floor", {
-      prompt: "floor",
+    // Leg 1: the floor must ALLOW the first job. A cap that honoured the
+    // literal 0 would refuse every job forever, including this one.
+    port.emit(envelope("job_start", "job_0fd_floor_a", {
+      prompt: "floor a",
       wait_interval_ms: 50,
-      wait_timeout_ms: 5000
+      wait_timeout_ms: 120000
     }));
     await eventually(() => port.messages.some((m) =>
-      m.type === "job_progress" && m.payload?.phase === "ready_for_file"
+      m.type === "job_progress" && m.job_id === "job_0fd_floor_a" && m.payload?.phase === "ready_for_file"
     ), 5000);
-    port.emit(envelope("job_file_chunk", "job_0fd_floor", {
+    assert.equal(tabCreateCount, 1, "a cap floored at 1 must let the first job open its tab");
+    port.emit(envelope("job_file_chunk", "job_0fd_floor_a", {
       sequence: 0,
       total_chunks: 1,
       total_bytes: 4,
-      filename: "job_0fd_floor.md",
+      filename: "job_0fd_floor_a.md",
       mime_type: "text/markdown",
       bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
     }));
     await eventually(() => port.messages.some((m) =>
-      m.type === "job_complete" && m.job_id === "job_0fd_floor"
+      m.type === "job_progress" && m.job_id === "job_0fd_floor_a" && m.payload?.phase === "prompt_sent"
+    ), 5000);
+
+    // Leg 2: with A still active, the floored cap of 1 must REFUSE B. This is
+    // the half that discriminates: an unfloored/unlimited cap opens a second tab.
+    port.messages.length = 0;
+    port.emit(envelope("job_start", "job_0fd_floor_b", {
+      prompt: "floor b",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 5000
+    }));
+    // Wait for B to be DECIDED either way - refused, or admitted far enough to
+    // open its own tab. Waiting only for the refusal would turn "B was
+    // admitted" into a timeout, which reads like a hang instead of the
+    // regression it is.
+    await eventually(() => port.messages.some((m) =>
+      m.job_id === "job_0fd_floor_b"
+      && ((m.type === "job_error" && m.payload?.code === "tab_pacing_active")
+        || (m.type === "job_progress" && m.payload?.phase === "ready_for_file"))
     ), 5000);
 
     const refused = port.messages.find((m) =>
-      m.type === "job_error" && m.payload?.code === "tab_pacing_active"
+      m.type === "job_error" && m.job_id === "job_0fd_floor_b" && m.payload?.code === "tab_pacing_active"
     );
-    assert.equal(refused, undefined, "floor of 1 must not refuse a job when nothing is active");
+    assert.ok(refused, "job B must be refused while job A is active: a cap floored at 1 admits one job, not two");
+    assert.equal(refused.payload.reason, "max_concurrent", "reason must say WHICH limit tripped");
+    assert.equal(refused.payload.active_jobs, 1, "exactly job A is active");
+    assert.equal(refused.payload.side_effect_started, false, "no side effect before pacing clears");
+    assert.equal(tabCreateCount, 1, "no second tab may be opened while the cap refuses");
+
+    // Cancel the hung job so the test does not leak a timer.
+    port.emit(envelope("job_cancel", "job_0fd_floor_a"));
+    await eventually(() => port.messages.some((m) =>
+      m.job_id === "job_0fd_floor_a"
+      && (m.type === "job_error" || m.type === "job_complete" || m.type === "job_cancel"
+        || m.payload?.phase === "cancelled")
+    ), 5000);
   } finally {
     globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT = originalMax;
     globalThis.chrome = originalChrome;

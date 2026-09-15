@@ -690,7 +690,13 @@ async function startJob(message) {
       return;
     }
     if (pacing) {
-      await failJob(job, "tab_pacing_active", `ChatGPT tab pacing is active (${pacing.reason}; ${pacing.activeJobs} active job(s)); not opening a new tab. Wait ${pacing.waitRemainingMs}ms then retry.`, {
+      // max_concurrent has waitRemainingMs 0: there is no timer to wait out, only
+      // a job to finish. Telling the caller to "wait 0ms then retry" would invite
+      // exactly the hot retry loop this refusal exists to prevent.
+      const retryAdvice = pacing.reason === "max_concurrent"
+        ? `Wait for one of the ${pacing.activeJobs} active job(s) to finish, then retry.`
+        : `Wait ${pacing.waitRemainingMs}ms then retry.`;
+      await failJob(job, "tab_pacing_active", `ChatGPT tab pacing is active (${pacing.reason}; ${pacing.activeJobs} active job(s)); not opening a new tab. ${retryAdvice}`, {
         phase: "profile",
         side_effect_started: false,
         reason: pacing.reason,

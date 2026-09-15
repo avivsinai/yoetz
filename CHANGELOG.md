@@ -19,7 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reserved inside the gate-mutex section that allows the job, so two
   job_starts in the same second cannot both pass the check. Nothing in the
   worker retries a refused job — the caller gets exactly one refusal and
-  decides when to retry. (`yz-0fd`)
+  decides when to retry. The refusal message names what to wait for rather
+  than a duration: `max_concurrent` carries `wait_remaining_ms` 0, so
+  "wait 0ms then retry" would have invited the hot retry loop the refusal
+  exists to prevent; it now says to wait for one of the active jobs to
+  finish. (`yz-0fd`)
 ### Fixed
 - ChatGPT rate-limit cooldown: the escalation level now counts
   expiry-then-re-trip *cycles* only. A trip that lands while a cooldown is
