@@ -6,6 +6,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- Upload-epoch fencing: a chunk or ack from an abandoned upload stream can no
+  longer kill a job the restart rescued. `yz-y5p` classified a stale chunk only
+  AFTER the accepting-status check, so once the restarted stream finished and
+  the job moved past `receiving_file`, a late low-generation chunk hit
+  `unexpected_chunk` and terminated the job — the exact outcome the restart
+  exists to prevent, in the window nobody had tested. Generation classification
+  now runs before the phase rejection, in every phase. Readiness
+  (`ready_for_file`) carries the authoritative `upload_generation` on first
+  start, restore and reconnect, so the client no longer has to infer a restart
+  from which recovery path fired: a newer epoch replaces the stream from chunk
+  0, an older one is ignored, and a repeat of the same epoch is a no-op rather
+  than a second concurrent sender. The `waiting_for_file` → `receiving_file`
+  transition is persisted before the first chunk ack is posted, closing a crash
+  window that restored a status the client had already advanced past, and
+  `receiving_file` is now reconnect-resumable instead of failing
+  `bridge_interrupted`. (`yz-91o`)
+- Capture sanitizer: `<template>` elements are removed outright rather than
+  emptied, and a `<textarea>` loses its default text content as well as its
+  value. Both carried page content into a capture that the element-body strip
+  did not reach. (`yz-beb`)
+- Capture sanitizer: JWT redaction now replaces the WHOLE token instead of the
+  matched prefix, so no trailing segment survives, and the credential shapes it
+  recognises extend to quoted-JSON values, `Bearer` headers, `#fragment` forms,
+  and the values of known credential-bearing attributes. (`yz-djy`)
 
 ## [0.5.77] - 2026-09-15
 ### Added
