@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.77] - 2026-09-15
 ### Added
 - Browser extension/CLI: `yoetz browser extension dump-conversation` — a
   read-only recovery capture, sibling of `dump-picker` (`yz-7iu`). It
@@ -56,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   setup; installed but not connected yet → "the reloaded extension is still
   reconnecting - retry in a few seconds"; connected but transport pinned
   away → names the pin and the instance (`yz-7xv`).
+
 
 ## [0.5.76] - 2026-09-15
 ### Added
