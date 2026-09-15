@@ -22,6 +22,7 @@ cargo clippy                   # Lint
 ```
 
 Tests use `assert_cmd`, `predicates`, and `serial_test` — no API keys needed for `cargo test`. Locally run only the focused test file you changed plus its discrimination run against main; full suites run in CI.
+- Beads: claim with `bd update <id> --status in_progress`. Only the orchestrator closes a bead, and only after its PR merges. `bd` does not expand `@file`; pass descriptions inline with `--description "$(cat <file>)"`, never a scratchpad path.
 
 ## Release
 

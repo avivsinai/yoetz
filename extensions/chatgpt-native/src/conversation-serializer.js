@@ -1,33 +1,31 @@
-// picker-serializer.js — shared ChatGPT model-picker menu serializer.
+// conversation-serializer.js — shared ChatGPT conversation-container
+// serializer for the dump-conversation capture command (yz-7iu).
 //
-// Clones the open [role="menu"] (falling back to the first [role="menu"]),
+// Sibling of picker-serializer.js: clones the main conversation container,
 // bakes computed inert/display:none/visibility:hidden state inline, and
-// returns sanitized outerHTML (capture-sanitizer.js, shared with the
-// conversation serializer — yz-7iu). The output is a snapshot fixture
-// consumed by tests/chatgpt-picker-reader.test.js (jsdom).
+// returns sanitized outerHTML. Read-only: it never mutates the live page
+// (all edits happen on the clone).
 //
-// One serializer, two callers:
-//   - scripts/capture-chatgpt-picker.mjs (raw CDP Runtime.evaluate)
-//   - src/content-script.js dump_picker_html (native-messaging channel)
-//
-// Computed styles are baked in because jsdom has no layout engine — the
-// reader's attribute+inline-style visibility predicate cannot see
-// stylesheet-driven hiding. See docs/design/chatgpt-picker-reader.md,
-// "Snapshot fixtures replace hand-built fakes" and the "jsdom boundary".
+// Sanitization lives in capture-sanitizer.js and is shared with the picker
+// serializer: a conversation dump serializes <main> (or body on a degraded
+// page) and can carry session secrets — hidden input values, template
+// fragments, style blocks, data-* token attributes, JWT-shaped strings.
+// The output is both an operator recovery artifact (a rendered answer on a
+// preserved tab that the extractor under-reads) and an extractor-drift
+// fixture: the same page is reported through the current extractor next to
+// the raw innerText length so the two can be compared.
 
 import { redactSecrets, sanitizeCaptureClone } from "./capture-sanitizer.js";
 
-export function serializePickerMenu(root = document) {
-  // The open surface is a [role="menu"] with data-state="open", falling back
-  // to any [role="menu"]; the hybrid advanced view (which carries the family
-  // radios but is not a [role="menu"]) is the third option so a collapsed
-  // Select-model surface serializes instead of throwing.
-  const live = root.querySelector('[role="menu"][data-state="open"]')
-    || root.querySelector('[role="menu"]')
-    || root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"][data-state="open"]')
-    || root.querySelector('[data-testid="composer-model-picker-slider-advanced-view"]');
+export function serializeConversation(root = document) {
+  // The conversation surface: ChatGPT renders the transcript inside <main>
+  // (falling back to the article container, then body so a degraded page
+  // still produces a capture instead of throwing).
+  const live = root.querySelector("main")
+    || root.querySelector("article")
+    || root.body;
   if (!live) {
-    throw new Error('no [role="menu"] or advanced picker view found in the page');
+    throw new Error("no conversation container found in the page");
   }
   const clone = live.cloneNode(true);
 
@@ -47,13 +45,12 @@ export function serializePickerMenu(root = document) {
 
   // Walk live and clone in parallel (same tree order) to copy live state onto
   // the clone: computed inert as an attribute, data-state/aria-* verbatim, and
-  // computed display/visibility written inline when none/hidden.
+  // computed display/visibility written inline when none/hidden. Identical
+  // treatment to picker-serializer.js so the two fixtures stay comparable.
   function sync(liveEl, cloneEl) {
     if (!liveEl || !cloneEl || cloneEl.nodeType !== 1) return;
     if (effectivelyInert(liveEl)) cloneEl.setAttribute("inert", "");
     else cloneEl.removeAttribute("inert");
-    // data-state and aria-* are already attributes on the clone (it was cloned
-    // from live), but re-copy to guarantee they survive any later mutation.
     if (liveEl.hasAttribute("data-state")) {
       cloneEl.setAttribute("data-state", liveEl.getAttribute("data-state"));
     }
@@ -66,10 +63,6 @@ export function serializePickerMenu(root = document) {
     for (const name of ariaNames) {
       cloneEl.setAttribute(name, liveEl.getAttribute(name));
     }
-    // Bake computed display/visibility inline so jsdom's attribute+inline-style
-    // readability predicate sees the same hidden state Chrome does. Only write
-    // when the computed value hides the node; never overwrite an existing
-    // inline value that already expresses the same intent.
     const computed = computedStyleFor(liveEl);
     if (computed) {
       if (computed.display === "none") cloneEl.style.setProperty("display", "none", "important");
@@ -79,8 +72,6 @@ export function serializePickerMenu(root = document) {
     const cloneKids = cloneEl.children;
     let cloneIndex = 0;
     for (let liveIndex = 0; liveIndex < liveKids.length && cloneIndex < cloneKids.length; liveIndex++) {
-      // Index parity holds only because cloneNode(true) preserves child order,
-      // so liveKids[i] corresponds to cloneKids[i] one-to-one.
       sync(liveKids[liveIndex], cloneKids[cloneIndex]);
       cloneIndex++;
     }
@@ -92,6 +83,6 @@ export function serializePickerMenu(root = document) {
   // surviving JWT-shaped string and report the count.
   sanitizeCaptureClone(clone);
   const { html, redactions } = redactSecrets(clone.outerHTML);
-  serializePickerMenu.lastRedactions = redactions;
+  serializeConversation.lastRedactions = redactions;
   return html;
 }

@@ -19,6 +19,7 @@ export const MESSAGE_TYPES = Object.freeze([
   "inspect_run",
   "list_jobs",
   "dump_picker_html",
+  "dump_conversation",
   "request_identity_permission",
   "terminal_ack"
 ]);

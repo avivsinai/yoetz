@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- Browser extension/CLI: `yoetz browser extension dump-conversation` — a
+  read-only recovery capture, sibling of `dump-picker` (`yz-7iu`). It
+  serializes the ChatGPT conversation container through the extension native
+  channel with the same baked hidden-state treatment as the picker
+  serializer, writes the HTML to `--path`, and prints the extractor's view
+  (chars + method) next to the raw innerText length so extractor drift is
+  visible at capture time. Ownership-checked like every capture command and
+  refuses a live job unless `--allow-live-job` (`yz-7iu`).
+### Fixed
+- Browser extension: DOM captures are sanitized before they reach disk.
+  Both `dump-picker` and `dump-conversation` now run a shared
+  `capture-sanitizer.js` pass: script/style/template/noscript/iframe/object/
+  embed/svg/use/canvas bodies stripped, form-control values blanked, on*/
+  srcdoc dropped, any attribute whose value is secret-shaped (JWT prefix or
+  token/secret/api-key style assignment) dropped, and the per-run
+  `data-yoetz-ownership-nonce` redacted to `[REDACTED]`. Unknown `data-*`
+  names are kept — values leak, names are the drift evidence. A final
+  JWT-shape guard replaces survivors with `[REDACTED_JWT]` and reports the
+  redaction count on the reply payload; the CLI prints a warning when > 0
+  (`yz-7iu`).
 
 ## [0.5.76] - 2026-09-15
 ### Added

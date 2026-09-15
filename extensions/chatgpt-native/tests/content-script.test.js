@@ -760,10 +760,30 @@ test("content script dump_picker_html serializes the open picker menu", async ()
   );
   try {
     globalThis.window.name = "yoetz-chatgpt-native:run-dump:job-dump|workspace_test|nonce-inspect";
-    // An open picker menu already mounted in the fake document.
+    // An open picker menu already mounted in the fake document. The clone
+    // must satisfy the capture-sanitizer walk: getAttributeNames/getAttribute
+    // for the value denylist and matches() for the form-control selector.
     const menuStub = {
       outerHTML: "<div role=\"menu\" data-state=\"open\"><div role=\"menuitemradio\" aria-checked=\"true\">Latest</div></div>",
-      cloneNode() { return { outerHTML: menuStub.outerHTML, querySelectorAll: () => [], removeAttribute() {}, setAttribute() {}, style: { setProperty() {} } }; },
+      cloneNode() {
+        return {
+          outerHTML: menuStub.outerHTML,
+          querySelectorAll: () => [],
+          getAttributeNames: () => [],
+          getAttribute: () => null,
+          hasAttribute: () => false,
+          removeAttribute: () => {},
+          setAttribute: () => {},
+          matches: () => false,
+          attributes: [],
+          children: [],
+          nodeType: 1,
+          style: { setProperty() {} }
+        };
+      },
+      hasAttribute: () => false,
+      attributes: [],
+      children: [],
       nodeType: 1
     };
     globalThis.document.querySelector = (selector) => (String(selector).includes("role=\"menu\"")

@@ -479,6 +479,12 @@ enum BrowserExtensionCommand {
     /// channel and write the serialized menu HTML to a file. Supersedes the
     /// `--dump-picker-html` flag on `inspect` (kept as a hidden alias).
     DumpPicker(BrowserExtensionDumpPickerArgs),
+    /// Capture the ChatGPT conversation container through the extension
+    /// native channel and write the serialized HTML to a file (read-only
+    /// recovery capture, yz-7iu). Prints the extractor's view next to the raw
+    /// innerText length so the two can be compared. Refuses a live job unless
+    /// --allow-live-job.
+    DumpConversation(BrowserExtensionDumpConversationArgs),
     /// Request the optional `identity.email` permission so profile_email
     /// becomes available as an opt-in routing verifier.
     GrantIdentity(BrowserExtensionMaintenanceArgs),
@@ -619,6 +625,40 @@ struct BrowserExtensionDumpPickerArgs {
     /// Opt in to dumping the picker on a live (in-flight) job's tab. Without
     /// this flag the dump is refused on a live job so a recipe mid
     /// model_selection is not aborted by the dump's pointerdown + Escape.
+    #[arg(long, default_value_t = false)]
+    allow_live_job: bool,
+
+    /// Route to a Chrome profile email reported by extension status.
+    #[arg(long, alias = "profile_email")]
+    profile_email: Option<String>,
+
+    /// Route to the stable extension instance id reported by extension status.
+    #[arg(long, alias = "extension_instance_id")]
+    extension_instance_id: Option<String>,
+
+    /// Route to a Chrome extension profile id reported by extension status.
+    #[arg(long, alias = "extension_profile_id")]
+    extension_profile_id: Option<String>,
+}
+
+#[derive(Args)]
+struct BrowserExtensionDumpConversationArgs {
+    #[arg(long)]
+    chatgpt: bool,
+    #[arg(long)]
+    claude: bool,
+
+    /// Yoetz run id whose tab should be captured.
+    #[arg(long, alias = "run_id")]
+    run_id: String,
+
+    /// Output path for the serialized conversation HTML.
+    #[arg(long, value_name = "PATH", alias = "out")]
+    path: PathBuf,
+
+    /// Opt in to capturing a live (in-flight) job's tab. Without this flag
+    /// the capture is refused on a live job so a recipe mid model_selection
+    /// is not disturbed.
     #[arg(long, default_value_t = false)]
     allow_live_job: bool,
 
@@ -3985,6 +4025,24 @@ fn handle_browser_extension(
             (
                 "browser.extension.dump_picker",
                 browser_extension_native::dump_picker_html_run(
+                    &args.run_id,
+                    &args.path,
+                    args.allow_live_job,
+                    selector,
+                    recipe,
+                )?,
+            )
+        }
+        BrowserExtensionCommand::DumpConversation(args) => {
+            let recipe = extension_site_scope(args.chatgpt, args.claude)?;
+            let selector = extension_selector_from_parts(
+                args.profile_email.as_ref(),
+                args.extension_instance_id.as_ref(),
+                args.extension_profile_id.as_ref(),
+            );
+            (
+                "browser.extension.dump_conversation",
+                browser_extension_native::dump_conversation_run(
                     &args.run_id,
                     &args.path,
                     args.allow_live_job,

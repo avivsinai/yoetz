@@ -506,6 +506,9 @@ async function handleNativeMessage(message, sourcePort = nativePort, sourceGener
       case "dump_picker_html":
         await handleDumpPickerHtml(message);
         break;
+      case "dump_conversation":
+        await handleDumpConversation(message);
+        break;
       case "request_identity_permission":
         await handleRequestIdentityPermission(message);
         break;
@@ -2537,8 +2540,177 @@ async function handleDumpPickerHtml(message) {
       service_worker_build: serviceWorkerBuild(),
       html: captured.html,
       bytes: captured.bytes,
+      redactions: captured.redactions ?? 0,
       opened_by_us: captured.opened_by_us === true,
       closed_after_dump: captured.closed_after_dump,
+      tab_id: captured.tab_id,
+      url: captured.url
+    }
+  }), { status: "complete", phase: "profile" });
+}
+
+// dump_conversation (yz-7iu) mirrors dump_picker_html one-for-one (same run_id
+// ownership model, same tab query + owned-tab filter) but forwards a read-only
+// capture command to the resolved tab — it serializes the conversation
+// container and never clicks, types, or navigates — and relays the reply
+// (HTML + extractor-vs-raw text lengths) as a terminal job_complete.
+async function handleDumpConversation(message) {
+  const adapter = siteAdapterForRecipe(message.payload?.recipe);
+  const runId = String(message.payload?.run_id ?? "").trim();
+  if (!runId) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), "missing_run_id", "dump_conversation requires payload.run_id", {
+        request_id: message.request_id,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
+    return;
+  }
+  const targetedJob = message?.job_id ? jobs.get(message.job_id) : null;
+  if (targetedJob) {
+    assertMessageOwnsJob(message, targetedJob);
+    if (runId !== targetedJob.run_id) {
+      throw commandError(
+        "run_mismatch",
+        `dump_conversation target run ${runId} does not match active job ${targetedJob.job_id}`,
+        {
+          phase: "profile",
+          side_effect_started: false,
+          expected_run_id: targetedJob.run_id,
+          received_run_id: runId
+        }
+      );
+    }
+  }
+  const liveInspectCandidates = targetedJob
+    ? [targetedJob]
+    : Array.from(jobs.values()).filter((job) => (
+      job?.job_id
+      && job.run_id === runId
+      && job.workspace_id === message.workspace_id
+      && (job.recipe ?? adapter.recipe) === adapter.recipe
+    ));
+  const acknowledgedInspectCandidates = targetedJob
+    ? []
+    : await loadAcknowledgedInspectableJobs(runId, message.workspace_id, adapter.recipe);
+  const inspectCandidates = Array.from(new Map(
+    [...liveInspectCandidates, ...acknowledgedInspectCandidates]
+      .map((job) => [job.job_id, job])
+  ).values());
+  if (inspectCandidates.length !== 1) {
+    const code = inspectCandidates.length === 0 ? "run_not_found" : "run_ambiguous";
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), code, inspectCandidates.length === 0
+        ? `no durable ${adapter.displayName} job found for run ${runId}`
+        : `more than one durable ${adapter.displayName} job owns run ${runId}`, {
+          request_id: message.request_id,
+          phase: "profile",
+          side_effect_started: false
+        }),
+      { status: "failed", phase: "profile" }
+    );
+    return;
+  }
+  const inspectJob = inspectCandidates[0];
+  if (!inspectJob.tab_id || !inspectJob.ownership_nonce) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), "ownership_unverified", `durable ${adapter.displayName} job ${inspectJob.job_id} has no inspectable owned tab`, {
+        request_id: message.request_id,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
+    return;
+  }
+  const tabs = await chrome.tabs.query({ url: adapter.tabQueryPattern });
+  // allow_live_job is threaded from the CLI payload so the content-script
+  // gate (dumpConversation) sees it; without this the gate is inert and the
+  // flag is silently ignored.
+  const allowLiveJob = message.payload?.allow_live_job === true;
+  let captured = null;
+  const errors = [];
+  for (const tab of tabs) {
+    if (!tab?.id) {
+      continue;
+    }
+    try {
+      captured = await sendToTab(tab.id, {
+        type: "yoetz_dump_conversation",
+        job_id: inspectJob.job_id,
+        run_id: runId,
+        workspace_id: message.workspace_id,
+        ownership_nonce: inspectJob.ownership_nonce,
+        recipe: adapter.recipe,
+        allow_live_job: allowLiveJob
+      });
+      captured = { ...captured, tab_id: tab.id, url: tab.url ?? null, title: tab.title ?? null };
+      break;
+    } catch (error) {
+      const isRunMismatch = error?.code === "run_mismatch";
+      // Same policy as dump_picker_html: a content-script exception on an
+      // ownership-matched tab surfaces as that tab's own code and message.
+      if (!isRunMismatch && error?.code) {
+        await postTerminalMessage(
+          message,
+          errorEnvelope(messageJob(message), error.code, String(error?.message ?? error), {
+            request_id: message.request_id,
+            run_id: runId,
+            tab_id: tab.id,
+            url: tab.url ?? null,
+            title: tab.title ?? null,
+            page_state: error?.page_state,
+            phase: error?.phase ?? "profile",
+            side_effect_started: error?.side_effect_started ?? false
+          }),
+          { status: "failed", phase: error?.phase ?? "profile" }
+        );
+        return;
+      }
+      errors.push({
+        tab_id: tab.id,
+        url: isRunMismatch ? null : (tab.url ?? null),
+        title: isRunMismatch ? null : (tab.title ?? null),
+        code: error?.code ?? undefined,
+        error: String(error?.message ?? error)
+      });
+    }
+  }
+  if (!captured) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), "run_not_found", `no Yoetz ${adapter.displayName} tab found for run ${runId}`, {
+        request_id: message.request_id,
+        run_id: runId,
+        inspected_tabs: errors,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
+    return;
+  }
+  await postTerminalMessage(message, makeEnvelope("job_complete", {
+    request_id: message.request_id,
+    job_id: message.job_id,
+    run_id: runId,
+    workspace_id: message.workspace_id,
+    payload: {
+      run_id: runId,
+      service_worker_build: serviceWorkerBuild(),
+      html: captured.html,
+      bytes: captured.bytes,
+      conversation_id: captured.conversation_id,
+      extracted_text: captured.extracted_text,
+      extraction_method: captured.extraction_method,
+      extracted_chars: captured.extracted_chars,
+      redactions: captured.redactions ?? 0,
+      raw_inner_text_chars: captured.raw_inner_text_chars,
       tab_id: captured.tab_id,
       url: captured.url
     }

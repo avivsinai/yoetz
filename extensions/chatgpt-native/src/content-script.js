@@ -117,6 +117,14 @@ async function handleMessage(message) {
         recipe: message.recipe,
         allow_live_job: message.allow_live_job === true
       });
+    case "yoetz_dump_conversation":
+      return dumpConversation(message.run_id, {
+        job_id: message.job_id,
+        workspace_id: message.workspace_id,
+        ownership_nonce: message.ownership_nonce,
+        recipe: message.recipe,
+        allow_live_job: message.allow_live_job === true
+      });
     case "yoetz_auth_probe":
       return authProbe(message.recipe);
     case "yoetz_probe":
@@ -787,6 +795,62 @@ async function inspectPage(runId, options = {}) {
     result.page_text_tail = pageText.slice(-500);
   }
   return result;
+}
+
+// dump-conversation (yz-7iu): read-only recovery capture, sibling of
+// dump_picker_html. Serializes the main conversation container (turns,
+// markdown, action bars) with the same baked-hidden-state treatment
+// picker-serializer.js applies, and reports the extractor's view next to the
+// raw innerText length so the two can be compared. Never mutates the page:
+// no clicks, no typing, no navigation (the picker command opens/closes the
+// menu; this one only reads).
+async function dumpConversation(runId, options = {}) {
+  const adapter = await siteAdapter(options.recipe);
+  const { parseOwnedWindowName } = await domHelpers(options.recipe);
+  const parsed = parseOwnedWindowName(window.name);
+  const jobId = String(options.job_id ?? "").trim();
+  const workspaceId = String(options.workspace_id ?? "").trim();
+  const ownershipNonce = String(options.ownership_nonce ?? "").trim();
+  const jobMatches = Boolean(jobId && parsed?.job_id === jobId);
+  const runMatches = Boolean(runId && parsed?.run_id === runId);
+  const workspaceMatches = Boolean(workspaceId && parsed?.workspace_id === workspaceId);
+  const nonceMatches = Boolean(ownershipNonce && parsed?.ownership_nonce === ownershipNonce);
+  if (!jobMatches || !runMatches || !workspaceMatches || !nonceMatches) {
+    throw commandError("run_mismatch", `tab is not owned by Yoetz job ${jobId || "(unknown)"}, run ${runId}, workspace ${workspaceId || "(unknown)"}`);
+  }
+  if (adapter.recipe !== "chatgpt") {
+    throw commandError("unsupported_recipe", `dump_conversation is ChatGPT-only; recipe ${JSON.stringify(adapter.recipe)} rejected before side effects`, {
+      phase: "profile",
+      side_effect_started: false
+    });
+  }
+  // Same live-job gate as dump_picker_html: a capture must not interfere with
+  // a recipe mid model_selection. Refuse unless the caller opted in.
+  if (jobId && activeJobs.has(jobId) && !options.allow_live_job) {
+    throw commandError("live_job_conflict", `dump_conversation refused on a live job ${jobId}; pass --allow-live-job to opt in`, {
+      phase: "profile",
+      side_effect_started: false
+    });
+  }
+  const { extractResponse } = await import(chrome.runtime.getURL("src/chatgpt-dom.js"));
+  const { serializeConversation } = await import(chrome.runtime.getURL("src/conversation-serializer.js"));
+
+  // Read-only: serialize the conversation container and run the extractor on
+  // the live DOM. No clicks, no typing, no navigation. The serializer
+  // redacts secrets (JWT shapes); lastRedactions reports how many.
+  const html = serializeConversation(document);
+  const extraction = extractResponse(document);
+  const rawText = document.body?.innerText ?? "";
+  return {
+    html,
+    bytes: new TextEncoder().encode(html).length,
+    redactions: serializeConversation.lastRedactions ?? 0,
+    conversation_id: adapter.conversationIdFromUrl(location.href) ?? null,
+    extracted_text: extraction.text ?? "",
+    extraction_method: extraction.method ?? null,
+    extracted_chars: (extraction.text ?? "").length,
+    raw_inner_text_chars: rawText.length
+  };
 }
 
 async function dumpPickerHtml(runId, options = {}) {
