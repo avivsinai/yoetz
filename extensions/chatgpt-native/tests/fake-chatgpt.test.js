@@ -15,6 +15,7 @@ import {
   findModelButton,
   insertPrompt,
   isResponseGenerating,
+  classifyBlockingState,
   modelSelectionDiagnostics,
   resetModelSelectionState,
   sendAcceptanceBaseline,
@@ -5743,6 +5744,21 @@ test("Wave 2 driver: quota-locked fixture → effort_options_disabled, family ve
   assert.match(result.warning, /Limit reached until 2026-10-01/);
 });
 
+// yz-2fz: The fake DOM gives each element a static innerText at construction
+// and never aggregates descendants, so body.innerText is empty. Real Chrome
+// aggregates innerText over the whole subtree — which is exactly how the
+// sidebar title reached the classifier on the field run. This helper mirrors
+// that aggregation for the fallback read under test.
+function aggregateInnerText(node) {
+  if (!node) return "";
+  const own = String(node.innerText ?? node.textContent ?? "").trim();
+  const childText = (node.children ?? [])
+    .map((child) => aggregateInnerText(child))
+    .filter(Boolean)
+    .join("\n");
+  return [own, childText].filter(Boolean).join("\n");
+}
+
 // Exported for scripts/picker-reader-fake-parity.mjs (Wave 2 T5). The test()
 // calls above register but do not execute when this file is imported as a
 // module (only the node --test runner runs them), so importing is safe.
@@ -5917,13 +5933,16 @@ test("yz-dl0: an upload-specific loading marker outside the composer still block
 });
 
 // yz-2fz: rateLimitedHandoff's no-transcript body fallback read raw
-// body.innerText. On the healthy page the shell (nav/aside/header/sidebar)
-// carries conversation-history titles, so a title merely containing "rate
-// limit" classified the page rate_limited with no wall present — and the
-// composer-visible guard did not help, because the false text arrives WITH a
-// visible composer. The fallback must go through the same shell-skipping
-// collector as the surface scan, while a portal-div modal appended to body
-// (the shape the fallback exists for) still surfaces its text.
+// body.innerText. Real Chrome aggregates innerText over the whole subtree, so
+// the shell (nav/aside/header/sidebar) carried conversation-history titles and
+// a title merely containing "rate limit" classified a healthy,
+// composer-visible page as rate_limited with no wall present — the v0.5.74
+// proof run fired the hard stop with the conversation surface fully rendered
+// (run fd4a47, via assertNoBlockingState -> classifyBlockingState ->
+// rateLimitedHandoff at model_selection). The fallback must go through the
+// same shell-skipping collector as the surface scan, while a portal-div modal
+// appended to body (the shape the fallback exists for) still surfaces its
+// text.
 test("yz-2fz: a sidebar conversation title containing 'rate limit' does not classify the page rate_limited", () => {
   const composer = new FakeElement("div", {
     id: "prompt-textarea",
@@ -5931,8 +5950,10 @@ test("yz-2fz: a sidebar conversation title containing 'rate limit' does not clas
     contenteditable: "true"
   });
   const nav = new FakeElement("nav", {}, "");
-  nav.append(new FakeElement("div", {}, "").append(
-    new FakeElement("a", {}, "Rate limit policy drafting")
+  nav.append(new FakeElement("ul", {}, "").append(
+    new FakeElement("li", {}, "").append(new FakeElement("a", {}, "Review Rate Limit Feature")),
+    new FakeElement("li", {}, "").append(new FakeElement("a", {}, "Onboarding checklist")),
+    new FakeElement("li", {}, "").append(new FakeElement("a", {}, "Design integration plan"))
   ));
   const main = new FakeElement("main", {}, "");
   main.append(composer);
@@ -5940,17 +5961,22 @@ test("yz-2fz: a sidebar conversation title containing 'rate limit' does not clas
   const doc = new FakeDocument(body);
   doc.defaultView.location.href = "https://chatgpt.com/?_yoetz=run_2fz_sidebar";
   doc.title = "ChatGPT";
+  // Chrome aggregates innerText over the subtree; the fake DOM does not.
+  doc.body.innerText = aggregateInnerText(doc.body);
+  doc.body.textContent = doc.body.innerText;
 
   assert.equal(rateLimitedHandoff(doc), null);
+  assert.equal(classifyBlockingState(doc), null);
 });
 
 test("yz-2fz: a portal-div rate-limit modal on the body still classifies rate_limited", () => {
   // No transcript (no user/assistant turns, no copy buttons) and no
   // [role=alert]/[role=dialog]/[aria-live] markers: the modal is a plain div
   // appended to body — the exact shape the no-transcript body fallback exists
-  // for. It must still surface after the fallback stops reading the shell.
-  const modal = new FakeElement("div", { class: "portal-overlay" },
-    "Too many requests. Please wait a few minutes and try again later.");
+  // for. It must still surface through both entry points after the fallback
+  // stops reading the shell.
+  const modal = new FakeElement("div", { class: "portal" },
+    "Too many requests. We've temporarily limited access to your conversations.");
   const composer = new FakeElement("div", {
     id: "prompt-textarea",
     "data-testid": "composer",
@@ -5962,9 +5988,12 @@ test("yz-2fz: a portal-div rate-limit modal on the body still classifies rate_li
   const doc = new FakeDocument(body);
   doc.defaultView.location.href = "https://chatgpt.com/?_yoetz=run_2fz_portal";
   doc.title = "ChatGPT";
+  doc.body.innerText = aggregateInnerText(doc.body);
+  doc.body.textContent = doc.body.innerText;
 
   assert.deepEqual(rateLimitedHandoff(doc), {
     state: "rate_limited",
     message: "ChatGPT is rate limited"
   });
+  assert.equal(classifyBlockingState(doc)?.code, "rate_limited");
 });
