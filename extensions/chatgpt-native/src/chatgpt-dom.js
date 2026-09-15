@@ -3609,6 +3609,7 @@ function uploadErrorText(root) {
   const error = candidates.find((node) => isVisible(node) && /\b(upload|attach|file|failed|error)\b/i.test(textOf(node)));
   return error ? textOf(error) : "";
 }
+export { uploadErrorText };
 
 function insertContenteditableText(root, composer, prompt) {
   const selection = root.defaultView?.getSelection?.();

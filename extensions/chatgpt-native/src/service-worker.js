@@ -185,6 +185,30 @@ const RATE_LIMIT_ESCALATION_WINDOW_MS = Math.max(
     ? Number(globalThis.__YOETZ_RATE_LIMIT_ESCALATION_WINDOW_MS)
     : RATE_LIMIT_COOLDOWN_CAP_MS
 );
+// yz-0fd: Per-profile tab pacing. Each fresh chatgpt.com tab is a history
+// read burst on a long-history account; N parallel tabs are N bursts. The
+// extension is the only place that sees every job across every CLI process
+// on the profile, so the pacing belongs here.
+//   - minimum gap between automated tab creations per recipe key (start 30s)
+//   - maximum concurrent yoetz-owned tabs per recipe key (start 2)
+// A job that would exceed either does NOT sleep: job_start returns typed
+// tab_pacing_active with reason (min_gap | max_concurrent), wait_remaining_ms
+// and active_jobs, side_effect_started false. Same shape as the cooldown
+// refusal. Both are __YOETZ_ overridable.
+const TAB_PACING_MIN_GAP_MS = Math.max(
+  0,
+  Number.isFinite(Number(globalThis.__YOETZ_TAB_PACING_MIN_GAP_MS))
+    ? Number(globalThis.__YOETZ_TAB_PACING_MIN_GAP_MS)
+    : 30000
+);
+// Floor at 1: an override of 0 must not refuse every job forever; 1 means
+// "one tab at a time", which is the strongest sane pacing.
+const TAB_PACING_MAX_CONCURRENT = Math.max(
+  1,
+  Number.isFinite(Number(globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT))
+    ? Number(globalThis.__YOETZ_TAB_PACING_MAX_CONCURRENT)
+    : 2
+);
 const CHATGPT_DOM_ONLY_FINALITY_WARNING = "ChatGPT finality_anchor=dom_only: backend API positive-finality proof was unavailable; response relied on DOM-only completion";
 const JOBS_KEY_PREFIX = "jobs.";
 const LEGACY_JOBS_KEY = "jobs";
@@ -654,6 +678,37 @@ async function startJob(message) {
   if (!jobContinuationIsLive(job, continuationEpoch)) {
     return;
   }
+  // yz-0fd: Per-profile tab pacing. Same contract as the cooldown refusal: a
+  // typed tab_pacing_active error, no tab opened, side_effect_started false.
+  // Nothing in the worker retries a tab command, so the caller that receives
+  // this refusal gets exactly one and decides when to retry. The reason field
+  // says WHICH limit tripped (min_gap vs max_concurrent) — waitRemainingMs 0
+  // on max_concurrent must not read as "wait zero and proceed".
+  if (adapterRecipeKey(job) === "chatgpt") {
+    const pacing = await checkTabPacing(adapterRecipeKey(job), { excludeJobId: job.job_id });
+    if (pacing && !jobContinuationIsLive(job, continuationEpoch)) {
+      return;
+    }
+    if (pacing) {
+      // max_concurrent has waitRemainingMs 0: there is no timer to wait out, only
+      // a job to finish. Telling the caller to "wait 0ms then retry" would invite
+      // exactly the hot retry loop this refusal exists to prevent.
+      const retryAdvice = pacing.reason === "max_concurrent"
+        ? `Wait for one of the ${pacing.activeJobs} active job(s) to finish, then retry.`
+        : `Wait ${pacing.waitRemainingMs}ms then retry.`;
+      await failJob(job, "tab_pacing_active", `ChatGPT tab pacing is active (${pacing.reason}; ${pacing.activeJobs} active job(s)); not opening a new tab. ${retryAdvice}`, {
+        phase: "profile",
+        side_effect_started: false,
+        reason: pacing.reason,
+        wait_remaining_ms: pacing.waitRemainingMs,
+        active_jobs: pacing.activeJobs
+      });
+      return;
+    }
+  }
+  if (!jobContinuationIsLive(job, continuationEpoch)) {
+    return;
+  }
   const tab = await createJobTab(url, adapter);
   if (!jobContinuationIsLive(job, continuationEpoch)) {
     await discardCreatedJobTab(tab);
@@ -665,6 +720,8 @@ async function startJob(message) {
   if (!jobContinuationIsLive(job, continuationEpoch)) {
     return;
   }
+  // yz-0fd: the min-gap anchor was already reserved inside checkTabPacing's
+  // mutex section when this job was allowed; no post-hoc recording here.
   const inspectCommand = inspectCommandForJob(job);
   if (!postNative(progress(job, "tab_opened", {
     tab_id: tab.id,
@@ -4270,6 +4327,90 @@ function withBackendApiGateMutex(task) {
   // caller, not to the mutex itself.
   backendApiGateMutex = run.then(() => undefined, () => undefined);
   return run;
+}
+
+// ---------------------------------------------------------------------------
+// yz-0fd: Per-profile tab pacing (min gap + max concurrent yoetz tabs).
+// Reuses the gate mutex/storage pattern. Tab creation timestamps and active
+// counts are per recipe key, stored in chrome.storage.session.
+// ---------------------------------------------------------------------------
+const TAB_PACING_STORAGE_KEY = "tab-pacing.";
+
+function tabPacingStorageKey(recipe) {
+  return `${TAB_PACING_STORAGE_KEY}${recipe}`;
+}
+
+async function readTabPacingState(recipe) {
+  const key = tabPacingStorageKey(recipe);
+  const stored = await chrome.storage.session.get(key);
+  const value = stored?.[key];
+  return {
+    last_tab_created_at_ms: Number(value?.last_tab_created_at_ms ?? 0) || 0
+  };
+}
+
+async function writeTabPacingState(recipe, state) {
+  const key = tabPacingStorageKey(recipe);
+  await chrome.storage.session.set({ [key]: state });
+}
+
+// Count active yoetz-owned jobs for a recipe key. A job is active if it's in
+// the in-memory jobs map and not in a terminal status. Safe across a
+// service-worker eviction: restoreJobsFromStorage rehydrates the jobs map at
+// startup, so the in-memory map is the durable truth here.
+function countActiveJobsForRecipe(recipe, excludeJobId = null) {
+  let count = 0;
+  for (const job of jobs.values()) {
+    if (job.job_id === excludeJobId) {
+      continue;
+    }
+    if (job.status && !TERMINAL_STATUSES.has(job.status) && adapterRecipeKey(job) === recipe) {
+      count++;
+    }
+  }
+  return count;
+}
+
+// Check tab pacing before creating a tab. Returns null if OK to proceed, or
+// { reason: "min_gap" | "max_concurrent", waitRemainingMs, activeJobs } if the
+// job should be refused. The reason is explicit because waitRemainingMs 0 on
+// max_concurrent must not read as "wait zero and proceed".
+// yz-0fd recut: when the check ALLOWS, the min-gap anchor is reserved in the
+// SAME mutex section (last_tab_created_at_ms = nowMs) before returning null.
+// check-then-act with the act outside the mutex would let two job_starts in
+// the same second both read the old anchor and both open tabs — the exact
+// pattern this pacing exists to stop. A failed createJobTab leaves the
+// anchor standing: the next caller waits out the gap for a tab that never
+// opened. That is acceptable over-pacing; the attempt was a navigation
+// attempt.
+async function checkTabPacing(recipe, { excludeJobId = null, nowMs = Date.now() } = {}) {
+  return withBackendApiGateMutex(async () => {
+    const state = await readTabPacingState(recipe);
+    // Min gap check
+    const sinceLast = nowMs - Number(state.last_tab_created_at_ms ?? 0);
+    if (state.last_tab_created_at_ms > 0 && sinceLast < TAB_PACING_MIN_GAP_MS) {
+      return {
+        reason: "min_gap",
+        waitRemainingMs: TAB_PACING_MIN_GAP_MS - sinceLast,
+        activeJobs: countActiveJobsForRecipe(recipe, excludeJobId)
+      };
+    }
+    // Max concurrent check
+    const activeCount = countActiveJobsForRecipe(recipe, excludeJobId);
+    if (activeCount >= TAB_PACING_MAX_CONCURRENT) {
+      return {
+        reason: "max_concurrent",
+        waitRemainingMs: 0,
+        activeJobs: activeCount
+      };
+    }
+    // Reserve: the anchor is written inside this mutex section so a second
+    // job_start arriving before createJobTab finishes still sees it.
+    await writeTabPacingState(recipe, {
+      last_tab_created_at_ms: nowMs
+    });
+    return null;
+  });
 }
 
 async function readBackendApiGateState(recipe) {

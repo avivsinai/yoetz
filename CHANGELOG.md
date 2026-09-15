@@ -6,8 +6,41 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- ChatGPT tab pacing: per-profile pacing of automated chatgpt.com tab
+  creation. A job_start that would exceed the limits is refused immediately
+  with a typed `tab_pacing_active` error — `reason` (`min_gap` or
+  `max_concurrent`), `wait_remaining_ms`, and `active_jobs` — and opens no
+  tab (`side_effect_started` false). Defaults: 30s minimum gap between tab
+  creations and at most 2 concurrent yoetz-owned tabs, per ChatGPT profile;
+  both are `__YOETZ_TAB_PACING_MIN_GAP_MS` / `__YOETZ_TAB_PACING_MAX_CONCURRENT`
+  overridable, and the max is floored at 1 so an override of 0 cannot refuse
+  every job forever. The Claude recipe is unpaced. The min-gap anchor is
+  reserved inside the gate-mutex section that allows the job, so two
+  job_starts in the same second cannot both pass the check. Nothing in the
+  worker retries a refused job — the caller gets exactly one refusal and
+  decides when to retry. The refusal message names what to wait for rather
+  than a duration: `max_concurrent` carries `wait_remaining_ms` 0, so
+  "wait 0ms then retry" would have invited the hot retry loop the refusal
+  exists to prevent; it now says to wait for one of the active jobs to
+  finish. (`yz-0fd`)
 ### Fixed
 - Dependencies: bump rustls past RUSTSEC-2026-0285.
+- ChatGPT send: the send-acceptance baseline is now captured at the END of
+  `verifyBeforeClick` — inside the `clickSend` loop, after `beforeClick`
+  (model reconfiguration) and immediately before the click — not before
+  `clickSend` is called. The yz-kio capture point was a no-op for its own
+  scenario: both hooks execute inside the `clickSend` loop, so a resumed
+  conversation whose older history finished loading during `beforeClick`
+  still landed after the baseline, and `waitForSendAccepted` accepted that
+  unrelated user-turn increase as a submission signal. Adapters without a
+  pre-click hook (Claude) keep the pre-`clickSend` capture.
+- ChatGPT send: `verifyBeforeClick` now consults `uploadErrorText` and
+  fails with a typed `upload_failed_before_send` error when an upload
+  error banner is up. The upload loop consults it only while waiting for
+  commit, so a bundle whose upload failed AFTER the upload phase committed
+  could previously be sent as a text-only prompt with no attachment. No
+  click is committed past this error. (`yz-ad7`)
 - ChatGPT upload: `hasUploadPending` no longer scans the whole document for
   the words uploading/attaching/processing/scanning. It scanned `document`
   using subtree text with `div` in the candidate set, so one occurrence of any

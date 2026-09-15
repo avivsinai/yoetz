@@ -399,6 +399,7 @@ async function sendPrompt(job, prompt) {
     insertPrompt,
     parseOwnedWindowName,
     sendAcceptanceBaseline,
+    uploadErrorText,
     verifyChatgptModelSelectionBeforeSend,
     waitForSendAccepted
   } = await domHelpers(job);
@@ -416,11 +417,11 @@ async function sendPrompt(job, prompt) {
   let surfaceEvidenceSeen = job.surface_evidence_seen === true
     || activeJobs.get(job.job_id)?.surface_evidence_seen === true;
   job.surface_evidence_seen = surfaceEvidenceSeen;
-  // yz-kio: The send-acceptance baseline is captured immediately before the
-  // click, NOT before insertPrompt/beforeClick. A resumed conversation that
-  // finishes loading older history during model reconfiguration can increase
-  // the user-turn count; a baseline captured before that load would accept
-  // the stale increase as a submission signal.
+  // yz-ad7: the baseline capture point moved into verifyBeforeClick (which
+  // runs inside clickSend, immediately before the click). For chatgpt the
+  // `let baseline` binding below is assigned by the verifyBeforeClick
+  // closure; the pre-clickSend capture at the bottom of this function runs
+  // only for adapters without a pre-click hook.
   let baseline;
   await insertPrompt(document, prompt, { timeoutMs: 20000 });
   assertJobOwnership(job, parseOwnedWindowName, ownershipOptionsForJob(job, "send", adapter));
@@ -473,6 +474,25 @@ async function sendPrompt(job, prompt) {
       return finalModelSelection;
     };
     clickOptions.verifyBeforeClick = () => {
+      // yz-ad7: a bundle whose upload failed AFTER the upload phase committed
+      // must not go out as a text-only prompt. The upload loop consults
+      // uploadErrorText only while it waits for commit; the error banner can
+      // appear later (attachment dropped between commit and send). This is
+      // the last hook before the irreversible click, so it is the last place
+      // the residual hole can be closed.
+      const uploadError = uploadErrorText(document);
+      if (uploadError) {
+        throw commandError(
+          "upload_failed_before_send",
+          `ChatGPT reported an upload failure immediately before send: ${uploadError}`,
+          {
+            phase: "send",
+            side_effect_started: true,
+            send_committed: false,
+            upload_error_text: uploadError
+          }
+        );
+      }
       const proof = verifyChatgptModelSelectionBeforeSend(document, finalModelSelection);
       surfaceEvidenceSeen = Boolean(surfaceEvidenceSeen || proof.surface_evidence_seen === true);
       job.surface_evidence_seen = surfaceEvidenceSeen;
@@ -511,13 +531,31 @@ async function sendPrompt(job, prompt) {
         click_bound_closed_pill_family_status: proof.current_closed_pill_family_status,
         click_bound_closed_pill_effort_status: proof.current_closed_pill_effort_status
       };
+      // yz-ad7: capture the baseline HERE — after beforeClick (model
+      // reconfiguration, which is where a resumed conversation's older
+      // history finishes loading) and immediately before the click that
+      // clickSend performs right after this hook returns. The yz-kio capture
+      // point (before clickSend was called) was a no-op for its own scenario
+      // because both hooks execute inside the clickSend loop.
+      baseline = sendAcceptanceBaseline(document);
       return proof;
     };
+  } else {
+    // Non-chatgpt adapters expose no verifyBeforeClick hook (claude's
+    // clickSend runs no pre-click callbacks), so the best available capture
+    // point stays immediately before clickSend; the capture below covers it.
   }
-  // yz-kio: Capture the acceptance baseline immediately before the click,
-  // after beforeClick/verifyBeforeClick have run. This ensures any history
-  // that loaded during model reconfiguration is already in the baseline.
-  baseline = sendAcceptanceBaseline(document);
+  // yz-ad7: for chatgpt the baseline is captured at the END of
+  // verifyBeforeClick (which runs inside clickSend, after beforeClick and
+  // immediately before the click). The pre-clickSend capture below runs only
+  // for adapters without a pre-click hook. A resumed conversation that
+  // finishes loading older history during beforeClick (model
+  // reconfiguration) therefore lands in the baseline and cannot be mistaken
+  // for a submission signal; the yz-kio capture point before insertPrompt
+  // was a no-op for its own scenario.
+  if (adapter.recipe !== "chatgpt") {
+    baseline = sendAcceptanceBaseline(document);
+  }
   await clickSend(document, clickOptions);
   let accepted;
   try {
