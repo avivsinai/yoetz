@@ -21,7 +21,7 @@ cargo fmt                      # Format code
 cargo clippy                   # Lint
 ```
 
-Tests use `assert_cmd`, `predicates`, and `serial_test` — no API keys needed for `cargo test`.
+Tests use `assert_cmd`, `predicates`, and `serial_test` — no API keys needed for `cargo test`. Locally run only the focused test file you changed plus its discrimination run against main; full suites run in CI.
 
 ## Release
 
@@ -29,6 +29,9 @@ Tests use `assert_cmd`, `predicates`, and `serial_test` — no API keys needed f
   (the parser consumes options before the positional version) and the
   resulting release PR. Never create
   manual tags or GitHub releases; never push directly to `main`.
+  Run `./scripts/release.sh --skip-verify X.Y.Z`; main only takes merged PRs,
+  so its CI is the gate and the local cargo/node rerun is redundant. After the
+  script opens the release PR, `git switch main` in the shared checkout.
 - Populate `## [Unreleased]` in `CHANGELOG.md` BEFORE running the script: the
   release commit's changelog section becomes the GitHub release notes.
 - The script moves the Unreleased section, bumps and aligns ALL version
