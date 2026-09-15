@@ -5818,3 +5818,98 @@ test("yz-2mf: post-close reverification failure returns a structured refusal, no
   assert.equal(result.failure_reason, "post_close_model_reverification_failed");
   assert.equal(result.post_close_family_status, "unverified");
 });
+
+// yz-dl0: hasUploadPending used to scan the WHOLE document for the words
+// uploading/attaching/processing/scanning, using subtree text with div in the
+// candidate set. Any such word anywhere visible on the page pinned pending
+// true forever. Field symptom, twice on 2026-09-13:
+// attached=true, pending=true, send_enabled=true, repeating to the deadline.
+function makeComposerWithSidebar({ sidebarText = "", inComposer = null } = {}) {
+  const composer = new FakeElement("textarea", { id: "prompt-textarea", placeholder: "Message ChatGPT" });
+  const send = new FakeElement("button", { "data-testid": "send-button", "aria-label": "Send prompt" }, "Send");
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
+  const input = new FakeElement("input", {
+    type: "file",
+    accept: "text/markdown",
+    onChange: () => form.append(new FakeElement("div", { "data-testid": "attachment-file" }, "bundle.md"))
+  });
+  form.append(input, send);
+  if (inComposer) form.append(inComposer);
+  // The history sidebar lives outside the composer form, exactly as on the
+  // page. A plain div, which is in the predicate's own candidate selector.
+  const sidebar = new FakeElement("div", {}, sidebarText);
+  const body = new FakeElement("body", {}, "").append(sidebar, form);
+  return { doc: new FakeDocument(body), form };
+}
+
+test("yz-dl0: a sidebar conversation title containing 'processing' does not wedge the upload", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    // A perfectly ordinary conversation title. On the previous predicate this
+    // alone made pending true for the life of the tab.
+    const { doc } = makeComposerWithSidebar({ sidebarText: "Processing pipeline redesign" });
+    const file = new File(["bundle"], "bundle.md", { type: "text/markdown" });
+
+    const result = await uploadFile(doc, file, { timeoutMs: 400, intervalMs: 10, attachmentMenuDelayMs: 0 });
+
+    assert.ok(result?.upload_commit_signal, `upload must commit, got ${JSON.stringify(result)}`);
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
+test("yz-dl0: an in-progress label inside the composer still blocks the upload", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    // Guard: the fix must not pass by simply never reporting pending. A leaf
+    // node inside the composer saying "Uploading" is a genuine in-progress
+    // signal and must still hold the upload open.
+    // (The structural markers -- [role="progressbar"] and friends -- are
+    // unchanged in logic and only re-scoped; the fake DOM's selector engine
+    // has no generic attribute matcher, so they are not expressible here.)
+    // Built with an inline child, which is the shape leaf-only matching missed:
+    // the outer span has children, and the inner leaf's text is just the dots.
+    const label = new FakeElement("span", {}, "Uploading")
+      .append(new FakeElement("span", { class: "dots" }, "\u2026"));
+    const { doc } = makeComposerWithSidebar({ inComposer: label });
+    const file = new File(["bundle"], "bundle.md", { type: "text/markdown" });
+
+    await assert.rejects(
+      () => uploadFile(doc, file, { timeoutMs: 200, intervalMs: 10, attachmentMenuDelayMs: 0 }),
+      /upload|attach|timed out|did not/i,
+      "an Uploading label in the composer must keep the upload pending"
+    );
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
+test("yz-dl0: an upload-specific loading marker outside the composer still blocks", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    // A read-only probe of a live ChatGPT tab found upload inputs and file
+    // tiles mounted OUTSIDE the composer form. So a node that declares itself
+    // an attachment in a loading state must be honoured wherever it renders:
+    // scoping these to the composer would risk a false negative, which is
+    // worse than the false positive this bead fixes, because it would send the
+    // prompt before the attachment commits.
+    const { doc, form } = makeComposerWithSidebar({});
+    const body = form.parentElement;
+    body.append(new FakeElement("div", {
+      "data-testid": "attachment-upload",
+      "data-state": "loading"
+    }, ""));
+    const file = new File(["bundle"], "bundle.md", { type: "text/markdown" });
+
+    await assert.rejects(
+      () => uploadFile(doc, file, { timeoutMs: 200, intervalMs: 10, attachmentMenuDelayMs: 0 }),
+      /upload|attach|timed out|did not/i,
+      "an attachment marked loading outside the composer must keep the upload pending"
+    );
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});

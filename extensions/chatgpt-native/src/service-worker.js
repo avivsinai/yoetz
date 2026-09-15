@@ -4426,19 +4426,30 @@ async function throttleBackendApiGate(recipe, retryAfterMsValue, nowMs = Date.no
 async function throttleBackendApiGateFromRateLimit(recipe, nowMs = Date.now()) {
   return withBackendApiGateMutex(async () => {
     const state = await readBackendApiGateState(recipe);
-    // Escalate if the previous rate-limit cooldown expired recently (inside
-    // the escalation window). Otherwise reset to base (first trip or the
-    // window has passed since the last trip).
+    // The escalation level counts expiry-then-re-trip CYCLES, which is the
+    // thing we are trying to punish: a caller that waited out a cooldown,
+    // probed again, and hit the wall again. It does not count how many times
+    // one wall event is observed.
+    //
+    // Two earlier versions were both wrong. Writing 0 on a trip during an
+    // active cooldown erased an accumulated level, so repeated trips decayed
+    // to the 15 min base. Incrementing on such a trip over-counts instead:
+    // job_start refuses while a cooldown holds, so the only trips that can
+    // land during one are (a) jobs already in flight when the wall rose and
+    // (b) the same job seeing the modal twice, since the wait_response branch
+    // trips before the one-shot dismiss guard. Neither is a re-probe; both are
+    // one wall event seen more than once, and both would have doubled the
+    // lockout.
     const lastUntil = Number(state.rate_limit_last_until_ms ?? 0);
-    // yz-zpj recut: a re-trip while a cooldown is STILL ACTIVE must escalate,
-    // not erase. Drop the lastUntil <= nowMs clause: when lastUntil is in the
-    // future, (nowMs - lastUntil) is negative, which is < WINDOW, so the same
-    // expression covers both "still active" and "expired recently".
-    const hadRecentTrip = lastUntil > 0
-      && (nowMs - lastUntil) < RATE_LIMIT_ESCALATION_WINDOW_MS;
-    const escalation = hadRecentTrip
-      ? (Number(state.rate_limit_escalation ?? 0) + 1)
-      : 0;
+    const currentEscalation = Number(state.rate_limit_escalation ?? 0);
+    const escalation = lastUntil > nowMs
+      // Still inside the previous cooldown: same wall event, hold the level.
+      ? currentEscalation
+      : (lastUntil > 0 && (nowMs - lastUntil) < RATE_LIMIT_ESCALATION_WINDOW_MS
+        // Expired, then tripped again inside the window: a real cycle.
+        ? currentEscalation + 1
+        // First trip, or the window has passed since the last one.
+        : 0);
     const cooldownMs = Math.min(
       RATE_LIMIT_COOLDOWN_CAP_MS,
       RATE_LIMIT_COOLDOWN_BASE_MS * Math.pow(RATE_LIMIT_COOLDOWN_MULTIPLIER, escalation)
@@ -4464,6 +4475,14 @@ async function throttleBackendApiGateFromRateLimit(recipe, nowMs = Date.now()) {
 async function resetRateLimitEscalation(recipe, nowMs = Date.now()) {
   return withBackendApiGateMutex(async () => {
     const state = await readBackendApiGateState(recipe);
+    // A job that completes while a cooldown is still holding started BEFORE
+    // the wall rose -- job_start refuses once the cooldown is armed, so that
+    // is the only kind of job that can finish during one. Its success says
+    // nothing about whether the wall has cleared for a NEW tab, so it must not
+    // spend an escalation step.
+    if (Number(state.throttle_until_ms ?? 0) > nowMs) {
+      return;
+    }
     if (Number(state.rate_limit_escalation ?? 0) === 0 && Number(state.rate_limit_last_until_ms ?? 0) === 0) {
       return;
     }
