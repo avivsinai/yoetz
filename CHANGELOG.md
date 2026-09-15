@@ -25,6 +25,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   modal-dismissed-successfully continuation (which never reaches `failJob`)
   still arms.
 
+## [0.5.75] - 2026-09-15
+### Fixed
+- ChatGPT rate-limit classification: the no-transcript body fallback in
+  `rateLimitedHandoff` no longer reads raw `document.body.innerText` — it goes
+  through the same shell-skipping collector as the surface scan, so sidebar
+  conversation titles ("Rate limit policy drafting") can no longer classify a
+  healthy, composer-visible page as `rate_limited`. A portal-div modal
+  appended to the body — the shape the fallback exists for — still surfaces.
+  (`yz-2fz`)
+
+
 ## [0.5.74] - 2026-09-15
 ### Added
 - ChatGPT tab pacing: per-profile pacing of automated chatgpt.com tab
