@@ -88,7 +88,7 @@ export function serializePickerMenu(root = document) {
   sync(live, clone);
 
   // Shared redaction pass (see capture-sanitizer.js): strip sensitive bodies,
-  // non-allowlisted attributes, and form-control values, then replace any
+  // secret-shaped attribute values, and form-control values, then replace any
   // surviving JWT-shaped string and report the count.
   sanitizeCaptureClone(clone);
   const { html, redactions } = redactSecrets(clone.outerHTML);
