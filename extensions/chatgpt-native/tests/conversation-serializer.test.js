@@ -59,6 +59,50 @@ function assertSanitized(html, label, redactions) {
 // colon also separates ordinary label text, so "Session: today" in an aria-label
 // is not a secret; dropping it costs the diagnostic evidence a capture exists to
 // preserve. A colon counts only when a serialized value follows.
+test("yz-beb: <template> contents do not survive serialization", () => {
+  // template children live in template.content, which neither the childNodes
+  // strip nor querySelectorAll("*") reached; the fragment serialized intact.
+  const dom = secretLadenDocument(`
+    <main>
+      <template><input value="TEMPLATE_SENTINEL"><span data-x="access_token=OPAQUE_SENTINEL">inside template</span></template>
+      <div data-testid="conversation-turn">answer</div>
+    </main>
+  `);
+  const html = serializeConversation(dom.window.document);
+  assert.ok(!html.includes("TEMPLATE_SENTINEL"), "template input value must not survive");
+  assert.ok(!html.includes("inside template"), "template body text must not survive");
+  assert.ok(!html.includes("<template"), "the template element itself must not survive");
+  assert.ok(html.includes("answer"), "the kept turn must survive");
+});
+
+test("yz-beb: textarea default (child text) does not survive serialization", () => {
+  // .value="" clears the live value only; outerHTML renders the child text.
+  // The assertion is on the SERIALIZED HTML, not element.value.
+  const dom = secretLadenDocument(`
+    <main>
+      <textarea>TEXTAREA_SENTINEL</textarea>
+    </main>
+  `);
+  const html = serializeConversation(dom.window.document);
+  assert.ok(!html.includes("TEXTAREA_SENTINEL"), `textarea child text survived: ${html.slice(0, 400)}`);
+  assert.ok(html.includes("<textarea"), "the textarea element keeps its tree position");
+});
+
+test("yz-djy: short-header and full-token JWTs are redacted whole", () => {
+  // (a) the 19-char HS256 header escaped the old {20,} guard entirely;
+  // (b) the old match ended at the second period, leaving the signature
+  //     segment appended after [REDACTED_JWT].
+  const shortHeaderJwt = `eyJhbGciOiJIUzI1NiJ9.${"A".repeat(20)}.${"S".repeat(20)}`;
+  const dom = secretLadenDocument(`
+    <main>
+      <div>${shortHeaderJwt} tail</div>
+    </main>
+  `);
+  const html = serializeConversation(dom.window.document);
+  assert.ok(!html.includes("eyJ"), `a short-header JWT survived: ${html.slice(0, 300)}`);
+  assert.ok(html.includes("[REDACTED_JWT] tail"), `signature must not trail the redaction: ${html.slice(0, 300)}`);
+});
+
 test("yz-y5p: benign 'Session: today' prose survives while a real colon assignment is dropped", () => {
   const dom = secretLadenDocument(`
     <main>
