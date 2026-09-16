@@ -2290,8 +2290,16 @@ async function handleInspectRun(message) {
   const acknowledgedInspectCandidates = targetedJob
     ? []
     : await loadAcknowledgedInspectableJobs(runId, message.workspace_id, adapter.recipe);
+  // yz-bwi: unacked terminal deliveries stay inspectable from their durable
+  // local outbox shard (see loadUnacknowledgedOutboxInspectables).
+  const outboxInspectCandidates = targetedJob
+    ? []
+    : await loadUnacknowledgedOutboxInspectables(runId, message.workspace_id, adapter.recipe);
+  // Pro review (yz-bwi): precedence must be live > ack tombstone > outbox —
+  // the spread order below feeds the Map so the LATER (fresher) source
+  // overwrites the same job_id from a staler source.
   const inspectCandidates = Array.from(new Map(
-    [...liveInspectCandidates, ...acknowledgedInspectCandidates]
+    [...outboxInspectCandidates, ...acknowledgedInspectCandidates, ...liveInspectCandidates]
       .map((job) => [job.job_id, job])
   ).values());
   if (inspectCandidates.length !== 1) {
@@ -2512,8 +2520,16 @@ async function handleDumpPickerHtml(message) {
   const acknowledgedInspectCandidates = targetedJob
     ? []
     : await loadAcknowledgedInspectableJobs(runId, message.workspace_id, adapter.recipe);
+  // yz-bwi: unacked terminal deliveries stay inspectable from their durable
+  // local outbox shard (see loadUnacknowledgedOutboxInspectables).
+  const outboxInspectCandidates = targetedJob
+    ? []
+    : await loadUnacknowledgedOutboxInspectables(runId, message.workspace_id, adapter.recipe);
+  // Pro review (yz-bwi): precedence must be live > ack tombstone > outbox —
+  // the spread order below feeds the Map so the LATER (fresher) source
+  // overwrites the same job_id from a staler source.
   const inspectCandidates = Array.from(new Map(
-    [...liveInspectCandidates, ...acknowledgedInspectCandidates]
+    [...outboxInspectCandidates, ...acknowledgedInspectCandidates, ...liveInspectCandidates]
       .map((job) => [job.job_id, job])
   ).values());
   if (inspectCandidates.length !== 1) {
@@ -2682,8 +2698,16 @@ async function handleDumpConversation(message) {
   const acknowledgedInspectCandidates = targetedJob
     ? []
     : await loadAcknowledgedInspectableJobs(runId, message.workspace_id, adapter.recipe);
+  // yz-bwi: unacked terminal deliveries stay inspectable from their durable
+  // local outbox shard (see loadUnacknowledgedOutboxInspectables).
+  const outboxInspectCandidates = targetedJob
+    ? []
+    : await loadUnacknowledgedOutboxInspectables(runId, message.workspace_id, adapter.recipe);
+  // Pro review (yz-bwi): precedence must be live > ack tombstone > outbox —
+  // the spread order below feeds the Map so the LATER (fresher) source
+  // overwrites the same job_id from a staler source.
   const inspectCandidates = Array.from(new Map(
-    [...liveInspectCandidates, ...acknowledgedInspectCandidates]
+    [...outboxInspectCandidates, ...acknowledgedInspectCandidates, ...liveInspectCandidates]
       .map((job) => [job.job_id, job])
   ).values());
   if (inspectCandidates.length !== 1) {
@@ -2801,6 +2825,61 @@ async function handleDumpConversation(message) {
       url: captured.url
     }
   }), { status: "complete", phase: "profile" });
+}
+
+// yz-bwi: the LOCAL terminal-outbox shard is the durable record for EVERY
+// terminal delivery (job_complete / job_error / job_cancel / ...), ack or
+// not — including records whose LATER re-persist failed
+// (terminal_persistence_failed): the surviving record still holds an accurate
+// earlier terminal state, capture stays gated by content-script ownership
+// re-verification, and staleness by TTL.
+// Field evidence run b10805: a job_error terminal whose ACK was lost (CLI died
+// at the deadline / ack raced a SW restart) left no terminal-ack. tombstone,
+// and the session shard was gone with the SW restart — so dump-conversation
+// found NEITHER and answered run_not_found while the owned tab was still up.
+// The outbox shard survives both losses and is only removed after a
+// successful ack, so it is the reliable inspectable source for unacked
+// terminals. Merged after the ack ledger; dedup by job_id.
+async function loadUnacknowledgedOutboxInspectables(runId, workspaceId, recipe) {
+  if (!chrome.storage.local?.get) {
+    return [];
+  }
+  const localStored = (await chrome.storage.local.get(null)) ?? {};
+  return Object.entries(localStored)
+    .filter(([key]) => key.startsWith(TERMINAL_OUTBOX_KEY_PREFIX))
+    .map(([, record]) => inspectableJobFromOutbox(record, runId, workspaceId, recipe))
+    .filter(Boolean);
+}
+
+function inspectableJobFromOutbox(record, runId, workspaceId, recipe) {
+  const stamp = terminalAgeStamp(record);
+  if (
+    !record?.job_id
+    || record.run_id !== runId
+    || (record.workspace_id ?? null) !== (workspaceId ?? null)
+    || (record.recipe ?? recipe) !== recipe
+    || !Number.isInteger(record.tab_id)
+    || typeof record.ownership_nonce !== "string"
+    || record.ownership_nonce.length === 0
+    || !Number.isSafeInteger(stamp)
+    || Date.now() - stamp > JOB_TTL_MS
+  ) {
+    return null;
+  }
+  return {
+    job_id: record.job_id,
+    run_id: record.run_id,
+    workspace_id: record.workspace_id ?? null,
+    recipe,
+    status: record.status ?? terminalStatusForEnvelope({ type: record.terminal_type }),
+    tab_id: record.tab_id,
+    ownership_nonce: record.ownership_nonce,
+    conversation_id: record.conversation_id ?? null,
+    expected_conversation_id: record.expected_conversation_id ?? null,
+    submitted_conversation_id: record.submitted_conversation_id ?? null,
+    terminal_delivered_at: record.terminal_delivered_at ?? null,
+    inspect_only: true
+  };
 }
 
 async function loadAcknowledgedInspectableJobs(runId, workspaceId, recipe) {

@@ -14070,3 +14070,136 @@ test("yz-91o: a stale chunk arriving after the upload completes is dropped, not 
     globalThis.setTimeout = originalSetTimeout;
   }
 });
+
+// yz-bwi: the terminal-ack ledger is not the only durable inspectable source.
+// Field run b10805: a job_error terminal whose ACK never committed (CLI died
+// at the deadline / ack raced a SW restart) left no terminal-ack. tombstone,
+// and the session shard was gone with the SW restart — dump_conversation
+// answered run_not_found while the owned tab was still up. The durable local
+// terminal-OUTBOX shard (written for EVERY terminal delivery, removed only
+// after a successful ack) must also resolve the run.
+test("yz-bwi: an unacked job_error terminal stays inspectable from its durable outbox shard", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const localStorage = makeStorage();
+  // The SW restarted: the session shard is GONE, only the durable local
+  // outbox record of the terminal delivery survived. No ack tombstone.
+  await localStorage.set({
+    "terminal-outbox.job_b10805": {
+      job_id: "job_b10805",
+      run_id: "run_b10805",
+      workspace_id: "workspace_test",
+      recipe: "chatgpt",
+      status: "failed",
+      terminal_type: "job_error",
+      terminal_sequence: 0,
+      terminal_delivered_at: Date.now() - 60_000,
+      tab_id: 31,
+      ownership_nonce: "nonce-b10805",
+      started_at: Date.now() - 3_600_000,
+      updated_at: Date.now() - 60_000
+    }
+  });
+  let dumpMessage = null;
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    localStorage,
+    tabs: {
+      query: async () => [{ id: 31, url: "https://chatgpt.com/c/late", title: "Yoetz run" }],
+      sendMessage: async (_id, message) => {
+        dumpMessage = message;
+        return {
+          ok: true,
+          payload: {
+            html: "<main>late answer</main>",
+            bytes: 20,
+            conversation_id: "conv-b10805",
+            extracted_text: "late answer",
+            extraction_method: "assistant_dom_fallback",
+            extracted_chars: 11,
+            raw_inner_text_chars: 900
+          }
+        };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_bwi_outbox=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("dump_conversation", "job_dump_b10805", { run_id: "run_b10805", allow_live_job: false }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    assert.equal(dumpMessage.type, "yoetz_dump_conversation");
+    assert.equal(dumpMessage.tab_id ?? dumpMessage.job_id, dumpMessage.job_id);
+    assert.equal(dumpMessage.job_id, "job_b10805");
+    assert.equal(dumpMessage.ownership_nonce, "nonce-b10805");
+    const complete = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_dump_b10805"
+    );
+    assert.equal(complete.payload.html, "<main>late answer</main>");
+    assert.equal(complete.payload.run_id, "run_b10805");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+// Discrimination: a TTL-expired outbox record must NOT resolve (the ledger
+// intentionally forgets after JOB_TTL_MS) — the fix must not make stale
+// terminals immortal.
+test("yz-bwi: a TTL-expired outbox terminal record no longer resolves", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const localStorage = makeStorage();
+  await localStorage.set({
+    "terminal-outbox.job_expired_b10805": {
+      job_id: "job_expired_b10805",
+      run_id: "run_expired_b10805",
+      workspace_id: "workspace_test",
+      recipe: "chatgpt",
+      status: "failed",
+      terminal_type: "job_error",
+      terminal_sequence: 0,
+      terminal_delivered_at: Date.now() - 4 * 60 * 60 * 1000,
+      tab_id: 32,
+      ownership_nonce: "nonce-expired",
+      started_at: Date.now() - 5 * 60 * 60 * 1000,
+      updated_at: Date.now() - 4 * 60 * 60 * 1000
+    }
+  });
+  let tabCalls = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    localStorage,
+    tabs: {
+      query: async () => [{ id: 32, url: "https://chatgpt.com/c/old", title: "Yoetz run" }],
+      sendMessage: async () => {
+        tabCalls += 1;
+        return { ok: true, payload: { html: "<main>x</main>", bytes: 12 } };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_bwi_expired=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("dump_conversation", "job_dump_expired", { run_id: "run_expired_b10805", allow_live_job: false }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_dump_expired"
+    );
+    assert.equal(error.payload.code, "run_not_found");
+    assert.equal(tabCalls, 0);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
