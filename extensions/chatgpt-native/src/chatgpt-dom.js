@@ -1021,6 +1021,23 @@ function modelSelectionOptionsForJob(job = {}) {
   if (Number.isFinite(hydrationStabilityMs) && hydrationStabilityMs > 0) {
     options.hydrationStabilityMs = hydrationStabilityMs;
   }
+  // Thread the picker-open tuning options through the same way. Without this
+  // the pickerTimeoutMs / settleMs / openAttempts a caller passes to
+  // configureModelState were silently dropped on the floor — every picker-open
+  // loop ran its full default budget (8 attempts x ~3s of real settles), which
+  // is what made the fail-closed picker tests take ~29s each in CI.
+  const pickerTimeoutMs = Number(job?.picker_timeout_ms ?? job?.pickerTimeoutMs);
+  if (Number.isFinite(pickerTimeoutMs) && pickerTimeoutMs > 0) {
+    options.pickerTimeoutMs = pickerTimeoutMs;
+  }
+  const settleMs = Number(job?.picker_settle_ms ?? job?.settleMs);
+  if (Number.isFinite(settleMs) && settleMs > 0) {
+    options.settleMs = settleMs;
+  }
+  const openAttempts = Number(job?.picker_open_attempts ?? job?.openAttempts);
+  if (Number.isFinite(openAttempts) && openAttempts > 0) {
+    options.openAttempts = openAttempts;
+  }
   return options;
 }
 

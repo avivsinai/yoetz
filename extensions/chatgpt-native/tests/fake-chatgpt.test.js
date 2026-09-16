@@ -2556,6 +2556,7 @@ for (const testCase of [
   {
     name: "fails closed when Work cannot switch to Chat",
     fixture: { surface: "work", chatClickUpdates: false },
+    selectionOptions: { model_selection_timeout_ms: 30, model_selection_interval_ms: 5 },
     expected: { status: "unavailable", failure_reason: "chat_surface_selection_mismatch" },
     surface: { chatClicked: true, workChecked: "true" },
     mainOpens: 0
@@ -3514,7 +3515,7 @@ test("Latest ignores a controlled picker below a closed ancestor", async () => {
     keyboardMode: "end"
   });
 
-  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, intervalMs: 25 });
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, picker_settle_ms: 5, intervalMs: 25 });
 
   assert.equal(result.status, "unavailable");
   assert.equal(result.failure_reason, "model_picker_open_failed");
@@ -3826,7 +3827,7 @@ test("Latest ignores a personal picker below a closed ancestor", async () => {
     closedAncestor: true
   });
 
-  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, intervalMs: 25 });
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, picker_settle_ms: 5, intervalMs: 25 });
 
   assert.equal(result.status, "unavailable");
   assert.equal(result.failure_reason, "model_picker_open_failed");
@@ -4126,7 +4127,7 @@ test("Latest rejects an identical hidden picker without trigger ownership", asyn
     disconnectedTrigger: true
   });
 
-  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, intervalMs: 20 });
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, picker_settle_ms: 5, intervalMs: 20 });
 
   assert.equal(result.status, "unavailable");
   assert.equal(result.failure_reason, "model_picker_open_failed");
