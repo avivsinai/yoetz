@@ -11,7 +11,7 @@ import {
   validateEnvelope
 } from "./protocol.js";
 import { advertisedRecipes, siteAdapterForRecipe } from "./sites/index.js";
-import { recordSwError, recordSwStart, swStartReason, SW_TELEMETRY_KEYS } from "./sw-telemetry.js";
+import { recordSwError, recordSwStart, refineSwStartReason, swStartReason, SW_TELEMETRY_KEYS } from "./sw-telemetry.js";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 90 * 60 * 1000;
 const JOB_TTL_MS = 3 * 60 * 60 * 1000;
@@ -250,20 +250,32 @@ let connectionGeneration = 0;
 const workerStartedAtMs = Date.now();
 
 chrome.runtime.onInstalled.addListener((details) => {
-  void recordSwStart(swStartReason({ onInstalledReason: details?.reason }));
+  refineSwStartReason(swStartReason({ onInstalledReason: details?.reason }));
   connectNative();
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void recordSwStart(swStartReason({ onStartupFired: true }));
+  refineSwStartReason(swStartReason({ onStartupFired: true }));
   connectNative();
 });
 
 // yz-9pf: a worker start that is neither onStartup nor onInstalled is a
-// restart (MV3 idle kill, crash, or a yz-4hr-style trigger) — record it so
-// `status` can show the restart trail. Emitted from module init so every
-// start path (including a bare import in the test harness) is counted.
+// restart (MV3 idle kill, crash, or a yz-4hr-style trigger). The start is
+// recorded EXACTLY ONCE here, at module init: the onInstalled/onStartup
+// listeners only REFINE the already-written record in place (the reason in
+// chrome.storage.session is overwritten before the control read), they do
+// not record again — recording in both places double-counted install and
+// browser-startup starts (review finding on yz-9pf). Emitted from module
+// init so every start path (including a bare import in the test harness)
+// is counted.
 void recordSwStart(swStartReason({}));
+
+// yz-9pf: overwrite ONLY the reason on the start record already written by
+// the module-init recordSwStart above. Never increments the count. The
+// fire-and-forget write races nothing that matters: the CLI's sw_telemetry
+// read happens over the native port long after both of these have settled,
+// and a re-entrant read-modify-write on session storage here would only
+// ever compete with itself.
 
 // yz-9pf: error + unhandledrejection telemetry (ring of last 5 in
 // chrome.storage.session, with the active job ids). No behaviour change.

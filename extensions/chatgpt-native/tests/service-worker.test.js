@@ -14289,3 +14289,53 @@ test("yz-9pf: recordSwStart writes last_start and increments persisted start_cou
     globalThis.chrome = originalChrome;
   }
 });
+
+// yz-9pf review follow-up: onInstalled/onStartup must REFINE the already-
+// recorded start (single count, corrected reason) — not record a second one.
+// An "update" install reason is "installed", not "restart".
+test("yz-9pf: onInstalled/onStartup refine the start record in place (no double count; update=installed)", async () => {
+  const originalChrome = globalThis.chrome;
+  const session = makeStorage();
+  const localStorage = makeStorage();
+  let installedListener = null;
+  let startupListener = null;
+  globalThis.chrome = {
+    runtime: {
+      connectNative: () => makePort(),
+      getManifest: () => ({ version: "0.4.0" }),
+      getURL: (value) => new URL(`../${value}`, import.meta.url).href,
+      onInstalled: { addListener: (fn) => { installedListener = fn; } },
+      onStartup: { addListener: (fn) => { startupListener = fn; } },
+      onMessage: { addListener: () => {} }
+    },
+    storage: { session, local: localStorage },
+    identity: { getProfileUserInfo: async () => ({ email: "work@example.com", id: "gaia-work" }) },
+    alarms: { onAlarm: { addListener: () => {} }, create: () => {}, clear: () => {} },
+    tabs: { create: async () => ({ id: 1 }), get: async () => ({}), sendMessage: async () => ({ ok: false }) },
+    tabGroups: { update: async () => {} }
+  };
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+  try {
+    await import(`../src/service-worker.js?telemetry_refine=${Date.now()}`);
+    assert.equal(((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"], 1);
+
+    await installedListener({ reason: "update" });
+    const afterUpdate = (await session.get("yoetz_sw_last_start"))["yoetz_sw_last_start"];
+    assert.equal(afterUpdate.reason, "installed", "an extension update is an install, not a restart");
+    assert.equal(((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"], 1, "refinement must not increment the count");
+
+    await startupListener();
+    const afterStartup = (await session.get("yoetz_sw_last_start"))["yoetz_sw_last_start"];
+    assert.equal(afterStartup.reason, "startup");
+    assert.equal(((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"], 1, "still exactly one start for this worker lifetime");
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    globalThis.chrome = originalChrome;
+  }
+});

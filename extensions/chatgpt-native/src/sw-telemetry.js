@@ -85,13 +85,35 @@ export function swStartReason({ onStartupFired, onInstalledReason } = {}) {
   if (onInstalledReason === "chrome_update" || onInstalledReason === "shared_module_update") {
     return "installed";
   }
-  if (onInstalledReason === "install") {
+  if (onInstalledReason === "install" || onInstalledReason === "update") {
     return "installed";
   }
   if (onStartupFired) {
     return "startup";
   }
   return "restart";
+}
+
+// yz-9pf: overwrite the reason on the start record written by the module-init
+// recordSwStart, WITHOUT incrementing start_count. The onInstalled/onStartup
+// listeners call this instead of recordSwStart so a single worker start is
+// counted exactly once. The read-modify-write races nothing that matters:
+// only these listeners ever refine, the count write is untouched, and the
+// CLI reads the record long after both have settled.
+export async function refineSwStartReason(reason) {
+  try {
+    const session = storageArea("session");
+    if (!session) {
+      return;
+    }
+    const existing = ((await session.get(SW_LAST_START_KEY)) ?? {})[SW_LAST_START_KEY];
+    if (!existing || typeof existing !== "object") {
+      return;
+    }
+    await session.set({ [SW_LAST_START_KEY]: { ...existing, reason } });
+  } catch {
+    // Telemetry must never break the worker.
+  }
 }
 
 export const SW_TELEMETRY_KEYS = {
