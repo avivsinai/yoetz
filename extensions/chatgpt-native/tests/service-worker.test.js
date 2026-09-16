@@ -14217,3 +14217,272 @@ test("yz-bwi: a TTL-expired outbox terminal record no longer resolves", async ()
     globalThis.chrome = originalChrome;
   }
 });
+test("yz-9pf: recordSwError appends to a ring of the last 5 with kind, message, stack_head, job_ids_active", async () => {
+  const { recordSwError } = await import(`../src/sw-telemetry.js?ring=${Date.now()}`);
+  const originalChrome = globalThis.chrome;
+  const session = makeStorage();
+  const localStorage = makeStorage();
+  globalThis.chrome = {
+    runtime: {},
+    storage: { session, local: localStorage },
+    identity: {},
+    alarms: {},
+    tabs: {}
+  };
+  try {
+    const activeIds = ["job_live_1", "job_live_2"];
+    for (let i = 0; i < 7; i += 1) {
+      const error = new Error(`boom ${i}`);
+      await recordSwError("error", error, () => activeIds);
+    }
+    const stored = (await session.get("yoetz_sw_last_errors"))["yoetz_sw_last_errors"];
+    assert.equal(stored.length, 5, "ring must keep only the last 5 records");
+    assert.equal(stored[0].message, "boom 2", "oldest kept record is the 3rd of 7");
+    assert.equal(stored[4].message, "boom 6");
+    assert.equal(stored[4].kind, "error");
+    assert.equal(typeof stored[4].at_ms, "number");
+    assert.match(stored[4].stack_head, /boom 6/);
+    assert.ok(stored[4].stack_head.split("\n").length <= 4, "stack_head is at most 3 frames + message line");
+    assert.deepEqual(stored[4].job_ids_active, ["job_live_1", "job_live_2"]);
+    assert.equal(((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"], undefined);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("yz-9pf: recordSwStart writes last_start and increments persisted start_count across re-imports (reason=restart)", async () => {
+  const originalChrome = globalThis.chrome;
+  const session = makeStorage();
+  const localStorage = makeStorage();
+  globalThis.chrome = {
+    runtime: {
+      connectNative: () => makePort(),
+      getManifest: () => ({ version: "0.4.0" }),
+      getURL: (value) => new URL(`../${value}`, import.meta.url).href,
+      onInstalled: { addListener: () => {} },
+      onStartup: { addListener: () => {} },
+      onMessage: { addListener: () => {} }
+    },
+    storage: { session, local: localStorage },
+    identity: { getProfileUserInfo: async () => ({ email: "work@example.com", id: "gaia-work" }) },
+    alarms: { onAlarm: { addListener: () => {} }, create: () => {}, clear: () => {} },
+    tabs: { create: async () => ({ id: 1 }), get: async () => ({}), sendMessage: async () => ({ ok: false }) },
+    tabGroups: { update: async () => {} }
+  };
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+  try {
+    // First worker start: no persisted count -> starts at 1, reason=restart
+    // (a bare import in the test harness is neither onStartup nor onInstalled).
+    await import(`../src/service-worker.js?telemetry_start_1=${Date.now()}`);
+    const firstCount = ((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"];
+    const firstStart = (await session.get("yoetz_sw_last_start"))["yoetz_sw_last_start"];
+    assert.equal(firstCount, 1);
+    assert.equal(firstStart.reason, "restart");
+    assert.equal(typeof firstStart.started_at_ms, "number");
+
+    // Re-import (fresh module instance, same persisted storage) simulates the
+    // worker being restarted with storage intact: count increments.
+    await import(`../src/service-worker.js?telemetry_start_2=${Date.now() + 1}`);
+    const secondCount = ((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"];
+    const secondStart = (await session.get("yoetz_sw_last_start"))["yoetz_sw_last_start"];
+    assert.equal(secondCount, 2, "start_count increments across a restart with persisted storage");
+    assert.ok(secondStart.started_at_ms >= firstStart.started_at_ms);
+    assert.equal(secondStart.reason, "restart");
+
+    // Settle pending worker tasks (start telemetry, reconnect timers) BEFORE
+    // the finally restores globalThis.chrome — an import that outlives the
+    // stub would surface as an unhandledRejection and fail the whole file.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    globalThis.chrome = originalChrome;
+  }
+});
+
+// yz-9pf review follow-up: onInstalled/onStartup must REFINE the already-
+// recorded start (single count, corrected reason) — not record a second one.
+// An "update" install reason is "installed", not "restart".
+test("yz-9pf: onInstalled/onStartup refine the start record in place (no double count; update=installed)", async () => {
+  const originalChrome = globalThis.chrome;
+  const session = makeStorage();
+  const localStorage = makeStorage();
+  let installedListener = null;
+  let startupListener = null;
+  globalThis.chrome = {
+    runtime: {
+      connectNative: () => makePort(),
+      getManifest: () => ({ version: "0.4.0" }),
+      getURL: (value) => new URL(`../${value}`, import.meta.url).href,
+      onInstalled: { addListener: (fn) => { installedListener = fn; } },
+      onStartup: { addListener: (fn) => { startupListener = fn; } },
+      onMessage: { addListener: () => {} }
+    },
+    storage: { session, local: localStorage },
+    identity: { getProfileUserInfo: async () => ({ email: "work@example.com", id: "gaia-work" }) },
+    alarms: { onAlarm: { addListener: () => {} }, create: () => {}, clear: () => {} },
+    tabs: { create: async () => ({ id: 1 }), get: async () => ({}), sendMessage: async () => ({ ok: false }) },
+    tabGroups: { update: async () => {} }
+  };
+  const originalSetInterval = globalThis.setInterval;
+  const originalClearInterval = globalThis.clearInterval;
+  globalThis.setInterval = () => 1;
+  globalThis.clearInterval = () => {};
+  try {
+    await import(`../src/service-worker.js?telemetry_refine=${Date.now()}`);
+    assert.equal(((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"], 1);
+
+    await installedListener({ reason: "update" });
+    const afterUpdate = (await session.get("yoetz_sw_last_start"))["yoetz_sw_last_start"];
+    assert.equal(afterUpdate.reason, "installed", "an extension update is an install, not a restart");
+    assert.equal(((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"], 1, "refinement must not increment the count");
+
+    await startupListener();
+    const afterStartup = (await session.get("yoetz_sw_last_start"))["yoetz_sw_last_start"];
+    assert.equal(afterStartup.reason, "startup");
+    assert.equal(((await localStorage.get("yoetz_sw_start_count")) ?? {})["yoetz_sw_start_count"], 1, "still exactly one start for this worker lifetime");
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  } finally {
+    globalThis.setInterval = originalSetInterval;
+    globalThis.clearInterval = originalClearInterval;
+    globalThis.chrome = originalChrome;
+  }
+});
+
+// yz-bwi part (b): --tab-id escape hatch. The durable job record is retired
+// (terminal outcome) — but the preserved tab still carries its
+// _yoetz=<run> URL marker, which outlives the record. dump_conversation must
+// resolve the tab by id alone; ownership is proven by the tab's own
+// window.name (job_id+run_id+workspace+nonce all from the VERIFIED window
+// name, never from the wire) cross-checked against the URL marker.
+test("yz-bwi(b): dump_conversation by --tab-id captures a preserved tab whose job record is retired", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  // No jobs map entry, no tombstone, no outbox record — the job record is
+  // gone; only the tab with its URL marker remains.
+  let dumpMessage = null;
+  const captureHtml = "<main><div class=\"markdown\">recovered via tab id</div></main>";
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      get: async (id) => ({
+        id,
+        status: "complete",
+        url: `https://chatgpt.com/c/preserved?_yoetz=run_b10805late`,
+        title: "Yoetz run"
+      }),
+      query: async () => [],
+      sendMessage: async (_id, message) => {
+        dumpMessage = message;
+        return {
+          ok: true,
+          payload: {
+            html: captureHtml,
+            bytes: captureHtml.length,
+            conversation_id: "conv-preserved",
+            job_id: "job_b10805late",
+            run_id: "run_b10805late",
+            extracted_text: "recovered via tab id",
+            extraction_method: "assistant_dom_fallback",
+            extracted_chars: 19,
+            raw_inner_text_chars: 500
+          }
+        };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_bwi_tab_id=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("dump_conversation", "job_dump_tabid", { tab_id: 41, allow_live_job: false }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    assert.equal(dumpMessage.type, "yoetz_dump_conversation");
+    // tab-addressed mode: the content script resolves ownership from the
+    // tab's own window.name; no job_id/nonce may be supplied over the wire.
+    assert.equal(dumpMessage.tab_addressed, true);
+    assert.equal(dumpMessage.job_id, undefined);
+    assert.equal(dumpMessage.ownership_nonce, undefined);
+    const complete = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_dump_tabid"
+    );
+    assert.equal(complete.payload.html, captureHtml);
+    assert.equal(complete.payload.run_id, "run_b10805late");
+    assert.equal(complete.payload.tab_id, 41);
+    assert.equal(complete.payload.job_id, "job_b10805late");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+// Discrimination: a --tab-id request for a tab WITHOUT the _yoetz marker (or
+// on the wrong site) must be refused before any capture attempt — the marker
+// is the minimum evidence that the tab was ever a Yoetz tab.
+test("yz-bwi(b): dump_conversation by --tab-id refuses a tab with no _yoetz marker", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  let tabCalls = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/c/stranger", title: "Some ChatGPT tab" }),
+      query: async () => [],
+      sendMessage: async () => {
+        tabCalls += 1;
+        return { ok: true, payload: { html: "<main>x</main>", bytes: 12 } };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?yz_bwi_tab_id_refuses=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("dump_conversation", "job_dump_tabid_stranger", { tab_id: 42, allow_live_job: false }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_dump_tabid_stranger"
+    );
+    assert.equal(error.payload.code, "tab_not_owned");
+    assert.equal(tabCalls, 0);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+// Discrimination: --run-id and --tab-id together is a caller error.
+test("yz-bwi(b): dump_conversation rejects passing both run_id and tab_id", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  globalThis.chrome = chromeStub({ port, storage, tabs: { query: async () => [], get: async (id) => ({ id, url: "https://chatgpt.com/" }) } });
+
+  try {
+    await import(`../src/service-worker.js?yz_bwi_tab_id_conflict=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("dump_conversation", "job_dump_both", { run_id: "run_x", tab_id: 43, allow_live_job: false }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error"));
+    const error = port.messages.find((message) =>
+      message.type === "job_error" && message.job_id === "job_dump_both"
+    );
+    assert.equal(error.payload.code, "selector_conflict");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});

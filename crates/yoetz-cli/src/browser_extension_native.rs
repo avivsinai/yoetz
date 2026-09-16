@@ -133,6 +133,11 @@ pub struct ExtensionStatus {
     /// listing is best-effort and must never make `status` itself fail.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub active_jobs: Vec<ActiveExtensionJob>,
+    /// yz-9pf: service-worker error/restart telemetry from the newest hello
+    /// instance. None when the instance is unreachable or the query fails —
+    /// best-effort, never fails `status`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_telemetry: Option<SwTelemetry>,
     pub recipes: Vec<String>,
     pub claude_ready: bool,
     pub protocol_version: u32,
@@ -185,6 +190,97 @@ pub struct ActiveExtensionJob {
     pub conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inspect_command: Option<String>,
+}
+
+/// yz-9pf: service-worker error/restart telemetry. Makes an unexplained
+/// mid-run worker restart (yz-4hr) diagnosable from `status` after the fact:
+/// the last-5 error ring, the last start record (reason: startup | installed
+/// | restart) and the monotonic start count.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SwTelemetry {
+    #[serde(default)]
+    pub sw_last_errors: Vec<SwErrorRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_last_start: Option<SwStartRecord>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_start_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sw_uptime_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SwErrorRecord {
+    #[serde(default)]
+    pub at_ms: Option<u64>,
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub stack_head: Option<String>,
+    #[serde(default)]
+    pub job_ids_active: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SwStartRecord {
+    #[serde(default)]
+    pub started_at_ms: Option<u64>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+fn fetch_sw_telemetry_for_instance(instance: &ExtensionInstanceStatus) -> Option<SwTelemetry> {
+    let selector = ExtensionInstanceSelector {
+        profile_email: instance.profile_email.as_deref(),
+        extension_instance_id: instance.extension_instance_id.as_deref(),
+        extension_profile_id: instance.profile_id.as_deref(),
+    };
+    let response = send_control_job_with_recipe("sw_telemetry", json!({}), selector, None).ok()?;
+    let payload = &response.payload;
+    Some(SwTelemetry {
+        sw_last_errors: payload
+            .get("sw_last_errors")
+            .and_then(Value::as_array)
+            .map(|records| {
+                records
+                    .iter()
+                    .map(|record| SwErrorRecord {
+                        at_ms: record.get("at_ms").and_then(Value::as_u64),
+                        kind: record
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        message: record
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        stack_head: record
+                            .get("stack_head")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                        job_ids_active: record.get("job_ids_active").and_then(Value::as_array).map(
+                            |ids| {
+                                ids.iter()
+                                    .filter_map(Value::as_str)
+                                    .map(str::to_string)
+                                    .collect()
+                            },
+                        ),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        sw_last_start: payload.get("sw_last_start").map(|start| SwStartRecord {
+            started_at_ms: start.get("started_at_ms").and_then(Value::as_u64),
+            reason: start
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
+        sw_start_count: payload.get("sw_start_count").and_then(Value::as_u64),
+        sw_uptime_ms: payload.get("sw_uptime_ms").and_then(Value::as_u64),
+    })
 }
 
 fn parse_active_jobs(payload: &Value) -> Vec<ActiveExtensionJob> {
@@ -1404,6 +1500,7 @@ pub fn status() -> Result<ExtensionStatus> {
         active_jobs: latest_instance_with_hello
             .map(|instance| fetch_active_jobs_for_instance(instance, None))
             .unwrap_or_default(),
+        sw_telemetry: latest_instance_with_hello.and_then(fetch_sw_telemetry_for_instance),
         connected_instances: connected_instances.clone(),
         recipes,
         claude_ready,
@@ -2186,7 +2283,8 @@ fn finalize_picker_capture(
 // Never mutates the page; refuses a live job unless --allow-live-job (the
 // gate lives in the content script, like dump-picker).
 pub fn dump_conversation_run(
-    run_id: &str,
+    run_id: Option<&str>,
+    tab_id: Option<i64>,
     out_path: &Path,
     allow_live_job: bool,
     selector: ExtensionInstanceSelector<'_>,
@@ -2195,13 +2293,25 @@ pub fn dump_conversation_run(
     if recipe != BuiltinWebRecipe::Chatgpt {
         bail!("dump-conversation is only supported with --chatgpt");
     }
-    let response = send_site_control_job(
-        "dump_conversation",
-        json!({ "run_id": run_id, "recipe": recipe.as_str(), "allow_live_job": allow_live_job }),
-        selector,
-        recipe,
-    )?;
-    finalize_conversation_capture(out_path, &response.payload, run_id, recipe)
+    let trimmed = run_id.map(str::trim).filter(|value| !value.is_empty());
+    let mut payload = json!({ "recipe": recipe.as_str(), "allow_live_job": allow_live_job });
+    let mut capture_run_id = "";
+    match (trimmed, tab_id) {
+        (Some(_), Some(_)) => bail!("pass either --run-id or --tab-id, not both"),
+        (Some(run), None) => {
+            payload["run_id"] = json!(run);
+            capture_run_id = run;
+        }
+        (None, Some(id)) => {
+            if id <= 0 {
+                bail!("--tab-id must be a positive Chrome tab id");
+            }
+            payload["tab_id"] = json!(id);
+        }
+        (None, None) => bail!("--run-id is required unless --tab-id is passed"),
+    }
+    let response = send_site_control_job("dump_conversation", payload, selector, recipe)?;
+    finalize_conversation_capture(out_path, &response.payload, capture_run_id, recipe)
 }
 
 // Process a dump_conversation response envelope and write the capture file.
@@ -2289,7 +2399,8 @@ fn finalize_conversation_capture(
         "extraction_method": extraction_method,
         "extracted_chars": extracted_chars,
         "raw_inner_text_chars": raw_inner_text_chars,
-        "run_id": run_id,
+        "run_id": if run_id.is_empty() { payload.get("run_id").cloned().unwrap_or(Value::Null) } else { json!(run_id) },
+        "tab_id": payload.get("tab_id"),
     }))
 }
 
@@ -9462,6 +9573,7 @@ mod yz_eld_tests {
             status_file_present: true,
             connected_instances: Vec::new(),
             active_jobs: vec![job],
+            sw_telemetry: None,
             recipes: vec!["chatgpt".to_string()],
             claude_ready: false,
             protocol_version: PROTOCOL_VERSION,
@@ -9511,6 +9623,7 @@ mod yz_eld_tests {
             status_file_present: false,
             connected_instances: Vec::new(),
             active_jobs: Vec::new(),
+            sw_telemetry: None,
             recipes: vec!["chatgpt".to_string()],
             claude_ready: false,
             protocol_version: PROTOCOL_VERSION,

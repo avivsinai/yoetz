@@ -648,9 +648,18 @@ struct BrowserExtensionDumpConversationArgs {
     #[arg(long)]
     claude: bool,
 
-    /// Yoetz run id whose tab should be captured.
+    /// Yoetz run id whose tab should be captured. Omit when --tab-id is used.
     #[arg(long, alias = "run_id")]
-    run_id: String,
+    run_id: Option<String>,
+
+    /// Chrome tab id to capture directly (yz-bwi escape hatch). Use when the
+    /// run's durable job record is retired or unresolvable — e.g. the CLI died
+    /// at the deadline and the ack was lost. The tab must still carry its
+    /// `_yoetz=<run>` URL marker; ownership is re-verified from the tab's own
+    /// window name before anything is captured. Mutually exclusive with
+    /// --run-id.
+    #[arg(long, value_name = "TAB_ID")]
+    tab_id: Option<i64>,
 
     /// Output path for the serialized conversation HTML.
     #[arg(long, value_name = "PATH", alias = "out")]
@@ -4084,7 +4093,8 @@ fn handle_browser_extension(
             (
                 "browser.extension.dump_conversation",
                 browser_extension_native::dump_conversation_run(
-                    &args.run_id,
+                    args.run_id.as_deref(),
+                    args.tab_id,
                     &args.path,
                     args.allow_live_job,
                     selector,

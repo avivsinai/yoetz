@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- Service-worker telemetry: `browser extension status` now reports
+  `sw_telemetry` (last-5 error ring with kind/message/stack/active jobs,
+  last start record with reason startup/installed/restart, monotonic
+  start count, uptime). An unexplained mid-run worker restart
+  (yz-4hr-style) is now diagnosable after the fact instead of
+  invisible. (`yz-9pf`)
+
 ### Fixed
 - Terminal inspectability: `inspect`, `dump-picker-html` and
   `dump-conversation` now also resolve runs from the durable local
