@@ -681,11 +681,16 @@ fn native_host_forwards_dump_conversation_and_routes_the_reply() {
                 "html": "<main><div class=\"markdown\">the recovered answer</div></main>",
                 "bytes": 55_u64,
                 "conversation_id": "conv-1846dc",
-                "extracted_text": "the recovered answer",
+                // yz-d8i: the wire shape no longer carries extracted_text —
+                // the unredacted prose stays in the content script; the CLI
+                // reads only the counts. A host that synthesized the field
+                // would still be relayed verbatim, so its absence here is the
+                // contract: the reply asserts what the extension sends.
                 "extraction_method": "assistant_dom_fallback",
                 "extracted_chars": 19_u64,
                 "raw_inner_text_chars": 10_449_u64,
-                "tab_id": 12
+                "tab_id": 12,
+                "url": "https://chatgpt.com/c/run?_yoetz=run_1846dc"
             }
         }),
     ));

@@ -872,6 +872,13 @@ async function dumpConversation(runId, options = {}) {
 async function captureConversation(adapter, { jobId, runId }) {
   const { extractResponse } = await import(chrome.runtime.getURL("src/chatgpt-dom.js"));
   const { serializeConversation } = await import(chrome.runtime.getURL("src/conversation-serializer.js"));
+
+  // Read-only: serialize the conversation container and run the extractor on
+  // the live DOM. No clicks, no typing, no navigation. The serializer
+  // redacts secrets (JWT shapes); lastRedactions reports how many.
+  // yz-d8i: the extracted TEXT itself never goes on the wire — the extractor
+  // output is unredacted prose, unlike the serialized HTML — so only its
+  // length and method travel; the Rust finalize reads counts, never text.
   const html = serializeConversation(document);
   const extraction = extractResponse(document);
   const rawText = document.body?.innerText ?? "";
@@ -880,9 +887,7 @@ async function captureConversation(adapter, { jobId, runId }) {
     bytes: new TextEncoder().encode(html).length,
     redactions: serializeConversation.lastRedactions ?? 0,
     conversation_id: adapter.conversationIdFromUrl(location.href) ?? null,
-    job_id: jobId || null,
-    run_id: runId || null,
-    extracted_text: extraction.text ?? "",
+
     extraction_method: extraction.method ?? null,
     extracted_chars: (extraction.text ?? "").length,
     raw_inner_text_chars: rawText.length

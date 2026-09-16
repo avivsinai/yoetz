@@ -2269,6 +2269,27 @@ function isYoetzOwnedTab(tab, adapter) {
     && new URL(tab.url).searchParams.has("_yoetz");
 }
 
+// yz-d8i: capture payloads carry the tab url for operator context. The Yoetz
+// ownership marker (_yoetz=<run>) is the one query param that must survive;
+// any other query string (token=..., session ids, redirect continuations) is
+// credential-shaped risk with no diagnostic value, so it is stripped before
+// the url enters a capture envelope that lands on disk.
+function sanitizeCaptureUrl(url) {
+  if (typeof url !== "string" || url.length === 0) {
+    return url ?? null;
+  }
+  try {
+    const parsed = new URL(url);
+    const marker = parsed.searchParams.get("_yoetz");
+    const search = marker === null ? "" : `?_yoetz=${encodeURIComponent(marker)}`;
+    return `${parsed.origin}${parsed.pathname}${search}${parsed.hash}`;
+  } catch {
+    // Not a parseable URL: forward unchanged (the tab url shapes are all
+    // absolute http(s); anything else was never a credential channel).
+    return url;
+  }
+}
+
 function selectSiteAuthProbeTab(tabs, adapter) {
   const candidates = (tabs ?? [])
     .filter((tab) => tab?.id && adapter.isAllowedTabUrl(tab.url))
@@ -2692,7 +2713,7 @@ async function handleDumpPickerHtml(message) {
       opened_by_us: captured.opened_by_us === true,
       closed_after_dump: captured.closed_after_dump,
       tab_id: captured.tab_id,
-      url: captured.url
+      url: sanitizeCaptureUrl(captured.url)
     }
   }), { status: "complete", phase: "profile" });
 }
@@ -2884,13 +2905,16 @@ async function handleDumpConversation(message) {
       html: captured.html,
       bytes: captured.bytes,
       conversation_id: captured.conversation_id,
-      extracted_text: captured.extracted_text,
+      // yz-d8i: extracted_text stays OFF the wire. The capture text is
+      // unredacted prose (unlike the sanitized HTML) and the Rust
+      // finalize_conversation_capture only ever reads the counts — so the
+      // wire carries the extractor's metrics, never its text.
       extraction_method: captured.extraction_method,
       extracted_chars: captured.extracted_chars,
       redactions: captured.redactions ?? 0,
       raw_inner_text_chars: captured.raw_inner_text_chars,
       tab_id: captured.tab_id,
-      url: captured.url
+      url: sanitizeCaptureUrl(captured.url)
     }
   }), { status: "complete", phase: "profile" });
 }
@@ -2947,13 +2971,16 @@ async function dumpConversationByTabId(message, adapter, tabId) {
         html: captured.html,
         bytes: captured.bytes,
         conversation_id: captured.conversation_id,
-        extracted_text: captured.extracted_text,
+        // yz-d8i: extracted_text stays OFF the wire in BOTH addressing modes.
+        // The capture text is unredacted prose (unlike the sanitized HTML)
+        // and the Rust finalize_conversation_capture only ever reads the
+        // counts — so the wire carries the extractor's metrics, never text.
         extraction_method: captured.extraction_method,
         extracted_chars: captured.extracted_chars,
         redactions: captured.redactions ?? 0,
         raw_inner_text_chars: captured.raw_inner_text_chars,
         tab_id: tab.id,
-        url: tab.url ?? null,
+        url: sanitizeCaptureUrl(tab.url ?? null),
         title: tab.title ?? null
       }
     }), { status: "complete", phase: "profile" });
