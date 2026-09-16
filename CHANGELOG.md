@@ -6,6 +6,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- Terminal inspectability: `inspect`, `dump-picker-html` and
+  `dump-conversation` now also resolve runs from the durable local
+  terminal-outbox shard, so a terminal whose ACK never committed (CLI
+  died at the deadline, or the ack raced a service-worker restart) stays
+  inspectable while its owned tab exists instead of answering
+  `run_not_found`. Every terminal type is covered, TTL and ownership
+  gates unchanged, and candidate resolution prefers the freshest state
+  (live > acknowledged > outbox). (`yz-bwi`)
+- Model-selection tuning: `picker_timeout_ms`, `picker_settle_ms` and
+  `picker_open_attempts` passed to `configureModelState` are now honoured by
+  the picker-open loop; previously they were silently dropped, so every
+  picker-open wait ran its full default budget. Production callers are
+  unaffected (none set these). (`yz-bwi` companion perf fix)
 
 ## [0.5.78] - 2026-09-16
 ### Fixed
