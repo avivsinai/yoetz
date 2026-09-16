@@ -21,7 +21,8 @@ export const MESSAGE_TYPES = Object.freeze([
   "dump_picker_html",
   "dump_conversation",
   "request_identity_permission",
-  "terminal_ack"
+  "terminal_ack",
+  "sw_telemetry"
 ]);
 
 export function nowIso() {

@@ -11,6 +11,7 @@ import {
   validateEnvelope
 } from "./protocol.js";
 import { advertisedRecipes, siteAdapterForRecipe } from "./sites/index.js";
+import { recordSwError, recordSwStart, refineSwStartReason, swStartReason, SW_TELEMETRY_KEYS } from "./sw-telemetry.js";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 90 * 60 * 1000;
 const JOB_TTL_MS = 3 * 60 * 60 * 1000;
@@ -245,14 +246,56 @@ const chunks = new ChunkAssembler();
 let nativePort = null;
 let extensionIdentityPromise = null;
 let connectionGeneration = 0;
+// yz-9pf: worker start timestamp for the sw_telemetry uptime readout.
+const workerStartedAtMs = Date.now();
 
-chrome.runtime.onInstalled.addListener(() => {
+chrome.runtime.onInstalled.addListener((details) => {
+  refineSwStartReason(swStartReason({ onInstalledReason: details?.reason }));
   connectNative();
 });
 
 chrome.runtime.onStartup.addListener(() => {
+  refineSwStartReason(swStartReason({ onStartupFired: true }));
   connectNative();
 });
+
+// yz-9pf: a worker start that is neither onStartup nor onInstalled is a
+// restart (MV3 idle kill, crash, or a yz-4hr-style trigger). The start is
+// recorded EXACTLY ONCE here, at module init: the onInstalled/onStartup
+// listeners only REFINE the already-written record in place (the reason in
+// chrome.storage.session is overwritten before the control read), they do
+// not record again — recording in both places double-counted install and
+// browser-startup starts (review finding on yz-9pf). Emitted from module
+// init so every start path (including a bare import in the test harness)
+// is counted.
+void recordSwStart(swStartReason({}));
+
+// yz-9pf: overwrite ONLY the reason on the start record already written by
+// the module-init recordSwStart above. Never increments the count. The
+// fire-and-forget write races nothing that matters: the CLI's sw_telemetry
+// read happens over the native port long after both of these have settled,
+// and a re-entrant read-modify-write on session storage here would only
+// ever compete with itself.
+
+// yz-9pf: error + unhandledrejection telemetry (ring of last 5 in
+// chrome.storage.session, with the active job ids). No behaviour change.
+// Guarded on `self` because the node test harness imports this module
+// without a service-worker global.
+function activeJobIdsForTelemetry() {
+  return [...jobs.entries()]
+    .filter(([, job]) => !TERMINAL_STATUSES.has(job.status))
+    .map(([jobId]) => jobId);
+}
+
+if (typeof self !== "undefined" && self?.addEventListener) {
+  self.addEventListener("error", (event) => {
+    void recordSwError("error", event?.error ?? event?.message, activeJobIdsForTelemetry);
+  });
+
+  self.addEventListener("unhandledrejection", (event) => {
+    void recordSwError("unhandledrejection", event?.reason, activeJobIdsForTelemetry);
+  });
+}
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "yoetz_popup_status") {
@@ -511,6 +554,9 @@ async function handleNativeMessage(message, sourcePort = nativePort, sourceGener
         break;
       case "request_identity_permission":
         await handleRequestIdentityPermission(message);
+        break;
+      case "sw_telemetry":
+        await handleSwTelemetry(message);
         break;
       case "terminal_ack":
         await handleTerminalAck(message);
@@ -3058,6 +3104,31 @@ function sanitizeInspection(inspection) {
     };
   }
   return sanitized;
+}
+
+// yz-9pf: read-only telemetry query for `status`. Returns the last-5 error
+// ring, the last start record and the monotonic start count so an
+// unexplained mid-run worker restart (yz-4hr) is diagnosable after the fact.
+async function handleSwTelemetry(message) {
+  const session = chrome.storage.session;
+  const local = chrome.storage.local;
+  const [errors, lastStart, startCount] = await Promise.all([
+    session.get(SW_TELEMETRY_KEYS.lastErrors),
+    session.get(SW_TELEMETRY_KEYS.lastStart),
+    local.get(SW_TELEMETRY_KEYS.startCount)
+  ]);
+  await postTerminalMessage(message, makeEnvelope("job_complete", {
+    request_id: message.request_id,
+    job_id: message.job_id,
+    run_id: message.run_id,
+    workspace_id: message.workspace_id,
+    payload: {
+      sw_last_errors: errors[SW_TELEMETRY_KEYS.lastErrors] ?? [],
+      sw_last_start: lastStart[SW_TELEMETRY_KEYS.lastStart] ?? null,
+      sw_start_count: startCount[SW_TELEMETRY_KEYS.startCount] ?? null,
+      sw_uptime_ms: typeof workerStartedAtMs === "number" ? Date.now() - workerStartedAtMs : null
+    }
+  }), { status: "complete", phase: "profile" });
 }
 
 async function handleRequestIdentityPermission(message) {
