@@ -246,6 +246,8 @@ const chunks = new ChunkAssembler();
 let nativePort = null;
 let extensionIdentityPromise = null;
 let connectionGeneration = 0;
+// yz-9pf: worker start timestamp for the sw_telemetry uptime readout.
+const workerStartedAtMs = Date.now();
 
 chrome.runtime.onInstalled.addListener((details) => {
   void recordSwStart(swStartReason({ onInstalledReason: details?.reason }));
@@ -540,6 +542,9 @@ async function handleNativeMessage(message, sourcePort = nativePort, sourceGener
         break;
       case "request_identity_permission":
         await handleRequestIdentityPermission(message);
+        break;
+      case "sw_telemetry":
+        await handleSwTelemetry(message);
         break;
       case "terminal_ack":
         await handleTerminalAck(message);
@@ -2977,6 +2982,31 @@ function sanitizeInspection(inspection) {
     };
   }
   return sanitized;
+}
+
+// yz-9pf: read-only telemetry query for `status`. Returns the last-5 error
+// ring, the last start record and the monotonic start count so an
+// unexplained mid-run worker restart (yz-4hr) is diagnosable after the fact.
+async function handleSwTelemetry(message) {
+  const session = chrome.storage.session;
+  const local = chrome.storage.local;
+  const [errors, lastStart, startCount] = await Promise.all([
+    session.get(SW_TELEMETRY_KEYS.lastErrors),
+    session.get(SW_TELEMETRY_KEYS.lastStart),
+    local.get(SW_TELEMETRY_KEYS.startCount)
+  ]);
+  await postTerminalMessage(message, makeEnvelope("job_complete", {
+    request_id: message.request_id,
+    job_id: message.job_id,
+    run_id: message.run_id,
+    workspace_id: message.workspace_id,
+    payload: {
+      sw_last_errors: errors[SW_TELEMETRY_KEYS.lastErrors] ?? [],
+      sw_last_start: lastStart[SW_TELEMETRY_KEYS.lastStart] ?? null,
+      sw_start_count: startCount[SW_TELEMETRY_KEYS.startCount] ?? null,
+      sw_uptime_ms: typeof workerStartedAtMs === "number" ? Date.now() - workerStartedAtMs : null
+    }
+  }), { status: "complete", phase: "profile" });
 }
 
 async function handleRequestIdentityPermission(message) {
