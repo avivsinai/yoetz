@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.78] - 2026-09-16
 ### Fixed
 - Upload-epoch fencing: a chunk or ack from an abandoned upload stream can no
   longer kill a job the restart rescued. `yz-y5p` classified a stale chunk only
@@ -31,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   matched prefix, so no trailing segment survives, and the credential shapes it
   recognises extend to quoted-JSON values, `Bearer` headers, `#fragment` forms,
   and the values of known credential-bearing attributes. (`yz-djy`)
+
 
 ## [0.5.77] - 2026-09-15
 ### Added
