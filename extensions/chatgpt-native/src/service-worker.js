@@ -2705,16 +2705,38 @@ async function handleDumpPickerHtml(message) {
 async function handleDumpConversation(message) {
   const adapter = siteAdapterForRecipe(message.payload?.recipe);
   const runId = String(message.payload?.run_id ?? "").trim();
-  if (!runId) {
+  const requestedTabId = Number(message.payload?.tab_id);
+  const tabTargeting = Number.isInteger(requestedTabId) && requestedTabId > 0;
+  if (!runId && !tabTargeting) {
     await postTerminalMessage(
       message,
-      errorEnvelope(messageJob(message), "missing_run_id", "dump_conversation requires payload.run_id", {
+      errorEnvelope(messageJob(message), "missing_run_id", "dump_conversation requires payload.run_id or payload.tab_id", {
         request_id: message.request_id,
         phase: "profile",
         side_effect_started: false
       }),
       { status: "failed", phase: "profile" }
     );
+    return;
+  }
+  // yz-bwi part (b): --tab-id escape hatch. The tab itself carries the
+  // ownership proof: the _yoetz=<run_id> URL marker outlives the retired job
+  // record, and the content script re-verifies the full owned window.name
+  // (job_id + run_id + workspace + nonce) before serializing anything.
+  if (tabTargeting) {
+    if (runId) {
+      await postTerminalMessage(
+        message,
+        errorEnvelope(messageJob(message), "selector_conflict", "pass either --run-id or --tab-id, not both", {
+          request_id: message.request_id,
+          phase: "profile",
+          side_effect_started: false
+        }),
+        { status: "failed", phase: "profile" }
+      );
+      return;
+    }
+    await dumpConversationByTabId(message, adapter, requestedTabId);
     return;
   }
   const targetedJob = message?.job_id ? jobs.get(message.job_id) : null;
@@ -2871,6 +2893,94 @@ async function handleDumpConversation(message) {
       url: captured.url
     }
   }), { status: "complete", phase: "profile" });
+}
+
+// yz-bwi part (b): resolve a preserved tab by tab_id alone. The durable job
+// record may be retired (terminal outcome) or never resolvable (ack raced a
+// SW restart) — the _yoetz=<run_id> URL marker is what persists. The marker
+// is a routing hint, not an ownership credential: the capture itself is
+// gated by the content script's owned window.name re-verification (job_id,
+// run_id, workspace, nonce must ALL match), so a tab that navigated away
+// from the Yoetz job answers run_mismatch instead of surrendering content.
+async function dumpConversationByTabId(message, adapter, tabId) {
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    tab = null;
+  }
+  if (!tab?.id || !adapter.isAllowedTabUrl(tab.url) || !isYoetzOwnedTab(tab, adapter)) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), "tab_not_owned", `tab ${tabId} is not a Yoetz-owned ${adapter.displayName} tab (no _yoetz marker or wrong site)`, {
+        request_id: message.request_id,
+        tab_id: tabId,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
+    return;
+  }
+  const markerRunId = runIdFromMarker(tab.url);
+  try {
+    const captured = await sendToTab(tab.id, {
+      type: "yoetz_dump_conversation",
+      run_id: markerRunId ?? "",
+      workspace_id: message.workspace_id,
+      recipe: adapter.recipe,
+      allow_live_job: message.payload?.allow_live_job === true,
+      // --tab-id mode: the content script resolves ownership from the tab's
+      // own window.name against the URL marker run; job_id/nonce equality is
+      // asserted between window.name and the verified ownership payload.
+      tab_addressed: true
+    });
+    await postTerminalMessage(message, makeEnvelope("job_complete", {
+      request_id: message.request_id,
+      job_id: message.job_id,
+      run_id: captured.run_id ?? markerRunId,
+      workspace_id: message.workspace_id,
+      payload: {
+        run_id: captured.run_id ?? markerRunId,
+        job_id: captured.job_id ?? null,
+        service_worker_build: serviceWorkerBuild(),
+        html: captured.html,
+        bytes: captured.bytes,
+        conversation_id: captured.conversation_id,
+        extracted_text: captured.extracted_text,
+        extraction_method: captured.extraction_method,
+        extracted_chars: captured.extracted_chars,
+        redactions: captured.redactions ?? 0,
+        raw_inner_text_chars: captured.raw_inner_text_chars,
+        tab_id: tab.id,
+        url: tab.url ?? null,
+        title: tab.title ?? null
+      }
+    }), { status: "complete", phase: "profile" });
+  } catch (error) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), error?.code ?? "dump_failed", String(error?.message ?? error), {
+        request_id: message.request_id,
+        run_id: markerRunId ?? null,
+        tab_id: tab.id,
+        url: tab.url ?? null,
+        title: tab.title ?? null,
+        page_state: error?.page_state,
+        phase: error?.phase ?? "profile",
+        side_effect_started: error?.side_effect_started ?? false
+      }),
+      { status: "failed", phase: error?.phase ?? "profile" }
+    );
+  }
+}
+
+function runIdFromMarker(url) {
+  try {
+    return new URL(url).searchParams.get("_yoetz");
+  } catch {
+    return null;
+  }
 }
 
 // yz-bwi: the LOCAL terminal-outbox shard is the durable record for EVERY
