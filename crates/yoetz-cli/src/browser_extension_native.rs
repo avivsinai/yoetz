@@ -2186,7 +2186,8 @@ fn finalize_picker_capture(
 // Never mutates the page; refuses a live job unless --allow-live-job (the
 // gate lives in the content script, like dump-picker).
 pub fn dump_conversation_run(
-    run_id: &str,
+    run_id: Option<&str>,
+    tab_id: Option<i64>,
     out_path: &Path,
     allow_live_job: bool,
     selector: ExtensionInstanceSelector<'_>,
@@ -2195,13 +2196,25 @@ pub fn dump_conversation_run(
     if recipe != BuiltinWebRecipe::Chatgpt {
         bail!("dump-conversation is only supported with --chatgpt");
     }
-    let response = send_site_control_job(
-        "dump_conversation",
-        json!({ "run_id": run_id, "recipe": recipe.as_str(), "allow_live_job": allow_live_job }),
-        selector,
-        recipe,
-    )?;
-    finalize_conversation_capture(out_path, &response.payload, run_id, recipe)
+    let trimmed = run_id.map(str::trim).filter(|value| !value.is_empty());
+    let mut payload = json!({ "recipe": recipe.as_str(), "allow_live_job": allow_live_job });
+    let mut capture_run_id = "";
+    match (trimmed, tab_id) {
+        (Some(_), Some(_)) => bail!("pass either --run-id or --tab-id, not both"),
+        (Some(run), None) => {
+            payload["run_id"] = json!(run);
+            capture_run_id = run;
+        }
+        (None, Some(id)) => {
+            if id <= 0 {
+                bail!("--tab-id must be a positive Chrome tab id");
+            }
+            payload["tab_id"] = json!(id);
+        }
+        (None, None) => bail!("--run-id is required unless --tab-id is passed"),
+    }
+    let response = send_site_control_job("dump_conversation", payload, selector, recipe)?;
+    finalize_conversation_capture(out_path, &response.payload, capture_run_id, recipe)
 }
 
 // Process a dump_conversation response envelope and write the capture file.
@@ -2289,7 +2302,8 @@ fn finalize_conversation_capture(
         "extraction_method": extraction_method,
         "extracted_chars": extracted_chars,
         "raw_inner_text_chars": raw_inner_text_chars,
-        "run_id": run_id,
+        "run_id": if run_id.is_empty() { payload.get("run_id").cloned().unwrap_or(Value::Null) } else { json!(run_id) },
+        "tab_id": payload.get("tab_id"),
     }))
 }
 
