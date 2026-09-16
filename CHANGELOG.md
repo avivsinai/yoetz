@@ -14,7 +14,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   (yz-4hr-style) is now diagnosable after the fact instead of
   invisible. (`yz-9pf`)
 
-## [Unreleased]
 ### Fixed
 - Terminal inspectability: `inspect`, `dump-picker-html` and
   `dump-conversation` now also resolve runs from the durable local
