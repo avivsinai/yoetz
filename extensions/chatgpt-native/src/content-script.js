@@ -123,7 +123,8 @@ async function handleMessage(message) {
         workspace_id: message.workspace_id,
         ownership_nonce: message.ownership_nonce,
         recipe: message.recipe,
-        allow_live_job: message.allow_live_job === true
+        allow_live_job: message.allow_live_job === true,
+        tab_addressed: message.tab_addressed === true
       });
     case "yoetz_auth_probe":
       return authProbe(message.recipe);
@@ -811,6 +812,36 @@ async function dumpConversation(runId, options = {}) {
   const jobId = String(options.job_id ?? "").trim();
   const workspaceId = String(options.workspace_id ?? "").trim();
   const ownershipNonce = String(options.ownership_nonce ?? "").trim();
+  // yz-bwi part (b): tab-addressed mode. The operator addressed the tab by
+  // --tab-id; the tab's own window.name IS the ownership evidence. The URL's
+  // _yoetz=<run> marker must agree with the window-name run (both were
+  // stamped by the same job and the marker outlives the job record); job_id
+  // and nonce are taken from the verified window-name, never from the wire.
+  if (options.tab_addressed === true) {
+    const markerRunId = (() => {
+      try {
+        return new URL(location.href).searchParams.get("_yoetz");
+      } catch {
+        return null;
+      }
+    })();
+    if (!parsed || !markerRunId || parsed.run_id !== markerRunId) {
+      throw commandError("run_mismatch", `tab is no longer owned by the Yoetz run stamped in its URL (window.name=${parsed ? parsed.run_id : "(unowned)"}, marker=${markerRunId ?? "(none)"})`);
+    }
+    if (adapter.recipe !== "chatgpt") {
+      throw commandError("unsupported_recipe", `dump_conversation is ChatGPT-only; recipe ${JSON.stringify(adapter.recipe)} rejected before side effects`, {
+        phase: "profile",
+        side_effect_started: false
+      });
+    }
+    if (parsed.job_id && activeJobs.has(parsed.job_id) && !options.allow_live_job) {
+      throw commandError("live_job_conflict", `dump_conversation refused on a live job ${parsed.job_id}; pass --allow-live-job to opt in`, {
+        phase: "profile",
+        side_effect_started: false
+      });
+    }
+    return captureConversation(adapter, { jobId: parsed.job_id, runId: parsed.run_id });
+  }
   const jobMatches = Boolean(jobId && parsed?.job_id === jobId);
   const runMatches = Boolean(runId && parsed?.run_id === runId);
   const workspaceMatches = Boolean(workspaceId && parsed?.workspace_id === workspaceId);
@@ -832,12 +863,15 @@ async function dumpConversation(runId, options = {}) {
       side_effect_started: false
     });
   }
+  return captureConversation(adapter, { jobId, runId });
+}
+
+// Shared read-only capture body for both addressing modes (run-id and
+// tab-id). No clicks, no typing, no navigation; the serializer redacts
+// secrets (JWT shapes); lastRedactions reports how many.
+async function captureConversation(adapter, { jobId, runId }) {
   const { extractResponse } = await import(chrome.runtime.getURL("src/chatgpt-dom.js"));
   const { serializeConversation } = await import(chrome.runtime.getURL("src/conversation-serializer.js"));
-
-  // Read-only: serialize the conversation container and run the extractor on
-  // the live DOM. No clicks, no typing, no navigation. The serializer
-  // redacts secrets (JWT shapes); lastRedactions reports how many.
   const html = serializeConversation(document);
   const extraction = extractResponse(document);
   const rawText = document.body?.innerText ?? "";
@@ -846,6 +880,8 @@ async function dumpConversation(runId, options = {}) {
     bytes: new TextEncoder().encode(html).length,
     redactions: serializeConversation.lastRedactions ?? 0,
     conversation_id: adapter.conversationIdFromUrl(location.href) ?? null,
+    job_id: jobId || null,
+    run_id: runId || null,
     extracted_text: extraction.text ?? "",
     extraction_method: extraction.method ?? null,
     extracted_chars: (extraction.text ?? "").length,
