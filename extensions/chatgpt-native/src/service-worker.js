@@ -2295,8 +2295,11 @@ async function handleInspectRun(message) {
   const outboxInspectCandidates = targetedJob
     ? []
     : await loadUnacknowledgedOutboxInspectables(runId, message.workspace_id, adapter.recipe);
+  // Pro review (yz-bwi): precedence must be live > ack tombstone > outbox —
+  // the spread order below feeds the Map so the LATER (fresher) source
+  // overwrites the same job_id from a staler source.
   const inspectCandidates = Array.from(new Map(
-    [...liveInspectCandidates, ...acknowledgedInspectCandidates, ...outboxInspectCandidates]
+    [...outboxInspectCandidates, ...acknowledgedInspectCandidates, ...liveInspectCandidates]
       .map((job) => [job.job_id, job])
   ).values());
   if (inspectCandidates.length !== 1) {
@@ -2522,8 +2525,11 @@ async function handleDumpPickerHtml(message) {
   const outboxInspectCandidates = targetedJob
     ? []
     : await loadUnacknowledgedOutboxInspectables(runId, message.workspace_id, adapter.recipe);
+  // Pro review (yz-bwi): precedence must be live > ack tombstone > outbox —
+  // the spread order below feeds the Map so the LATER (fresher) source
+  // overwrites the same job_id from a staler source.
   const inspectCandidates = Array.from(new Map(
-    [...liveInspectCandidates, ...acknowledgedInspectCandidates, ...outboxInspectCandidates]
+    [...outboxInspectCandidates, ...acknowledgedInspectCandidates, ...liveInspectCandidates]
       .map((job) => [job.job_id, job])
   ).values());
   if (inspectCandidates.length !== 1) {
@@ -2697,8 +2703,11 @@ async function handleDumpConversation(message) {
   const outboxInspectCandidates = targetedJob
     ? []
     : await loadUnacknowledgedOutboxInspectables(runId, message.workspace_id, adapter.recipe);
+  // Pro review (yz-bwi): precedence must be live > ack tombstone > outbox —
+  // the spread order below feeds the Map so the LATER (fresher) source
+  // overwrites the same job_id from a staler source.
   const inspectCandidates = Array.from(new Map(
-    [...liveInspectCandidates, ...acknowledgedInspectCandidates, ...outboxInspectCandidates]
+    [...outboxInspectCandidates, ...acknowledgedInspectCandidates, ...liveInspectCandidates]
       .map((job) => [job.job_id, job])
   ).values());
   if (inspectCandidates.length !== 1) {
@@ -2819,7 +2828,11 @@ async function handleDumpConversation(message) {
 }
 
 // yz-bwi: the LOCAL terminal-outbox shard is the durable record for EVERY
-// terminal delivery (job_complete / job_error / job_cancel / ...), ack or not.
+// terminal delivery (job_complete / job_error / job_cancel / ...), ack or
+// not — including records whose LATER re-persist failed
+// (terminal_persistence_failed): the surviving record still holds an accurate
+// earlier terminal state, capture stays gated by content-script ownership
+// re-verification, and staleness by TTL.
 // Field evidence run b10805: a job_error terminal whose ACK was lost (CLI died
 // at the deadline / ack raced a SW restart) left no terminal-ack. tombstone,
 // and the session shard was gone with the SW restart — so dump-conversation
@@ -2850,10 +2863,6 @@ function inspectableJobFromOutbox(record, runId, workspaceId, recipe) {
     || record.ownership_nonce.length === 0
     || !Number.isSafeInteger(stamp)
     || Date.now() - stamp > JOB_TTL_MS
-    // A delivered-but-uncommitted terminal that the retry loop will still
-    // replay stays reachable through the live map on restore; the outbox copy
-    // is inspectable the same way the ack tombstone is.
-    || record.terminal_persistence_failed === true
   ) {
     return null;
   }
