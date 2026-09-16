@@ -9227,6 +9227,47 @@ mod tests {
         assert!(out.exists());
         assert_eq!(fs::read_to_string(&out).unwrap(), html);
     }
+
+    #[test]
+    fn finalize_conversation_capture_never_propagates_extracted_text() {
+        // yz-d8i: the capture text is unredacted prose — it must never reach
+        // the CLI envelope (which lands on disk via maybe_write_output), even
+        // if a hostile or stale extension still puts it on the wire. The
+        // finalize reads counts only; extract-then-drop is the contract.
+        let tmp = TempDir::new().expect("temp dir");
+        let out = tmp.path().join("conversation.html");
+        let html = "<main><div class=\"markdown\">the recovered answer</div></main>";
+        let payload = json!({
+            "status": "job_complete",
+            "html": html,
+            "bytes": html.len(),
+            "conversation_id": "conv-d8i",
+            "extracted_text": "wire-only prose marker 7q3f: must not reach the envelope",
+            "extraction_method": "assistant_dom_fallback",
+            "extracted_chars": 19_u64,
+            "raw_inner_text_chars": 10_449_u64,
+            "redactions": 0_u64,
+            "tab_id": 12_u64,
+            "url": "https://chatgpt.com/c/run?next=%2Fsettings&_yoetz=run_d8i"
+        });
+        let result =
+            finalize_conversation_capture(&out, &payload, "run-d8i", BuiltinWebRecipe::Chatgpt)
+                .expect("finalize");
+        assert_eq!(result["status"], "ok");
+        assert_eq!(result["extracted_chars"], 19);
+        assert_eq!(result["extraction_method"], "assistant_dom_fallback");
+        assert!(
+            result.get("extracted_text").is_none(),
+            "the CLI envelope must never carry the extracted text"
+        );
+        let serialized = result.to_string();
+        assert!(
+            !serialized.contains("wire-only prose marker"),
+            "no wire text may leak into the CLI envelope: {serialized}"
+        );
+        // The written capture file is the sanitized HTML only.
+        assert_eq!(fs::read_to_string(&out).unwrap(), html);
+    }
     // yz-er5: unit tests for check_recipe_cooldown pure function
     fn test_instance(cooldowns: Option<Value>) -> ExtensionInstanceStatus {
         ExtensionInstanceStatus {

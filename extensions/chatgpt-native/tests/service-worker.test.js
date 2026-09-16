@@ -3064,7 +3064,7 @@ test("service worker dump_picker_html forwards to the run's tab and relays the c
     port,
     storage,
     tabs: {
-      query: async () => [{ id: 13, url: "https://chatgpt.com/c/run", title: "Yoetz run" }],
+      query: async () => [{ id: 13, url: "https://chatgpt.com/c/run?next=%2Fsettings&api_key=sk-live-123&_yoetz=run_dump", title: "Yoetz run" }],
       sendMessage: async (_id, message) => {
         dumpMessage = message;
         return {
@@ -3104,6 +3104,12 @@ test("service worker dump_picker_html forwards to the run's tab and relays the c
     assert.equal(complete.payload.opened_by_us, false);
     // closed_after_dump is forwarded from the tab reply unchanged (was dropped in r2).
     assert.equal(complete.payload.closed_after_dump, false);
+    // yz-d8i: the capture url keeps only the _yoetz ownership marker; any
+    // other query param (credential-shaped) is stripped before the envelope.
+    assert.equal(
+      complete.payload.url,
+      "https://chatgpt.com/c/run?_yoetz=run_dump"
+    );
     assert.equal(complete.payload.run_id, "run_dump");
   } finally {
     globalThis.chrome = originalChrome;
@@ -3130,7 +3136,7 @@ test("service worker dump_conversation forwards to the run's tab and relays the 
     port,
     storage,
     tabs: {
-      query: async () => [{ id: 13, url: "https://chatgpt.com/c/run", title: "Yoetz run" }],
+      query: async () => [{ id: 13, url: "https://chatgpt.com/c/run?auth=secret-token&_yoetz=run_dump&session=abc", title: "Yoetz run" }],
       sendMessage: async (_id, message) => {
         dumpMessage = message;
         return {
@@ -3169,10 +3175,18 @@ test("service worker dump_conversation forwards to the run's tab and relays the 
     assert.equal(complete.payload.html, captureHtml);
     assert.equal(complete.payload.bytes, captureHtml.length);
     assert.equal(complete.payload.conversation_id, "conv-7iu");
-    assert.equal(complete.payload.extracted_text, "the recovered answer");
+    // yz-d8i: the extractor's TEXT must not ride the wire (it is unredacted
+    // prose, unlike the sanitized HTML) — only its length and method travel.
+    assert.equal(complete.payload.extracted_text, undefined);
     assert.equal(complete.payload.extraction_method, "assistant_dom_fallback");
     assert.equal(complete.payload.extracted_chars, 19);
     assert.equal(complete.payload.raw_inner_text_chars, 10449);
+    // yz-d8i: capture url keeps the _yoetz ownership marker but drops any
+    // other query params (credential-shaped, no diagnostic value).
+    assert.equal(
+      complete.payload.url,
+      "https://chatgpt.com/c/run?_yoetz=run_dump"
+    );
     assert.equal(complete.payload.run_id, "run_dump");
   } finally {
     globalThis.chrome = originalChrome;
