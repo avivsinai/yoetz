@@ -54,6 +54,16 @@ const RECIPE_READ_GRACE: Duration = Duration::from_secs(60);
 // budget is still running. Progress posts and upload ACKs arrive far more
 // often than this, so a longer silence means the extension stopped answering.
 const RECIPE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(180);
+
+// yz-y0p (review): the inactivity cap must never preempt a phase whose own
+// documented budget is longer — a slow-but-healthy attach stays silent up to
+// upload_timeout_ms (default 120s + 5s/MiB, capped at 3600s; operators are
+// told to raise it for slow sites), and the send wait up to send_timeout_ms.
+fn recipe_inactivity_cap(upload_timeout_ms: u64, send_timeout_ms: u64) -> Duration {
+    let longest_phase = Duration::from_millis(upload_timeout_ms.max(send_timeout_ms))
+        .saturating_add(RECIPE_READ_GRACE);
+    RECIPE_INACTIVITY_TIMEOUT.max(longest_phase)
+}
 const RECIPE_RECONNECT_WINDOW: Duration = Duration::from_secs(60);
 const RECIPE_RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const EXTENSION_RELOAD_VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -2597,6 +2607,7 @@ pub(crate) fn run_chatgpt_recipe_with_lease(
         BuiltinWebRecipe::Chatgpt,
         &spec.run_id,
         spec.wait_timeout_ms,
+        recipe_inactivity_cap(spec.upload_timeout_ms, spec.send_timeout_ms),
         &bundle,
         &token,
         chatgpt_job_start_payload(spec, &bundle),
@@ -2639,6 +2650,7 @@ pub(crate) fn run_claude_recipe_with_lease(
         BuiltinWebRecipe::Claude,
         &spec.run_id,
         spec.wait_timeout_ms,
+        recipe_inactivity_cap(spec.upload_timeout_ms, spec.send_timeout_ms),
         &bundle,
         &token,
         claude_job_start_payload(spec, &bundle),
@@ -2658,6 +2670,7 @@ fn run_extension_recipe_with_reconnect(
     recipe: BuiltinWebRecipe,
     run_id: &str,
     wait_timeout_ms: u64,
+    inactivity_cap: Duration,
     bundle: &BundleInfo,
     token: &str,
     start_payload: Value,
@@ -2690,9 +2703,10 @@ fn run_extension_recipe_with_reconnect(
             None => {
                 // yz-y0p: cap each read at the inactivity limit so a wedged
                 // extension fails fast with guidance instead of sitting out the
-                // whole wait budget in silence.
+                // whole wait budget in silence. The cap is derived per run so a
+                // legitimately long attach/send budget is never preempted.
                 let remaining = overall_budget.saturating_sub(started.elapsed());
-                stream.set_read_timeout(Some(remaining.min(RECIPE_INACTIVITY_TIMEOUT)))?;
+                stream.set_read_timeout(Some(remaining.min(inactivity_cap)))?;
                 read_json_frame(&mut stream)
             }
         };
@@ -2736,7 +2750,7 @@ fn run_extension_recipe_with_reconnect(
                 }
                 bail!(
                     "chrome-extension-native recipe run {run_id} produced no events for {}s with {}s of wait budget left: {}. The job was NOT resubmitted and its tab may still hold a live job; inspect it with `yoetz browser extension inspect --{} --run-id {run_id}`",
-                    RECIPE_INACTIVITY_TIMEOUT.as_secs(),
+                    inactivity_cap.as_secs(),
                     overall_budget.saturating_sub(started.elapsed()).as_secs(),
                     wedged_channel_hint(&lease.paths),
                     recipe.as_str()
@@ -7939,6 +7953,22 @@ mod tests {
             &instance,
             BuiltinWebRecipe::Claude
         ));
+    }
+
+    #[test]
+    fn yz_y0p_inactivity_cap_never_preempts_phase_budgets() {
+        // Default budgets stay on the fixed 180s floor.
+        assert_eq!(
+            recipe_inactivity_cap(120_000, 120_000),
+            RECIPE_INACTIVITY_TIMEOUT
+        );
+        // Review blocker: an upload_timeout_ms override of 300000 with a
+        // silent-but-healthy attach must not trip the cap at 180s.
+        let cap = recipe_inactivity_cap(300_000, 120_000);
+        assert!(cap > Duration::from_secs(300));
+        assert_eq!(cap, Duration::from_secs(300) + RECIPE_READ_GRACE);
+        // Same for a raised send budget.
+        assert!(recipe_inactivity_cap(120_000, 300_000) > Duration::from_secs(300));
     }
 
     #[test]

@@ -22,8 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   poisoned the connection generation permanently — every command timed out
   while `extension status` kept reporting the bridge alive. The CLI now
   fails fast instead of sitting in silence: control calls time out with
-  heartbeat freshness and recovery steps, and recipe runs bail after 180s
-  without events (with the inspect command; the job is never resubmitted).
+  heartbeat freshness and recovery steps, and recipe runs bail after a
+  silent stretch (180s floor, raised past the run's upload/send budgets
+  so a slow-but-healthy attach is never preempted) with the inspect
+  command; the job is never resubmitted.
   `extension doctor` also fails when PATH resolves `yoetz` to a different
   binary than the running one (stale-shadow guard). (`yz-y0p`)
 - Terminal inspectability: `inspect`, `dump-picker-html` and
