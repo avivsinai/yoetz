@@ -8935,6 +8935,98 @@ test("service worker terminal_ack marks a persisted envelope delivered so restor
   }
 });
 
+// yz-y0p: a restore chain that pends forever (observed live: chrome.storage.local
+// writes stalling in the browser process while reads kept working) must not wedge
+// the command channel. The restore gate is bounded and clears itself, so commands
+// are answered again while heartbeats keep flowing.
+test("yz-y0p: a pending restore gate times out and the command channel recovers", async () => {
+  const originalChrome = globalThis.chrome;
+  const originalGateTimeout = globalThis.__YOETZ_RESTORE_GATE_TIMEOUT_MS;
+  globalThis.__YOETZ_RESTORE_GATE_TIMEOUT_MS = 50;
+  const port = makePort();
+  const storage = makeStorage();
+  const pendingStorage = makeStorage();
+  const realSet = pendingStorage.set.bind(pendingStorage);
+  // Reads keep working; every write pends forever (the live failure mode).
+  pendingStorage.set = () => new Promise(() => {});
+  await realSet({
+    // Seed the instance id so postHello does not pend on its one-time local
+    // write — this test wedges the restore chain, not the identity path.
+    yoetz_extension_instance_id: "ext_test_y0p",
+    "terminal-outbox.job_y0p_pending": {
+      job_id: "job_y0p_pending",
+      run_id: "run_test",
+      workspace_id: "workspace_test",
+      status: "complete",
+      terminal_type: "job_complete",
+      terminal_envelope: envelope("job_complete", "job_y0p_pending", { is_final: true, response: "stuck", sequence: 0 }, { run_id: "run_test" }),
+      terminal_sequence: 0,
+      terminal_delivered_at: null,
+      started_at: Date.now(),
+      updated_at: Date.now()
+    }
+  });
+  globalThis.chrome = chromeStub({ port, storage, localStorage: pendingStorage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?y0p_pending_gate=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+
+    // The restore chain pends on the wedged write; the bounded gate records the
+    // failure and clears itself instead of poisoning the connection generation.
+    await eventually(() => {
+      return storage.get("status").then((stored) => stored.status?.status === "restore_failed"
+        && String(stored.status?.detail ?? "").includes("did not settle"));
+    });
+
+    port.messages.length = 0;
+    port.emit(envelope("heartbeat", "hb_y0p_pending"));
+    await eventually(() => port.messages.some((message) => message.type === "heartbeat"));
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (originalGateTimeout === undefined) {
+      delete globalThis.__YOETZ_RESTORE_GATE_TIMEOUT_MS;
+    } else {
+      globalThis.__YOETZ_RESTORE_GATE_TIMEOUT_MS = originalGateTimeout;
+    }
+  }
+});
+
+// yz-y0p: a rejected restore previously stayed in nativeRestorePromises forever,
+// so every later command awaited the same rejection and was dropped silently.
+test("yz-y0p: a rejected restore gate clears instead of poisoning the generation", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  const brokenStorage = makeStorage();
+  const realGet = brokenStorage.get.bind(brokenStorage);
+  // Fail only the full-store reads the restore chain depends on. Keyed reads
+  // (extension identity) keep working so the hello path stays healthy and does
+  // not race a "connected" status write over the restore_failed signal.
+  brokenStorage.get = async (key) => {
+    if (typeof key === "string") {
+      return realGet(key);
+    }
+    throw new Error("storage backend gone");
+  };
+  globalThis.chrome = chromeStub({ port, storage, localStorage: brokenStorage, tabs: {} });
+
+  try {
+    await import(`../src/service-worker.js?y0p_rejected_gate=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+
+    await eventually(() => {
+      return storage.get("status").then((stored) => stored.status?.status === "restore_failed");
+    });
+
+    port.messages.length = 0;
+    port.emit(envelope("heartbeat", "hb_y0p_rejected"));
+    await eventually(() => port.messages.some((message) => message.type === "heartbeat"));
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
 test("service worker retains the terminal until the ACK tombstone commits", async () => {
   const originalChrome = globalThis.chrome;
   const port = makePort();

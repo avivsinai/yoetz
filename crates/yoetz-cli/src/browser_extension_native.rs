@@ -50,6 +50,10 @@ pub const MAX_BUNDLE_BYTES: u64 = 10 * 1024 * 1024;
 const CHUNK_BYTES: usize = 192 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const RECIPE_READ_GRACE: Duration = Duration::from_secs(60);
+// yz-y0p: longest silent stretch a recipe stream may sit in while the wait
+// budget is still running. Progress posts and upload ACKs arrive far more
+// often than this, so a longer silence means the extension stopped answering.
+const RECIPE_INACTIVITY_TIMEOUT: Duration = Duration::from_secs(180);
 const RECIPE_RECONNECT_WINDOW: Duration = Duration::from_secs(60);
 const RECIPE_RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const EXTENSION_RELOAD_VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -1828,6 +1832,7 @@ pub fn doctor() -> Result<DoctorReport> {
             }),
         },
         identity_permission_doctor_check(latest_instance_with_hello, legacy_hello_seen, extension_value),
+        cli_path_doctor_check(),
         DoctorCheck {
             name: "stable_extension_id",
             ok: EXTENSION_ID == extension_id_from_public_key(EXTENSION_KEY)?,
@@ -1846,6 +1851,57 @@ pub fn doctor_with_auth_probe(
     report.checks.push(site_auth_doctor_check(selector, recipe));
     report.ok = report.checks.iter().all(|check| check.ok);
     Ok(report)
+}
+
+// yz-y0p: a stale `yoetz` earlier on PATH keeps driving the new extension with
+// an old CLI (observed live: 0.5.67 shadowing 0.5.78). Fail doctor when PATH
+// resolves `yoetz` to a different binary than the one running. Advisory-only
+// when the current exe is not itself a `yoetz` binary (cargo test / target).
+fn cli_path_doctor_check() -> DoctorCheck {
+    let skipped = |detail: &str| DoctorCheck {
+        name: "cli_path",
+        ok: true,
+        detail: detail.to_string(),
+    };
+    let Ok(current) = env::current_exe() else {
+        return skipped("current exe unknown; PATH check skipped");
+    };
+    let is_yoetz_binary = current
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(|stem| stem == "yoetz")
+        .unwrap_or(false);
+    if !is_yoetz_binary {
+        return skipped("running binary is not a `yoetz` executable; PATH check skipped");
+    }
+    let exe_name = format!("yoetz{}", env::consts::EXE_SUFFIX);
+    let on_path = env::var_os("PATH").and_then(|path| {
+        env::split_paths(&path)
+            .map(|dir| dir.join(&exe_name))
+            .find(|candidate| candidate.is_file())
+    });
+    let Some(on_path) = on_path else {
+        return skipped("no `yoetz` found on PATH");
+    };
+    let same = match (fs::canonicalize(&on_path), fs::canonicalize(&current)) {
+        (Ok(resolved), Ok(running)) => resolved == running,
+        _ => true, // cannot compare; do not fail doctor on a filesystem hiccup
+    };
+    DoctorCheck {
+        name: "cli_path",
+        ok: same,
+        detail: if same {
+            format!(
+                "PATH resolves `yoetz` to the running binary {}",
+                on_path.display()
+            )
+        } else {
+            format!(
+                "PATH resolves `yoetz` to {} which is not the running binary; remove the stale shadow or fix PATH order",
+                on_path.display()
+            )
+        },
+    }
 }
 
 fn site_auth_doctor_check(
@@ -2615,7 +2671,6 @@ fn run_extension_recipe_with_reconnect(
             recipe.as_str()
         )
     })?;
-    set_recipe_read_timeout(&stream, wait_timeout_ms)?;
     let start = ProtocolEnvelope::new_with_workspace(
         "job_start",
         Some(job_id.clone()),
@@ -2626,13 +2681,22 @@ fn run_extension_recipe_with_reconnect(
     .with_token(token.to_string());
     write_json_frame(&mut stream, &start).context("start chrome-extension-native recipe")?;
 
+    let started = Instant::now();
+    let overall_budget = Duration::from_millis(wait_timeout_ms).saturating_add(RECIPE_READ_GRACE);
     let mut pending = None;
     loop {
-        match pending
-            .take()
-            .map(Ok)
-            .unwrap_or_else(|| read_json_frame(&mut stream))
-        {
+        let read = match pending.take() {
+            Some(envelope) => Ok(envelope),
+            None => {
+                // yz-y0p: cap each read at the inactivity limit so a wedged
+                // extension fails fast with guidance instead of sitting out the
+                // whole wait budget in silence.
+                let remaining = overall_budget.saturating_sub(started.elapsed());
+                stream.set_read_timeout(Some(remaining.min(RECIPE_INACTIVITY_TIMEOUT)))?;
+                read_json_frame(&mut stream)
+            }
+        };
+        match read {
             Ok(envelope) => {
                 validate_inbound_envelope(&envelope)?;
                 match envelope.kind.as_str() {
@@ -2662,6 +2726,21 @@ fn run_extension_recipe_with_reconnect(
                 )?;
                 stream = reconnected;
                 pending = first;
+            }
+            Err(error) if is_socket_timeout(&error) => {
+                if started.elapsed() >= overall_budget {
+                    return Err(error).context(format!(
+                        "chrome-extension-native recipe run {run_id} exceeded the wait budget of {}s",
+                        overall_budget.as_secs()
+                    ));
+                }
+                bail!(
+                    "chrome-extension-native recipe run {run_id} produced no events for {}s with {}s of wait budget left: {}. The job was NOT resubmitted and its tab may still hold a live job; inspect it with `yoetz browser extension inspect --{} --run-id {run_id}`",
+                    RECIPE_INACTIVITY_TIMEOUT.as_secs(),
+                    overall_budget.saturating_sub(started.elapsed()).as_secs(),
+                    wedged_channel_hint(&lease.paths),
+                    recipe.as_str()
+                );
             }
             Err(error) => return Err(error).context("read chrome-extension-native recipe event"),
         }
@@ -2811,6 +2890,40 @@ fn is_recipe_disconnect_error(error: &anyhow::Error) -> bool {
             )
         )
     })
+}
+
+fn is_socket_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
+        )
+    })
+}
+
+// yz-y0p: the extension can wedge its command channel (a stuck chrome.storage
+// write blocking the service worker restore gate) while heartbeats keep the
+// bridge status fresh. Surface heartbeat freshness so operators can tell a
+// wedged extension from a dead bridge, plus the recovery that actually works.
+fn wedged_channel_hint(paths: &ExtensionPaths) -> String {
+    let freshness = match read_status_file(&paths.status_path)
+        .and_then(|status| status.get("last_heartbeat_ms").and_then(Value::as_u64))
+    {
+        Some(last_heartbeat_ms) => {
+            let now_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64;
+            format!(
+                "bridge heartbeat {}s ago",
+                now_ms.saturating_sub(last_heartbeat_ms) / 1000
+            )
+        }
+        None => "no bridge heartbeat recorded".to_string(),
+    };
+    format!(
+        "{freshness}. The extension command channel appears wedged; recovery: reload the Yoetz extension in chrome://extensions (toggle off/on) or restart Chrome, then retry"
+    )
 }
 
 pub fn serve_native_host_chatgpt() -> Result<()> {
@@ -4112,8 +4225,19 @@ fn send_control_job_with_recipe(
     .with_token(token);
     write_json_frame(&mut stream, &envelope)?;
     loop {
-        let response = read_json_frame(&mut stream)
-            .with_context(|| format!("timed out waiting for chrome-extension-native `{kind}`"))?;
+        let response = match read_json_frame(&mut stream) {
+            Ok(response) => response,
+            // yz-y0p: a control timeout with a live bridge means the extension
+            // never answered; say so instead of a bare os error 35.
+            Err(error) if is_socket_timeout(&error) => bail!(
+                "timed out waiting for chrome-extension-native `{kind}`: {}",
+                wedged_channel_hint(&paths)
+            ),
+            Err(error) => {
+                return Err(error)
+                    .context(format!("read chrome-extension-native `{kind}` response"))
+            }
+        };
         validate_inbound_envelope(&response)?;
         match response.kind.as_str() {
             "job_progress" | "heartbeat" => continue,
@@ -7815,6 +7939,22 @@ mod tests {
             &instance,
             BuiltinWebRecipe::Claude
         ));
+    }
+
+    #[test]
+    fn yz_y0p_socket_timeout_detection() {
+        let timeout = anyhow::Error::new(io::Error::new(io::ErrorKind::WouldBlock, "os error 35"));
+        assert!(is_socket_timeout(&timeout));
+        assert!(is_socket_timeout(&timeout.context("read frame")));
+        let closed = anyhow::Error::new(io::Error::new(io::ErrorKind::UnexpectedEof, "closed"));
+        assert!(!is_socket_timeout(&closed));
+    }
+
+    #[test]
+    fn yz_y0p_cli_path_check_never_fails_non_yoetz_binary() {
+        // Under cargo test the current exe is the test runner, never `yoetz`,
+        // so the PATH-shadow guard must stay advisory here.
+        assert!(cli_path_doctor_check().ok);
     }
 
     #[test]

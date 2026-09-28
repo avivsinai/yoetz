@@ -15,6 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   invisible. (`yz-9pf`)
 
 ### Fixed
+- Native transport wedge: the service worker's per-connection restore gate
+  now has a 15s bound and clears on EVERY settle. Previously a restore that
+  pended forever (observed live: `chrome.storage.local` writes stalling in
+  the browser process while reads and heartbeats kept working) or rejected
+  poisoned the connection generation permanently — every command timed out
+  while `extension status` kept reporting the bridge alive. The CLI now
+  fails fast instead of sitting in silence: control calls time out with
+  heartbeat freshness and recovery steps, and recipe runs bail after 180s
+  without events (with the inspect command; the job is never resubmitted).
+  `extension doctor` also fails when PATH resolves `yoetz` to a different
+  binary than the running one (stale-shadow guard). (`yz-y0p`)
 - Terminal inspectability: `inspect`, `dump-picker-html` and
   `dump-conversation` now also resolve runs from the durable local
   terminal-outbox shard, so a terminal whose ACK never committed (CLI

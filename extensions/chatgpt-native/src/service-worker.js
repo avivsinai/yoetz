@@ -108,6 +108,12 @@ const TERMINAL_ACK_KEY_PREFIX = "terminal-ack.";
 const CANCEL_PENDING_KEY_PREFIX = "cancel-pending.";
 const MAX_TERMINAL_ID_CHARS = 512;
 const WAITING_RESPONSE_PROGRESS_INTERVAL_MS = Math.max(50, Number(globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS ?? 60000) || 60000);
+// yz-y0p: upper bound on how long a native command may wait behind the
+// per-connection restore gate. A restore that pends forever (observed live: a
+// chrome.storage.local write stalling in the browser process while reads and
+// session writes kept working) must not silently kill the whole command
+// channel — heartbeats are alarm-driven and keep reporting the bridge alive.
+const RESTORE_GATE_TIMEOUT_MS = Math.max(50, Number(globalThis.__YOETZ_RESTORE_GATE_TIMEOUT_MS ?? 15000) || 15000);
 const CONTENT_SCRIPT_RECONNECT_ATTEMPTS = Math.max(
   1,
   Number(globalThis.__YOETZ_CONTENT_SCRIPT_RECONNECT_ATTEMPTS ?? 40) || 40
@@ -449,10 +455,19 @@ function connectNative() {
       }
       handleNativeDisconnect(port, generation);
     });
-    const restorePromise = reconcileAcknowledgedTerminalTombstones()
-      .then(() => restoreJobsFromStorage({ emitLostState: true }))
-      .then(() => retryPendingTerminalJobs());
+    const restorePromise = Promise.race([
+      reconcileAcknowledgedTerminalTombstones()
+        .then(() => restoreJobsFromStorage({ emitLostState: true }))
+        .then(() => retryPendingTerminalJobs()),
+      sleep(RESTORE_GATE_TIMEOUT_MS).then(() => {
+        throw new Error(`native state restore did not settle within ${RESTORE_GATE_TIMEOUT_MS}ms`);
+      })
+    ]);
     nativeRestorePromises.set(generation, restorePromise);
+    // yz-y0p: clear the gate on EVERY settle, not only on success. Keeping a
+    // rejected (or timed-out) restore in the map poisoned the connection
+    // generation permanently: every later command awaited the same settled
+    // rejection and was dropped silently.
     void restorePromise.then(
       () => {
         if (nativeRestorePromises.get(generation) === restorePromise) {
@@ -460,6 +475,9 @@ function connectNative() {
         }
       },
       (error) => {
+        if (nativeRestorePromises.get(generation) === restorePromise) {
+          nativeRestorePromises.delete(generation);
+        }
         setStatus("restore_failed", String(error?.message ?? error));
       }
     );
