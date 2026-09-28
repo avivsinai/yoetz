@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.79] - 2026-09-28
 ### Added
 - Service-worker telemetry: `browser extension status` now reports
   `sw_telemetry` (last-5 error ring with kind/message/stack/active jobs,
@@ -41,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   the picker-open loop; previously they were silently dropped, so every
   picker-open wait ran its full default budget. Production callers are
   unaffected (none set these). (`yz-bwi` companion perf fix)
+
 
 ## [0.5.78] - 2026-09-16
 ### Fixed
