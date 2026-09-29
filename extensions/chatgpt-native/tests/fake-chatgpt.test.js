@@ -832,7 +832,76 @@ test("extractResponse uses 2026-09-28 conversation-role markdown without author-
 
   assert.notEqual(extraction.method, "page_text_fallback");
   assert.equal(extraction.text, "YOETZ_E2E_OK");
+  assert.equal(/chatgpt\s+said:/i.test(extraction.text), false);
+  assert.equal(/you\s+said:/i.test(extraction.text), false);
+  assert.equal(extraction.text.includes("Reply with exactly"), false);
   assert.ok(extraction.assistant_count >= 1);
+});
+
+// M13: user Copy under *:user must not promote the shared data-turn-key / article wrapper
+// (which also contains the prompt) into an assistant turn. Deleting the
+// isUserUnitContainer / looksLikeUserTurn early-return in assistantTurnForNode must fail this.
+test("extractResponse keeps 2026-09-28 user unit copy out of combined turn-key assistant scope", () => {
+  const prompt = "YZ_C1L_M13_USER_PROMPT_MUST_NOT_LEAK";
+  const userBubble = new FakeElement("div", {
+    "data-user-message-bubble": "true",
+    class: "bg-user-message text-user-message"
+  }, prompt);
+  const userCopy = new FakeElement("button", { "aria-label": "Copy message" }, "Copy");
+  const userUnit = new FakeElement("div", {
+    class: "group/user-message flex flex-col items-end gap-2",
+    "data-content-search-unit-key": "fallback-turn-0:0:user"
+  }, "").append(userBubble, userCopy);
+  // Answer text lives on the *:assistant unit itself (FakeElement does not roll child
+  // textContent up). No markdown-text-style so a wrongly promoted article wrapper
+  // falls through to cleanAssistantText(article) and would leak the prompt.
+  const assistantUnit = new FakeElement("div", {
+    "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+    "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant"
+  }, "YZ_C1L_M13_ASSISTANT_ONLY");
+  const turnKey = new FakeElement("div", {
+    "data-turn-key": "m13-combined-turn"
+  }, "").append(userUnit, assistantUnit);
+  const wrapper = new FakeElement("article", {
+    "data-testid": "conversation-turn-0"
+  }, "").append(turnKey);
+  // Aggregate transcript text onto the article the way a real DOM textContent walk would.
+  wrapper.textContent = `${prompt}\nYZ_C1L_M13_ASSISTANT_ONLY`;
+  wrapper.innerText = wrapper.textContent;
+  const conversation = new FakeElement("main", { role: "main" }, "").append(wrapper);
+  const body = new FakeElement("body", {}, `${prompt}\nYZ_C1L_M13_ASSISTANT_ONLY`)
+    .append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.notEqual(extraction.method, "page_text_fallback");
+  assert.equal(extraction.text, "YZ_C1L_M13_ASSISTANT_ONLY");
+  assert.equal(extraction.text.includes(prompt), false);
+  assert.match(extraction.text, /^YZ_C1L_M13_ASSISTANT_ONLY$/);
+});
+
+// M14: strip leaked "ChatGPT said:" / "You said:" role labels from assistant text.
+// Deleting the /^(chatgpt|you)\s+said:$/i control-line filter must fail this.
+test("extractResponse strips ChatGPT said and You said labels from 2026-09-28 assistant text", () => {
+  const assistantMarkdown = new FakeElement("div", {
+    "data-markdown-text-style": "assistant-message",
+    class: "MarkdownRoot-rZKhxa"
+  }, "ChatGPT said:\nYOETZ_E2E_OK\nYou said:");
+  const assistantUnit = new FakeElement("div", {
+    "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+    "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant"
+  }, "").append(assistantMarkdown);
+  const body = new FakeElement("body", {}, "ChatGPT said:\nYOETZ_E2E_OK\nYou said:")
+    .append(new FakeElement("main", { role: "main" }, "").append(assistantUnit));
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.notEqual(extraction.method, "page_text_fallback");
+  assert.equal(extraction.text, "YOETZ_E2E_OK");
+  assert.equal(/chatgpt\s+said:/i.test(extraction.text), false);
+  assert.equal(/you\s+said:/i.test(extraction.text), false);
 });
 
 test("extractResponse scopes sibling markdown to a later copy control", () => {
