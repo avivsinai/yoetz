@@ -1085,7 +1085,12 @@ function findChatSurfaceControls(root) {
     if (textLabels && modeGroupHasForeignPressedControl(group, chats[0], works[0])) {
       return null;
     }
-    candidates.push({ group, chat: chats[0], work: works[0] });
+    candidates.push({
+      group,
+      chat: chats[0],
+      work: works[0],
+      shape: textLabels ? "composer_mode" : "radiogroup"
+    });
   }
   return candidates.length === 1 ? candidates[0] : null;
 }
@@ -1181,6 +1186,7 @@ function surfaceSelectionIsChat(controls) {
 }
 
 function surfaceProofFields(controls, visibleSurfaceToggleCount, composer, proofKind) {
+  const composerMode = proofKind === "explicit_composer_mode_buttons";
   return {
     surface_proof_kind: proofKind,
     surface_chat_state: controls ? surfaceSelectionState(controls.chat) : null,
@@ -1188,7 +1194,9 @@ function surfaceProofFields(controls, visibleSurfaceToggleCount, composer, proof
     surface_visible_toggle_count: visibleSurfaceToggleCount,
     surface_composer_aria: proofKind === "implicit_chat_composer_aria"
       ? composer?.getAttribute?.("aria-label") ?? null
-      : null
+      : null,
+    surface_observed_labels: composerMode ? ["Chat", "Work"] : null,
+    surface_foreign_pressed: composerMode ? false : null
   };
 }
 
@@ -1210,7 +1218,9 @@ export function verifyChatSurface(root = document, options = {}) {
     && observedValues.length === 0
     && isChatSurfaceComposerAria(composer);
   const proofKind = controlsReady
-    ? "explicit_chat_work_radios"
+    ? (controls.shape === "composer_mode"
+      ? "explicit_composer_mode_buttons"
+      : "explicit_chat_work_radios")
     : implicitReady
       ? "implicit_chat_composer_aria"
       : null;
@@ -1301,6 +1311,8 @@ export function verifyChatgptModelSelectionBeforeSend(root = document, selection
     surface_work_state: surface.surface_work_state ?? selection.surface_work_state ?? null,
     surface_visible_toggle_count: surface.surface_visible_toggle_count ?? selection.surface_visible_toggle_count ?? 0,
     surface_composer_aria: surface.surface_composer_aria ?? selection.surface_composer_aria ?? null,
+    surface_observed_labels: surface.surface_observed_labels ?? selection.surface_observed_labels ?? null,
+    surface_foreign_pressed: surface.surface_foreign_pressed ?? selection.surface_foreign_pressed ?? null,
     picker_shape: selection.picker_shape ?? null,
     current_closed_pill_text: pillText || null,
     current_closed_pill_family_status: currentFamilyStatus,
@@ -1321,7 +1333,9 @@ function surfaceResultFields(surface) {
     surface_chat_state: surface?.surface_chat_state ?? null,
     surface_work_state: surface?.surface_work_state ?? null,
     surface_visible_toggle_count: surface?.surface_visible_toggle_count ?? 0,
-    surface_composer_aria: surface?.surface_composer_aria ?? null
+    surface_composer_aria: surface?.surface_composer_aria ?? null,
+    surface_observed_labels: surface?.surface_observed_labels ?? null,
+    surface_foreign_pressed: surface?.surface_foreign_pressed ?? null
   };
 }
 

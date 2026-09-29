@@ -5043,6 +5043,10 @@ test("yz-c1l: Composer mode surface group (aria-pressed buttons) verifies Chat",
 
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.equal(result.state.aria_pressed, "true");
+  assert.equal(result.surface_proof_kind, "explicit_composer_mode_buttons");
+  assert.deepEqual(result.surface_observed_labels, ["Chat", "Work"]);
+  assert.equal(result.surface_foreign_pressed, false);
+  assert.deepEqual(result.observed_values, []);
 });
 
 test("yz-c1l: Composer mode surface on Work is clicked back to Chat and verified", async () => {

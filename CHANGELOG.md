@@ -22,11 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   view via close+reopen before driving a slider the family view keeps inert.
   Surface proof refuses a third pressed mode button and does not treat the
   "Ask ChatGPT" composer label as implicit Chat-surface proof (that label
-  coexists with the toggle). Send acceptance recognizes the new
-  `aria-label="Stop"` control and `data-user-message-bubble` user turns so
-  a real post-send generation is not reported as a false timeout. New live
-  picker + stop-button fixtures; mutation-killing surface tests; inert-aware
-  fake slider. `scripts/capture-chatgpt-picker.mjs` now bundles the
+  coexists with the toggle). Composer mode emits its own receipt proof kind
+  `explicit_composer_mode_buttons` (aria_pressed + labels + foreign-pressed),
+  validated in both the native service worker and the CLI receipt gate — the
+  radio-era `explicit_chat_work_radios` branch is unchanged. Send acceptance
+  recognizes the new `aria-label="Stop"` control and
+  `data-user-message-bubble` user turns so a real post-send generation is
+  not reported as a false timeout. New live picker + stop-button fixtures;
+  mutation-killing surface tests; inert-aware fake slider; surface-receipt
+  contract tests. `scripts/capture-chatgpt-picker.mjs` now bundles the
   serializer's sanitizer import instead of crashing in-page with
   `ReferenceError: sanitizeCaptureClone is not defined`. (`yz-c1l`)
 

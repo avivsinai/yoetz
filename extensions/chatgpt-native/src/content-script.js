@@ -535,6 +535,8 @@ async function sendPrompt(job, prompt) {
         surface_work_state: proof.surface_work_state,
         surface_visible_toggle_count: proof.surface_visible_toggle_count,
         surface_composer_aria: proof.surface_composer_aria,
+        surface_observed_labels: proof.surface_observed_labels,
+        surface_foreign_pressed: proof.surface_foreign_pressed,
         click_bound: true,
         click_bound_closed_pill_text: proof.current_closed_pill_text,
         click_bound_closed_pill_family_status: proof.current_closed_pill_family_status,

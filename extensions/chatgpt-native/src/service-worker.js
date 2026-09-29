@@ -12,6 +12,7 @@ import {
 } from "./protocol.js";
 import { advertisedRecipes, siteAdapterForRecipe } from "./sites/index.js";
 import { recordSwError, recordSwStart, refineSwStartReason, swStartReason, SW_TELEMETRY_KEYS } from "./sw-telemetry.js";
+import { validateChatgptSurfaceProofReceipt } from "./surface-receipt.js";
 
 const DEFAULT_WAIT_TIMEOUT_MS = 90 * 60 * 1000;
 const JOB_TTL_MS = 3 * 60 * 60 * 1000;
@@ -1573,38 +1574,12 @@ function validateChatgptFinalModelSelectionReceipt(receipt, job) {
       || !receipt.click_bound_closed_pill_text.trim()) {
     return "click-time closed pill text is empty";
   }
-  const observed = Array.isArray(receipt.surface_observed_values)
-    ? receipt.surface_observed_values
-    : [];
-  const chatState = receipt.surface_chat_state;
-  const workState = receipt.surface_work_state;
-  if (receipt.surface_proof_kind === "explicit_chat_work_radios") {
-    if (receipt.surface_evidence_seen !== true
-        || receipt.surface_visible_toggle_count !== 2
-        || chatState?.aria_checked !== "true"
-        || workState?.aria_checked !== "false"
-        || !observed.includes("chatgpt")
-        || !observed.includes("work")) {
-      return "explicit Chat/Work surface proof is incomplete";
-    }
-    if (receipt.surface_composer_aria !== null) {
-      return "explicit surface proof must not claim implicit composer proof";
-    }
-  } else if (receipt.surface_proof_kind === "implicit_chat_composer_aria") {
-    if (receipt.surface_evidence_seen !== false
-        || receipt.surface_visible_toggle_count !== 0
-        || observed.length !== 0
-        || receipt.surface_composer_aria !== "Chat with ChatGPT"
-        || chatState !== null
-        || workState !== null) {
-      return "implicit Chat composer proof is incomplete";
-    }
-  } else {
-    return `surface_proof_kind=${JSON.stringify(receipt.surface_proof_kind)}`;
+  const surfaceError = validateChatgptSurfaceProofReceipt(receipt);
+  if (surfaceError) {
+    return surfaceError;
   }
   return null;
 }
-
 function acquirePollerLease(job) {
   if (job.poller_lease != null) {
     return null;
