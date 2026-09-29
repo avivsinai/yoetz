@@ -86,6 +86,7 @@ class FakeElement {
   }
 
   click() {
+    if (this.isInertSubtree()) return;
     this.recordClick();
     this.onClick?.();
   }
@@ -94,8 +95,25 @@ class FakeElement {
     this.clicked = true;
   }
 
+  isInertSubtree() {
+    for (let node = this; node; node = node.parentElement) {
+      if (node.getAttribute?.("inert") != null) return true;
+    }
+    return false;
+  }
+
   dispatchEvent(event) {
     this.events.push(event.type);
+    // Model the real DOM: an inert ancestor suppresses pointer/keyboard input
+    // (yz-c1l split-view effort slider stays mounted but must ignore keys).
+    if (this.isInertSubtree()
+      && (event.type === "keydown"
+        || event.type === "click"
+        || event.type === "pointerdown"
+        || event.type === "pointermove"
+        || event.type === "mousemove")) {
+      return true;
+    }
     if (event.type === "pointerdown") {
       this.onPointerDown?.(event);
     }
@@ -2515,6 +2533,53 @@ test("waitForSendAccepted rejects a click that leaves ChatGPT idle", async () =>
     () => waitForSendAccepted(doc, baseline, { timeoutMs: 30, intervalMs: 10 }),
     /did not accept the prompt/
   );
+});
+
+// yz-c1l: 2026-09-28 stop control is aria-label="Stop" (no stop-button testid).
+test("yz-c1l: waitForSendAccepted accepts aria-label Stop as generation evidence", async () => {
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Ask ChatGPT",
+    class: "ProseMirror"
+  }, "");
+  const send = new FakeElement("button", { "aria-label": "Send prompt" }, "Send");
+  const body = new FakeElement("body", {}, "").append(composer, send);
+  const doc = new FakeDocument(body);
+  const baseline = sendAcceptanceBaseline(doc);
+
+  setTimeout(() => {
+    body.append(new FakeElement("button", { "aria-label": "Stop", type: "button" }, ""));
+  }, 20);
+
+  await clickSend(doc, { timeoutMs: 250, intervalMs: 10 });
+  const accepted = await waitForSendAccepted(doc, baseline, { timeoutMs: 250, intervalMs: 10 });
+
+  assert.equal(accepted.send_acceptance_signal, "stop_control");
+});
+
+test("yz-c1l: waitForSendAccepted accepts a data-user-message-bubble turn", async () => {
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Ask ChatGPT",
+    class: "ProseMirror"
+  }, "Review this");
+  const send = new FakeElement("button", { "aria-label": "Send prompt" }, "Send");
+  const body = new FakeElement("body", {}, "Review this").append(composer, send);
+  const doc = new FakeDocument(body);
+  const baseline = sendAcceptanceBaseline(doc);
+
+  setTimeout(() => {
+    const turn = new FakeElement("div", { "data-turn-key": "live-turn-0" });
+    turn.append(new FakeElement("div", { "data-user-message-bubble": "true" }, "Review this"));
+    body.append(turn);
+  }, 20);
+
+  await clickSend(doc, { timeoutMs: 250, intervalMs: 10 });
+  const accepted = await waitForSendAccepted(doc, baseline, { timeoutMs: 250, intervalMs: 10 });
+
+  assert.equal(accepted.send_acceptance_signal, "user_turn");
 });
 
 test("clickSend reports disabled send controls distinctly from missing controls", async () => {
@@ -5016,6 +5081,95 @@ test("yz-c1l: Composer mode group without a Work button fails closed", () => {
   assert.equal(result.failure_reason, "chat_surface_control_not_found");
 });
 
+// M1: surfaceSelectionIsChat must require Chat pressed AND Work unpressed.
+test("yz-c1l: Composer mode Chat with no aria-pressed fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { chat } = appendChatSurfaceModeGroup(body);
+  delete chat.attrs["aria-pressed"];
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_selection_mismatch");
+});
+
+test("yz-c1l: Composer mode Chat and Work both pressed fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { chat, work } = appendChatSurfaceModeGroup(body);
+  chat.setAttribute("aria-pressed", "true");
+  work.setAttribute("aria-pressed", "true");
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_selection_mismatch");
+});
+
+test("yz-c1l: Composer mode Work pressed with Chat attribute missing fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { chat, work } = appendChatSurfaceModeGroup(body, { surface: "work" });
+  delete chat.attrs["aria-pressed"];
+  work.setAttribute("aria-pressed", "true");
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_selection_mismatch");
+});
+
+// M3: "Ask ChatGPT" alone must not prove the Chat surface (no toggle).
+test("yz-c1l: Ask ChatGPT composer without a surface toggle fails closed", () => {
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Ask ChatGPT",
+    class: "ProseMirror"
+  });
+  const body = new FakeElement("body", {}, "Ask ChatGPT").append(composer);
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+});
+
+test("yz-c1l: Chat with ChatGPT composer still proves implicit Chat surface", () => {
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Chat with ChatGPT",
+    class: "ProseMirror"
+  });
+  const body = new FakeElement("body", {}, "Chat with ChatGPT").append(composer);
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.surface_proof_kind, "implicit_chat_composer_aria");
+});
+
+// M5: look-alike labels must not be taken as the Chat/Work pair.
+test("yz-c1l: Composer mode group with Chat history look-alike fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const group = new FakeElement("div", { role: "group", "aria-label": "Composer mode" });
+  group.append(
+    new FakeElement("button", { "aria-pressed": "true" }, "Chat history"),
+    new FakeElement("button", { "aria-pressed": "false" }, "Work")
+  );
+  body.append(group);
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+});
+
 test("yz-c1l: split-view picker verifies Latest Pro end to end", async () => {
   const fixture = makeSplitViewPickerFixture();
 
@@ -5974,8 +6128,18 @@ function matchesSimpleSelector(element, selector) {
   if (selector.includes('aria-label*="Stop streaming"')) {
     return tag === "button" && /Stop streaming/i.test(attr("aria-label") ?? "");
   }
+  if (selector.includes('aria-label*="Stop answering"')) {
+    return tag === "button" && /Stop answering/i.test(attr("aria-label") ?? "");
+  }
+  // Exact aria-label="Stop" (2026-09-28 composer); match before the *="Stop" catch-all.
+  if (/aria-label="Stop"/i.test(selector)) {
+    return tag === "button" && /^Stop$/i.test(attr("aria-label") ?? "");
+  }
   if (selector.includes('aria-label*="Stop"')) {
-    return tag === "button" && /Stop generating|Stop streaming/.test(attr("aria-label") ?? "");
+    return tag === "button" && /^(Stop generating|Stop streaming|Stop answering|Stop)$/i.test(attr("aria-label") ?? "");
+  }
+  if (selector.includes('[data-user-message-bubble="true"]')) {
+    return attr("data-user-message-bubble") === "true";
   }
   if (selector.includes('[aria-label*="Copy"]')) {
     return tag === "button" && /Copy/.test(attr("aria-label") ?? "");

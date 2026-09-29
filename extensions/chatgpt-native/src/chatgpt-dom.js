@@ -1135,9 +1135,11 @@ function observedSurfaceToggleValues(root) {
     .slice(0, 10);
 }
 
-// yz-c1l: 2026-09-28 drift relabeled the composer from "Chat with ChatGPT" to
-// "Ask ChatGPT"; both prove the implicit Chat surface when no toggle exists.
-const CHAT_SURFACE_COMPOSER_ARIA_LABELS = new Set(["Chat with ChatGPT", "Ask ChatGPT"]);
+// Implicit Chat-surface proof stays pinned to the pre-drift composer label.
+// The 2026-09-28 "Ask ChatGPT" label rides the authenticated ProseMirror
+// composer even when a Composer mode toggle is present, so it must not prove
+// Chat with no toggle (service-worker receipt also requires this exact label).
+const CHAT_SURFACE_COMPOSER_ARIA_LABELS = new Set(["Chat with ChatGPT"]);
 
 function isChatSurfaceComposerAria(composer) {
   return CHAT_SURFACE_COMPOSER_ARIA_LABELS.has(composer?.getAttribute?.("aria-label"));
@@ -3173,7 +3175,10 @@ const STOP_CONTROL_SELECTORS = [
   'button[aria-label*="Stop generating" i]',
   'button[aria-label*="Stop streaming" i]',
   // yz-91m: ChatGPT Pro's Stop button uses aria-label="Stop answering".
-  'button[aria-label*="Stop answering" i]'
+  'button[aria-label*="Stop answering" i]',
+  // yz-c1l: 2026-09-28 composer submit stop control is aria-label="Stop"
+  // with no data-testid (live run 20260929T065120Z_ec641a).
+  'button[aria-label="Stop" i]'
 ];
 
 export function isResponseGenerating(root = document) {
@@ -3798,7 +3803,11 @@ function composerContainsPrompt(composer, prompt) {
 function findUserTurns(root) {
   const explicitUserTurns = Array.from(root.querySelectorAll('[data-message-author-role="user"]'))
     .map((node) => node.closest?.('article, [data-testid*="conversation-turn"], [class*="user-turn"], [class*="turn-messages"]') ?? node);
-  return uniqueElements(explicitUserTurns)
+  // yz-c1l: 2026-09-28 conversation turns dropped data-message-author-role;
+  // the user bubble is marked data-user-message-bubble instead.
+  const bubbleUserTurns = Array.from(root.querySelectorAll('[data-user-message-bubble="true"]'))
+    .map((node) => node.closest?.('[data-turn-key], [data-content-search-turn-key], article, [data-testid*="conversation-turn"]') ?? node);
+  return uniqueElements([...explicitUserTurns, ...bubbleUserTurns])
     .filter((node) => isVisible(node, { allowDisabled: true, allowNoLayout: true }));
 }
 

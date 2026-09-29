@@ -20,8 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   buttons on the new group), anchors the labeled trigger, qualifies the
   authenticated composer by the ProseMirror class, and returns to the effort
   view via close+reopen before driving a slider the family view keeps inert.
-  New live picker capture fixture; `scripts/capture-chatgpt-picker.mjs` now
-  bundles the serializer's sanitizer import instead of crashing in-page with
+  Surface proof refuses a third pressed mode button and does not treat the
+  "Ask ChatGPT" composer label as implicit Chat-surface proof (that label
+  coexists with the toggle). Send acceptance recognizes the new
+  `aria-label="Stop"` control and `data-user-message-bubble` user turns so
+  a real post-send generation is not reported as a false timeout. New live
+  picker + stop-button fixtures; mutation-killing surface tests; inert-aware
+  fake slider. `scripts/capture-chatgpt-picker.mjs` now bundles the
+  serializer's sanitizer import instead of crashing in-page with
   `ReferenceError: sanitizeCaptureClone is not defined`. (`yz-c1l`)
 
 ## [0.5.79] - 2026-09-28
