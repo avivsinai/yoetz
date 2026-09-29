@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.80] - 2026-09-29
 ### Fixed
 - ChatGPT native extraction after the 2026-09-28 transcript markup drop of
   `data-message-author-role` / `article` wrappers: recognize
@@ -43,6 +45,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   assigns the permanent `/c/<uuid>` after send. `scripts/capture-chatgpt-picker.mjs` now bundles the
   serializer's sanitizer import instead of crashing in-page with
   `ReferenceError: sanitizeCaptureClone is not defined`. (`yz-c1l`)
+
 
 ## [0.5.79] - 2026-09-28
 ### Added
