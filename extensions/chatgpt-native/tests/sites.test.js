@@ -80,6 +80,7 @@ test("Claude adapter owns UUID conversations, exact model policy, and DOM-only f
 test("ChatGPT adapter owns conversation and model policy", () => {
   const adapter = siteAdapterForRecipe("chatgpt");
   const provisionalConversationId = "WEB:ca5209ac-2836-440d-b674-ffc54ee5dd2d";
+  const localProvisionalConversationId = "local-chatgpt:5a0f882c-74bc-411f-89e1-b57e509a7b94";
   const assignedConversationId = "6a5f60dc-8174-8329-949a-1f282d1dccbd";
   assert.deepEqual(adapter.tabActivation, {
     activateOnCreate: false,
@@ -91,6 +92,14 @@ test("ChatGPT adapter owns conversation and model policy", () => {
     conversation_id: null,
     submitted_conversation_id: provisionalConversationId
   }, provisionalConversationId, assignedConversationId), true);
+  assert.equal(adapter.isExpectedConversationIdAssignment({
+    conversation_id: null,
+    submitted_conversation_id: localProvisionalConversationId
+  }, localProvisionalConversationId, assignedConversationId), true);
+  assert.equal(adapter.isExpectedConversationIdAssignment({
+    conversation_id: null,
+    submitted_conversation_id: localProvisionalConversationId
+  }, localProvisionalConversationId, "local-chatgpt:other"), false);
   assert.equal(adapter.isExpectedConversationIdAssignment({
     conversation_id: null,
     submitted_conversation_id: provisionalConversationId
