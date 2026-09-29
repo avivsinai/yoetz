@@ -90,3 +90,11 @@ paths = [
     # unpacked/release extension id, not a credential.
     '''extensions/chatgpt-native/manifest\.json$''',
 ]
+# Historical false positives: fixture data-turn-key strings in extraction tests
+# (UUID-shaped live capture id + m13 label) flagged as generic-api-key. Current
+# tree uses low-entropy fixture-turn-* keys; these fingerprints cover the
+# intermediate commits still on the PR branch history.
+fingerprints = [
+    '''147dbbb8f252077157957b1fc6d598917073df2e:extensions/chatgpt-native/tests/fake-chatgpt.test.js:generic-api-key:823''',
+    '''c10a69441b01af7bd3f1323b13e30c44ba5a017e:extensions/chatgpt-native/tests/fake-chatgpt.test.js:generic-api-key:863''',
+]
