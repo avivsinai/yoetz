@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- ChatGPT recipe drift (2026-09-28): the Chat/Work surface toggle moved from
+  a `radiogroup` with `data-tpp-toggle-value` radios to a "Composer mode"
+  group of plain buttons selected via `aria-pressed`; the composer model pill
+  dropped the `__composer-pill` class (the trigger is now the button labeled
+  "Select ChatGPT model"); the composer lost `#prompt-textarea` (now a
+  ProseMirror contenteditable textbox); and the model picker became a
+  split-view design whose "Select model" toggle swaps the effort and family
+  views (exactly one live at a time, no `aria-expanded`). Model selection
+  failed closed with `chat_surface_control_not_found`. The driver now reads
+  both surface shapes (hook-only on the legacy radiogroup, exact-label
+  buttons on the new group), anchors the labeled trigger, qualifies the
+  authenticated composer by the ProseMirror class, and returns to the effort
+  view via close+reopen before driving a slider the family view keeps inert.
+  New live picker capture fixture; `scripts/capture-chatgpt-picker.mjs` now
+  bundles the serializer's sanitizer import instead of crashing in-page with
+  `ReferenceError: sanitizeCaptureClone is not defined`. (`yz-c1l`)
 
 ## [0.5.79] - 2026-09-28
 ### Added

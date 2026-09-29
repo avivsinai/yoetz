@@ -91,9 +91,15 @@ async function waitForRead(root, options = {}) {
   }
   return last;
 }
-const CHAT_SURFACE_GROUP_SELECTOR = '[role="radiogroup"][aria-label="Select chat surface"]';
+// yz-c1l: 2026-09-28 drift replaced the "Select chat surface" radiogroup with
+// a "Composer mode" group of plain buttons selected via aria-pressed.
+const CHAT_SURFACE_GROUP_SELECTOR = '[role="radiogroup"][aria-label="Select chat surface"], [role="group"][aria-label="Composer mode"]';
 const CHAT_SURFACE_CHAT_SELECTOR = '[role="radio"][data-tpp-toggle-value="chatgpt"]';
 const CHAT_SURFACE_WORK_SELECTOR = '[role="radio"][data-tpp-toggle-value="work"]';
+// The 2026-09-28 composer pill dropped the __composer-pill class; the trigger
+// is the composer menu button with this static aria-label (its
+// data-codex-intelligence-trigger="true" attribute is the secondary hook).
+const MODEL_TRIGGER_ARIA_LABEL = "Select ChatGPT model";
 const MANUAL_HANDOFF_SHELL_SELECTORS = Object.freeze([
   "nav",
   "aside",
@@ -397,6 +403,10 @@ export function findComposer(root = document) {
 export function findAuthenticatedComposer(root = document) {
   return firstVisible(root, [
     "#prompt-textarea",
+    // yz-c1l: 2026-09-28 drift dropped the #prompt-textarea id; the composer is
+    // now the ProseMirror contenteditable textbox. The class qualifier keeps
+    // the match ChatGPT-specific (generic editor textboxes stay rejected).
+    'div[contenteditable="true"][role="textbox"].ProseMirror',
     'textarea[data-testid*="composer"]',
     'div[contenteditable="true"][data-testid*="composer"]'
   ]);
@@ -422,6 +432,11 @@ export function findModelButton(root = document) {
   for (const scope of scopes) {
     const buttons = Array.from(scope.querySelectorAll('button[aria-haspopup="menu"]'))
       .filter((node) => isVisible(node, { allowDisabled: true }) && !isTranscriptModelControl(node));
+    const labeledTrigger = buttons.find((node) => node.getAttribute?.("aria-label") === MODEL_TRIGGER_ARIA_LABEL)
+      ?? buttons.find((node) => node.getAttribute?.("data-codex-intelligence-trigger") === "true");
+    if (labeledTrigger) {
+      return labeledTrigger;
+    }
     const composerPills = buttons.filter((node) => classTokens(node).includes("__composer-pill"));
     const grammarPill = composerPills.find((node) => modelPillSummaryMatches(modelControlLabel(node)))
       ?? buttons.find((node) => modelPillSummaryMatches(modelControlLabel(node)));
@@ -1056,16 +1071,29 @@ function positiveMs(value, fallback) {
 function findChatSurfaceControls(root) {
   const candidates = [];
   for (const group of visibleSurfaceGroups(root)) {
-    const chats = Array.from(group.querySelectorAll(CHAT_SURFACE_CHAT_SELECTOR))
-      .filter((node) => isVisibleSurfaceRadio(node));
-    const works = Array.from(group.querySelectorAll(CHAT_SURFACE_WORK_SELECTOR))
-      .filter((node) => isVisibleSurfaceRadio(node));
+    // The 2026-09-28 "Composer mode" group carries plain buttons matched by
+    // exact label; the pre-drift radiogroup stays hook-only so unexpected
+    // data-tpp-toggle-value values keep failing closed.
+    const textLabels = group.getAttribute?.("role") === "group";
+    const chats = surfaceToggleNodes(group, CHAT_SURFACE_CHAT_SELECTOR, textLabels ? "Chat" : null);
+    const works = surfaceToggleNodes(group, CHAT_SURFACE_WORK_SELECTOR, textLabels ? "Work" : null);
     if (chats.length !== 1 || works.length !== 1) {
       return null;
     }
     candidates.push({ group, chat: chats[0], work: works[0] });
   }
   return candidates.length === 1 ? candidates[0] : null;
+}
+
+function surfaceToggleNodes(group, hookSelector, textLabel) {
+  const byHook = Array.from(group.querySelectorAll(hookSelector))
+    .filter((node) => isVisibleSurfaceRadio(node));
+  if (byHook.length > 0 || !textLabel) {
+    return byHook;
+  }
+  return Array.from(group.querySelectorAll("button"))
+    .filter((node) => textOf(node) === textLabel)
+    .filter((node) => isVisibleSurfaceRadio(node));
 }
 
 function visibleSurfaceGroups(root) {
@@ -1079,8 +1107,12 @@ function surfaceEvidencePresent(root) {
 }
 
 function visibleSurfaceToggleNodes(root) {
-  return Array.from(root?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]') ?? [])
-    .filter((node) => isVisibleSurfaceRadio(node));
+  const radios = Array.from(root?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]') ?? []);
+  const modeButtons = visibleSurfaceGroups(root)
+    .filter((group) => group.getAttribute?.("role") === "group")
+    .flatMap((group) => Array.from(group.querySelectorAll("button")))
+    .filter((node) => textOf(node) === "Chat" || textOf(node) === "Work");
+  return [...radios, ...modeButtons].filter((node) => isVisibleSurfaceRadio(node));
 }
 
 function observedSurfaceToggleValues(root) {
@@ -1091,13 +1123,20 @@ function observedSurfaceToggleValues(root) {
     .slice(0, 10);
 }
 
+// yz-c1l: 2026-09-28 drift relabeled the composer from "Chat with ChatGPT" to
+// "Ask ChatGPT"; both prove the implicit Chat surface when no toggle exists.
+const CHAT_SURFACE_COMPOSER_ARIA_LABELS = new Set(["Chat with ChatGPT", "Ask ChatGPT"]);
+
+function isChatSurfaceComposerAria(composer) {
+  return CHAT_SURFACE_COMPOSER_ARIA_LABELS.has(composer?.getAttribute?.("aria-label"));
+}
+
 function implicitChatSurfaceProof(root, observedValues) {
   if (observedValues.length > 0
     || surfaceEvidencePresent(root)) {
     return false;
   }
-  const composer = findComposer(root);
-  return composer?.getAttribute?.("aria-label") === "Chat with ChatGPT";
+  return isChatSurfaceComposerAria(findComposer(root));
 }
 
 function hasPositiveLayout(element) {
@@ -1113,6 +1152,7 @@ function isVisibleSurfaceRadio(element) {
 function surfaceSelectionState(node) {
   return {
     aria_checked: node?.getAttribute?.("aria-checked") ?? null,
+    aria_pressed: node?.getAttribute?.("aria-pressed") ?? null,
     data_state: node?.getAttribute?.("data-state") ?? null
   };
 }
@@ -1120,7 +1160,10 @@ function surfaceSelectionState(node) {
 function surfaceSelectionIsChat(controls) {
   const chat = surfaceSelectionState(controls?.chat);
   const work = surfaceSelectionState(controls?.work);
-  return chat.aria_checked === "true" && work.aria_checked === "false";
+  if (chat.aria_checked !== null || work.aria_checked !== null) {
+    return chat.aria_checked === "true" && work.aria_checked === "false";
+  }
+  return chat.aria_pressed === "true" && work.aria_pressed === "false";
 }
 
 function surfaceProofFields(controls, visibleSurfaceToggleCount, composer, proofKind) {
@@ -1151,7 +1194,7 @@ export function verifyChatSurface(root = document, options = {}) {
     && !surfaceEvidenceSeen
     && visibleSurfaceGroups(root).length === 0
     && observedValues.length === 0
-    && composer?.getAttribute?.("aria-label") === "Chat with ChatGPT";
+    && isChatSurfaceComposerAria(composer);
   const proofKind = controlsReady
     ? "explicit_chat_work_radios"
     : implicitReady
@@ -1356,9 +1399,12 @@ function leftoverSurfaceIsOpen(root, trigger) {
 }
 
 function modelControlLabel(node) {
+  const ariaLabel = node?.getAttribute?.("aria-label");
   return normalizeText([
     textOf(node),
-    node?.getAttribute?.("aria-label"),
+    // The 2026-09-28 trigger's aria-label is a static control description, not
+    // the selected value; including it would defeat pill-grammar corroboration.
+    ariaLabel === MODEL_TRIGGER_ARIA_LABEL ? null : ariaLabel,
     node?.getAttribute?.("title")
   ].filter(Boolean).join(" "));
 }
@@ -1542,12 +1588,42 @@ async function selectLatestChatProModel(root, options = {}) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, r, availableFamilies, "Latest effort slider was not found in the Advanced picker", "effort_control_not_found");
       }
-      const moved = await moveEffortSliderToPro(root, r, options);
-      effortMoveMethod = moved.method;
-      r = moved.read;
-      if (!moved.ok) {
-        await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, r, availableFamilies, "Latest effort slider did not move to verified Pro", "effort_slider_move_failed", { effortMoveMethod });
+      // yz-c1l: the 2026-09-28 split-view picker keeps the slider mounted but
+      // inert while the family view is active (the family leg toggled to it),
+      // and the view toggle is inert inside the family view — the way back to
+      // the effort view is close + reopen, since the effort view is the
+      // default on open.
+      if (effortControlIsInert(r.effort.control) && r.nav.viewToggle) {
+        if (!await closeModelPicker(root, modelButton)) {
+          return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT model picker did not close before returning to the effort view", "model_picker_close_failed", { effortMoveMethod });
+        }
+        modelButton = await waitForModelButton(root, options);
+        if (!modelButton) {
+          return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount before the effort move", "effort_control_remount_failed", { effortMoveMethod });
+        }
+        if (!await openModelPicker(root, modelButton, options)) {
+          return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen into the effort view", "model_picker_reopen_failed", { effortMoveMethod });
+        }
+        r = await waitForRead(root, options);
+        if (!r.shape) {
+          await closeModelPicker(root, modelButton);
+          return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT model picker exposed an unsupported shape on returning to the effort view; refusing unverified model selection", "model_picker_shape_unsupported", { effortMoveMethod });
+        }
+      }
+      // The reopen above can land on an already-Pro effort (a family click
+      // resets effort to the family default); only move when still needed.
+      if (foldedModelText(r.effort.label) !== "pro") {
+        if (r.effort.kind !== "slider" || !r.effort.control || effortControlIsInert(r.effort.control)) {
+          await closeModelPicker(root, modelButton);
+          return selectionFailure(base, modelButton, r, availableFamilies, "Latest effort slider was not live in the effort view", "effort_control_not_found", { effortMoveMethod });
+        }
+        const moved = await moveEffortSliderToPro(root, r, options);
+        effortMoveMethod = moved.method;
+        r = moved.read;
+        if (!moved.ok) {
+          await closeModelPicker(root, modelButton);
+          return selectionFailure(base, modelButton, r, availableFamilies, "Latest effort slider did not move to verified Pro", "effort_slider_move_failed", { effortMoveMethod });
+        }
       }
     } else {
       // rows: click the Pro tier row (found via the reader-exported helpers,
@@ -2189,6 +2265,18 @@ function combinedVerificationStatus(pickerStatus, closedStatus) {
 // PickerRead values. The control comes from read.effort.control; verification
 // re-reads the fresh value and succeeds only when the settled read still
 // carries the Pro label on a slider control.
+// yz-c1l: structural inert check (never opacity) — the 2026-09-28 split-view
+// picker keeps the effort slider mounted but inert while the family view is
+// active, and an inert slider ignores the keyboard moves below.
+function effortControlIsInert(control) {
+  let node = control;
+  while (node) {
+    if (node.getAttribute?.("inert") != null) return true;
+    node = node.parentElement;
+  }
+  return false;
+}
+
 async function moveEffortSliderToPro(root, initialRead, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   let r = initialRead;

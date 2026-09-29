@@ -290,6 +290,35 @@ function appendChatSurfaceToggle(body, {
   return { chat, work, group, track };
 }
 
+// yz-c1l: the 2026-09-28 "Composer mode" surface — plain buttons in a
+// role=group, selected via aria-pressed (no radio semantics, no
+// data-tpp-toggle-value hooks).
+function appendChatSurfaceModeGroup(body, {
+  surface = "chat",
+  chatClickUpdates = true
+} = {}) {
+  const setSurface = (selected) => {
+    chat.setAttribute("aria-pressed", String(selected === "chat"));
+    work.setAttribute("aria-pressed", String(selected === "work"));
+  };
+  const chat = new FakeElement("button", {
+    "aria-pressed": String(surface === "chat"),
+    onClick: () => {
+      if (chatClickUpdates) setSurface("chat");
+    }
+  }, "Chat");
+  const work = new FakeElement("button", {
+    "aria-pressed": String(surface === "work"),
+    onClick: () => setSurface("work")
+  }, "Work");
+  const group = new FakeElement("div", {
+    role: "group",
+    "aria-label": "Composer mode"
+  }).append(chat, work);
+  body.append(group);
+  return { chat, work, group };
+}
+
 class FakeDataTransfer {
   constructor() {
     this.files = [];
@@ -2537,7 +2566,7 @@ for (const testCase of [
     selectionOptions: { model_selection_timeout_ms: 500, model_selection_interval_ms: 5 },
     expected: {
       status: "selected",
-      surface_state: { aria_checked: "true", data_state: "on" }
+      surface_state: { aria_checked: "true", aria_pressed: null, data_state: "on" }
     },
     minimumSurfaceVerificationAttempts: 2
   },
@@ -2549,7 +2578,7 @@ for (const testCase of [
       status: "unavailable",
       failure_reason: "chat_surface_control_not_found",
       surface_observed_values: ["unexpected-chat", "unexpected-work"],
-      surface_state: { aria_checked: null, data_state: null }
+      surface_state: { aria_checked: null, aria_pressed: null, data_state: null }
     },
     mainOpens: 0
   },
@@ -4779,6 +4808,251 @@ function makeHybridSimpleViewFixture({
   };
 }
 
+// yz-c1l: the 2026-09-28 split-view picker (live capture:
+// fixtures/chatgpt-picker/2026-09-28-gpt6-chat-live-capture.html). The
+// composer pill lost the __composer-pill class — the trigger is the button
+// labeled "Select ChatGPT model" — and the picker splits effort and family
+// into mutually exclusive views behind the "Select model" toggle: exactly one
+// view is live at a time (the other is inert + aria-hidden), the toggle is
+// inert inside the family view, and reopening lands in the effort view. The
+// inert slider's aria-valuetext stays readable from the family view.
+function makeSplitViewPickerFixture({
+  family = "Latest",
+  families = ["Latest", "GPT-5.6 Sol", "GPT-5.5"],
+  sliderNow = 4,
+  keyboardMode = "end",
+  surface = "chat"
+} = {}) {
+  const levels = ["Instant", "Medium", "High", "Extra High", "Pro"];
+  const sliderMin = 0;
+  const sliderMax = 4;
+  let menu = null;
+  let currentFamily = family;
+  let currentNow = sliderNow;
+  let familyViewActive = false;
+  let toggleClicks = 0;
+  let sliderKeyCount = 0;
+  let familyClickCount = 0;
+  let openCount = 0;
+  let effortView = null;
+  let familyView = null;
+  const labelFor = (value) => levels[Math.max(sliderMin, Math.min(sliderMax, value))];
+  const valueText = () => `${labelFor(currentNow)}, ${currentNow - sliderMin + 1} of ${sliderMax - sliderMin + 1}.`;
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Ask ChatGPT",
+    class: "ProseMirror"
+  });
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask ChatGPT").append(form);
+  appendChatSurfaceModeGroup(body, { surface });
+
+  const updatePill = () => {
+    pill.innerText = labelFor(currentNow);
+    pill.textContent = pill.innerText;
+  };
+  const closeMenu = () => {
+    if (!menu) return;
+    body.children = body.children.filter((child) => child !== menu);
+    menu.parentElement = null;
+    menu = null;
+    effortView = null;
+    familyView = null;
+    pill.setAttribute("aria-expanded", "false");
+    pill.setAttribute("data-state", "closed");
+    updatePill();
+  };
+  const setFamilyViewActive = (active) => {
+    familyViewActive = active;
+    if (!effortView || !familyView) return;
+    if (active) {
+      effortView.setAttribute("inert", "");
+      effortView.setAttribute("aria-hidden", "true");
+      delete familyView.attrs.inert;
+      delete familyView.attrs["aria-hidden"];
+    } else {
+      familyView.setAttribute("inert", "");
+      familyView.setAttribute("aria-hidden", "true");
+      delete effortView.attrs.inert;
+      delete effortView.attrs["aria-hidden"];
+    }
+  };
+  const openMenu = () => {
+    if (menu) closeMenu();
+    openCount += 1;
+    const slider = new FakeElement("span", {
+      role: "slider",
+      "aria-valuemin": String(sliderMin),
+      "aria-valuemax": String(sliderMax),
+      "aria-valuenow": String(currentNow),
+      "aria-valuetext": valueText(),
+      onKeyDown: (event) => {
+        sliderKeyCount += 1;
+        const next = event.key === "End" ? sliderMax : event.key === "ArrowRight" ? currentNow + 1 : null;
+        if (next === null) return;
+        currentNow = Math.max(sliderMin, Math.min(sliderMax, next));
+        slider.setAttribute("aria-valuenow", String(currentNow));
+        slider.setAttribute("aria-valuetext", valueText());
+        status.innerText = valueText();
+        status.textContent = status.innerText;
+      }
+    });
+    const status = new FakeElement("span", { role: "status" }, valueText());
+    const powerRow = new FakeElement("div", {
+      role: "menuitem",
+      "aria-label": "Power",
+      "data-reasoning-slider": "true"
+    }, "Power").append(new FakeElement("span", {}, "").append(slider), status);
+    // The toggle swaps the views; it has no aria-expanded/data-state and is
+    // inert while the family view is active.
+    const viewToggle = new FakeElement("div", {
+      role: "menuitem",
+      "aria-label": "Select model",
+      "data-model-picker-view-toggle": "true",
+      onClick: () => {
+        toggleClicks += 1;
+        setFamilyViewActive(!familyViewActive);
+      }
+    }, "6 Pro");
+    effortView = new FakeElement("div", {}, "Select model Power").append(viewToggle, powerRow);
+    familyView = new FakeElement("div", { inert: "", "aria-hidden": "true" });
+    for (const radioLabel of families) {
+      familyView.append(new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": String(radioLabel === currentFamily),
+        onClick: () => {
+          currentFamily = radioLabel;
+          familyClickCount += 1;
+          for (const radio of familyView.querySelectorAll('[role="menuitemradio"]')) {
+            radio.setAttribute("aria-checked", String(radio.innerText === radioLabel));
+          }
+          // Radix closes the menu on a radio selection.
+          closeMenu();
+        }
+      }, radioLabel));
+    }
+    familyViewActive = false;
+    menu = new FakeElement("div", {
+      id: "split-view-menu",
+      role: "menu",
+      "data-state": "open"
+    }).append(effortView, familyView);
+    body.append(menu);
+    pill.setAttribute("aria-expanded", "true");
+    pill.setAttribute("data-state", "open");
+  };
+  const pill = new FakeElement("button", {
+    "aria-label": "Select ChatGPT model",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    "data-state": "closed",
+    "aria-controls": "split-view-menu",
+    "data-codex-intelligence-trigger": "true",
+    onPointerDown: openMenu,
+    onKeyDown: (event) => {
+      if (event.key === "Escape") closeMenu();
+    }
+  }, labelFor(currentNow));
+  form.append(pill);
+  const doc = new FakeDocument(body);
+
+  return {
+    doc,
+    pill,
+    viewToggleClicks: () => toggleClicks,
+    sliderKeys: () => sliderKeyCount,
+    familyClicks: () => familyClickCount,
+    openCount: () => openCount,
+    pickerOpen: () => Boolean(menu),
+    familyViewActive: () => familyViewActive
+  };
+}
+
+test("yz-c1l: Composer mode surface group (aria-pressed buttons) verifies Chat", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  appendChatSurfaceModeGroup(body);
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.state.aria_pressed, "true");
+});
+
+test("yz-c1l: Composer mode surface on Work is clicked back to Chat and verified", async () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { chat } = appendChatSurfaceModeGroup(body, { surface: "work" });
+  const doc = new FakeDocument(body);
+
+  const result = await ensureChatSurface(doc, { timeoutMs: 400, intervalMs: 10 });
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(chat.clicked, true);
+  assert.equal(chat.getAttribute("aria-pressed"), "true");
+});
+
+test("yz-c1l: Composer mode group without a Work button fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  body.append(new FakeElement("div", { role: "group", "aria-label": "Composer mode" })
+    .append(new FakeElement("button", { "aria-pressed": "true" }, "Chat")));
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+});
+
+test("yz-c1l: split-view picker verifies Latest Pro end to end", async () => {
+  const fixture = makeSplitViewPickerFixture();
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "Latest Pro");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "verified");
+  assert.ok(fixture.viewToggleClicks() >= 1, "family view reached via the view toggle");
+});
+
+test("yz-c1l: split-view picker moves a Medium effort slider to Pro after close+reopen to the effort view", async () => {
+  const fixture = makeSplitViewPickerFixture({ sliderNow: 1 });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "Latest Pro");
+  assert.ok(fixture.sliderKeys() >= 1, "slider received keyboard moves");
+  assert.ok(fixture.openCount() >= 2, "picker closed and reopened into the effort view");
+});
+
+test("yz-c1l: split-view picker with Sol checked clicks Latest in the family view", async () => {
+  const fixture = makeSplitViewPickerFixture({ family: "GPT-5.6 Sol" });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "Latest Pro");
+  assert.equal(fixture.familyClicks(), 1);
+});
+
+test("yz-c1l: split-view picker with a Sol-only family fails closed", async () => {
+  const fixture = makeSplitViewPickerFixture({ family: "GPT-5.6 Sol", families: ["GPT-5.6 Sol"] });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_family_not_found");
+  assert.match(result.warning, /refusing to fall back to Sol/);
+});
+
+test("yz-c1l: findModelButton anchors the labeled trigger without __composer-pill", () => {
+  const fixture = makeSplitViewPickerFixture();
+
+  assert.equal(findModelButton(fixture.doc), fixture.pill);
+});
+
 // September 2026 "Thinking effort" list picker: one menu holding inline family
 // radios (GPT-5.6 Sol / GPT-5.5), explicit effort radios (Medium / High /
 // Extra High / Pro), and a single-position "Instant, 1 of 1." speed slider
@@ -5663,6 +5937,9 @@ function matchesSimpleSelector(element, selector) {
   }
   if (selector === '[role="radiogroup"][aria-label="Select chat surface"]') {
     return attr("role") === "radiogroup" && attr("aria-label") === "Select chat surface";
+  }
+  if (selector === '[role="group"][aria-label="Composer mode"]') {
+    return attr("role") === "group" && attr("aria-label") === "Composer mode";
   }
   if (selector === '[role="radio"][data-tpp-toggle-value="chatgpt"]') {
     return attr("role") === "radio" && attr("data-tpp-toggle-value") === "chatgpt";
