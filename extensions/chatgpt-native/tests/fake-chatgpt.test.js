@@ -820,7 +820,7 @@ test("extractResponse uses 2026-09-28 conversation-role markdown without author-
     "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant"
   }, "").append(assistantLabel, assistantMarkdown);
   const turn = new FakeElement("div", {
-    "data-turn-key": "3df53795-b467-49ba-8b84-8c538fc572e7"
+    "data-turn-key": "fixture-turn-a"
   }, "").append(userUnit, assistantUnit);
   const conversation = new FakeElement("main", { role: "main" }, "")
     .append(turn);
@@ -860,7 +860,7 @@ test("extractResponse keeps 2026-09-28 user unit copy out of combined turn-key a
     "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant"
   }, "YZ_C1L_M13_ASSISTANT_ONLY");
   const turnKey = new FakeElement("div", {
-    "data-turn-key": "m13-combined-turn"
+    "data-turn-key": "fixture-turn-m13"
   }, "").append(userUnit, assistantUnit);
   const wrapper = new FakeElement("article", {
     "data-testid": "conversation-turn-0"
