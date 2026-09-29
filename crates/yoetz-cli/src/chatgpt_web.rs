@@ -2646,7 +2646,9 @@ pub fn validate_chatgpt_final_model_selection(
             {
                 problems.push(format!(
                     "surface_evidence_seen={}, expected true",
-                    object.get("surface_evidence_seen").unwrap_or(&serde_json::Value::Null)
+                    object
+                        .get("surface_evidence_seen")
+                        .unwrap_or(&serde_json::Value::Null)
                 ));
             }
             if object
@@ -2699,7 +2701,9 @@ pub fn validate_chatgpt_final_model_selection(
             {
                 problems.push(format!(
                     "surface_composer_aria={}, expected null",
-                    object.get("surface_composer_aria").unwrap_or(&serde_json::Value::Null)
+                    object
+                        .get("surface_composer_aria")
+                        .unwrap_or(&serde_json::Value::Null)
                 ));
             }
             if !problems.is_empty() {
@@ -2721,7 +2725,9 @@ pub fn validate_chatgpt_final_model_selection(
             {
                 problems.push(format!(
                     "surface_evidence_seen={}, expected true",
-                    object.get("surface_evidence_seen").unwrap_or(&serde_json::Value::Null)
+                    object
+                        .get("surface_evidence_seen")
+                        .unwrap_or(&serde_json::Value::Null)
                 ));
             }
             if object
@@ -2803,7 +2809,9 @@ pub fn validate_chatgpt_final_model_selection(
             {
                 problems.push(format!(
                     "surface_composer_aria={}, expected null",
-                    object.get("surface_composer_aria").unwrap_or(&serde_json::Value::Null)
+                    object
+                        .get("surface_composer_aria")
+                        .unwrap_or(&serde_json::Value::Null)
                 ));
             }
             if !problems.is_empty() {
@@ -2822,7 +2830,9 @@ pub fn validate_chatgpt_final_model_selection(
             {
                 problems.push(format!(
                     "surface_evidence_seen={}, expected false",
-                    object.get("surface_evidence_seen").unwrap_or(&serde_json::Value::Null)
+                    object
+                        .get("surface_evidence_seen")
+                        .unwrap_or(&serde_json::Value::Null)
                 ));
             }
             if object
@@ -2849,7 +2859,9 @@ pub fn validate_chatgpt_final_model_selection(
             {
                 problems.push(format!(
                     "surface_composer_aria={}, expected \"Chat with ChatGPT\"",
-                    object.get("surface_composer_aria").unwrap_or(&serde_json::Value::Null)
+                    object
+                        .get("surface_composer_aria")
+                        .unwrap_or(&serde_json::Value::Null)
                 ));
             }
             if chat_state.is_some_and(|value| !value.is_null()) {
@@ -3621,10 +3633,26 @@ mod tests {
         );
 
         for (label, key, value) in [
-            ("Work pressed", "surface_work_state", serde_json::json!({"aria_checked": null, "aria_pressed": "true"})),
-            ("foreign pressed", "surface_foreign_pressed", serde_json::json!(true)),
-            ("aria_pressed missing", "surface_chat_state", serde_json::json!({"aria_checked": null, "aria_pressed": null})),
-            ("labels omitted", "surface_observed_labels", serde_json::Value::Null),
+            (
+                "Work pressed",
+                "surface_work_state",
+                serde_json::json!({"aria_checked": null, "aria_pressed": "true"}),
+            ),
+            (
+                "foreign pressed",
+                "surface_foreign_pressed",
+                serde_json::json!(true),
+            ),
+            (
+                "aria_pressed missing",
+                "surface_chat_state",
+                serde_json::json!({"aria_checked": null, "aria_pressed": null}),
+            ),
+            (
+                "labels omitted",
+                "surface_observed_labels",
+                serde_json::Value::Null,
+            ),
         ] {
             let mut case = composer_mode.clone();
             case[key] = value;
