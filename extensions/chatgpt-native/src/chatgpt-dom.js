@@ -2897,7 +2897,24 @@ function responseFrame(node) {
 }
 
 function isInsideUserTurn(node) {
-  return Boolean(node.closest?.('[data-message-author-role="user"], [class*="user-turn"]'));
+  if (!node) {
+    return false;
+  }
+  if (node.closest?.([
+    '[data-message-author-role="user"]',
+    '[class*="user-turn"]',
+    '[class*="user-message"]',
+    '[data-user-message-bubble="true"]',
+    '[data-conversation-role="user"]'
+  ].join(", "))) {
+    return true;
+  }
+  for (let current = node; current; current = current.parentElement) {
+    if (isUserUnitContainer(current)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function responseConversationScope(node, latestUser) {
@@ -2993,6 +3010,8 @@ function assistantMessageTextEntry(turn) {
   }
   for (const selector of [
     '[data-message-author-role="assistant"]',
+    '[data-conversation-role="assistant"]',
+    '[data-markdown-text-style="assistant-message"]',
     '[data-testid*="assistant-message"]',
     '[data-testid*="assistant-response"]',
     '[data-message-author-role="assistant"] [class*="markdown"]',
@@ -3049,6 +3068,18 @@ function isAssistantContentNode(node, turn = null) {
   }
   if (role === "user") {
     return false;
+  }
+  if (node.getAttribute?.("data-conversation-role") === "assistant"
+      || node.getAttribute?.("data-markdown-text-style") === "assistant-message") {
+    // <h4 class="sr-only" data-conversation-role="assistant">ChatGPT said:</h4> is a
+    // marker, not answer text — keep finding turns via it, but do not extract its label.
+    if (node.getAttribute?.("data-conversation-role") === "assistant"
+        && (/^h[1-6]$/i.test(String(node.tagName ?? ""))
+          || /\bsr-only\b/i.test(String(node.getAttribute?.("class") ?? ""))
+          || /^(chatgpt|you)\s+said:$/i.test(normalizeText(textOf(node))))) {
+      return false;
+    }
+    return true;
   }
   const testId = String(node.getAttribute?.("data-testid") ?? "");
   if (/assistant-(message|response)/i.test(testId)) {
@@ -3156,6 +3187,8 @@ function isAssistantControlLine(line, options = {}) {
     // Strip them as standalone lines so a fenced code block in the answer doesn't leak its
     // toolbar text. Anchored to a standalone line so it never eats real answer prose.
     || /^copy code$/i.test(value)
+    // yz-c1l: 2026-09-28 sr-only role labels leak into unit-scoped textContent.
+    || /^(chatgpt|you)\s+said:$/i.test(value)
     || /^(thought|reasoned)\s+for\s+\S.*$/i.test(value)
     || /^show\s+(more|reasoning)$/i.test(value)
     || (!options.preserveContentStatusText && (isThoughtStatusLine(line) || isModelStatusText(line)));
@@ -3172,7 +3205,12 @@ function isModelStatusText(text) {
 }
 
 function isMarkdownNode(node) {
-  return /\bmarkdown\b/i.test(String(node?.getAttribute?.("class") ?? ""));
+  // yz-c1l: 2026-09-28 renders MarkdownRoot-* (no lowercase "markdown" token) plus
+  // data-markdown-text-style="assistant-message".
+  if (node?.getAttribute?.("data-markdown-text-style")) {
+    return true;
+  }
+  return /markdown/i.test(String(node?.getAttribute?.("class") ?? ""));
 }
 
 function isThoughtStatusLine(line) {
@@ -3828,6 +3866,14 @@ function findUserTurns(root) {
 function findAssistantTurns(root) {
   const explicitAssistantTurns = Array.from(root.querySelectorAll('[data-message-author-role="assistant"]'))
     .map((node) => assistantTurnForNode(node) ?? node);
+  // yz-c1l: 2026-09-28 dropped data-message-author-role; assistant turns are marked via
+  // data-conversation-role, data-markdown-text-style, and *:assistant unit keys.
+  const conversationRoleTurns = Array.from(root.querySelectorAll('[data-conversation-role="assistant"]'))
+    .map((node) => assistantTurnForNode(node) ?? node);
+  const markdownStyleTurns = Array.from(root.querySelectorAll('[data-markdown-text-style="assistant-message"]'))
+    .map((node) => assistantTurnForNode(node) ?? node);
+  const unitKeyTurns = findAssistantUnitContainers(root)
+    .map((node) => assistantTurnForNode(node) ?? node);
   const markdownAssistantTurns = Array.from(root.querySelectorAll([
     '[data-testid*="assistant-message"]',
     '[data-testid*="assistant-response"]',
@@ -3838,16 +3884,60 @@ function findAssistantTurns(root) {
     .map((node) => assistantTurnForNode(node) ?? (isAssistantMarkerNode(node) ? node : null));
   const copyScopedTurns = Array.from(root.querySelectorAll('button[aria-label*="Copy"], button[data-testid*="copy"]'))
     .map((node) => assistantTurnForNode(node));
-  return uniqueElements([...explicitAssistantTurns, ...markdownAssistantTurns, ...copyScopedTurns])
+  return uniqueElements([
+    ...explicitAssistantTurns,
+    ...conversationRoleTurns,
+    ...markdownStyleTurns,
+    ...unitKeyTurns,
+    ...markdownAssistantTurns,
+    ...copyScopedTurns
+  ])
     .filter((node) => isVisible(node, { allowDisabled: true, allowNoLayout: true }));
+}
+
+function findAssistantUnitContainers(root) {
+  return Array.from(root.querySelectorAll("[data-content-search-unit-key], [data-chatgpt-search-unit-key]"))
+    .filter((node) => isAssistantUnitContainer(node));
+}
+
+function unitKeyValues(node) {
+  return [
+    node?.getAttribute?.("data-content-search-unit-key"),
+    node?.getAttribute?.("data-chatgpt-search-unit-key")
+  ].filter(Boolean).map(String);
+}
+
+function isAssistantUnitContainer(node) {
+  return unitKeyValues(node).some((key) => /:assistant$/i.test(key));
+}
+
+function isUserUnitContainer(node) {
+  return unitKeyValues(node).some((key) => /:user$/i.test(key));
 }
 
 function assistantTurnForNode(node) {
   if (!node) {
     return null;
   }
+  // Prefer the *:assistant search-unit wrapper over the combined data-turn-key that
+  // also contains the user bubble (2026-09-28 ChatGPT transcript).
+  for (let current = node; current; current = current.parentElement) {
+    if (isUserUnitContainer(current) || looksLikeUserTurn(current)) {
+      return null;
+    }
+    if (isAssistantUnitContainer(current)) {
+      return current;
+    }
+  }
   const explicit = node.closest?.('[data-message-author-role="assistant"]');
-  const turn = node.closest?.('article, [data-testid*="conversation-turn"], [class*="agent-turn"], [class*="turn-messages"]');
+  const conversationRole = node.closest?.('[data-conversation-role="assistant"]');
+  const turn = node.closest?.([
+    'article',
+    '[data-testid*="conversation-turn"]',
+    '[class*="agent-turn"]',
+    '[class*="turn-messages"]',
+    '[data-markdown-text-style="assistant-message"]'
+  ].join(", "));
   if (explicit && turn && !looksLikeUserTurn(turn)) {
     if (!hasUserRoleDescendant(turn)) {
       return turn;
@@ -3855,6 +3945,11 @@ function assistantTurnForNode(node) {
   }
   if (explicit) {
     return explicit;
+  }
+  if (conversationRole && !isInsideUserTurn(conversationRole)) {
+    return conversationRole.closest?.(
+      '[data-content-search-unit-key], [data-chatgpt-search-unit-key], article, [data-testid*="conversation-turn"], [class*="agent-turn"]'
+    ) ?? conversationRole;
   }
   if (!turn) {
     return isAssistantMarkerNode(node) ? node : null;
@@ -3873,7 +3968,7 @@ function assistantTurnForNode(node) {
   if (assistantDescendants.length > 0) {
     return turn;
   }
-  if (looksLikeUserTurn(turn)) {
+  if (looksLikeUserTurn(turn) || isInsideUserTurn(turn)) {
     return null;
   }
   return isCopyControl(node) || isAssistantMarkerNode(node) || isAssistantMarkdownInTurn(node, turn) ? turn : null;
@@ -4128,27 +4223,45 @@ function isAssistantMarkerNode(node) {
   if (role === "assistant") {
     return true;
   }
+  if (node?.getAttribute?.("data-conversation-role") === "assistant"
+      || node?.getAttribute?.("data-markdown-text-style") === "assistant-message"
+      || isAssistantUnitContainer(node)) {
+    return true;
+  }
   const testId = String(node?.getAttribute?.("data-testid") ?? "");
   return /assistant-(message|response)/i.test(testId);
 }
 
 function isAssistantMarkdownInTurn(node, turn) {
+  if (node?.getAttribute?.("data-markdown-text-style") === "assistant-message") {
+    return true;
+  }
   const marker = [
     node?.getAttribute?.("class"),
     turn?.getAttribute?.("class"),
     turn?.getAttribute?.("data-testid")
   ].filter(Boolean).join(" ");
-  return /\bmarkdown\b/i.test(marker)
+  return /markdown/i.test(marker)
     && (
       /\bagent-turn\b/i.test(marker)
       || /\bassistant\b/i.test(marker)
       || /\bconversation-turn\b/i.test(marker)
       || turn?.getAttribute?.("data-message-author-role") === "assistant"
+      || turn?.getAttribute?.("data-conversation-role") === "assistant"
+      || isAssistantUnitContainer(turn)
       || hasAssistantRoleDescendant(turn)
     );
 }
 
 function looksLikeUserTurn(turn) {
+  if (!turn) {
+    return false;
+  }
+  if (turn.getAttribute?.("data-conversation-role") === "user"
+      || turn.getAttribute?.("data-user-message-bubble") === "true"
+      || isUserUnitContainer(turn)) {
+    return true;
+  }
   const marker = [
     turn?.getAttribute?.("data-message-author-role"),
     turn?.getAttribute?.("class"),

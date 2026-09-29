@@ -795,6 +795,46 @@ test("extractResponse can use ChatGPT markdown assistant content without role ma
   assert.equal(extraction.assistant_count, 1);
 });
 
+// yz-c1l: 2026-09-28 live ChatGPT dropped data-message-author-role / article wrappers.
+// Assistant content is data-conversation-role + data-markdown-text-style + *:assistant unit keys.
+test("extractResponse uses 2026-09-28 conversation-role markdown without author-role markers", () => {
+  const userBubble = new FakeElement("div", {
+    "data-user-message-bubble": "true",
+    class: "bg-user-message text-user-message"
+  }, "Reply with exactly: YOETZ_E2E_OK");
+  const userCopy = new FakeElement("button", { "aria-label": "Copy message" }, "Copy");
+  const userUnit = new FakeElement("div", {
+    class: "group/user-message flex flex-col items-end gap-2",
+    "data-content-search-unit-key": "fallback-turn-0:0:user"
+  }, "").append(userBubble, userCopy);
+  const assistantLabel = new FakeElement("h4", {
+    class: "sr-only m-0 select-none",
+    "data-conversation-role": "assistant"
+  }, "ChatGPT said:");
+  const assistantMarkdown = new FakeElement("div", {
+    "data-markdown-text-style": "assistant-message",
+    class: "MarkdownRoot-rZKhxa"
+  }, "YOETZ_E2E_OK");
+  const assistantUnit = new FakeElement("div", {
+    "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+    "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant"
+  }, "").append(assistantLabel, assistantMarkdown);
+  const turn = new FakeElement("div", {
+    "data-turn-key": "3df53795-b467-49ba-8b84-8c538fc572e7"
+  }, "").append(userUnit, assistantUnit);
+  const conversation = new FakeElement("main", { role: "main" }, "")
+    .append(turn);
+  const body = new FakeElement("body", {}, "You said:\nReply with exactly: YOETZ_E2E_OK\nChatGPT said:\nYOETZ_E2E_OK")
+    .append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.notEqual(extraction.method, "page_text_fallback");
+  assert.equal(extraction.text, "YOETZ_E2E_OK");
+  assert.ok(extraction.assistant_count >= 1);
+});
+
 test("extractResponse scopes sibling markdown to a later copy control", () => {
   const user = new FakeElement("article", { "data-message-author-role": "user" }, "Review this bundle");
   const answer = new FakeElement("div", { class: "markdown prose" }, "Complete answer from the personal profile");
@@ -6144,6 +6184,24 @@ function matchesSimpleSelector(element, selector) {
   }
   if (selector.includes('[data-user-message-bubble="true"]')) {
     return attr("data-user-message-bubble") === "true";
+  }
+  if (selector.includes('[data-conversation-role="assistant"]')) {
+    return attr("data-conversation-role") === "assistant";
+  }
+  if (selector.includes('[data-conversation-role="user"]')) {
+    return attr("data-conversation-role") === "user";
+  }
+  if (selector.includes('[data-markdown-text-style="assistant-message"]')) {
+    return attr("data-markdown-text-style") === "assistant-message";
+  }
+  if (selector === "[data-content-search-unit-key]" || selector.includes("[data-content-search-unit-key]")) {
+    return attr("data-content-search-unit-key") != null;
+  }
+  if (selector === "[data-chatgpt-search-unit-key]" || selector.includes("[data-chatgpt-search-unit-key]")) {
+    return attr("data-chatgpt-search-unit-key") != null;
+  }
+  if (selector.includes('[class*="user-message"]')) {
+    return String(attr("class") ?? "").includes("user-message");
   }
   if (selector.includes('[aria-label*="Copy"]')) {
     return tag === "button" && /Copy/.test(attr("aria-label") ?? "");

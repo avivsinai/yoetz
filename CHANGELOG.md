@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- ChatGPT native extraction after the 2026-09-28 transcript markup drop of
+  `data-message-author-role` / `article` wrappers: recognize
+  `data-conversation-role`, `data-markdown-text-style="assistant-message"`, and
+  `*:assistant` search-unit keys so wait_response no longer stalls on
+  `page_text_fallback` with `assistant_count=0` while the answer is visible.
+  (`yz-c1l`)
 - ChatGPT recipe drift (2026-09-28): the Chat/Work surface toggle moved from
   a `radiogroup` with `data-tpp-toggle-value` radios to a "Composer mode"
   group of plain buttons selected via `aria-pressed`; the composer model pill
