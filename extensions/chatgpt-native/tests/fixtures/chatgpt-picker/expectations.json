@@ -37,5 +37,19 @@
       "First live serializer capture: Latest CHECKED, GPT-5.6 Sol / GPT-5.5 unchecked; effort slider Pro (valuenow 4 of 0..4, 'Pro, 5 of 5.').",
       "Captured 10778 bytes; real Radix incidental structure retained (inert attributes on descendants, tooltip wrappers absent in this surface unlike the quota-locked fixture)."
     ]
+  },
+  "2026-09-28-gpt6-chat-live-capture.html": {
+    "shape": "slider",
+    "ready": true,
+    "family": { "label": "6Pro", "checked": false, "checkedCount": 0, "options": [] },
+    "effort": { "label": "Pro", "disabled": false, "kind": "slider", "options": [] },
+    "nav": { "expanded": false },
+    "_provenance": "Live capture from the preserved yz-c1l recipe tab (run 20260928T154808Z_35123c, 2026-09-28): picker opened via the extension's own synthetic activation gesture over CDP (focus + pointerdown/mousedown/pointerup/mouseup/click on the 'Select ChatGPT model' composer trigger), serialized in-page with picker-serializer.js. Captured in the DEFAULT effort view; the family view was verified live (toggle click swaps inert: family radios readable, slider inert) but not serialized. Reader values asserted above verified with readPicker on this file.",
+    "_notes": [
+      "yz-c1l drift: the picker now opens into a split-view design — effort view ('Select model' view-toggle menuitem with data-model-picker-view-toggle, 'Power' slider row with data-reasoning-slider, status 'Pro, 5 of 5.') with the family view mounted but inert + aria-hidden; clicking the toggle swaps which view is inert (no aria-expanded/data-state/aria-controls on the toggle, so nav.expanded stays false).",
+      "Family read is empty here BY CONTRACT: inert family rows are never reported (fail-closed); family.label falls back to the toggle text '6Pro'. The driver reaches the family view via the viewToggle click / revealFamily pointer path.",
+      "The inert effort slider's attributes stay readable in the family view (sliderEffortSnapshot has no inert gate), so the family-view read still carries effort.label Pro for the combined verification.",
+      "GPT-5.5 radio label gained a 'Leaving on October 14' deprecation suffix; isFamilyOptionLabel still matches on the /^gpt\\b/i anchor."
+    ]
   }
 }

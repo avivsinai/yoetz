@@ -20,23 +20,29 @@
 // dependencies — Node 24 globals only (fetch, WebSocket, fs). Exits non-zero
 // with a clear message if no [role=menu] is open in the matched tab.
 
-import { writeFileSync, mkdirSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname } from "node:path";
-import { createRequire } from "node:module";
 
 // The serializer lives in the extension package (one serializer, two callers:
-// this dev script and the content script's dump_picker_html command).
-const require = createRequire(import.meta.url);
-const { serializePickerMenu } = require(
-  "../extensions/chatgpt-native/src/picker-serializer.js"
+// this dev script and the content script's dump_picker_html command). Bundle
+// the module graph inline: stringifying serializePickerMenu alone loses its
+// capture-sanitizer.js imports and dies in-page with ReferenceError
+// (yz-c1l). Both modules are dependency-free once the import/export lines are
+// stripped.
+const extensionSrc = (name) => readFileSync(
+  new URL(`../extensions/chatgpt-native/src/${name}`, import.meta.url),
+  "utf8"
 );
+const inlineModule = (source) => source
+  .replace(/^import[^;]*;\s*$/gm, "")
+  .replace(/^export\s+function\s+/gm, "function ");
 
 // In-page wrapper: runs the shared extension serializer as a pure function in
 // the page via Runtime.evaluate. Returns the outerHTML of the open picker
 // menu, or throws if none is open. The call sites append the invocation () —
 // do not invoke here or Chrome throws "is not a function" (the IIFE returns a
 // string).
-const SERIALIZER = `(${serializePickerMenu.toString()})`;
+const SERIALIZER = `(() => {\n${inlineModule(extensionSrc("capture-sanitizer.js"))}\n${inlineModule(extensionSrc("picker-serializer.js"))}\nreturn serializePickerMenu;\n})()`;
 
 function parseArgs(argv) {
   const args = {

@@ -86,6 +86,7 @@ class FakeElement {
   }
 
   click() {
+    if (this.isInertSubtree()) return;
     this.recordClick();
     this.onClick?.();
   }
@@ -94,8 +95,25 @@ class FakeElement {
     this.clicked = true;
   }
 
+  isInertSubtree() {
+    for (let node = this; node; node = node.parentElement) {
+      if (node.getAttribute?.("inert") != null) return true;
+    }
+    return false;
+  }
+
   dispatchEvent(event) {
     this.events.push(event.type);
+    // Model the real DOM: an inert ancestor suppresses pointer/keyboard input
+    // (yz-c1l split-view effort slider stays mounted but must ignore keys).
+    if (this.isInertSubtree()
+      && (event.type === "keydown"
+        || event.type === "click"
+        || event.type === "pointerdown"
+        || event.type === "pointermove"
+        || event.type === "mousemove")) {
+      return true;
+    }
     if (event.type === "pointerdown") {
       this.onPointerDown?.(event);
     }
@@ -288,6 +306,35 @@ function appendChatSurfaceToggle(body, {
   }).append(track);
   body.append(group);
   return { chat, work, group, track };
+}
+
+// yz-c1l: the 2026-09-28 "Composer mode" surface — plain buttons in a
+// role=group, selected via aria-pressed (no radio semantics, no
+// data-tpp-toggle-value hooks).
+function appendChatSurfaceModeGroup(body, {
+  surface = "chat",
+  chatClickUpdates = true
+} = {}) {
+  const setSurface = (selected) => {
+    chat.setAttribute("aria-pressed", String(selected === "chat"));
+    work.setAttribute("aria-pressed", String(selected === "work"));
+  };
+  const chat = new FakeElement("button", {
+    "aria-pressed": String(surface === "chat"),
+    onClick: () => {
+      if (chatClickUpdates) setSurface("chat");
+    }
+  }, "Chat");
+  const work = new FakeElement("button", {
+    "aria-pressed": String(surface === "work"),
+    onClick: () => setSurface("work")
+  }, "Work");
+  const group = new FakeElement("div", {
+    role: "group",
+    "aria-label": "Composer mode"
+  }).append(chat, work);
+  body.append(group);
+  return { chat, work, group };
 }
 
 class FakeDataTransfer {
@@ -746,6 +793,115 @@ test("extractResponse can use ChatGPT markdown assistant content without role ma
   assert.equal(extraction.text, "Markdown answer");
   assert.equal(extraction.has_copy_button, false);
   assert.equal(extraction.assistant_count, 1);
+});
+
+// yz-c1l: 2026-09-28 live ChatGPT dropped data-message-author-role / article wrappers.
+// Assistant content is data-conversation-role + data-markdown-text-style + *:assistant unit keys.
+test("extractResponse uses 2026-09-28 conversation-role markdown without author-role markers", () => {
+  const userBubble = new FakeElement("div", {
+    "data-user-message-bubble": "true",
+    class: "bg-user-message text-user-message"
+  }, "Reply with exactly: YOETZ_E2E_OK");
+  const userCopy = new FakeElement("button", { "aria-label": "Copy message" }, "Copy");
+  const userUnit = new FakeElement("div", {
+    class: "group/user-message flex flex-col items-end gap-2",
+    "data-content-search-unit-key": "fallback-turn-0:0:user"
+  }, "").append(userBubble, userCopy);
+  const assistantLabel = new FakeElement("h4", {
+    class: "sr-only m-0 select-none",
+    "data-conversation-role": "assistant"
+  }, "ChatGPT said:");
+  const assistantMarkdown = new FakeElement("div", {
+    "data-markdown-text-style": "assistant-message",
+    class: "MarkdownRoot-rZKhxa"
+  }, "YOETZ_E2E_OK");
+  const assistantUnit = new FakeElement("div", {
+    "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+    "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant"
+  }, "").append(assistantLabel, assistantMarkdown);
+  const turn = new FakeElement("div", {
+    "data-turn-key": "fixture-turn-a"
+  }, "").append(userUnit, assistantUnit);
+  const conversation = new FakeElement("main", { role: "main" }, "")
+    .append(turn);
+  const body = new FakeElement("body", {}, "You said:\nReply with exactly: YOETZ_E2E_OK\nChatGPT said:\nYOETZ_E2E_OK")
+    .append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.notEqual(extraction.method, "page_text_fallback");
+  assert.equal(extraction.text, "YOETZ_E2E_OK");
+  assert.equal(/chatgpt\s+said:/i.test(extraction.text), false);
+  assert.equal(/you\s+said:/i.test(extraction.text), false);
+  assert.equal(extraction.text.includes("Reply with exactly"), false);
+  assert.ok(extraction.assistant_count >= 1);
+});
+
+// M13: user Copy under *:user must not promote the shared data-turn-key / article wrapper
+// (which also contains the prompt) into an assistant turn. Deleting the
+// isUserUnitContainer / looksLikeUserTurn early-return in assistantTurnForNode must fail this.
+test("extractResponse keeps 2026-09-28 user unit copy out of combined turn-key assistant scope", () => {
+  const prompt = "YZ_C1L_M13_USER_PROMPT_MUST_NOT_LEAK";
+  const userBubble = new FakeElement("div", {
+    "data-user-message-bubble": "true",
+    class: "bg-user-message text-user-message"
+  }, prompt);
+  const userCopy = new FakeElement("button", { "aria-label": "Copy message" }, "Copy");
+  const userUnit = new FakeElement("div", {
+    class: "group/user-message flex flex-col items-end gap-2",
+    "data-content-search-unit-key": "fallback-turn-0:0:user"
+  }, "").append(userBubble, userCopy);
+  // Answer text lives on the *:assistant unit itself (FakeElement does not roll child
+  // textContent up). No markdown-text-style so a wrongly promoted article wrapper
+  // falls through to cleanAssistantText(article) and would leak the prompt.
+  const assistantUnit = new FakeElement("div", {
+    "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+    "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant"
+  }, "YZ_C1L_M13_ASSISTANT_ONLY");
+  const turnKey = new FakeElement("div", {
+    "data-turn-key": "fixture-turn-m13"
+  }, "").append(userUnit, assistantUnit);
+  const wrapper = new FakeElement("article", {
+    "data-testid": "conversation-turn-0"
+  }, "").append(turnKey);
+  // Aggregate transcript text onto the article the way a real DOM textContent walk would.
+  wrapper.textContent = `${prompt}\nYZ_C1L_M13_ASSISTANT_ONLY`;
+  wrapper.innerText = wrapper.textContent;
+  const conversation = new FakeElement("main", { role: "main" }, "").append(wrapper);
+  const body = new FakeElement("body", {}, `${prompt}\nYZ_C1L_M13_ASSISTANT_ONLY`)
+    .append(conversation);
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.notEqual(extraction.method, "page_text_fallback");
+  assert.equal(extraction.text, "YZ_C1L_M13_ASSISTANT_ONLY");
+  assert.equal(extraction.text.includes(prompt), false);
+  assert.match(extraction.text, /^YZ_C1L_M13_ASSISTANT_ONLY$/);
+});
+
+// M14: strip leaked "ChatGPT said:" / "You said:" role labels from assistant text.
+// Deleting the /^(chatgpt|you)\s+said:$/i control-line filter must fail this.
+test("extractResponse strips ChatGPT said and You said labels from 2026-09-28 assistant text", () => {
+  const assistantMarkdown = new FakeElement("div", {
+    "data-markdown-text-style": "assistant-message",
+    class: "MarkdownRoot-rZKhxa"
+  }, "ChatGPT said:\nYOETZ_E2E_OK\nYou said:");
+  const assistantUnit = new FakeElement("div", {
+    "data-content-search-unit-key": "fallback-turn-0:2:assistant",
+    "data-chatgpt-search-unit-key": "fallback-turn-0:2:assistant"
+  }, "").append(assistantMarkdown);
+  const body = new FakeElement("body", {}, "ChatGPT said:\nYOETZ_E2E_OK\nYou said:")
+    .append(new FakeElement("main", { role: "main" }, "").append(assistantUnit));
+  const doc = new FakeDocument(body);
+
+  const extraction = extractResponse(doc);
+
+  assert.notEqual(extraction.method, "page_text_fallback");
+  assert.equal(extraction.text, "YOETZ_E2E_OK");
+  assert.equal(/chatgpt\s+said:/i.test(extraction.text), false);
+  assert.equal(/you\s+said:/i.test(extraction.text), false);
 });
 
 test("extractResponse scopes sibling markdown to a later copy control", () => {
@@ -2488,6 +2644,53 @@ test("waitForSendAccepted rejects a click that leaves ChatGPT idle", async () =>
   );
 });
 
+// yz-c1l: 2026-09-28 stop control is aria-label="Stop" (no stop-button testid).
+test("yz-c1l: waitForSendAccepted accepts aria-label Stop as generation evidence", async () => {
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Ask ChatGPT",
+    class: "ProseMirror"
+  }, "");
+  const send = new FakeElement("button", { "aria-label": "Send prompt" }, "Send");
+  const body = new FakeElement("body", {}, "").append(composer, send);
+  const doc = new FakeDocument(body);
+  const baseline = sendAcceptanceBaseline(doc);
+
+  setTimeout(() => {
+    body.append(new FakeElement("button", { "aria-label": "Stop", type: "button" }, ""));
+  }, 20);
+
+  await clickSend(doc, { timeoutMs: 250, intervalMs: 10 });
+  const accepted = await waitForSendAccepted(doc, baseline, { timeoutMs: 250, intervalMs: 10 });
+
+  assert.equal(accepted.send_acceptance_signal, "stop_control");
+});
+
+test("yz-c1l: waitForSendAccepted accepts a data-user-message-bubble turn", async () => {
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Ask ChatGPT",
+    class: "ProseMirror"
+  }, "Review this");
+  const send = new FakeElement("button", { "aria-label": "Send prompt" }, "Send");
+  const body = new FakeElement("body", {}, "Review this").append(composer, send);
+  const doc = new FakeDocument(body);
+  const baseline = sendAcceptanceBaseline(doc);
+
+  setTimeout(() => {
+    const turn = new FakeElement("div", { "data-turn-key": "live-turn-0" });
+    turn.append(new FakeElement("div", { "data-user-message-bubble": "true" }, "Review this"));
+    body.append(turn);
+  }, 20);
+
+  await clickSend(doc, { timeoutMs: 250, intervalMs: 10 });
+  const accepted = await waitForSendAccepted(doc, baseline, { timeoutMs: 250, intervalMs: 10 });
+
+  assert.equal(accepted.send_acceptance_signal, "user_turn");
+});
+
 test("clickSend reports disabled send controls distinctly from missing controls", async () => {
   const composer = new FakeElement("div", { id: "prompt-textarea", role: "textbox" }, "Review this");
   const send = new FakeElement("button", { "aria-label": "Send prompt", "aria-disabled": "true" }, "");
@@ -2537,7 +2740,7 @@ for (const testCase of [
     selectionOptions: { model_selection_timeout_ms: 500, model_selection_interval_ms: 5 },
     expected: {
       status: "selected",
-      surface_state: { aria_checked: "true", data_state: "on" }
+      surface_state: { aria_checked: "true", aria_pressed: null, data_state: "on" }
     },
     minimumSurfaceVerificationAttempts: 2
   },
@@ -2549,7 +2752,7 @@ for (const testCase of [
       status: "unavailable",
       failure_reason: "chat_surface_control_not_found",
       surface_observed_values: ["unexpected-chat", "unexpected-work"],
-      surface_state: { aria_checked: null, data_state: null }
+      surface_state: { aria_checked: null, aria_pressed: null, data_state: null }
     },
     mainOpens: 0
   },
@@ -4779,6 +4982,356 @@ function makeHybridSimpleViewFixture({
   };
 }
 
+// yz-c1l: the 2026-09-28 split-view picker (live capture:
+// fixtures/chatgpt-picker/2026-09-28-gpt6-chat-live-capture.html). The
+// composer pill lost the __composer-pill class — the trigger is the button
+// labeled "Select ChatGPT model" — and the picker splits effort and family
+// into mutually exclusive views behind the "Select model" toggle: exactly one
+// view is live at a time (the other is inert + aria-hidden), the toggle is
+// inert inside the family view, and reopening lands in the effort view. The
+// inert slider's aria-valuetext stays readable from the family view.
+function makeSplitViewPickerFixture({
+  family = "Latest",
+  families = ["Latest", "GPT-5.6 Sol", "GPT-5.5"],
+  sliderNow = 4,
+  keyboardMode = "end",
+  surface = "chat"
+} = {}) {
+  const levels = ["Instant", "Medium", "High", "Extra High", "Pro"];
+  const sliderMin = 0;
+  const sliderMax = 4;
+  let menu = null;
+  let currentFamily = family;
+  let currentNow = sliderNow;
+  let familyViewActive = false;
+  let toggleClicks = 0;
+  let sliderKeyCount = 0;
+  let familyClickCount = 0;
+  let openCount = 0;
+  let effortView = null;
+  let familyView = null;
+  const labelFor = (value) => levels[Math.max(sliderMin, Math.min(sliderMax, value))];
+  const valueText = () => `${labelFor(currentNow)}, ${currentNow - sliderMin + 1} of ${sliderMax - sliderMin + 1}.`;
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Ask ChatGPT",
+    class: "ProseMirror"
+  });
+  const form = new FakeElement("form", { "data-testid": "composer" }, "").append(composer);
+  const body = new FakeElement("body", {}, "Ask ChatGPT").append(form);
+  appendChatSurfaceModeGroup(body, { surface });
+
+  const updatePill = () => {
+    pill.innerText = labelFor(currentNow);
+    pill.textContent = pill.innerText;
+  };
+  const closeMenu = () => {
+    if (!menu) return;
+    body.children = body.children.filter((child) => child !== menu);
+    menu.parentElement = null;
+    menu = null;
+    effortView = null;
+    familyView = null;
+    pill.setAttribute("aria-expanded", "false");
+    pill.setAttribute("data-state", "closed");
+    updatePill();
+  };
+  const setFamilyViewActive = (active) => {
+    familyViewActive = active;
+    if (!effortView || !familyView) return;
+    if (active) {
+      effortView.setAttribute("inert", "");
+      effortView.setAttribute("aria-hidden", "true");
+      delete familyView.attrs.inert;
+      delete familyView.attrs["aria-hidden"];
+    } else {
+      familyView.setAttribute("inert", "");
+      familyView.setAttribute("aria-hidden", "true");
+      delete effortView.attrs.inert;
+      delete effortView.attrs["aria-hidden"];
+    }
+  };
+  const openMenu = () => {
+    if (menu) closeMenu();
+    openCount += 1;
+    const slider = new FakeElement("span", {
+      role: "slider",
+      "aria-valuemin": String(sliderMin),
+      "aria-valuemax": String(sliderMax),
+      "aria-valuenow": String(currentNow),
+      "aria-valuetext": valueText(),
+      onKeyDown: (event) => {
+        sliderKeyCount += 1;
+        const next = event.key === "End" ? sliderMax : event.key === "ArrowRight" ? currentNow + 1 : null;
+        if (next === null) return;
+        currentNow = Math.max(sliderMin, Math.min(sliderMax, next));
+        slider.setAttribute("aria-valuenow", String(currentNow));
+        slider.setAttribute("aria-valuetext", valueText());
+        status.innerText = valueText();
+        status.textContent = status.innerText;
+      }
+    });
+    const status = new FakeElement("span", { role: "status" }, valueText());
+    const powerRow = new FakeElement("div", {
+      role: "menuitem",
+      "aria-label": "Power",
+      "data-reasoning-slider": "true"
+    }, "Power").append(new FakeElement("span", {}, "").append(slider), status);
+    // The toggle swaps the views; it has no aria-expanded/data-state and is
+    // inert while the family view is active.
+    const viewToggle = new FakeElement("div", {
+      role: "menuitem",
+      "aria-label": "Select model",
+      "data-model-picker-view-toggle": "true",
+      onClick: () => {
+        toggleClicks += 1;
+        setFamilyViewActive(!familyViewActive);
+      }
+    }, "6 Pro");
+    effortView = new FakeElement("div", {}, "Select model Power").append(viewToggle, powerRow);
+    familyView = new FakeElement("div", { inert: "", "aria-hidden": "true" });
+    for (const radioLabel of families) {
+      familyView.append(new FakeElement("div", {
+        role: "menuitemradio",
+        "aria-checked": String(radioLabel === currentFamily),
+        onClick: () => {
+          currentFamily = radioLabel;
+          familyClickCount += 1;
+          for (const radio of familyView.querySelectorAll('[role="menuitemradio"]')) {
+            radio.setAttribute("aria-checked", String(radio.innerText === radioLabel));
+          }
+          // Radix closes the menu on a radio selection.
+          closeMenu();
+        }
+      }, radioLabel));
+    }
+    familyViewActive = false;
+    menu = new FakeElement("div", {
+      id: "split-view-menu",
+      role: "menu",
+      "data-state": "open"
+    }).append(effortView, familyView);
+    body.append(menu);
+    pill.setAttribute("aria-expanded", "true");
+    pill.setAttribute("data-state", "open");
+  };
+  const pill = new FakeElement("button", {
+    "aria-label": "Select ChatGPT model",
+    "aria-haspopup": "menu",
+    "aria-expanded": "false",
+    "data-state": "closed",
+    "aria-controls": "split-view-menu",
+    "data-codex-intelligence-trigger": "true",
+    onPointerDown: openMenu,
+    onKeyDown: (event) => {
+      if (event.key === "Escape") closeMenu();
+    }
+  }, labelFor(currentNow));
+  form.append(pill);
+  const doc = new FakeDocument(body);
+
+  return {
+    doc,
+    pill,
+    viewToggleClicks: () => toggleClicks,
+    sliderKeys: () => sliderKeyCount,
+    familyClicks: () => familyClickCount,
+    openCount: () => openCount,
+    pickerOpen: () => Boolean(menu),
+    familyViewActive: () => familyViewActive
+  };
+}
+
+test("yz-c1l: Composer mode surface group (aria-pressed buttons) verifies Chat", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  appendChatSurfaceModeGroup(body);
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.state.aria_pressed, "true");
+  assert.equal(result.surface_proof_kind, "explicit_composer_mode_buttons");
+  assert.deepEqual(result.surface_observed_labels, ["Chat", "Work"]);
+  assert.equal(result.surface_foreign_pressed, false);
+  assert.deepEqual(result.observed_values, []);
+});
+
+test("yz-c1l: Composer mode surface on Work is clicked back to Chat and verified", async () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { chat } = appendChatSurfaceModeGroup(body, { surface: "work" });
+  const doc = new FakeDocument(body);
+
+  const result = await ensureChatSurface(doc, { timeoutMs: 400, intervalMs: 10 });
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(chat.clicked, true);
+  assert.equal(chat.getAttribute("aria-pressed"), "true");
+});
+
+test("yz-c1l: Composer mode group with a third pressed mode fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { group } = appendChatSurfaceModeGroup(body);
+  group.append(new FakeElement("button", { "aria-pressed": "true" }, "Projects"));
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+});
+
+test("yz-c1l: Composer mode group without a Work button fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  body.append(new FakeElement("div", { role: "group", "aria-label": "Composer mode" })
+    .append(new FakeElement("button", { "aria-pressed": "true" }, "Chat")));
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+});
+
+// M1: surfaceSelectionIsChat must require Chat pressed AND Work unpressed.
+test("yz-c1l: Composer mode Chat with no aria-pressed fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { chat } = appendChatSurfaceModeGroup(body);
+  delete chat.attrs["aria-pressed"];
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_selection_mismatch");
+});
+
+test("yz-c1l: Composer mode Chat and Work both pressed fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { chat, work } = appendChatSurfaceModeGroup(body);
+  chat.setAttribute("aria-pressed", "true");
+  work.setAttribute("aria-pressed", "true");
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_selection_mismatch");
+});
+
+test("yz-c1l: Composer mode Work pressed with Chat attribute missing fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { chat, work } = appendChatSurfaceModeGroup(body, { surface: "work" });
+  delete chat.attrs["aria-pressed"];
+  work.setAttribute("aria-pressed", "true");
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_selection_mismatch");
+});
+
+// M3: "Ask ChatGPT" alone must not prove the Chat surface (no toggle).
+test("yz-c1l: Ask ChatGPT composer without a surface toggle fails closed", () => {
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Ask ChatGPT",
+    class: "ProseMirror"
+  });
+  const body = new FakeElement("body", {}, "Ask ChatGPT").append(composer);
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+});
+
+test("yz-c1l: Chat with ChatGPT composer still proves implicit Chat surface", () => {
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Chat with ChatGPT",
+    class: "ProseMirror"
+  });
+  const body = new FakeElement("body", {}, "Chat with ChatGPT").append(composer);
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.surface_proof_kind, "implicit_chat_composer_aria");
+});
+
+// M5: look-alike labels must not be taken as the Chat/Work pair.
+test("yz-c1l: Composer mode group with Chat history look-alike fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const group = new FakeElement("div", { role: "group", "aria-label": "Composer mode" });
+  group.append(
+    new FakeElement("button", { "aria-pressed": "true" }, "Chat history"),
+    new FakeElement("button", { "aria-pressed": "false" }, "Work")
+  );
+  body.append(group);
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+});
+
+test("yz-c1l: split-view picker verifies Latest Pro end to end", async () => {
+  const fixture = makeSplitViewPickerFixture();
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "Latest Pro");
+  assert.equal(result.family_status, "verified");
+  assert.equal(result.effort_status, "verified");
+  assert.ok(fixture.viewToggleClicks() >= 1, "family view reached via the view toggle");
+});
+
+test("yz-c1l: split-view picker moves a Medium effort slider to Pro after close+reopen to the effort view", async () => {
+  const fixture = makeSplitViewPickerFixture({ sliderNow: 1 });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "Latest Pro");
+  assert.ok(fixture.sliderKeys() >= 1, "slider received keyboard moves");
+  assert.ok(fixture.openCount() >= 2, "picker closed and reopened into the effort view");
+});
+
+test("yz-c1l: split-view picker with Sol checked clicks Latest in the family view", async () => {
+  const fixture = makeSplitViewPickerFixture({ family: "GPT-5.6 Sol" });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "Latest Pro");
+  assert.equal(fixture.familyClicks(), 1);
+});
+
+test("yz-c1l: split-view picker with a Sol-only family fails closed", async () => {
+  const fixture = makeSplitViewPickerFixture({ family: "GPT-5.6 Sol", families: ["GPT-5.6 Sol"] });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "unavailable");
+  assert.equal(result.failure_reason, "model_family_not_found");
+  assert.match(result.warning, /refusing to fall back to Sol/);
+});
+
+test("yz-c1l: findModelButton anchors the labeled trigger without __composer-pill", () => {
+  const fixture = makeSplitViewPickerFixture();
+
+  assert.equal(findModelButton(fixture.doc), fixture.pill);
+});
+
 // September 2026 "Thinking effort" list picker: one menu holding inline family
 // radios (GPT-5.6 Sol / GPT-5.5), explicit effort radios (Medium / High /
 // Extra High / Pro), and a single-position "Instant, 1 of 1." speed slider
@@ -5664,6 +6217,9 @@ function matchesSimpleSelector(element, selector) {
   if (selector === '[role="radiogroup"][aria-label="Select chat surface"]') {
     return attr("role") === "radiogroup" && attr("aria-label") === "Select chat surface";
   }
+  if (selector === '[role="group"][aria-label="Composer mode"]') {
+    return attr("role") === "group" && attr("aria-label") === "Composer mode";
+  }
   if (selector === '[role="radio"][data-tpp-toggle-value="chatgpt"]') {
     return attr("role") === "radio" && attr("data-tpp-toggle-value") === "chatgpt";
   }
@@ -5685,8 +6241,36 @@ function matchesSimpleSelector(element, selector) {
   if (selector.includes('aria-label*="Stop streaming"')) {
     return tag === "button" && /Stop streaming/i.test(attr("aria-label") ?? "");
   }
+  if (selector.includes('aria-label*="Stop answering"')) {
+    return tag === "button" && /Stop answering/i.test(attr("aria-label") ?? "");
+  }
+  // Exact aria-label="Stop" (2026-09-28 composer); match before the *="Stop" catch-all.
+  if (/aria-label="Stop"/i.test(selector)) {
+    return tag === "button" && /^Stop$/i.test(attr("aria-label") ?? "");
+  }
   if (selector.includes('aria-label*="Stop"')) {
-    return tag === "button" && /Stop generating|Stop streaming/.test(attr("aria-label") ?? "");
+    return tag === "button" && /^(Stop generating|Stop streaming|Stop answering|Stop)$/i.test(attr("aria-label") ?? "");
+  }
+  if (selector.includes('[data-user-message-bubble="true"]')) {
+    return attr("data-user-message-bubble") === "true";
+  }
+  if (selector.includes('[data-conversation-role="assistant"]')) {
+    return attr("data-conversation-role") === "assistant";
+  }
+  if (selector.includes('[data-conversation-role="user"]')) {
+    return attr("data-conversation-role") === "user";
+  }
+  if (selector.includes('[data-markdown-text-style="assistant-message"]')) {
+    return attr("data-markdown-text-style") === "assistant-message";
+  }
+  if (selector === "[data-content-search-unit-key]" || selector.includes("[data-content-search-unit-key]")) {
+    return attr("data-content-search-unit-key") != null;
+  }
+  if (selector === "[data-chatgpt-search-unit-key]" || selector.includes("[data-chatgpt-search-unit-key]")) {
+    return attr("data-chatgpt-search-unit-key") != null;
+  }
+  if (selector.includes('[class*="user-message"]')) {
+    return String(attr("class") ?? "").includes("user-message");
   }
   if (selector.includes('[aria-label*="Copy"]')) {
     return tag === "button" && /Copy/.test(attr("aria-label") ?? "");

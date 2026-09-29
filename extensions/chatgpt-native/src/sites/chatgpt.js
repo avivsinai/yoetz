@@ -41,6 +41,13 @@ function normalizeConversationId(value) {
   return { ok: true, id };
 }
 
+function isProvisionalConversationId(value) {
+  const id = String(value ?? "").trim();
+  // Pre-drift provisional ids used WEB:<uuid>; 2026-09-29 ChatGPT uses
+  // local-chatgpt:<uuid> before the permanent /c/<uuid> assignment.
+  return id.startsWith("WEB:") || id.startsWith("local-chatgpt:");
+}
+
 function isExpectedConversationIdAssignment(job, expectedConversationId, currentConversationId) {
   const requestedConversationId = String(job?.conversation_id ?? "").trim();
   const submittedConversationId = String(job?.submitted_conversation_id ?? "").trim();
@@ -48,8 +55,9 @@ function isExpectedConversationIdAssignment(job, expectedConversationId, current
   const current = String(currentConversationId ?? "").trim();
   return !requestedConversationId
     && submittedConversationId === expected
-    && expected.startsWith("WEB:")
-    && normalizeConversationId(current).ok;
+    && isProvisionalConversationId(expected)
+    && normalizeConversationId(current).ok
+    && !isProvisionalConversationId(current);
 }
 
 function modelUsedLooksLikeLatestPro(value) {

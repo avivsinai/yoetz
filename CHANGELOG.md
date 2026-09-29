@@ -6,6 +6,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- ChatGPT native extraction after the 2026-09-28 transcript markup drop of
+  `data-message-author-role` / `article` wrappers: recognize
+  `data-conversation-role`, `data-markdown-text-style="assistant-message"`, and
+  `*:assistant` search-unit keys so wait_response no longer stalls on
+  `page_text_fallback` with `assistant_count=0` while the answer is visible.
+  (`yz-c1l`)
+- ChatGPT recipe drift (2026-09-28): the Chat/Work surface toggle moved from
+  a `radiogroup` with `data-tpp-toggle-value` radios to a "Composer mode"
+  group of plain buttons selected via `aria-pressed`; the composer model pill
+  dropped the `__composer-pill` class (the trigger is now the button labeled
+  "Select ChatGPT model"); the composer lost `#prompt-textarea` (now a
+  ProseMirror contenteditable textbox); and the model picker became a
+  split-view design whose "Select model" toggle swaps the effort and family
+  views (exactly one live at a time, no `aria-expanded`). Model selection
+  failed closed with `chat_surface_control_not_found`. The driver now reads
+  both surface shapes (hook-only on the legacy radiogroup, exact-label
+  buttons on the new group), anchors the labeled trigger, qualifies the
+  authenticated composer by the ProseMirror class, and returns to the effort
+  view via close+reopen before driving a slider the family view keeps inert.
+  Surface proof refuses a third pressed mode button and does not treat the
+  "Ask ChatGPT" composer label as implicit Chat-surface proof (that label
+  coexists with the toggle). Composer mode emits its own receipt proof kind
+  `explicit_composer_mode_buttons` (aria_pressed + labels + foreign-pressed),
+  validated in both the native service worker and the CLI receipt gate — the
+  radio-era `explicit_chat_work_radios` branch is unchanged. Send acceptance
+  recognizes the new `aria-label="Stop"` control and
+  `data-user-message-bubble` user turns so a real post-send generation is
+  not reported as a false timeout. New live picker + stop-button fixtures;
+  mutation-killing surface tests; inert-aware fake slider; surface-receipt
+  contract tests. Content-script send packing now forwards
+  `surface_observed_labels` / `surface_foreign_pressed` (197f58a live miss);
+  validators name the failing field and value. Accept
+  `local-chatgpt:` provisional conversation ids (was `WEB:` only) when ChatGPT
+  assigns the permanent `/c/<uuid>` after send. `scripts/capture-chatgpt-picker.mjs` now bundles the
+  serializer's sanitizer import instead of crashing in-page with
+  `ReferenceError: sanitizeCaptureClone is not defined`. (`yz-c1l`)
 
 ## [0.5.79] - 2026-09-28
 ### Added

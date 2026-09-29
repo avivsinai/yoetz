@@ -2466,14 +2466,24 @@ pub fn canonical_chatgpt_final_model_selection(selection: &serde_json::Value) ->
         "surface_proof_kind": selection.get("surfaceProofKind").cloned().or_else(|| selection.get("surface_proof_kind").cloned()).unwrap_or(serde_json::Value::Null),
         "surface_chat_state": canonical_chatgpt_nested_object(
             selection.get("surfaceChatState").or_else(|| selection.get("surface_chat_state")),
-            &[("aria_checked", "ariaChecked"), ("data_state", "dataState")],
+            &[
+                ("aria_checked", "ariaChecked"),
+                ("aria_pressed", "ariaPressed"),
+                ("data_state", "dataState"),
+            ],
         ),
         "surface_work_state": canonical_chatgpt_nested_object(
             selection.get("surfaceWorkState").or_else(|| selection.get("surface_work_state")),
-            &[("aria_checked", "ariaChecked"), ("data_state", "dataState")],
+            &[
+                ("aria_checked", "ariaChecked"),
+                ("aria_pressed", "ariaPressed"),
+                ("data_state", "dataState"),
+            ],
         ),
         "surface_visible_toggle_count": selection.get("surfaceVisibleToggleCount").cloned().or_else(|| selection.get("surface_visible_toggle_count").cloned()).unwrap_or(serde_json::Value::Null),
         "surface_composer_aria": selection.get("surfaceComposerAria").cloned().or_else(|| selection.get("surface_composer_aria").cloned()).unwrap_or(serde_json::Value::Null),
+        "surface_observed_labels": selection.get("surfaceObservedLabels").cloned().or_else(|| selection.get("surface_observed_labels").cloned()).unwrap_or(serde_json::Value::Null),
+        "surface_foreign_pressed": selection.get("surfaceForeignPressed").cloned().or_else(|| selection.get("surface_foreign_pressed").cloned()).unwrap_or(serde_json::Value::Null),
         "picker_close_verification": canonical_chatgpt_nested_object(
             selection.get("pickerCloseVerification").or_else(|| selection.get("picker_close_verification")),
             &[
@@ -2628,52 +2638,249 @@ pub fn validate_chatgpt_final_model_selection(
         .ok_or_else(|| anyhow!("receipt surface_proof_kind is missing"))?;
     match surface_kind {
         "explicit_chat_work_radios" => {
+            let mut problems = Vec::new();
             if object
                 .get("surface_evidence_seen")
                 .and_then(serde_json::Value::as_bool)
                 != Some(true)
-                || object
-                    .get("surface_visible_toggle_count")
-                    .and_then(serde_json::Value::as_u64)
-                    != Some(2)
-                || !surface_state_is(chat_state, "true")
-                || !surface_state_is(work_state, "false")
-                || !observed_values
-                    .iter()
-                    .any(|value| value.as_str() == Some("chatgpt"))
-                || !observed_values
-                    .iter()
-                    .any(|value| value.as_str() == Some("work"))
             {
-                return Err(anyhow!("explicit Chat/Work surface proof is incomplete"));
+                problems.push(format!(
+                    "surface_evidence_seen={}, expected true",
+                    object
+                        .get("surface_evidence_seen")
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if object
+                .get("surface_visible_toggle_count")
+                .and_then(serde_json::Value::as_u64)
+                != Some(2)
+            {
+                problems.push(format!(
+                    "surface_visible_toggle_count={}, expected 2",
+                    object
+                        .get("surface_visible_toggle_count")
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !surface_state_aria_checked_is(chat_state, "true") {
+                problems.push(format!(
+                    "surface_chat_state.aria_checked={}, expected \"true\"",
+                    chat_state
+                        .and_then(|v| v.get("aria_checked"))
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !surface_state_aria_checked_is(work_state, "false") {
+                problems.push(format!(
+                    "surface_work_state.aria_checked={}, expected \"false\"",
+                    work_state
+                        .and_then(|v| v.get("aria_checked"))
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !observed_values
+                .iter()
+                .any(|value| value.as_str() == Some("chatgpt"))
+            {
+                problems.push(format!(
+                    "surface_observed_values missing \"chatgpt\": {observed_values:?}"
+                ));
+            }
+            if !observed_values
+                .iter()
+                .any(|value| value.as_str() == Some("work"))
+            {
+                problems.push(format!(
+                    "surface_observed_values missing \"work\": {observed_values:?}"
+                ));
             }
             if object
                 .get("surface_composer_aria")
                 .is_some_and(|value| !value.is_null())
             {
+                problems.push(format!(
+                    "surface_composer_aria={}, expected null",
+                    object
+                        .get("surface_composer_aria")
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !problems.is_empty() {
                 return Err(anyhow!(
-                    "explicit surface proof must not claim implicit composer proof"
+                    "explicit Chat/Work surface proof is incomplete; {}",
+                    problems.join("; ")
+                ));
+            }
+        }
+        "explicit_composer_mode_buttons" => {
+            let mut problems = Vec::new();
+            let labels = object
+                .get("surface_observed_labels")
+                .and_then(serde_json::Value::as_array);
+            if object
+                .get("surface_evidence_seen")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            {
+                problems.push(format!(
+                    "surface_evidence_seen={}, expected true",
+                    object
+                        .get("surface_evidence_seen")
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if object
+                .get("surface_visible_toggle_count")
+                .and_then(serde_json::Value::as_u64)
+                != Some(2)
+            {
+                problems.push(format!(
+                    "surface_visible_toggle_count={}, expected 2",
+                    object
+                        .get("surface_visible_toggle_count")
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !surface_state_aria_pressed_is(chat_state, "true") {
+                problems.push(format!(
+                    "surface_chat_state.aria_pressed={}, expected \"true\"",
+                    chat_state
+                        .and_then(|v| v.get("aria_pressed"))
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !surface_state_aria_pressed_is(work_state, "false") {
+                problems.push(format!(
+                    "surface_work_state.aria_pressed={}, expected \"false\"",
+                    work_state
+                        .and_then(|v| v.get("aria_pressed"))
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !surface_state_aria_checked_absent(chat_state) {
+                problems.push(format!(
+                    "surface_chat_state.aria_checked={}, expected null",
+                    chat_state
+                        .and_then(|v| v.get("aria_checked"))
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !surface_state_aria_checked_absent(work_state) {
+                problems.push(format!(
+                    "surface_work_state.aria_checked={}, expected null",
+                    work_state
+                        .and_then(|v| v.get("aria_checked"))
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if object
+                .get("surface_foreign_pressed")
+                .and_then(serde_json::Value::as_bool)
+                != Some(false)
+            {
+                problems.push(format!(
+                    "surface_foreign_pressed={}, expected false",
+                    object
+                        .get("surface_foreign_pressed")
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            match labels {
+                Some(labels)
+                    if labels.len() == 2
+                        && labels.iter().any(|value| value.as_str() == Some("Chat"))
+                        && labels.iter().any(|value| value.as_str() == Some("Work")) => {}
+                other => problems.push(format!(
+                    "surface_observed_labels={}, expected [\"Chat\",\"Work\"]",
+                    other
+                        .map(|v| serde_json::Value::Array(v.clone()))
+                        .unwrap_or(serde_json::Value::Null)
+                )),
+            }
+            if !observed_values.is_empty() {
+                problems.push(format!(
+                    "surface_observed_values={observed_values:?}, expected []"
+                ));
+            }
+            if object
+                .get("surface_composer_aria")
+                .is_some_and(|value| !value.is_null())
+            {
+                problems.push(format!(
+                    "surface_composer_aria={}, expected null",
+                    object
+                        .get("surface_composer_aria")
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !problems.is_empty() {
+                return Err(anyhow!(
+                    "explicit Composer mode surface proof is incomplete; {}",
+                    problems.join("; ")
                 ));
             }
         }
         "implicit_chat_composer_aria" => {
+            let mut problems = Vec::new();
             if object
                 .get("surface_evidence_seen")
                 .and_then(serde_json::Value::as_bool)
                 != Some(false)
-                || object
-                    .get("surface_visible_toggle_count")
-                    .and_then(serde_json::Value::as_u64)
-                    != Some(0)
-                || !observed_values.is_empty()
-                || object
-                    .get("surface_composer_aria")
-                    .and_then(serde_json::Value::as_str)
-                    != Some("Chat with ChatGPT")
-                || chat_state.is_some_and(|value| !value.is_null())
-                || work_state.is_some_and(|value| !value.is_null())
             {
-                return Err(anyhow!("implicit Chat composer proof is incomplete"));
+                problems.push(format!(
+                    "surface_evidence_seen={}, expected false",
+                    object
+                        .get("surface_evidence_seen")
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if object
+                .get("surface_visible_toggle_count")
+                .and_then(serde_json::Value::as_u64)
+                != Some(0)
+            {
+                problems.push(format!(
+                    "surface_visible_toggle_count={}, expected 0",
+                    object
+                        .get("surface_visible_toggle_count")
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !observed_values.is_empty() {
+                problems.push(format!(
+                    "surface_observed_values={observed_values:?}, expected []"
+                ));
+            }
+            if object
+                .get("surface_composer_aria")
+                .and_then(serde_json::Value::as_str)
+                != Some("Chat with ChatGPT")
+            {
+                problems.push(format!(
+                    "surface_composer_aria={}, expected \"Chat with ChatGPT\"",
+                    object
+                        .get("surface_composer_aria")
+                        .unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if chat_state.is_some_and(|value| !value.is_null()) {
+                problems.push(format!(
+                    "surface_chat_state={}, expected null",
+                    chat_state.unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if work_state.is_some_and(|value| !value.is_null()) {
+                problems.push(format!(
+                    "surface_work_state={}, expected null",
+                    work_state.unwrap_or(&serde_json::Value::Null)
+                ));
+            }
+            if !problems.is_empty() {
+                return Err(anyhow!(
+                    "implicit Chat composer proof is incomplete; {}",
+                    problems.join("; ")
+                ));
             }
         }
         other => return Err(anyhow!("unsupported surface_proof_kind {other:?}")),
@@ -2729,12 +2936,30 @@ fn collapse_label_whitespace(value: &str) -> String {
     value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn surface_state_is(value: Option<&serde_json::Value>, expected_aria_checked: &str) -> bool {
+fn surface_state_aria_checked_is(value: Option<&serde_json::Value>, expected: &str) -> bool {
     value
         .and_then(serde_json::Value::as_object)
         .and_then(|state| state.get("aria_checked"))
         .and_then(serde_json::Value::as_str)
-        == Some(expected_aria_checked)
+        == Some(expected)
+}
+
+fn surface_state_aria_pressed_is(value: Option<&serde_json::Value>, expected: &str) -> bool {
+    value
+        .and_then(serde_json::Value::as_object)
+        .and_then(|state| state.get("aria_pressed"))
+        .and_then(serde_json::Value::as_str)
+        == Some(expected)
+}
+
+fn surface_state_aria_checked_absent(value: Option<&serde_json::Value>) -> bool {
+    match value.and_then(serde_json::Value::as_object) {
+        Some(state) => state
+            .get("aria_checked")
+            .map(|v| v.is_null())
+            .unwrap_or(true),
+        None => false,
+    }
 }
 
 pub fn build_chatgpt_dom_probe_function() -> String {
@@ -3361,6 +3586,87 @@ mod tests {
             "surface_work_state": null
         });
         validate_chatgpt_final_model_selection(&current, ChatgptModelStrategy::Current).unwrap();
+    }
+
+    #[test]
+    fn final_model_selection_validator_accepts_composer_mode_surface_proof() {
+        let composer_mode = serde_json::json!({
+            "status": "selected",
+            "model_used": "Latest Pro",
+            "requested_model": "gpt-6-pro-chat",
+            "family_status": "verified",
+            "effort_status": "verified",
+            "picker_family_status": "verified",
+            "picker_effort_status": "verified",
+            "picker_shape": "menu",
+            "picker_close_verification": {
+                "picker_surface_closed": true,
+                "model_trigger_closed": true,
+                "family_trigger_closed": true,
+                "closed_pill_pro": true
+            },
+            "click_bound": true,
+            "click_bound_closed_pill_text": "Pro",
+            "click_bound_closed_pill_family_status": "skipped",
+            "click_bound_closed_pill_effort_status": "verified",
+            "surface_evidence_seen": true,
+            "surface_proof_kind": "explicit_composer_mode_buttons",
+            "surface_chat_state": {"aria_checked": null, "aria_pressed": "true"},
+            "surface_work_state": {"aria_checked": null, "aria_pressed": "false"},
+            "surface_visible_toggle_count": 2,
+            "surface_composer_aria": null,
+            "surface_observed_values": [],
+            "surface_observed_labels": ["Chat", "Work"],
+            "surface_foreign_pressed": false
+        });
+        validate_chatgpt_final_model_selection(&composer_mode, ChatgptModelStrategy::Select)
+            .expect("composer mode receipt must validate");
+
+        // b25007f bug: composer aria_pressed states under the radio proof kind.
+        let mut radio_kind = composer_mode.clone();
+        radio_kind["surface_proof_kind"] = serde_json::json!("explicit_chat_work_radios");
+        assert!(
+            validate_chatgpt_final_model_selection(&radio_kind, ChatgptModelStrategy::Select)
+                .unwrap_err()
+                .to_string()
+                .contains("explicit Chat/Work surface proof is incomplete")
+        );
+
+        for (label, key, value) in [
+            (
+                "Work pressed",
+                "surface_work_state",
+                serde_json::json!({"aria_checked": null, "aria_pressed": "true"}),
+            ),
+            (
+                "foreign pressed",
+                "surface_foreign_pressed",
+                serde_json::json!(true),
+            ),
+            (
+                "aria_pressed missing",
+                "surface_chat_state",
+                serde_json::json!({"aria_checked": null, "aria_pressed": null}),
+            ),
+            (
+                "labels omitted",
+                "surface_observed_labels",
+                serde_json::Value::Null,
+            ),
+        ] {
+            let mut case = composer_mode.clone();
+            case[key] = value;
+            let err = validate_chatgpt_final_model_selection(&case, ChatgptModelStrategy::Select)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("explicit Composer mode surface proof is incomplete"),
+                "{label}: {err}"
+            );
+            if label == "labels omitted" {
+                assert!(err.contains("surface_observed_labels"), "{err}");
+            }
+        }
     }
 
     #[test]

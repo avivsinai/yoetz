@@ -91,9 +91,15 @@ async function waitForRead(root, options = {}) {
   }
   return last;
 }
-const CHAT_SURFACE_GROUP_SELECTOR = '[role="radiogroup"][aria-label="Select chat surface"]';
+// yz-c1l: 2026-09-28 drift replaced the "Select chat surface" radiogroup with
+// a "Composer mode" group of plain buttons selected via aria-pressed.
+const CHAT_SURFACE_GROUP_SELECTOR = '[role="radiogroup"][aria-label="Select chat surface"], [role="group"][aria-label="Composer mode"]';
 const CHAT_SURFACE_CHAT_SELECTOR = '[role="radio"][data-tpp-toggle-value="chatgpt"]';
 const CHAT_SURFACE_WORK_SELECTOR = '[role="radio"][data-tpp-toggle-value="work"]';
+// The 2026-09-28 composer pill dropped the __composer-pill class; the trigger
+// is the composer menu button with this static aria-label (its
+// data-codex-intelligence-trigger="true" attribute is the secondary hook).
+const MODEL_TRIGGER_ARIA_LABEL = "Select ChatGPT model";
 const MANUAL_HANDOFF_SHELL_SELECTORS = Object.freeze([
   "nav",
   "aside",
@@ -397,6 +403,10 @@ export function findComposer(root = document) {
 export function findAuthenticatedComposer(root = document) {
   return firstVisible(root, [
     "#prompt-textarea",
+    // yz-c1l: 2026-09-28 drift dropped the #prompt-textarea id; the composer is
+    // now the ProseMirror contenteditable textbox. The class qualifier keeps
+    // the match ChatGPT-specific (generic editor textboxes stay rejected).
+    'div[contenteditable="true"][role="textbox"].ProseMirror',
     'textarea[data-testid*="composer"]',
     'div[contenteditable="true"][data-testid*="composer"]'
   ]);
@@ -422,6 +432,11 @@ export function findModelButton(root = document) {
   for (const scope of scopes) {
     const buttons = Array.from(scope.querySelectorAll('button[aria-haspopup="menu"]'))
       .filter((node) => isVisible(node, { allowDisabled: true }) && !isTranscriptModelControl(node));
+    const labeledTrigger = buttons.find((node) => node.getAttribute?.("aria-label") === MODEL_TRIGGER_ARIA_LABEL)
+      ?? buttons.find((node) => node.getAttribute?.("data-codex-intelligence-trigger") === "true");
+    if (labeledTrigger) {
+      return labeledTrigger;
+    }
     const composerPills = buttons.filter((node) => classTokens(node).includes("__composer-pill"));
     const grammarPill = composerPills.find((node) => modelPillSummaryMatches(modelControlLabel(node)))
       ?? buttons.find((node) => modelPillSummaryMatches(modelControlLabel(node)));
@@ -1056,16 +1071,46 @@ function positiveMs(value, fallback) {
 function findChatSurfaceControls(root) {
   const candidates = [];
   for (const group of visibleSurfaceGroups(root)) {
-    const chats = Array.from(group.querySelectorAll(CHAT_SURFACE_CHAT_SELECTOR))
-      .filter((node) => isVisibleSurfaceRadio(node));
-    const works = Array.from(group.querySelectorAll(CHAT_SURFACE_WORK_SELECTOR))
-      .filter((node) => isVisibleSurfaceRadio(node));
+    // The 2026-09-28 "Composer mode" group carries plain buttons matched by
+    // exact label; the pre-drift radiogroup stays hook-only so unexpected
+    // data-tpp-toggle-value values keep failing closed.
+    const textLabels = group.getAttribute?.("role") === "group";
+    const chats = surfaceToggleNodes(group, CHAT_SURFACE_CHAT_SELECTOR, textLabels ? "Chat" : null);
+    const works = surfaceToggleNodes(group, CHAT_SURFACE_WORK_SELECTOR, textLabels ? "Work" : null);
     if (chats.length !== 1 || works.length !== 1) {
       return null;
     }
-    candidates.push({ group, chat: chats[0], work: works[0] });
+    // Fail closed if the mode group grows a third pressed control the Chat/Work
+    // pair would otherwise ignore (ChatGPT Pro review of PR #562).
+    if (textLabels && modeGroupHasForeignPressedControl(group, chats[0], works[0])) {
+      return null;
+    }
+    candidates.push({
+      group,
+      chat: chats[0],
+      work: works[0],
+      shape: textLabels ? "composer_mode" : "radiogroup"
+    });
   }
   return candidates.length === 1 ? candidates[0] : null;
+}
+
+function modeGroupHasForeignPressedControl(group, chat, work) {
+  return Array.from(group.querySelectorAll("button"))
+    .some((node) => node !== chat
+      && node !== work
+      && node.getAttribute?.("aria-pressed") === "true");
+}
+
+function surfaceToggleNodes(group, hookSelector, textLabel) {
+  const byHook = Array.from(group.querySelectorAll(hookSelector))
+    .filter((node) => isVisibleSurfaceRadio(node));
+  if (byHook.length > 0 || !textLabel) {
+    return byHook;
+  }
+  return Array.from(group.querySelectorAll("button"))
+    .filter((node) => textOf(node) === textLabel)
+    .filter((node) => isVisibleSurfaceRadio(node));
 }
 
 function visibleSurfaceGroups(root) {
@@ -1079,8 +1124,12 @@ function surfaceEvidencePresent(root) {
 }
 
 function visibleSurfaceToggleNodes(root) {
-  return Array.from(root?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]') ?? [])
-    .filter((node) => isVisibleSurfaceRadio(node));
+  const radios = Array.from(root?.querySelectorAll?.('[role="radio"][data-tpp-toggle-value]') ?? []);
+  const modeButtons = visibleSurfaceGroups(root)
+    .filter((group) => group.getAttribute?.("role") === "group")
+    .flatMap((group) => Array.from(group.querySelectorAll("button")))
+    .filter((node) => textOf(node) === "Chat" || textOf(node) === "Work");
+  return [...radios, ...modeButtons].filter((node) => isVisibleSurfaceRadio(node));
 }
 
 function observedSurfaceToggleValues(root) {
@@ -1091,13 +1140,22 @@ function observedSurfaceToggleValues(root) {
     .slice(0, 10);
 }
 
+// Implicit Chat-surface proof stays pinned to the pre-drift composer label.
+// The 2026-09-28 "Ask ChatGPT" label rides the authenticated ProseMirror
+// composer even when a Composer mode toggle is present, so it must not prove
+// Chat with no toggle (service-worker receipt also requires this exact label).
+const CHAT_SURFACE_COMPOSER_ARIA_LABELS = new Set(["Chat with ChatGPT"]);
+
+function isChatSurfaceComposerAria(composer) {
+  return CHAT_SURFACE_COMPOSER_ARIA_LABELS.has(composer?.getAttribute?.("aria-label"));
+}
+
 function implicitChatSurfaceProof(root, observedValues) {
   if (observedValues.length > 0
     || surfaceEvidencePresent(root)) {
     return false;
   }
-  const composer = findComposer(root);
-  return composer?.getAttribute?.("aria-label") === "Chat with ChatGPT";
+  return isChatSurfaceComposerAria(findComposer(root));
 }
 
 function hasPositiveLayout(element) {
@@ -1113,6 +1171,7 @@ function isVisibleSurfaceRadio(element) {
 function surfaceSelectionState(node) {
   return {
     aria_checked: node?.getAttribute?.("aria-checked") ?? null,
+    aria_pressed: node?.getAttribute?.("aria-pressed") ?? null,
     data_state: node?.getAttribute?.("data-state") ?? null
   };
 }
@@ -1120,10 +1179,14 @@ function surfaceSelectionState(node) {
 function surfaceSelectionIsChat(controls) {
   const chat = surfaceSelectionState(controls?.chat);
   const work = surfaceSelectionState(controls?.work);
-  return chat.aria_checked === "true" && work.aria_checked === "false";
+  if (chat.aria_checked !== null || work.aria_checked !== null) {
+    return chat.aria_checked === "true" && work.aria_checked === "false";
+  }
+  return chat.aria_pressed === "true" && work.aria_pressed === "false";
 }
 
 function surfaceProofFields(controls, visibleSurfaceToggleCount, composer, proofKind) {
+  const composerMode = proofKind === "explicit_composer_mode_buttons";
   return {
     surface_proof_kind: proofKind,
     surface_chat_state: controls ? surfaceSelectionState(controls.chat) : null,
@@ -1131,7 +1194,9 @@ function surfaceProofFields(controls, visibleSurfaceToggleCount, composer, proof
     surface_visible_toggle_count: visibleSurfaceToggleCount,
     surface_composer_aria: proofKind === "implicit_chat_composer_aria"
       ? composer?.getAttribute?.("aria-label") ?? null
-      : null
+      : null,
+    surface_observed_labels: composerMode ? ["Chat", "Work"] : null,
+    surface_foreign_pressed: composerMode ? false : null
   };
 }
 
@@ -1151,9 +1216,11 @@ export function verifyChatSurface(root = document, options = {}) {
     && !surfaceEvidenceSeen
     && visibleSurfaceGroups(root).length === 0
     && observedValues.length === 0
-    && composer?.getAttribute?.("aria-label") === "Chat with ChatGPT";
+    && isChatSurfaceComposerAria(composer);
   const proofKind = controlsReady
-    ? "explicit_chat_work_radios"
+    ? (controls.shape === "composer_mode"
+      ? "explicit_composer_mode_buttons"
+      : "explicit_chat_work_radios")
     : implicitReady
       ? "implicit_chat_composer_aria"
       : null;
@@ -1244,6 +1311,8 @@ export function verifyChatgptModelSelectionBeforeSend(root = document, selection
     surface_work_state: surface.surface_work_state ?? selection.surface_work_state ?? null,
     surface_visible_toggle_count: surface.surface_visible_toggle_count ?? selection.surface_visible_toggle_count ?? 0,
     surface_composer_aria: surface.surface_composer_aria ?? selection.surface_composer_aria ?? null,
+    surface_observed_labels: surface.surface_observed_labels ?? selection.surface_observed_labels ?? null,
+    surface_foreign_pressed: surface.surface_foreign_pressed ?? selection.surface_foreign_pressed ?? null,
     picker_shape: selection.picker_shape ?? null,
     current_closed_pill_text: pillText || null,
     current_closed_pill_family_status: currentFamilyStatus,
@@ -1264,7 +1333,9 @@ function surfaceResultFields(surface) {
     surface_chat_state: surface?.surface_chat_state ?? null,
     surface_work_state: surface?.surface_work_state ?? null,
     surface_visible_toggle_count: surface?.surface_visible_toggle_count ?? 0,
-    surface_composer_aria: surface?.surface_composer_aria ?? null
+    surface_composer_aria: surface?.surface_composer_aria ?? null,
+    surface_observed_labels: surface?.surface_observed_labels ?? null,
+    surface_foreign_pressed: surface?.surface_foreign_pressed ?? null
   };
 }
 
@@ -1356,9 +1427,12 @@ function leftoverSurfaceIsOpen(root, trigger) {
 }
 
 function modelControlLabel(node) {
+  const ariaLabel = node?.getAttribute?.("aria-label");
   return normalizeText([
     textOf(node),
-    node?.getAttribute?.("aria-label"),
+    // The 2026-09-28 trigger's aria-label is a static control description, not
+    // the selected value; including it would defeat pill-grammar corroboration.
+    ariaLabel === MODEL_TRIGGER_ARIA_LABEL ? null : ariaLabel,
     node?.getAttribute?.("title")
   ].filter(Boolean).join(" "));
 }
@@ -1542,12 +1616,42 @@ async function selectLatestChatProModel(root, options = {}) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, r, availableFamilies, "Latest effort slider was not found in the Advanced picker", "effort_control_not_found");
       }
-      const moved = await moveEffortSliderToPro(root, r, options);
-      effortMoveMethod = moved.method;
-      r = moved.read;
-      if (!moved.ok) {
-        await closeModelPicker(root, modelButton);
-        return selectionFailure(base, modelButton, r, availableFamilies, "Latest effort slider did not move to verified Pro", "effort_slider_move_failed", { effortMoveMethod });
+      // yz-c1l: the 2026-09-28 split-view picker keeps the slider mounted but
+      // inert while the family view is active (the family leg toggled to it),
+      // and the view toggle is inert inside the family view — the way back to
+      // the effort view is close + reopen, since the effort view is the
+      // default on open.
+      if (effortControlIsInert(r.effort.control) && r.nav.viewToggle) {
+        if (!await closeModelPicker(root, modelButton)) {
+          return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT model picker did not close before returning to the effort view", "model_picker_close_failed", { effortMoveMethod });
+        }
+        modelButton = await waitForModelButton(root, options);
+        if (!modelButton) {
+          return selectionFailure(base, null, null, availableFamilies, "ChatGPT composer model pill did not remount before the effort move", "effort_control_remount_failed", { effortMoveMethod });
+        }
+        if (!await openModelPicker(root, modelButton, options)) {
+          return selectionFailure(base, modelButton, null, availableFamilies, "ChatGPT picker did not reopen into the effort view", "model_picker_reopen_failed", { effortMoveMethod });
+        }
+        r = await waitForRead(root, options);
+        if (!r.shape) {
+          await closeModelPicker(root, modelButton);
+          return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT model picker exposed an unsupported shape on returning to the effort view; refusing unverified model selection", "model_picker_shape_unsupported", { effortMoveMethod });
+        }
+      }
+      // The reopen above can land on an already-Pro effort (a family click
+      // resets effort to the family default); only move when still needed.
+      if (foldedModelText(r.effort.label) !== "pro") {
+        if (r.effort.kind !== "slider" || !r.effort.control || effortControlIsInert(r.effort.control)) {
+          await closeModelPicker(root, modelButton);
+          return selectionFailure(base, modelButton, r, availableFamilies, "Latest effort slider was not live in the effort view", "effort_control_not_found", { effortMoveMethod });
+        }
+        const moved = await moveEffortSliderToPro(root, r, options);
+        effortMoveMethod = moved.method;
+        r = moved.read;
+        if (!moved.ok) {
+          await closeModelPicker(root, modelButton);
+          return selectionFailure(base, modelButton, r, availableFamilies, "Latest effort slider did not move to verified Pro", "effort_slider_move_failed", { effortMoveMethod });
+        }
       }
     } else {
       // rows: click the Pro tier row (found via the reader-exported helpers,
@@ -2189,10 +2293,25 @@ function combinedVerificationStatus(pickerStatus, closedStatus) {
 // PickerRead values. The control comes from read.effort.control; verification
 // re-reads the fresh value and succeeds only when the settled read still
 // carries the Pro label on a slider control.
+// yz-c1l: structural inert check (never opacity) — the 2026-09-28 split-view
+// picker keeps the effort slider mounted but inert while the family view is
+// active, and an inert slider ignores the keyboard moves below.
+function effortControlIsInert(control) {
+  let node = control;
+  while (node) {
+    if (node.getAttribute?.("inert") != null) return true;
+    node = node.parentElement;
+  }
+  return false;
+}
+
 async function moveEffortSliderToPro(root, initialRead, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   let r = initialRead;
   const slider = initialRead?.effort?.control ?? null;
+  if (effortControlIsInert(slider)) {
+    return { ok: false, read: r, method: null };
+  }
   const originalSnapshot = sliderEffortSnapshot(slider, initialRead?.surface);
   const attemptKey = async (key, method) => {
     if (r?.effort?.kind !== "slider" || !r.effort.control) return null;
@@ -2778,7 +2897,24 @@ function responseFrame(node) {
 }
 
 function isInsideUserTurn(node) {
-  return Boolean(node.closest?.('[data-message-author-role="user"], [class*="user-turn"]'));
+  if (!node) {
+    return false;
+  }
+  if (node.closest?.([
+    '[data-message-author-role="user"]',
+    '[class*="user-turn"]',
+    '[class*="user-message"]',
+    '[data-user-message-bubble="true"]',
+    '[data-conversation-role="user"]'
+  ].join(", "))) {
+    return true;
+  }
+  for (let current = node; current; current = current.parentElement) {
+    if (isUserUnitContainer(current)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function responseConversationScope(node, latestUser) {
@@ -2874,6 +3010,8 @@ function assistantMessageTextEntry(turn) {
   }
   for (const selector of [
     '[data-message-author-role="assistant"]',
+    '[data-conversation-role="assistant"]',
+    '[data-markdown-text-style="assistant-message"]',
     '[data-testid*="assistant-message"]',
     '[data-testid*="assistant-response"]',
     '[data-message-author-role="assistant"] [class*="markdown"]',
@@ -2930,6 +3068,18 @@ function isAssistantContentNode(node, turn = null) {
   }
   if (role === "user") {
     return false;
+  }
+  if (node.getAttribute?.("data-conversation-role") === "assistant"
+      || node.getAttribute?.("data-markdown-text-style") === "assistant-message") {
+    // <h4 class="sr-only" data-conversation-role="assistant">ChatGPT said:</h4> is a
+    // marker, not answer text — keep finding turns via it, but do not extract its label.
+    if (node.getAttribute?.("data-conversation-role") === "assistant"
+        && (/^h[1-6]$/i.test(String(node.tagName ?? ""))
+          || /\bsr-only\b/i.test(String(node.getAttribute?.("class") ?? ""))
+          || /^(chatgpt|you)\s+said:$/i.test(normalizeText(textOf(node))))) {
+      return false;
+    }
+    return true;
   }
   const testId = String(node.getAttribute?.("data-testid") ?? "");
   if (/assistant-(message|response)/i.test(testId)) {
@@ -3037,6 +3187,8 @@ function isAssistantControlLine(line, options = {}) {
     // Strip them as standalone lines so a fenced code block in the answer doesn't leak its
     // toolbar text. Anchored to a standalone line so it never eats real answer prose.
     || /^copy code$/i.test(value)
+    // yz-c1l: 2026-09-28 sr-only role labels leak into unit-scoped textContent.
+    || /^(chatgpt|you)\s+said:$/i.test(value)
     || /^(thought|reasoned)\s+for\s+\S.*$/i.test(value)
     || /^show\s+(more|reasoning)$/i.test(value)
     || (!options.preserveContentStatusText && (isThoughtStatusLine(line) || isModelStatusText(line)));
@@ -3053,7 +3205,12 @@ function isModelStatusText(text) {
 }
 
 function isMarkdownNode(node) {
-  return /\bmarkdown\b/i.test(String(node?.getAttribute?.("class") ?? ""));
+  // yz-c1l: 2026-09-28 renders MarkdownRoot-* (no lowercase "markdown" token) plus
+  // data-markdown-text-style="assistant-message".
+  if (node?.getAttribute?.("data-markdown-text-style")) {
+    return true;
+  }
+  return /markdown/i.test(String(node?.getAttribute?.("class") ?? ""));
 }
 
 function isThoughtStatusLine(line) {
@@ -3070,7 +3227,10 @@ const STOP_CONTROL_SELECTORS = [
   'button[aria-label*="Stop generating" i]',
   'button[aria-label*="Stop streaming" i]',
   // yz-91m: ChatGPT Pro's Stop button uses aria-label="Stop answering".
-  'button[aria-label*="Stop answering" i]'
+  'button[aria-label*="Stop answering" i]',
+  // yz-c1l: 2026-09-28 composer submit stop control is aria-label="Stop"
+  // with no data-testid (live run 20260929T065120Z_ec641a).
+  'button[aria-label="Stop" i]'
 ];
 
 export function isResponseGenerating(root = document) {
@@ -3695,12 +3855,24 @@ function composerContainsPrompt(composer, prompt) {
 function findUserTurns(root) {
   const explicitUserTurns = Array.from(root.querySelectorAll('[data-message-author-role="user"]'))
     .map((node) => node.closest?.('article, [data-testid*="conversation-turn"], [class*="user-turn"], [class*="turn-messages"]') ?? node);
-  return uniqueElements(explicitUserTurns)
+  // yz-c1l: 2026-09-28 conversation turns dropped data-message-author-role;
+  // the user bubble is marked data-user-message-bubble instead.
+  const bubbleUserTurns = Array.from(root.querySelectorAll('[data-user-message-bubble="true"]'))
+    .map((node) => node.closest?.('[data-turn-key], [data-content-search-turn-key], article, [data-testid*="conversation-turn"]') ?? node);
+  return uniqueElements([...explicitUserTurns, ...bubbleUserTurns])
     .filter((node) => isVisible(node, { allowDisabled: true, allowNoLayout: true }));
 }
 
 function findAssistantTurns(root) {
   const explicitAssistantTurns = Array.from(root.querySelectorAll('[data-message-author-role="assistant"]'))
+    .map((node) => assistantTurnForNode(node) ?? node);
+  // yz-c1l: 2026-09-28 dropped data-message-author-role; assistant turns are marked via
+  // data-conversation-role, data-markdown-text-style, and *:assistant unit keys.
+  const conversationRoleTurns = Array.from(root.querySelectorAll('[data-conversation-role="assistant"]'))
+    .map((node) => assistantTurnForNode(node) ?? node);
+  const markdownStyleTurns = Array.from(root.querySelectorAll('[data-markdown-text-style="assistant-message"]'))
+    .map((node) => assistantTurnForNode(node) ?? node);
+  const unitKeyTurns = findAssistantUnitContainers(root)
     .map((node) => assistantTurnForNode(node) ?? node);
   const markdownAssistantTurns = Array.from(root.querySelectorAll([
     '[data-testid*="assistant-message"]',
@@ -3712,16 +3884,60 @@ function findAssistantTurns(root) {
     .map((node) => assistantTurnForNode(node) ?? (isAssistantMarkerNode(node) ? node : null));
   const copyScopedTurns = Array.from(root.querySelectorAll('button[aria-label*="Copy"], button[data-testid*="copy"]'))
     .map((node) => assistantTurnForNode(node));
-  return uniqueElements([...explicitAssistantTurns, ...markdownAssistantTurns, ...copyScopedTurns])
+  return uniqueElements([
+    ...explicitAssistantTurns,
+    ...conversationRoleTurns,
+    ...markdownStyleTurns,
+    ...unitKeyTurns,
+    ...markdownAssistantTurns,
+    ...copyScopedTurns
+  ])
     .filter((node) => isVisible(node, { allowDisabled: true, allowNoLayout: true }));
+}
+
+function findAssistantUnitContainers(root) {
+  return Array.from(root.querySelectorAll("[data-content-search-unit-key], [data-chatgpt-search-unit-key]"))
+    .filter((node) => isAssistantUnitContainer(node));
+}
+
+function unitKeyValues(node) {
+  return [
+    node?.getAttribute?.("data-content-search-unit-key"),
+    node?.getAttribute?.("data-chatgpt-search-unit-key")
+  ].filter(Boolean).map(String);
+}
+
+function isAssistantUnitContainer(node) {
+  return unitKeyValues(node).some((key) => /:assistant$/i.test(key));
+}
+
+function isUserUnitContainer(node) {
+  return unitKeyValues(node).some((key) => /:user$/i.test(key));
 }
 
 function assistantTurnForNode(node) {
   if (!node) {
     return null;
   }
+  // Prefer the *:assistant search-unit wrapper over the combined data-turn-key that
+  // also contains the user bubble (2026-09-28 ChatGPT transcript).
+  for (let current = node; current; current = current.parentElement) {
+    if (isUserUnitContainer(current) || looksLikeUserTurn(current)) {
+      return null;
+    }
+    if (isAssistantUnitContainer(current)) {
+      return current;
+    }
+  }
   const explicit = node.closest?.('[data-message-author-role="assistant"]');
-  const turn = node.closest?.('article, [data-testid*="conversation-turn"], [class*="agent-turn"], [class*="turn-messages"]');
+  const conversationRole = node.closest?.('[data-conversation-role="assistant"]');
+  const turn = node.closest?.([
+    'article',
+    '[data-testid*="conversation-turn"]',
+    '[class*="agent-turn"]',
+    '[class*="turn-messages"]',
+    '[data-markdown-text-style="assistant-message"]'
+  ].join(", "));
   if (explicit && turn && !looksLikeUserTurn(turn)) {
     if (!hasUserRoleDescendant(turn)) {
       return turn;
@@ -3729,6 +3945,11 @@ function assistantTurnForNode(node) {
   }
   if (explicit) {
     return explicit;
+  }
+  if (conversationRole && !isInsideUserTurn(conversationRole)) {
+    return conversationRole.closest?.(
+      '[data-content-search-unit-key], [data-chatgpt-search-unit-key], article, [data-testid*="conversation-turn"], [class*="agent-turn"]'
+    ) ?? conversationRole;
   }
   if (!turn) {
     return isAssistantMarkerNode(node) ? node : null;
@@ -3747,7 +3968,7 @@ function assistantTurnForNode(node) {
   if (assistantDescendants.length > 0) {
     return turn;
   }
-  if (looksLikeUserTurn(turn)) {
+  if (looksLikeUserTurn(turn) || isInsideUserTurn(turn)) {
     return null;
   }
   return isCopyControl(node) || isAssistantMarkerNode(node) || isAssistantMarkdownInTurn(node, turn) ? turn : null;
@@ -4002,27 +4223,45 @@ function isAssistantMarkerNode(node) {
   if (role === "assistant") {
     return true;
   }
+  if (node?.getAttribute?.("data-conversation-role") === "assistant"
+      || node?.getAttribute?.("data-markdown-text-style") === "assistant-message"
+      || isAssistantUnitContainer(node)) {
+    return true;
+  }
   const testId = String(node?.getAttribute?.("data-testid") ?? "");
   return /assistant-(message|response)/i.test(testId);
 }
 
 function isAssistantMarkdownInTurn(node, turn) {
+  if (node?.getAttribute?.("data-markdown-text-style") === "assistant-message") {
+    return true;
+  }
   const marker = [
     node?.getAttribute?.("class"),
     turn?.getAttribute?.("class"),
     turn?.getAttribute?.("data-testid")
   ].filter(Boolean).join(" ");
-  return /\bmarkdown\b/i.test(marker)
+  return /markdown/i.test(marker)
     && (
       /\bagent-turn\b/i.test(marker)
       || /\bassistant\b/i.test(marker)
       || /\bconversation-turn\b/i.test(marker)
       || turn?.getAttribute?.("data-message-author-role") === "assistant"
+      || turn?.getAttribute?.("data-conversation-role") === "assistant"
+      || isAssistantUnitContainer(turn)
       || hasAssistantRoleDescendant(turn)
     );
 }
 
 function looksLikeUserTurn(turn) {
+  if (!turn) {
+    return false;
+  }
+  if (turn.getAttribute?.("data-conversation-role") === "user"
+      || turn.getAttribute?.("data-user-message-bubble") === "true"
+      || isUserUnitContainer(turn)) {
+    return true;
+  }
   const marker = [
     turn?.getAttribute?.("data-message-author-role"),
     turn?.getAttribute?.("class"),

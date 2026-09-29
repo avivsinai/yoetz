@@ -90,3 +90,10 @@ paths = [
     # unpacked/release extension id, not a credential.
     '''extensions/chatgpt-native/manifest\.json$''',
 ]
+# Historical false positives on this PR: fixture data-turn-key strings that
+# generic-api-key mistook for secrets (live UUID-shaped id + m13 label). Current
+# tree uses low-entropy fixture-turn-* keys; regexes cover intermediate commits.
+regexes = [
+    '''3df53795-b467-49ba-8b84-8c538fc572e7''',
+    '''m13-combined-turn''',
+]

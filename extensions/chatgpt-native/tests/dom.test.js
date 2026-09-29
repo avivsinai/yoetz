@@ -198,6 +198,15 @@ test("findAuthenticatedComposer rejects permissive editor fallbacks", () => {
   ]));
 
   assert.equal(findAuthenticatedComposer(chatgptRoot), chatgptComposer);
+
+  // yz-c1l: the 2026-09-28 composer dropped #prompt-textarea; the ProseMirror
+  // class qualifies the contenteditable textbox as the authenticated composer.
+  const prosemirrorComposer = visibleElement({ contenteditable: "true", role: "textbox", class: "ProseMirror" });
+  const prosemirrorRoot = selectorRoot(new Map([
+    ['div[contenteditable="true"][role="textbox"].ProseMirror', [prosemirrorComposer]]
+  ]));
+
+  assert.equal(findAuthenticatedComposer(prosemirrorRoot), prosemirrorComposer);
 });
 
 test("manualHandoffContext suppresses all page text when the strict composer is visible", () => {
