@@ -625,6 +625,8 @@ async function sendPrompt(job, prompt) {
           surface_work_state: finalModelSelection.surface_work_state ?? null,
           surface_visible_toggle_count: finalModelSelection.surface_visible_toggle_count ?? 0,
           surface_composer_aria: finalModelSelection.surface_composer_aria ?? null,
+          surface_observed_labels: finalModelSelection.surface_observed_labels ?? null,
+          surface_foreign_pressed: finalModelSelection.surface_foreign_pressed ?? null,
           picker_close_verification: finalModelSelection.picker_close_verification ?? null,
           click_bound: finalModelSelection.click_bound === true,
           click_bound_closed_pill_text: finalModelSelection.click_bound_closed_pill_text ?? null,

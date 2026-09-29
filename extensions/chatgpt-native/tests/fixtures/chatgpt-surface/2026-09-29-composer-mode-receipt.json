@@ -1,0 +1,25 @@
+{
+  "_provenance": {
+    "captured": "2026-09-29",
+    "source": "live chatgpt.com AppleScript DOM probe + content-script pack shape",
+    "run_ids": ["20260929T083741Z_d2d911"],
+    "notes": "Composer mode group: Chat aria-pressed=true, Work aria-pressed=false, aria_checked null, exactly two buttons. 197f58a failed live because content-script omitted surface_observed_labels and surface_foreign_pressed when packing final_model_selection."
+  },
+  "surface_evidence_seen": true,
+  "surface_proof_kind": "explicit_composer_mode_buttons",
+  "surface_chat_state": {
+    "aria_checked": null,
+    "aria_pressed": "true",
+    "data_state": null
+  },
+  "surface_work_state": {
+    "aria_checked": null,
+    "aria_pressed": "false",
+    "data_state": null
+  },
+  "surface_visible_toggle_count": 2,
+  "surface_composer_aria": null,
+  "surface_observed_values": [],
+  "surface_observed_labels": ["Chat", "Work"],
+  "surface_foreign_pressed": false
+}

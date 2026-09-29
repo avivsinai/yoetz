@@ -30,7 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `data-user-message-bubble` user turns so a real post-send generation is
   not reported as a false timeout. New live picker + stop-button fixtures;
   mutation-killing surface tests; inert-aware fake slider; surface-receipt
-  contract tests. `scripts/capture-chatgpt-picker.mjs` now bundles the
+  contract tests. Content-script send packing now forwards
+  `surface_observed_labels` / `surface_foreign_pressed` (197f58a live miss);
+  validators name the failing field and value. `scripts/capture-chatgpt-picker.mjs` now bundles the
   serializer's sanitizer import instead of crashing in-page with
   `ReferenceError: sanitizeCaptureClone is not defined`. (`yz-c1l`)
 
