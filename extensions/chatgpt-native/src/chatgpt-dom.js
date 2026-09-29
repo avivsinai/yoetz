@@ -1080,9 +1080,21 @@ function findChatSurfaceControls(root) {
     if (chats.length !== 1 || works.length !== 1) {
       return null;
     }
+    // Fail closed if the mode group grows a third pressed control the Chat/Work
+    // pair would otherwise ignore (ChatGPT Pro review of PR #562).
+    if (textLabels && modeGroupHasForeignPressedControl(group, chats[0], works[0])) {
+      return null;
+    }
     candidates.push({ group, chat: chats[0], work: works[0] });
   }
   return candidates.length === 1 ? candidates[0] : null;
+}
+
+function modeGroupHasForeignPressedControl(group, chat, work) {
+  return Array.from(group.querySelectorAll("button"))
+    .some((node) => node !== chat
+      && node !== work
+      && node.getAttribute?.("aria-pressed") === "true");
 }
 
 function surfaceToggleNodes(group, hookSelector, textLabel) {
@@ -2281,6 +2293,9 @@ async function moveEffortSliderToPro(root, initialRead, options = {}) {
   const settleMs = Number(options.actionSettleMs ?? 250);
   let r = initialRead;
   const slider = initialRead?.effort?.control ?? null;
+  if (effortControlIsInert(slider)) {
+    return { ok: false, read: r, method: null };
+  }
   const originalSnapshot = sliderEffortSnapshot(slider, initialRead?.surface);
   const attemptKey = async (key, method) => {
     if (r?.effort?.kind !== "slider" || !r.effort.control) return null;

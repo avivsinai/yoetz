@@ -4992,6 +4992,18 @@ test("yz-c1l: Composer mode surface on Work is clicked back to Chat and verified
   assert.equal(chat.getAttribute("aria-pressed"), "true");
 });
 
+test("yz-c1l: Composer mode group with a third pressed mode fails closed", () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { group } = appendChatSurfaceModeGroup(body);
+  group.append(new FakeElement("button", { "aria-pressed": "true" }, "Projects"));
+  const doc = new FakeDocument(body);
+
+  const result = verifyChatSurface(doc);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_reason, "chat_surface_control_not_found");
+});
+
 test("yz-c1l: Composer mode group without a Work button fails closed", () => {
   const body = new FakeElement("body", {}, "Ask ChatGPT");
   body.append(new FakeElement("div", { role: "group", "aria-label": "Composer mode" })
