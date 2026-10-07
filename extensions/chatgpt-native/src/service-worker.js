@@ -109,6 +109,14 @@ const TERMINAL_ACK_KEY_PREFIX = "terminal-ack.";
 const CANCEL_PENDING_KEY_PREFIX = "cancel-pending.";
 const MAX_TERMINAL_ID_CHARS = 512;
 const WAITING_RESPONSE_PROGRESS_INTERVAL_MS = Math.max(50, Number(globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS ?? 60000) || 60000);
+// yz-40u: upper bound on one content-script DOM round trip inside the response
+// wait loop. chrome.tabs.sendMessage has no timeout of its own: a frozen or
+// starved background renderer never runs its listener, so the await never
+// settles and the loop stops posting progress while the alarm-driven heartbeat
+// stays fresh. 20s is far above a healthy extraction (one synchronous DOM
+// read), and a stalled try plus the poll sleep (<= 30s) still fits inside the
+// 60s progress interval.
+const TAB_ROUND_TRIP_TIMEOUT_MS = Math.max(50, Number(globalThis.__YOETZ_TAB_ROUND_TRIP_TIMEOUT_MS ?? 20000) || 20000);
 // yz-y0p: upper bound on how long a native command may wait behind the
 // per-connection restore gate. A restore that pends forever (observed live: a
 // chrome.storage.local write stalling in the browser process while reads and
@@ -4108,6 +4116,25 @@ async function sendToTab(tabId, message) {
   return response.payload;
 }
 
+// yz-40u: sendToTab with an upper bound, for the response wait loop. Nothing
+// awaits the command after the bound fires, so a late answer is dropped, and
+// Promise.race has already attached a handler to a late rejection.
+async function sendToTabWithin(tabId, message, timeoutMs = TAB_ROUND_TRIP_TIMEOUT_MS) {
+  let timer = null;
+  const bound = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(commandError(
+      "tab_unresponsive",
+      `tab did not answer ${message?.type} within ${formatDurationForMessage(timeoutMs)}`,
+      { phase: "wait_response", side_effect_started: true, command: message?.type, timeout_ms: timeoutMs }
+    )), timeoutMs);
+  });
+  try {
+    return await Promise.race([sendToTab(tabId, message), bound]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function verifyTabOwnership(job) {
   if (!job?.tab_id) {
     return { owned: true, reason: "no_tab" };
@@ -4336,7 +4363,33 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
     if (cancellationIsPending(job)) {
       return null;
     }
-    const extraction = await extractResponseForJob(job);
+    let extraction;
+    try {
+      extraction = await extractResponseForJob(job);
+    } catch (error) {
+      if (error?.code !== "tab_unresponsive") {
+        throw error;
+      }
+      // yz-40u: a tab that does not answer is a missed sample, not a
+      // contradicting one: keep every finality candidate, say so on the
+      // wire, and poll again until the response deadline.
+      if (!jobContinuationIsLive(job, continuationEpoch)) {
+        return null;
+      }
+      assertJobConnectionCurrent(job);
+      const nowMs = Date.now();
+      postWaitingResponseProgress(job, last, {
+        elapsed_ms: nowMs - startedAt,
+        timeout_ms: timeoutMs,
+        next_poll_ms: interval,
+        tab_unresponsive: true,
+        tab_unresponsive_command: error.command ?? null,
+        tab_stall: `${error.message}; still waiting`
+      });
+      lastWaitingProgressAt = nowMs;
+      await sleep(interval);
+      continue;
+    }
     if (!jobContinuationIsLive(job, continuationEpoch)) {
       return null;
     }
@@ -4376,7 +4429,7 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
         await persistJob(job);
         let dismissResult = null;
         try {
-          dismissResult = await sendToTab(job.tab_id, {
+          dismissResult = await sendToTabWithin(job.tab_id, {
             type: "yoetz_dismiss_rate_limit_modal",
             job
           });
@@ -4399,7 +4452,7 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
             }
             await sleep(DISMISS_SETTLE_STEP_MS);
             try {
-              const state = await sendToTab(job.tab_id, {
+              const state = await sendToTabWithin(job.tab_id, {
                 type: "yoetz_rate_limit_modal_state",
                 job
               });
@@ -4880,10 +4933,11 @@ function postWaitingResponseProgress(job, extraction, detail = {}) {
   const scopedCopyStatus = extraction?.has_copy_button ? ", scoped_copy_button=true" : ", scoped_copy_button=false";
   const { generating, turnsSinceSend, interimAssistantTurn } = interimTurnState(job, extraction);
   const interimStatus = interimAssistantTurn ? `, interim assistant turn ${turnsSinceSend} (response not final)` : "";
+  const stallStatus = detail.tab_stall ? `; ${detail.tab_stall}` : "";
   postNative(progress(job, "waiting_response", {
     ...detail,
     inspect_command: detail.inspect_command ?? inspectCommandForJob(job),
-    message: `waiting for ${adapter.displayName} response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${scopedCopyStatus}${generating ? ", generating" : ""}${interimStatus}${finalityStatus})`,
+    message: `waiting for ${adapter.displayName} response (${formatDurationForMessage(elapsedMs)} elapsed of ${formatDurationForMessage(timeoutMs)} timeout; method=${extraction?.method ?? "none"}, assistant_count=${extraction?.assistant_count ?? 0}, copy_buttons=${extraction?.copy_button_count ?? 0}${scopedCopyStatus}${generating ? ", generating" : ""}${interimStatus}${finalityStatus}${stallStatus})`,
     extraction_method: extraction?.method ?? "none",
     response_in_progress: generating,
     interim_assistant_turn: interimAssistantTurn,
@@ -4969,7 +5023,7 @@ async function extractResponseForJob(job) {
 
 async function extractDomResponseForJob(job) {
   try {
-    const extraction = await sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
+    const extraction = await sendToTabWithin(job.tab_id, { type: "yoetz_extract_response", job });
     forgetSettledSuccessfulRecovery(job.job_id);
     return extraction;
   } catch (error) {
@@ -4980,7 +5034,7 @@ async function extractDomResponseForJob(job) {
       throw error;
     }
     await recoverContentScriptJob(job, error);
-    return sendToTab(job.tab_id, { type: "yoetz_extract_response", job });
+    return sendToTabWithin(job.tab_id, { type: "yoetz_extract_response", job });
   }
 }
 
@@ -5394,19 +5448,21 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
   // Bound the ENTIRE auth+conversation operation with ONE absolute deadline.
   // The deadline is passed to the content script, which creates a single
   // AbortController whose signal is passed to BOTH website fetches and stays
-  // active through both response-body reads. The SW no longer races a timer;
-  // it awaits actual command settlement and releases the lease in finally only
-  // after the content-script command has settled (yz-5bd blocker: HTTP abort).
+  // active through both response-body reads. The SW awaits command settlement
+  // and releases the lease in finally (yz-5bd blocker: HTTP abort). yz-40u: it
+  // stops waiting only at the lease expiry, after the content script's own
+  // abort deadline: a tab that has not answered by then is not running the
+  // command, and the persisted lease would be reclaimed at that point anyway.
   const operationDeadlineMs = Number(acquired.lease.acquired_at)
     + BACKEND_API_READ_LEASE_TTL_MS
     - BACKEND_API_READ_LEASE_SAFETY_MARGIN_MS;
   try {
-    const backendExtraction = await sendToTab(job.tab_id, {
+    const backendExtraction = await sendToTabWithin(job.tab_id, {
       type: "yoetz_fetch_conversation",
       job,
       conversation_id: conversationId,
       operation_deadline_ms: operationDeadlineMs
-    });
+    }, Math.max(0, operationDeadlineMs - Date.now()) + BACKEND_API_READ_LEASE_SAFETY_MARGIN_MS);
     const normalized = normalizeBackendApiExtraction(backendExtraction, domExtraction, conversationId);
     const fresh = completion.isFreshBackendApiExtraction(normalized);
     job.backend_api_consecutive_failures = 0;
@@ -5457,7 +5513,9 @@ async function maybeBackendApiExtractionForJob(job, domExtraction) {
     await persistJob(job);
     return normalized;
   } catch (error) {
-    if (!completion.isBackendApiFallbackError(error)) {
+    // yz-40u: an unresponsive tab says nothing about the backend anchor; the
+    // wait loop reports the stall and retries on the ordinary cadence.
+    if (error?.code === "tab_unresponsive" || !completion.isBackendApiFallbackError(error)) {
       throw error;
     }
     if (error?.code === "backend_api_throttled") {
