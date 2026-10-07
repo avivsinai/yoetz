@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - `browser extension doctor` now has a `bridge_heartbeat` check. It fails when
   the extension has not heartbeated for 90s, so doctor no longer reports all
   ok while `check` times out on reconnect. (`yz-40u`, gh-567)
+- ChatGPT native recipe waits out the extension's tab-pacing `min_gap` and
+  then starts, instead of exiting 1 with `tab_pacing_active` (bounded to 5
+  waits and the run's wait budget; `max_concurrent` and rate-limit refusals
+  still fail at once). (`yz-qth`)
 
 ## [0.5.80] - 2026-09-29
 ### Fixed
