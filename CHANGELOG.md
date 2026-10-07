@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 ### Fixed
+- chrome-extension-native: a CLI run under a custom `TMPDIR` (for example an
+  agent scratch directory) no longer rejects every live instance record as
+  non-canonical and reports `disconnected`. On macOS the per-instance socket
+  fallback directory now comes from the per-user Darwin temp dir, which does
+  not depend on `TMPDIR`, so the CLI and the Chrome-spawned host agree.
+  (`yz-omi`)
 - chrome-extension-native: a ChatGPT tab that stops answering during the
   response wait no longer silences the job until the CLI declares the extension
   wedged; each tab round trip is bounded (20s; the backend read at its lease
@@ -19,12 +25,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   then starts, instead of exiting 1 with `tab_pacing_active` (bounded to 5
   waits and the run's wait budget; `max_concurrent` and rate-limit refusals
   still fail at once). (`yz-qth`)
-- chrome-extension-native: a CLI run under a custom `TMPDIR` (for example an
-  agent scratch directory) no longer rejects every live instance record as
-  non-canonical and reports `disconnected`. On macOS the per-instance socket
-  fallback directory now comes from the per-user Darwin temp dir, which does
-  not depend on `TMPDIR`, so the CLI and the Chrome-spawned host agree.
-  (`yz-omi`)
 
 ## [0.5.80] - 2026-09-29
 ### Fixed
