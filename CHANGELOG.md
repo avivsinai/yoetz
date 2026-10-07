@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.81] - 2026-10-07
 ### Fixed
 - chrome-extension-native: a CLI run under a custom `TMPDIR` (for example an
   agent scratch directory) no longer rejects every live instance record as
@@ -31,6 +33,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   copy-button scope check counted as a new response, so the answer lost its own
   Copy button. A node inside the response is no longer a response boundary.
   (`yz-wf0`)
+
 
 ## [0.5.80] - 2026-09-29
 ### Fixed
