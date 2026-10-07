@@ -3989,7 +3989,41 @@ fn short_socket_path(state_dir: &Path) -> PathBuf {
 #[cfg(unix)]
 fn socket_fallback_dir(state_dir: &Path) -> PathBuf {
     let digest = socket_fallback_digest(state_dir);
-    env::temp_dir().join(format!("yoetz-cen-{}", &digest[..8]))
+    socket_fallback_root().join(format!("yoetz-cen-{}", &digest[..8]))
+}
+
+// The native host is spawned by Chrome with the login environment, while the
+// CLI may run under a caller-set TMPDIR (agent scratch dirs). Both sides must
+// derive the same fallback directory, or the CLI rejects every instance record
+// as non-canonical. On macOS the per-user Darwin temp dir is independent of
+// TMPDIR, so both sides agree.
+#[cfg(unix)]
+fn socket_fallback_root() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    if let Some(dir) = darwin_user_temp_dir() {
+        return dir;
+    }
+    env::temp_dir()
+}
+
+#[cfg(target_os = "macos")]
+#[allow(unsafe_code)]
+fn darwin_user_temp_dir() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = vec![0u8; 1024];
+    // SAFETY: confstr writes at most buf.len() bytes, NUL-terminated.
+    let len = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_TEMP_DIR,
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if len == 0 || len > buf.len() {
+        return None;
+    }
+    buf.truncate(len - 1);
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(&buf)))
 }
 
 #[cfg(unix)]
@@ -7684,6 +7718,21 @@ mod tests {
             .contains("private directory must not be a symlink"));
         assert!(target_socket.exists());
         fs::remove_file(&fallback_dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[serial]
+    fn socket_fallback_dir_ignores_caller_tmpdir() {
+        // Field 2026-10-07: a CLI run under an agent TMPDIR rejected both
+        // live instance records as non-canonical because the host (spawned
+        // by Chrome) bound its socket under the login temp dir.
+        let state = Path::new("/state");
+        let host_dir = socket_fallback_dir(state);
+        let dir = TempDir::new().unwrap();
+        let _tmp_guard = EnvGuard::set("TMPDIR", dir.path());
+
+        assert_eq!(socket_fallback_dir(state), host_dir);
     }
 
     #[test]
