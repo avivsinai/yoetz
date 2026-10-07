@@ -64,6 +64,11 @@ fn recipe_inactivity_cap(upload_timeout_ms: u64, send_timeout_ms: u64) -> Durati
         .saturating_add(RECIPE_READ_GRACE);
     RECIPE_INACTIVITY_TIMEOUT.max(longest_phase)
 }
+const TAB_PACING_MAX_WAITS: u32 = 5;
+#[cfg(not(test))]
+const TAB_PACING_WAIT_MARGIN: Duration = Duration::from_millis(500);
+#[cfg(test)]
+const TAB_PACING_WAIT_MARGIN: Duration = Duration::from_millis(5);
 const RECIPE_RECONNECT_WINDOW: Duration = Duration::from_secs(60);
 const RECIPE_RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const EXTENSION_RELOAD_VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -2676,23 +2681,30 @@ fn run_extension_recipe_with_reconnect(
     start_payload: Value,
 ) -> Result<ProtocolEnvelope> {
     let workspace_id = workspace_id()?;
-    let job_id = new_id("job");
-    let mut stream = connect_socket(&lease.instance.socket_path).with_context(|| {
-        format!(
-            "chrome-extension-native bridge is not connected at {}. Run `yoetz browser extension doctor --{}` then open Chrome with the Yoetz extension enabled.",
-            lease.instance.socket_path.display(),
-            recipe.as_str()
+    // yz-qth: the native host handles exactly one frame per local connection,
+    // so each (re)start of a job uses a fresh connection and job id.
+    let start_job = || -> Result<(String, SocketStream)> {
+        let job_id = new_id("job");
+        let mut stream = connect_socket(&lease.instance.socket_path).with_context(|| {
+            format!(
+                "chrome-extension-native bridge is not connected at {}. Run `yoetz browser extension doctor --{}` then open Chrome with the Yoetz extension enabled.",
+                lease.instance.socket_path.display(),
+                recipe.as_str()
+            )
+        })?;
+        let start = ProtocolEnvelope::new_with_workspace(
+            "job_start",
+            Some(job_id.clone()),
+            Some(run_id.to_string()),
+            Some(workspace_id.clone()),
+            start_payload.clone(),
         )
-    })?;
-    let start = ProtocolEnvelope::new_with_workspace(
-        "job_start",
-        Some(job_id.clone()),
-        Some(run_id.to_string()),
-        Some(workspace_id.clone()),
-        start_payload,
-    )
-    .with_token(token.to_string());
-    write_json_frame(&mut stream, &start).context("start chrome-extension-native recipe")?;
+        .with_token(token.to_string());
+        write_json_frame(&mut stream, &start).context("start chrome-extension-native recipe")?;
+        Ok((job_id, stream))
+    };
+    let (mut job_id, mut stream) = start_job()?;
+    let mut pacing_waits = 0;
 
     let started = Instant::now();
     let overall_budget = Duration::from_millis(wait_timeout_ms).saturating_add(RECIPE_READ_GRACE);
@@ -2715,6 +2727,21 @@ fn run_extension_recipe_with_reconnect(
                 validate_inbound_envelope(&envelope)?;
                 match envelope.kind.as_str() {
                     "job_progress" => emit_progress(format, &envelope)?,
+                    "job_error" if pacing_waits < TAB_PACING_MAX_WAITS => {
+                        let Some(wait) = tab_pacing_min_gap_wait(&envelope.payload) else {
+                            return Ok(envelope);
+                        };
+                        if started.elapsed().saturating_add(wait) >= overall_budget {
+                            return Ok(envelope);
+                        }
+                        pacing_waits += 1;
+                        eprintln!(
+                            "chrome-extension-native: tab pacing active (min_gap); waiting {:.1}s before opening a ChatGPT tab",
+                            wait.as_secs_f64()
+                        );
+                        thread::sleep(wait);
+                        (job_id, stream) = start_job()?;
+                    }
                     "job_complete" | "job_error" | "job_cancel" => return Ok(envelope),
                     other => {
                         if matches!(format, OutputFormat::Text | OutputFormat::Markdown) {
@@ -2759,6 +2786,20 @@ fn run_extension_recipe_with_reconnect(
             Err(error) => return Err(error).context("read chrome-extension-native recipe event"),
         }
     }
+}
+
+/// yz-qth: the extension refuses a new tab inside its pacing gap before any
+/// side effect. Only `min_gap` is worth waiting out; `max_concurrent` and every
+/// rate-limit code stay a hard stop for the caller.
+fn tab_pacing_min_gap_wait(payload: &Value) -> Option<Duration> {
+    if payload.get("code").and_then(Value::as_str) != Some("tab_pacing_active")
+        || payload.get("reason").and_then(Value::as_str) != Some("min_gap")
+        || payload.get("side_effect_started").and_then(Value::as_bool) == Some(true)
+    {
+        return None;
+    }
+    let wait_ms = payload.get("wait_remaining_ms").and_then(Value::as_u64)?;
+    Some(Duration::from_millis(wait_ms).saturating_add(TAB_PACING_WAIT_MARGIN))
 }
 
 fn reconnect_selector_for_instance(
@@ -4530,6 +4571,13 @@ fn job_error_message(payload: &Value) -> String {
         .unwrap_or("chrome-extension-native job failed")
         .to_string();
     let code = payload.get("code").and_then(Value::as_str).unwrap_or("");
+    if code == "tab_pacing_active"
+        && payload.get("reason").and_then(Value::as_str) == Some("max_concurrent")
+    {
+        message.push_str(
+            " The concurrent ChatGPT tab limit is reached; yoetz does not wait for it. Retry after a running job finishes.",
+        );
+    }
     let mut detail = Vec::new();
     if !code.starts_with("conversation_") {
         append_job_error_detail(payload, &message, &mut detail);
@@ -7049,6 +7097,108 @@ mod tests {
 
         server.join().unwrap();
         assert_eq!(result.response, "reconnected answer");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn recipe_waits_out_tab_pacing_min_gap_then_restarts_the_job() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let _state_guard = EnvGuard::set("YOETZ_DIR", dir.path());
+        let instances_dir = dir.path().join(INSTANCES_DIRNAME);
+        fs::create_dir_all(&instances_dir).unwrap();
+        let paths = ExtensionPaths {
+            state_dir: dir.path().to_path_buf(),
+            instances_dir,
+            manifest_path: dir.path().join("manifest.json"),
+            wrapper_path: dir.path().join("wrapper"),
+            socket_path: dir.path().join("native.sock"),
+            token_path: dir.path().join(TOKEN_FILENAME),
+            status_path: dir.path().join("status.json"),
+        };
+        let socket = dir.path().join("pacing.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            let start = read_json_frame(&mut first).unwrap();
+            let refusal = ProtocolEnvelope::new(
+                "job_error",
+                start.job_id.clone(),
+                start.run_id.clone(),
+                json!({
+                    "code": "tab_pacing_active",
+                    "message": "ChatGPT tab pacing is active (min_gap; 1 active job(s))",
+                    "phase": "profile",
+                    "side_effect_started": false,
+                    "reason": "min_gap",
+                    "wait_remaining_ms": 20,
+                    "active_jobs": 1
+                }),
+            );
+            write_json_frame(&mut first, &refusal).unwrap();
+            let (mut second, _) = listener.accept().unwrap();
+            let restart = read_json_frame(&mut second).unwrap();
+            assert_eq!(restart.kind, "job_start");
+            assert_ne!(restart.job_id, start.job_id);
+            let complete = ProtocolEnvelope::new(
+                "job_complete",
+                restart.job_id.clone(),
+                restart.run_id.clone(),
+                json!({"is_final": true}),
+            );
+            write_json_frame(&mut second, &complete).unwrap();
+        });
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.path().join("recipe.lock"))
+            .unwrap();
+        let lease = ExtensionRecipeLease {
+            _lifecycle_lock: ExtensionLifecycleLock { _file: lock_file },
+            paths,
+            instance: ExtensionInstanceStatus {
+                native_instance_id: "native_pacing".to_string(),
+                socket_path: socket,
+                pid: process::id(),
+                extension_instance_id: Some("ext_pacing".to_string()),
+                extension_version: None,
+                profile_email: None,
+                profile_id: None,
+                recipes: vec!["chatgpt".to_string()],
+                capabilities: vec![NATIVE_JOB_COMMANDS_CAPABILITY.to_string()],
+                protocol_version: PROTOCOL_VERSION,
+                last_seen_ms: 1,
+                cooldown_until_ms: None,
+            },
+            recipe: BuiltinWebRecipe::Chatgpt,
+        };
+        let bundle = BundleInfo {
+            path: PathBuf::from("bundle.md"),
+            file_name: "bundle.md".to_string(),
+            size: 1,
+            mime: "text/markdown".to_string(),
+        };
+
+        let envelope = run_extension_recipe_with_reconnect(
+            OutputFormat::Json,
+            &lease,
+            ExtensionInstanceSelector::default(),
+            BuiltinWebRecipe::Chatgpt,
+            "run_pacing",
+            2_000,
+            Duration::from_secs(2),
+            &bundle,
+            "token",
+            json!({}),
+        )
+        .unwrap();
+
+        assert_eq!(envelope.kind, "job_complete");
+        server.join().unwrap();
     }
 
     #[test]
