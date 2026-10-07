@@ -3899,7 +3899,7 @@ test("service worker keeps reporting when the tab stops answering the response e
     port,
     tabs: {
       create: async (opts) => ({ id: ++tabId, ...opts }),
-      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/", frozen: sent }),
       sendMessage: async (_id, message) => {
         switch (message.type) {
           case "yoetz_probe":
@@ -3957,7 +3957,8 @@ test("service worker keeps reporting when the tab stops answering the response e
       && message.payload.phase === "waiting_response"
       && message.payload.tab_unresponsive === true);
     assert.ok(stalled, "a stalled extraction must still post waiting_response progress");
-    assert.match(stalled.payload.message, /tab did not answer yoetz_extract_response within/);
+    assert.match(stalled.payload.message, /tab did not answer yoetz_extract_response within .* \(tab frozen=true\)/);
+    assert.equal(stalled.payload.tab_frozen, true);
     const error = port.messages.find((message) => message.type === "job_error");
     assert.equal(error?.payload?.code, "response_timeout");
   } finally {

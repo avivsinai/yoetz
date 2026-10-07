@@ -4135,6 +4135,23 @@ async function sendToTabWithin(tabId, message, timeoutMs = TAB_ROUND_TRIP_TIMEOU
   }
 }
 
+// yz-40u: best-effort tab state for a stall report, so the progress line says
+// whether Chrome froze or discarded the background tab (Tab.frozen, Chrome 132+).
+// Bounded like the round trip itself; any failure reads as unknown.
+async function tabStateForStall(tabId, timeoutMs = 2000) {
+  let timer = null;
+  const bound = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(null), timeoutMs);
+  });
+  try {
+    return await Promise.race([chrome.tabs.get(tabId), bound]);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function verifyTabOwnership(job) {
   if (!job?.tab_id) {
     return { owned: true, reason: "no_tab" };
@@ -4376,6 +4393,10 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
       if (!jobContinuationIsLive(job, continuationEpoch)) {
         return null;
       }
+      const tab = await tabStateForStall(job.tab_id);
+      if (!jobContinuationIsLive(job, continuationEpoch)) {
+        return null;
+      }
       assertJobConnectionCurrent(job);
       const nowMs = Date.now();
       postWaitingResponseProgress(job, last, {
@@ -4384,7 +4405,10 @@ async function waitForResponse(job, continuationEpoch = job?.continuation_epoch)
         next_poll_ms: interval,
         tab_unresponsive: true,
         tab_unresponsive_command: error.command ?? null,
-        tab_stall: `${error.message}; still waiting`
+        tab_frozen: tab?.frozen ?? null,
+        tab_discarded: tab?.discarded ?? null,
+        tab_status: tab?.status ?? null,
+        tab_stall: `${error.message}${tab?.frozen === true ? " (tab frozen=true)" : ""}; still waiting`
       });
       lastWaitingProgressAt = nowMs;
       await sleep(interval);
