@@ -2657,7 +2657,7 @@ export function extractResponse(root = document) {
       assistant_count: assistantTurns.length,
       user_count: userTurns.length,
       preceding_user_count: precedingTurnCount(root, latestAssistant, userTurns),
-      copy_button_count: copyButtonCount,
+      copy_button_count: Math.max(copyButtonCount, latestTurnHasCopyButton ? 1 : 0),
       has_copy_button: latestTurnHasCopyButton,
       turn_index: turnIndex,
       model_slug: messageModelSlug(latestAssistant ?? latestTextEntry?.node),
@@ -2874,8 +2874,15 @@ function isScopedResponseCopyButton(root, button, latestUser, conversation, scop
 }
 
 function hasResponseBoundaryBetween(ordered, startIndex, endIndex) {
+  const start = ordered[startIndex];
   for (let index = startIndex + 1; index < endIndex; index += 1) {
     const node = ordered[index];
+    // yz-wf0: a node inside the start node is part of that response, never a
+    // boundary. 2026-10-07 inline code renders as InlineMarkdownIsolate-* spans
+    // that match isMarkdownNode and orphaned the answer's own Copy button.
+    if (containsNode(start, node)) {
+      continue;
+    }
     const role = node?.getAttribute?.("data-message-author-role");
     if (role === "user" || role === "assistant") {
       return true;

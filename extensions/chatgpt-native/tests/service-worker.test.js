@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { uint8ArrayToBase64 } from "../src/chunks.js";
 
-const TEST_CONTENT_SCRIPT_BUILD = "0.5.80";
+const TEST_CONTENT_SCRIPT_BUILD = "0.5.81";
 
 globalThis.__YOETZ_MIN_STABLE_IDLE_MS = 100;
 globalThis.__YOETZ_STABLE_IDLE_INTERVAL_MULTIPLIER = 0;
@@ -3881,6 +3881,92 @@ test("service worker emits low-noise waiting progress while ChatGPT is quiet", a
       delete globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS;
     } else {
       globalThis.__YOETZ_WAITING_RESPONSE_PROGRESS_INTERVAL_MS = previousWaitingProgressInterval;
+    }
+  }
+});
+
+// yz-40u (gh-567): a frozen background tab never answered the wait-loop
+// extraction, so the loop went silent for 185 s with a fresh heartbeat and the
+// CLI declared the extension wedged. The loop must keep reporting and end typed.
+test("service worker keeps reporting when the tab stops answering the response extraction", async () => {
+  const originalChrome = globalThis.chrome;
+  const previousTabTimeout = globalThis.__YOETZ_TAB_ROUND_TRIP_TIMEOUT_MS;
+  globalThis.__YOETZ_TAB_ROUND_TRIP_TIMEOUT_MS = 100;
+  const port = makePort();
+  let tabId = 0;
+  let sent = false;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/", frozen: sent }),
+      sendMessage: async (_id, message) => {
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedLatestProSelection() };
+          case "yoetz_upload_file":
+            return {
+              ok: true,
+              payload: {
+                filename: message.file.filename,
+                size: 4,
+                upload_commit_signal: "empty_composer_variant"
+              }
+            };
+          case "yoetz_send_prompt":
+            sent = true;
+            return { ok: true, payload: { sent: true, conversation_id: "conv-tab-stall" } };
+          case "yoetz_extract_response":
+            if (sent) {
+              return new Promise(() => {});
+            }
+            return {
+              ok: true,
+              payload: { method: "none", text: "", is_generating: false, assistant_count: 0, copy_button_count: 0, has_copy_button: false, turn_index: -1 }
+            };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?tab_stall=${Date.now()}`);
+    port.emit(envelope("job_start", "job_tab_stall", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1200
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_tab_stall", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 4,
+      filename: "job_tab_stall.md",
+      mime_type: "text/markdown",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("body"))
+    }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_error"), 3000).catch(() => {});
+    const stalled = port.messages.find((message) => message.type === "job_progress"
+      && message.payload.phase === "waiting_response"
+      && message.payload.tab_unresponsive === true);
+    assert.ok(stalled, "a stalled extraction must still post waiting_response progress");
+    assert.match(stalled.payload.message, /tab did not answer yoetz_extract_response within .* \(tab frozen=true\)/);
+    assert.equal(stalled.payload.tab_frozen, true);
+    const error = port.messages.find((message) => message.type === "job_error");
+    assert.equal(error?.payload?.code, "response_timeout");
+  } finally {
+    globalThis.chrome = originalChrome;
+    if (previousTabTimeout === undefined) {
+      delete globalThis.__YOETZ_TAB_ROUND_TRIP_TIMEOUT_MS;
+    } else {
+      globalThis.__YOETZ_TAB_ROUND_TRIP_TIMEOUT_MS = previousTabTimeout;
     }
   }
 });
