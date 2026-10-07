@@ -25,6 +25,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   then starts, instead of exiting 1 with `tab_pacing_active` (bounded to 5
   waits and the run's wait budget; `max_concurrent` and rate-limit refusals
   still fail at once). (`yz-qth`)
+- ChatGPT native finality: a finished answer that contains inline code no
+  longer times out "waiting for final assistant controls". The 2026-10-07
+  transcript renders inline code as `InlineMarkdownIsolate-*` spans, which the
+  copy-button scope check counted as a new response, so the answer lost its own
+  Copy button. A node inside the response is no longer a response boundary.
+  (`yz-wf0`)
 
 ## [0.5.80] - 2026-09-29
 ### Fixed
