@@ -1827,6 +1827,7 @@ pub fn doctor() -> Result<DoctorReport> {
                 observed_extension_profiles(&connected_instances)
             },
         },
+        bridge_heartbeat_doctor_check(status_value.as_ref()),
         DoctorCheck {
             name: "extension_hello",
             ok: extension_protocol.is_some(),
@@ -2954,6 +2955,44 @@ fn is_socket_timeout(error: &anyhow::Error) -> bool {
             Some(io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut)
         )
     })
+}
+
+// yz-40u (gh-567): a live host process with a reachable socket says nothing
+// about the extension side. The service worker heartbeats every 30s, so three
+// missed periods mean the bridge is down even when every other check is ok.
+const BRIDGE_HEARTBEAT_STALE_AFTER_MS: u64 = 90_000;
+
+fn bridge_heartbeat_doctor_check(status_value: Option<&Value>) -> DoctorCheck {
+    let last_heartbeat_ms = status_value
+        .and_then(|status| status.get("last_heartbeat_ms"))
+        .and_then(Value::as_u64);
+    let Some(last_heartbeat_ms) = last_heartbeat_ms else {
+        return DoctorCheck {
+            name: "bridge_heartbeat",
+            ok: false,
+            detail:
+                "no bridge heartbeat recorded; the extension posts one every 30s once connected"
+                    .to_string(),
+        };
+    };
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let age_ms = now_ms.saturating_sub(last_heartbeat_ms);
+    let ok = age_ms <= BRIDGE_HEARTBEAT_STALE_AFTER_MS;
+    DoctorCheck {
+        name: "bridge_heartbeat",
+        ok,
+        detail: if ok {
+            format!("last heartbeat {}s ago", age_ms / 1000)
+        } else {
+            format!(
+                "last heartbeat {}s ago; the extension side is not running. Reload the Yoetz extension in chrome://extensions (toggle off/on) or restart Chrome",
+                age_ms / 1000
+            )
+        },
+    }
 }
 
 // yz-y0p: the extension can wedge its command channel (a stuck chrome.storage
@@ -7960,6 +7999,18 @@ mod tests {
             .unwrap();
         assert!(!extension_hello.ok);
         assert_eq!(extension_hello.detail, "no extension hello observed");
+    }
+
+    #[test]
+    fn doctor_flags_a_stale_bridge_heartbeat() {
+        // gh-567: doctor said all ok while `check` timed out on reconnect.
+        let stale = json!({ "last_heartbeat_ms": 1_000 });
+
+        let check = bridge_heartbeat_doctor_check(Some(&stale));
+
+        assert_eq!(check.name, "bridge_heartbeat");
+        assert!(!check.ok);
+        assert!(check.detail.contains("not running"), "{}", check.detail);
     }
 
     #[test]
