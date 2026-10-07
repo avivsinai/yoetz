@@ -24,6 +24,8 @@ import {
 } from "../src/chatgpt-dom.js";
 import { chatgptSiteAdapter } from "../src/sites/chatgpt.js";
 import { claudeSiteAdapter } from "../src/sites/claude.js";
+import { JSDOM } from "jsdom";
+import { readFileSync } from "node:fs";
 
 test("ownedWindowName round trips run and job ids", () => {
   const job = { run_id: "run_abc", job_id: "job_xyz" };
@@ -1062,4 +1064,22 @@ test("yz-5bc: isContentPolicyFlagged returns true for policy-flag text", () => {
   const normalNode = visibleElement({});
   normalNode.textContent = "Here is the answer to your question.";
   assert.equal(isContentPolicyFlagged(normalNode), false);
+});
+
+// yz-wf0: live capture 2026-10-07 (run 20261007T130518Z_0f17f6). The answer's
+// inline code renders as an InlineMarkdownIsolate-* span; the boundary scan
+// counted it as a new response and orphaned the answer's own Copy button, so a
+// finished answer timed out "waiting for final assistant controls".
+test("yz-wf0: finished answer with inline code keeps its Copy button", () => {
+  const html = readFileSync(
+    new URL("./fixtures/chatgpt-conversation/2026-10-07-turn-key-finished-answer.html", import.meta.url),
+    "utf8"
+  );
+  const extraction = extractResponse(new JSDOM(`<!doctype html><body>${html}`).window.document);
+
+  assert.equal(extraction.method, "copy_scope_dom_fallback");
+  assert.equal(extraction.has_copy_button, true);
+  assert.equal(extraction.is_generating, false);
+  assert.match(extraction.text, /^safe to merge\./);
+  assert.ok(chatgptSiteAdapter.completion.hasFinalAssistantAffordance(extraction));
 });
