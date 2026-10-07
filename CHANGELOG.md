@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- chrome-extension-native: a ChatGPT tab that stops answering during the
+  response wait no longer silences the job until the CLI declares the extension
+  wedged; each tab round trip is bounded (20s; the backend read at its lease
+  expiry), the stall is reported as `waiting_response` progress, and polling
+  continues to the response deadline. (`yz-40u`, gh-567)
+- `browser extension doctor` now has a `bridge_heartbeat` check. It fails when
+  the extension has not heartbeated for 90s, so doctor no longer reports all
+  ok while `check` times out on reconnect. (`yz-40u`, gh-567)
 
 ## [0.5.80] - 2026-09-29
 ### Fixed
