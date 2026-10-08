@@ -2795,6 +2795,23 @@ for (const testCase of [
   });
 }
 
+// yz-oke live 2026-10-08 (run 20261008T064017Z_7c31ff): a fresh chat labels
+// the target family radio "GPT-6"; every leg verified, but model_used came
+// out "GPT-6 Pro" and the send-time proof gate (model_used === "Latest Pro")
+// refused the verified selection.
+test("ChatGPT model selection reports Latest Pro when the family radio reads GPT-6", async () => {
+  const fixture = makeLatestPickerFixture({
+    family: "GPT-6",
+    effort: "Pro",
+    families: ["GPT-6", "GPT-5.6 Sol", "GPT-5.5"]
+  });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "Latest Pro");
+});
+
 test("ChatGPT model selection accepts an absent surface toggle only with Chat composer proof", async () => {
   const fixture = makeLatestPickerFixture({
     family: "Latest",
@@ -4585,7 +4602,8 @@ function makeLatestPickerFixture({
     const pillEffort = currentEffort === "Pro Extended" ? "Pro" : currentEffort;
     // Live probe 2026-09-05: the Latest pin shows a "6 Pro" pill (generation
     // number + effort, no family token — corroborates effort only).
-    const label = currentFamily === "GPT-5.6 Sol" ? pillEffort
+    // Live 2026-10-08: the fresh-chat "GPT-6" family shows a bare "Pro" pill.
+    const label = currentFamily === "GPT-5.6 Sol" || currentFamily === "GPT-6" ? pillEffort
       : currentFamily === "Latest" ? `6\n${pillEffort}`
       : `5.5\n${pillEffort}`;
     const displayedLabel = pillLabelAfterSelection && currentEffort === "Pro"

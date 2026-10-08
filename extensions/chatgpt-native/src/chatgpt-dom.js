@@ -1745,7 +1745,9 @@ async function selectLatestChatProModel(root, options = {}) {
 
   return {
     status: "selected",
-    model_used: `${normalizeText(r.family.label)} ${verifiedEffortLabel}`,
+    // yz-oke: the target family reads "Latest" or "GPT-6" depending on the
+    // page; report the canonical target name (family_label keeps the raw one).
+    model_used: `${familyIsLatest(r.family.label) ? "Latest" : normalizeText(r.family.label)} ${verifiedEffortLabel}`,
     failure_reason: null,
     family_status: familyStatus,
     effort_status: combinedVerificationStatus(pickerEffortStatus, closedPill.closed_pill_effort_status),
