@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.85] - 2026-10-08
 ### Fixed
 - ChatGPT native finality after a long Pro think: the "Our systems are
   thinking a bit more..." interstitial stays mounted in a `role="status"`
@@ -13,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   check counted it as a new response. The finished answer then waited for final
   controls until the timeout. Status-region text is no longer a response
   boundary. (`yz-wf0`)
+
 
 ## [0.5.84] - 2026-10-08
 ### Fixed
