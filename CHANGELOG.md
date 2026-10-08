@@ -6,12 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.84] - 2026-10-08
 ### Fixed
 - ChatGPT upload drift (2026-10-08): a repeat upload is now renamed with a
   timestamp (`bundle(20261008-080525).md`) and shown as a
   `span.group/composer-attachment` tile, so the upload attached but yoetz
   reported `attached=false` and failed the run. The filename match accepts the
   timestamp suffix and the tile finder recognizes the new tile. (`yz-oke`)
+
 
 ## [0.5.83] - 2026-10-08
 ### Fixed
