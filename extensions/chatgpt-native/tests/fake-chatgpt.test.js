@@ -2410,6 +2410,39 @@ test("uploadFile accepts ChatGPT deduped attachment filenames", async () => {
   }
 });
 
+// Live 2026-10-08 (runs 20261008T080445Z_71232f, 20261008T080449Z_8e577c): the
+// upload attached, but ChatGPT renamed the repeat upload with a timestamp and
+// mounted it as a span.group/composer-attachment tile, so uploadFile reported
+// attached=false with attachment_tiles=[].
+test("uploadFile accepts ChatGPT timestamp-renamed attachment tiles", async () => {
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
+    const send = new FakeElement("button", { "aria-label": "Send message" }, "Send");
+    const upload = new FakeElement("input", {
+      type: "file",
+      accept: "text/markdown",
+      style: "display:none",
+      onChange: () => composer.parentElement.append(
+        new FakeElement("span", { class: "group/composer-attachment relative block" }, "bundle(20261008-080525).md")
+          .append(new FakeElement("button", { "aria-label": "Remove bundle(20261008-080525).md" }))
+      )
+    });
+    const body = new FakeElement("body", {}, "Message ChatGPT").append(composer, upload, send);
+    const doc = new FakeDocument(body);
+
+    await uploadFile(doc, new File(["bundle"], "bundle.md", { type: "text/markdown" }), {
+      timeoutMs: 250,
+      intervalMs: 10
+    });
+
+    assert.equal(upload.files[0].name, "bundle.md");
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
 test("uploadFile accepts one new attachment tile when ChatGPT hides the filename", async () => {
   const previousDataTransfer = globalThis.DataTransfer;
   globalThis.DataTransfer = FakeDataTransfer;
