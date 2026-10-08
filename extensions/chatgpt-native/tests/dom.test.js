@@ -1083,3 +1083,21 @@ test("yz-wf0: finished answer with inline code keeps its Copy button", () => {
   assert.match(extraction.text, /^safe to merge\./);
   assert.ok(chatgptSiteAdapter.completion.hasFinalAssistantAffordance(extraction));
 });
+
+// Live 2026-10-08 (run 20261008T084708Z_f87895, v0.5.84): a long Pro think left
+// its "Our systems are thinking..." interstitial mounted in a role="status"
+// live region between the finished answer and its Copy button. The boundary
+// scan counted that status MarkdownRoot as a new response, so the finished
+// answer waited for final controls until the timeout.
+test("finished answer keeps its Copy button past a role=status interstitial", () => {
+  const html = readFileSync(
+    new URL("./fixtures/chatgpt-conversation/2026-10-08-status-interstitial-finished-answer.html", import.meta.url),
+    "utf8"
+  );
+  const extraction = extractResponse(new JSDOM(`<!doctype html><body>${html}`).window.document);
+
+  assert.equal(extraction.has_copy_button, true);
+  assert.equal(extraction.is_generating, false);
+  assert.match(extraction.text, /^Blocking: two credential-preview bypasses/);
+  assert.ok(chatgptSiteAdapter.completion.hasFinalAssistantAffordance(extraction));
+});
