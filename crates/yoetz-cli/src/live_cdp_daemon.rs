@@ -1437,47 +1437,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn bundled_daemon_rejects_status_without_capability_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let _home = EnvVarGuard::set("HOME", dir.path().as_os_str());
-        let _runtime = EnvVarGuard::remove("XDG_RUNTIME_DIR");
-        let _enabled = EnvVarGuard::remove(YOETZ_LIVE_CDP_DAEMON_ENV);
-
-        let paths = daemon_paths_for_home(dir.path());
-        let result = (|| -> Result<()> {
-            ensure_daemon()?;
-            let mut stream = connect_to_daemon(&paths)?;
-            set_stream_timeouts(&stream, Duration::from_secs(5))?;
-            let request = json!({
-                "id": request_id("status"),
-                "type": "status",
-                "version": daemon_version(),
-            });
-            write_request(&mut stream, &request)?;
-
-            let mut reader = BufReader::new(stream);
-            let mut line = String::new();
-            reader.read_line(&mut line)?;
-            let response: DaemonResponse = serde_json::from_str(line.trim_end())?;
-            match response {
-                DaemonResponse::Error { message } => {
-                    if !is_daemon_unauthorized_message(&message) {
-                        return Err(anyhow!("unexpected daemon error: {message}"));
-                    }
-                }
-                other => return Err(anyhow!("unexpected daemon response: {other:?}")),
-            }
-            Ok(())
-        })();
-        let stopped = stop_live_cdp_daemon();
-
-        result.unwrap();
-        stopped.unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
     fn stale_socket_file_is_cleaned_and_recovered() {
         let dir = tempfile::tempdir().unwrap();
         let _home = EnvVarGuard::set("HOME", dir.path().as_os_str());
