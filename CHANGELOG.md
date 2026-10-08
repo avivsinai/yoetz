@@ -6,11 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.82] - 2026-10-08
 ### Fixed
 - ChatGPT recipe drift (2026-10-08): on a fresh chat the picker labels the
   GPT-6 Chat family radio `GPT-6` instead of `Latest`, so every run failed
   closed with `model_family_not_found`. The reader now accepts both exact
   labels as the target family; Sol is still refused. (`yz-oke`)
+
 
 ## [0.5.81] - 2026-10-07
 ### Fixed
