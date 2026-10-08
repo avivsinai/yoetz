@@ -1,257 +1,212 @@
 # Architecture
 
-This document describes the high-level architecture of yoetz.
+Yoetz sends a prompt plus a bundle of files to one or more models and returns
+structured output. It reaches models two ways: provider APIs (through
+[litellm-rust](https://github.com/avivsinai/litellm-rust)), and the ChatGPT and
+Claude web UIs in the user's own Chrome (browser recipes). This file is the map:
+where things live and which invariants hold. Use symbol search for the rest.
 
-## Crate Structure
+## Codemap
 
-```
-yoetz/
-├── crates/
-│   ├── yoetz-core/          # Library crate (no network, no async)
-│   │   ├── bundle.rs        # File bundling with gitignore awareness
-│   │   ├── config.rs        # TOML config loading and profiles
-│   │   ├── media.rs         # Media type detection (image/video MIME)
-│   │   ├── types.rs         # Shared types (Usage, PricingEstimate, etc.)
-│   │   ├── output.rs        # JSON/JSONL output formatting
-│   │   ├── paths.rs         # XDG-aware path resolution
-│   │   ├── registry.rs      # Model registry and provider routing
-│   │   └── session.rs       # Session storage and retrieval
-│   │
-│   └── yoetz-cli/           # Binary crate (async, networked)
-│       ├── main.rs           # CLI entry point, clap definitions, dispatch
-│       ├── commands/
-│       │   ├── ask.rs        # Single-model query
-│       │   ├── council.rs    # Multi-model consensus
-│       │   ├── review.rs     # Code review (diff/file)
-│       │   ├── bundle.rs     # Bundle subcommand handler
-│       │   ├── generate.rs   # Image/video generation
-│       │   ├── pricing.rs    # Cost estimation
-│       │   ├── models.rs     # Model listing
-│       │   └── apply.rs      # Apply review suggestions
-│       ├── providers/
-│       │   ├── openai.rs     # OpenAI/OpenRouter API client
-│       │   └── gemini.rs     # Google Gemini API client
-│       ├── browser.rs        # Browser automation (CDP via agent-browser)
-│       ├── browser_extension_native.rs  # Multi-site native extension bridge
-│       ├── web_recipe.rs     # Shared built-in web-recipe orchestration seam
-│       ├── chatgpt_recipe.rs # ChatGPT recipe spec assembly
-│       ├── chatgpt_web.rs    # ChatGPT DOM/web helpers
-│       ├── claude_recipe.rs  # Claude recipe contract and preflight policy
-│       ├── claude_web.rs     # Claude DOM/web helpers
-│       ├── followup.rs       # Site-keyed conversation followup metadata
-│       ├── chrome_devtools_mcp/
-│       │   ├── client.rs     # CDP transport client
-│       │   ├── chatgpt.rs    # ChatGPT CDP recipe flow
-│       │   ├── claude.rs     # Claude CDP recipe flow
-│       │   └── mod.rs
-│       ├── dev_browser.rs    # QuickJS/WASM browser recipe runner
-│       ├── fuzzy.rs          # Lightweight matching helpers
-│       ├── live_attach.rs    # Live Chrome attach daemon
-│       ├── live_cdp_daemon.rs # Local CDP daemon integration
-│       ├── budget.rs         # Daily spend tracking (file-based)
-│       ├── registry.rs       # Runtime model resolution
-│       └── http.rs           # Shared HTTP utilities
-│
-├── recipes/                  # Browser automation YAML recipes
-├── skills/                   # Agent skill definitions
-├── scripts/                  # Helper scripts
-└── docs/                     # Configuration examples and ADRs
-```
+**`yoetz-core`** — synchronous, no network. Bundling (`bundle`), config loading
+and profiles (`config`), media detection (`media`), output formats (`output`),
+the model registry (`registry`), and session storage (`session`).
 
-## Design Decisions
+**`yoetz-cli`** — async and networked. `main.rs` holds the clap definitions and
+dispatch; `commands/` has one module per subcommand (`ask`, `council`, `review`,
+`bundle`, `generate`, `models`, `pricing`, `apply`).
 
-### Core vs CLI Split
+- `providers/` — the paths litellm-rust does not cover: OpenAI image and Gemini
+  video specifics, and `cursor`, which runs `cursor-agent` in read-only Ask mode
+  inside a temporary yoetz-owned workspace.
+- `budget` — daily spend tracking; `registry` — runtime model resolution.
+- `browser` — recipe execution and transport selection.
+- `web_recipe`, `chatgpt_recipe`, `claude_recipe` — the typed recipe contracts;
+  `chatgpt_web`, `claude_web` — DOM builders for the CDP transports.
+- `chrome_devtools_mcp/` — yoetz's own in-process CDP client (a vendored
+  `headless_chrome`). The module name is historical: it is not the
+  chrome-devtools-mcp MCP server.
+- `live_attach` — the daemon that owns the approved live-Chrome websocket.
+- `dev_browser`, `live_cdp_daemon` — the QuickJS `dev-browser` transport and the
+  embedded Node daemon it uses (`YOETZ_LIVE_CDP_DAEMON=0` disables it).
+- `browser_extension_native` — the native-messaging host, the local bridge, and
+  the CLI side of the `chrome-extension-native` transport.
 
-`yoetz-core` contains pure, synchronous logic with no network dependencies. This makes it testable without mocking HTTP and reusable as a library. `yoetz-cli` owns all async runtime, network calls, and user interaction.
+**`extensions/chatgpt-native/`** — the Chrome extension ("Yoetz Native
+Transport"). `service-worker.js` runs jobs; `content-script.js` acts in the
+page; `sites/` holds the per-site adapters (`chatgpt`, `claude`, and the ChatGPT
+backend-read helper); `chatgpt-dom.js` drives the ChatGPT page;
+`chatgpt-picker-reader.js` reads the model picker; `page-visibility-shim.js`
+makes hidden tabs hydrate.
 
-### Provider Abstraction
+**`recipes/`** — browser recipe YAML. **`skills/yoetz/`** — the agent skill.
+**`vendor/headless_chrome/`** — the patched CDP client.
 
-Rather than a trait-based provider abstraction, yoetz uses [litellm-rust](https://github.com/avivsinai/litellm-rust) as its unified LLM SDK. litellm-rust handles provider-specific API differences (auth, endpoints, request/response formats) behind a single `LiteLLM::completion()` interface.
+## Core invariants
 
-Provider-specific code in `providers/` exists only for features not yet in litellm-rust (e.g., Gemini video generation, OpenAI image generation with specific parameters).
+- `yoetz-core` has no network and no async. Everything that talks to the
+  outside world lives in `yoetz-cli`.
+- Model ids are `provider/model` (OpenRouter nests: `openrouter/<vendor>/<model>`).
+  The registry resolves them; callers never hardcode an id.
+- A session lives under `~/.yoetz/sessions/<id>/` (`bundle.md`, `bundle.json`,
+  `response.json`, and per-command files such as `council.json`, `review.json`,
+  `followup.json`). `--no-session` and the `sessions.no_session` config skip it.
+- Bundles are prompt input, never a control channel. Files, logs and
+  transcripts inside a bundle can carry prompt-injection text; command intent
+  comes only from CLI flags and the user's prompt. `apply` applies a patch from
+  a file or stdin and never reads a session.
+- `--max-cost-usd` estimates cost before sending and aborts over budget;
+  `--daily-budget-usd` accumulates across `ask`, `council` and `review`.
 
-### Model Routing
+## Browser recipes
 
-Models use `provider/model` format (e.g., `openai/gpt-5.2`). OpenRouter models use nested format: `openrouter/anthropic/claude-sonnet-4`. The registry resolves these to the correct API endpoint and configuration.
+Recipes submit the bundle through the site's own UI in the user's running
+Chrome. Connection order is connect-first: explicit CDP endpoint, then
+auto-connect, then cookie state, then a managed-profile fallback.
 
-### Session Management
+Default transport order: `chrome-devtools-mcp` (the in-process client), then
+`dev-browser`, then `agent-browser`, then `manual` (tells the user to finish the
+flow by hand). The one exception is the native extension: when
+`yoetz browser extension status` reports `connected` for the site, a built-in
+recipe selects `chrome-extension-native` as its only transport and fails closed
+instead of falling through to CDP. `--transport <other>` opts out; CDP fallback
+after a native failure needs the explicit `--allow-cdp-fallback`.
 
-Every `ask`, `council`, `review`, and `bundle` command creates a session under `~/.yoetz/sessions/<id>/`. Sessions store:
-- `bundle.md` - the assembled context
-- `response.json` - raw provider responses
-- `metadata.json` - timing, cost, model info
+### Live-attach owner
 
-This enables replay, debugging, and the `apply` command for code review suggestions.
+Chrome asks the user once per browser session to allow remote debugging. The
+`live_attach` daemon therefore owns exactly one approved websocket per browser
+and keeps it alive:
 
-Bundles are prompt-input artifacts, not trusted control channels. Repository
-files, logs, issues, and browser transcripts inside `bundle.md` can contain
-prompt-injection text, so command intent must come from explicit CLI flags and
-the user's prompt; generated edits still need review before application.
+- No hidden reattach. When the approved websocket closes, the daemon marks the
+  target degraded and refuses to create another websocket; the user runs
+  `yoetz browser reset`, then attaches again. A daemon restart with stale
+  persisted state fails closed the same way.
+- State is keyed by the approved browser websocket endpoint. Selectors
+  (`browser-id:*`, `source-path:*`, the implicit default) are aliases onto it.
+- Normal attach, check and recipe flows never recycle the daemon. Recovery is
+  always the explicit `yoetz browser reset`.
 
-### Budget Tracking
+### Native extension
 
-Daily spend is tracked in a local JSON file. The `--max-cost-usd` flag estimates cost before sending (using the pricing registry) and aborts if over budget. `--daily-budget-usd` accumulates across `ask`, `council`, and `review`. Generation commands do not expose budget flags yet, and multimodal `ask` currently rejects strict preflight budget enforcement until media pricing can be estimated accurately.
+One pinned multi-site package. `job_start.payload.recipe` selects the site
+adapter (missing means ChatGPT; unknown fails before any side effect). The
+extension `hello` advertises a `recipes` list; site readiness derives from it,
+never from version comparison.
 
-### Browser Mode
+- `setup` copies the packaged source to `$YOETZ_DIR/chatgpt-native-extension`
+  (`$YOETZ_DIR` defaults to `~/.yoetz`); the user loads that directory unpacked
+  once per Chrome profile. `update` re-syncs it, reloads the extension over the
+  bridge, and verifies the loaded version. `status` and `doctor` fail on a
+  wrong-path or unstamped load.
+- The native host and the managed directory are machine-global, single-writer
+  state. Recipe runs hold the shared side of a lifecycle lock; setup, update,
+  reload and auto-heal need the exclusive side and fail closed while a recipe
+  runs.
+- Each loaded Chrome profile publishes its own bridge instance. One connected
+  instance is used directly; with several, the caller routes by
+  `extension_instance_id` (stable across reloads) or by `profile_email` (only
+  after `extension grant-identity`). No match fails closed.
+- Bridge sockets live under the state directory. When the Unix socket path
+  limit forbids that, they fall back to a per-user temp directory that does not
+  depend on `TMPDIR` (on macOS, `confstr(_CS_DARWIN_USER_TEMP_DIR)`), so the
+  CLI and the Chrome-spawned host agree.
+- The host runs on macOS and Linux. Custom Chrome user-data directories and
+  Chromium builds are targeted with `YOETZ_CHROME_NATIVE_MESSAGING_DIR`.
+- Independent ChatGPT and Claude jobs run concurrently, one background tab
+  each. Every parallel job needs its own bundle session directory; a shared
+  `bundle.md` fails with `session_busy`.
 
-For models without API access (e.g., ChatGPT Pro or Claude's Fable 5 Max), yoetz bundles files into markdown and submits the bundle through the web UI in the user's running Chrome — via the multi-site native extension when it is connected, otherwise via CDP (Chrome DevTools Protocol) transports.
+#### Job contract
 
-Outside the connected-extension exception described below, the browser transport stack is extension-free. Yoetz prefers to act as a wrapper over the underlying transport rather than reimplementing transport logic itself:
+A run never returns success unless every gate below holds.
 
-- `chrome-devtools-mcp` is the primary live-Chrome transport for the built-in web recipes (ChatGPT and Claude).
-- `dev-browser` is the secondary live-Chrome transport.
-- `agent-browser` remains the tertiary / legacy fallback when the first two transports are unavailable or a path still depends on its literal YAML steps.
-- `manual` is the explicit final fallback; it tells the user to complete the web flow manually and does not need CDP.
-- Explicit CDP endpoints are forwarded to the transport unchanged; the transport owns `/json/version`, `DevToolsActivePort`, and related connection logic.
+- Capability token: every `job_*` envelope after `job_start` carries the job's
+  token; a mismatch fails with `capability_mismatch`.
+- Duplicate jobs: a `job_start` for an active job id, or one still in the
+  `terminalJobIds` tombstone window, fails with `duplicate_job` before any side
+  effect.
+- Connection generation: each native connect increments a generation captured
+  on the job, so a job from generation N cannot complete after `state_lost` was
+  emitted on generation N+1.
+- Conversation pinning: `sendPrompt` returns `conversation_id` and the
+  submitted user-turn count. A navigation to another conversation, or an
+  extraction that precedes the submitted turn, fails with
+  `conversation_changed`. The id is pinned late, once the site redirects from
+  its new-chat URL to the conversation URL.
+- Send acceptance: when the click lands but no post-click signal confirms it,
+  the run fails with `send_acceptance_unknown` and `side_effect_started: true`.
+  The runner never falls back to another transport and never resubmits after a
+  side effect.
+- Cancel: clicks the site's stop control best-effort, removes the owned tab,
+  and tombstones the job id; later messages for it are ignored.
+- Storage: `chrome.storage.session` holds one `jobs.<id>` key per job, with the
+  streamed text capped to an 8 KB tail on disk. A worker restart during upload
+  restarts the chunk stream from zero instead of failing.
+- Liveness: every tab round trip in the response wait is bounded, so a frozen
+  tab is reported in `waiting_response` progress instead of silencing the job.
+  The CLI's no-events watchdog therefore fires only on a real dead channel.
 
-Connection priority remains connect-first: explicit CDP endpoint > auto-connect > cookie state > profile fallback.
+### ChatGPT recipe
 
-See [ADR-001: Live Attach Owner](docs/decisions/ADR-001-live-attach-owner.md)
-for the ownership model behind the live Chrome attach path.
+The only target is the GPT-6 Chat family at the `Pro` effort tier. The family
+radio is labeled `Latest` on conversation pages and `GPT-6` on a fresh chat;
+both are the target, and `model_used` is always `Latest Pro`. Sol, Work mode,
+any other family or tier, and disabled tier rows (the account quota lock,
+`effort_options_disabled`) all fail closed.
 
-Chrome 146+ may show a one-time "Allow remote debugging?" approval dialog for a new CDP session. The acceptance criterion is one approval per browser session, not per yoetz invocation, so yoetz avoids silently tearing down live-attach daemons in normal attach/check/recipe flows. Recovery is explicit via `yoetz browser reset`.
+- Reader and driver are separate. `readPicker` (chatgpt-picker-reader.js) is a
+  pure function of the DOM: it never locates the pill, never mutates, and is
+  jsdom-safe (no layout APIs). `chatgpt-dom.js` locates, opens, clicks and
+  closes, and judges every step from a fresh read.
+- A click is never proof. After every mutation the driver re-reads the picker;
+  after close, the composer pill must corroborate the effort, and the family is
+  never inferred from the pill.
+- Classification is structural (`aria-expanded`, `data-state`, `inert`,
+  `aria-controls`), never opacity: background tabs do not animate.
+- Per-shape DOM rules live in the fixtures (`tests/fixtures/chatgpt-picker/`,
+  `expectations.json`) and their tests, not in prose.
+- Finality: a response completes on a confirmed backend node, or on a scoped
+  copy control for the latest assistant turn with no generation running. A
+  copy control belongs to the answer unless another response lies between
+  them; nodes inside the answer and `role="status"` interstitials are never
+  such a boundary. Text stability alone never completes a run.
+- Hidden tabs: ChatGPT defers hydration in background tabs. The visibility
+  shim (injected only into `?_yoetz=` tabs) presents the page as visible and
+  delivers the IntersectionObserver and idle callbacks Chrome withholds;
+  selection waits for its hydration marker within one bounded budget.
+- Rate limits: the "Too many requests" modal limits conversation-history
+  reads, and every page load is one. A typed `rate_limited` arms a
+  profile-wide cooldown, and `job_start` refuses with
+  `rate_limit_cooldown_active` while it holds; both are hard stops, never
+  retried. Backend reads share one profile-scoped gate. Tab pacing refuses new
+  tabs inside a 30 s gap (`min_gap`, which the CLI waits out) or above two
+  concurrent jobs (`max_concurrent`, which fails).
 
-The `chrome-extension-native` transport is the only browser extension
-exception. It is one pinned multi-site package: site adapters under
-`extensions/chatgpt-native/src/sites/` route ChatGPT and Claude jobs via the
-`job_start.payload.recipe` discriminator, and the extension `hello` advertises
-a `recipes` capability list (site readiness derives from that capability,
-never from version comparison). When the extension is installed and
-`yoetz browser extension status --chatgpt` (or `--claude`) reports
-`connected` for the selected site, the matching built-in recipe auto-selects
-it as the only default transport and fails closed instead of falling through
-to CDP transports; `--transport <other>` opts out, and CDP
-fallback after a native failure requires the explicit
-`--transport chrome-extension-native --allow-cdp-fallback`. Unhealthy or
-missing extensions leave the default CDP transport order untouched.
+### Claude recipe
 
-Its lifecycle is managed by `yoetz browser extension <subcommand> --chatgpt|--claude`
-(see `--help` for the full set). `setup` materializes the packaged extension
-source into the stable `$YOETZ_DIR/chatgpt-native-extension` directory; users
-load that unpacked directory in Chrome once, and `update` afterwards
-re-syncs the managed copy atomically, reloads the extension over the native
-bridge, and verifies the loaded version. Recipe dispatch auto-heals version
-skew the same way. Release builds still package the extension as a separate
-versioned zip so the CLI archives do not make the extension path implicit.
-The native-host install and runtime are currently macOS/Linux-only; Windows
-requires registry-based native messaging host registration before this
-transport can run there.
+The only target is Fable 5 at Effort Max, verified by re-reading the model
+radio and the effort option after selection. Finality needs the last assistant
+turn to be non-streaming with no `Stop response` control, held through a
+stable-idle window. The hover-only copy control is never a primary anchor, and
+cloned thinking rows are excluded from the response text.
 
-The native host manifest follows Chrome's Native Messaging lookup rules: the
-default Google Chrome profile is automatic, while custom `--user-data-dir`,
-Chrome for Testing, and Chromium profiles can be targeted with
-`YOETZ_CHROME_NATIVE_MESSAGING_DIR`. Each loaded extension profile publishes a
-separate local bridge instance under the Yoetz state directory. If one instance
-is connected, the CLI uses it. If several are connected, recipe execution must
-specify `profile_email` or the stable `extension_instance_id` published by
-`status --chatgpt` (or `--claude`) so the CLI can route to the matching Chrome profile. It fails
-closed if no selector matches; when Chrome does not expose a verifiable profile
-email, `extension_instance_id` remains the deterministic selector. The local CLI
-bridge sockets normally live under the Yoetz state directory, but fall back to
-short per-state `/tmp` paths when macOS/Linux Unix socket path limits would
-reject the bind.
-
-#### V1 contract for chrome-extension-native
-
-The extension transport ships a typed correctness contract that the recipe
-runner relies on. The shared gates below hold for every site adapter; the
-conversation and completion gates are adapter-specific and are
-listed per site. A run never returns success unless every applicable gate
-holds.
-
-- Capability token: every `job_*` envelope after `job_start` must carry the
-  job's capability token. Mismatches fail with `capability_mismatch` and
-  preserve `phase` + `side_effect_started` from the live job.
-- Duplicate-job rejection: a `job_start` for a `job_id` that is already
-  active or in the `terminalJobIds` tombstone TTL is rejected with
-  `duplicate_job` (no side effect). Tombstones survive long enough to
-  reject stale chunks and cancels for completed runs.
-- Connection-generation fence: each connect to the native host increments a
-  generation counter that is captured on the job. Async-resume sites verify
-  the generation before any state mutation, so a job started under
-  generation N cannot post `job_complete` after a `state_lost` was emitted
-  on generation N+1.
-- Conversation pinning (ChatGPT): `sendPrompt` returns `conversation_id`
-  and `submitted_user_count`. Subsequent extractions are gated against both —
-  a tab navigation to another `/c/<id>` mid-run, or an extraction whose
-  `preceding_user_count` precedes the submitted user turn, fails with
-  `conversation_changed`. Late-pinning fills in `conversation_id` once
-  ChatGPT redirects from `/` to `/c/<id>` after the first streamed token.
-- Conversation pinning (Claude): the same `conversation_changed` /
-  `conversation_unavailable` / `conversation_not_loaded` taxonomy applies to
-  `/chat/<uuid>` URLs; late-pinning fills in `conversation_id` once claude.ai
-  navigates from `/new` to `/chat/<uuid>`.
-- Storage shape: `chrome.storage.session` is sharded as `jobs.<id>` keys
-  with a one-time legacy `jobs` map migration on restart. The on-disk job
-  shape strips `last_response_progress_text` to an 8KB tail; the in-memory
-  job retains the full text for `response_delta` calculation. The TTL
-  sweep runs on the heartbeat alarm tick, not per save.
-- Completion gate (ChatGPT): `extractResponse` rejects "thought/status chrome only"
-  bodies (`Thought for ...`, `Reasoned for ...`, `Analyzing...`, etc.) and
-  the SW refuses completion when extracted text is chrome-only, even if a
-  copy button is visible. Turns with a response-scoped copy affordance
-  confirm over the `MIN_AFFORDANCE_CONFIRM_MS` window; the only
-  long-floor path is stable-idle-with-unscoped-copy, which requires scoped
-  idle text, a new unscoped copy affordance above the baseline count, no
-  visible stop controls, a minimum text length, and the `MIN_STABLE_IDLE_MS`
-  floor. There is no pure text-stability completion path.
-- Completion gate (Claude): finality requires scoped assistant-DOM text with
-  the last turn non-streaming and no `Stop response` control, held through
-  the stable-idle window. If that condition is not reached before
-  `responseWaitTimeoutMs`, the job fails with `response_timeout`. The
-  hover-dependent copy control is never a primary anchor; cloned
-  `group/status` thinking rows are excluded from response text. Claude jobs use
-  independent background tabs for model selection, upload, accepted send, and
-  response extraction; cancelling one job removes only its owned tab.
-- Send acceptance: when `clickSend` commits but `waitForSendAccepted`
-  cannot confirm a post-click signal within budget, the run fails with
-  `send_acceptance_unknown` carrying `side_effect_started: true`. The
-  recipe runner treats this as a terminal Send-phase error and does not
-  fall back to another transport, since the site may still process the
-  prompt asynchronously. The error message tells the caller not to rerun
-  blindly.
-- Cancel: `cancelJob` clicks the site's stop control via the content
-  script (best-effort), removes the owned tab, marks the job terminal,
-  and adds it to `terminalJobIds`. Subsequent extracts for the cancelled
-  `job_id` surface `unknown_job`.
-- Identity: `identity.email` is an optional permission. Default routing
-  uses `extension_instance_id` (per-Chrome-profile, persisted in
-  `chrome.storage.local`). Pass `--var profile_email` only when you want
-  a fail-closed verifier; the user must run
-  `yoetz browser extension grant-identity --chatgpt` (or `--claude`) first.
-
-The runner's contract under this transport: it never returns success on
-partial or status-chrome-only output for either site, never automatically
-retries via a different transport once a side effect has landed in the
-user's tab, and never silently re-submits a prompt the site may already be
-processing.
-
-## Data Flow
+## Data flow (API commands)
 
 ```
-User Input (prompt + files)
-    │
-    ├─ bundle.rs: collect files, apply gitignore, assemble markdown
-    │
-    ├─ media.rs: detect/validate image/video inputs
-    │
-    ├─ config.rs: resolve provider + model from config/flags
-    │
-    ├─ budget.rs: estimate cost, check daily budget
-    │
-    ├─ litellm-rust: send request to provider API
-    │   ├─ OpenAI / OpenRouter
-    │   ├─ Gemini
-    │   └─ LiteLLM proxy
-    │
-    ├─ session.rs: persist request/response
-    │
-    └─ output.rs: format as JSON/text, write to stdout/file
+prompt + files
+  → bundle (core): collect files, honor .gitignore, assemble markdown
+  → media (core): validate image/video inputs
+  → config + registry: resolve provider and model
+  → budget: estimate cost, check limits
+  → litellm-rust → provider API
+  → session (core): persist bundle and response
+  → output (core): JSON / text to stdout or file
 ```
 
-## Testing Strategy
+## Testing
 
-- **Unit tests**: Inline `#[cfg(test)]` modules testing core logic (bundling, media detection, budget math)
-- **HTTP mocking**: WireMock for provider API tests (no API keys needed)
-- **CLI integration**: `assert_cmd` tests for command-line behavior
-- **Serial execution**: `serial_test` for tests that share filesystem state
+Rust tests run without API keys: inline unit tests, `assert_cmd` CLI tests,
+local `TcpListener` fakes for provider HTTP, and `serial_test` for shared state.
+The extension's tests use `node --test` with a fake DOM for the driver and
+jsdom for the picker and conversation fixtures.

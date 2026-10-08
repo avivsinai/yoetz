@@ -12,7 +12,7 @@
 //
 // Computed styles are baked in because jsdom has no layout engine — the
 // reader's attribute+inline-style visibility predicate cannot see
-// stylesheet-driven hiding. See docs/design/chatgpt-picker-reader.md,
+// stylesheet-driven hiding. See ARCHITECTURE.md ("ChatGPT recipe"),
 // "Snapshot fixtures replace hand-built fakes" and the "jsdom boundary".
 
 import { redactSecrets, sanitizeCaptureClone } from "./capture-sanitizer.js";

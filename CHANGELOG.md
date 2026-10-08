@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- Docs: the README's prebuilt-archive and `cargo install` steps now install the
+  `recipes/` and `scripts/` data that browser recipes need, and say where the
+  separate extension zip goes. Model-lookup examples no longer pass
+  `--model null` when nothing matches. `browser recipe --transport` help now
+  says native auto-select applies to both built-in recipes.
+### Changed
+- Docs: `CLAUDE.md` is rewritten as agent rules only (`AGENTS.md` is now a
+  symlink to it); the durable design moved into `ARCHITECTURE.md`; the yoetz
+  skill is split into a short `SKILL.md` plus `references/browser.md`. The
+  stale ADR, design docs, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` and the
+  skill's `references/commands.md` are removed (`yoetz <cmd> --help` is the
+  flag reference).
 
 ## [0.5.86] - 2026-10-08
 ### Fixed

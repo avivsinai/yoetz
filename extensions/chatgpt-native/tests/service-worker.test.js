@@ -11752,7 +11752,7 @@ function chromeStub({ port, tabs, connectNative = null, profileEmail = "", profi
 // NOTE: the 429s below are SIMULATED responses used to exercise the pacing
 // machinery. They are NOT a reproduction of the unknown incident that produced
 // the field "Too many requests" modal; no network trace of that incident
-// exists (see docs/design/chatgpt-web-rate-limit-fix.md).
+// exists (see ARCHITECTURE.md, "ChatGPT recipe", rate limits).
 // ---------------------------------------------------------------------------
 
 function throttledFetchConversationPayload(error) {

@@ -1,36 +1,10 @@
-# Security Policy
+# Security
 
-## Reporting a Vulnerability
+Report vulnerabilities by email to **aviv@sinai.dev**, not in a public issue.
+Include what you found, how to reproduce it, and its impact.
 
-If you discover a security vulnerability in yoetz, please report it responsibly.
-
-**Do not open a public GitHub issue for security vulnerabilities.**
-
-Instead, please email: **aviv@sinai.dev**
-
-### What to Include
-
-- Description of the vulnerability
-- Steps to reproduce
-- Potential impact
-- Suggested fix (if any)
-
-### Response Timeline
-
-- **Acknowledgment**: Within 48 hours
-- **Assessment**: Within 1 week
-- **Fix**: Depending on severity, typically within 2 weeks
-
-## Scope
-
-This policy covers the yoetz CLI tool and its yoetz-core library. Issues with upstream LLM provider APIs should be reported to those providers directly.
-
-## Security Measures
-
-This project uses:
-
-- **gitleaks** - Automated secret scanning in CI
-- **cargo-deny** - Dependency vulnerability and license auditing
-- **clippy** - Static analysis for common Rust pitfalls
-- Core library code avoids `unsafe`; the workspace lint warns on any `unsafe`
-  use so reviewers can inspect it explicitly.
+In scope: the `yoetz` CLI and `yoetz-core`; the Chrome extension
+(`extensions/chatgpt-native/`); the native-messaging host and its local bridge
+sockets, capability tokens and state directory (`~/.yoetz`); and the
+live-attach and CDP daemons. Out of scope: the provider APIs and the ChatGPT
+and Claude websites themselves; report those to their owners.

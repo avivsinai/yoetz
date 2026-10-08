@@ -2,13 +2,13 @@
 //
 // The pure ChatGPT picker reader. Owns every DOM heuristic for reading the
 // model picker surface and produces one plain value (PickerRead) consumed by
-// the driver in chatgpt-dom.js. See docs/design/chatgpt-picker-reader.md.
+// the driver in chatgpt-dom.js. See ARCHITECTURE.md, "ChatGPT recipe".
 //
 // Purity contract: same DOM -> same value. No awaits, no dispatched events, no
 // attribute writes. Never throws; an unrecognized DOM yields shape:null with
 // diagnostics populated.
 //
-// jsdom boundary (docs/design/chatgpt-picker-reader.md "jsdom boundary"):
+// jsdom boundary (ARCHITECTURE.md, "ChatGPT recipe"):
 // jsdom 30 has no layout engine. This reader therefore NEVER calls any
 // layout-dependent visibility API (no computed-style, no client-rect, no
 // visibility-check method, no driver-level visibility helper). Its readability
