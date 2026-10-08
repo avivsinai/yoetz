@@ -3628,7 +3628,8 @@ function findNewChatControl(root) {
 
 function findAttachmentTiles(root, options = {}) {
   const scopes = options.composerOnly ? composerScopes(root, { includeRoot: false }) : [root];
-  return uniqueElements(scopes.flatMap((scope) => Array.from(scope.querySelectorAll('[class*="file-tile"], [data-testid*="attachment"]'))))
+  // 2026-10-08: tiles render as span.group/composer-attachment.
+  return uniqueElements(scopes.flatMap((scope) => Array.from(scope.querySelectorAll('[class*="file-tile"], [data-testid*="attachment"], [class*="group/composer-attachment"]'))))
     .filter((node) => isVisible(node, { allowDisabled: true }));
 }
 
@@ -3675,8 +3676,10 @@ function attachmentTextMatchesFilename(text, filename) {
   }
 
   const boundary = "[^\\p{L}\\p{N}._-]";
+  // Dedupe suffixes: "bundle(13).md" and, since 2026-10-08, a timestamp
+  // "bundle(20261008-080525).md".
   const pattern = new RegExp(
-    `(^|${boundary})${escapeRegExp(stem)}\\s*\\(\\d+\\)${escapeRegExp(extension)}($|${boundary})`,
+    `(^|${boundary})${escapeRegExp(stem)}\\s*\\(\\d+(?:-\\d+)?\\)${escapeRegExp(extension)}($|${boundary})`,
     "iu"
   );
   return pattern.test(haystack);
