@@ -6,11 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.83] - 2026-10-08
 ### Fixed
 - ChatGPT recipe on a fresh chat (`GPT-6` family label): model selection
   verified every leg but reported `model_used` "GPT-6 Pro", so the send-time
   proof gate (which requires "Latest Pro") refused it. `model_used` now carries
   the canonical target name; `family_label` keeps the raw label. (`yz-oke`)
+
 
 ## [0.5.82] - 2026-10-08
 ### Fixed
