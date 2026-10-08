@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.87] - 2026-10-08
 ### Fixed
 - Docs: the README's prebuilt-archive and `cargo install` steps now install the
   `recipes/` and `scripts/` data that browser recipes need, and say where the
@@ -19,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   stale ADR, design docs, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` and the
   skill's `references/commands.md` are removed (`yoetz <cmd> --help` is the
   flag reference).
+
 
 ## [0.5.86] - 2026-10-08
 ### Fixed
