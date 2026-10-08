@@ -27,7 +27,10 @@ const CHATGPT_SOL_FAMILY_LABEL = "GPT-5.6 Sol";
 // Live probe 2026-09-05 (yz-a8c.1): the Chat family radio checked on a Pro
 // account is "Latest" (GPT-5.6 Sol and GPT-5.5 mounted unchecked). "Latest" is
 // the selection target; Sol is recognized only to refuse it (never select Sol).
-const CHATGPT_TARGET_FAMILY_LABEL = "Latest";
+// Live capture 2026-10-08: a fresh new-chat page labels the same first radio
+// "GPT-6" while existing conversation pages still read "Latest". Exact labels
+// only, so no other GPT-6 variant can match.
+const CHATGPT_TARGET_FAMILY_LABELS = ["Latest", "GPT-6"];
 
 /**
  * @typedef {Object} PickerRead
@@ -94,7 +97,8 @@ function familyIsSol(value) {
 }
 
 function familyIsLatest(value) {
-  return foldedModelText(value) === foldedModelText(CHATGPT_TARGET_FAMILY_LABEL);
+  const folded = foldedModelText(value);
+  return CHATGPT_TARGET_FAMILY_LABELS.some((label) => folded === foldedModelText(label));
 }
 
 function descendantDepth(node, ancestor) {
