@@ -4427,6 +4427,7 @@ fn validate_inbound_envelope(envelope: &ProtocolEnvelope) -> Result<()> {
         | "reconnect"
         | "inspect_run"
         | "list_jobs"
+        | "sw_telemetry"
         | "dump_picker_html"
         | "dump_conversation"
         | "request_identity_permission" => {}
@@ -5330,6 +5331,7 @@ mod native_host_unix {
             | "reconnect"
             | "inspect_run"
             | "list_jobs"
+            | "sw_telemetry"
             | "dump_picker_html"
             | "dump_conversation"
             | "request_identity_permission" => forward_to_extension(&stdout, &forwarded),
@@ -5370,6 +5372,7 @@ mod native_host_unix {
                         | "reconnect"
                         | "inspect_run"
                         | "list_jobs"
+                        | "sw_telemetry"
                         | "dump_picker_html"
                         | "dump_conversation"
                         | "request_identity_permission" => {
