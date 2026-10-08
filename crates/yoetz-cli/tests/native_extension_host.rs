@@ -643,6 +643,33 @@ fn native_host_forwards_list_jobs_and_routes_the_reply() {
     client.assert_no_frame();
 }
 
+// Field 2026-10-08: `browser extension status` never showed sw_telemetry
+// (yz-9pf) on a real host. The host's validator and both forward matches
+// rejected the `sw_telemetry` kind, and the CLI swallowed the error.
+#[test]
+fn native_host_forwards_sw_telemetry_and_routes_the_reply() {
+    let mut host = NativeHost::start();
+    let token = wait_for_token(&host.token_path);
+
+    let client = LocalClient::connect_control(
+        &host.socket_path,
+        "job_swt",
+        &token,
+        "sw_telemetry",
+        json!({}),
+    );
+
+    host.output.take("sw_telemetry", "job_swt");
+    host.send(extension_frame(
+        "job_complete",
+        "job_swt",
+        json!({ "sw_last_errors": [], "sw_start_count": 3 }),
+    ));
+    let reply = client.take("job_complete");
+    assert_eq!(reply["payload"]["sw_start_count"], 3);
+    client.assert_no_frame();
+}
+
 // yz-7iu: a `dump_conversation` control message must be accepted as the
 // client's FIRST frame — validator allowlist (site 1), first-frame forward
 // match (site 2), and follow-up control match (site 3) all take the kind —
