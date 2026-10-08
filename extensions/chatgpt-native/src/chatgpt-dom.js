@@ -2885,6 +2885,12 @@ function hasResponseBoundaryBetween(ordered, startIndex, endIndex) {
     if (containsNode(start, node)) {
       continue;
     }
+    // 2026-10-08: the Pro long-think interstitial ("Our systems are thinking a
+    // bit more...") stays mounted as a MarkdownRoot inside a role="status"
+    // live region after the answer completes. Status text is never a response.
+    if (node?.closest?.('[role="status"]')) {
+      continue;
+    }
     const role = node?.getAttribute?.("data-message-author-role");
     if (role === "user" || role === "assistant") {
       return true;
