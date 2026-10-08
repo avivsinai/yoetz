@@ -50,6 +50,9 @@ for (const name of fixtures) {
       assert.equal(read.family.checked, expected.family.checked, "family.checked");
       assert.equal(read.family.checkedCount, expected.family.checkedCount, "family.checkedCount");
       assert.deepEqual(read.family.options, expected.family.options, "family.options");
+      if (expected.family.latest !== undefined) {
+        assert.equal(Boolean(read.family.latestOption), expected.family.latest, "family.latest");
+      }
     }
     if (expected.effort) {
       assert.equal(read.effort.label, expected.effort.label, "effort.label");
