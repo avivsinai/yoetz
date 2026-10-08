@@ -321,10 +321,11 @@ struct BrowserRecipeArgs {
     #[arg(long, value_enum, default_value_t = chatgpt_recipe::ChatgptModelStrategy::Select)]
     model_strategy: chatgpt_recipe::ChatgptModelStrategy,
 
-    /// Explicitly select one browser recipe transport. When omitted, the
-    /// chatgpt recipe selects only `chrome-extension-native` if the Yoetz
-    /// Chrome extension is installed and reports `connected`; otherwise the
-    /// default funnel stays extension-free.
+    /// Explicitly select one browser recipe transport. When omitted, a
+    /// built-in recipe (chatgpt or claude) selects only
+    /// `chrome-extension-native` if the Yoetz Chrome extension reports
+    /// `connected` for that site; otherwise the default funnel stays
+    /// extension-free.
     #[arg(long, value_parser = parse_recipe_transport_flag)]
     transport: Option<browser::RecipeTransport>,
 
@@ -463,7 +464,7 @@ struct BrowserExtensionArgs {
 enum BrowserExtensionCommand {
     /// Prepare the native-extension install and open Chrome's extension page.
     Setup(BrowserExtensionSetupArgs),
-    /// Install the ChatGPT native messaging host. Currently macOS/Linux only.
+    /// Install the native messaging host (macOS and Linux only).
     InstallHost(BrowserExtensionScopeArgs),
     Status(BrowserExtensionScopeArgs),
     Doctor(BrowserExtensionMaintenanceArgs),

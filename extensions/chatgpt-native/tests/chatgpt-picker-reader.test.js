@@ -3,7 +3,7 @@
 // Fixture-driven reader tests (Wave 1+). Each fixture in
 // tests/fixtures/chatgpt-picker/*.html is loaded into jsdom and asserted
 // against tests/fixtures/chatgpt-picker/expectations.json. See
-// docs/design/chatgpt-picker-reader.md.
+// ARCHITECTURE.md ("ChatGPT recipe").
 
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -68,8 +68,8 @@ for (const name of fixtures) {
 
 // Boundary lock: the reader module must contain ZERO layout-dependent
 // identifiers. The reader is jsdom-pure; if any of these leak in, jsdom
-// fixtures would silently diverge from live Chrome. See the "jsdom boundary"
-// section of docs/design/chatgpt-picker-reader.md.
+// fixtures would silently diverge from live Chrome. See ARCHITECTURE.md
+// ("ChatGPT recipe").
 test("reader module contains no layout-dependent identifiers (jsdom boundary lock)", () => {
   const readerSource = readFileSync(join(__dirname, "..", "src", "chatgpt-picker-reader.js"), "utf8");
   const forbidden = [

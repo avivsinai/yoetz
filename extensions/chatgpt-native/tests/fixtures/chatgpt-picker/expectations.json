@@ -1,5 +1,5 @@
 {
-  "_comment": "Expected PickerRead values per fixture, asserted by tests/chatgpt-picker-reader.test.js from Wave 1 on. Captured from live Enterprise ChatGPT tabs with the inline serializer described in docs/design/chatgpt-picker-reader.md (computed inert + display/visibility written back as attributes; script/svg/use/canvas bodies stripped).",
+  "_comment": "Expected PickerRead values per fixture, asserted by tests/chatgpt-picker-reader.test.js. Fixtures are live ChatGPT captures serialized with src/picker-serializer.js (computed inert + display/visibility written back as attributes; script/svg/use/canvas bodies stripped). Each row records its capture in _provenance.",
   "2026-09-05-gpt6-chat-family-expanded.html": {
     "shape": "slider",
     "ready": true,
