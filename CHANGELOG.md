@@ -6,11 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.86] - 2026-10-08
 ### Fixed
 - `browser extension status` now shows `sw_telemetry` on a real native host.
   The host rejected the `sw_telemetry` command in its validator and both forward
   paths, and the CLI dropped the error, so the yz-9pf telemetry never appeared.
   (`yz-a1o`)
+
 
 ## [0.5.85] - 2026-10-08
 ### Fixed
