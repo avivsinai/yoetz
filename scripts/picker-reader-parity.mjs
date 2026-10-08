@@ -132,14 +132,12 @@ if (fixtures.length === 0) {
 }
 
 // The pinned 6aaa07f baseline predates #485: isFamilyOptionLabel there is
-// /^gpt\b|^o3$/i, so the old reader drops the Latest radio on the gpt6 fixture
-// and reports family "" where the new reader reads 'Latest' (shape and effort
-// still match). That vocabulary drift is expected and INFO-only; a shape or
-// effort disagreement on any row is a parity failure.
-const KNOWN_BASELINE_DRIFT = new Map([
-  ["2026-09-05-gpt6-chat-family-expanded.html",
-    "baseline predates the 'Latest' family (#485): old reader drops the Latest radio"],
-]);
+// /^gpt\b|^o3$/i, so the old reader drops the Latest radio on every Latest-family
+// fixture and reports family "" where the new reader reads 'Latest' (shape and
+// effort still match). That vocabulary drift is expected and INFO-only; a shape
+// or effort disagreement on any row is a parity failure.
+const BASELINE_PREDATES_LATEST =
+  "baseline predates the 'Latest' family (#485): old reader drops the Latest radio";
 
 let mismatches = 0;
 let infos = 0;
@@ -196,10 +194,13 @@ for (const name of fixtures) {
   const shapeMatch = String(oldResult.shape) === String(newResult.shape);
   const familyMatch = String(oldResult.family) === String(newResult.family);
   const effortMatch = String(oldResult.effort) === String(newResult.effort);
-  const knownDriftReason = KNOWN_BASELINE_DRIFT.get(name);
+  const knownDriftReason = String(oldResult.family) === "" && String(newResult.family) === "Latest"
+    ? BASELINE_PREDATES_LATEST
+    : undefined;
   const identical = shapeMatch && familyMatch && effortMatch;
-  // INFO only for the vocabulary gap the drift map names (family label on the
-  // gpt6 row): shape and effort must still match for INFO treatment.
+  // INFO only for the vocabulary gap (baseline family empty,
+  // new family Latest; the new reader already matched expectations.json above):
+  // shape and effort must still match for INFO treatment.
   const info = shapeMatch && effortMatch && !familyMatch && Boolean(knownDriftReason);
   const ok = identical || info;
 
