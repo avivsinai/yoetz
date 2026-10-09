@@ -62,5 +62,34 @@
     "_notes": [
       "2026-10-08 drift: on a fresh new-chat page the GPT-6 Chat family radio is labeled 'GPT-6'; on an existing conversation page the same first radio still read 'Latest' (captured the same minute). Sol and GPT-5.5 rows are unchanged, so 'GPT-6' is the target family and Sol stays refused."
     ]
+  },
+  "2026-10-09-enterprise-family-view-medium.html": {
+    "shape": "slider",
+    "ready": true,
+    "family": {
+      "label": "GPT-6",
+      "checked": true,
+      "checkedCount": 1,
+      "options": [
+        "GPT-6",
+        "GPT-5.6 Sol",
+        "GPT-5.5Leaving on October 14"
+      ],
+      "latest": true
+    },
+    "effort": {
+      "label": "Medium",
+      "disabled": false,
+      "kind": "slider",
+      "options": []
+    },
+    "nav": {
+      "expanded": false
+    },
+    "_provenance": "Live capture 2026-10-09 on the enterprise Chrome profile (ext_b71b20752c525505b0ee85cf, read-only, nothing sent): dump-picker on the kept tab of run 20261009T112551Z_766fb4, which had failed closed in model_selection with effort_control_not_found. The capture's own open activated the view toggle, so this is the family view; reader values verified with readPicker on this file.",
+    "_notes": [
+      "Same split-view markup as the personal 2026-10-08 capture; only the effort differs: the slider reads 'Medium, 2 of 5.' (Pro is 5 of 5) where the personal account persists Pro.",
+      "The driver therefore takes the effort-move path, and the picker now reopens into the last active view: close + reopen stayed in this family view with the slider inert. Clicking the checked GPT-6 radio returns to the effort view with the menu open (live trace 2026-10-09); the fake-page test 'split-view picker that reopens into the family view\u2026' pins the selection contract."
+    ]
   }
 }

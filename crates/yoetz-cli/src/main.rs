@@ -615,9 +615,17 @@ struct BrowserExtensionDumpPickerArgs {
     #[arg(long)]
     claude: bool,
 
-    /// Yoetz run id whose tab should be captured.
+    /// Yoetz run id whose tab should be captured. Omit when --tab-id is used.
     #[arg(long, alias = "run_id")]
-    run_id: String,
+    run_id: Option<String>,
+
+    /// Chrome tab id to capture directly. Use when the run's durable job
+    /// record is retired, e.g. a run that failed closed in model_selection
+    /// with --keep-tab. The tab must still carry its `_yoetz=<run>` URL
+    /// marker; ownership is re-verified from the tab's own window name.
+    /// Mutually exclusive with --run-id.
+    #[arg(long, value_name = "TAB_ID")]
+    tab_id: Option<i64>,
 
     /// Output path for the serialized picker menu HTML.
     #[arg(long, value_name = "PATH", alias = "out")]
@@ -628,6 +636,12 @@ struct BrowserExtensionDumpPickerArgs {
     /// model_selection is not aborted by the dump's pointerdown + Escape.
     #[arg(long, default_value_t = false)]
     allow_live_job: bool,
+
+    /// Run the recipe's own Latest Pro model selection on the tab before the
+    /// capture, and print its result. Nothing is uploaded or sent, so this
+    /// verifies a picker fix on an account where a full run must not send.
+    #[arg(long, default_value_t = false)]
+    select_model: bool,
 
     /// Route to a Chrome profile email reported by extension status.
     #[arg(long, alias = "profile_email")]
@@ -4076,9 +4090,11 @@ fn handle_browser_extension(
             (
                 "browser.extension.dump_picker",
                 browser_extension_native::dump_picker_html_run(
-                    &args.run_id,
+                    args.run_id.as_deref(),
+                    args.tab_id,
                     &args.path,
                     args.allow_live_job,
+                    args.select_model,
                     selector,
                     recipe,
                 )?,

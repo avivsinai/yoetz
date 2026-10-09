@@ -2549,16 +2549,37 @@ async function handleListJobs(message) {
 async function handleDumpPickerHtml(message) {
   const adapter = siteAdapterForRecipe(message.payload?.recipe);
   const runId = String(message.payload?.run_id ?? "").trim();
-  if (!runId) {
+  const requestedTabId = Number(message.payload?.tab_id);
+  const tabTargeting = Number.isInteger(requestedTabId) && requestedTabId > 0;
+  if (!runId && !tabTargeting) {
     await postTerminalMessage(
       message,
-      errorEnvelope(messageJob(message), "missing_run_id", "dump_picker_html requires payload.run_id", {
+      errorEnvelope(messageJob(message), "missing_run_id", "dump_picker_html requires payload.run_id or payload.tab_id", {
         request_id: message.request_id,
         phase: "profile",
         side_effect_started: false
       }),
       { status: "failed", phase: "profile" }
     );
+    return;
+  }
+  // --tab-id: same escape hatch and ownership proof as dump_conversation. A
+  // run that failed closed in model_selection keeps its tab (--keep-tab) but
+  // leaves no durable job record to resolve by run id.
+  if (tabTargeting) {
+    if (runId) {
+      await postTerminalMessage(
+        message,
+        errorEnvelope(messageJob(message), "selector_conflict", "pass either --run-id or --tab-id, not both", {
+          request_id: message.request_id,
+          phase: "profile",
+          side_effect_started: false
+        }),
+        { status: "failed", phase: "profile" }
+      );
+      return;
+    }
+    await dumpPickerByTabId(message, adapter, requestedTabId);
     return;
   }
   const targetedJob = message?.job_id ? jobs.get(message.job_id) : null;
@@ -2647,7 +2668,8 @@ async function handleDumpPickerHtml(message) {
         workspace_id: message.workspace_id,
         ownership_nonce: inspectJob.ownership_nonce,
         recipe: adapter.recipe,
-        allow_live_job: allowLiveJob
+        allow_live_job: allowLiveJob,
+        select_model: message.payload?.select_model === true
       });
       // Forward closed_after_dump so the Rust envelope does not always read
       // null (the content script computes it; the SW must pass it through).
@@ -2713,10 +2735,78 @@ async function handleDumpPickerHtml(message) {
       redactions: captured.redactions ?? 0,
       opened_by_us: captured.opened_by_us === true,
       closed_after_dump: captured.closed_after_dump,
+      selection: captured.selection ?? null,
       tab_id: captured.tab_id,
       url: sanitizeCaptureUrl(captured.url)
     }
   }), { status: "complete", phase: "profile" });
+}
+
+async function dumpPickerByTabId(message, adapter, tabId) {
+  let tab = null;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    tab = null;
+  }
+  if (!tab?.id || !adapter.isAllowedTabUrl(tab.url) || !isYoetzOwnedTab(tab, adapter)) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), "tab_not_owned", `tab ${tabId} is not a Yoetz-owned ${adapter.displayName} tab (no _yoetz marker or wrong site)`, {
+        request_id: message.request_id,
+        tab_id: tabId,
+        phase: "profile",
+        side_effect_started: false
+      }),
+      { status: "failed", phase: "profile" }
+    );
+    return;
+  }
+  const markerRunId = runIdFromMarker(tab.url);
+  try {
+    const captured = await sendToTab(tab.id, {
+      type: "yoetz_dump_picker_html",
+      run_id: markerRunId ?? "",
+      workspace_id: message.workspace_id,
+      recipe: adapter.recipe,
+      allow_live_job: message.payload?.allow_live_job === true,
+      select_model: message.payload?.select_model === true,
+      tab_addressed: true
+    });
+    await postTerminalMessage(message, makeEnvelope("job_complete", {
+      request_id: message.request_id,
+      job_id: message.job_id,
+      run_id: message.run_id,
+      workspace_id: message.workspace_id,
+      payload: {
+        run_id: markerRunId,
+        service_worker_build: serviceWorkerBuild(),
+        html: captured.html,
+        bytes: captured.bytes,
+        redactions: captured.redactions ?? 0,
+        opened_by_us: captured.opened_by_us === true,
+        closed_after_dump: captured.closed_after_dump,
+        selection: captured.selection ?? null,
+        tab_id: tab.id,
+        url: sanitizeCaptureUrl(tab.url ?? null)
+      }
+    }), { status: "complete", phase: "profile" });
+  } catch (error) {
+    await postTerminalMessage(
+      message,
+      errorEnvelope(messageJob(message), error?.code ?? "dump_failed", String(error?.message ?? error), {
+        request_id: message.request_id,
+        run_id: markerRunId ?? null,
+        tab_id: tab.id,
+        url: tab.url ?? null,
+        title: tab.title ?? null,
+        page_state: error?.page_state,
+        phase: error?.phase ?? "profile",
+        side_effect_started: error?.side_effect_started ?? false
+      }),
+      { status: "failed", phase: error?.phase ?? "profile" }
+    );
+  }
 }
 
 // dump_conversation (yz-7iu) mirrors dump_picker_html one-for-one (same run_id
@@ -2960,10 +3050,14 @@ async function dumpConversationByTabId(message, adapter, tabId) {
       // asserted between window.name and the verified ownership payload.
       tab_addressed: true
     });
+    // The envelope echoes the request's run id (none in --tab-id mode): the
+    // native host routes a terminal only to the client whose job/run match,
+    // so stamping the marker run here dropped every successful capture and
+    // the CLI timed out. The recovered run travels in the payload.
     await postTerminalMessage(message, makeEnvelope("job_complete", {
       request_id: message.request_id,
       job_id: message.job_id,
-      run_id: captured.run_id ?? markerRunId,
+      run_id: message.run_id,
       workspace_id: message.workspace_id,
       payload: {
         run_id: captured.run_id ?? markerRunId,

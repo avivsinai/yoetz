@@ -1618,10 +1618,18 @@ async function selectLatestChatProModel(root, options = {}) {
       }
       // yz-c1l: the 2026-09-28 split-view picker keeps the slider mounted but
       // inert while the family view is active (the family leg toggled to it),
-      // and the view toggle is inert inside the family view — the way back to
-      // the effort view is close + reopen, since the effort view is the
-      // default on open.
-      if (effortControlIsInert(r.effort.control) && r.nav.viewToggle) {
+      // and the view toggle is inert inside the family view.
+      // 2026-10-09 (enterprise field runs): the picker now reopens into the
+      // last active view, so close + reopen stays in the family view. Clicking
+      // the already-checked target family radio returns to the effort view
+      // with the menu still open; close + reopen stays as the fallback, and
+      // also covers a picker that closes on the radio click.
+      if (effortControlIsInert(r.effort.control) && r.family.checked
+        && familyIsLatest(r.family.label) && r.family.latestOption) {
+        realClick(r.family.latestOption);
+        r = await waitForLiveEffortSlider(root, options);
+      }
+      if (!r.shape || (effortControlIsInert(r.effort.control) && r.nav.viewToggle)) {
         if (!await closeModelPicker(root, modelButton)) {
           return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT model picker did not close before returning to the effort view", "model_picker_close_failed", { effortMoveMethod });
         }
@@ -2305,6 +2313,25 @@ function effortControlIsInert(control) {
     node = node.parentElement;
   }
   return false;
+}
+
+// Polls until the effort slider is live (the view swap is not synchronous
+// with the click), the picker closed, or the picker budget runs out; returns
+// the last read.
+async function waitForLiveEffortSlider(root, options = {}) {
+  const timeoutMs = Number(options.pickerTimeoutMs ?? 3000);
+  const intervalMs = Number(options.intervalMs ?? 100);
+  const startedAt = Date.now();
+  let last = read(root);
+  while (Date.now() - startedAt < timeoutMs) {
+    if (!last.shape || (last.effort.kind === "slider" && last.effort.control
+      && !effortControlIsInert(last.effort.control))) {
+      return last;
+    }
+    await sleep(intervalMs);
+    last = read(root);
+  }
+  return last;
 }
 
 async function moveEffortSliderToPro(root, initialRead, options = {}) {

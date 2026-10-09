@@ -14581,7 +14581,10 @@ test("yz-bwi(b): dump_conversation by --tab-id captures a preserved tab whose jo
     await eventually(() => port.messages.some((message) => message.type === "hello"));
     port.messages.length = 0;
 
-    port.emit(envelope("dump_conversation", "job_dump_tabid", { tab_id: 41, allow_live_job: false }));
+    // The CLI sends no run id in --tab-id mode (field run 2026-10-09: the
+    // capture succeeded but the host dropped the terminal stamped with the
+    // marker run, and the CLI timed out).
+    port.emit(envelope("dump_conversation", "job_dump_tabid", { tab_id: 41, allow_live_job: false }, { run_id: undefined }));
 
     await eventually(() => port.messages.some((message) => message.type === "job_complete"));
     assert.equal(dumpMessage.type, "yoetz_dump_conversation");
@@ -14593,10 +14596,70 @@ test("yz-bwi(b): dump_conversation by --tab-id captures a preserved tab whose jo
     const complete = port.messages.find((message) =>
       message.type === "job_complete" && message.job_id === "job_dump_tabid"
     );
+    assert.equal(complete.run_id, undefined, "terminal must echo the request's run id or the host drops it");
     assert.equal(complete.payload.html, captureHtml);
     assert.equal(complete.payload.run_id, "run_b10805late");
     assert.equal(complete.payload.tab_id, 41);
     assert.equal(complete.payload.job_id, "job_b10805late");
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+// dump-picker --tab-id --select-model: the kept tab of a run that failed
+// closed in model_selection has no durable job record; the picker capture and
+// the selection probe reach it by tab id.
+test("dump_picker_html by --tab-id forwards select_model and returns the selection", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const storage = makeStorage();
+  let dumpMessage = null;
+  const captureHtml = "<div role=\"menu\" data-state=\"open\"></div>";
+  globalThis.chrome = chromeStub({
+    port,
+    storage,
+    tabs: {
+      get: async (id) => ({
+        id,
+        status: "complete",
+        url: "https://chatgpt.com/?_yoetz=run_picker_kept",
+        title: "ChatGPT"
+      }),
+      query: async () => [],
+      sendMessage: async (_id, message) => {
+        dumpMessage = message;
+        return {
+          ok: true,
+          payload: {
+            html: captureHtml,
+            bytes: captureHtml.length,
+            opened_by_us: true,
+            closed_after_dump: true,
+            selection: { status: "selected", model_used: "Latest Pro" }
+          }
+        };
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?picker_tab_id=${Date.now()}`);
+    await eventually(() => port.messages.some((message) => message.type === "hello"));
+    port.messages.length = 0;
+
+    port.emit(envelope("dump_picker_html", "job_picker_tabid", { tab_id: 42, select_model: true }, { run_id: undefined }));
+
+    await eventually(() => port.messages.some((message) => message.type === "job_complete"));
+    assert.equal(dumpMessage.type, "yoetz_dump_picker_html");
+    assert.equal(dumpMessage.tab_addressed, true);
+    assert.equal(dumpMessage.select_model, true);
+    const complete = port.messages.find((message) =>
+      message.type === "job_complete" && message.job_id === "job_picker_tabid"
+    );
+    assert.equal(complete.run_id, undefined);
+    assert.equal(complete.payload.html, captureHtml);
+    assert.equal(complete.payload.run_id, "run_picker_kept");
+    assert.deepEqual(complete.payload.selection, { status: "selected", model_used: "Latest Pro" });
   } finally {
     globalThis.chrome = originalChrome;
   }

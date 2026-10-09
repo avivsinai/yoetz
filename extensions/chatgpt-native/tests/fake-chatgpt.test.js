@@ -5041,12 +5041,16 @@ function makeHybridSimpleViewFixture({
 // view is live at a time (the other is inert + aria-hidden), the toggle is
 // inert inside the family view, and reopening lands in the effort view. The
 // inert slider's aria-valuetext stays readable from the family view.
+// rememberView: the 2026-10-09 enterprise behavior — reopening lands in the
+// last active view, and clicking the already-checked family radio returns to
+// the effort view with the menu still open.
 function makeSplitViewPickerFixture({
   family = "Latest",
   families = ["Latest", "GPT-5.6 Sol", "GPT-5.5"],
   sliderNow = 4,
   keyboardMode = "end",
-  surface = "chat"
+  surface = "chat",
+  rememberView = false
 } = {}) {
   const levels = ["Instant", "Medium", "High", "Extra High", "Pro"];
   const sliderMin = 0;
@@ -5147,6 +5151,11 @@ function makeSplitViewPickerFixture({
         role: "menuitemradio",
         "aria-checked": String(radioLabel === currentFamily),
         onClick: () => {
+          if (rememberView && radioLabel === currentFamily) {
+            familyClickCount += 1;
+            setFamilyViewActive(false);
+            return;
+          }
           currentFamily = radioLabel;
           familyClickCount += 1;
           for (const radio of familyView.querySelectorAll('[role="menuitemradio"]')) {
@@ -5157,6 +5166,7 @@ function makeSplitViewPickerFixture({
         }
       }, radioLabel));
     }
+    const reopenInFamilyView = rememberView && familyViewActive;
     familyViewActive = false;
     menu = new FakeElement("div", {
       id: "split-view-menu",
@@ -5164,6 +5174,7 @@ function makeSplitViewPickerFixture({
       "data-state": "open"
     }).append(effortView, familyView);
     body.append(menu);
+    if (reopenInFamilyView) setFamilyViewActive(true);
     pill.setAttribute("aria-expanded", "true");
     pill.setAttribute("data-state", "open");
   };
@@ -5355,6 +5366,20 @@ test("yz-c1l: split-view picker moves a Medium effort slider to Pro after close+
   assert.equal(result.model_used, "Latest Pro");
   assert.ok(fixture.sliderKeys() >= 1, "slider received keyboard moves");
   assert.ok(fixture.openCount() >= 2, "picker closed and reopened into the effort view");
+});
+
+// Field runs 2026-10-09 (enterprise account, effort Medium): close + reopen
+// stayed in the family view, so the slider was still inert and the run failed
+// closed with effort_control_not_found before any upload.
+test("split-view picker that reopens into the family view returns to the effort view through the checked family radio", async () => {
+  const fixture = makeSplitViewPickerFixture({ sliderNow: 1, rememberView: true });
+
+  const result = await configureModelState(fixture.doc, {});
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "Latest Pro");
+  assert.equal(fixture.familyClicks(), 1, "clicked the checked Latest radio once");
+  assert.ok(fixture.sliderKeys() >= 1, "slider received keyboard moves");
 });
 
 test("yz-c1l: split-view picker with Sol checked clicks Latest in the family view", async () => {
