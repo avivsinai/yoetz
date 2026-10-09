@@ -115,7 +115,9 @@ async function handleMessage(message) {
         workspace_id: message.workspace_id,
         ownership_nonce: message.ownership_nonce,
         recipe: message.recipe,
-        allow_live_job: message.allow_live_job === true
+        allow_live_job: message.allow_live_job === true,
+        tab_addressed: message.tab_addressed === true,
+        select_model: message.select_model === true
       });
     case "yoetz_dump_conversation":
       return dumpConversation(message.run_id, {
@@ -902,15 +904,25 @@ async function dumpPickerHtml(runId, options = {}) {
   const adapter = await siteAdapter(options.recipe);
   const { parseOwnedWindowName } = await domHelpers(options.recipe);
   const parsed = parseOwnedWindowName(window.name);
-  const jobId = String(options.job_id ?? "").trim();
-  const workspaceId = String(options.workspace_id ?? "").trim();
-  const ownershipNonce = String(options.ownership_nonce ?? "").trim();
-  const jobMatches = Boolean(jobId && parsed?.job_id === jobId);
-  const runMatches = Boolean(runId && parsed?.run_id === runId);
-  const workspaceMatches = Boolean(workspaceId && parsed?.workspace_id === workspaceId);
-  const nonceMatches = Boolean(ownershipNonce && parsed?.ownership_nonce === ownershipNonce);
-  if (!jobMatches || !runMatches || !workspaceMatches || !nonceMatches) {
-    throw commandError("run_mismatch", `tab is not owned by Yoetz job ${jobId || "(unknown)"}, run ${runId}, workspace ${workspaceId || "(unknown)"}`);
+  let jobId = String(options.job_id ?? "").trim();
+  if (options.tab_addressed === true) {
+    // Tab-addressed mode, same ownership rule as dumpConversation: the tab's
+    // own window.name is the evidence and must agree with its _yoetz marker.
+    const markerRunId = runIdFromUrl(location.href);
+    if (!parsed || !markerRunId || parsed.run_id !== markerRunId) {
+      throw commandError("run_mismatch", `tab is no longer owned by the Yoetz run stamped in its URL (window.name=${parsed ? parsed.run_id : "(unowned)"}, marker=${markerRunId ?? "(none)"})`);
+    }
+    jobId = parsed.job_id ?? "";
+  } else {
+    const workspaceId = String(options.workspace_id ?? "").trim();
+    const ownershipNonce = String(options.ownership_nonce ?? "").trim();
+    const jobMatches = Boolean(jobId && parsed?.job_id === jobId);
+    const runMatches = Boolean(runId && parsed?.run_id === runId);
+    const workspaceMatches = Boolean(workspaceId && parsed?.workspace_id === workspaceId);
+    const nonceMatches = Boolean(ownershipNonce && parsed?.ownership_nonce === ownershipNonce);
+    if (!jobMatches || !runMatches || !workspaceMatches || !nonceMatches) {
+      throw commandError("run_mismatch", `tab is not owned by Yoetz job ${jobId || "(unknown)"}, run ${runId}, workspace ${workspaceId || "(unknown)"}`);
+    }
   }
   if (adapter.recipe !== "chatgpt") {
     throw commandError("unsupported_recipe", `dump_picker_html is ChatGPT-only; recipe ${JSON.stringify(adapter.recipe)} rejected before side effects`, {
@@ -928,9 +940,23 @@ async function dumpPickerHtml(runId, options = {}) {
       side_effect_started: false
     });
   }
+  // --select-model changes the model, so it never runs on a live job's tab,
+  // whatever --allow-live-job says.
+  if (options.select_model === true && jobId && activeJobs.has(jobId)) {
+    throw commandError("live_job_conflict", `dump_picker_html --select-model refused on a live job ${jobId}`, {
+      phase: "profile",
+      side_effect_started: false
+    });
+  }
   const { findModelButton } = await import(chrome.runtime.getURL("src/chatgpt-dom.js"));
   const { serializePickerMenu } = await import(chrome.runtime.getURL("src/picker-serializer.js"));
-  const { manualHandoffContext, classifyManualHandoff } = await domHelpers(options.recipe);
+  const { manualHandoffContext, classifyManualHandoff, configureModelState } = await domHelpers(options.recipe);
+  // --select-model: run the recipe's own model selection (no upload, no
+  // send) before the capture, so a picker fix is verified on an account where
+  // a full recipe run must not send.
+  const selection = options.select_model === true
+    ? await configureModelState(document, {})
+    : null;
 
   // Classify the page state so a picker-not-mounted failure names the real
   // cause (challenge / login / rate_limited) instead of a misleading
@@ -1013,7 +1039,8 @@ async function dumpPickerHtml(runId, options = {}) {
     html,
     bytes: new TextEncoder().encode(html).length,
     opened_by_us: openedByUs,
-    closed_after_dump: closedAfterDump
+    closed_after_dump: closedAfterDump,
+    selection
   };
 }
 

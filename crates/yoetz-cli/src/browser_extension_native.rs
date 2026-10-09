@@ -49,6 +49,9 @@ pub const MAX_FRAME_BYTES: usize = MAX_CHROME_NATIVE_EXTENSION_MESSAGE_BYTES;
 pub const MAX_BUNDLE_BYTES: u64 = 10 * 1024 * 1024;
 const CHUNK_BYTES: usize = 192 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
+// dump-picker --select-model runs the recipe's model selection (hydration
+// wait, picker open/close/reopen, slider moves) before it answers.
+const SELECT_MODEL_CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const RECIPE_READ_GRACE: Duration = Duration::from_secs(60);
 // yz-y0p: longest silent stretch a recipe stream may sit in while the wait
 // budget is still running. Progress posts and upload ACKs arrive far more
@@ -2227,7 +2230,15 @@ pub fn inspect_run(
         bail!("--run-id is required");
     }
     if let Some(out_path) = dump_picker_html {
-        return dump_picker_html_run(trimmed, out_path, allow_live_job, selector, recipe);
+        return dump_picker_html_run(
+            Some(trimmed),
+            None,
+            out_path,
+            allow_live_job,
+            false,
+            selector,
+            recipe,
+        );
     }
     let response = send_site_control_job(
         "inspect_run",
@@ -2251,22 +2262,53 @@ pub fn inspect_run(
 // Also reachable via the deprecated `browser extension inspect
 // --dump-picker-html PATH` alias.
 pub fn dump_picker_html_run(
-    run_id: &str,
+    run_id: Option<&str>,
+    tab_id: Option<i64>,
     out_path: &Path,
     allow_live_job: bool,
+    select_model: bool,
     selector: ExtensionInstanceSelector<'_>,
     recipe: BuiltinWebRecipe,
 ) -> Result<Value> {
     if recipe != BuiltinWebRecipe::Chatgpt {
         bail!("dump-picker is only supported with --chatgpt");
     }
-    let response = send_site_control_job(
-        "dump_picker_html",
-        json!({ "run_id": run_id, "recipe": recipe.as_str(), "allow_live_job": allow_live_job }),
-        selector,
-        recipe,
-    )?;
-    finalize_picker_capture(out_path, &response.payload, run_id, recipe)
+    let (mut payload, capture_run_id) =
+        capture_target_payload(run_id, tab_id, allow_live_job, recipe)?;
+    if select_model {
+        payload["select_model"] = json!(true);
+    }
+    let response = send_site_control_job("dump_picker_html", payload, selector, recipe)?;
+    finalize_picker_capture(out_path, &response.payload, capture_run_id, recipe)
+}
+
+// Shared --run-id / --tab-id addressing for the read-only capture commands
+// (dump-picker, dump-conversation). --tab-id (yz-bwi) reaches a preserved
+// `_yoetz` tab whose job record is retired, e.g. a run that failed closed in
+// model_selection.
+fn capture_target_payload(
+    run_id: Option<&str>,
+    tab_id: Option<i64>,
+    allow_live_job: bool,
+    recipe: BuiltinWebRecipe,
+) -> Result<(Value, &str)> {
+    let trimmed = run_id.map(str::trim).filter(|value| !value.is_empty());
+    let mut payload = json!({ "recipe": recipe.as_str(), "allow_live_job": allow_live_job });
+    match (trimmed, tab_id) {
+        (Some(_), Some(_)) => bail!("pass either --run-id or --tab-id, not both"),
+        (Some(run), None) => {
+            payload["run_id"] = json!(run);
+            Ok((payload, run))
+        }
+        (None, Some(id)) => {
+            if id <= 0 {
+                bail!("--tab-id must be a positive Chrome tab id");
+            }
+            payload["tab_id"] = json!(id);
+            Ok((payload, ""))
+        }
+        (None, None) => bail!("--run-id is required unless --tab-id is passed"),
+    }
 }
 
 // Process a dump_picker_html response envelope and write the capture file.
@@ -2336,6 +2378,23 @@ fn finalize_picker_capture(
         out_path.display()
     );
     eprintln!("opened_by_us: {opened_by_us}");
+    let selection = payload.get("selection").filter(|value| !value.is_null());
+    if let Some(selection) = selection {
+        let field = |key: &str| match selection.get(key) {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Null) | None => "null".to_string(),
+            Some(other) => other.to_string(),
+        };
+        eprintln!(
+            "selection: status={} model_used={} failure_reason={} picker_shape={} effort_move_method={} closed_pill_text={}",
+            field("status"),
+            field("model_used"),
+            field("failure_reason"),
+            field("picker_shape"),
+            field("effort_move_method"),
+            field("closed_pill_text"),
+        );
+    }
     Ok(json!({
         "status": "ok",
         "transport": TRANSPORT_NAME,
@@ -2344,6 +2403,7 @@ fn finalize_picker_capture(
         "bytes": bytes,
         "opened_by_us": opened_by_us,
         "closed_after_dump": closed_after_dump,
+        "selection": selection,
         "run_id": run_id,
     }))
 }
@@ -2365,23 +2425,7 @@ pub fn dump_conversation_run(
     if recipe != BuiltinWebRecipe::Chatgpt {
         bail!("dump-conversation is only supported with --chatgpt");
     }
-    let trimmed = run_id.map(str::trim).filter(|value| !value.is_empty());
-    let mut payload = json!({ "recipe": recipe.as_str(), "allow_live_job": allow_live_job });
-    let mut capture_run_id = "";
-    match (trimmed, tab_id) {
-        (Some(_), Some(_)) => bail!("pass either --run-id or --tab-id, not both"),
-        (Some(run), None) => {
-            payload["run_id"] = json!(run);
-            capture_run_id = run;
-        }
-        (None, Some(id)) => {
-            if id <= 0 {
-                bail!("--tab-id must be a positive Chrome tab id");
-            }
-            payload["tab_id"] = json!(id);
-        }
-        (None, None) => bail!("--run-id is required unless --tab-id is passed"),
-    }
+    let (payload, capture_run_id) = capture_target_payload(run_id, tab_id, allow_live_job, recipe)?;
     let response = send_site_control_job("dump_conversation", payload, selector, recipe)?;
     finalize_conversation_capture(out_path, &response.payload, capture_run_id, recipe)
 }
@@ -4337,7 +4381,12 @@ fn send_control_job_with_recipe(
             instance.socket_path.display()
         )
     })?;
-    stream.set_read_timeout(Some(CONTROL_READ_TIMEOUT))?;
+    let read_timeout = if payload.get("select_model").and_then(Value::as_bool) == Some(true) {
+        SELECT_MODEL_CONTROL_READ_TIMEOUT
+    } else {
+        CONTROL_READ_TIMEOUT
+    };
+    stream.set_read_timeout(Some(read_timeout))?;
     let control_run_id =
         (kind == "inspect_run" || kind == "dump_picker_html" || kind == "dump_conversation")
             .then(|| payload.get("run_id").and_then(Value::as_str))
@@ -9727,8 +9776,16 @@ mod tests {
             extension_instance_id: None,
             extension_profile_id: None,
         };
-        let err = dump_picker_html_run("run-490", &out, false, selector, BuiltinWebRecipe::Claude)
-            .unwrap_err();
+        let err = dump_picker_html_run(
+            Some("run-490"),
+            None,
+            &out,
+            false,
+            false,
+            selector,
+            BuiltinWebRecipe::Claude,
+        )
+        .unwrap_err();
         let text = format!("{err:#}");
         assert!(text.contains("dump-picker is only supported with --chatgpt"));
         // No file written on the bail path.
