@@ -640,6 +640,8 @@ struct BrowserExtensionDumpPickerArgs {
     /// Run the recipe's own Latest Pro model selection on the tab before the
     /// capture, and print its result. Nothing is uploaded or sent, so this
     /// verifies a picker fix on an account where a full run must not send.
+    /// It changes the account's saved model and effort, as a run
+    /// would. Refused on a live job's tab, even with --allow-live-job.
     #[arg(long, default_value_t = false)]
     select_model: bool,
 

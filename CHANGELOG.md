@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `_yoetz` tab whose job record is gone (for example a run that failed in
   model selection), and `--select-model` runs the recipe's Latest Pro
   selection on that tab first and prints its result, without uploading or
-  sending anything.
+  sending anything. It changes the account's saved model and effort, and it
+  is refused on a live job's tab.
 
 ## [0.5.87] - 2026-10-08
 ### Fixed

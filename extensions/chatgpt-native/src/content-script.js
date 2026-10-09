@@ -940,6 +940,14 @@ async function dumpPickerHtml(runId, options = {}) {
       side_effect_started: false
     });
   }
+  // --select-model changes the model, so it never runs on a live job's tab,
+  // whatever --allow-live-job says.
+  if (options.select_model === true && jobId && activeJobs.has(jobId)) {
+    throw commandError("live_job_conflict", `dump_picker_html --select-model refused on a live job ${jobId}`, {
+      phase: "profile",
+      side_effect_started: false
+    });
+  }
   const { findModelButton } = await import(chrome.runtime.getURL("src/chatgpt-dom.js"));
   const { serializePickerMenu } = await import(chrome.runtime.getURL("src/picker-serializer.js"));
   const { manualHandoffContext, classifyManualHandoff, configureModelState } = await domHelpers(options.recipe);
