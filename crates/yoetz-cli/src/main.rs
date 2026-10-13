@@ -5045,7 +5045,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 .with_context(|| format!("resolve recipe {:?}", recipe_args.recipe))?;
             let content = fs::read_to_string(&recipe_path)
                 .with_context(|| format!("read recipe {}", recipe_path.display()))?;
-            let recipe: browser::Recipe = serde_yaml_ng::from_str(&content)?;
+            let recipe: browser::Recipe = serde_saphyr::from_str(&content)?;
             let mut recipe_vars =
                 browser::build_recipe_vars(recipe.defaults.as_ref(), &recipe_args.vars)?;
             let profile_dir =
@@ -8574,8 +8574,7 @@ mod tests {
     fn builtin_chatgpt_recipe_defaults_flow_into_shared_sol_chat_pro_spec() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/chatgpt.yaml");
         let content = fs::read_to_string(&path).expect("read recipes/chatgpt.yaml");
-        let recipe: browser::Recipe =
-            serde_yaml_ng::from_str(&content).expect("parse chatgpt.yaml");
+        let recipe: browser::Recipe = serde_saphyr::from_str(&content).expect("parse chatgpt.yaml");
         let recipe_args = BrowserRecipeArgs {
             recipe: PathBuf::from("recipes/chatgpt.yaml"),
             transport: None,
@@ -8608,7 +8607,7 @@ mod tests {
     fn builtin_claude_recipe_routes_attachment_stall_timeout_from_recipe_var_to_native_spec() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/claude.yaml");
         let content = fs::read_to_string(&path).expect("read recipes/claude.yaml");
-        let recipe: browser::Recipe = serde_yaml_ng::from_str(&content).expect("parse claude.yaml");
+        let recipe: browser::Recipe = serde_saphyr::from_str(&content).expect("parse claude.yaml");
         let defaults = browser::build_recipe_vars(recipe.defaults.as_ref(), &[])
             .expect("build default recipe vars");
         assert_eq!(
