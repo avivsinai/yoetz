@@ -7539,7 +7539,7 @@ browser_cdp = "http://evil.example.com:9222"
             ctx.vars.insert("prompt".to_string(), "Review".to_string());
             ctx.vars
                 .insert("run_id".to_string(), "run-focus".to_string());
-            let recipe = serde_yaml_ng::from_str::<Recipe>(
+            let recipe = serde_saphyr::from_str::<Recipe>(
                 r##"
 name: chatgpt
 steps:
@@ -8701,7 +8701,7 @@ steps:
 
     #[test]
     fn recipe_yaml_rejects_unknown_keys() {
-        let top_level_err = serde_yaml_ng::from_str::<Recipe>(
+        let top_level_err = serde_saphyr::from_str::<Recipe>(
             r#"
 name: chatgpt
 oops: true
@@ -8713,7 +8713,7 @@ steps:
         .unwrap_err();
         assert!(top_level_err.to_string().contains("unknown field"));
 
-        let step_err = serde_yaml_ng::from_str::<Recipe>(
+        let step_err = serde_saphyr::from_str::<Recipe>(
             r#"
 name: chatgpt
 steps:
@@ -8728,7 +8728,7 @@ steps:
 
     #[test]
     fn recipe_yaml_parses_transport_order() {
-        let recipe = serde_yaml_ng::from_str::<Recipe>(
+        let recipe = serde_saphyr::from_str::<Recipe>(
             r#"
 name: chatgpt
 transports: [dev-browser, agent-browser, chrome-devtools-mcp, chrome-extension-native, manual]
@@ -8753,7 +8753,7 @@ steps:
 
     #[test]
     fn recipe_transports_default_to_chatgpt_funnel() {
-        let recipe = serde_yaml_ng::from_str::<Recipe>(
+        let recipe = serde_saphyr::from_str::<Recipe>(
             r#"
 name: chatgpt
 steps:
@@ -8783,7 +8783,7 @@ steps:
 
     #[test]
     fn recipe_transports_default_to_same_builtin_claude_funnel() {
-        let recipe = serde_yaml_ng::from_str::<Recipe>(
+        let recipe = serde_saphyr::from_str::<Recipe>(
             r#"
 name: claude
 steps:
@@ -8879,7 +8879,7 @@ steps:
 
     #[test]
     fn recipe_step_parses_timeout_ms() {
-        let recipe = serde_yaml_ng::from_str::<Recipe>(
+        let recipe = serde_saphyr::from_str::<Recipe>(
             r#"
 name: test
 steps:
@@ -8900,7 +8900,7 @@ steps:
         let bin = fake_agent_browser_bin();
         let _bin_env = EnvVarGuard::set("YOETZ_AGENT_BROWSER_BIN", &bin);
         let _log_env = EnvVarGuard::set("LOG_PATH", &log_path);
-        let recipe = serde_yaml_ng::from_str::<Recipe>(
+        let recipe = serde_saphyr::from_str::<Recipe>(
             r#"
 name: noop
 steps:
@@ -8941,7 +8941,7 @@ steps:
     fn builtin_chatgpt_recipe_does_not_pin_transports_so_native_selection_can_fail_closed() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/chatgpt.yaml");
         let content = fs::read_to_string(&path).expect("read recipes/chatgpt.yaml");
-        let recipe: Recipe = serde_yaml_ng::from_str(&content).expect("parse chatgpt.yaml");
+        let recipe: Recipe = serde_saphyr::from_str(&content).expect("parse chatgpt.yaml");
 
         assert!(
             recipe.transports.is_none(),
@@ -8969,7 +8969,7 @@ steps:
     fn builtin_claude_recipe_declares_typed_defaults_without_pinning_transports() {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../recipes/claude.yaml");
         let content = fs::read_to_string(&path).expect("read recipes/claude.yaml");
-        let recipe: Recipe = serde_yaml_ng::from_str(&content).expect("parse claude.yaml");
+        let recipe: Recipe = serde_saphyr::from_str(&content).expect("parse claude.yaml");
         assert!(recipe.transports.is_none());
         let actions = recipe
             .steps
@@ -9041,7 +9041,7 @@ steps:
         let _guard = lock_env();
         let bin = fake_agent_browser_timeout_bin();
         let _bin_env = EnvVarGuard::set("YOETZ_AGENT_BROWSER_BIN", &bin);
-        let recipe = serde_yaml_ng::from_str::<Recipe>(
+        let recipe = serde_saphyr::from_str::<Recipe>(
             r#"
 name: fail-fast
 steps:
