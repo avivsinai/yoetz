@@ -305,10 +305,12 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_CONFIG: .gitleaks.toml
 
+  # The LTO release build runs only after merge; PRs get compile coverage from
+  # clippy, test and MSRV.
   build:
     name: Build (${{ matrix.os }})
     needs: changes
-    if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
