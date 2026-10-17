@@ -40,6 +40,9 @@ const DEFAULT_WAIT_TIMEOUT_MS = 15000;
 const DEFAULT_WAIT_INTERVAL_MS = 250;
 const DEFAULT_SEND_MIN_TIMEOUT_MS = 120000;
 const MIN_IMPLICIT_SURFACE_ABSENCE_MS = 1500;
+const CHAT_SURFACE_MAX_CLICKS = 3;
+// Polls between Chat clicks: about 2 s at the default 250 ms interval.
+const CHAT_SURFACE_RECLICK_ATTEMPTS = 8;
 // Live probe 2026-09-05 (yz-a8c.1): Chat family radio "Latest" checked at Pro
 // effort ("6 Pro" pill); GPT-5.6 Sol / GPT-5.5 mounted unchecked. The pin
 // targets Latest and never Sol.
@@ -899,7 +902,8 @@ export async function ensureChatSurface(root, options = {}) {
   let attempts = 0;
   let observedValues = [];
   let state = surfaceSelectionState(null);
-  let clicked = false;
+  let clicks = 0;
+  let lastClickAttempt = 0;
   let stableProof = null;
   let stableObservations = 0;
   let surfaceEvidenceSeen = options.surfaceEvidenceSeen === true;
@@ -931,6 +935,7 @@ export async function ensureChatSurface(root, options = {}) {
         timeout_ms: timing.timeoutMs,
         interval_ms: timing.intervalMs,
         verification_attempts: Math.max(0, attempts - 1),
+        clicks,
         state,
         observed_values: observedValues,
         surface_evidence_seen: surfaceEvidenceSeen
@@ -946,14 +951,21 @@ export async function ensureChatSurface(root, options = {}) {
         timeout_ms: timing.timeoutMs,
         interval_ms: timing.intervalMs,
         verification_attempts: Math.max(0, attempts - 1),
+        clicks,
         state,
         observed_values: observedValues,
         surface_evidence_seen: surfaceEvidenceSeen
       };
     }
-    if (controls && !surfaceSelectionIsChat(controls) && !clicked) {
+    // A click can land before the toggle is live (live 2026-10-17): click the
+    // freshly found Chat again while Work stays pressed. Clicking an
+    // already-pressed Chat is a no-op.
+    if (controls && !surfaceSelectionIsChat(controls)
+      && clicks < CHAT_SURFACE_MAX_CLICKS
+      && (clicks === 0 || attempts - lastClickAttempt >= CHAT_SURFACE_RECLICK_ATTEMPTS)) {
       realClick(controls.chat);
-      clicked = true;
+      clicks += 1;
+      lastClickAttempt = attempts;
       stableProof = null;
       stableObservations = 0;
     }
@@ -963,8 +975,8 @@ export async function ensureChatSurface(root, options = {}) {
   }
   return {
     ok: false,
-    failure_reason: clicked ? "chat_surface_selection_mismatch" : "chat_surface_control_not_found",
-    warning: clicked
+    failure_reason: clicks > 0 ? "chat_surface_selection_mismatch" : "chat_surface_control_not_found",
+    warning: clicks > 0
       ? "ChatGPT Chat surface could not be verified after selection"
       : 'ChatGPT Chat surface toggle not found or could not be read',
     elapsed_ms: Math.max(0, Date.now() - startedAt),
@@ -972,6 +984,7 @@ export async function ensureChatSurface(root, options = {}) {
     timeout_ms: timing.timeoutMs,
     interval_ms: timing.intervalMs,
     verification_attempts: Math.max(0, attempts - 1),
+    clicks,
     state,
     observed_values: observedValues,
     surface_evidence_seen: surfaceEvidenceSeen
@@ -1140,14 +1153,19 @@ function observedSurfaceToggleValues(root) {
     .slice(0, 10);
 }
 
-// Implicit Chat-surface proof stays pinned to the pre-drift composer label.
-// The 2026-09-28 "Ask ChatGPT" label rides the authenticated ProseMirror
-// composer even when a Composer mode toggle is present, so it must not prove
-// Chat with no toggle (service-worker receipt also requires this exact label).
+// Implicit Chat-surface proof (no Chat/Work toggle) rests on the composer
+// label. "Chat with ChatGPT" is the pre-drift label. "Ask ChatGPT" also rides
+// a fresh page that shows the Composer mode toggle, so it proves Chat only on
+// a conversation page, which renders no toggle (live 2026-10-17; the Work
+// composer reads "Work with ChatGPT"). The receipt validators accept both.
 const CHAT_SURFACE_COMPOSER_ARIA_LABELS = new Set(["Chat with ChatGPT"]);
+const CHAT_CONVERSATION_COMPOSER_ARIA_LABEL = "Ask ChatGPT";
 
-function isChatSurfaceComposerAria(composer) {
-  return CHAT_SURFACE_COMPOSER_ARIA_LABELS.has(composer?.getAttribute?.("aria-label"));
+function isChatSurfaceComposerAria(root, composer) {
+  const label = composer?.getAttribute?.("aria-label");
+  return CHAT_SURFACE_COMPOSER_ARIA_LABELS.has(label)
+    || (label === CHAT_CONVERSATION_COMPOSER_ARIA_LABEL
+      && conversationIdFromPathname(root?.defaultView?.location?.pathname) !== null);
 }
 
 function implicitChatSurfaceProof(root, observedValues) {
@@ -1155,7 +1173,7 @@ function implicitChatSurfaceProof(root, observedValues) {
     || surfaceEvidencePresent(root)) {
     return false;
   }
-  return isChatSurfaceComposerAria(findComposer(root));
+  return isChatSurfaceComposerAria(root, findComposer(root));
 }
 
 function hasPositiveLayout(element) {
@@ -1216,7 +1234,7 @@ export function verifyChatSurface(root = document, options = {}) {
     && !surfaceEvidenceSeen
     && visibleSurfaceGroups(root).length === 0
     && observedValues.length === 0
-    && isChatSurfaceComposerAria(composer);
+    && isChatSurfaceComposerAria(root, composer);
   const proofKind = controlsReady
     ? (controls.shape === "composer_mode"
       ? "explicit_composer_mode_buttons"
@@ -1252,11 +1270,9 @@ export function verifyChatgptModelSelectionBeforeSend(root = document, selection
   const pillText = modelControlLabel(modelButton);
   const pickerOpen = Boolean(findPickerState(root))
     || openComposerPickerLeftovers(root).some((leftover) => leftoverSurfaceIsOpen(root, leftover.trigger));
-  const currentFamilyStatus = pillHasModelFamilyToken(pillText)
-    ? pillConfirmsFamilyLabel(pillText, selection.family_label)
-      ? "verified"
-      : "unverified"
-    : "skipped";
+  const currentFamilyStatus = closedPillFamilyStatus(
+    pillText, selection.family_label, selection.family_label_candidates
+  );
   const currentEffortStatus = pillConfirmsEffortLabel(pillText, "Pro") ? "verified" : "unverified";
   const supportedShape = isSupportedPickerShape({ shape: selection.picker_shape });
   const familyCorroborated = selection.closed_pill_family_status === "verified"
@@ -1326,6 +1342,7 @@ function surfaceResultFields(surface) {
     surface_elapsed_ms: surface?.elapsed_ms ?? null,
     surface_attempts: surface?.attempts ?? 0,
     surface_verification_attempts: surface?.verification_attempts ?? 0,
+    surface_clicks: surface?.clicks ?? 0,
     surface_state: surface?.state ?? surfaceSelectionState(null),
     surface_observed_values: surface?.observed_values ?? [],
     surface_evidence_seen: surface?.surface_evidence_seen === true,
@@ -2272,6 +2289,28 @@ function pillHasModelFamilyToken(pillText) {
     || /\bo\d(?:[\s.-]*\d)?\b/.test(foldedPill)
     || /\b\d+(?:\.\d+)+\b/.test(foldedPill);
 }
+
+// The closed pill names the version-less "Latest" by generation: "6 Pro", or
+// "5.6 Pro" on a ChatGPT Enterprise workspace (live 2026-10-17). For Latest a
+// version contradicts the family only when it names another listed family
+// ("5.6 Sol Pro", "5.5 Pro"); otherwise the post-close picker re-read proves it.
+function closedPillFamilyStatus(pillText, familyLabel, familyOptions) {
+  if (pillConfirmsFamilyLabel(pillText, familyLabel)) return "verified";
+  if (!pillHasModelFamilyToken(pillText)) return "skipped";
+  const otherFamilies = (familyOptions ?? []).filter((option) => !familyIsLatest(option));
+  // Literal "Latest" only: a versioned target ("GPT-6") contradicts any other version.
+  if (foldedModelText(familyLabel) !== "latest" || otherFamilies.length === 0) return "unverified";
+  return otherFamilies.some((option) => pillConfirmsFamilyLabel(pillText, familyOptionName(option)))
+    ? "unverified"
+    : "skipped";
+}
+
+// A family row can carry a note in a sibling span ("GPT-5.5" + "Leaving on
+// October 14"); its text reads back on a second line or glued to the version.
+function familyOptionName(option) {
+  return normalizeText(option).split("\n")[0].replace(/(\d)(?=[A-Z])[\s\S]*$/, "$1");
+}
+
 function closedPillDiagnostics(pillText, readValue) {
   const text = pillText ?? "";
   const familyLabel = readValue?.family?.label ?? null;
@@ -2280,9 +2319,7 @@ function closedPillDiagnostics(pillText, readValue) {
   // label, or the personal row's label — exactly what read.effort.label is.
   const effortLabel = readValue?.effort?.label ?? null;
   const familyStatus = text && familyLabel
-    ? pillConfirmsFamilyLabel(text, familyLabel)
-      ? "verified"
-      : pillHasModelFamilyToken(text) ? "unverified" : "skipped"
+    ? closedPillFamilyStatus(text, familyLabel, readValue?.family?.options)
     : "skipped";
   const verificationStatus = (ok) => (ok ? "verified" : "unverified");
   return {
