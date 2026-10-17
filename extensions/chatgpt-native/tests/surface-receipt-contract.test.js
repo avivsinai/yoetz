@@ -61,9 +61,10 @@ class FakeElement {
 }
 
 class FakeDocument {
-  constructor(body) {
+  constructor(body, { pathname = "/" } = {}) {
     this.body = body;
     this.documentElement = body;
+    this.defaultView = { location: { pathname } };
     body.ownerDocument = this;
     for (const child of flatten(body)) child.ownerDocument = this;
   }
@@ -143,6 +144,26 @@ test("yz-c1l contract: Composer mode verifyChatSurface receipt passes SW surface
   const surface = verifyChatSurface(new FakeDocument(body));
   assert.equal(surface.ok, true, JSON.stringify(surface));
   assert.equal(surface.surface_proof_kind, "explicit_composer_mode_buttons");
+
+  const error = validateChatgptSurfaceProofReceipt(receiptFromSurface(surface));
+  assert.equal(error, null, error);
+});
+
+// Live 2026-10-17, a ChatGPT Enterprise workspace: a conversation page renders
+// no Chat/Work toggle and its Chat composer reads "Ask ChatGPT", so a run
+// continuing a conversation failed with chat_surface_control_not_found.
+test("conversation page Ask ChatGPT composer proof passes SW surface validator", () => {
+  const composer = new FakeElement("div", {
+    contenteditable: "true",
+    role: "textbox",
+    "aria-label": "Ask ChatGPT",
+    class: "ProseMirror"
+  });
+  const body = new FakeElement("body", {}, "Ask ChatGPT").append(composer);
+  const surface = verifyChatSurface(new FakeDocument(body, { pathname: "/c/conv-123" }));
+  assert.equal(surface.ok, true, JSON.stringify(surface));
+  assert.equal(surface.surface_proof_kind, "implicit_chat_composer_aria");
+  assert.equal(surface.surface_composer_aria, "Ask ChatGPT");
 
   const error = validateChatgptSurfaceProofReceipt(receiptFromSurface(surface));
   assert.equal(error, null, error);

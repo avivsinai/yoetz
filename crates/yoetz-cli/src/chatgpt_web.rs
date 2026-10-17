@@ -2852,13 +2852,16 @@ pub fn validate_chatgpt_final_model_selection(
                     "surface_observed_values={observed_values:?}, expected []"
                 ));
             }
-            if object
-                .get("surface_composer_aria")
-                .and_then(serde_json::Value::as_str)
-                != Some("Chat with ChatGPT")
-            {
+            // "Ask ChatGPT" proves Chat only on a conversation page; the
+            // extension enforces that before it reports the label.
+            if !matches!(
+                object
+                    .get("surface_composer_aria")
+                    .and_then(serde_json::Value::as_str),
+                Some("Chat with ChatGPT" | "Ask ChatGPT")
+            ) {
                 problems.push(format!(
-                    "surface_composer_aria={}, expected \"Chat with ChatGPT\"",
+                    "surface_composer_aria={}, expected \"Chat with ChatGPT\" or \"Ask ChatGPT\"",
                     object
                         .get("surface_composer_aria")
                         .unwrap_or(&serde_json::Value::Null)
@@ -3667,6 +3670,29 @@ mod tests {
                 assert!(err.contains("surface_observed_labels"), "{err}");
             }
         }
+    }
+
+    // Live 2026-10-17, a ChatGPT Enterprise workspace: a conversation page has
+    // no Chat/Work toggle and its Chat composer reads "Ask ChatGPT".
+    #[test]
+    fn final_model_selection_validator_accepts_conversation_page_composer_proof() {
+        let receipt = serde_json::json!({
+            "status": "current",
+            "model_used": "5.6 Pro",
+            "requested_model": "current",
+            "family_status": "skipped",
+            "effort_status": "skipped",
+            "click_bound": true,
+            "click_bound_closed_pill_text": "5.6 Pro",
+            "surface_evidence_seen": false,
+            "surface_proof_kind": "implicit_chat_composer_aria",
+            "surface_visible_toggle_count": 0,
+            "surface_composer_aria": "Ask ChatGPT",
+            "surface_observed_values": [],
+            "surface_chat_state": null,
+            "surface_work_state": null
+        });
+        validate_chatgpt_final_model_selection(&receipt, ChatgptModelStrategy::Current).unwrap();
     }
 
     #[test]

@@ -151,9 +151,15 @@ A run never returns success unless every gate below holds.
 
 The only target is the GPT-6 Chat family at the `Pro` effort tier. The family
 radio is labeled `Latest` on conversation pages and `GPT-6` on a fresh chat;
-both are the target, and `model_used` is always `Latest Pro`. Sol, Work mode,
-any other family or tier, and disabled tier rows (the account quota lock,
-`effort_options_disabled`) all fail closed.
+both are the target, and `model_used` is always `Latest Pro`. On a ChatGPT
+Enterprise workspace `Latest` is GPT-5.6 and the closed pill reads `5.6 Pro`.
+Sol, Work mode, any other family or tier, and disabled tier rows (the account
+quota lock, `effort_options_disabled`) all fail closed.
+
+- Surface: a fresh page with a Chat/Work toggle must show Chat pressed; the
+  driver clicks Chat (at most three times) while Work stays pressed. A
+  conversation page has no toggle; there the `Ask ChatGPT` composer is the
+  Chat proof (the Work composer reads `Work with ChatGPT`).
 
 - Reader and driver are separate. `readPicker` (chatgpt-picker-reader.js) is a
   pure function of the DOM: it never locates the pill, never mutates, and is

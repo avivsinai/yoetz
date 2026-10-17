@@ -313,8 +313,10 @@ function appendChatSurfaceToggle(body, {
 // data-tpp-toggle-value hooks).
 function appendChatSurfaceModeGroup(body, {
   surface = "chat",
-  chatClickUpdates = true
+  chatClickUpdates = true,
+  ignoredChatClicks = 0
 } = {}) {
+  let chatClicks = 0;
   const setSurface = (selected) => {
     chat.setAttribute("aria-pressed", String(selected === "chat"));
     work.setAttribute("aria-pressed", String(selected === "work"));
@@ -322,7 +324,8 @@ function appendChatSurfaceModeGroup(body, {
   const chat = new FakeElement("button", {
     "aria-pressed": String(surface === "chat"),
     onClick: () => {
-      if (chatClickUpdates) setSurface("chat");
+      chatClicks += 1;
+      if (chatClickUpdates && chatClicks > ignoredChatClicks) setSurface("chat");
     }
   }, "Chat");
   const work = new FakeElement("button", {
@@ -5050,7 +5053,8 @@ function makeSplitViewPickerFixture({
   sliderNow = 4,
   keyboardMode = "end",
   surface = "chat",
-  rememberView = false
+  rememberView = false,
+  pillGeneration = ""
 } = {}) {
   const levels = ["Instant", "Medium", "High", "Extra High", "Pro"];
   const sliderMin = 0;
@@ -5077,8 +5081,9 @@ function makeSplitViewPickerFixture({
   const body = new FakeElement("body", {}, "Ask ChatGPT").append(form);
   appendChatSurfaceModeGroup(body, { surface });
 
+  const pillLabel = () => (pillGeneration ? `${pillGeneration} ${labelFor(currentNow)}` : labelFor(currentNow));
   const updatePill = () => {
-    pill.innerText = labelFor(currentNow);
+    pill.innerText = pillLabel();
     pill.textContent = pill.innerText;
   };
   const closeMenu = () => {
@@ -5189,7 +5194,7 @@ function makeSplitViewPickerFixture({
     onKeyDown: (event) => {
       if (event.key === "Escape") closeMenu();
     }
-  }, labelFor(currentNow));
+  }, pillLabel());
   form.append(pill);
   const doc = new FakeDocument(body);
 
@@ -5229,6 +5234,21 @@ test("yz-c1l: Composer mode surface on Work is clicked back to Chat and verified
 
   assert.equal(result.ok, true, JSON.stringify(result));
   assert.equal(chat.clicked, true);
+  assert.equal(chat.getAttribute("aria-pressed"), "true");
+});
+
+// Live 2026-10-17, a ChatGPT Enterprise workspace that opens in Work: the one
+// Chat click landed before the toggle was live, Work stayed selected for the
+// whole budget, and the run failed with chat_surface_selection_mismatch.
+test("Composer mode surface clicks Chat again when the first click does not take", async () => {
+  const body = new FakeElement("body", {}, "Ask ChatGPT");
+  const { chat } = appendChatSurfaceModeGroup(body, { surface: "work", ignoredChatClicks: 1 });
+  const doc = new FakeDocument(body);
+
+  const result = await ensureChatSurface(doc, { timeoutMs: 1000, intervalMs: 10 });
+
+  assert.equal(result.ok, true, JSON.stringify(result));
+  assert.equal(result.clicks, 2);
   assert.equal(chat.getAttribute("aria-pressed"), "true");
 });
 
@@ -5380,6 +5400,38 @@ test("split-view picker that reopens into the family view returns to the effort 
   assert.equal(result.model_used, "Latest Pro");
   assert.equal(fixture.familyClicks(), 1, "clicked the checked Latest radio once");
   assert.ok(fixture.sliderKeys() >= 1, "slider received keyboard moves");
+});
+
+// Live 2026-10-17, a ChatGPT Enterprise workspace where Latest is GPT-5.6: the
+// closed pill reads "5.6 Pro". The version names no other listed family, so
+// the run must not fail closed with family_composer_pill_unverified.
+test("split-view picker accepts a 5.6 Pro closed pill for Latest through the post-close re-read", async () => {
+  const fixture = makeSplitViewPickerFixture({ pillGeneration: "5.6" });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, picker_settle_ms: 5, intervalMs: 25 });
+
+  assert.equal(result.status, "selected", JSON.stringify(result));
+  assert.equal(result.model_used, "Latest Pro");
+  assert.equal(result.closed_pill_text, "5.6 Pro");
+  assert.equal(result.closed_pill_family_status, "skipped");
+  assert.equal(result.post_close_family_status, "verified");
+  const proof = verifyChatgptModelSelectionBeforeSend(fixture.doc, result);
+  assert.equal(proof.ok, true, JSON.stringify(proof));
+});
+
+// The reader returns a deprecated row with its note glued on (fixture
+// 2026-10-09-enterprise-family-view-medium.html); a pill naming that family
+// still fails closed.
+test("split-view picker rejects a 5.5 Pro closed pill that names a listed family with a row note", async () => {
+  const fixture = makeSplitViewPickerFixture({
+    pillGeneration: "5.5",
+    families: ["Latest", "GPT-5.6 Sol", "GPT-5.5Leaving on October 14"]
+  });
+
+  const result = await configureModelState(fixture.doc, { pickerTimeoutMs: 100, picker_settle_ms: 5, intervalMs: 25 });
+
+  assert.equal(result.status, "unavailable", JSON.stringify(result));
+  assert.equal(result.failure_reason, "family_composer_pill_unverified");
 });
 
 test("yz-c1l: split-view picker with Sol checked clicks Latest in the family view", async () => {
