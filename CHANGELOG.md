@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   sending anything. It changes the account's saved model and effort, and it
   is refused on a live job's tab.
 
+### Security
+- Bump `rustls` to 0.23.46 for RUSTSEC-2026-0346, RUSTSEC-2026-0347,
+  RUSTSEC-2026-0348, and RUSTSEC-2026-0349 (TLS secrets in `Debug` output,
+  data sent after ECH rejection, a 1 GiB Brotli certificate decompression
+  before authentication, and a key-exchange downgrade from an unauthenticated
+  ServerHello).
+
 ## [0.5.87] - 2026-10-08
 ### Fixed
 - Docs: the README's prebuilt-archive and `cargo install` steps now install the
