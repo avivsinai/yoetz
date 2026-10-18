@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - The minimum supported Rust version (MSRV) is now 1.89 (was 1.88).
   `serde-saphyr` 1.3 needs rustc 1.89.
 ### Fixed
+- Dependencies: bump rustls to 0.23.46 for RUSTSEC-2026-0346..0349.
 - ChatGPT recipe: Latest Pro selection no longer fails closed with
   `effort_control_not_found` when the effort is below Pro (seen on enterprise
   accounts). The picker now reopens into the last active view, so the driver
