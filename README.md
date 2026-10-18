@@ -7,7 +7,7 @@
 [![CI](https://github.com/avivsinai/yoetz/actions/workflows/ci.yml/badge.svg)](https://github.com/avivsinai/yoetz/actions/workflows/ci.yml)
 [![Latest Release](https://img.shields.io/github/v/release/avivsinai/yoetz)](https://github.com/avivsinai/yoetz/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust: 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+[![Rust: 1.89+](https://img.shields.io/badge/rust-1.89%2B-orange.svg)](https://www.rust-lang.org/)
 
 Yoetz is a CLI for coding agents and terminal workflows. It bundles repository
 context (gitignore-aware), sends it to one model or to a council of models in

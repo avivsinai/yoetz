@@ -9,7 +9,7 @@ are in `ARCHITECTURE.md`; user docs are in `README.md`; the agent skill is
 ## Develop
 
 - Rust: `cargo build`, `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`
-  (exactly what CI runs). Rust 2021, MSRV 1.88, `anyhow` in the CLI,
+  (exactly what CI runs). Rust 2021, MSRV 1.89, `anyhow` in the CLI,
   `thiserror` in libraries, `tokio`.
 - Extension: `npm ci --prefix extensions/chatgpt-native --ignore-scripts`
   once (jsdom is required), then

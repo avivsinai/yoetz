@@ -240,7 +240,7 @@ jobs:
         if: needs.changes.outputs.light_only != 'true'
 
   msrv:
-    name: MSRV (1.88)
+    name: MSRV (1.89)
     needs: changes
     if: needs.changes.outputs.release_push != 'true' && needs.changes.outputs.light_only != 'true'
     runs-on: ubuntu-latest
@@ -249,10 +249,10 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
         with:
-          toolchain: 1.88.0
+          toolchain: 1.89.0
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
-          shared-key: rust-msrv-1.88-${{ runner.os }}
+          shared-key: rust-msrv-1.89-${{ runner.os }}
           cache-bin: false
       # --all-targets compiles dev-dependencies too; without it a dev-dep with
       # rust-version above the MSRV passes this job while `cargo test` breaks.
