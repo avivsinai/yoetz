@@ -192,7 +192,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.release_ref }}
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
         with:
           node-version: 24
           cache: npm
@@ -209,7 +209,7 @@ jobs:
 
       - name: Install cross
         if: matrix.cross
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cross
 
@@ -247,7 +247,7 @@ jobs:
           npm ci --prefix staging/scripts --omit=dev --ignore-scripts
           Compress-Archive -Path "staging/*" -DestinationPath "yoetz-${{ matrix.target }}.zip"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: yoetz-${{ matrix.target }}
           path: yoetz-${{ matrix.target }}.*
@@ -267,7 +267,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.release_ref }}
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
         with:
           node-version: 24
 
@@ -288,7 +288,7 @@ jobs:
 
           cp "$zip_path" "yoetz-chatgpt-native-extension-${VERSION}.zip"
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: yoetz-chatgpt-native-extension
           path: yoetz-chatgpt-native-extension-${{ needs.prepare.outputs.version }}.zip
@@ -338,7 +338,7 @@ jobs:
             git push origin "refs/tags/${TAG}"
           fi
 
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
           merge-multiple: true
@@ -422,7 +422,7 @@ jobs:
         with:
           ref: ${{ needs.prepare.outputs.release_ref }}
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v6
         with:
           node-version: 20
 
@@ -506,7 +506,7 @@ jobs:
     if: >-
       needs.prepare.result == 'success' && needs.prepare.outputs.prerelease != 'true'
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
           merge-multiple: true
@@ -595,7 +595,7 @@ jobs:
     if: >-
       needs.prepare.result == 'success' && needs.prepare.outputs.prerelease != 'true'
     steps:
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           path: artifacts
           merge-multiple: true
