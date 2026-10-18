@@ -44,7 +44,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
 ] }
 tokio = { version = "1.52", features = ["io-util", "rt-multi-thread", "macros", "process", "time"] }
-serde-saphyr = "=1.1.0"
+serde-saphyr = "=1.3.0"
 tempfile = "3.27"
 jsonschema = { version = "0.58", default-features = false, features = ["resolve-file"] }
 fs2.workspace = true
