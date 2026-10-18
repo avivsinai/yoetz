@@ -100,8 +100,11 @@ export function validateChatgptSurfaceProofReceipt(receipt) {
     if (observed.length !== 0) {
       problems.push(`surface_observed_values=${fmt(observed)}, expected []`);
     }
-    if (receipt.surface_composer_aria !== "Chat with ChatGPT") {
-      problems.push(`surface_composer_aria=${fmt(receipt.surface_composer_aria)}, expected "Chat with ChatGPT"`);
+    // "Ask ChatGPT" proves Chat only on a conversation page; chatgpt-dom.js
+    // enforces that before it reports the label.
+    if (receipt.surface_composer_aria !== "Chat with ChatGPT"
+      && receipt.surface_composer_aria !== "Ask ChatGPT") {
+      problems.push(`surface_composer_aria=${fmt(receipt.surface_composer_aria)}, expected "Chat with ChatGPT" or "Ask ChatGPT"`);
     }
     if (chatState !== null) {
       problems.push(`surface_chat_state=${fmt(chatState)}, expected null`);

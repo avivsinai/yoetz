@@ -1000,6 +1000,7 @@ function modelSelectionFailureDiagnostics(selection) {
     "surface_elapsed_ms",
     "surface_attempts",
     "surface_verification_attempts",
+    "surface_clicks",
     "surface_state",
     "surface_observed_values",
     "modelVerified",

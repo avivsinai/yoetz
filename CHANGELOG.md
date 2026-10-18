@@ -12,6 +12,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   accounts). The picker now reopens into the last active view, so the driver
   returns from the family view to the effort slider by clicking the checked
   Latest radio instead of relying on close and reopen.
+- ChatGPT recipe: Latest Pro selection no longer fails closed with
+  `family_composer_pill_unverified` on a ChatGPT Enterprise workspace where
+  Latest is GPT-5.6. The closed pill reads `5.6 Pro` there; a version in the
+  pill now counts against Latest only when it names another family the picker
+  lists (`5.6 Sol Pro`, `5.5 Pro`), and the post-close picker re-read proves
+  the family otherwise.
+- ChatGPT recipe: a page that opens in Work mode no longer fails with
+  `chat_surface_selection_mismatch` when the one Chat click lands before the
+  Chat/Work toggle is live. The driver clicks Chat again (at most three
+  clicks, about 2 s apart) while Work stays selected, and failure diagnostics
+  report `surface_clicks`.
+- ChatGPT recipe: `--var conversation=<id>` no longer fails with
+  `chat_surface_control_not_found` when the conversation page has no Chat/Work
+  toggle. On a conversation page the `Ask ChatGPT` composer now proves the Chat
+  surface (the Work composer reads `Work with ChatGPT`); a fresh page still
+  needs the toggle, and the extension and CLI receipt checks accept the label.
 - `browser extension dump-conversation --tab-id` no longer times out after a
   successful capture: the reply now carries the request's run id, so the
   native host delivers it.
