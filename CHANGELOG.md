@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.88] - 2026-10-18
 ### Changed
 - The minimum supported Rust version (MSRV) is now 1.89 (was 1.88).
   `serde-saphyr` 1.3 needs rustc 1.89.
@@ -42,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   selection on that tab first and prints its result, without uploading or
   sending anything. It changes the account's saved model and effort, and it
   is refused on a live job's tab.
+
 
 ## [0.5.87] - 2026-10-08
 ### Fixed
