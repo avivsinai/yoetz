@@ -1640,6 +1640,37 @@ test("backend-api read returns the fresh final answer from the conversation mapp
   }
 });
 
+test("backend-api read strips ChatGPT inline citation markers from the answer", async () => {
+  const { send, hooks, restore } = await loadContentScript("backend_citations", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
+  const marker = (kind, ...refs) => `\uE200${kind}\uE202${refs.join("\uE202")}\uE201`;
+  const RAW = [
+    `Water boils at 100 C at sea level ${marker("cite", "turn0search1")}.`,
+    `Ice melts at 0 C. ${marker("cite", "turn12search1", "turn34search7", "turn56view7")} ${marker("cite", "turn7search0")}`,
+    `| Fact | Note |\n| melt | see notes ${marker("filecite", "turn0file0", "L20-L28")} |`
+  ].join("\n");
+  const restoreFetch = installBackendFetch({ conv: {
+    current_node: "a_final",
+    mapping: {
+      u1: { id: "u1", parent: null, children: ["a_final"], message: { author: { role: "user" }, content: { content_type: "text", parts: ["facts"] }, end_turn: null } },
+      a_final: asstTextNode("a_final", "u1", RAW)
+    }
+  }});
+  try {
+    const job = fetchJob(0);
+    await prepareFetchJob(send, hooks, job);
+    const res = await send({ type: "yoetz_fetch_conversation", job, conversation_id: "conv-123" });
+    assert.equal(res.ok, true, JSON.stringify(res));
+    assert.equal(res.payload.text, [
+      "Water boils at 100 C at sea level.",
+      "Ice melts at 0 C.",
+      "| Fact | Note |\n| melt | see notes |"
+    ].join("\n"));
+  } finally {
+    restoreFetch();
+    restore();
+  }
+});
+
 test("backend-api freshness uses the pre-send answer baseline, not the post-send DOM turn count", async () => {
   const { send, hooks, restore } = await loadContentScript("backend_post_send_dom_turn", "https://chatgpt.com/c/conv-123?_yoetz=run_fetch");
   const restoreFetch = installBackendFetch({ conv: {

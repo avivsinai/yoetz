@@ -185,7 +185,7 @@ function resolveBackendAnswer(job, conversationId, data) {
   if (lineageAnswerCount <= baseline) {
     return notReady(`assistant answer not fresh past baseline (active-lineage ${lineageAnswerCount} <= ${baseline})`);
   }
-  const text = answerTextOf(answerNode.message);
+  const text = answerTextOf(answerNode.message).replace(CITATION_MARKER, "").trim();
   if (!text) {
     return notReady("latest active-lineage assistant answer node had no text parts");
   }
@@ -216,6 +216,11 @@ function isAssistantAnswerNode(message) {
     && answerTextOf(message).length > 0
   );
 }
+
+// Raw answer markdown carries inline citation markers that the web UI renders
+// as source pills: U+E200 cite|filecite (U+E202 <ref>)+ U+E201. The DOM path
+// already drops the pills (#345), so drop the markers and the space before them.
+const CITATION_MARKER = / ?\uE200(?:file)?cite\uE202[^\uE200\uE201]*\uE201/g;
 
 function answerTextOf(message) {
   const parts = message?.content?.parts;
