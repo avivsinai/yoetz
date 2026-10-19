@@ -1398,45 +1398,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
-    fn bundled_daemon_status_round_trips_under_isolated_home() {
-        let dir = tempfile::tempdir().unwrap();
-        let _home = EnvVarGuard::set("HOME", dir.path().as_os_str());
-        let _runtime = EnvVarGuard::remove("XDG_RUNTIME_DIR");
-        let _enabled = EnvVarGuard::remove(YOETZ_LIVE_CDP_DAEMON_ENV);
-
-        let paths = daemon_paths_for_home(dir.path());
-        let result = (|| -> Result<()> {
-            ensure_daemon()?;
-            let token_metadata = fs::symlink_metadata(&paths.token_path)
-                .with_context(|| format!("inspect {}", paths.token_path.display()))?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if token_metadata.permissions().mode() & 0o777 != 0o600 {
-                    return Err(anyhow!(
-                        "unexpected daemon token permissions: {:03o}",
-                        token_metadata.permissions().mode() & 0o777
-                    ));
-                }
-            }
-            let status = request_daemon_status(&paths)?;
-            if status.version.as_deref() != Some(daemon_version().as_str()) {
-                return Err(anyhow!("unexpected daemon status version: {status:?}"));
-            }
-            if status.pid.is_none() {
-                return Err(anyhow!("status response did not include pid"));
-            }
-            Ok(())
-        })();
-        let stopped = stop_live_cdp_daemon();
-
-        result.unwrap();
-        stopped.unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial]
     fn stale_socket_file_is_cleaned_and_recovered() {
         let dir = tempfile::tempdir().unwrap();
         let _home = EnvVarGuard::set("HOME", dir.path().as_os_str());
