@@ -5958,6 +5958,61 @@ mod tests {
         normalize_model_name_with_aliases(model, &std::collections::HashMap::new())
     }
 
+    #[test]
+    fn extension_status_text_shows_each_profile_version() {
+        use browser_extension_native::{ExtensionInstanceStatus, ExtensionStatus};
+        let instance =
+            |extension_instance_id: &str, extension_version: &str| ExtensionInstanceStatus {
+                native_instance_id: format!("native_{extension_instance_id}"),
+                socket_path: PathBuf::from("/tmp/instance.sock"),
+                pid: 1,
+                extension_instance_id: Some(extension_instance_id.to_string()),
+                extension_version: Some(extension_version.to_string()),
+                profile_email: None,
+                profile_id: None,
+                recipes: vec!["chatgpt".to_string()],
+                capabilities: Vec::new(),
+                protocol_version: browser_extension_native::PROTOCOL_VERSION,
+                last_seen_ms: 1,
+                cooldown_until_ms: None,
+            };
+        let status = ExtensionStatus {
+            status: "connected",
+            native_host_name: browser_extension_native::NATIVE_HOST_NAME,
+            extension_id: browser_extension_native::EXTENSION_ID,
+            hello_seen: true,
+            extension_version: Some("0.5.0.1".to_string()),
+            extension_instance_id: Some("ext_work".to_string()),
+            extension_profile_email: None,
+            extension_profile_id: None,
+            manifest_path: PathBuf::from("/tmp/manifest.json"),
+            manifest_installed: true,
+            wrapper_path: PathBuf::from("/tmp/wrapper.sh"),
+            wrapper_installed: true,
+            socket_path: PathBuf::from("/tmp/yoetz.sock"),
+            socket_reachable: true,
+            token_path: PathBuf::from("/tmp/token"),
+            token_present: true,
+            status_path: PathBuf::from("/tmp/status.json"),
+            status_file_present: true,
+            connected_instances: vec![
+                instance("ext_work", "0.5.0.1"),
+                instance("ext_personal", "0.4.0.6"),
+            ],
+            active_jobs: Vec::new(),
+            sw_telemetry: None,
+            recipes: vec!["chatgpt".to_string()],
+            claude_ready: false,
+            protocol_version: browser_extension_native::PROTOCOL_VERSION,
+            detail: "test".to_string(),
+        };
+
+        let text = format_extension_status(&status, web_recipe::BuiltinWebRecipe::Chatgpt);
+
+        assert!(text.contains("extension_instance_id=ext_work extension_version=0.5.0.1"));
+        assert!(text.contains("extension_instance_id=ext_personal extension_version=0.4.0.6"));
+    }
+
     fn test_app_context() -> AppContext {
         let config = Config::default();
         let client = build_client(1).expect("build reqwest client");
