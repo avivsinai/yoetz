@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.90] - 2026-10-19
 ### Fixed
 - `yoetz browser extension update` without a profile selector now updates and
   reloads every connected Chrome profile, instead of failing with "multiple
@@ -14,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `extension_instance` fields). A selector still updates one profile.
 - `yoetz browser extension status` shows the `extension_version` of each
   connected profile, so a profile left on an old version is visible.
+
 
 ## [0.5.89] - 2026-10-19
 ### Fixed
