@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/yoetz-core", "crates/yoetz-cli"]
 
 [workspace.package]
-version = "0.5.88"
+version = "0.5.89"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT"

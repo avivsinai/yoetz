@@ -6,11 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.89] - 2026-10-19
 ### Fixed
 - ChatGPT recipe: an answer read from the conversation API no longer contains
   raw inline citation markers (`U+E200 cite U+E202 turn0search1 U+E201`, shown
   as `citeturn0search1`). The extension drops them, as the DOM path already
   drops citation pills.
+
 
 ## [0.5.88] - 2026-10-18
 ### Changed
