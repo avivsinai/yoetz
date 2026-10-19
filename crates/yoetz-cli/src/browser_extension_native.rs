@@ -2051,45 +2051,63 @@ pub fn update_extension(
 ) -> Result<Value> {
     let _lifecycle_lock = acquire_extension_lifecycle_exclusive("update native extension")?;
     let paths = extension_paths()?;
-    let previous_instance = select_extension_instance(&paths, selector)?;
+    let targets = extension_update_targets(&paths, selector)?;
     let update = prepare_managed_chatgpt_extension_unlocked()?;
     let expected_version = update
         .manifest_version
         .as_deref()
         .context("managed extension copy has no stamped manifest version")?;
-    ensure_reload_can_reach_managed_copy(&previous_instance, &update)?;
-    // yz-7xv: capture the pre-reload identity BEFORE issuing the reload.
-    // The post-reload wait selects the profile's entry by
-    // extension_instance_id (stable across reloads) and compares that
-    // entry's native_instance_id (what actually changes on a reload)
-    // against this baseline.
-    let pre_native_instance_id = previous_instance.native_instance_id.clone();
-    let target_extension_instance_id = previous_instance.extension_instance_id.clone();
-    let reload = reload_extension_unlocked(selector)?;
-    let instance = wait_for_extension_update(
-        &paths,
-        selector,
-        expected_version,
-        recipe.as_str(),
-        &previous_instance.native_instance_id,
-    )
-    .with_context(|| {
-        format!(
-            "managed extension source {} was copied, but the loaded extension did not activate the requested site capability",
-            update.source_dir.display()
+    // Check every target before the first reload so a wrong-path load fails
+    // closed before any side effect.
+    for target in &targets {
+        ensure_reload_can_reach_managed_copy(target, &update)?;
+    }
+    // Reload every target before waiting on any: the reconnect wait reads the
+    // aggregate status, which a not-yet-reloaded profile can hold at
+    // version_mismatch. yz-7xv: each target's native_instance_id is its
+    // pre-reload baseline; extension_instance_id is stable across reloads.
+    let mut reloads = Vec::with_capacity(targets.len());
+    for target in &targets {
+        reloads.push(reload_extension_unlocked(update_target_selector(
+            target,
+            selector,
+            targets.len(),
+        ))?);
+    }
+    let mut extension_instances = Vec::with_capacity(targets.len());
+    let mut site_status = None;
+    for (target, reload) in targets.iter().zip(reloads) {
+        let instance = wait_for_extension_update(
+            &paths,
+            update_target_selector(target, selector, targets.len()),
+            expected_version,
+            recipe.as_str(),
+            &target.native_instance_id,
         )
-    })?;
-    // yz-7xv: do not return while the reloaded worker is still reconnecting —
-    // the next command in the release runbook (update-then-run) would race
-    // the reload window and reject the instance-id selector. The new-instance
-    // wait IS the version verification (instance id differs from the pre
-    // reload baseline AND version == expected_version).
-    let site_status = wait_for_reloaded_instance(
-        recipe,
-        &pre_native_instance_id,
-        target_extension_instance_id.as_deref().unwrap_or(""),
-        expected_version,
-    )?;
+        .with_context(|| {
+            format!(
+                "managed extension source {} was copied, but the loaded extension did not activate the requested site capability",
+                update.source_dir.display()
+            )
+        })?;
+        // yz-7xv: do not return while the reloaded worker is still
+        // reconnecting — the next command in the release runbook
+        // (update-then-run) would race the reload window and reject the
+        // instance-id selector. The new-instance wait IS the version
+        // verification (instance id differs from the pre reload baseline AND
+        // version == expected_version).
+        site_status = Some(wait_for_reloaded_instance(
+            recipe,
+            &target.native_instance_id,
+            target.extension_instance_id.as_deref().unwrap_or(""),
+            expected_version,
+        )?);
+        extension_instances.push(json!({
+            "reload": reload,
+            "extension_instance": instance,
+        }));
+    }
+    let site_status = site_status.context("extension update selected no instance")?;
     Ok(json!({
         "status": "updated",
         "transport": TRANSPORT_NAME,
@@ -2102,11 +2120,49 @@ pub fn update_extension(
         "manifest_version": update.manifest_version,
         "copy_status": update.status,
         "copied_files": update.copied_files,
-        "reload": reload,
-        "extension_instance": instance,
+        "extension_instances": extension_instances,
         "site_status": site_status.status,
         "site_status_detail": site_status.detail,
     }))
+}
+
+/// Instances `update` reloads. Every connected Chrome profile loads the one
+/// managed copy, so with no selector all of them must reload, or the ones
+/// left behind run stale code against the new CLI. A selector, or anything
+/// `select_extension_instance` must refuse, keeps the single-instance path.
+fn extension_update_targets(
+    paths: &ExtensionPaths,
+    selector: ExtensionInstanceSelector<'_>,
+) -> Result<Vec<ExtensionInstanceStatus>> {
+    let selector_given = non_empty_selector(selector.profile_email).is_some()
+        || non_empty_selector(selector.extension_instance_id).is_some()
+        || non_empty_selector(selector.extension_profile_id).is_some();
+    if !selector_given {
+        let connected = connected_extension_instances(paths);
+        if connected.malformed_records == 0
+            && connected.instances.len() > 1
+            && connected.instances.iter().all(|instance| {
+                non_empty_selector(instance.extension_instance_id.as_deref()).is_some()
+            })
+        {
+            return Ok(connected.instances);
+        }
+    }
+    Ok(vec![select_extension_instance(paths, selector)?])
+}
+
+fn update_target_selector<'a>(
+    target: &'a ExtensionInstanceStatus,
+    selector: ExtensionInstanceSelector<'a>,
+    target_count: usize,
+) -> ExtensionInstanceSelector<'a> {
+    if target_count == 1 {
+        return selector;
+    }
+    ExtensionInstanceSelector {
+        extension_instance_id: target.extension_instance_id.as_deref(),
+        ..ExtensionInstanceSelector::default()
+    }
 }
 
 pub fn bridge_check_for_recipe(
@@ -9322,6 +9378,55 @@ mod tests {
 
         assert_eq!(selected.native_instance_id, "native_work");
         assert_eq!(selected.socket_path, work_socket);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    #[serial]
+    fn extension_update_targets_every_connected_profile_without_a_selector() {
+        use std::os::unix::net::UnixListener;
+
+        let dir = TempDir::new().unwrap();
+        let manifest_dir = dir.path().join("native-hosts");
+        let state_dir = dir.path().join("state");
+        let _manifest_guard = EnvGuard::set("YOETZ_CHROME_NATIVE_MESSAGING_DIR", &manifest_dir);
+        let _state_guard = EnvGuard::set("YOETZ_DIR", &state_dir);
+        let paths = extension_paths().unwrap();
+        fs::create_dir_all(&paths.instances_dir).unwrap();
+        let mut listeners = Vec::new();
+        for (native_id, extension_id, socket_name) in [
+            ("native_work", "ext_work", "work.sock"),
+            ("native_personal", "ext_personal", "personal.sock"),
+        ] {
+            let socket = fixture_socket_path(&paths, native_id, socket_name);
+            listeners.push(UnixListener::bind(&socket).unwrap());
+            write_instance_fixture(
+                &paths,
+                ExtensionInstanceStatus {
+                    native_instance_id: native_id.to_string(),
+                    socket_path: socket,
+                    pid: process::id(),
+                    extension_instance_id: Some(extension_id.to_string()),
+                    extension_version: Some("0.4.0".to_string()),
+                    profile_email: None,
+                    profile_id: None,
+                    recipes: default_extension_recipes(),
+                    capabilities: Vec::new(),
+                    protocol_version: PROTOCOL_VERSION,
+                    last_seen_ms: 1,
+                    cooldown_until_ms: None,
+                },
+            );
+        }
+
+        let targets =
+            extension_update_targets(&paths, ExtensionInstanceSelector::default()).unwrap();
+
+        let ids = targets
+            .iter()
+            .map(|target| target.extension_instance_id.as_deref().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["ext_personal", "ext_work"]);
     }
 
     #[test]

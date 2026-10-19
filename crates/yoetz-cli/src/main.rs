@@ -4341,11 +4341,12 @@ fn format_extension_status(
         lines.push("connected_instances:".to_string());
         for instance in &status.connected_instances {
             lines.push(format!(
-                "  - extension_instance_id={} chrome_profile_email={} chrome_profile_id={} native_instance_id={} socket={}",
+                "  - extension_instance_id={} extension_version={} chrome_profile_email={} chrome_profile_id={} native_instance_id={} socket={}",
                 instance
                     .extension_instance_id
                     .as_deref()
                     .unwrap_or("<unknown>"),
+                instance.extension_version.as_deref().unwrap_or("<unknown>"),
                 instance.profile_email.as_deref().unwrap_or("<unknown>"),
                 instance.profile_id.as_deref().unwrap_or("<unknown>"),
                 instance.native_instance_id,
