@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Changed
+- macOS release binaries are signed with a Developer ID and notarized when the
+  signing secrets are configured, so Gatekeeper accepts a binary downloaded
+  from the release page. Without the secrets they stay ad-hoc signed.
 
 ## [0.5.90] - 2026-10-19
 ### Fixed

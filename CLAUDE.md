@@ -43,6 +43,14 @@ are in `ARCHITECTURE.md`; user docs are in `README.md`; the agent skill is
   `workflow_dispatch` retries an existing tag.
 - Branch protection needs an up-to-date branch: on "Head branch is out of
   date", run `gh pr update-branch <n>`, wait for CI, then merge. Never `--admin`.
+- macOS release binaries are signed with a Developer ID and notarized when
+  all six repository secrets are set: `APPLE_TEAM_ID`,
+  `APPLE_DEVELOPER_ID_P12_BASE64`, `APPLE_DEVELOPER_ID_P12_PASSWORD`,
+  `APPLE_NOTARY_ISSUER_ID`, `APPLE_NOTARY_KEY_ID`,
+  `APPLE_NOTARY_KEY_P8_BASE64`. All or none: with none, `release.yml` warns
+  and signs ad-hoc as before; with some, the release fails. The `.p12` must
+  hold the "Developer ID Application" certificate, its key and the Developer
+  ID intermediate.
 - Gitleaks scans the whole PR range. A secret-shaped literal (including a UUID
   next to a `key`-like attribute in a fixture) must be replaced and the
   introducing commit rewritten; a later deleting commit does not clear it.
