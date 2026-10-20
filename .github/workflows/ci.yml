@@ -373,7 +373,6 @@ jobs:
             libxcomposite1 \
             libxdamage1 \
             libxrandr2 \
-            libu2f-udev \
             libvulkan1 \
             xdg-utils
       - name: Fake-ChatGPT fixture tests
