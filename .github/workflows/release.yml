@@ -287,7 +287,26 @@ jobs:
           YOETZ_MACOS_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           YOETZ_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
           YOETZ_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-        run: ./scripts/codesign-macos.sh target/${{ matrix.target }}/release/${{ matrix.artifact }} io.github.avivsinai.yoetz darwin
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/${{ matrix.artifact }}"
+          # A workflow_dispatch rerun of a tag older than this script checks
+          # out a tree without it: sign ad-hoc as those releases did.
+          if [[ ! -f scripts/codesign-macos.sh ]]; then
+            echo "::warning::scripts/codesign-macos.sh is missing at this ref; signing ad-hoc."
+            codesign --force --sign - --identifier io.github.avivsinai.yoetz "$binary"
+            exit 0
+          fi
+          ./scripts/codesign-macos.sh "$binary" io.github.avivsinai.yoetz darwin
+
+      - name: Remove macOS signing material
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        run: |
+          if [[ -n "${YOETZ_MACOS_KEYCHAIN:-}" ]]; then
+            security delete-keychain "$YOETZ_MACOS_KEYCHAIN" || true
+          fi
+          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary-key.p8"
 
       - name: Build (cross)
         if: matrix.cross
@@ -321,15 +340,6 @@ jobs:
           path: yoetz-${{ matrix.target }}.*
           retention-days: 1
           compression-level: 0
-
-      - name: Remove macOS signing material
-        if: always() && runner.os == 'macOS'
-        shell: bash
-        run: |
-          if [[ -n "${YOETZ_MACOS_KEYCHAIN:-}" ]]; then
-            security delete-keychain "$YOETZ_MACOS_KEYCHAIN" || true
-          fi
-          rm -f "$RUNNER_TEMP/developer-id.p12" "$RUNNER_TEMP/notary-key.p8"
 
   build-chatgpt-native-extension:
     name: Build ChatGPT Native Extension
