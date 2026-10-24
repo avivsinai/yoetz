@@ -1231,13 +1231,13 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litellm-rust"
-version = "0.3.0"
-source = "git+https://github.com/avivsinai/litellm-rust?tag=v0.3.0#739cb399b4aab147e25910e2737d405e533f6ae3"
+version = "0.4.0"
+source = "git+https://github.com/avivsinai/litellm-rust?tag=v0.4.0#ad7693c552c23240d22f75fb8d6b3decdcdd2e91"
 dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "futures-util",
  "mime_guess",
