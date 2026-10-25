@@ -458,7 +458,10 @@ printf '%s' '{{"type":"result","subtype":"success","is_error":false,"result":"re
             &models,
             "cursor/cursor-grok-4.6-xhigh",
             "bounded context",
-            Duration::from_secs(2),
+            // The fixture exits in milliseconds; this bound only stops a
+            // runaway. Under parallel test load (8+ threads on a busy Mac)
+            // a 2s wall clock flaked with 'timed out after 2 seconds'.
+            Duration::from_secs(30),
         )
         .await
         .unwrap();
@@ -568,11 +571,14 @@ printf '%s' '{{"type":"result","subtype":"success","is_error":false,"result":"re
         .await
         .unwrap_err();
         assert!(error.to_string().contains("timed out"));
-        for _ in 0..200 {
+        // The fixture publishes the child PID within milliseconds, but spawn
+        // under parallel test load on a busy Mac can take seconds. Wait up
+        // to 15s before declaring the fixture broken.
+        for _ in 0..600 {
             if child_log.exists() {
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(child_log.exists(), "fixture did not publish child PID");
         let child_pid: libc::pid_t = std::fs::read_to_string(child_log).unwrap().parse().unwrap();
