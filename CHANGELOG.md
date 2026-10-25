@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.92] - 2026-10-25
 ### Changed
 - Tokio updated to 1.54.1, clearing RUSTSEC-2026-0386 (tokio AsyncFd soundness
   advisory). Dependency-only change; no user-visible behavior change.
@@ -13,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Fixed
 - Internal dependency updates past current RustSec advisories (rustls, webpki,
   quinn-proto, webpki-roots) and Node 24 in CI workflows.
+
 
 ## [0.5.91] - 2026-10-20
 ### Changed
