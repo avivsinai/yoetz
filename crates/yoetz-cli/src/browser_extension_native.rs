@@ -73,6 +73,10 @@ const TAB_PACING_WAIT_MARGIN: Duration = Duration::from_millis(500);
 #[cfg(test)]
 const TAB_PACING_WAIT_MARGIN: Duration = Duration::from_millis(5);
 const RECIPE_RECONNECT_WINDOW: Duration = Duration::from_secs(60);
+// yz-einval: EINVAL (os error 22) from read/setsockopt on a Unix stream whose
+// peer fully closed after unread data — macOS reports the taken reset as
+// EINVAL. io::ErrorKind::InvalidArgument is not stable, so match the raw code.
+const EINVAL_OS_ERROR: i32 = 22;
 const RECIPE_RECONNECT_INTERVAL: Duration = Duration::from_millis(250);
 const EXTENSION_RELOAD_VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
 const EXTENSION_RELOAD_VERIFY_INTERVAL: Duration = Duration::from_millis(250);
@@ -2819,8 +2823,22 @@ fn run_extension_recipe_with_reconnect(
                 // whole wait budget in silence. The cap is derived per run so a
                 // legitimately long attach/send budget is never preempted.
                 let remaining = overall_budget.saturating_sub(started.elapsed());
-                stream.set_read_timeout(Some(remaining.min(inactivity_cap)))?;
-                read_json_frame(&mut stream)
+                // yz-einval: on macOS, setsockopt(SO_RCVTIMEO) fails with EINVAL
+                // once the peer has fully closed and the socket has taken a
+                // reset. Treat that the same as a read-time disconnect so the
+                // reconnect path runs instead of surfacing a bare io error.
+                let timeout_error = stream
+                    .set_read_timeout(Some(remaining.min(inactivity_cap)))
+                    .err()
+                    .map(|error| anyhow::Error::new(error).context("set recipe read timeout"));
+                if let Some(error) = timeout_error {
+                    if !is_recipe_disconnect_error(&error) {
+                        return Err(error);
+                    }
+                    Err(error)
+                } else {
+                    read_json_frame(&mut stream)
+                }
             }
         };
         match read {
@@ -3028,23 +3046,25 @@ fn reconnect_recipe_stream(
 }
 
 fn set_recipe_read_timeout(stream: &SocketStream, wait_timeout_ms: u64) -> Result<()> {
-    stream.set_read_timeout(Some(
-        Duration::from_millis(wait_timeout_ms).saturating_add(RECIPE_READ_GRACE),
-    ))?;
+    let timeout = Duration::from_millis(wait_timeout_ms).saturating_add(RECIPE_READ_GRACE);
+    stream
+        .set_read_timeout(Some(timeout))
+        .context("set recipe read timeout for reconnect stream")?;
     Ok(())
 }
 
 fn is_recipe_disconnect_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
+        let Some(io_error) = cause.downcast_ref::<io::Error>() else {
+            return false;
+        };
         matches!(
-            cause.downcast_ref::<io::Error>().map(io::Error::kind),
-            Some(
-                io::ErrorKind::UnexpectedEof
-                    | io::ErrorKind::BrokenPipe
-                    | io::ErrorKind::ConnectionAborted
-                    | io::ErrorKind::ConnectionReset
-            )
-        )
+            io_error.kind(),
+            io::ErrorKind::UnexpectedEof
+                | io::ErrorKind::BrokenPipe
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+        ) || io_error.raw_os_error() == Some(EINVAL_OS_ERROR)
     })
 }
 
