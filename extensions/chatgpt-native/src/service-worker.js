@@ -3737,7 +3737,9 @@ function normalizeJob(message, adapter) {
     conversation_error: conversation.ok ? null : conversation,
     bundle_size: payload.bundle_size ?? 0,
     file_name: payload.file_name ?? "yoetz-bundle.md",
-    attachments: Array.isArray(payload.attachments) ? payload.attachments : null,
+    attachments: Array.isArray(payload.attachments)
+      ? payload.attachments.map(({ filename, mime_type, bytes }) => ({ filename, mime_type, bytes: Number(bytes) }))
+      : null,
     model_selection_status: "unavailable",
     model_used: null,
     warnings: [],

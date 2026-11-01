@@ -4420,9 +4420,8 @@ fn validate_bundle_path(path: &Path) -> Result<BundleInfo> {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "webp" => "image/webp",
-        "json" => "application/json",
-        "txt" | "log" | "diff" | "patch" | "csv" => "text/plain",
-        _ => "application/octet-stream",
+        // Unchanged default: source and request files have always gone as text.
+        _ => "text/plain",
     }
     .to_string();
     Ok(BundleInfo {
@@ -4435,7 +4434,8 @@ fn validate_bundle_path(path: &Path) -> Result<BundleInfo> {
 
 /// yz-w4s: the files one recipe uploads, in order (`--bundle`, then each
 /// `--attach`). Checked as a set before any side effect: per-file cap, total
-/// cap, and distinct file names (the sites identify an attachment by name).
+/// cap, and distinct file names (the sites identify an attachment by name,
+/// and `--thread` copies them into one directory).
 pub(crate) fn validate_upload_files<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<BundleInfo>> {
     let files = paths
         .iter()
@@ -4446,7 +4446,9 @@ pub(crate) fn validate_upload_files<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<B
     }
     let mut names = std::collections::HashSet::new();
     for file in &files {
-        if !names.insert(file.file_name.as_str()) {
+        // Case-insensitive: --thread copies the files into one directory,
+        // which is case-insensitive on default macOS volumes.
+        if !names.insert(file.file_name.to_lowercase()) {
             bail!(
                 "two upload files are named `{}`; the site tells attachments apart by name, so rename one",
                 file.file_name
