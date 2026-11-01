@@ -338,6 +338,10 @@ struct BrowserRecipeArgs {
     #[arg(long)]
     keep_tab: bool,
 
+    /// The file to attach: a `yoetz bundle` .md, or any file such as a .zip
+    /// of screenshots and source. For a ZIP, put the request in a .md inside
+    /// it and pass a short --var prompt= that points to it. The
+    /// chrome-extension-native transport uploads at most 10 MiB.
     #[arg(long)]
     bundle: Option<PathBuf>,
 
@@ -3225,15 +3229,14 @@ fn browser_recipe_artifact_paths(bundle_path: Option<&Path>) -> Option<ArtifactP
     let bundle_path = bundle_path?;
     let session_dir = bundle_path.parent()?;
     let sibling_bundle_json = session_dir.join("bundle.json");
-    if !is_managed_bundle_markdown(bundle_path) || !sibling_bundle_json.exists() {
+    if !sibling_bundle_json.exists() {
         return None;
     }
     Some(ArtifactPaths {
         session_dir: session_dir.to_string_lossy().to_string(),
-        bundle_json: sibling_bundle_json
-            .exists()
-            .then(|| sibling_bundle_json.to_string_lossy().to_string()),
-        bundle_md: Some(bundle_path.to_string_lossy().to_string()),
+        bundle_json: Some(sibling_bundle_json.to_string_lossy().to_string()),
+        bundle_md: is_managed_bundle_markdown(bundle_path)
+            .then(|| bundle_path.to_string_lossy().to_string()),
         response_json: Some(
             session_dir
                 .join("response.json")
@@ -3244,6 +3247,65 @@ fn browser_recipe_artifact_paths(bundle_path: Option<&Path>) -> Option<ArtifactP
     })
 }
 
+/// `--thread` records its conversation in a managed bundle session. A plain
+/// file passed as `--bundle` (a ZIP of screenshots, a hand-written request)
+/// has no session, so copy it into a new one. A file next to a `bundle.json`
+/// is a bundle session already and goes through the preflight unchanged.
+fn adopt_thread_attachment_in(
+    recipe_args: &mut BrowserRecipeArgs,
+    sessions_base: &Path,
+) -> Result<()> {
+    let (Some(thread_label), Some(bundle_path)) =
+        (recipe_args.thread.as_deref(), recipe_args.bundle.as_deref())
+    else {
+        return Ok(());
+    };
+    if bundle_path
+        .parent()
+        .is_some_and(|dir| fs::symlink_metadata(dir.join("bundle.json")).is_ok())
+    {
+        return Ok(());
+    }
+    ensure_regular_file(bundle_path, "bundle file", thread_label)?;
+    let file_name = bundle_path
+        .file_name()
+        .ok_or_else(|| anyhow!("thread `{thread_label}` bundle has no file name"))?;
+    let bytes = fs::read(bundle_path)
+        .with_context(|| format!("thread `{thread_label}` read {}", bundle_path.display()))?;
+    let yoetz_root = sessions_base
+        .parent()
+        .ok_or_else(|| anyhow!("managed sessions directory has no parent"))?;
+    let session = yoetz_core::session::create_session_dir_in(yoetz_root)?;
+    let adopted = session.path.join(file_name);
+    fs::write(&adopted, &bytes)
+        .with_context(|| format!("thread `{thread_label}` write {}", adopted.display()))?;
+    let is_binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
+    let bundle = yoetz_core::types::Bundle {
+        prompt: String::new(),
+        files: vec![yoetz_core::types::BundleFile {
+            path: file_name.to_string_lossy().to_string(),
+            bytes: bytes.len(),
+            sha256: hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)),
+            truncated: false,
+            is_binary,
+            content: None,
+        }],
+        stats: yoetz_core::types::BundleStats {
+            file_count: 1,
+            total_bytes: bytes.len(),
+            ..Default::default()
+        },
+    };
+    yoetz_core::session::write_json(&session.path.join("bundle.json"), &bundle)?;
+    eprintln!(
+        "info: thread `{thread_label}`: copied {} into session {}",
+        bundle_path.display(),
+        session.path.display()
+    );
+    recipe_args.bundle = Some(adopted);
+    Ok(())
+}
+
 fn validate_thread_persistence_preflight_in(
     recipe_args: &BrowserRecipeArgs,
     sessions_base: &Path,
@@ -3251,20 +3313,16 @@ fn validate_thread_persistence_preflight_in(
     let Some(thread_label) = recipe_args.thread.as_deref() else {
         return Ok(());
     };
-    let bundle_path = recipe_args.bundle.as_deref().ok_or_else(|| {
-        anyhow!(
-                "thread `{thread_label}` requires a managed bundle session with a named .md file and bundle.json"
-        )
-    })?;
-    if !is_managed_bundle_markdown(bundle_path) {
-        bail!("thread `{thread_label}` bundle must be a Markdown file");
-    }
+    let bundle_path = recipe_args
+        .bundle
+        .as_deref()
+        .ok_or_else(|| anyhow!("thread `{thread_label}` requires --bundle"))?;
     let session_dir = bundle_path
         .parent()
         .ok_or_else(|| anyhow!("thread `{thread_label}` bundle has no session directory"))?;
     let bundle_json = session_dir.join("bundle.json");
 
-    ensure_regular_file(bundle_path, "named bundle Markdown file", thread_label)?;
+    ensure_regular_file(bundle_path, "bundle file", thread_label)?;
     ensure_regular_file(&bundle_json, "bundle.json", thread_label)?;
     let canonical_base = fs::canonicalize(sessions_base).with_context(|| {
         format!(
@@ -3376,9 +3434,7 @@ fn write_followup_session_metadata_with_lineage(
 ) -> Result<()> {
     let session_artifacts = browser_recipe_artifact_paths(recipe_args.bundle.as_deref())
         .ok_or_else(|| {
-            anyhow!(
-                "followup metadata requires a managed bundle session with a named .md file and bundle.json"
-            )
+            anyhow!("followup metadata requires a managed bundle session with bundle.json")
         })?;
     let conversation_raw = final_conversation_identity(payload)
         .ok_or_else(|| anyhow!("missing authoritative final conversation identity"))?;
@@ -5037,7 +5093,8 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                 }
             }
         }
-        BrowserCommand::Recipe(recipe_args) => {
+        BrowserCommand::Recipe(mut recipe_args) => {
+            adopt_thread_attachment_in(&mut recipe_args, &yoetz_core::session::session_base_dir())?;
             let _session_lease = acquire_browser_recipe_session_lease_in(
                 &recipe_args,
                 &yoetz_core::session::session_base_dir(),
@@ -7389,6 +7446,24 @@ mod tests {
     }
 
     #[test]
+    fn thread_adopts_plain_zip_bundle_into_managed_session() {
+        let root = TempDir::new().unwrap();
+        let sessions_base = root.path().join("sessions");
+        let zip = root.path().join("packet.zip");
+        fs::write(&zip, b"PK\x03\x04\x00binary").unwrap();
+        let mut recipe_args = thread_recipe_args(zip);
+
+        adopt_thread_attachment_in(&mut recipe_args, &sessions_base).unwrap();
+
+        let adopted = recipe_args.bundle.clone().unwrap();
+        assert_eq!(adopted.file_name().unwrap(), "packet.zip");
+        assert_eq!(fs::read(&adopted).unwrap(), b"PK\x03\x04\x00binary");
+        validate_thread_persistence_preflight_in(&recipe_args, &sessions_base).unwrap();
+        let artifacts = browser_recipe_artifact_paths(Some(&adopted)).unwrap();
+        assert!(artifacts.bundle_md.is_none());
+    }
+
+    #[test]
     fn thread_rejects_non_regular_bundle_artifacts_and_followup_target() {
         let root = TempDir::new().unwrap();
         let sessions_base = root.path().join("sessions");
@@ -7403,7 +7478,7 @@ mod tests {
         .unwrap_err();
         assert!(err
             .to_string()
-            .contains("named bundle Markdown file must be a regular file"));
+            .contains("bundle file must be a regular file"));
 
         let json_dir_session = sessions_base.join("json-dir");
         fs::create_dir_all(json_dir_session.join("bundle.json")).unwrap();
@@ -9515,6 +9590,7 @@ async fn call_litellm(
         parts.push(ChatContentPart::Text(ChatContentPartText {
             kind: std::borrow::Cow::Borrowed("text"),
             text: prompt.to_string(),
+            cache_control: None,
         }));
         for image in images {
             parts.push(media_to_image_part(image)?);

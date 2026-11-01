@@ -89,7 +89,8 @@ yoetz council -p "Async traits or callbacks for this API?" -f "src/api/*.rs" \
 yoetz review diff --staged --format json
 yoetz review file --path src/main.rs --format json
 
-# bundle: package files for a browser recipe or manual paste
+# bundle: package text files for a browser recipe or manual paste. Binary files
+# are left out (listed in .omitted_binary); send screenshots as a ZIP --bundle.
 BUNDLE=$(yoetz bundle -p "Review this" -f "src/**/*.rs" --format json | jq -er '.artifacts.bundle_md')
 
 # generate: image or video
@@ -160,6 +161,10 @@ For web-only models, `yoetz browser recipe --recipe chatgpt|claude --bundle
 - **Native extension first.** Set it up once with `yoetz browser extension
   setup --chatgpt --open-chrome` (or `--claude`). When it reports connected,
   every built-in recipe uses it and fails closed; no Chrome approval dialog.
+- **Binary evidence goes in a ZIP.** `--bundle` takes any file. Put
+  screenshots, source, and a request `.md` in one ZIP, pass a short `--var
+  prompt=` that points to the `.md`, and keep it under the native 10 MiB cap.
+  See "Binary evidence" in the guide.
 - **Never rerun after a side effect.** A failure after upload, send, or wait
   leaves the tab open. Run `yoetz browser extension inspect --chatgpt --run-id
   <run-id>` (or `--claude`) before any rerun; a blind rerun can duplicate the

@@ -5,7 +5,7 @@ use crate::{maybe_write_output, render_bundle_md, resolve_prompt, AppContext, Bu
 use yoetz_core::bundle::{build_bundle, BundleOptions};
 use yoetz_core::output::{write_json, write_jsonl, OutputFormat};
 use yoetz_core::session::{create_session_dir, write_json as write_json_file, write_text};
-use yoetz_core::types::{ArtifactPaths, BundleResult};
+use yoetz_core::types::{ArtifactPaths, Bundle, BundleResult};
 
 pub(crate) fn handle_bundle(
     ctx: &AppContext,
@@ -34,9 +34,18 @@ pub(crate) fn handle_bundle(
     write_json_file(&bundle_json, &bundle)?;
     write_text(&bundle_md, &render_bundle_md(&bundle))?;
 
+    let omitted_binary = omitted_binary_paths(&bundle);
+    if !omitted_binary.is_empty() {
+        eprintln!(
+            "warning: left out {} binary file(s) the bundle cannot inline: {}. To send binary evidence to a browser recipe, pass the file (a ZIP for several) as `yoetz browser recipe --bundle <file>`.",
+            omitted_binary.len(),
+            omitted_binary.join(", ")
+        );
+    }
     let result = BundleResult {
         id: session.id,
         bundle,
+        omitted_binary,
         artifacts: ArtifactPaths {
             session_dir: session.path.to_string_lossy().to_string(),
             bundle_json: Some(bundle_json.to_string_lossy().to_string()),
@@ -60,6 +69,15 @@ pub(crate) fn handle_bundle(
             Ok(())
         }
     }
+}
+
+fn omitted_binary_paths(bundle: &Bundle) -> Vec<String> {
+    bundle
+        .files
+        .iter()
+        .filter(|file| file.is_binary && file.content.is_none())
+        .map(|file| file.path.clone())
+        .collect()
 }
 
 const BUNDLE_TIMESTAMP_FORMAT: &[FormatItem<'static>] =
@@ -101,7 +119,30 @@ fn slugify_bundle_name(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::bundle_file_name;
+    use super::{bundle_file_name, omitted_binary_paths};
+    use yoetz_core::types::{Bundle, BundleFile, BundleStats};
+
+    #[test]
+    fn omitted_binary_lists_binary_files_the_bundle_left_out() {
+        let file = |path: &str, is_binary: bool, content: Option<&str>| BundleFile {
+            path: path.to_string(),
+            bytes: 4,
+            sha256: String::new(),
+            truncated: false,
+            is_binary,
+            content: content.map(str::to_string),
+        };
+        let bundle = Bundle {
+            prompt: String::new(),
+            files: vec![
+                file("README.md", false, Some("text")),
+                file("packet.zip", true, None),
+            ],
+            stats: BundleStats::default(),
+        };
+
+        assert_eq!(omitted_binary_paths(&bundle), vec!["packet.zip"]);
+    }
 
     #[test]
     fn bundle_file_name_uses_agent_name_and_timestamp() {
