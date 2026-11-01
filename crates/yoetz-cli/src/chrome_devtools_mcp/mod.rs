@@ -38,7 +38,7 @@ pub mod claude;
 use crate::{chatgpt_recipe, chatgpt_web};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Default)]
 pub enum RecipeThreadMode {
@@ -109,6 +109,48 @@ pub struct DevtoolsMcpRecipeContext {
 
     /// Whether to surface approval-dialog guidance to stderr in text mode.
     pub show_approval_guidance: bool,
+
+    /// Where phase progress lines go. The live-attach daemon sets this to
+    /// stream them to the client; `None` prints them on this process's stderr.
+    #[serde(skip)]
+    pub progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+}
+
+/// Reports one recipe phase to the caller, in every output format.
+pub fn report_progress(ctx: &DevtoolsMcpRecipeContext, message: impl Into<String>) {
+    let message = message.into();
+    match &ctx.progress {
+        Some(sink) => {
+            let _ = sink.send(message);
+        }
+        None => eprintln!("info: chrome-devtools-mcp: {message}"),
+    }
+}
+
+/// Reports the bundle upload start with its file name and size.
+pub fn report_upload_started(ctx: &DevtoolsMcpRecipeContext, bundle_path: &Path) {
+    const MB: u64 = 1024 * 1024;
+    let name = bundle_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| bundle_path.display().to_string());
+    let message = match std::fs::metadata(bundle_path).map(|meta| meta.len()) {
+        Ok(bytes) if bytes >= MB => {
+            format!("uploading {name} ({:.1} MB)", bytes as f64 / MB as f64)
+        }
+        Ok(bytes) => format!("uploading {name} ({bytes} bytes)"),
+        Err(_) => format!("uploading {name}"),
+    };
+    report_progress(ctx, message);
+}
+
+/// Short human duration for progress lines (`45 s`, `90 min`).
+pub fn format_duration_ms(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{} min", ms / 60_000)
+    } else {
+        format!("{} s", ms / 1_000)
+    }
 }
 
 impl Default for DevtoolsMcpRecipeContext {
@@ -127,6 +169,7 @@ impl Default for DevtoolsMcpRecipeContext {
             response_poll_interval_ms: 30_000,
             upload_timeout_ms: 120_000,
             show_approval_guidance: true,
+            progress: None,
         }
     }
 }

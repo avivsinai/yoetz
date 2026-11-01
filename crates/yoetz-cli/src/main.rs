@@ -2546,6 +2546,7 @@ async fn run_recipe_via_chrome_devtools_mcp(
         response_poll_interval_ms: recipe_spec.wait_interval_ms,
         upload_timeout_ms: recipe_spec.upload_timeout_ms,
         show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
+        progress: None,
     };
 
     let response = live_attach::run_chatgpt_recipe(
@@ -2648,6 +2649,7 @@ async fn run_claude_recipe_via_chrome_devtools_mcp(
         response_poll_interval_ms: recipe_spec.wait_interval_ms,
         upload_timeout_ms: recipe_spec.upload_timeout_ms,
         show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
+        progress: None,
     };
     let response = chrome_devtools_mcp::claude::run(&recipe_ctx).await?;
     let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;

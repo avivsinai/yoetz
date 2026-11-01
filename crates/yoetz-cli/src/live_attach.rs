@@ -384,6 +384,10 @@ enum DaemonRequest {
         token: String,
         target: LiveAttachTarget,
         recipe_ctx: chrome_devtools_mcp::DevtoolsMcpRecipeContext,
+        /// Stream `Progress` lines before the final response. Older clients
+        /// omit it and get only the final line.
+        #[serde(default)]
+        progress: bool,
     },
 }
 
@@ -405,6 +409,9 @@ enum DaemonResponse {
     },
     Recipe {
         result: ChatgptRunResult,
+    },
+    Progress {
+        message: String,
     },
     Error {
         message: String,
@@ -1884,6 +1891,7 @@ pub async fn run_chatgpt_recipe(
             token: daemon.token.clone(),
             target,
             recipe_ctx,
+            progress: true,
         },
     )
     .await?
@@ -2184,25 +2192,61 @@ async fn handle_daemon_connection(
         .await
         .context("read yoetz live-attach request")?;
 
-    let request = serde_json::from_str::<DaemonRequest>(line.trim_end())
+    let mut request = serde_json::from_str::<DaemonRequest>(line.trim_end())
         .context("parse yoetz live-attach request")?;
-    let (response, shutdown_requested) = daemon_response_for_request(request, token, daemon).await;
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
+    match &mut request {
+        DaemonRequest::RunRecipe {
+            progress: true,
+            recipe_ctx,
+            ..
+        } => recipe_ctx.progress = Some(progress_tx),
+        _ => drop(progress_tx),
+    }
 
     let socket = reader.get_mut();
-    socket
-        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-        .await
-        .context("write yoetz live-attach response")?;
-    socket
-        .flush()
-        .await
-        .context("flush yoetz live-attach response")?;
+    let mut request_done = std::pin::pin!(daemon_response_for_request(request, token, daemon));
+    // A client that went away stops progress writes; the request still runs
+    // to completion because it may already have side effects in Chrome.
+    let mut client_listening = true;
+    let (response, shutdown_requested) = loop {
+        tokio::select! {
+            Some(message) = progress_rx.recv() => {
+                if client_listening {
+                    client_listening =
+                        write_daemon_line(socket, &DaemonResponse::Progress { message })
+                            .await
+                            .is_ok();
+                }
+            }
+            outcome = &mut request_done => break outcome,
+        }
+    };
+    while let Ok(message) = progress_rx.try_recv() {
+        if client_listening {
+            client_listening = write_daemon_line(socket, &DaemonResponse::Progress { message })
+                .await
+                .is_ok();
+        }
+    }
+    write_daemon_line(socket, &response).await?;
 
     if shutdown_requested {
         shutdown.notify_one();
     }
 
     Ok(())
+}
+
+async fn write_daemon_line(socket: &mut TcpStream, response: &DaemonResponse) -> Result<()> {
+    socket
+        .write_all(format!("{}\n", serde_json::to_string(response)?).as_bytes())
+        .await
+        .context("write yoetz live-attach response")?;
+    socket
+        .flush()
+        .await
+        .context("flush yoetz live-attach response")
 }
 
 enum SessionRequest {
@@ -2646,14 +2690,20 @@ async fn dispatch_daemon_request(
             token: request_token,
             target,
             recipe_ctx,
+            ..
         } => {
             ensure_token(token, &request_token)?;
+            chrome_devtools_mcp::report_progress(
+                &recipe_ctx,
+                "attaching to Chrome; if prompted, click Allow in Chrome's remote debugging dialog",
+            );
             let lease = LiveAttachDaemon::checkout_session(
                 Arc::clone(&daemon),
                 target,
                 InitialAttachPolicy::RequireLiveSessionIfPersisted,
             )
             .await?;
+            chrome_devtools_mcp::report_progress(&recipe_ctx, "attached to Chrome");
             let response = run_session_request(
                 Arc::clone(&daemon),
                 lease,
@@ -2815,16 +2865,40 @@ async fn daemon_round_trip_inner(
         .await
         .context("flush yoetz live-attach request")?;
 
+    read_daemon_response(&mut reader, |message| {
+        eprintln!("info: chrome-devtools-mcp: {message}")
+    })
+    .await
+}
+
+/// Reads response lines until the final one, handing each streamed
+/// `Progress` message to `on_progress`.
+async fn read_daemon_response<R>(
+    reader: &mut R,
+    mut on_progress: impl FnMut(String),
+) -> Result<DaemonResponse>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
     let mut line = String::new();
-    reader
-        .read_line(&mut line)
-        .await
-        .context("read yoetz live-attach response")?;
-    let response = serde_json::from_str::<DaemonResponse>(line.trim_end())
-        .context("parse yoetz live-attach response")?;
-    match response {
-        DaemonResponse::Error { message } => Err(anyhow!(message)),
-        other => Ok(other),
+    loop {
+        line.clear();
+        let read = reader
+            .read_line(&mut line)
+            .await
+            .context("read yoetz live-attach response")?;
+        if read == 0 {
+            return Err(anyhow!(
+                "yoetz live-attach daemon closed the connection without a response"
+            ));
+        }
+        match serde_json::from_str::<DaemonResponse>(line.trim_end())
+            .context("parse yoetz live-attach response")?
+        {
+            DaemonResponse::Progress { message } => on_progress(message),
+            DaemonResponse::Error { message } => return Err(anyhow!(message)),
+            other => return Ok(other),
+        }
     }
 }
 
@@ -3214,6 +3288,7 @@ mod tests {
             token: "token".to_string(),
             target,
             recipe_ctx: chrome_devtools_mcp::DevtoolsMcpRecipeContext::default(),
+            progress: false,
         }
     }
 
@@ -4934,9 +5009,45 @@ mod tests {
                     response_timeout_ms: 123_000,
                     ..Default::default()
                 },
+                progress: false,
             }),
             Duration::from_millis(243_000)
         );
+    }
+
+    #[test]
+    fn read_daemon_response_streams_progress_before_recipe_result() {
+        let result = ChatgptRunResult {
+            response: "answer".to_string(),
+            model_used: None,
+            model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus::Unavailable,
+            final_model_selection: None,
+        };
+        let wire = [
+            DaemonResponse::Progress {
+                message: "uploading bundle.md (12 bytes)".to_string(),
+            },
+            DaemonResponse::Progress {
+                message: "prompt sent".to_string(),
+            },
+            DaemonResponse::Recipe {
+                result: result.clone(),
+            },
+        ]
+        .iter()
+        .map(|response| format!("{}\n", serde_json::to_string(response).unwrap()))
+        .collect::<String>();
+
+        let mut progress = Vec::new();
+        let response = tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(read_daemon_response(&mut wire.as_bytes(), |message| {
+                progress.push(message)
+            }))
+            .unwrap();
+
+        assert_eq!(progress, ["uploading bundle.md (12 bytes)", "prompt sent"]);
+        assert!(matches!(response, DaemonResponse::Recipe { result: got } if got == result));
     }
 
     fn spawn_unresponsive_server() -> (String, mpsc::Sender<()>, thread::JoinHandle<()>) {

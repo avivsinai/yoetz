@@ -6,7 +6,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use super::client::{is_external_create_target_block_error, ChromeCdpClient};
-use super::DevtoolsMcpRecipeContext;
+use super::{report_progress, report_upload_started, DevtoolsMcpRecipeContext};
 use crate::claude_recipe::{self, AnyhowResultExt};
 use crate::claude_web;
 use crate::web_recipe::{WebModelSelectionStatus, WebRecipeTransportPhase};
@@ -64,6 +64,7 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ClaudeRunResult> {
         ctx.show_approval_guidance,
     )
     .await?;
+    report_progress(ctx, "attached to Chrome");
     let browser_context_id = client
         .resolve_browser_context_id(
             ctx.browser_context_id.as_deref(),
@@ -104,16 +105,19 @@ async fn run_with_client(
         .await
         .context("mark yoetz-owned Claude tab with window.name")?;
 
+    report_progress(ctx, "Claude tab open; waiting for the composer");
     wait_for_composer(client).await?;
     let model_selection = select_fable_max(client).await?;
     if model_selection != WebModelSelectionStatus::Selected {
         bail!("Claude Fable 5 / Max selection was not verified")
     }
 
+    report_upload_started(ctx, bundle_path);
     upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
         .await
         .with_claude_phase(WebRecipeTransportPhase::Upload)
         .context("upload bundle to Claude")?;
+    report_progress(ctx, "upload attached");
 
     client
         .evaluate_script(&claude_web::build_focus_composer_function(), vec![])
@@ -133,6 +137,7 @@ async fn run_with_client(
     if send.get("status").and_then(Value::as_str) != Some("sent") {
         bail!("could not find an enabled Claude send button; diagnostics={send}")
     }
+    report_progress(ctx, "prompt sent");
     let baseline = ResponseBaseline {
         count: send
             .get("assistantCount")
@@ -144,6 +149,13 @@ async fn run_with_client(
             .unwrap_or(0),
     };
 
+    report_progress(
+        ctx,
+        format!(
+            "waiting for the Claude answer (timeout {})",
+            super::format_duration_ms(ctx.response_timeout_ms)
+        ),
+    );
     let response = poll_for_response(
         client,
         baseline,
@@ -153,6 +165,7 @@ async fn run_with_client(
     .await
     .with_claude_phase(WebRecipeTransportPhase::WaitResponse)
     .context("stable-idle polling for Claude response")?;
+    report_progress(ctx, "answer received");
     let conversation = read_conversation(client).await?;
 
     Ok(ClaudeRunResult {

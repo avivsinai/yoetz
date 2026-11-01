@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   names the limit in MiB and the CDP fallback. The skill has a "Binary
   evidence" section with packet-size guidance (#622, #632).
 
+### Fixed
+- The chrome-devtools-mcp (live-attach) recipe path now prints phase progress
+  on stderr in every output format (`info: chrome-devtools-mcp: attached to
+  Chrome`, `uploading <file> (<size>)`, `prompt sent`, `waiting for the
+  ChatGPT answer`, ...), including the "click Allow" hint, instead of going
+  silent for minutes after `attempting chrome-devtools-mcp transport` (#632).
+
 ## [0.5.92] - 2026-10-25
 ### Changed
 - Tokio updated to 1.54.1, clearing RUSTSEC-2026-0386 (tokio AsyncFd soundness
