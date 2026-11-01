@@ -155,8 +155,10 @@ YOETZ_AGENT=1 yoetz browser recipe --recipe chatgpt --bundle "$PWD/packet.zip" \
 - A file that is not a yoetz bundle has no stored prompt, so always pass
   `--var prompt=`; without it the recipe default asks for a generic analysis.
 - The native extension uploads at most 10 MiB and refuses a larger file before
-  any side effect. Above that, `--transport chrome-extension-native
-  --allow-cdp-fallback` uploads through Chrome DevTools.
+  any side effect. Above that, a run without `--thread`, `--followup` or
+  `--var conversation=` can use `--transport chrome-extension-native
+  --allow-cdp-fallback` to upload through Chrome DevTools. Resume and thread
+  runs are native-only: send a smaller packet.
 - Keep the packet small. The model unpacks a ZIP in its code tool and samples
   it; it does not look at hundreds of images in one turn. Send the screenshots
   that show each step, at a lower resolution, and name them so the request

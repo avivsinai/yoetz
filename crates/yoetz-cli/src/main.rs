@@ -2918,6 +2918,16 @@ fn bundle_prompt_for_recipe(bundle_path: Option<&Path>) -> Result<Option<String>
     Ok(Some(bundle.prompt))
 }
 
+fn is_managed_session_dir(session_dir: &Path, sessions_base: &Path) -> bool {
+    match (
+        fs::canonicalize(session_dir),
+        fs::canonicalize(sessions_base),
+    ) {
+        (Ok(session), Ok(base)) => session.parent() == Some(base.as_path()),
+        _ => false,
+    }
+}
+
 fn is_managed_bundle_markdown(bundle_path: &Path) -> bool {
     bundle_path
         .extension()
@@ -3228,10 +3238,25 @@ fn attach_browser_recipe_artifacts(payload: &mut Value, bundle_path: Option<&Pat
 }
 
 fn browser_recipe_artifact_paths(bundle_path: Option<&Path>) -> Option<ArtifactPaths> {
+    browser_recipe_artifact_paths_in(bundle_path, &yoetz_core::session::session_base_dir())
+}
+
+/// A bundle session is the folder of a `yoetz bundle` .md, or a managed
+/// session (a direct child of `sessions_base`) for any other file, such as a
+/// ZIP adopted by `--thread`. Yoetz writes run artifacts only there.
+fn browser_recipe_artifact_paths_in(
+    bundle_path: Option<&Path>,
+    sessions_base: &Path,
+) -> Option<ArtifactPaths> {
     let bundle_path = bundle_path?;
     let session_dir = bundle_path.parent()?;
     let sibling_bundle_json = session_dir.join("bundle.json");
     if !sibling_bundle_json.exists() {
+        return None;
+    }
+    if !is_managed_bundle_markdown(bundle_path)
+        && !is_managed_session_dir(session_dir, sessions_base)
+    {
         return None;
     }
     Some(ArtifactPaths {
@@ -3262,16 +3287,38 @@ fn adopt_thread_attachment_in(
     else {
         return Ok(());
     };
-    if bundle_path
-        .parent()
-        .is_some_and(|dir| fs::symlink_metadata(dir.join("bundle.json")).is_ok())
+    if browser_recipe_artifact_paths_in(Some(bundle_path), sessions_base).is_some()
+        || (is_managed_bundle_markdown(bundle_path)
+            && bundle_path
+                .parent()
+                .is_some_and(|dir| dir.join("bundle.json").exists()))
     {
         return Ok(());
     }
+    followup::validate_thread_label(thread_label)?;
     ensure_regular_file(bundle_path, "bundle file", thread_label)?;
     let file_name = bundle_path
         .file_name()
         .ok_or_else(|| anyhow!("thread `{thread_label}` bundle has no file name"))?;
+    if ["bundle.json", "response.json", "followup.json"]
+        .iter()
+        .any(|reserved| file_name == *reserved)
+        || file_name == yoetz_core::session::SESSION_LEASE_FILENAME
+    {
+        bail!(
+            "thread `{thread_label}` bundle file name `{}` is reserved for session files; rename it",
+            file_name.to_string_lossy()
+        );
+    }
+    let len = fs::metadata(bundle_path)
+        .with_context(|| format!("thread `{thread_label}` inspect {}", bundle_path.display()))?
+        .len();
+    if len > browser_extension_native::MAX_BUNDLE_BYTES {
+        bail!(
+            "thread `{thread_label}` runs only on chrome-extension-native, which uploads at most {} MiB; this bundle is {len} bytes. Send a smaller packet (fewer or lower-resolution screenshots)",
+            browser_extension_native::MAX_BUNDLE_BYTES / (1024 * 1024)
+        );
+    }
     let bytes = fs::read(bundle_path)
         .with_context(|| format!("thread `{thread_label}` read {}", bundle_path.display()))?;
     let yoetz_root = sessions_base
@@ -7461,7 +7508,7 @@ mod tests {
         assert_eq!(adopted.file_name().unwrap(), "packet.zip");
         assert_eq!(fs::read(&adopted).unwrap(), b"PK\x03\x04\x00binary");
         validate_thread_persistence_preflight_in(&recipe_args, &sessions_base).unwrap();
-        let artifacts = browser_recipe_artifact_paths(Some(&adopted)).unwrap();
+        let artifacts = browser_recipe_artifact_paths_in(Some(&adopted), &sessions_base).unwrap();
         assert!(artifacts.bundle_md.is_none());
     }
 

@@ -16,7 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Changed
 - `yoetz browser recipe --help` describes `--bundle` as any file (a ZIP
   included) and states the 10 MiB native upload limit. The over-limit error
-  names the limit in MiB and the CDP fallback. The skill has a "Binary
+  names the limit in MiB and, for runs that are not resumes or threads, the
+  CDP fallback. The skill has a "Binary
   evidence" section with packet-size guidance (#622, #632).
 
 ### Fixed
