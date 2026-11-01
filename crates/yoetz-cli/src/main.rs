@@ -3287,12 +3287,7 @@ fn adopt_thread_attachment_in(
     else {
         return Ok(());
     };
-    if browser_recipe_artifact_paths_in(Some(bundle_path), sessions_base).is_some()
-        || (is_managed_bundle_markdown(bundle_path)
-            && bundle_path
-                .parent()
-                .is_some_and(|dir| dir.join("bundle.json").exists()))
-    {
+    if browser_recipe_artifact_paths_in(Some(bundle_path), sessions_base).is_some() {
         return Ok(());
     }
     followup::validate_thread_label(thread_label)?;
@@ -3300,14 +3295,18 @@ fn adopt_thread_attachment_in(
     let file_name = bundle_path
         .file_name()
         .ok_or_else(|| anyhow!("thread `{thread_label}` bundle has no file name"))?;
-    if ["bundle.json", "response.json", "followup.json"]
-        .iter()
-        .any(|reserved| file_name == *reserved)
-        || file_name == yoetz_core::session::SESSION_LEASE_FILENAME
+    let name = file_name.to_string_lossy();
+    if [
+        "bundle.json",
+        "response.json",
+        "followup.json",
+        yoetz_core::session::SESSION_LEASE_FILENAME,
+    ]
+    .iter()
+    .any(|reserved| name.eq_ignore_ascii_case(reserved))
     {
         bail!(
-            "thread `{thread_label}` bundle file name `{}` is reserved for session files; rename it",
-            file_name.to_string_lossy()
+            "thread `{thread_label}` bundle file name `{name}` is reserved for session files; rename it"
         );
     }
     let len = fs::metadata(bundle_path)
