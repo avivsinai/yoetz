@@ -4371,9 +4371,10 @@ fn validate_bundle_path(path: &Path) -> Result<BundleInfo> {
     }
     if metadata.len() > MAX_BUNDLE_BYTES {
         bail!(
-            "bundle is {} bytes, above chrome-extension-native limit of {} bytes",
+            "bundle is {} bytes, above chrome-extension-native limit of {} bytes ({} MiB). Send less evidence (fewer or lower-resolution screenshots). A run without --thread, --followup or --var conversation= can instead retry with `--transport chrome-extension-native --allow-cdp-fallback` to upload through Chrome DevTools",
             metadata.len(),
-            MAX_BUNDLE_BYTES
+            MAX_BUNDLE_BYTES,
+            MAX_BUNDLE_BYTES / (1024 * 1024)
         );
     }
     let file_name = canonical_path

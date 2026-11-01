@@ -138,6 +138,32 @@ YOETZ_AGENT=1 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" \
   `--browser-id <id>` selects a local Chrome by its `/devtools/browser/<id>`
   suffix.
 
+### Binary evidence: screenshots, PDFs, many files
+
+`yoetz bundle` inlines text only; it names binary files in `omitted_binary`
+and leaves them out. `--bundle` accepts any file, so send binary evidence as
+one ZIP:
+
+```bash
+# REVIEW-REQUEST.md at the ZIP root holds the full request.
+zip -r packet.zip REVIEW-REQUEST.md shots/ src/
+YOETZ_AGENT=1 yoetz browser recipe --recipe chatgpt --bundle "$PWD/packet.zip" \
+  --var prompt='Extract the attached ZIP and follow REVIEW-REQUEST.md at its root.' \
+  --format json --output-final ./yoetz-chatgpt.json 2> ./yoetz-chatgpt.log
+```
+
+- A file that is not a yoetz bundle has no stored prompt, so always pass
+  `--var prompt=`; without it the recipe default asks for a generic analysis.
+- The native extension uploads at most 10 MiB and refuses a larger file before
+  any side effect. Above that, a run without `--thread`, `--followup` or
+  `--var conversation=` can use `--transport chrome-extension-native
+  --allow-cdp-fallback` to upload through Chrome DevTools. Resume and thread
+  runs are native-only: send a smaller packet.
+- Keep the packet small. The model unpacks a ZIP in its code tool and samples
+  it; it does not look at hundreds of images in one turn. Send the screenshots
+  that show each step, at a lower resolution, and name them so the request
+  can point at them.
+
 ## Timeouts and long runs
 
 ChatGPT Pro reviews of large bundles often take 15-20 minutes. Keep waiting on
@@ -165,8 +191,9 @@ resume and when to start fresh.
   return `conversation_id` and `conversation_url`; save them for this.
 - `--followup <session-id|conversation-id|url>` resumes; a session id resumes
   from that session's stored conversation.
-- `--thread <label>` addresses a conversation by a stable name. It also needs a
-  managed bundle session (a named `.md` plus `bundle.json`).
+- `--thread <label>` addresses a conversation by a stable name. The run is
+  recorded in the bundle's session; any other file (a ZIP) is first copied
+  into a new session.
 
 ```bash
 # Start a new conversation and point the label at it.

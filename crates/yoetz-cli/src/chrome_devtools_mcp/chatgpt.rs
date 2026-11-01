@@ -41,7 +41,7 @@ use std::io::IsTerminal;
 use std::time::Duration;
 
 use super::client::{is_external_create_target_block_error, ChromeCdpClient};
-use super::DevtoolsMcpRecipeContext;
+use super::{report_progress, report_upload_started, DevtoolsMcpRecipeContext};
 use crate::chatgpt_recipe::AnyhowResultExt;
 use crate::{chatgpt_recipe, chatgpt_web};
 
@@ -338,6 +338,7 @@ async fn run_attached_recipe_inner(
 
     // Step 2: wait for the composer to mount, then verify Latest at verified Pro effort.
     // before any upload/send side effects.
+    report_progress(ctx, "ChatGPT tab open; waiting for the composer");
     wait_for_composer_ready(client, /* focus_composer */ true).await?;
     let model_selection = maybe_select_model(client, &ctx.model, ctx.model_strategy).await?;
 
@@ -354,10 +355,12 @@ async fn run_attached_recipe_inner(
         .bundle_path
         .as_ref()
         .context("ChatGPT recipe requires a bundle file path")?;
+    report_upload_started(ctx, bundle_path);
     try_upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
         .await
         .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Upload)
         .context("upload bundle to ChatGPT")?;
+    report_progress(ctx, "upload attached");
 
     // Step 4: type the delivery text into the focused composer.
     //
@@ -458,6 +461,14 @@ async fn run_attached_recipe_inner(
     let response_baseline = parse_response_baseline(&clicked)
         .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::PostCompletion)
         .context("parse ChatGPT response baseline before send")?;
+    report_progress(ctx, "prompt sent");
+    report_progress(
+        ctx,
+        format!(
+            "waiting for the ChatGPT answer (timeout {})",
+            super::format_duration_ms(ctx.response_timeout_ms)
+        ),
+    );
 
     // Step 6: stable-idle polling for response completion.
     //
@@ -480,6 +491,7 @@ async fn run_attached_recipe_inner(
     .await
     .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::WaitResponse)
     .context("stable-idle polling for ChatGPT response")?;
+    report_progress(ctx, "answer received");
 
     Ok(ChatgptRunResult {
         response: response_text,

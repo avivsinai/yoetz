@@ -116,6 +116,10 @@ pub struct BundleResult {
     pub id: String,
     pub bundle: Bundle,
     pub artifacts: ArtifactPaths,
+    /// Binary files the bundle names but does not inline. Send them as a
+    /// browser recipe `--bundle` attachment (a ZIP for several files).
+    #[serde(default)]
+    pub omitted_binary: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

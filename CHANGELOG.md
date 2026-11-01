@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Added
+- `yoetz browser recipe --thread` accepts any `--bundle` file, such as a ZIP of
+  screenshots: a file that is not a yoetz bundle is copied into a new session,
+  so `--thread <label> --fresh` works for binary evidence (#632).
+- `yoetz bundle` warns on stderr when it leaves out binary files and lists them
+  in a new `omitted_binary` JSON field, with the ZIP `--bundle` route (#622).
+
+### Changed
+- `yoetz browser recipe --help` describes `--bundle` as any file (a ZIP
+  included) and states the 10 MiB native upload limit. The over-limit error
+  names the limit in MiB and, for runs that are not resumes or threads, the
+  CDP fallback. The skill has a "Binary
+  evidence" section with packet-size guidance (#622, #632).
+
+### Fixed
+- The chrome-devtools-mcp (live-attach) recipe path now prints phase progress
+  on stderr in every output format (`info: chrome-devtools-mcp: attached to
+  Chrome`, `uploading <file> (<size>)`, `prompt sent`, `waiting for the
+  ChatGPT answer`, ...), including the "click Allow" hint, instead of going
+  silent for minutes after `attempting chrome-devtools-mcp transport` (#632).
 
 ## [0.5.92] - 2026-10-25
 ### Changed

@@ -43,7 +43,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "multipart",
     "blocking",
 ] }
-tokio = { version = "1.52", features = ["io-util", "rt-multi-thread", "macros", "process", "time"] }
+tokio = { version = "1.52", features = ["io-util", "rt-multi-thread", "macros", "process", "sync", "time"] }
 serde-saphyr = "=2.0.0"
 tempfile = "3.27"
 jsonschema = { version = "0.60", default-features = false, features = ["resolve-file"] }
