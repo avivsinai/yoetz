@@ -1232,13 +1232,13 @@ checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
 
 [[package]]
 name = "litellm-rust"
-version = "0.3.0"
-source = "git+https://github.com/avivsinai/litellm-rust?tag=v0.3.0#739cb399b4aab147e25910e2737d405e533f6ae3"
+version = "0.5.0"
+source = "git+https://github.com/avivsinai/litellm-rust?tag=v0.5.0#39ee2d3a7ed2715f6c72436fbcad897af226a6cf"
 dependencies = [
  "anyhow",
  "async-stream",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "bytes",
  "futures-util",
  "mime_guess",
