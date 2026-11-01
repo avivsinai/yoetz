@@ -9515,6 +9515,7 @@ async fn call_litellm(
         parts.push(ChatContentPart::Text(ChatContentPartText {
             kind: std::borrow::Cow::Borrowed("text"),
             text: prompt.to_string(),
+            cache_control: None,
         }));
         for image in images {
             parts.push(media_to_image_part(image)?);
