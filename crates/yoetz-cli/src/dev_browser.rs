@@ -756,21 +756,21 @@ pub fn resolve_chatgpt_poll_settings(
     Ok(settings)
 }
 
+/// Scales the upload budget with the total size of every file the run uploads.
 pub fn resolve_chatgpt_upload_timeout_ms(
     vars: &BTreeMap<String, String>,
-    bundle_path: Option<&Path>,
+    upload_paths: &[PathBuf],
 ) -> Result<u64> {
     let base_timeout_ms = parse_positive_u64_var(vars, "upload_timeout_ms")?
         .unwrap_or(CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT);
-    let Some(bundle_path) = bundle_path else {
-        return Ok(base_timeout_ms);
-    };
-    let Ok(metadata) = fs::metadata(bundle_path) else {
-        return Ok(base_timeout_ms);
-    };
+    let total_bytes = upload_paths
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok())
+        .map(|metadata| metadata.len())
+        .sum();
     Ok(scale_chatgpt_upload_timeout_ms(
         base_timeout_ms,
-        metadata.len(),
+        total_bytes,
     ))
 }
 
@@ -2447,11 +2447,11 @@ mod tests {
         let vars = BTreeMap::from([("upload_timeout_ms".to_string(), "180000".to_string())]);
 
         assert_eq!(
-            resolve_chatgpt_upload_timeout_ms(&vars, None).unwrap(),
+            resolve_chatgpt_upload_timeout_ms(&vars, &[]).unwrap(),
             180_000
         );
         assert_eq!(
-            resolve_chatgpt_upload_timeout_ms(&BTreeMap::new(), None).unwrap(),
+            resolve_chatgpt_upload_timeout_ms(&BTreeMap::new(), &[]).unwrap(),
             CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT
         );
     }
@@ -2465,7 +2465,8 @@ mod tests {
         fs::write(&bundle_path, vec![b'x'; 3 * 1024 * 1024 + 1]).unwrap();
 
         let timeout =
-            resolve_chatgpt_upload_timeout_ms(&BTreeMap::new(), Some(&bundle_path)).unwrap();
+            resolve_chatgpt_upload_timeout_ms(&BTreeMap::new(), std::slice::from_ref(&bundle_path))
+                .unwrap();
 
         assert_eq!(timeout, CHATGPT_UPLOAD_TIMEOUT_MS_DEFAULT + 20_000);
         let _ = fs::remove_dir_all(dir);

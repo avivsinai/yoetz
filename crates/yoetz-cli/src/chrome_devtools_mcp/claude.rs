@@ -56,12 +56,15 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ClaudeRunResult> {
             ctx.model
         );
     }
-    let bundle_path = ctx.bundle_path.as_deref().ok_or_else(|| {
-        anyhow!("Claude recipe requires `--bundle`; CDP uploads a file attachment")
-    })?;
+    let upload_paths = ctx.files_to_upload();
+    if upload_paths.is_empty() {
+        bail!("Claude recipe requires `--bundle`; CDP uploads a file attachment");
+    }
+    // The "click Allow" guidance goes to stderr in every output format, like
+    // report_progress: a --format json caller also has to approve the dialog.
     let mut client = crate::chrome_devtools_mcp::chatgpt::connect_client_with_attach_attempt_lock(
         ctx.cdp_endpoint.as_deref(),
-        ctx.show_approval_guidance,
+        true,
     )
     .await?;
     report_progress(ctx, "attached to Chrome");
@@ -71,7 +74,13 @@ pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ClaudeRunResult> {
             ctx.profile_email.as_deref(),
         )
         .context("resolve Chrome browser context for Claude")?;
-    run_with_client(&mut client, ctx, bundle_path, browser_context_id.as_deref()).await
+    run_with_client(
+        &mut client,
+        ctx,
+        &upload_paths,
+        browser_context_id.as_deref(),
+    )
+    .await
 }
 
 pub async fn check_auth(cdp_endpoint: Option<&str>, show_approval_guidance: bool) -> Result<()> {
@@ -93,7 +102,7 @@ pub async fn check_auth(cdp_endpoint: Option<&str>, show_approval_guidance: bool
 async fn run_with_client(
     client: &mut ChromeCdpClient,
     ctx: &DevtoolsMcpRecipeContext,
-    bundle_path: &Path,
+    upload_paths: &[&Path],
     browser_context_id: Option<&str>,
 ) -> Result<ClaudeRunResult> {
     let marked_url = claude_web::mark_claude_url(&ctx.run_id)?;
@@ -112,12 +121,14 @@ async fn run_with_client(
         bail!("Claude Fable 5 / Max selection was not verified")
     }
 
-    report_upload_started(ctx, bundle_path);
-    upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
-        .await
-        .with_claude_phase(WebRecipeTransportPhase::Upload)
-        .context("upload bundle to Claude")?;
-    report_progress(ctx, "upload attached");
+    for bundle_path in upload_paths {
+        report_upload_started(ctx, bundle_path);
+        upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
+            .await
+            .with_claude_phase(WebRecipeTransportPhase::Upload)
+            .context("upload bundle to Claude")?;
+        report_progress(ctx, "upload attached");
+    }
 
     client
         .evaluate_script(&claude_web::build_focus_composer_function(), vec![])

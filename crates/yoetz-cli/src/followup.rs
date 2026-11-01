@@ -519,16 +519,18 @@ fn read_thread_lock_holder(file: &mut File) -> Option<ThreadLockHolder> {
     None
 }
 
-pub(crate) fn compute_prompt_hash(prompt: &str, bundle_path: Option<&Path>) -> Result<String> {
-    let bundle_hash = if let Some(bundle_path) = bundle_path {
-        let bundle_bytes = fs::read(bundle_path)
-            .with_context(|| format!("read bundle for followup hash {}", bundle_path.display()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(bundle_bytes);
-        hex::encode(hasher.finalize())
-    } else {
-        String::new()
-    };
+/// Hashes the prompt and every uploaded file in order. One file hashes exactly
+/// as before `--attach` existed, so recorded hashes keep matching.
+pub(crate) fn compute_prompt_hash(prompt: &str, upload_paths: &[PathBuf]) -> Result<String> {
+    let bundle_hash = upload_paths
+        .iter()
+        .map(|path| {
+            let bytes = fs::read(path)
+                .with_context(|| format!("read bundle for followup hash {}", path.display()))?;
+            Ok(hex::encode(Sha256::digest(bytes)))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .join("\n");
 
     let mut hasher = Sha256::new();
     hasher.update(prompt.as_bytes());
@@ -749,9 +751,9 @@ mod tests {
         let bundle = dir.path().join("bundle.md");
         fs::write(&bundle, "bundle one").unwrap();
 
-        let a = compute_prompt_hash("prompt one", Some(&bundle)).unwrap();
-        let b = compute_prompt_hash("prompt two", Some(&bundle)).unwrap();
-        let c = compute_prompt_hash("prompt one", None).unwrap();
+        let a = compute_prompt_hash("prompt one", std::slice::from_ref(&bundle)).unwrap();
+        let b = compute_prompt_hash("prompt two", std::slice::from_ref(&bundle)).unwrap();
+        let c = compute_prompt_hash("prompt one", &[]).unwrap();
 
         assert_ne!(a, b);
         assert_ne!(a, c);

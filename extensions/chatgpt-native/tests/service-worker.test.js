@@ -135,7 +135,8 @@ test("service worker routes reconnect and multiplexes two native jobs", async ()
     assert.deepEqual(port.messages[0].payload.capabilities, [
       "terminal_ack",
       "native_job_commands_v1",
-      "chatgpt_click_bound_send_receipt_v1"
+      "chatgpt_click_bound_send_receipt_v1",
+      "multi_attach_v1"
     ]);
 
     port.emit(envelope("reconnect", "job_reconnect"));
@@ -2775,7 +2776,8 @@ test("service worker hello falls back with instance id when profile identity fai
     assert.deepEqual(hello.payload.capabilities, [
       "terminal_ack",
       "native_job_commands_v1",
-      "chatgpt_click_bound_send_receipt_v1"
+      "chatgpt_click_bound_send_receipt_v1",
+      "multi_attach_v1"
     ]);
   } finally {
     globalThis.chrome = originalChrome;
@@ -3784,6 +3786,76 @@ test("service worker does not complete long idle assistant text with only baseli
 
     await eventually(() => port.messages.some((message) => message.type === "job_error" && message.payload.code === "response_timeout"));
     assert.equal(port.messages.some((message) => message.type === "job_complete"), false);
+  } finally {
+    globalThis.chrome = originalChrome;
+  }
+});
+
+test("service worker uploads a two-file manifest as two attachments before the prompt", async () => {
+  const originalChrome = globalThis.chrome;
+  const port = makePort();
+  const tabCommands = [];
+  let tabId = 0;
+  globalThis.chrome = chromeStub({
+    port,
+    tabs: {
+      create: async (opts) => ({ id: ++tabId, ...opts }),
+      get: async (id) => ({ id, status: "complete", url: "https://chatgpt.com/" }),
+      sendMessage: async (_id, message) => {
+        tabCommands.push(message);
+        switch (message.type) {
+          case "yoetz_probe":
+            return { ok: true, payload: {} };
+          case "yoetz_prepare_job":
+            return { ok: true, payload: { manual_handoff: null } };
+          case "yoetz_configure_model":
+            return { ok: true, payload: verifiedLatestProSelection() };
+          case "yoetz_upload_file":
+            return { ok: true, payload: { filename: message.file.filename } };
+          case "yoetz_send_prompt":
+            return { ok: true, payload: { sent: true, conversation_id: "conv-multi-attach" } };
+          case "yoetz_extract_response":
+            return { ok: true, payload: { method: "none", text: "", is_generating: true, assistant_count: 0, turn_index: -1 } };
+          default:
+            throw new Error(`unexpected tab message ${message.type}`);
+        }
+      }
+    }
+  });
+
+  try {
+    await import(`../src/service-worker.js?multi_attach=${Date.now()}`);
+    port.emit(envelope("job_start", "job_multi_attach", {
+      prompt: "prompt",
+      wait_interval_ms: 50,
+      wait_timeout_ms: 1200,
+      attachments: [
+        { filename: "part1.zip", mime_type: "application/zip", bytes: 3 },
+        { filename: "part2.zip", mime_type: "application/zip", bytes: 2 }
+      ]
+    }));
+    await eventually(() => port.messages.some((message) => message.payload?.phase === "ready_for_file"));
+    port.emit(envelope("job_file_chunk", "job_multi_attach", {
+      sequence: 0,
+      total_chunks: 1,
+      total_bytes: 5,
+      filename: "part1.zip",
+      mime_type: "application/zip",
+      bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("abcde"))
+    }));
+
+    await eventually(() => tabCommands.some((message) => message.type === "yoetz_send_prompt"));
+    const uploads = tabCommands.filter((message) => message.type === "yoetz_upload_file").map((message) => message.file);
+    assert.deepEqual(uploads, [
+      { filename: "part1.zip", mime_type: "application/zip", bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("abc")) },
+      { filename: "part2.zip", mime_type: "application/zip", bytes_base64: uint8ArrayToBase64(new TextEncoder().encode("de")) }
+    ]);
+    assert.ok(
+      tabCommands.findLastIndex((message) => message.type === "yoetz_upload_file")
+        < tabCommands.findIndex((message) => message.type === "yoetz_send_prompt")
+    );
+    const uploaded = port.messages.filter((message) => message.type === "job_progress" && message.payload.phase === "file_uploaded");
+    assert.deepEqual(uploaded.map((message) => message.payload.filename), ["part1.zip", "part2.zip"]);
   } finally {
     globalThis.chrome = originalChrome;
   }

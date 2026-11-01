@@ -72,6 +72,13 @@ pub struct DevtoolsMcpRecipeContext {
     /// does not fall back to paste mode.
     pub bundle_path: Option<PathBuf>,
 
+    /// yz-w4s: every file to upload, in order, when there are several (then
+    /// `bundle_path` is None). A live-attach daemon that predates this field
+    /// ignores it and so refuses "requires `--bundle`" before any side effect
+    /// instead of uploading only the first file.
+    #[serde(default)]
+    pub upload_paths: Vec<PathBuf>,
+
     /// Reserved for compatibility with other recipe contexts. The current
     /// live-attach Chrome transport does not use inline bundle text.
     pub bundle_text: Option<String>,
@@ -116,6 +123,28 @@ pub struct DevtoolsMcpRecipeContext {
     pub progress: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
+impl DevtoolsMcpRecipeContext {
+    /// Fills the upload fields from the run's files (see `upload_paths`).
+    pub fn with_upload_paths(mut self, mut paths: Vec<PathBuf>) -> Self {
+        if paths.len() == 1 {
+            self.bundle_path = paths.pop();
+        } else {
+            self.bundle_path = None;
+            self.upload_paths = paths;
+        }
+        self
+    }
+
+    /// The files to upload, in order.
+    pub fn files_to_upload(&self) -> Vec<&Path> {
+        if self.upload_paths.is_empty() {
+            self.bundle_path.as_deref().into_iter().collect()
+        } else {
+            self.upload_paths.iter().map(PathBuf::as_path).collect()
+        }
+    }
+}
+
 /// Reports one recipe phase to the caller, in every output format.
 pub fn report_progress(ctx: &DevtoolsMcpRecipeContext, message: impl Into<String>) {
     let message = message.into();
@@ -158,6 +187,7 @@ impl Default for DevtoolsMcpRecipeContext {
         Self {
             cdp_endpoint: None,
             bundle_path: None,
+            upload_paths: Vec::new(),
             bundle_text: None,
             model: String::new(),
             model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,

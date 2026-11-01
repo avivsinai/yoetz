@@ -176,7 +176,7 @@ pub fn should_recover_initial_page_open_after_reconnect(err: &anyhow::Error) -> 
 
 /// The full ChatGPT Pro recipe. Returns the assistant's final response text.
 pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ChatgptRunResult> {
-    if ctx.bundle_path.is_none() {
+    if ctx.files_to_upload().is_empty() {
         return Err(anyhow!(
             "ChatGPT recipe requires `--bundle`; this transport uploads a file attachment and does not support paste mode"
         ));
@@ -351,16 +351,14 @@ async fn run_attached_recipe_inner(
     // `take_snapshot` to find the input's uid, then `upload_file` against
     // that uid.
     //
-    let bundle_path = ctx
-        .bundle_path
-        .as_ref()
-        .context("ChatGPT recipe requires a bundle file path")?;
-    report_upload_started(ctx, bundle_path);
-    try_upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
-        .await
-        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Upload)
-        .context("upload bundle to ChatGPT")?;
-    report_progress(ctx, "upload attached");
+    for bundle_path in ctx.files_to_upload() {
+        report_upload_started(ctx, bundle_path);
+        try_upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
+            .await
+            .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Upload)
+            .context("upload bundle to ChatGPT")?;
+        report_progress(ctx, "upload attached");
+    }
 
     // Step 4: type the delivery text into the focused composer.
     //

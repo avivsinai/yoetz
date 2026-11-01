@@ -1,10 +1,14 @@
 const DEFAULT_MAX_CHUNKS = 100000;
-export const MAX_BUNDLE_BYTES = 10 * 1024 * 1024;
+// yz-w4s: one job streams all its attachments concatenated, so the assembler
+// caps the total. The per-file cap (40 MiB, from Chrome's 64 MiB message limit
+// on the base64 hop to the tab) and the derivation live in the CLI
+// (browser_extension_native.rs MAX_FILE_BYTES / MAX_TOTAL_BYTES).
+export const MAX_TOTAL_BYTES = 128 * 1024 * 1024;
 export const MAX_NATIVE_INBOUND_BYTES = 1024 * 1024;
 
 export class ChunkAssembler {
   constructor({ maxBytes, maxChunks = DEFAULT_MAX_CHUNKS } = {}) {
-    this.maxBytes = maxBytes ?? MAX_BUNDLE_BYTES;
+    this.maxBytes = maxBytes ?? MAX_TOTAL_BYTES;
     this.maxChunks = maxChunks;
     this.jobs = new Map();
   }

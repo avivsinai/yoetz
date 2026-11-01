@@ -41,6 +41,8 @@ impl<T> AnyhowResultExt<T> for Result<T, AnyhowError> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ClaudeRecipeSpec {
     pub bundle_path: Option<PathBuf>,
+    /// Extra files uploaded after `bundle_path`, in order (`--attach`).
+    pub attach_paths: Vec<PathBuf>,
     pub prompt: String,
     pub browser_context_id: Option<String>,
     pub profile_email: Option<String>,

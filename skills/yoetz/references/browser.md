@@ -142,7 +142,7 @@ YOETZ_AGENT=1 yoetz browser recipe --recipe chatgpt --bundle "$BUNDLE" \
 
 `yoetz bundle` inlines text only; it names binary files in `omitted_binary`
 and leaves them out. `--bundle` accepts any file, so send binary evidence as
-one ZIP:
+a ZIP, and add more files to the same turn with repeatable `--attach`:
 
 ```bash
 # REVIEW-REQUEST.md at the ZIP root holds the full request.
@@ -154,11 +154,22 @@ YOETZ_AGENT=1 yoetz browser recipe --recipe chatgpt --bundle "$PWD/packet.zip" \
 
 - A file that is not a yoetz bundle has no stored prompt, so always pass
   `--var prompt=`; without it the recipe default asks for a generic analysis.
-- The native extension uploads at most 10 MiB and refuses a larger file before
-  any side effect. Above that, a run without `--thread`, `--followup` or
-  `--var conversation=` can use `--transport chrome-extension-native
-  --allow-cdp-fallback` to upload through Chrome DevTools. Resume and thread
-  runs are native-only: send a smaller packet.
+- The native extension uploads at most 40 MiB per file and 128 MiB per run,
+  and refuses more before any side effect. Split a larger packet into ZIPs of
+  at most 40 MiB and send them in one turn:
+
+  ```bash
+  yoetz browser recipe --recipe chatgpt --bundle "$PWD/part1.zip" \
+    --attach "$PWD/part2.zip" --attach "$PWD/part3.zip" \
+    --var prompt='Extract the attached ZIPs and follow REVIEW-REQUEST.md in part1.zip.'
+  ```
+
+  Every file uploads before the prompt is sent. File names must differ.
+  `--attach` works on `chatgpt` and `claude`, on chrome-extension-native and
+  chrome-devtools-mcp; dev-browser and agent-browser refuse it. With
+  `--thread`, all files are copied into the thread's session. If the extension
+  is older than the CLI, the run refuses before job start; run `yoetz browser
+  extension update --chatgpt` (or `--claude`).
 - Keep the packet small. The model unpacks a ZIP in its code tool and samples
   it; it does not look at hundreds of images in one turn. Send the screenshots
   that show each step, at a lower resolution, and name them so the request
@@ -174,7 +185,7 @@ because the first is slow.
 |-----|---------|--------|
 | `wait_timeout_ms` | 5400000 (90 min) | the response wait |
 | `send_timeout_ms` | 120000 | the send |
-| `upload_timeout_ms` | 120000, plus 5000 per MiB of bundle, capped at 3600000 | the attach |
+| `upload_timeout_ms` | 120000, plus 5000 per MiB of all upload files, capped at 3600000 | the attach |
 
 Set them with `--var <name>=<ms>`, on `chatgpt` and `claude`. An upload timeout
 ("page did not reach the requested state within <n>ms") is processing latency,

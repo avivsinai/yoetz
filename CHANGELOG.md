@@ -12,15 +12,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   so `--thread <label> --fresh` works for binary evidence (#632).
 - `yoetz bundle` warns on stderr when it leaves out binary files and lists them
   in a new `omitted_binary` JSON field, with the ZIP `--bundle` route (#622).
+- `yoetz browser recipe --attach <FILE>` (repeatable) uploads more files in the
+  same ChatGPT or Claude turn after `--bundle`. The native extension now takes
+  40 MiB per file and 128 MiB per run (was 10 MiB), so a large evidence packet
+  goes as several ZIPs without the CDP fallback. `--thread` copies every file.
+  An extension older than the CLI refuses `--attach` before job start; a
+  `.zip`, image or PDF is now sent with its own MIME type (#632).
 
 ### Changed
 - `yoetz browser recipe --help` describes `--bundle` as any file (a ZIP
-  included) and states the 10 MiB native upload limit. The over-limit error
-  names the limit in MiB and, for runs that are not resumes or threads, the
-  CDP fallback. The skill has a "Binary
-  evidence" section with packet-size guidance (#622, #632).
+  included) and states the native upload limit. The over-limit error names
+  the limit in MiB and `--attach`. The skill has a "Binary evidence" section
+  with packet-size guidance (#622, #632).
 
 ### Fixed
+- A native-extension recipe no longer fails with "Invalid argument (os error
+  22)" when the recipe socket's peer closed: macOS EINVAL on that socket is
+  treated as a disconnect and the run reconnects (#625).
 - The chrome-devtools-mcp (live-attach) recipe path now prints phase progress
   on stderr in every output format (`info: chrome-devtools-mcp: attached to
   Chrome`, `uploading <file> (<size>)`, `prompt sent`, `waiting for the

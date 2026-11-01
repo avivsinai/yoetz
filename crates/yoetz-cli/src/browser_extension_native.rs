@@ -28,6 +28,9 @@ use yoetz_core::paths::home_dir;
 pub const TRANSPORT_NAME: &str = "chrome-extension-native";
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const NATIVE_JOB_COMMANDS_CAPABILITY: &str = "native_job_commands_v1";
+/// yz-w4s: the extension uploads a job's attachment manifest file by file. An
+/// extension without it would upload the concatenated stream as one file.
+pub const MULTI_ATTACH_CAPABILITY: &str = "multi_attach_v1";
 pub const YOETZ_CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
 const EXPECTED_CHATGPT_EXTENSION_FINGERPRINT: &str =
     env!("YOETZ_CHATGPT_NATIVE_EXTENSION_FINGERPRINT");
@@ -46,7 +49,17 @@ pub const CHATGPT_EXTENSION_DIR_ENV: &str = "YOETZ_CHATGPT_NATIVE_EXTENSION_DIR"
 pub const MAX_CHROME_NATIVE_EXTENSION_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_CHROME_NATIVE_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const MAX_FRAME_BYTES: usize = MAX_CHROME_NATIVE_EXTENSION_MESSAGE_BYTES;
-pub const MAX_BUNDLE_BYTES: u64 = 10 * 1024 * 1024;
+// yz-w4s: upload caps. The chunk stream is not the bound (it carries 1 MiB
+// native-host frames). The bound is the service worker -> tab hop: each file
+// goes to the content script in ONE runtime message as base64, and Chrome caps
+// an extension message at 64 MiB of serialized JSON (kMaxMessageLength in
+// extensions/renderer messaging_util.cc). base64 costs 4/3, so a file of F bytes
+// needs ceil(F/3)*4 bytes plus the serialized job (prompt included) and framing:
+// 40 MiB -> 53.4 MiB, which leaves ~10 MiB for the job. The total is a margin
+// judgment, not a derived number: the service worker holds the assembled stream
+// (briefly twice, chunks plus the joined buffer) and one file's base64 string.
+pub const MAX_FILE_BYTES: u64 = 40 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const CHUNK_BYTES: usize = 192 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(10);
 // dump-picker --select-model runs the recipe's model selection (hydration
@@ -2226,6 +2239,7 @@ pub fn canary(
         BuiltinWebRecipe::Chatgpt => run_chatgpt_recipe(
             &ChatgptRecipeSpec {
                 bundle_path: Some(bundle_path),
+                attach_paths: Vec::new(),
                 model: crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL.to_string(),
                 model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
                 prompt: "Reply with exactly OK.".to_string(),
@@ -2246,6 +2260,7 @@ pub fn canary(
         BuiltinWebRecipe::Claude => run_claude_recipe(
             &ClaudeRecipeSpec {
                 bundle_path: Some(bundle_path),
+                attach_paths: Vec::new(),
                 prompt: "Reply with exactly OK.".to_string(),
                 browser_context_id: None,
                 profile_email: selector.profile_email.map(str::to_string),
@@ -2625,11 +2640,7 @@ fn select_recipe_instance_with_lifecycle_lock(
 pub(crate) fn acquire_chatgpt_recipe_lease(
     spec: &ChatgptRecipeSpec,
 ) -> Result<ExtensionRecipeLease> {
-    let bundle_path = spec
-        .bundle_path
-        .as_deref()
-        .context("chrome-extension-native transport requires `--bundle`")?;
-    validate_bundle_path(bundle_path)?;
+    let files = recipe_upload_files(spec.bundle_path.as_deref(), &spec.attach_paths)?;
     acquire_extension_recipe_lease(
         ExtensionInstanceSelector {
             profile_email: spec.profile_email.as_deref(),
@@ -2639,15 +2650,12 @@ pub(crate) fn acquire_chatgpt_recipe_lease(
         BuiltinWebRecipe::Chatgpt,
         "--chatgpt",
         "ChatGPT native extension recipe",
+        files.len(),
     )
 }
 
 pub(crate) fn acquire_claude_recipe_lease(spec: &ClaudeRecipeSpec) -> Result<ExtensionRecipeLease> {
-    let bundle_path = spec
-        .bundle_path
-        .as_deref()
-        .context("chrome-extension-native transport requires `--bundle`")?;
-    validate_bundle_path(bundle_path)?;
+    let files = recipe_upload_files(spec.bundle_path.as_deref(), &spec.attach_paths)?;
     acquire_extension_recipe_lease(
         ExtensionInstanceSelector {
             profile_email: spec.profile_email.as_deref(),
@@ -2657,6 +2665,7 @@ pub(crate) fn acquire_claude_recipe_lease(spec: &ClaudeRecipeSpec) -> Result<Ext
         BuiltinWebRecipe::Claude,
         "--claude",
         "Claude native extension recipe",
+        files.len(),
     )
 }
 
@@ -2665,12 +2674,14 @@ fn acquire_extension_recipe_lease(
     recipe: BuiltinWebRecipe,
     recipe_flag: &str,
     action: &str,
+    file_count: usize,
 ) -> Result<ExtensionRecipeLease> {
     let paths = extension_paths()?;
     let (lifecycle_lock, instance) =
         select_recipe_instance_with_lifecycle_lock(&paths, selector, recipe_flag, action)?;
     ensure_instance_matches_managed_copy(&instance)?;
     ensure_instance_supports_capability(&instance, NATIVE_JOB_COMMANDS_CAPABILITY)?;
+    ensure_instance_supports_file_count(&instance, file_count)?;
     if recipe == BuiltinWebRecipe::Claude {
         ensure_instance_supports_recipe(&instance, "claude")?;
     }
@@ -2704,11 +2715,7 @@ pub(crate) fn run_chatgpt_recipe_with_lease(
     if lease.recipe != BuiltinWebRecipe::Chatgpt {
         bail!("native extension recipe lease does not belong to ChatGPT");
     }
-    let bundle_path = spec
-        .bundle_path
-        .as_deref()
-        .context("chrome-extension-native transport requires `--bundle`")?;
-    let bundle = validate_bundle_path(bundle_path)?;
+    let files = recipe_upload_files(spec.bundle_path.as_deref(), &spec.attach_paths)?;
     let token = read_capability_token(&lease.paths.token_path)?;
     let envelope = run_extension_recipe_with_reconnect(
         format,
@@ -2718,9 +2725,9 @@ pub(crate) fn run_chatgpt_recipe_with_lease(
         &spec.run_id,
         spec.wait_timeout_ms,
         recipe_inactivity_cap(spec.upload_timeout_ms, spec.send_timeout_ms),
-        &bundle,
+        &files,
         &token,
-        chatgpt_job_start_payload(spec, &bundle),
+        chatgpt_job_start_payload(spec, &files),
     )?;
     match envelope.kind.as_str() {
         "job_complete" => parse_recipe_result(envelope, BuiltinWebRecipe::Chatgpt)
@@ -2747,11 +2754,7 @@ pub(crate) fn run_claude_recipe_with_lease(
     if lease.recipe != BuiltinWebRecipe::Claude {
         bail!("native extension recipe lease does not belong to Claude");
     }
-    let bundle_path = spec
-        .bundle_path
-        .as_deref()
-        .context("chrome-extension-native transport requires `--bundle`")?;
-    let bundle = validate_bundle_path(bundle_path)?;
+    let files = recipe_upload_files(spec.bundle_path.as_deref(), &spec.attach_paths)?;
     let token = read_capability_token(&lease.paths.token_path)?;
     let envelope = run_extension_recipe_with_reconnect(
         format,
@@ -2761,9 +2764,9 @@ pub(crate) fn run_claude_recipe_with_lease(
         &spec.run_id,
         spec.wait_timeout_ms,
         recipe_inactivity_cap(spec.upload_timeout_ms, spec.send_timeout_ms),
-        &bundle,
+        &files,
         &token,
-        claude_job_start_payload(spec, &bundle),
+        claude_job_start_payload(spec, &files),
     )?;
     match envelope.kind.as_str() {
         "job_complete" => parse_recipe_result(envelope, BuiltinWebRecipe::Claude),
@@ -2781,7 +2784,7 @@ fn run_extension_recipe_with_reconnect(
     run_id: &str,
     wait_timeout_ms: u64,
     inactivity_cap: Duration,
-    bundle: &BundleInfo,
+    files: &[BundleInfo],
     token: &str,
     start_payload: Value,
 ) -> Result<ProtocolEnvelope> {
@@ -2880,7 +2883,7 @@ fn run_extension_recipe_with_reconnect(
                     run_id,
                     &job_id,
                     &workspace_id,
-                    bundle,
+                    files,
                     token,
                     wait_timeout_ms,
                 )?;
@@ -2949,10 +2952,11 @@ fn reconnect_recipe_stream(
     run_id: &str,
     job_id: &str,
     workspace_id: &str,
-    bundle: &BundleInfo,
+    files: &[BundleInfo],
     token: &str,
     wait_timeout_ms: u64,
 ) -> Result<(SocketStream, Option<ProtocolEnvelope>)> {
+    let bundle = &files[0];
     let deadline = Instant::now() + RECIPE_RECONNECT_WINDOW;
     let mut last_error = anyhow!("no connected native host instance was available");
     loop {
@@ -2965,6 +2969,7 @@ fn reconnect_recipe_stream(
         match select_extension_instance(&lease.paths, selector).and_then(|instance| {
             ensure_instance_matches_managed_copy(&instance)?;
             ensure_instance_supports_capability(&instance, NATIVE_JOB_COMMANDS_CAPABILITY)?;
+            ensure_instance_supports_file_count(&instance, files.len())?;
             if recipe == BuiltinWebRecipe::Claude {
                 ensure_instance_supports_recipe(&instance, "claude")?;
             }
@@ -2983,6 +2988,7 @@ fn reconnect_recipe_stream(
                     "bundle_size": bundle.size,
                     "file_name": bundle.file_name,
                     "mime": bundle.mime,
+                    "attachments": attachment_manifest(files, true),
                 }),
             )
             .with_token(token.to_string());
@@ -3151,13 +3157,15 @@ pub fn serve_native_host_chatgpt() -> Result<()> {
     }
 }
 
-fn chatgpt_job_start_payload(spec: &ChatgptRecipeSpec, bundle: &BundleInfo) -> Value {
+fn chatgpt_job_start_payload(spec: &ChatgptRecipeSpec, files: &[BundleInfo]) -> Value {
+    let bundle = &files[0];
     json!({
         "recipe": "chatgpt",
         "bundle_path": bundle.path,
         "file_name": bundle.file_name,
         "bundle_size": bundle.size,
         "mime": bundle.mime,
+        "attachments": attachment_manifest(files, true),
         "prompt": spec.prompt,
         "model": spec.model,
         "model_strategy": spec.model_strategy,
@@ -3174,13 +3182,15 @@ fn chatgpt_job_start_payload(spec: &ChatgptRecipeSpec, bundle: &BundleInfo) -> V
     })
 }
 
-fn claude_job_start_payload(spec: &ClaudeRecipeSpec, bundle: &BundleInfo) -> Value {
+fn claude_job_start_payload(spec: &ClaudeRecipeSpec, files: &[BundleInfo]) -> Value {
+    let bundle = &files[0];
     json!({
         "recipe": "claude",
         "bundle_path": bundle.path,
         "file_name": bundle.file_name,
         "bundle_size": bundle.size,
         "mime": bundle.mime,
+        "attachments": attachment_manifest(files, true),
         "prompt": spec.prompt,
         "model": crate::claude_recipe::CLAUDE_FABLE_MAX_MODEL,
         "model_strategy": "select",
@@ -3210,7 +3220,7 @@ struct ExtensionPaths {
 }
 
 #[derive(Clone, Debug)]
-struct BundleInfo {
+pub(crate) struct BundleInfo {
     path: PathBuf,
     file_name: String,
     size: u64,
@@ -3635,6 +3645,18 @@ fn ensure_recipe_not_in_cooldown(instance: &ExtensionInstanceStatus, recipe: &st
     );
 }
 
+/// yz-w4s: an extension without the manifest loop would upload the
+/// concatenated stream under the first file's name, so refuse before job_start.
+fn ensure_instance_supports_file_count(
+    instance: &ExtensionInstanceStatus,
+    file_count: usize,
+) -> Result<()> {
+    if file_count > 1 {
+        ensure_instance_supports_capability(instance, MULTI_ATTACH_CAPABILITY)?;
+    }
+    Ok(())
+}
+
 fn ensure_instance_supports_capability(
     instance: &ExtensionInstanceStatus,
     capability: &str,
@@ -3647,7 +3669,7 @@ fn ensure_instance_supports_capability(
         return Ok(());
     }
     bail!(
-        "selected chrome-extension-native instance {} does not advertise capability `{capability}`; refusing before job_start. Run `yoetz browser extension update --chatgpt` and reload the selected Chrome profile",
+        "selected chrome-extension-native instance {} does not advertise capability `{capability}`; refusing before job_start. Run `yoetz browser extension update --chatgpt` (or `--claude`) and reload the selected Chrome profile",
         instance
             .extension_instance_id
             .as_deref()
@@ -4369,12 +4391,15 @@ fn validate_bundle_path(path: &Path) -> Result<BundleInfo> {
     if !metadata.is_file() {
         bail!("bundle path is not a file: {}", canonical_path.display());
     }
-    if metadata.len() > MAX_BUNDLE_BYTES {
+    if metadata.len() > MAX_FILE_BYTES {
         bail!(
-            "bundle is {} bytes, above chrome-extension-native limit of {} bytes ({} MiB). Send less evidence (fewer or lower-resolution screenshots). A run without --thread, --followup or --var conversation= can instead retry with `--transport chrome-extension-native --allow-cdp-fallback` to upload through Chrome DevTools",
+            "{} is {} bytes, above chrome-extension-native limit of {} bytes ({} MiB) per file. Split the evidence into files of at most {} MiB and pass the extra files with `--attach <FILE>` (repeatable, {} MiB in total)",
+            canonical_path.display(),
             metadata.len(),
-            MAX_BUNDLE_BYTES,
-            MAX_BUNDLE_BYTES / (1024 * 1024)
+            MAX_FILE_BYTES,
+            MAX_FILE_BYTES / (1024 * 1024),
+            MAX_FILE_BYTES / (1024 * 1024),
+            MAX_TOTAL_BYTES / (1024 * 1024)
         );
     }
     let file_name = canonical_path
@@ -4382,10 +4407,22 @@ fn validate_bundle_path(path: &Path) -> Result<BundleInfo> {
         .and_then(|name| name.to_str())
         .context("bundle path must end in a UTF-8 filename")?
         .to_string();
-    let mime = if file_name.ends_with(".md") || file_name.ends_with(".markdown") {
-        "text/markdown"
-    } else {
-        "text/plain"
+    let extension = Path::new(&file_name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mime = match extension.as_str() {
+        "md" | "markdown" => "text/markdown",
+        "zip" => "application/zip",
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "json" => "application/json",
+        "txt" | "log" | "diff" | "patch" | "csv" => "text/plain",
+        _ => "application/octet-stream",
     }
     .to_string();
     Ok(BundleInfo {
@@ -4394,6 +4431,70 @@ fn validate_bundle_path(path: &Path) -> Result<BundleInfo> {
         size: metadata.len(),
         mime,
     })
+}
+
+/// yz-w4s: the files one recipe uploads, in order (`--bundle`, then each
+/// `--attach`). Checked as a set before any side effect: per-file cap, total
+/// cap, and distinct file names (the sites identify an attachment by name).
+pub(crate) fn validate_upload_files<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<BundleInfo>> {
+    let files = paths
+        .iter()
+        .map(|path| validate_bundle_path(path.as_ref()))
+        .collect::<Result<Vec<_>>>()?;
+    if files.is_empty() {
+        bail!("no upload file given");
+    }
+    let mut names = std::collections::HashSet::new();
+    for file in &files {
+        if !names.insert(file.file_name.as_str()) {
+            bail!(
+                "two upload files are named `{}`; the site tells attachments apart by name, so rename one",
+                file.file_name
+            );
+        }
+    }
+    let total = files.iter().map(|file| file.size).sum::<u64>();
+    if total > MAX_TOTAL_BYTES {
+        bail!(
+            "upload files total {total} bytes, above chrome-extension-native limit of {MAX_TOTAL_BYTES} bytes ({} MiB) for one run. Send less evidence or split it across runs",
+            MAX_TOTAL_BYTES / (1024 * 1024)
+        );
+    }
+    Ok(files)
+}
+
+fn recipe_upload_files(
+    bundle_path: Option<&Path>,
+    attach_paths: &[PathBuf],
+) -> Result<Vec<BundleInfo>> {
+    let bundle_path =
+        bundle_path.context("chrome-extension-native transport requires `--bundle`")?;
+    let paths = std::iter::once(bundle_path.to_path_buf())
+        .chain(attach_paths.iter().cloned())
+        .collect::<Vec<_>>();
+    validate_upload_files(&paths)
+}
+
+/// The attachment manifest in upload order. The CLI sends it with paths; the
+/// native host reads those files, streams them concatenated, and forwards the
+/// manifest without paths so the service worker can split the stream.
+fn attachment_manifest(files: &[BundleInfo], with_paths: bool) -> Value {
+    Value::Array(
+        files
+            .iter()
+            .map(|file| {
+                let mut entry = json!({
+                    "filename": file.file_name,
+                    "mime_type": file.mime,
+                    "bytes": file.size,
+                });
+                if with_paths {
+                    entry["path"] = json!(file.path);
+                }
+                entry
+            })
+            .collect(),
+    )
 }
 
 fn connect_socket(path: &Path) -> io::Result<SocketStream> {
@@ -4502,12 +4603,18 @@ fn send_control_job_with_recipe(
     }
 }
 
-pub fn chunk_payloads_for_file(
-    path: &Path,
-    file_name: &str,
-    mime_type: &str,
-) -> Result<Vec<Value>> {
-    let bytes = fs::read(path).with_context(|| format!("read bundle {}", path.display()))?;
+/// One chunk stream per job: every file concatenated in manifest order. The
+/// chunk filename and mime are the first file's, which is all a service worker
+/// without a manifest (one file) needs.
+fn chunk_payloads_for_files(files: &[BundleInfo]) -> Result<Vec<Value>> {
+    let first = files.first().context("no upload file to stream")?;
+    let (file_name, mime_type) = (first.file_name.as_str(), first.mime.as_str());
+    let mut bytes = Vec::new();
+    for file in files {
+        bytes.extend(
+            fs::read(&file.path).with_context(|| format!("read bundle {}", file.path.display()))?,
+        );
+    }
     let total_bytes = bytes.len();
     let total_chunks = total_bytes.div_ceil(CHUNK_BYTES).max(1);
     let mut chunks = Vec::with_capacity(total_chunks);
@@ -5960,43 +6067,68 @@ mod native_host_unix {
         Ok(Some(chunk))
     }
 
-    fn prepare_local_message(
+    pub(super) fn prepare_local_message(
         mut envelope: ProtocolEnvelope,
     ) -> Result<(ProtocolEnvelope, Vec<Value>)> {
         let chunks = if matches!(envelope.kind.as_str(), "job_start" | "reconnect")
             && envelope.payload.get("bundle_path").is_some()
         {
-            let bundle = validate_local_job_bundle(&envelope)?;
+            let files = validate_local_job_files(&envelope)?;
             if let Some(payload) = envelope.payload.as_object_mut() {
                 payload.remove("bundle_path");
-                payload.insert("file_name".to_string(), json!(bundle.file_name.clone()));
-                payload.insert("bundle_size".to_string(), json!(bundle.size));
-                payload.insert("mime".to_string(), json!(bundle.mime.clone()));
+                payload.insert("file_name".to_string(), json!(files[0].file_name.clone()));
+                payload.insert(
+                    "bundle_size".to_string(),
+                    json!(files.iter().map(|file| file.size).sum::<u64>()),
+                );
+                payload.insert("mime".to_string(), json!(files[0].mime.clone()));
+                payload.insert(
+                    "attachments".to_string(),
+                    attachment_manifest(&files, false),
+                );
             }
-            chunk_payloads_for_file(&bundle.path, &bundle.file_name, &bundle.mime)?
+            chunk_payloads_for_files(&files)?
         } else {
             Vec::new()
         };
         Ok((without_token(envelope), chunks))
     }
 
-    fn validate_local_job_bundle(envelope: &ProtocolEnvelope) -> Result<BundleInfo> {
+    /// The job's files in upload order: the `attachments` manifest the CLI
+    /// sent, or just `bundle_path` from a CLI that predates it.
+    fn validate_local_job_files(envelope: &ProtocolEnvelope) -> Result<Vec<BundleInfo>> {
         let bundle_path = envelope
             .payload
             .get("bundle_path")
             .and_then(Value::as_str)
             .context("local message payload missing bundle_path")?;
-        let bundle = validate_bundle_path(Path::new(bundle_path))?;
+        let paths = match envelope
+            .payload
+            .get("attachments")
+            .and_then(Value::as_array)
+        {
+            Some(entries) => entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .get("path")
+                        .and_then(Value::as_str)
+                        .context("local message attachment missing path")
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => vec![bundle_path],
+        };
+        let files = validate_upload_files(&paths)?;
         if let Some(size) = envelope.payload.get("bundle_size").and_then(Value::as_u64) {
-            if size != bundle.size {
+            if size != files[0].size {
                 bail!(
                     "bundle_size {} does not match current file size {}",
                     size,
-                    bundle.size
+                    files[0].size
                 );
             }
         }
-        Ok(bundle)
+        Ok(files)
     }
 
     fn should_send_next_chunk(client: &ClientJob, envelope: &ProtocolEnvelope) -> Result<bool> {
@@ -7086,6 +7218,7 @@ mod tests {
         };
         let spec = ChatgptRecipeSpec {
             bundle_path: Some(bundle.path.clone()),
+            attach_paths: Vec::new(),
             model: crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL.to_string(),
             model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
             prompt: "continue".to_string(),
@@ -7102,7 +7235,7 @@ mod tests {
             close_tab_on_complete: true,
         };
 
-        let payload = chatgpt_job_start_payload(&spec, &bundle);
+        let payload = chatgpt_job_start_payload(&spec, std::slice::from_ref(&bundle));
 
         assert_eq!(payload["conversation_id"], "conv-123");
         assert_eq!(payload["close_tab_on_complete"], true);
@@ -7279,6 +7412,7 @@ mod tests {
         };
         let spec = ChatgptRecipeSpec {
             bundle_path: Some(bundle_path),
+            attach_paths: Vec::new(),
             model: crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL.to_string(),
             model_strategy: ChatgptModelStrategy::Select,
             prompt: "review".to_string(),
@@ -7393,7 +7527,7 @@ mod tests {
             "run_pacing",
             2_000,
             Duration::from_secs(2),
-            &bundle,
+            std::slice::from_ref(&bundle),
             "token",
             json!({}),
         )
@@ -7414,6 +7548,7 @@ mod tests {
         let conversation_id = "123e4567-e89b-12d3-a456-426614174000";
         let spec = crate::claude_recipe::ClaudeRecipeSpec {
             bundle_path: Some(bundle.path.clone()),
+            attach_paths: Vec::new(),
             prompt: "continue".to_string(),
             browser_context_id: None,
             profile_email: None,
@@ -7430,7 +7565,7 @@ mod tests {
             warnings: vec!["size warning".to_string()],
         };
 
-        let payload = claude_job_start_payload(&spec, &bundle);
+        let payload = claude_job_start_payload(&spec, std::slice::from_ref(&bundle));
 
         assert_eq!(payload["recipe"], "claude");
         assert_eq!(
@@ -7494,6 +7629,34 @@ mod tests {
         let error = ensure_instance_supports_capability(&instance, NATIVE_JOB_COMMANDS_CAPABILITY)
             .unwrap_err();
         assert!(error.to_string().contains("before job_start"));
+    }
+
+    #[test]
+    fn attach_needs_the_multi_attach_capability_before_job_start() {
+        let mut instance = ExtensionInstanceStatus {
+            native_instance_id: "native_old".to_string(),
+            socket_path: PathBuf::from("/tmp/old.sock"),
+            pid: 1,
+            extension_instance_id: Some("ext_old".to_string()),
+            extension_version: Some("0.5.92".to_string()),
+            profile_email: None,
+            profile_id: None,
+            recipes: vec!["chatgpt".to_string()],
+            capabilities: vec![NATIVE_JOB_COMMANDS_CAPABILITY.to_string()],
+            protocol_version: PROTOCOL_VERSION,
+            last_seen_ms: 1,
+            cooldown_until_ms: None,
+        };
+
+        ensure_instance_supports_file_count(&instance, 1).unwrap();
+        let error = ensure_instance_supports_file_count(&instance, 2).unwrap_err();
+        assert!(error.to_string().contains("multi_attach_v1"));
+        assert!(error.to_string().contains("before job_start"));
+        assert!(error.to_string().contains("yoetz browser extension update"));
+        instance
+            .capabilities
+            .push(MULTI_ATTACH_CAPABILITY.to_string());
+        ensure_instance_supports_file_count(&instance, 2).unwrap();
     }
 
     #[test]
@@ -9454,7 +9617,7 @@ mod tests {
     fn validate_bundle_rejects_oversized_files() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("bundle.md");
-        fs::write(&path, vec![b'x'; (MAX_BUNDLE_BYTES + 1) as usize]).unwrap();
+        fs::write(&path, vec![b'x'; (MAX_FILE_BYTES + 1) as usize]).unwrap();
         let err = validate_bundle_path(&path).unwrap_err();
         assert!(err
             .to_string()
@@ -9479,17 +9642,67 @@ mod tests {
     }
 
     #[test]
-    fn chunk_payload_uses_base64() {
+    #[cfg(unix)]
+    fn attach_files_stream_as_one_manifest_and_hash_with_the_prompt() {
         let dir = TempDir::new().unwrap();
-        let path = dir.path().join("bundle.md");
-        fs::write(&path, b"abc").unwrap();
-        let chunks = chunk_payloads_for_file(&path, "bundle.md", "text/markdown").unwrap();
+        let first = dir.path().join("part1.zip");
+        let second = dir.path().join("part2.zip");
+        fs::write(&first, b"abc").unwrap();
+        fs::write(&second, b"de").unwrap();
+        let files = recipe_upload_files(Some(&first), std::slice::from_ref(&second)).unwrap();
+        let spec = ChatgptRecipeSpec {
+            bundle_path: Some(first.clone()),
+            attach_paths: vec![second.clone()],
+            model: crate::chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL.to_string(),
+            model_strategy: crate::chatgpt_recipe::ChatgptModelStrategy::Select,
+            prompt: "review".to_string(),
+            browser_context_id: None,
+            profile_email: None,
+            extension_instance_id: None,
+            extension_profile_id: None,
+            conversation_id: None,
+            run_id: "run-attach".to_string(),
+            wait_timeout_ms: 10_000,
+            wait_interval_ms: 1_000,
+            upload_timeout_ms: 2_000,
+            send_timeout_ms: 3_000,
+            close_tab_on_complete: true,
+        };
+        let start = ProtocolEnvelope::new(
+            "job_start",
+            Some("job_attach".to_string()),
+            Some("run-attach".to_string()),
+            chatgpt_job_start_payload(&spec, &files),
+        );
+
+        let (forwarded, chunks) = native_host_unix::prepare_local_message(start).unwrap();
+
+        assert_eq!(
+            forwarded.payload["attachments"],
+            json!([
+                {"filename": "part1.zip", "mime_type": "application/zip", "bytes": 3},
+                {"filename": "part2.zip", "mime_type": "application/zip", "bytes": 2},
+            ])
+        );
+        assert_eq!(forwarded.payload["bundle_size"], 5);
+        assert!(forwarded.payload.get("bundle_path").is_none());
         assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0]["sequence"], 0);
-        assert_eq!(chunks[0]["total_chunks"], 1);
-        assert_eq!(chunks[0]["total_bytes"], 3);
-        assert_eq!(chunks[0]["filename"], "bundle.md");
-        assert_eq!(chunks[0]["bytes_base64"], "YWJj");
+        assert_eq!(chunks[0]["total_bytes"], 5);
+        assert_eq!(chunks[0]["bytes_base64"], "YWJjZGU=");
+
+        // One file hashes as before --attach existed; a second file changes it.
+        let legacy_one_file_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(b"review");
+            hasher.update([0]);
+            hasher.update(hex::encode(Sha256::digest(b"abc")).as_bytes());
+            hex::encode(hasher.finalize())
+        };
+        let one =
+            crate::followup::compute_prompt_hash("review", std::slice::from_ref(&first)).unwrap();
+        let two = crate::followup::compute_prompt_hash("review", &[first, second]).unwrap();
+        assert_eq!(one, legacy_one_file_hash);
+        assert_ne!(two, one);
     }
 
     #[test]
