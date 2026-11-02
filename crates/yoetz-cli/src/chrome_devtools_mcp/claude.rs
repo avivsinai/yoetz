@@ -246,7 +246,7 @@ async fn select_fable_max(client: &ChromeCdpClient) -> Result<WebModelSelectionS
         .evaluate_script(&claude_web::build_select_max_function(), vec![])
         .await
         .context("select Max from Claude effort submenu")?;
-    require_status(&max, "selected", "Max effort", "effortOptions")?;
+    require_status(&max, "selected", "Max effort", "reason")?;
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     // A successful click is not proof. Close, re-open, hover again, and read

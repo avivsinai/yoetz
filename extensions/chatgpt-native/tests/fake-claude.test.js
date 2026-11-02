@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import { JSDOM } from "jsdom";
 import {
   classifyBlockingState,
   clickSend,
@@ -1046,7 +1047,7 @@ test("fake Claude missing Fable returns unavailable with live options", async ()
   }
 });
 
-test("fake Claude model picker refuses to proceed without a verifiable Max option", async () => {
+test("fake Claude missing Max effort returns unavailable with live effort options", async () => {
   const fixture = makeClaudeModelFixture({ includeMax: false });
   const previousPointerEvent = globalThis.PointerEvent;
   const previousMouseEvent = globalThis.MouseEvent;
@@ -1055,10 +1056,12 @@ test("fake Claude model picker refuses to proceed without a verifiable Max optio
   globalThis.MouseEvent = FakeMouseEvent;
   globalThis.KeyboardEvent = FakeKeyboardEvent;
   try {
-    await assert.rejects(
-      configureModelState(fixture.root, { model_selection_timeout_ms: 1 }),
-      /did not reach the requested state/
-    );
+    const result = await configureModelState(fixture.root, { model_selection_timeout_ms: 1 });
+
+    assert.equal(result.status, "unavailable");
+    assert.match(result.warning, /Max effort is unavailable; live effort options: High$/);
+    assert.equal(fixture.maxClicks, 0);
+    assert.equal(fixture.modelButton.getAttribute("aria-expanded"), "false");
   } finally {
     globalThis.PointerEvent = previousPointerEvent;
     globalThis.MouseEvent = previousMouseEvent;
@@ -1100,6 +1103,86 @@ test("fake Claude model picker never toggles a late-opening menu closed (gh-472)
     globalThis.PointerEvent = previousPointerEvent;
     globalThis.MouseEvent = previousMouseEvent;
     globalThis.KeyboardEvent = previousKeyboardEvent;
+  }
+});
+
+test("Claude model picker selects Fable 5 Max in the 2026-11-02 Base UI menu (yz-ejp)", async () => {
+  // Field defect yz-ejp: claude.ai dropped the effort-menu-trigger and
+  // effort-option-max testids; model_selection timed out after 10000ms.
+  // The model menu is the captured markup. The effort submenu was not captured
+  // (it mounts only on hover), so its markup here is an assumption: plain
+  // menuitemradio rows without testids.
+  const menuHtml = await readFile(
+    new URL("./fixtures/claude-picker/model-menu-2026-11-02.html", import.meta.url),
+    "utf8"
+  );
+  const dom = new JSDOM(`<!doctype html><body>
+    <button data-testid="model-selector-dropdown" aria-haspopup="menu" aria-expanded="false">Fable 5.1 Medium</button>
+    ${menuHtml}</body>`);
+  const { window } = dom;
+  const document = window.document;
+  // jsdom has no layout. Worst case: the retained closed menu still has rects,
+  // but its items do not respond.
+  window.Element.prototype.getClientRects = function getClientRects() {
+    return this.closest("[hidden]") ? [] : [{}];
+  };
+  const trigger = document.querySelector("[data-testid='model-selector-dropdown']");
+  const menu = document.querySelector("[data-cds='ModelSelector']");
+  const effort = Array.from(menu.querySelectorAll("[role='menuitem']"))
+    .find((item) => item.textContent.startsWith("Effort"));
+  let level = "Medium";
+  const setOpen = (open) => {
+    trigger.setAttribute("aria-expanded", String(open));
+    menu.toggleAttribute("data-closed", !open);
+    menu.toggleAttribute("data-open", open);
+    if (!open) document.querySelector("[data-yoetz-test='effort-submenu']")?.remove();
+  };
+  trigger.addEventListener("click", () => setOpen(trigger.getAttribute("aria-expanded") !== "true"));
+  document.addEventListener("keydown", (event) => event.key === "Escape" && setOpen(false));
+  const closed = () => menu.hasAttribute("data-closed");
+  effort.addEventListener("pointerenter", () => {
+    if (closed() || document.querySelector("[data-yoetz-test='effort-submenu']")) return;
+    const submenu = document.createElement("div");
+    submenu.setAttribute("role", "menu");
+    submenu.setAttribute("data-yoetz-test", "effort-submenu");
+    for (const name of ["Low", "Medium", "High", "Max"]) {
+      const option = document.createElement("div");
+      option.setAttribute("role", "menuitemradio");
+      option.setAttribute("aria-checked", String(name === level));
+      option.textContent = name;
+      option.addEventListener("click", () => {
+        level = name;
+        trigger.textContent = `Fable 5.1 ${level}`;
+        setOpen(false);
+      });
+      submenu.append(option);
+    }
+    document.body.append(submenu);
+  });
+  for (const model of menu.querySelectorAll("[data-model-id]")) {
+    model.addEventListener("click", () => {
+      if (closed()) return;
+      for (const other of menu.querySelectorAll("[data-model-id]")) {
+        other.setAttribute("aria-checked", String(other === model));
+      }
+      setOpen(false);
+    });
+  }
+  const previousPointerEvent = globalThis.PointerEvent;
+  const previousMouseEvent = globalThis.MouseEvent;
+  globalThis.PointerEvent = window.PointerEvent;
+  globalThis.MouseEvent = window.MouseEvent;
+  try {
+    const result = await configureModelState(document, { model_selection_timeout_ms: 500 });
+
+    assert.equal(result.status, "selected", result.warning ?? JSON.stringify(result));
+    assert.equal(result.modelVerified, true);
+    assert.equal(result.maxVerified, true);
+    assert.equal(trigger.textContent, "Fable 5.1 Max");
+    assert.equal(claudeSiteAdapter.isAcceptableModelSelection(result), true);
+  } finally {
+    globalThis.PointerEvent = previousPointerEvent;
+    globalThis.MouseEvent = previousMouseEvent;
   }
 });
 
@@ -1684,7 +1767,7 @@ function makeClaudeModelFixture({
       markClosed();
     }
   };
-  const fable = control({ role: "menuitemradio", "aria-checked": initiallyConfigured ? "true" : "false" }, "Fable 5", (element) => {
+  const fable = control({ role: "menuitemradio", "data-model-id": "claude-fable-5", "aria-checked": initiallyConfigured ? "true" : "false" }, "Fable 5", (element) => {
     fableClicks += 1;
     element.setAttribute("aria-checked", "true");
     modelButton.innerText = "Fable 5 High";
@@ -1701,9 +1784,10 @@ function makeClaudeModelFixture({
       height: 20
     });
   }
-  const sonnet = control({ role: "menuitemradio", "aria-checked": includeFable ? "false" : "true" }, "Sonnet 5");
-  const effort = control({ "data-testid": "effort-menu-trigger" }, "Effort");
-  const max = control({ role: "menuitemradio", "data-testid": "effort-option-max", "aria-checked": initiallyConfigured ? "true" : "false" }, "Max", (element) => {
+  const sonnet = control({ role: "menuitemradio", "data-model-id": "claude-sonnet-5", "aria-checked": includeFable ? "false" : "true" }, "Sonnet 5");
+  const effort = control({ role: "menuitem", "aria-haspopup": "menu" }, "Effort High");
+  const high = control({ role: "menuitemradio", "aria-checked": "false" }, "High");
+  const max = control({ role: "menuitemradio", "aria-checked": initiallyConfigured ? "true" : "false" }, "Max", (element) => {
     maxClicks += 1;
     element.setAttribute("aria-checked", "true");
     modelButton.innerText = "Fable 5 Max";
@@ -1716,16 +1800,16 @@ function makeClaudeModelFixture({
     defaultView: { KeyboardEvent: FakeKeyboardEvent },
     querySelector(selector) {
       if (selector === "[data-testid='model-selector-dropdown']") return modelButton;
-      if (selector === "[data-testid='effort-menu-trigger']") return menuOpen ? effort : null;
-      if (selector === "[role='menuitemradio'][data-testid='effort-option-max']") {
-        return includeMax && menuOpen && effortHovered ? max : null;
-      }
       return null;
     },
     querySelectorAll(selector) {
       if (!menuOpen) return [];
+      const effortLevels = effortHovered ? [high, includeMax ? max : null] : [];
       if (selector === "[role='menuitemradio']") {
-        return includeFable ? [fable, sonnet] : [sonnet];
+        return [includeFable ? fable : null, sonnet, ...effortLevels].filter(Boolean);
+      }
+      if (selector === "[role='menuitem'][aria-haspopup='menu'], [data-testid='effort-menu-trigger']") {
+        return [effort];
       }
       if (selector === "[role='menuitemradio'][aria-checked='true']") {
         return [fable, sonnet, includeMax ? max : null]
@@ -1736,7 +1820,7 @@ function makeClaudeModelFixture({
           includeFable ? fable : null,
           sonnet,
           effort,
-          includeMax && effortHovered ? max : null
+          ...effortLevels
         ].filter(Boolean);
       }
       return [];
