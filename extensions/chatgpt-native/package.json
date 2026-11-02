@@ -10,5 +10,8 @@
     "eslint": "^10.10.0",
     "globals": "^17.12.0",
     "jsdom": "30.0.1"
+  },
+  "overrides": {
+    "minimatch": "^11.0.1"
   }
 }
