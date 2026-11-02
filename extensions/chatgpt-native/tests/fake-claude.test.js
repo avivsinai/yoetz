@@ -1384,6 +1384,24 @@ test("fake Claude extraction fails closed when final controls are not scoped to 
   assert.equal(claudeSiteAdapter.completion.hasFinalAssistantAffordance(extraction), false);
 });
 
+test("Claude extraction reads the 2026-11-02 assistant turn as a final answer (yz-ejp)", async () => {
+  // Field defect yz-ejp, runs 20261102T145140Z_b280b5 and
+  // 20261102T145413Z_bd3993: Claude answered, but .font-claude-response and
+  // action-bar-copy were gone, so the recipe waited forever (method=none).
+  const turnHtml = await readFile(
+    new URL("./fixtures/claude-conversation/assistant-turn-2026-11-02.html", import.meta.url),
+    "utf8"
+  );
+  const page = new JSDOM(`<!doctype html><body>${turnHtml}</body>`).window.document;
+
+  const extraction = extractResponse(page);
+
+  assert.equal(extraction.method, "assistant_dom");
+  assert.equal(extraction.text, "Attached files: part1.md and part2.md.\nCode words: amber, cobalt.");
+  assert.equal(extraction.has_copy_button, true);
+  assert.equal(claudeSiteAdapter.completion.hasFinalAssistantAffordance(extraction), true);
+});
+
 test("fake Claude completed scoped answer does not require a hover-only copy button", () => {
   const page = fakeClaudePage({ text: "complete without hover", streaming: false, copy: false });
 
@@ -1450,7 +1468,7 @@ test("fake Claude extraction reports artifact cards from only the final assistan
         resumedPage.assistant
       ];
     }
-    if (selector === "[data-testid='action-bar-copy']") return resumedPage.globalCopy;
+    if (selector === "[data-testid='action-bar-copy'], [data-testid='message-actions'] button[aria-label='Copy']:not([data-testid='user-message-copy'])") return resumedPage.globalCopy;
     if (selector === "button[aria-label='Stop response']") return [];
     if (selector === "button[class*='group/status']") return [];
     if (selector === "[data-testid='user-message']") return [];
@@ -1556,7 +1574,7 @@ function fakeClaudePage({
   };
   const turn = {
     querySelectorAll(selector) {
-      return selector === "[data-testid='action-bar-copy']" && copy ? [copyButton] : [];
+      return selector === "[data-testid='action-bar-copy'], [data-testid='message-actions'] button[aria-label='Copy']:not([data-testid='user-message-copy'])" && copy ? [copyButton] : [];
     }
   };
   const assistant = fakeClaudeAssistant({ text, streaming, thinking, artifacts, body, turn });
@@ -1575,7 +1593,7 @@ function fakeClaudePage({
       if (selector === "[data-is-streaming]") {
         return [assistant];
       }
-      if (selector === "[data-testid='action-bar-copy']") return page.globalCopy;
+      if (selector === "[data-testid='action-bar-copy'], [data-testid='message-actions'] button[aria-label='Copy']:not([data-testid='user-message-copy'])") return page.globalCopy;
       if (selector === "button[aria-label='Stop response']") return stop ? [{}] : [];
       if (selector === "button[class*='group/status']") return thinking ? [{}] : [];
       if (selector === "[data-testid='user-message']") return [user];
@@ -1648,7 +1666,7 @@ function fakeClaudeAssistant({
       return name === "data-is-streaming" ? String(this.streaming) : null;
     },
     querySelector(selector) {
-      if (selector === ".font-claude-response") return body;
+      if (selector === ".font-claude-response, [data-cds='Prose']") return body;
       if (selector === "button[class*='group/status']") return this.thinking ? {} : null;
       return null;
     },

@@ -9,7 +9,12 @@ const ATTACHMENT_SELECTOR = "[data-testid='file-thumbnail']";
 // Attachment card captured 2026-11-02: the filename is a [title] on the card
 // link and the remove button reads "Remove <file>". Older cards: h3, "Remove".
 const ATTACHMENT_REMOVE_SELECTOR = "button[aria-label='Remove'], button[aria-label^='Remove '], button[data-cds-attachment-remove]";
-const COPY_ACTION_SELECTOR = "[data-testid='action-bar-copy']";
+// Assistant turn captured 2026-11-02: the answer body is [data-cds='Prose']
+// (was .font-claude-response) and Copy is an unlabelled-testid button in the
+// turn's message-actions toolbar (was action-bar-copy). The user's own Copy
+// button (user-message-copy) must never count as an answer control.
+const COPY_ACTION_SELECTOR = "[data-testid='action-bar-copy'], [data-testid='message-actions'] button[aria-label='Copy']:not([data-testid='user-message-copy'])";
+const RESPONSE_BODY_SELECTOR = ".font-claude-response, [data-cds='Prose']";
 const ASSISTANT_SELECTOR = "[data-is-streaming]";
 const EFFORT_TRIGGER_SELECTOR = "[role='menuitem'][aria-haspopup='menu'], [data-testid='effort-menu-trigger']";
 const MODEL_MENU_SETTLE_MS = 300;
@@ -579,7 +584,7 @@ export function extractResponse(root = document) {
   const assistants = assistantRoots(root);
   const last = assistants.at(-1) ?? null;
   const turn = last?.closest?.("[data-testid*='turn'], article") ?? last;
-  const body = last?.querySelector?.(".font-claude-response") ?? null;
+  const body = last?.querySelector?.(RESPONSE_BODY_SELECTOR) ?? null;
   const text = responseBodyText(body);
   const artifactCards = Array.from(
     last?.querySelectorAll?.("[class*='group/artifact-block']") ?? []
