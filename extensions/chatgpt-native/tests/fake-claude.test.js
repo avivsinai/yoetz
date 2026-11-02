@@ -526,7 +526,7 @@ test("fake Claude upload waits for the committed chip and re-enabled send", asyn
         attachment = {
           querySelector(selector) {
             if (selector === "h3") return { textContent: name };
-            if (selector === "button[aria-label='Remove']") return {};
+            if (selector === "button[aria-label='Remove'], button[aria-label^='Remove '], button[data-cds-attachment-remove]") return {};
             return null;
           }
         };
@@ -559,6 +559,45 @@ test("fake Claude upload waits for the committed chip and re-enabled send", asyn
   }
 });
 
+test("Claude upload recognizes the 2026-11-02 attachment card (yz-ejp)", async () => {
+  // Field defect yz-ejp, run 20261102T133520Z_084ad3: part1.md attached, but
+  // the card has no h3 and its remove button is labelled "Remove part1.md",
+  // so attachment_readiness timed out with thumbnail_labels=[""].
+  const cardHtml = await readFile(
+    new URL("./fixtures/claude-attachment/attachment-card-2026-11-02.html", import.meta.url),
+    "utf8"
+  );
+  const page = new JSDOM(`<!doctype html><body>${cardHtml}</body>`).window.document;
+  const previousDataTransfer = globalThis.DataTransfer;
+  globalThis.DataTransfer = FakeDataTransfer;
+  try {
+    let attached = false;
+    const send = { disabled: false, getAttribute: () => null };
+    const input = {
+      files: null,
+      dispatchEvent() {
+        attached = true;
+        return true;
+      }
+    };
+    const root = {
+      querySelector(selector) {
+        if (selector === "input[data-testid='file-upload']") return input;
+        if (selector === "button[aria-label='Send message']") return send;
+        return null;
+      },
+      querySelectorAll(selector) {
+        return attached ? page.querySelectorAll(selector) : [];
+      }
+    };
+    const file = new File(["bundle"], "part1.md", { type: "text/markdown" });
+
+    assert.equal(await uploadFile(root, file, { timeoutMs: 300 }), true);
+  } finally {
+    globalThis.DataTransfer = previousDataTransfer;
+  }
+});
+
 test("fake Claude upload accepts a later duplicate thumbnail that has the remove control", async () => {
   const previousDataTransfer = globalThis.DataTransfer;
   globalThis.DataTransfer = FakeDataTransfer;
@@ -572,7 +611,7 @@ test("fake Claude upload accepts a later duplicate thumbnail that has the remove
     const thumbnail = (hasRemoveControl) => ({
       querySelector(selector) {
         if (selector === "h3") return { textContent: "fixture.md" };
-        if (selector === "button[aria-label='Remove']") return hasRemoveControl ? {} : null;
+        if (selector === "button[aria-label='Remove'], button[aria-label^='Remove '], button[data-cds-attachment-remove]") return hasRemoveControl ? {} : null;
         return null;
       }
     });
@@ -619,7 +658,7 @@ test("fake Claude upload keeps observing after its soft deadline without redispa
           attachment = {
             querySelector(selector) {
               if (selector === "h3") return { textContent: name };
-              if (selector === "button[aria-label='Remove']") return {};
+              if (selector === "button[aria-label='Remove'], button[aria-label^='Remove '], button[data-cds-attachment-remove]") return {};
               return null;
             }
           };
@@ -789,7 +828,7 @@ test("fake Claude upload timeout reports an absent send control", async () => {
       getAttribute: () => null,
       querySelector(selector) {
         if (selector === "h3") return { textContent: "fixture.md" };
-        if (selector === "button[aria-label='Remove']") return {};
+        if (selector === "button[aria-label='Remove'], button[aria-label^='Remove '], button[data-cds-attachment-remove]") return {};
         return null;
       }
     };

@@ -6,6 +6,9 @@ const COMPOSER_SELECTOR = "[data-testid='chat-input']";
 const MODEL_SELECTOR = "[data-testid='model-selector-dropdown']";
 const FILE_INPUT_SELECTOR = "input[data-testid='file-upload']";
 const ATTACHMENT_SELECTOR = "[data-testid='file-thumbnail']";
+// Attachment card captured 2026-11-02: the filename is a [title] on the card
+// link and the remove button reads "Remove <file>". Older cards: h3, "Remove".
+const ATTACHMENT_REMOVE_SELECTOR = "button[aria-label='Remove'], button[aria-label^='Remove '], button[data-cds-attachment-remove]";
 const COPY_ACTION_SELECTOR = "[data-testid='action-bar-copy']";
 const ASSISTANT_SELECTOR = "[data-is-streaming]";
 const EFFORT_TRIGGER_SELECTOR = "[role='menuitem'][aria-haspopup='menu'], [data-testid='effort-menu-trigger']";
@@ -297,10 +300,10 @@ function initialAttachmentTrace(value) {
 
 function attachmentReadiness(root, filename) {
   const matchingThumbnails = Array.from(root.querySelectorAll(ATTACHMENT_SELECTOR)).filter((node) =>
-    normalizeText(node.querySelector("h3")?.textContent) === filename
+    attachmentLabel(node) === filename
   );
   const removeControl = matchingThumbnails.some((node) =>
-    Boolean(node.querySelector("button[aria-label='Remove']"))
+    Boolean(node.querySelector(ATTACHMENT_REMOVE_SELECTOR))
   );
   const send = findSendButton(root);
   const sendPresent = Boolean(send);
@@ -313,6 +316,13 @@ function attachmentReadiness(root, filename) {
     send_present: sendPresent,
     send_enabled: sendEnabled
   };
+}
+
+function attachmentLabel(thumbnail) {
+  return normalizeText(
+    thumbnail.querySelector?.("[title]")?.getAttribute("title")
+    || thumbnail.querySelector?.("h3")?.textContent
+  );
 }
 
 function recordAttachmentReadiness(trace, readiness, now) {
@@ -1190,11 +1200,8 @@ function claudeUploadDiagnosticSummary(root, filename, timeoutStage) {
   const thumbnails = Array.from(root.querySelectorAll?.(ATTACHMENT_SELECTOR) ?? []);
   const send = findSendButton(root);
   const observations = thumbnails.map((thumbnail) => {
-    const label = normalizeText(
-      thumbnail.querySelector?.("h3")?.textContent
-      || thumbnail.getAttribute?.("aria-label")
-      || thumbnail.getAttribute?.("title")
-    );
+    const label = attachmentLabel(thumbnail)
+      || normalizeText(thumbnail.getAttribute?.("aria-label") || thumbnail.getAttribute?.("title"));
     const text = normalizeText(thumbnail.innerText || thumbnail.textContent);
     const busy = thumbnail.getAttribute?.("aria-busy") === "true"
       || Boolean(thumbnail.querySelector?.([
@@ -1213,7 +1220,7 @@ function claudeUploadDiagnosticSummary(root, filename, timeoutStage) {
     return {
       label,
       matchesFilename: label === filename,
-      removePresent: Boolean(thumbnail.querySelector?.("button[aria-label='Remove']")),
+      removePresent: Boolean(thumbnail.querySelector?.(ATTACHMENT_REMOVE_SELECTOR)),
       busy,
       failure
     };
