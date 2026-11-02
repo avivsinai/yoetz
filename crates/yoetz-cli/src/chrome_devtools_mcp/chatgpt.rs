@@ -176,7 +176,7 @@ pub fn should_recover_initial_page_open_after_reconnect(err: &anyhow::Error) -> 
 
 /// The full ChatGPT Pro recipe. Returns the assistant's final response text.
 pub async fn run(ctx: &DevtoolsMcpRecipeContext) -> Result<ChatgptRunResult> {
-    if ctx.bundle_path.is_none() {
+    if ctx.files_to_upload().is_empty() {
         return Err(anyhow!(
             "ChatGPT recipe requires `--bundle`; this transport uploads a file attachment and does not support paste mode"
         ));
@@ -351,16 +351,18 @@ async fn run_attached_recipe_inner(
     // `take_snapshot` to find the input's uid, then `upload_file` against
     // that uid.
     //
-    let bundle_path = ctx
-        .bundle_path
-        .as_ref()
-        .context("ChatGPT recipe requires a bundle file path")?;
-    report_upload_started(ctx, bundle_path);
-    try_upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
-        .await
-        .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Upload)
-        .context("upload bundle to ChatGPT")?;
-    report_progress(ctx, "upload attached");
+    let upload_paths = ctx.files_to_upload();
+    if upload_paths.is_empty() {
+        return Err(anyhow!("ChatGPT recipe requires a bundle file path"));
+    }
+    for bundle_path in upload_paths {
+        report_upload_started(ctx, bundle_path);
+        try_upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
+            .await
+            .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Upload)
+            .context("upload bundle to ChatGPT")?;
+        report_progress(ctx, "upload attached");
+    }
 
     // Step 4: type the delivery text into the focused composer.
     //
@@ -1190,6 +1192,21 @@ async fn try_upload_bundle(
         .and_then(|value| value.to_str())
         .map(ToOwned::to_owned)
         .context("bundle path must end in a UTF-8 filename")?;
+    // yz-w4s: tiles already in the composer (earlier files of this run) must
+    // not satisfy this file's wait, even when their names share a stem.
+    let baseline = client
+        .evaluate_script(
+            &chatgpt_web::build_attachment_probe_function(&file_name)?,
+            vec![],
+        )
+        .await
+        .context("read attachment tiles before upload")?
+        .get("tileKeys")
+        .cloned()
+        .map(serde_json::from_value::<Vec<String>>)
+        .transpose()
+        .context("parse attachment tile keys")?
+        .unwrap_or_default();
 
     // Fast path: 0ms input wait falls through to click flow if no input, but
     // once an input is found and upload_file runs we still need real verify time.
@@ -1198,6 +1215,7 @@ async fn try_upload_bundle(
         client,
         bundle_path,
         &file_name,
+        &baseline,
         input_wait_ms,
         verify_timeout_ms,
     )
@@ -1248,9 +1266,16 @@ async fn try_upload_bundle(
             attempts.push("upload deadline exhausted before file input wait".to_string());
             break;
         }
-        if try_upload_via_file_input(client, bundle_path, &file_name, remaining_ms, remaining_ms)
-            .await
-            .with_context(|| format!("upload after clicking {label}"))?
+        if try_upload_via_file_input(
+            client,
+            bundle_path,
+            &file_name,
+            &baseline,
+            remaining_ms,
+            remaining_ms,
+        )
+        .await
+        .with_context(|| format!("upload after clicking {label}"))?
         {
             return Ok(());
         }
@@ -1270,6 +1295,7 @@ async fn try_upload_bundle(
                 client,
                 bundle_path,
                 &file_name,
+                &baseline,
                 remaining_ms,
                 remaining_ms,
             )
@@ -1307,6 +1333,7 @@ async fn try_upload_via_file_input(
     client: &ChromeCdpClient,
     bundle_path: &std::path::Path,
     file_name: &str,
+    baseline_tile_keys: &[String],
     input_wait_timeout_ms: u64,
     attachment_verify_timeout_ms: u64,
 ) -> Result<bool> {
@@ -1323,9 +1350,14 @@ async fn try_upload_via_file_input(
         .await
         .with_context(|| format!("upload_file via input `{input_uid}`"))?;
 
-    wait_for_attachment_visible(client, file_name, attachment_verify_timeout_ms)
-        .await
-        .with_context(|| format!("verify attachment chip for `{file_name}`"))?;
+    wait_for_attachment_visible(
+        client,
+        file_name,
+        baseline_tile_keys,
+        attachment_verify_timeout_ms,
+    )
+    .await
+    .with_context(|| format!("verify attachment chip for `{file_name}`"))?;
 
     Ok(true)
 }
@@ -1537,9 +1569,11 @@ fn format_upload_diagnostics(diagnostics: &serde_json::Value) -> String {
 async fn wait_for_attachment_visible(
     client: &ChromeCdpClient,
     file_name: &str,
+    baseline_tile_keys: &[String],
     upload_timeout_ms: u64,
 ) -> Result<()> {
-    let script = build_wait_for_attachment_visible_script(file_name, upload_timeout_ms)?;
+    let script =
+        build_wait_for_attachment_visible_script(file_name, baseline_tile_keys, upload_timeout_ms)?;
     let evidence = client
         .evaluate_script(&script, vec![])
         .await
@@ -1556,14 +1590,18 @@ async fn wait_for_attachment_visible(
 
 fn build_wait_for_attachment_visible_script(
     file_name: &str,
+    baseline_tile_keys: &[String],
     upload_timeout_ms: u64,
 ) -> Result<String> {
-    let probe_function_json =
-        serde_json::to_string(&chatgpt_web::build_attachment_probe_function(file_name)?)?;
+    let probe_function_json = serde_json::to_string(
+        &chatgpt_web::build_attachment_probe_function_excluding(file_name, baseline_tile_keys)?,
+    )?;
     Ok(format!(
         r##"
 async () => {{
   const probe = eval("(" + {probe_function_json} + ")");
+  // The baseline read before upload ran the probe too; count only this wait.
+  if (window.__yoetzAttachmentReadyCounts) delete window.__yoetzAttachmentReadyCounts[{ready_key_json}];
   const stableEnough = (state) => state?.ok && Number(state?.stableReadyCount || 0) >= {upload_stable_polls};
   const deadline = Date.now() + {upload_timeout_ms};
   while (Date.now() < deadline) {{
@@ -1581,6 +1619,7 @@ async () => {{
 }}
 "##,
         probe_function_json = probe_function_json,
+        ready_key_json = serde_json::to_string(&format!("file:{file_name}"))?,
         upload_timeout_ms = upload_timeout_ms,
         upload_stable_polls = chatgpt_web::CHATGPT_UPLOAD_STABLE_POLLS,
     ))
@@ -2289,7 +2328,7 @@ mod tests {
 
     #[test]
     fn attachment_visibility_script_matches_file_name_variable() {
-        let script = build_wait_for_attachment_visible_script("bundle.txt", 180_000).unwrap();
+        let script = build_wait_for_attachment_visible_script("bundle.txt", &[], 180_000).unwrap();
         assert!(script.contains("name === fileName"));
         assert!(script.contains("exactNameMatched"));
         assert!(script.contains("stableReadyCount"));

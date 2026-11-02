@@ -111,6 +111,8 @@ impl ChatgptDeliveryMode {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ChatgptRecipeSpec {
     pub bundle_path: Option<PathBuf>,
+    /// Extra files uploaded after `bundle_path`, in order (`--attach`).
+    pub attach_paths: Vec<PathBuf>,
     pub model: String,
     pub model_strategy: ChatgptModelStrategy,
     pub prompt: String,

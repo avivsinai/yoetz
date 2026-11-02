@@ -163,8 +163,9 @@ For web-only models, `yoetz browser recipe --recipe chatgpt|claude --bundle
   every built-in recipe uses it and fails closed; no Chrome approval dialog.
 - **Binary evidence goes in a ZIP.** `--bundle` takes any file. Put
   screenshots, source, and a request `.md` in one ZIP, pass a short `--var
-  prompt=` that points to the `.md`, and keep it under the native 10 MiB cap.
-  See "Binary evidence" in the guide.
+  prompt=` that points to the `.md`. The native cap is 40 MiB per file: split
+  more into several ZIPs and add them with repeatable `--attach <FILE>` (128
+  MiB per run, all in one turn). See "Binary evidence" in the guide.
 - **Never rerun after a side effect.** A failure after upload, send, or wait
   leaves the tab open. Run `yoetz browser extension inspect --chatgpt --run-id
   <run-id>` (or `--claude`) before any rerun; a blind rerun can duplicate the

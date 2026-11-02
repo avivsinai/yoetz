@@ -24,6 +24,8 @@ const ADVERTISED_RECIPES = Object.freeze(advertisedRecipes());
 const TERMINAL_ACK_CAPABILITY = "terminal_ack";
 const NATIVE_JOB_COMMANDS_CAPABILITY = "native_job_commands_v1";
 const CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY = "chatgpt_click_bound_send_receipt_v1";
+// yz-w4s: the job's attachment manifest is uploaded file by file.
+const MULTI_ATTACH_CAPABILITY = "multi_attach_v1";
 // This literal is stamped by the release script and must match the content script. The managed
 // extension manifest can receive a local reload suffix, so it is not the content-script identity.
 const CONTENT_SCRIPT_BUILD = "0.5.92";
@@ -42,7 +44,8 @@ const SECURE_CONTENT_SCRIPT_COMMANDS = new Set([
 const ADVERTISED_CAPABILITIES = Object.freeze([
   TERMINAL_ACK_CAPABILITY,
   NATIVE_JOB_COMMANDS_CAPABILITY,
-  CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY
+  CHATGPT_CLICK_BOUND_SEND_RECEIPT_CAPABILITY,
+  MULTI_ATTACH_CAPABILITY
 ]);
 const MIN_STABLE_IDLE_MS = Number(globalThis.__YOETZ_MIN_STABLE_IDLE_MS ?? 90000);
 // Require multiple stable polls so final controls cannot win before late text hydration.
@@ -711,6 +714,17 @@ async function startJob(message) {
     });
     return;
   }
+  // yz-w4s: an older native host forwards the CLI's manifest but streams and
+  // reports only the first file. Refuse before a tab opens; runJobWithFile
+  // keeps the same check on the received stream as a backstop.
+  const manifestBytes = job.attachments?.reduce((total, attachment) => total + attachment.bytes, 0);
+  if (manifestBytes !== undefined && manifestBytes !== job.bundle_size) {
+    await failJob(job, "attachment_manifest_mismatch", `attachment manifest declares ${manifestBytes} bytes but the native host announced ${job.bundle_size}; restart Chrome so the native host runs the installed yoetz`, {
+      phase: "upload",
+      side_effect_started: false
+    });
+    return;
+  }
 
   const targetProfile = await validateTargetProfile(job);
   if (!jobContinuationIsLive(job, continuationEpoch)) {
@@ -1151,6 +1165,21 @@ async function acceptFileChunk(message) {
 async function runJobWithFile(job, file, continuationEpoch = job?.continuation_epoch) {
   if (!jobContinuationIsLive(job, continuationEpoch)) return;
   assertJobConnectionCurrent(job);
+  // yz-w4s: the stream is every attachment concatenated in manifest order. A
+  // job without a manifest (an older native host) is one file. A manifest that
+  // does not add up to the stream (an older host streamed only the first file)
+  // fails closed before anything reaches the page.
+  const attachments = job.attachments?.length
+    ? job.attachments
+    : [{ filename: file.filename, mime_type: file.mimeType, bytes: file.bytes.byteLength }];
+  const manifestBytes = attachments.reduce((total, attachment) => total + Number(attachment.bytes), 0);
+  if (manifestBytes !== file.bytes.byteLength) {
+    await failJob(job, "attachment_manifest_mismatch", `attachment manifest declares ${manifestBytes} bytes but the upload stream carried ${file.bytes.byteLength}; restart Chrome so the native host runs the installed yoetz`, {
+      phase: "upload",
+      side_effect_started: Boolean(job.tab_id)
+    });
+    return;
+  }
   const adapter = adapterForJob(job);
   const uploadProbe = await requireContentScriptCapability(job.tab_id, adapter, {
     phase: "upload",
@@ -1162,27 +1191,33 @@ async function runJobWithFile(job, file, continuationEpoch = job?.continuation_e
   job.updated_at = Date.now();
   await persistJob(job);
   if (!jobContinuationIsLive(job, continuationEpoch)) return;
-  const uploadResult = await sendToTab(job.tab_id, {
-    type: "yoetz_upload_file",
-    job,
-    file: {
-      filename: file.filename,
-      mime_type: file.mimeType,
-      bytes_base64: uint8ArrayToBase64(file.bytes)
+  let offset = 0;
+  for (const [index, attachment] of attachments.entries()) {
+    const bytes = file.bytes.subarray(offset, offset + attachment.bytes);
+    offset += attachment.bytes;
+    const uploadResult = await sendToTab(job.tab_id, {
+      type: "yoetz_upload_file",
+      job,
+      file: {
+        filename: attachment.filename,
+        mime_type: attachment.mime_type,
+        bytes_base64: uint8ArrayToBase64(bytes)
+      }
+    });
+    if (!jobContinuationIsLive(job, continuationEpoch)) return;
+    assertJobConnectionCurrent(job);
+    const last = index === attachments.length - 1;
+    if (!postNative(progress(job, "file_uploaded", {
+      filename: attachment.filename,
+      bytes: bytes.byteLength,
+      ...(uploadResult?.upload_commit_signal
+        ? { upload_commit_signal: uploadResult.upload_commit_signal }
+        : {}),
+      message: `bundle uploaded (${bytes.byteLength} bytes): ${attachment.filename}, file ${index + 1} of ${attachments.length}${last ? "; sending prompt" : ""}`
+    }))) {
+      await recordTerminalDeliveryLost(job, "upload");
+      return;
     }
-  });
-  if (!jobContinuationIsLive(job, continuationEpoch)) return;
-  assertJobConnectionCurrent(job);
-  if (!postNative(progress(job, "file_uploaded", {
-    filename: file.filename,
-    bytes: file.bytes.byteLength,
-    ...(uploadResult?.upload_commit_signal
-      ? { upload_commit_signal: uploadResult.upload_commit_signal }
-      : {}),
-    message: `bundle uploaded (${file.bytes.byteLength} bytes); sending prompt`
-  }))) {
-    await recordTerminalDeliveryLost(job, "upload");
-    return;
   }
 
   const prompt = job.prompt ?? "";
@@ -3713,6 +3748,9 @@ function normalizeJob(message, adapter) {
     conversation_error: conversation.ok ? null : conversation,
     bundle_size: payload.bundle_size ?? 0,
     file_name: payload.file_name ?? "yoetz-bundle.md",
+    attachments: Array.isArray(payload.attachments)
+      ? payload.attachments.map(({ filename, mime_type, bytes }) => ({ filename, mime_type, bytes: Number(bytes) }))
+      : null,
     model_selection_status: "unavailable",
     model_used: null,
     warnings: [],

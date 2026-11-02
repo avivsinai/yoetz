@@ -383,7 +383,7 @@ enum DaemonRequest {
     RunRecipe {
         token: String,
         target: LiveAttachTarget,
-        recipe_ctx: chrome_devtools_mcp::DevtoolsMcpRecipeContext,
+        recipe_ctx: Box<chrome_devtools_mcp::DevtoolsMcpRecipeContext>,
         /// Stream `Progress` lines before the final response. Older clients
         /// omit it and get only the final line.
         #[serde(default)]
@@ -1890,7 +1890,7 @@ pub async fn run_chatgpt_recipe(
         DaemonRequest::RunRecipe {
             token: daemon.token.clone(),
             target,
-            recipe_ctx,
+            recipe_ctx: Box::new(recipe_ctx),
             progress: true,
         },
     )
@@ -2255,7 +2255,7 @@ enum SessionRequest {
         profile_email: Option<String>,
     },
     RunRecipe {
-        recipe_ctx: chrome_devtools_mcp::DevtoolsMcpRecipeContext,
+        recipe_ctx: Box<chrome_devtools_mcp::DevtoolsMcpRecipeContext>,
     },
 }
 
@@ -3287,7 +3287,7 @@ mod tests {
         DaemonRequest::RunRecipe {
             token: "token".to_string(),
             target,
-            recipe_ctx: chrome_devtools_mcp::DevtoolsMcpRecipeContext::default(),
+            recipe_ctx: Box::new(chrome_devtools_mcp::DevtoolsMcpRecipeContext::default()),
             progress: false,
         }
     }
@@ -5005,10 +5005,10 @@ mod tests {
             daemon_request_timeout(&DaemonRequest::RunRecipe {
                 token: "token".to_string(),
                 target: LiveAttachTarget::from_resolved(None),
-                recipe_ctx: chrome_devtools_mcp::DevtoolsMcpRecipeContext {
+                recipe_ctx: Box::new(chrome_devtools_mcp::DevtoolsMcpRecipeContext {
                     response_timeout_ms: 123_000,
                     ..Default::default()
-                },
+                }),
                 progress: false,
             }),
             Duration::from_millis(243_000)

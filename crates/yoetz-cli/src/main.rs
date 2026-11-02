@@ -341,9 +341,17 @@ struct BrowserRecipeArgs {
     /// The file to attach: a `yoetz bundle` .md, or any file such as a .zip
     /// of screenshots and source. For a ZIP, put the request in a .md inside
     /// it and pass a short --var prompt= that points to it. The
-    /// chrome-extension-native transport uploads at most 10 MiB.
+    /// chrome-extension-native transport uploads at most 40 MiB per file;
+    /// split larger evidence with --attach.
     #[arg(long)]
     bundle: Option<PathBuf>,
+
+    /// Another file to upload in the same turn, after --bundle (repeatable).
+    /// chrome-extension-native takes 40 MiB per file and 128 MiB in total;
+    /// chrome-devtools-mcp also takes it; dev-browser, agent-browser and
+    /// manual refuse it.
+    #[arg(long, value_name = "FILE", requires = "bundle")]
+    attach: Vec<PathBuf>,
 
     #[arg(long)]
     profile: Option<PathBuf>,
@@ -383,6 +391,13 @@ struct BrowserRecipeArgs {
     /// Suppress native completion notifications for this run.
     #[arg(long)]
     no_notify: bool,
+}
+
+impl BrowserRecipeArgs {
+    /// Every file this run uploads, in order: --bundle, then each --attach.
+    fn upload_paths(&self) -> Vec<PathBuf> {
+        self.bundle.iter().chain(&self.attach).cloned().collect()
+    }
 }
 
 #[derive(Args)]
@@ -1517,12 +1532,19 @@ fn recipe_should_auto_select_extension_native<R: IntoBuiltinWebRecipe>(
 
 fn manual_browser_recipe_fallback(
     recipe_path: &Path,
-    bundle: Option<&Path>,
+    upload_paths: &[PathBuf],
     builtin_recipe: Option<web_recipe::BuiltinWebRecipe>,
 ) -> String {
-    let bundle_hint = bundle
-        .map(|path| format!(" Upload or paste `{}` manually.", path.display()))
-        .unwrap_or_default();
+    let bundle_hint = if upload_paths.is_empty() {
+        String::new()
+    } else {
+        let files = upload_paths
+            .iter()
+            .map(|path| format!("`{}`", path.display()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" Upload or paste {files} manually.")
+    };
     let destination = builtin_recipe
         .map(web_recipe::BuiltinWebRecipe::display_name)
         .unwrap_or("the target site");
@@ -2534,7 +2556,8 @@ async fn run_recipe_via_chrome_devtools_mcp(
     let recipe_spec = build_chatgpt_recipe_spec(recipe_args, recipe_vars)?;
     let recipe_ctx = chrome_devtools_mcp::DevtoolsMcpRecipeContext {
         cdp_endpoint: selected_cdp_target.map(|target| target.endpoint.clone()),
-        bundle_path: recipe_spec.bundle_path.clone(),
+        bundle_path: None,
+        upload_paths: Vec::new(),
         bundle_text: None,
         model: recipe_spec.model.clone(),
         model_strategy: recipe_spec.model_strategy,
@@ -2547,7 +2570,8 @@ async fn run_recipe_via_chrome_devtools_mcp(
         upload_timeout_ms: recipe_spec.upload_timeout_ms,
         show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
         progress: None,
-    };
+    }
+    .with_upload_paths(recipe_args.upload_paths());
 
     let response = live_attach::run_chatgpt_recipe(
         selected_cdp_target,
@@ -2637,7 +2661,8 @@ async fn run_claude_recipe_via_chrome_devtools_mcp(
     let recipe_spec = build_claude_recipe_spec(recipe_args, recipe_vars, preflight_warnings)?;
     let recipe_ctx = chrome_devtools_mcp::DevtoolsMcpRecipeContext {
         cdp_endpoint: selected_cdp_target.map(|target| target.endpoint.clone()),
-        bundle_path: recipe_spec.bundle_path.clone(),
+        bundle_path: None,
+        upload_paths: Vec::new(),
         bundle_text: None,
         model: claude_recipe::CLAUDE_FABLE_MAX_MODEL.to_string(),
         model_strategy: chatgpt_recipe::ChatgptModelStrategy::Select,
@@ -2650,7 +2675,8 @@ async fn run_claude_recipe_via_chrome_devtools_mcp(
         upload_timeout_ms: recipe_spec.upload_timeout_ms,
         show_approval_guidance: matches!(format, OutputFormat::Text | OutputFormat::Markdown),
         progress: None,
-    };
+    }
+    .with_upload_paths(recipe_args.upload_paths());
     let response = chrome_devtools_mcp::claude::run(&recipe_ctx).await?;
     let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let output = claude_recipe::ClaudeRecipeOutput {
@@ -2695,7 +2721,7 @@ fn build_chatgpt_recipe_spec(
     ensure_chatgpt_sol_chat_pro_only_vars(recipe_vars)?;
     let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
     let upload_timeout_ms =
-        dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, recipe_args.bundle.as_deref())?;
+        dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, &recipe_args.upload_paths())?;
     let send_timeout_ms = dev_browser::resolve_chatgpt_send_timeout_ms(recipe_vars)?;
     chrome_devtools_mcp::RecipeThreadMode::parse(recipe_vars.get("thread").map(String::as_str))?;
     let conversation = recipe_vars
@@ -2704,6 +2730,7 @@ fn build_chatgpt_recipe_spec(
         .transpose()?;
     Ok(chatgpt_recipe::ChatgptRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
+        attach_paths: recipe_args.attach.clone(),
         model: match recipe_args.model_strategy {
             chatgpt_recipe::ChatgptModelStrategy::Select => {
                 chatgpt_recipe::CHATGPT_LATEST_CHAT_PRO_MODEL.to_string()
@@ -2753,7 +2780,7 @@ fn build_claude_recipe_spec(
     ensure_claude_fable_max_only(recipe_args, recipe_vars)?;
     let poll_settings = dev_browser::resolve_chatgpt_poll_settings(recipe_vars)?;
     let upload_timeout_ms =
-        dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, recipe_args.bundle.as_deref())?;
+        dev_browser::resolve_chatgpt_upload_timeout_ms(recipe_vars, &recipe_args.upload_paths())?;
     let attachment_stall_timeout_ms = recipe_vars
         .get("attachment_stall_timeout_ms")
         .map(|raw| {
@@ -2771,6 +2798,7 @@ fn build_claude_recipe_spec(
         .transpose()?;
     Ok(claude_recipe::ClaudeRecipeSpec {
         bundle_path: recipe_args.bundle.clone(),
+        attach_paths: recipe_args.attach.clone(),
         prompt: claude_recipe::render_builtin_prompt(
             recipe_vars
                 .get("prompt")
@@ -3276,8 +3304,9 @@ fn browser_recipe_artifact_paths_in(
 
 /// `--thread` records its conversation in a managed bundle session. A plain
 /// file passed as `--bundle` (a ZIP of screenshots, a hand-written request)
-/// has no session, so copy it into a new one. A file next to a `bundle.json`
-/// is a bundle session already and goes through the preflight unchanged.
+/// has no session, so copy it and every `--attach` file into one new session.
+/// A file next to a `bundle.json` is a bundle session already and goes through
+/// the preflight unchanged.
 fn adopt_thread_attachment_in(
     recipe_args: &mut BrowserRecipeArgs,
     sessions_base: &Path,
@@ -3291,66 +3320,69 @@ fn adopt_thread_attachment_in(
         return Ok(());
     }
     followup::validate_thread_label(thread_label)?;
-    ensure_regular_file(bundle_path, "bundle file", thread_label)?;
-    let file_name = bundle_path
-        .file_name()
-        .ok_or_else(|| anyhow!("thread `{thread_label}` bundle has no file name"))?;
-    let name = file_name.to_string_lossy();
-    if [
-        "bundle.json",
-        "response.json",
-        "followup.json",
-        yoetz_core::session::SESSION_LEASE_FILENAME,
-    ]
-    .iter()
-    .any(|reserved| name.eq_ignore_ascii_case(reserved))
-    {
-        bail!(
-            "thread `{thread_label}` bundle file name `{name}` is reserved for session files; rename it"
-        );
+    let upload_paths = recipe_args.upload_paths();
+    for path in &upload_paths {
+        ensure_regular_file(path, "bundle file", thread_label)?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| anyhow!("thread `{thread_label}` bundle has no file name"))?
+            .to_string_lossy();
+        if [
+            "bundle.json",
+            "response.json",
+            "followup.json",
+            yoetz_core::session::SESSION_LEASE_FILENAME,
+        ]
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
+        {
+            bail!(
+                "thread `{thread_label}` bundle file name `{name}` is reserved for session files; rename it"
+            );
+        }
     }
-    let len = fs::metadata(bundle_path)
-        .with_context(|| format!("thread `{thread_label}` inspect {}", bundle_path.display()))?
-        .len();
-    if len > browser_extension_native::MAX_BUNDLE_BYTES {
-        bail!(
-            "thread `{thread_label}` runs only on chrome-extension-native, which uploads at most {} MiB; this bundle is {len} bytes. Send a smaller packet (fewer or lower-resolution screenshots)",
-            browser_extension_native::MAX_BUNDLE_BYTES / (1024 * 1024)
-        );
-    }
-    let bytes = fs::read(bundle_path)
-        .with_context(|| format!("thread `{thread_label}` read {}", bundle_path.display()))?;
+    browser_extension_native::validate_upload_files(&upload_paths)
+        .with_context(|| format!("thread `{thread_label}` runs only on chrome-extension-native"))?;
     let yoetz_root = sessions_base
         .parent()
         .ok_or_else(|| anyhow!("managed sessions directory has no parent"))?;
     let session = yoetz_core::session::create_session_dir_in(yoetz_root)?;
-    let adopted = session.path.join(file_name);
-    fs::write(&adopted, &bytes)
-        .with_context(|| format!("thread `{thread_label}` write {}", adopted.display()))?;
-    let is_binary = bytes.contains(&0) || std::str::from_utf8(&bytes).is_err();
-    let bundle = yoetz_core::types::Bundle {
-        prompt: String::new(),
-        files: vec![yoetz_core::types::BundleFile {
+    let mut adopted = Vec::new();
+    let mut files = Vec::new();
+    for path in &upload_paths {
+        let file_name = path.file_name().unwrap_or_default();
+        let bytes = fs::read(path)
+            .with_context(|| format!("thread `{thread_label}` read {}", path.display()))?;
+        let target = session.path.join(file_name);
+        fs::write(&target, &bytes)
+            .with_context(|| format!("thread `{thread_label}` write {}", target.display()))?;
+        files.push(yoetz_core::types::BundleFile {
             path: file_name.to_string_lossy().to_string(),
             bytes: bytes.len(),
             sha256: hex::encode(<sha2::Sha256 as sha2::Digest>::digest(&bytes)),
             truncated: false,
-            is_binary,
+            is_binary: bytes.contains(&0) || std::str::from_utf8(&bytes).is_err(),
             content: None,
-        }],
+        });
+        adopted.push(target);
+    }
+    let bundle = yoetz_core::types::Bundle {
+        prompt: String::new(),
         stats: yoetz_core::types::BundleStats {
-            file_count: 1,
-            total_bytes: bytes.len(),
+            file_count: files.len(),
+            total_bytes: files.iter().map(|file| file.bytes).sum(),
             ..Default::default()
         },
+        files,
     };
     yoetz_core::session::write_json(&session.path.join("bundle.json"), &bundle)?;
     eprintln!(
-        "info: thread `{thread_label}`: copied {} into session {}",
-        bundle_path.display(),
+        "info: thread `{thread_label}`: copied {} file(s) into session {}",
+        adopted.len(),
         session.path.display()
     );
-    recipe_args.bundle = Some(adopted);
+    recipe_args.bundle = adopted.first().cloned();
+    recipe_args.attach = adopted.split_off(1);
     Ok(())
 }
 
@@ -3617,6 +3649,17 @@ fn resolve_dev_browser_delivery_mode_for_platform(
     Ok((requested_paste_mode, bundle_text, false))
 }
 
+/// yz-w4s: only chrome-extension-native and chrome-devtools-mcp upload several
+/// files; the other transports refuse `--attach` before any browser work.
+fn ensure_single_upload_file(recipe_args: &BrowserRecipeArgs, transport: &str) -> Result<()> {
+    if recipe_args.attach.is_empty() {
+        return Ok(());
+    }
+    bail!(
+        "{transport} transport does not support `--attach`; use chrome-extension-native or chrome-devtools-mcp"
+    )
+}
+
 fn run_recipe_via_dev_browser<R: IntoBuiltinWebRecipe>(
     ctx: &AppContext,
     recipe_args: &BrowserRecipeArgs,
@@ -3627,6 +3670,7 @@ fn run_recipe_via_dev_browser<R: IntoBuiltinWebRecipe>(
     preflight_warnings: &[String],
     fallback_used: bool,
 ) -> Result<Value> {
+    ensure_single_upload_file(recipe_args, "dev-browser")?;
     let builtin_recipe = builtin_recipe.into_builtin_web_recipe();
     if builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Claude) {
         return run_claude_recipe_via_dev_browser(
@@ -3826,6 +3870,7 @@ fn run_recipe_via_agent_browser<R: IntoBuiltinWebRecipe>(
     prefer_auto_connect: bool,
     selected_cdp_target: &mut Option<browser::ResolvedCdpTarget>,
 ) -> Result<Value> {
+    ensure_single_upload_file(recipe_args, "agent-browser")?;
     let builtin_recipe = builtin_recipe.into_builtin_web_recipe();
     let is_chatgpt = builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Chatgpt);
     let is_claude = builtin_recipe == Some(web_recipe::BuiltinWebRecipe::Claude);
@@ -5142,6 +5187,12 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             }
         }
         BrowserCommand::Recipe(mut recipe_args) => {
+            browser_extension_native::ensure_distinct_file_names(
+                recipe_args
+                    .upload_paths()
+                    .iter()
+                    .filter_map(|path| path.file_name()?.to_str()),
+            )?;
             adopt_thread_attachment_in(&mut recipe_args, &yoetz_core::session::session_base_dir())?;
             let _session_lease = acquire_browser_recipe_session_lease_in(
                 &recipe_args,
@@ -5169,7 +5220,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
                         .get("prompt")
                         .map(String::as_str)
                         .unwrap_or_default(),
-                    recipe_args.bundle.as_deref(),
+                    &recipe_args.upload_paths(),
                 )?;
                 followup::validate_followup_args(
                     recipe_args.followup.as_deref(),
@@ -5344,7 +5395,7 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             );
             let manual_fallback = manual_browser_recipe_fallback(
                 &recipe_path,
-                recipe_args.bundle.as_deref(),
+                &recipe_args.upload_paths(),
                 builtin_recipe,
             );
             let mut transport_errors = Vec::new();
@@ -6144,6 +6195,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(bundle),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -6484,6 +6536,7 @@ mod tests {
                 allow_cdp_fallback: false,
                 keep_tab: false,
                 bundle: Some(bundle),
+                attach: Vec::new(),
                 profile: None,
                 cdp: None,
                 browser_id: None,
@@ -7499,13 +7552,19 @@ mod tests {
         let sessions_base = root.path().join("sessions");
         let zip = root.path().join("packet.zip");
         fs::write(&zip, b"PK\x03\x04\x00binary").unwrap();
+        let part2 = root.path().join("packet-2.zip");
+        fs::write(&part2, b"PK\x03\x04\x00part2").unwrap();
         let mut recipe_args = thread_recipe_args(zip);
+        recipe_args.attach = vec![part2];
 
         adopt_thread_attachment_in(&mut recipe_args, &sessions_base).unwrap();
 
         let adopted = recipe_args.bundle.clone().unwrap();
         assert_eq!(adopted.file_name().unwrap(), "packet.zip");
         assert_eq!(fs::read(&adopted).unwrap(), b"PK\x03\x04\x00binary");
+        let adopted_attach = adopted.with_file_name("packet-2.zip");
+        assert_eq!(recipe_args.attach, vec![adopted_attach.clone()]);
+        assert_eq!(fs::read(&adopted_attach).unwrap(), b"PK\x03\x04\x00part2");
         validate_thread_persistence_preflight_in(&recipe_args, &sessions_base).unwrap();
         let artifacts = browser_recipe_artifact_paths_in(Some(&adopted), &sessions_base).unwrap();
         assert!(artifacts.bundle_md.is_none());
@@ -8190,6 +8249,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: None,
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8231,6 +8291,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: None,
+            attach: Vec::new(),
             profile: Some(PathBuf::from("/tmp/ignored")),
             cdp: None,
             browser_id: None,
@@ -8268,6 +8329,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8306,6 +8368,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: None,
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8344,6 +8407,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8382,6 +8446,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8422,6 +8487,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(bundle_path.clone()),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8455,6 +8521,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(bundle_path.clone()),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8486,6 +8553,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8539,6 +8607,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8697,6 +8766,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8760,6 +8830,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8801,6 +8872,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8849,6 +8921,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(bundle_md),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8899,6 +8972,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(bundle_md),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8929,6 +9003,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/missing-bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -8968,6 +9043,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/missing-bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -9007,6 +9083,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -9075,6 +9152,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -9112,6 +9190,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/claude-bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,
@@ -9160,6 +9239,7 @@ mod tests {
             allow_cdp_fallback: false,
             keep_tab: false,
             bundle: Some(PathBuf::from("/tmp/bundle.md")),
+            attach: Vec::new(),
             profile: None,
             cdp: None,
             browser_id: None,

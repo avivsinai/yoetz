@@ -1728,6 +1728,18 @@ async () => {{
 }
 
 pub fn build_attachment_probe_function(file_name: &str) -> Result<String> {
+    build_attachment_probe_function_excluding(file_name, &[])
+}
+
+/// yz-w4s: the probe ignores tiles whose key is in `baseline_tile_keys` (the
+/// `tileKeys` a probe returned before this file's upload), so a later file
+/// never matches an earlier file's tile by stem. Mirrors the native upload's
+/// baselineAttachments.
+pub fn build_attachment_probe_function_excluding(
+    file_name: &str,
+    baseline_tile_keys: &[String],
+) -> Result<String> {
+    let baseline_tile_keys_json = serde_json::to_string(baseline_tile_keys)?;
     let file_name_json = serde_json::to_string(file_name)?;
     let file_stem = Path::new(file_name)
         .file_stem()
@@ -1740,6 +1752,7 @@ pub fn build_attachment_probe_function(file_name: &str) -> Result<String> {
 () => {{
   const fileName = {file_name_json};
   const fileStem = {file_stem_json};
+  const baselineTileKeys = new Set({baseline_tile_keys_json});
   const ATTACHMENT_TILE_SELECTOR = {attachment_tile_selector_json};
   const COMPOSER_SELECTOR = {composer_selector_json};
   const clip = (value, max = 160) => String(value || "").replace(/\s+/g, " ").trim().slice(0, max);
@@ -1771,6 +1784,7 @@ pub fn build_attachment_probe_function(file_name: &str) -> Result<String> {
     clip(tile.getAttribute?.("title") || ""),
     clip(tile.getAttribute?.("data-testid") || "", 80),
   ].filter(Boolean);
+  const tileKey = (tile) => readFields(tile).join("|");
   const childHasExactName = (tile) => Array.from(tile.querySelectorAll("*")).some((node) => {{
     const text = clip(node.innerText || node.textContent || "", 220);
     return text === fileName ||
@@ -1817,11 +1831,13 @@ pub fn build_attachment_probe_function(file_name: &str) -> Result<String> {
       ready: nameMatched && !busy.busy && !failed,
     }};
   }};
-  const collectTiles = (root, scope) => root
-    ? Array.from(root.querySelectorAll(ATTACHMENT_TILE_SELECTOR))
-      .filter((tile) => isVisible(tile))
-      .map((tile, index) => describeTile(tile, scope, index))
+  const visibleTiles = (root) => root
+    ? Array.from(root.querySelectorAll(ATTACHMENT_TILE_SELECTOR)).filter((tile) => isVisible(tile))
     : [];
+  const tileKeys = visibleTiles(document).map(tileKey);
+  const collectTiles = (root, scope) => visibleTiles(root)
+    .filter((tile) => !baselineTileKeys.has(tileKey(tile)))
+    .map((tile, index) => describeTile(tile, scope, index));
   const scopedTiles = collectTiles(composerRoot, composerForm ? "form" : "composer-root");
   const documentTiles = collectTiles(document, "document");
   const scopedMatches = scopedTiles.filter((entry) => entry.nameMatched);
@@ -1877,6 +1893,7 @@ pub fn build_attachment_probe_function(file_name: &str) -> Result<String> {
       composerScoped: !!composerRoot,
       scopeUsed: matchedTiles[0]?.scope || null,
       tileCount: scopedTiles.length || documentTiles.length,
+      tileKeys,
     }};
   }}
   return {{
@@ -1896,6 +1913,7 @@ pub fn build_attachment_probe_function(file_name: &str) -> Result<String> {
     tileCount: scopedTiles.length || documentTiles.length,
     matchedTileCount: matchedTiles.length,
     fallbackMatches: scopedMatches.length > 0 ? [] : documentMatches.slice(0, 4),
+    tileKeys,
   }};
 }}
 "##,
