@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- `yoetz browser recipe --recipe claude` sees its uploaded file again after
+  claude.ai changed the attachment card (file name in a `title`, remove button
+  labelled "Remove <file>"), so the upload no longer times out in
+  `attachment_readiness` (yz-ejp).
 
 ## [0.5.94] - 2026-11-02
 ### Fixed

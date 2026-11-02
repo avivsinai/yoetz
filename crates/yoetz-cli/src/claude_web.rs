@@ -10,6 +10,10 @@ pub const COMPOSER_SELECTOR: &str = "[data-testid='chat-input']";
 pub const MODEL_SELECTOR: &str = "[data-testid='model-selector-dropdown']";
 pub const FILE_INPUT_SELECTOR: &str = "input[data-testid='file-upload']";
 pub const ATTACHMENT_SELECTOR: &str = "[data-testid='file-thumbnail']";
+/// Attachment card captured 2026-11-02: the filename is a `[title]` on the
+/// card link and the remove button reads "Remove <file>". Older cards: `h3`,
+/// "Remove". Same reads as `extensions/chatgpt-native/src/claude-dom.js`.
+const ATTACHMENT_REMOVE_SELECTOR: &str = "button[aria-label='Remove'], button[aria-label^='Remove '], button[data-cds-attachment-remove]";
 pub const COPY_ACTION_SELECTOR: &str = "[data-testid='action-bar-copy']";
 /// claude.ai picker (Base UI menu captured 2026-11-02, no testids): models are
 /// `menuitemradio` rows with `data-model-id`; Effort is a submenu `menuitem`
@@ -337,20 +341,20 @@ pub fn build_attachment_probe_function_for(
         r##"() => {{
   const expected = {file_name};
   const nodes = Array.from(document.querySelectorAll("{attachment_selector}"));
-  const labels = nodes.map((node) => String(node.querySelector("h3")?.textContent || "").trim());
-  const matched = nodes.find((node) =>
-    String(node.querySelector("h3")?.textContent || "").trim() === expected &&
-    !!node.querySelector("button[aria-label='Remove']")
-  );
+  const label = (node) => String(node.querySelector("[title]")?.getAttribute("title") || node.querySelector("h3")?.textContent || "").replace(/\s+/g, " ").trim();
+  const removable = (node) => !!node.querySelector("{remove_selector}");
+  const labels = nodes.map(label);
+  const matched = nodes.find((node) => label(node) === expected && removable(node));
   const pastedContent = {accept_pasted_content} && nodes.find((node) =>
-    String(node.querySelector("h3")?.textContent || node.textContent || "").replace(/\s+/g, " ").trim().toLowerCase().includes("pasted content") &&
-    !!node.querySelector("button[aria-label='Remove']")
+    `${{label(node)}} ${{node.textContent || ""}}`.replace(/\s+/g, " ").trim().toLowerCase().includes("pasted content") &&
+    removable(node)
   );
   const send = document.querySelector("button[aria-label='Send message']");
   const sendEnabled = !!send && !send.disabled && send.getAttribute("aria-disabled") !== "true";
   return {{ status: (matched || pastedContent) && sendEnabled ? "candidate" : "pending", count: nodes.length, labels, sendEnabled, pastedContent: !!pastedContent }};
 }}"##,
-        attachment_selector = ATTACHMENT_SELECTOR
+        attachment_selector = ATTACHMENT_SELECTOR,
+        remove_selector = ATTACHMENT_REMOVE_SELECTOR,
     ))
 }
 
@@ -502,8 +506,8 @@ mod tests {
         let attachment = build_attachment_probe_function("bundle.md").unwrap();
         assert!(attachment.contains("file-thumbnail"));
         assert!(attachment.contains("pasted content"));
-        assert!(attachment.contains("querySelector(\"h3\")"));
-        assert!(attachment.contains("button[aria-label='Remove']"));
+        assert!(attachment.contains("querySelector(\"[title]\")"));
+        assert!(attachment.contains("button[data-cds-attachment-remove]"));
         assert!(attachment.contains("sendEnabled ? \"candidate\""));
         let send = build_send_function();
         assert!(send.contains("assistantCount"));
