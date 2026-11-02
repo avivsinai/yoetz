@@ -449,7 +449,7 @@ export async function configureModelState(root, job = {}) {
   const timeoutMs = Number(job.model_selection_timeout_ms) || 10000;
   const modelButton = await waitForModelState(root, () => root.querySelector(MODEL_SELECTOR), 20000, "model selector");
   await openModelMenu(root, modelButton, timeoutMs);
-  const fable = await waitForModelOptional(root, () => visibleElements(root, "[role='menuitemradio']")
+  const fable = await waitForModelOptional(root, () => openMenuItems(root, "[role='menuitemradio']")
     .find((element) => textStartsWith(element, "fable 5")), timeoutMs);
   if (!fable) {
     return unavailableModelSelection(
@@ -464,9 +464,7 @@ export async function configureModelState(root, job = {}) {
     return alreadySelected;
   }
 
-  throwIfModelBlocked(root);
-  fable.click();
-  await settleAfterMenuSelection(root, modelButton, timeoutMs, "model menu closed after Fable selection");
+  await selectMenuRadio(root, modelButton, fable, timeoutMs, "Fable radio checked");
 
   await openModelMenu(root, modelButton, timeoutMs);
   const effortChoices = await openEffortSubmenu(root, timeoutMs);
@@ -479,12 +477,7 @@ export async function configureModelState(root, job = {}) {
       `Claude Max effort is unavailable; live effort options: ${live.join(", ") || "none"}`
     );
   }
-  throwIfModelBlocked(root);
-  max.click();
-  await settleAfterMenuSelection(root, modelButton, timeoutMs, "model menu closed after Max selection");
-
-  await closeModelMenu(root, modelButton);
-  await sleep(MODEL_MENU_SETTLE_MS);
+  await selectMenuRadio(root, modelButton, max, timeoutMs, "Max radio checked");
   await openModelMenu(root, modelButton, timeoutMs);
   // Fable 5 is a checked model menuitemradio and Max a checked effort
   // menuitemradio; there is no independent Thinking control. Keep both legs as
@@ -684,7 +677,7 @@ export async function confirmGenerationStopped(root = document, options = {}) {
 export function modelSelectionDiagnostics(root = document) {
   const modelButton = root.querySelector(MODEL_SELECTOR);
   const modelChip = normalizeText(modelButton?.innerText || modelButton?.textContent);
-  const checkedRadios = Array.from(root.querySelectorAll("[role='menuitemradio'][aria-checked='true']"));
+  const checkedRadios = openMenuItems(root, "[role='menuitemradio'][aria-checked='true']");
   const modelVerified = /\bFable 5\b/i.test(modelChip)
     && checkedRadios.some((element) => textStartsWith(element, "fable 5"));
   const maxVerified = /\bMax\b/i.test(modelChip) && checkedRadios.some(isMaxEffortOption);
@@ -844,8 +837,19 @@ async function openModelMenu(root, button, timeoutMs) {
   throw new Error(`Claude model menu did not open within ${timeoutMs}ms`);
 }
 
-async function settleAfterMenuSelection(root, modelButton, timeoutMs, target) {
-  await waitForModelState(root, () => modelButton.getAttribute("aria-expanded") !== "true", timeoutMs, target);
+// A radio click need not close the menu. Wait for the radio to read checked
+// (a node the click unmounted cannot update; the reopen re-read is the proof),
+// then close the menu.
+async function selectMenuRadio(root, modelButton, radio, timeoutMs, target) {
+  throwIfModelBlocked(root);
+  radio.click();
+  await waitForModelState(
+    root,
+    () => radio.getAttribute("aria-checked") === "true" || radio.isConnected === false,
+    timeoutMs,
+    target
+  );
+  await closeModelMenu(root, modelButton);
   await sleep(MODEL_MENU_SETTLE_MS);
 }
 
@@ -893,15 +897,20 @@ async function verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs) {
 async function openEffortSubmenu(root, timeoutMs) {
   const trigger = await waitForModelState(
     root,
-    () => visibleElements(root, EFFORT_TRIGGER_SELECTOR).find((element) => textStartsWith(element, "effort")),
+    () => openMenuItems(root, EFFORT_TRIGGER_SELECTOR).find((element) => textStartsWith(element, "effort")),
     timeoutMs,
     "Effort item in the model menu"
   );
   dispatchHover(trigger);
   const hovered = await waitForModelOptional(root, () => effortOptions(root).length > 0, Math.min(timeoutMs, EFFORT_HOVER_MS));
+  // Mirror the openModelMenu #469 guard: a click on an already-open submenu
+  // trigger can toggle it closed, so settle and re-read before clicking.
   if (!hovered) {
-    throwIfModelBlocked(root);
-    trigger.click();
+    await sleep(MODEL_MENU_SETTLE_MS);
+    if (effortOptions(root).length === 0 && trigger.getAttribute("aria-expanded") !== "true") {
+      throwIfModelBlocked(root);
+      trigger.click();
+    }
   }
   return waitForModelState(root, () => {
     const options = effortOptions(root);
@@ -910,17 +919,23 @@ async function openEffortSubmenu(root, timeoutMs) {
 }
 
 function effortOptions(root) {
-  return visibleElements(root, "[role='menuitemradio']")
-    .filter((element) => element.getAttribute("data-model-id") === null && !inClosedMenu(element));
+  return openMenuItems(root, "[role='menuitemradio']")
+    .filter((element) => element.getAttribute("data-model-id") === null);
 }
 
-// Base UI keeps a closed menu mounted and marks it data-closed.
-function inClosedMenu(element) {
-  return Boolean(element.closest?.("[role='menu'][data-closed]"));
+// Visible items outside a closed menu: Base UI keeps a closed menu mounted
+// and marks it data-closed.
+function openMenuItems(root, selector) {
+  return visibleElements(root, selector)
+    .filter((element) => !element.closest?.("[role='menu'][data-closed]"));
 }
 
+// A disabled Max counts as missing, so it reports the typed unavailable.
 function isMaxEffortOption(element) {
-  return element.getAttribute("data-model-id") === null && textStartsWith(element, "max");
+  return element.getAttribute("data-model-id") === null
+    && textStartsWith(element, "max")
+    && element.getAttribute("aria-disabled") !== "true"
+    && element.getAttribute("data-disabled") === null;
 }
 
 function textStartsWith(element, prefix) {
@@ -987,7 +1002,7 @@ function visibleElements(root, selector) {
 // never gates this read (background tabs never animate).
 function menuMountedOpen(root, button) {
   if (button?.getAttribute?.("aria-expanded") === "true") return true;
-  return visibleElements(root, "[role='menuitemradio']").some((element) => !inClosedMenu(element));
+  return openMenuItems(root, "[role='menuitemradio']").length > 0;
 }
 
 function hasUsageCreditsCore(text) {

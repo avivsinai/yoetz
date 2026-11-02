@@ -14,10 +14,12 @@ pub const COPY_ACTION_SELECTOR: &str = "[data-testid='action-bar-copy']";
 /// claude.ai picker (Base UI menu captured 2026-11-02, no testids): models are
 /// `menuitemradio` rows with `data-model-id`; Effort is a submenu `menuitem`
 /// whose text starts with "Effort"; its levels are `menuitemradio` rows without
-/// `data-model-id`. Base UI keeps a closed menu mounted with `data-closed`.
-/// Same reads as `extensions/chatgpt-native/src/claude-dom.js`.
+/// `data-model-id`. Base UI keeps a closed menu mounted with `data-closed`, so
+/// `visible` also rejects items inside one. Same reads as
+/// `extensions/chatgpt-native/src/claude-dom.js`.
+const MENU_VISIBLE_JS: &str = r#"(el) => !!el && el.getClientRects().length > 0 && !el.closest("[role='menu'][data-closed]")"#;
 const FIND_EFFORT_TRIGGER_JS: &str = r#"Array.from(document.querySelectorAll("[role='menuitem'][aria-haspopup='menu'], [data-testid='effort-menu-trigger']")).filter(visible).find((el) => normalize(el.innerText || el.textContent).toLowerCase().startsWith("effort"))"#;
-const EFFORT_OPTIONS_JS: &str = r#"Array.from(document.querySelectorAll("[role='menuitemradio']:not([data-model-id])")).filter((el) => visible(el) && !el.closest("[role='menu'][data-closed]"))"#;
+const EFFORT_OPTIONS_JS: &str = r#"Array.from(document.querySelectorAll("[role='menuitemradio']:not([data-model-id])")).filter(visible)"#;
 pub const EFFORT_HOVER_MARKER: &str = "yoetz-claude-effort-target";
 pub const FILE_INPUT_MARKER: &str = "yoetz-claude-upload-target";
 pub const STABLE_IDLE_FLOOR_MS: u64 = 90_000;
@@ -160,18 +162,21 @@ pub fn build_close_model_menu_function() -> String {
 }
 
 pub fn build_select_fable_function() -> String {
-    r##"() => {
-  const visible = (el) => !!el && el.getClientRects().length > 0;
+    format!(
+        r##"() => {{
+  const visible = {menu_visible};
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const options = Array.from(document.querySelectorAll("[role='menuitemradio']"))
     .filter(visible)
-    .map((el) => ({ el, text: normalize(el.innerText || el.textContent) }))
-    .filter(({ text }) => text);
-  const fable = options.find(({ text }) => text.toLowerCase().startsWith("fable 5"));
-  if (!fable) return { status: "unavailable", options: options.map(({ text }) => text).slice(0, 40) };
+    .map((el) => ({{ el, text: normalize(el.innerText || el.textContent) }}))
+    .filter(({{ text }}) => text);
+  const fable = options.find(({{ text }}) => text.toLowerCase().startsWith("fable 5"));
+  if (!fable) return {{ status: "unavailable", options: options.map(({{ text }}) => text).slice(0, 40) }};
   fable.el.click();
-  return { status: "selected", selected: fable.text, options: options.map(({ text }) => text).slice(0, 40) };
-}"##.to_string()
+  return {{ status: "selected", selected: fable.text, options: options.map(({{ text }}) => text).slice(0, 40) }};
+}}"##,
+        menu_visible = MENU_VISIBLE_JS,
+    )
 }
 
 /// Mark the visible Effort parent row so the CDP driver can try a physical
@@ -179,7 +184,7 @@ pub fn build_select_fable_function() -> String {
 pub fn build_mark_effort_parent_function() -> String {
     format!(
         r##"() => {{
-  const visible = (el) => !!el && el.getClientRects().length > 0;
+  const visible = {menu_visible};
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
   document.querySelectorAll(`[title='{marker}']`).forEach((el) => el.removeAttribute("title"));
   const options = Array.from(document.querySelectorAll("[role='menuitem'], [role='menuitemradio']"))
@@ -194,6 +199,7 @@ pub fn build_mark_effort_parent_function() -> String {
 }}"##,
         marker = EFFORT_HOVER_MARKER,
         find_effort = FIND_EFFORT_TRIGGER_JS,
+        menu_visible = MENU_VISIBLE_JS,
     )
 }
 
@@ -203,7 +209,7 @@ pub fn build_mark_effort_parent_function() -> String {
 pub fn build_open_effort_submenu_function() -> String {
     format!(
         r##"() => {{
-  const visible = (el) => !!el && el.getClientRects().length > 0;
+  const visible = {menu_visible};
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const existing = {effort_options}
     .map((el) => normalize(el.innerText || el.textContent))
@@ -231,23 +237,28 @@ pub fn build_open_effort_submenu_function() -> String {
 }}"##,
         effort_options = EFFORT_OPTIONS_JS,
         find_effort = FIND_EFFORT_TRIGGER_JS,
+        menu_visible = MENU_VISIBLE_JS,
     )
 }
 
 pub fn build_select_max_function() -> String {
     format!(
         r##"() => {{
-  const visible = (el) => !!el && el.getClientRects().length > 0;
+  const visible = {menu_visible};
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const options = {effort_options}
     .map((el) => ({{ el, text: normalize(el.innerText || el.textContent) }}))
     .filter(({{ text }}) => text);
-  const max = options.find(({{ text }}) => text.toLowerCase().startsWith("max"));
-  if (!max) return {{ status: "unavailable", effortOptions: options.map(({{ text }}) => text) }};
+  const effortOptions = options.map(({{ text }}) => text);
+  if (options.length === 0) return {{ status: "unavailable", reason: "effort submenu did not open", effortOptions }};
+  const max = options.find(({{ el, text }}) => text.toLowerCase().startsWith("max")
+    && el.getAttribute("aria-disabled") !== "true" && !el.hasAttribute("data-disabled"));
+  if (!max) return {{ status: "unavailable", reason: `no enabled Max effort; live effort options: ${{effortOptions.join(", ")}}`, effortOptions }};
   max.el.click();
-  return {{ status: "selected", selected: max.text, effortOptions: options.map(({{ text }}) => text) }};
+  return {{ status: "selected", selected: max.text, effortOptions }};
 }}"##,
         effort_options = EFFORT_OPTIONS_JS,
+        menu_visible = MENU_VISIBLE_JS,
     )
 }
 
@@ -259,7 +270,7 @@ pub fn build_select_max_function() -> String {
 pub fn build_verify_fable_max_function() -> String {
     format!(
         r##"() => {{
-  const visible = (el) => !!el && el.getClientRects().length > 0;
+  const visible = {menu_visible};
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const modelChip = normalize(document.querySelector({model_selector})?.innerText || document.querySelector({model_selector})?.textContent);
   const visibleText = Array.from(document.querySelectorAll("[role='menuitem'], [role='menuitemradio'], button, [role='switch']"))
@@ -268,9 +279,9 @@ pub fn build_verify_fable_max_function() -> String {
     .filter(visible).map((el) => normalize(el.innerText || el.textContent))
     .find((text) => /^(Low|Medium|High|Extra|Max)(?:\b|$)/i.test(text)) || "";
   const modelSelected = Array.from(document.querySelectorAll("[role='menuitemradio'][aria-checked='true']"))
-    .some((el) => normalize(el.innerText || el.textContent).toLowerCase().startsWith("fable 5"));
+    .filter(visible).some((el) => normalize(el.innerText || el.textContent).toLowerCase().startsWith("fable 5"));
   const maxChecked = Array.from(document.querySelectorAll("[role='menuitemradio'][aria-checked='true']:not([data-model-id])"))
-    .some((el) => normalize(el.innerText || el.textContent).toLowerCase().startsWith("max"));
+    .filter(visible).some((el) => normalize(el.innerText || el.textContent).toLowerCase().startsWith("max"));
   const modelVerified = modelSelected && /\bFable 5\b/i.test(modelChip);
   const maxVerified = maxChecked && /\bMax\b/i.test(modelChip);
   return {{
@@ -279,7 +290,8 @@ pub fn build_verify_fable_max_function() -> String {
     options: visibleText.slice(0, 50),
   }};
 }}"##,
-        model_selector = serde_json::to_string(MODEL_SELECTOR).expect("selector JSON")
+        model_selector = serde_json::to_string(MODEL_SELECTOR).expect("selector JSON"),
+        menu_visible = MENU_VISIBLE_JS,
     )
 }
 
