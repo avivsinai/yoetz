@@ -1600,6 +1600,8 @@ fn build_wait_for_attachment_visible_script(
         r##"
 async () => {{
   const probe = eval("(" + {probe_function_json} + ")");
+  // The baseline read before upload ran the probe too; count only this wait.
+  if (window.__yoetzAttachmentReadyCounts) delete window.__yoetzAttachmentReadyCounts[{ready_key_json}];
   const stableEnough = (state) => state?.ok && Number(state?.stableReadyCount || 0) >= {upload_stable_polls};
   const deadline = Date.now() + {upload_timeout_ms};
   while (Date.now() < deadline) {{
@@ -1617,6 +1619,7 @@ async () => {{
 }}
 "##,
         probe_function_json = probe_function_json,
+        ready_key_json = serde_json::to_string(&format!("file:{file_name}"))?,
         upload_timeout_ms = upload_timeout_ms,
         upload_stable_polls = chatgpt_web::CHATGPT_UPLOAD_STABLE_POLLS,
     ))
