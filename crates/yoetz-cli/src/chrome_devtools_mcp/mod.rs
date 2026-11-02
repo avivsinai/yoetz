@@ -74,8 +74,10 @@ pub struct DevtoolsMcpRecipeContext {
 
     /// yz-w4s: every file to upload, in order, when there are several (then
     /// `bundle_path` is None). A live-attach daemon that predates this field
-    /// ignores it and so refuses "requires `--bundle`" before any side effect
-    /// instead of uploading only the first file.
+    /// ignores it and fails with "requires a bundle file path" at the upload
+    /// step: it has opened the tab and selected the model, but uploads and
+    /// sends nothing, instead of uploading only the first file. The fix is
+    /// `yoetz browser reset`.
     #[serde(default)]
     pub upload_paths: Vec<PathBuf>,
 

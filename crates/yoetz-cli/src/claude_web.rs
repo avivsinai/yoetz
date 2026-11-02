@@ -304,6 +304,15 @@ pub fn build_scope_file_input_function() -> String {
 }
 
 pub fn build_attachment_probe_function(file_name: &str) -> Result<String> {
+    build_attachment_probe_function_for(file_name, true)
+}
+
+/// yz-w4s: a file after the first must match its own tile by exact name; the
+/// "Pasted content" fallback would accept an earlier file's tile.
+pub fn build_attachment_probe_function_for(
+    file_name: &str,
+    accept_pasted_content: bool,
+) -> Result<String> {
     let file_name = serde_json::to_string(file_name)?;
     Ok(format!(
         r##"() => {{
@@ -314,7 +323,7 @@ pub fn build_attachment_probe_function(file_name: &str) -> Result<String> {
     String(node.querySelector("h3")?.textContent || "").trim() === expected &&
     !!node.querySelector("button[aria-label='Remove']")
   );
-  const pastedContent = nodes.find((node) =>
+  const pastedContent = {accept_pasted_content} && nodes.find((node) =>
     String(node.querySelector("h3")?.textContent || node.textContent || "").replace(/\s+/g, " ").trim().toLowerCase().includes("pasted content") &&
     !!node.querySelector("button[aria-label='Remove']")
   );

@@ -5187,6 +5187,12 @@ async fn handle_browser(ctx: &AppContext, args: BrowserArgs, format: OutputForma
             }
         }
         BrowserCommand::Recipe(mut recipe_args) => {
+            browser_extension_native::ensure_distinct_file_names(
+                recipe_args
+                    .upload_paths()
+                    .iter()
+                    .filter_map(|path| path.file_name()?.to_str()),
+            )?;
             adopt_thread_attachment_in(&mut recipe_args, &yoetz_core::session::session_base_dir())?;
             let _session_lease = acquire_browser_recipe_session_lease_in(
                 &recipe_args,

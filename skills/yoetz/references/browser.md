@@ -170,8 +170,9 @@ YOETZ_AGENT=1 yoetz browser recipe --recipe chatgpt --bundle "$PWD/packet.zip" \
   `--thread`, all files are copied into the thread's session. If the extension
   is older than the CLI, the run refuses before job start; run `yoetz browser
   extension update --chatgpt` (or `--claude`). On chrome-devtools-mcp, a
-  live-attach daemon started by an older yoetz refuses a multi-file run with
-  "requires `--bundle`"; run `yoetz browser reset` once.
+  live-attach daemon started by an older yoetz opens the tab but stops with
+  "requires a bundle file path" before any upload; run `yoetz browser reset`
+  once.
 - Keep the packet small. The model unpacks a ZIP in its code tool and samples
   it; it does not look at hundreds of images in one turn. Send the screenshots
   that show each step, at a lower resolution, and name them so the request

@@ -4444,17 +4444,7 @@ pub(crate) fn validate_upload_files<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<B
     if files.is_empty() {
         bail!("no upload file given");
     }
-    let mut names = std::collections::HashSet::new();
-    for file in &files {
-        // Case-insensitive: --thread copies the files into one directory,
-        // which is case-insensitive on default macOS volumes.
-        if !names.insert(file.file_name.to_lowercase()) {
-            bail!(
-                "two upload files are named `{}`; the site tells attachments apart by name, so rename one",
-                file.file_name
-            );
-        }
-    }
+    ensure_distinct_file_names(files.iter().map(|file| file.file_name.as_str()))?;
     let total = files.iter().map(|file| file.size).sum::<u64>();
     if total > MAX_TOTAL_BYTES {
         bail!(
@@ -4463,6 +4453,22 @@ pub(crate) fn validate_upload_files<P: AsRef<Path>>(paths: &[P]) -> Result<Vec<B
         );
     }
     Ok(files)
+}
+
+/// Upload files need distinct names on every transport: the sites and the
+/// upload waits tell attachments apart by name, and `--thread` copies them
+/// into one directory. Case-insensitive, because that directory is on
+/// default macOS volumes.
+pub(crate) fn ensure_distinct_file_names<'a>(names: impl Iterator<Item = &'a str>) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name.to_lowercase()) {
+            bail!(
+                "two upload files are named `{name}`; the site tells attachments apart by name, so rename one"
+            );
+        }
+    }
+    Ok(())
 }
 
 fn recipe_upload_files(
@@ -6104,7 +6110,9 @@ mod native_host_unix {
             .get("bundle_path")
             .and_then(Value::as_str)
             .context("local message payload missing bundle_path")?;
-        let paths = match envelope
+        // (path, size the CLI saw). A file that changed since then fails here,
+        // on job_start and on every reconnect replay.
+        let expected = match envelope
             .payload
             .get("attachments")
             .and_then(Value::as_array)
@@ -6112,21 +6120,26 @@ mod native_host_unix {
             Some(entries) => entries
                 .iter()
                 .map(|entry| {
-                    entry
+                    let path = entry
                         .get("path")
                         .and_then(Value::as_str)
-                        .context("local message attachment missing path")
+                        .context("local message attachment missing path")?;
+                    Ok((path, entry.get("bytes").and_then(Value::as_u64)))
                 })
                 .collect::<Result<Vec<_>>>()?,
-            None => vec![bundle_path],
+            None => vec![(
+                bundle_path,
+                envelope.payload.get("bundle_size").and_then(Value::as_u64),
+            )],
         };
+        let paths = expected.iter().map(|(path, _)| *path).collect::<Vec<_>>();
         let files = validate_upload_files(&paths)?;
-        if let Some(size) = envelope.payload.get("bundle_size").and_then(Value::as_u64) {
-            if size != files[0].size {
+        for (file, (_, size)) in files.iter().zip(&expected) {
+            if let Some(size) = size.filter(|size| *size != file.size) {
                 bail!(
-                    "bundle_size {} does not match current file size {}",
-                    size,
-                    files[0].size
+                    "{} changed since the run started: it was {size} bytes and is now {}",
+                    file.path.display(),
+                    file.size
                 );
             }
         }

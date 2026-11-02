@@ -714,6 +714,17 @@ async function startJob(message) {
     });
     return;
   }
+  // yz-w4s: an older native host forwards the CLI's manifest but streams and
+  // reports only the first file. Refuse before a tab opens; runJobWithFile
+  // keeps the same check on the received stream as a backstop.
+  const manifestBytes = job.attachments?.reduce((total, attachment) => total + attachment.bytes, 0);
+  if (manifestBytes !== undefined && manifestBytes !== job.bundle_size) {
+    await failJob(job, "attachment_manifest_mismatch", `attachment manifest declares ${manifestBytes} bytes but the native host announced ${job.bundle_size}; restart Chrome so the native host runs the installed yoetz`, {
+      phase: "upload",
+      side_effect_started: false
+    });
+    return;
+  }
 
   const targetProfile = await validateTargetProfile(job);
   if (!jobContinuationIsLive(job, continuationEpoch)) {

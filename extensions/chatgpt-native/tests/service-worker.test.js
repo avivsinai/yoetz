@@ -3829,6 +3829,7 @@ test("service worker uploads a two-file manifest as two attachments before the p
       prompt: "prompt",
       wait_interval_ms: 50,
       wait_timeout_ms: 1200,
+      bundle_size: 5,
       attachments: [
         { filename: "part1.zip", mime_type: "application/zip", bytes: 3 },
         { filename: "part2.zip", mime_type: "application/zip", bytes: 2 }

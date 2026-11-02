@@ -121,9 +121,9 @@ async fn run_with_client(
         bail!("Claude Fable 5 / Max selection was not verified")
     }
 
-    for bundle_path in upload_paths {
+    for (index, bundle_path) in upload_paths.iter().enumerate() {
         report_upload_started(ctx, bundle_path);
-        upload_bundle(client, bundle_path, ctx.upload_timeout_ms)
+        upload_bundle(client, bundle_path, index == 0, ctx.upload_timeout_ms)
             .await
             .with_claude_phase(WebRecipeTransportPhase::Upload)
             .context("upload bundle to Claude")?;
@@ -361,6 +361,7 @@ fn require_status(
 async fn upload_bundle(
     client: &ChromeCdpClient,
     bundle_path: &Path,
+    first_file: bool,
     timeout_ms: u64,
 ) -> Result<()> {
     let file_name = bundle_path
@@ -377,7 +378,7 @@ async fn upload_bundle(
         .await
         .context("upload file through hidden Claude composer input")?;
 
-    let probe = claude_web::build_attachment_probe_function(file_name)?;
+    let probe = claude_web::build_attachment_probe_function_for(file_name, first_file)?;
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let mut stable_ready_ticks = 0_u8;
     loop {
