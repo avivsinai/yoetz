@@ -8,7 +8,9 @@ const FILE_INPUT_SELECTOR = "input[data-testid='file-upload']";
 const ATTACHMENT_SELECTOR = "[data-testid='file-thumbnail']";
 const COPY_ACTION_SELECTOR = "[data-testid='action-bar-copy']";
 const ASSISTANT_SELECTOR = "[data-is-streaming]";
+const EFFORT_TRIGGER_SELECTOR = "[role='menuitem'][aria-haspopup='menu'], [data-testid='effort-menu-trigger']";
 const MODEL_MENU_SETTLE_MS = 300;
+const EFFORT_HOVER_MS = 500;
 const BLOCKING_STATE_SCAN_INTERVAL_MS = 1000;
 const SWITCH_MODELS_CONTROL_SELECTOR = "button, a, [role='button'], [role='link']";
 // Keep control corroboration inside a local notice subtree rather than allowing
@@ -445,21 +447,16 @@ export async function ensureConversationLoaded(root = document, conversationId, 
 
 export async function configureModelState(root, job = {}) {
   const timeoutMs = Number(job.model_selection_timeout_ms) || 10000;
-  const modelButton = await waitForModelState(root, () => root.querySelector(MODEL_SELECTOR), 20000);
+  const modelButton = await waitForModelState(root, () => root.querySelector(MODEL_SELECTOR), 20000, "model selector");
   await openModelMenu(root, modelButton, timeoutMs);
   const fable = await waitForModelOptional(root, () => visibleElements(root, "[role='menuitemradio']")
-    .find((element) => normalizeText(element.innerText || element.textContent).toLowerCase().startsWith("fable 5")), timeoutMs);
+    .find((element) => textStartsWith(element, "fable 5")), timeoutMs);
   if (!fable) {
-    const diagnostics = modelSelectionDiagnostics(root);
-    const menuClosed = await closeModelMenu(root, modelButton);
-    return {
-      status: "unavailable",
-      requested_model: "fable-5-max",
-      model_used: diagnostics.modelChip || null,
-      warning: `Claude Fable 5 is unavailable; live options: ${diagnostics.options.join(", ") || "none"}${menuClosed ? "" : "; model menu remained open"}`,
-      menuClosed,
-      ...diagnostics
-    };
+    return unavailableModelSelection(
+      root,
+      modelButton,
+      `Claude Fable 5 is unavailable; live options: ${modelSelectionDiagnostics(root).options.join(", ") || "none"}`
+    );
   }
 
   const alreadySelected = await verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs);
@@ -469,25 +466,30 @@ export async function configureModelState(root, job = {}) {
 
   throwIfModelBlocked(root);
   fable.click();
-  await settleAfterMenuSelection(root, modelButton, timeoutMs);
+  await settleAfterMenuSelection(root, modelButton, timeoutMs, "model menu closed after Fable selection");
 
   await openModelMenu(root, modelButton, timeoutMs);
-  const effortTrigger = await waitForModelState(root, () => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
-  dispatchHover(effortTrigger);
-  const max = await waitForModelState(root, () => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"), timeoutMs);
+  const effortChoices = await openEffortSubmenu(root, timeoutMs);
+  const max = effortChoices.find(isMaxEffortOption);
+  if (!max) {
+    const live = effortChoices.map((element) => normalizeText(element.innerText || element.textContent));
+    return unavailableModelSelection(
+      root,
+      modelButton,
+      `Claude Max effort is unavailable; live effort options: ${live.join(", ") || "none"}`
+    );
+  }
   throwIfModelBlocked(root);
   max.click();
-  await settleAfterMenuSelection(root, modelButton, timeoutMs);
+  await settleAfterMenuSelection(root, modelButton, timeoutMs, "model menu closed after Max selection");
 
   await closeModelMenu(root, modelButton);
   await sleep(MODEL_MENU_SETTLE_MS);
   await openModelMenu(root, modelButton, timeoutMs);
-  const verificationEffort = await waitForModelState(root, () => root.querySelector("[data-testid='effort-menu-trigger']"), timeoutMs);
-  dispatchHover(verificationEffort);
-  // Live picker DOM captured 2026-07-21 exposes Fable 5 as a checked
-  // menuitemradio and Max as effort-option-max; it has no independent Thinking
-  // control. Keep both remaining legs as positive, post-click re-reads.
-  await waitForModelState(root, () => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"), timeoutMs);
+  // Fable 5 is a checked model menuitemradio and Max a checked effort
+  // menuitemradio; there is no independent Thinking control. Keep both legs as
+  // positive, post-click re-reads.
+  await openEffortSubmenu(root, timeoutMs);
   const diagnostics = modelSelectionDiagnostics(root);
   const menuClosed = await closeModelMenu(root, modelButton);
   await sleep(MODEL_MENU_SETTLE_MS);
@@ -682,20 +684,29 @@ export async function confirmGenerationStopped(root = document, options = {}) {
 export function modelSelectionDiagnostics(root = document) {
   const modelButton = root.querySelector(MODEL_SELECTOR);
   const modelChip = normalizeText(modelButton?.innerText || modelButton?.textContent);
-  const selectedModels = Array.from(root.querySelectorAll("[role='menuitemradio'][aria-checked='true']"));
+  const checkedRadios = Array.from(root.querySelectorAll("[role='menuitemradio'][aria-checked='true']"));
   const modelVerified = /\bFable 5\b/i.test(modelChip)
-    && selectedModels.some((element) => normalizeText(element.innerText || element.textContent).toLowerCase().startsWith("fable 5"));
-  const maxOption = root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']");
-  const maxVerified = maxOption?.getAttribute("aria-checked") === "true" && /\bMax\b/i.test(modelChip);
+    && checkedRadios.some((element) => textStartsWith(element, "fable 5"));
+  const maxVerified = /\bMax\b/i.test(modelChip) && checkedRadios.some(isMaxEffortOption);
   const options = visibleElements(root, "[role='menuitem'], [role='menuitemradio'], button, [role='switch']")
     .map((element) => normalizeText(element.innerText || element.textContent))
     .filter(Boolean)
     .slice(0, 50);
+  const openMenus = visibleElements(root, "[role='menu']").map((menu) => ({
+    cds: menu.getAttribute("data-cds"),
+    closed: menu.getAttribute("data-closed") !== null
+  }));
+  const dialogs = visibleElements(root, "[role='dialog']").map((dialog) => ({
+    testid: dialog.getAttribute("data-testid"),
+    heading: normalizeText(dialog.querySelector?.("h1, h2, h3, [role='heading']")?.textContent).slice(0, 120)
+  }));
   return {
     modelVerified,
     maxVerified,
     modelChip,
-    options
+    options,
+    openMenus,
+    dialogs
   };
 }
 
@@ -833,9 +844,22 @@ async function openModelMenu(root, button, timeoutMs) {
   throw new Error(`Claude model menu did not open within ${timeoutMs}ms`);
 }
 
-async function settleAfterMenuSelection(root, modelButton, timeoutMs) {
-  await waitForModelState(root, () => modelButton.getAttribute("aria-expanded") !== "true", timeoutMs);
+async function settleAfterMenuSelection(root, modelButton, timeoutMs, target) {
+  await waitForModelState(root, () => modelButton.getAttribute("aria-expanded") !== "true", timeoutMs, target);
   await sleep(MODEL_MENU_SETTLE_MS);
+}
+
+async function unavailableModelSelection(root, modelButton, warning) {
+  const diagnostics = modelSelectionDiagnostics(root);
+  const menuClosed = await closeModelMenu(root, modelButton);
+  return {
+    status: "unavailable",
+    requested_model: "fable-5-max",
+    model_used: diagnostics.modelChip || null,
+    warning: `${warning}${menuClosed ? "" : "; model menu remained open"}`,
+    menuClosed,
+    ...diagnostics
+  };
 }
 
 async function verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs) {
@@ -845,19 +869,7 @@ async function verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs) {
     return null;
   }
 
-  const effortTrigger = root.querySelector("[data-testid='effort-menu-trigger']");
-  if (!effortTrigger) {
-    return null;
-  }
-  dispatchHover(effortTrigger);
-  const max = await waitForModelOptional(
-    root,
-    () => root.querySelector("[role='menuitemradio'][data-testid='effort-option-max']"),
-    timeoutMs
-  );
-  if (!max) {
-    return null;
-  }
+  await openEffortSubmenu(root, timeoutMs);
   const diagnostics = modelSelectionDiagnostics(root);
   if (!diagnostics.modelVerified || !diagnostics.maxVerified) {
     return null;
@@ -872,6 +884,42 @@ async function verifyAlreadySelectedModel(root, modelButton, fable, timeoutMs) {
     ...(menuClosed ? {} : { warning: "Claude model menu remained open after Escape; refusing to send" }),
     ...diagnostics
   };
+}
+
+// claude.ai picker (Base UI menu captured 2026-11-02, no testids): models are
+// menuitemradio rows with data-model-id; Effort is a submenu menuitem whose
+// text starts with "Effort"; its levels are menuitemradio rows without
+// data-model-id. Hover opens the submenu; click the trigger once if it did not.
+async function openEffortSubmenu(root, timeoutMs) {
+  const trigger = await waitForModelState(
+    root,
+    () => visibleElements(root, EFFORT_TRIGGER_SELECTOR).find((element) => textStartsWith(element, "effort")),
+    timeoutMs,
+    "Effort item in the model menu"
+  );
+  dispatchHover(trigger);
+  const hovered = await waitForModelOptional(root, () => effortOptions(root).length > 0, Math.min(timeoutMs, EFFORT_HOVER_MS));
+  if (!hovered) {
+    throwIfModelBlocked(root);
+    trigger.click();
+  }
+  return waitForModelState(root, () => {
+    const options = effortOptions(root);
+    return options.length > 0 && options;
+  }, timeoutMs, "effort submenu options");
+}
+
+function effortOptions(root) {
+  return visibleElements(root, "[role='menuitemradio']")
+    .filter((element) => element.getAttribute("data-model-id") === null);
+}
+
+function isMaxEffortOption(element) {
+  return element.getAttribute("data-model-id") === null && textStartsWith(element, "max");
+}
+
+function textStartsWith(element, prefix) {
+  return normalizeText(element.innerText || element.textContent).toLowerCase().startsWith(prefix);
 }
 
 function dispatchHover(element) {
@@ -1211,12 +1259,19 @@ async function waitForClaudeState(root, read, timeoutMs, detail) {
   }, timeoutMs);
 }
 
-function waitForModelState(root, read, timeoutMs) {
-  return waitForClaudeState(root, read, timeoutMs, {
-    phase: "model_selection",
-    side_effect_started: false,
-    send_committed: false
-  });
+async function waitForModelState(root, read, timeoutMs, target) {
+  try {
+    return await waitForClaudeState(root, read, timeoutMs, {
+      phase: "model_selection",
+      side_effect_started: false,
+      send_committed: false
+    });
+  } catch (error) {
+    if (error?.isClaudeWaitTimeout && target) {
+      error.message = `${error.message} (waiting for ${target}); model diagnostics: ${JSON.stringify(modelSelectionDiagnostics(root))}`;
+    }
+    throw error;
+  }
 }
 
 function throwIfModelBlocked(root) {
