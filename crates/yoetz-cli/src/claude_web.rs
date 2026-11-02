@@ -14,13 +14,25 @@ pub const ATTACHMENT_SELECTOR: &str = "[data-testid='file-thumbnail']";
 /// card link and the remove button reads `Remove <file>`. Older cards: `h3`,
 /// "Remove". Same reads as `extensions/chatgpt-native/src/claude-dom.js`.
 const ATTACHMENT_REMOVE_SELECTOR: &str = "button[aria-label='Remove'], button[aria-label^='Remove '], button[data-cds-attachment-remove]";
-/// Assistant turn captured 2026-11-02: the answer body is `[data-cds='Prose']`
-/// (was `.font-claude-response`) and Copy is a button in the turn's
-/// `message-actions` toolbar (was `action-bar-copy`). The user's own Copy
-/// button (`user-message-copy`) never counts. Same reads as
+/// Assistant turn captured 2026-11-02: the answer is one or more
+/// `[data-cds='Prose']` blocks (was one `.font-claude-response`) and Copy is a
+/// button in the turn's `message-actions` toolbar (was `action-bar-copy`). The
+/// user's own Copy button (`user-message-copy`) never counts. Same reads as
 /// `extensions/chatgpt-native/src/claude-dom.js`.
 pub const COPY_ACTION_SELECTOR: &str = "[data-testid='action-bar-copy'], [data-testid='message-actions'] button[aria-label='Copy']:not([data-testid='user-message-copy'])";
-const RESPONSE_BODY_SELECTOR: &str = ".font-claude-response, [data-cds='Prose']";
+/// Answer text of the last assistant turn: the legacy single block, else every
+/// outermost Prose block in DOM order (not one inside a thinking status row),
+/// joined with a blank line.
+const RESPONSE_TEXT_JS: &str = r#"(last) => {
+  const legacy = last?.querySelector?.(".font-claude-response");
+  const thinkingRow = (block) => {
+    const row = block.closest(".row-start-1.col-start-1");
+    return !!row && last.contains(row) && !!row.querySelector("button[class*='group/status']");
+  };
+  const bodies = legacy ? [legacy] : Array.from(last?.querySelectorAll?.("[data-cds='Prose']") || [])
+    .filter((block) => !block.parentElement?.closest("[data-cds='Prose']") && !thinkingRow(block));
+  return bodies.map((body) => String(body.innerText || body.textContent || "").trim()).filter(Boolean).join("\n\n");
+}"#;
 /// claude.ai picker (Base UI menu captured 2026-11-02, no testids): models are
 /// `menuitemradio` rows with `data-model-id`; Effort is a submenu `menuitem`
 /// whose text starts with "Effort"; its levels are `menuitemradio` rows without
@@ -382,13 +394,13 @@ pub fn build_send_function() -> String {
   if (!send) return {{ status: "missing", assistantCount: assistantRoots.length, assistantLastLength: 0, copyButtons, diagnostics }};
   if (send.disabled || send.getAttribute("aria-disabled") === "true") return {{ status: "disabled", assistantCount: assistantRoots.length, assistantLastLength: 0, copyButtons, diagnostics }};
   const last = assistantRoots.at(-1);
-  const lastBody = last?.querySelector?.("{body_selector}");
-  const assistantLastLength = String(lastBody?.innerText || lastBody?.textContent || "").trim().length;
+  const responseText = {response_text};
+  const assistantLastLength = responseText(last).length;
   send.click();
   return {{ status: "sent", assistantCount: assistantRoots.length, assistantLastLength, copyButtons, diagnostics }};
 }}"##,
         copy_selector = COPY_ACTION_SELECTOR,
-        body_selector = RESPONSE_BODY_SELECTOR,
+        response_text = RESPONSE_TEXT_JS,
     )
 }
 
@@ -405,8 +417,8 @@ pub fn build_response_poll_function() -> String {
     !!last?.querySelector?.("button[class*='group/status']");
   const streaming = !!stop || last?.getAttribute?.("data-is-streaming") === "true";
   const send = document.querySelector("button[aria-label='Send message']");
-  const body = last?.querySelector?.("{body_selector}");
-  const text = String(body?.innerText || body?.textContent || "").trim();
+  const responseText = {response_text};
+  const text = responseText(last);
   const err = Array.from(document.querySelectorAll("[role='alert'], [data-testid*='error']")).find(visible);
   return {{
     count: nodes.length, length: text.length, text, streaming,
@@ -417,7 +429,7 @@ pub fn build_response_poll_function() -> String {
   }};
 }}"##,
         copy_selector = COPY_ACTION_SELECTOR,
-        body_selector = RESPONSE_BODY_SELECTOR,
+        response_text = RESPONSE_TEXT_JS,
     )
 }
 

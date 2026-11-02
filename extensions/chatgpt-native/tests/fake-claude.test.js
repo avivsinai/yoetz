@@ -1666,7 +1666,7 @@ function fakeClaudeAssistant({
       return name === "data-is-streaming" ? String(this.streaming) : null;
     },
     querySelector(selector) {
-      if (selector === ".font-claude-response, [data-cds='Prose']") return body;
+      if (selector === ".font-claude-response") return body;
       if (selector === "button[class*='group/status']") return this.thinking ? {} : null;
       return null;
     },
