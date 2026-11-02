@@ -6,11 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.96] - 2026-11-02
 ### Fixed
 - `yoetz browser recipe --recipe claude` returns Claude's answer again instead
   of waiting forever for final assistant controls: it reads the answer body
   and the Copy control in claude.ai's new message layout, and the user's own
   Copy button never counts as a finished answer (yz-ejp).
+
 
 ## [0.5.95] - 2026-11-02
 ### Fixed
