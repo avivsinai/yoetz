@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.93] - 2026-11-02
 ### Added
 - `yoetz browser recipe --thread` accepts any `--bundle` file, such as a ZIP of
   screenshots: a file that is not a yoetz bundle is copied into a new session,
@@ -34,6 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   Chrome`, `uploading <file> (<size>)`, `prompt sent`, `waiting for the
   ChatGPT answer`, ...), including the "click Allow" hint, instead of going
   silent for minutes after `attempting chrome-devtools-mcp transport` (#632).
+
 
 ## [0.5.92] - 2026-10-25
 ### Changed
