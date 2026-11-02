@@ -1121,9 +1121,10 @@ test("Claude model picker selects Fable 5 Max in the 2026-11-02 Base UI menu (yz
     ${menuHtml}</body>`);
   const { window } = dom;
   const document = window.document;
-  // jsdom has no layout. Emulate "a closed menu is not rendered".
+  // jsdom has no layout. Worst case: the retained closed menu still has rects,
+  // but its items do not respond.
   window.Element.prototype.getClientRects = function getClientRects() {
-    return this.closest("[data-closed], [hidden]") ? [] : [{}];
+    return this.closest("[hidden]") ? [] : [{}];
   };
   const trigger = document.querySelector("[data-testid='model-selector-dropdown']");
   const menu = document.querySelector("[data-cds='ModelSelector']");
@@ -1138,8 +1139,9 @@ test("Claude model picker selects Fable 5 Max in the 2026-11-02 Base UI menu (yz
   };
   trigger.addEventListener("click", () => setOpen(trigger.getAttribute("aria-expanded") !== "true"));
   document.addEventListener("keydown", (event) => event.key === "Escape" && setOpen(false));
+  const closed = () => menu.hasAttribute("data-closed");
   effort.addEventListener("pointerenter", () => {
-    if (document.querySelector("[data-yoetz-test='effort-submenu']")) return;
+    if (closed() || document.querySelector("[data-yoetz-test='effort-submenu']")) return;
     const submenu = document.createElement("div");
     submenu.setAttribute("role", "menu");
     submenu.setAttribute("data-yoetz-test", "effort-submenu");
@@ -1159,6 +1161,7 @@ test("Claude model picker selects Fable 5 Max in the 2026-11-02 Base UI menu (yz
   });
   for (const model of menu.querySelectorAll("[data-model-id]")) {
     model.addEventListener("click", () => {
+      if (closed()) return;
       for (const other of menu.querySelectorAll("[data-model-id]")) {
         other.setAttribute("aria-checked", String(other === model));
       }

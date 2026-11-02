@@ -2801,7 +2801,7 @@ mod tests {
 
         let model = build_claude_model_script("yoetz-claude-test");
         assert!(model.contains("Fable 5"));
-        assert!(model.contains("effort-option-max"));
+        assert!(model.contains(":not([data-model-id])"));
         assert!(model.contains("aria-checked"));
         assert!(!model.contains(".hover()"));
         assert!(model.contains("pointerover"));

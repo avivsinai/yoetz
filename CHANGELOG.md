@@ -8,7 +8,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 ### Fixed
 - `yoetz browser recipe --recipe claude` selects Fable 5 at Max effort again
-  after claude.ai changed its model menu. When the account has no Max effort,
+  after claude.ai changed its model menu, on the native extension, CDP and
+  dev-browser transports. When the account has no Max effort,
   the run stops with a typed `unavailable` that lists the live effort options,
   and a model-selection timeout now names the state it waited for (yz-ejp).
 

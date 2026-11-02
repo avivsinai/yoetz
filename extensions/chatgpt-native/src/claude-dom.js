@@ -911,7 +911,12 @@ async function openEffortSubmenu(root, timeoutMs) {
 
 function effortOptions(root) {
   return visibleElements(root, "[role='menuitemradio']")
-    .filter((element) => element.getAttribute("data-model-id") === null);
+    .filter((element) => element.getAttribute("data-model-id") === null && !inClosedMenu(element));
+}
+
+// Base UI keeps a closed menu mounted and marks it data-closed.
+function inClosedMenu(element) {
+  return Boolean(element.closest?.("[role='menu'][data-closed]"));
 }
 
 function isMaxEffortOption(element) {
@@ -978,11 +983,11 @@ function visibleElements(root, selector) {
 // Structural mounted-open signal for the Claude model menu, mirroring the
 // ChatGPT #469 openSignal: the aria-expanded attribute can lag the mount in a
 // throttled hidden tab, so accept either the trigger attribute or mounted
-// menuitemradio options (the same probe used elsewhere in this file). Opacity
-// /animation never gates this read (background tabs never animate).
+// menuitemradio options outside a retained closed menu. Opacity/animation
+// never gates this read (background tabs never animate).
 function menuMountedOpen(root, button) {
   if (button?.getAttribute?.("aria-expanded") === "true") return true;
-  return visibleElements(root, "[role='menuitemradio']").length > 0;
+  return visibleElements(root, "[role='menuitemradio']").some((element) => !inClosedMenu(element));
 }
 
 function hasUsageCreditsCore(text) {

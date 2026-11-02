@@ -11,7 +11,13 @@ pub const MODEL_SELECTOR: &str = "[data-testid='model-selector-dropdown']";
 pub const FILE_INPUT_SELECTOR: &str = "input[data-testid='file-upload']";
 pub const ATTACHMENT_SELECTOR: &str = "[data-testid='file-thumbnail']";
 pub const COPY_ACTION_SELECTOR: &str = "[data-testid='action-bar-copy']";
-pub const EFFORT_TRIGGER_SELECTOR: &str = "[data-testid='effort-menu-trigger']";
+/// claude.ai picker (Base UI menu captured 2026-11-02, no testids): models are
+/// `menuitemradio` rows with `data-model-id`; Effort is a submenu `menuitem`
+/// whose text starts with "Effort"; its levels are `menuitemradio` rows without
+/// `data-model-id`. Base UI keeps a closed menu mounted with `data-closed`.
+/// Same reads as `extensions/chatgpt-native/src/claude-dom.js`.
+const FIND_EFFORT_TRIGGER_JS: &str = r#"Array.from(document.querySelectorAll("[role='menuitem'][aria-haspopup='menu'], [data-testid='effort-menu-trigger']")).filter(visible).find((el) => normalize(el.innerText || el.textContent).toLowerCase().startsWith("effort"))"#;
+const EFFORT_OPTIONS_JS: &str = r#"Array.from(document.querySelectorAll("[role='menuitemradio']:not([data-model-id])")).filter((el) => visible(el) && !el.closest("[role='menu'][data-closed]"))"#;
 pub const EFFORT_HOVER_MARKER: &str = "yoetz-claude-effort-target";
 pub const FILE_INPUT_MARKER: &str = "yoetz-claude-upload-target";
 pub const STABLE_IDLE_FLOOR_MS: u64 = 90_000;
@@ -180,14 +186,14 @@ pub fn build_mark_effort_parent_function() -> String {
     .filter(visible)
     .map((el) => ({{ el, text: normalize(el.innerText || el.textContent) }}))
     .filter(({{ text }}) => text);
-  const effort = document.querySelector("{effort_trigger}");
+  const effort = {find_effort};
   const effortText = normalize(effort?.innerText || effort?.textContent);
   if (!effort) return {{ status: "unavailable", options: options.map(({{ text }}) => text).slice(0, 40) }};
   effort.setAttribute("title", "{marker}");
   return {{ status: "marked", marker: "{marker}", text: effortText, options: options.map(({{ text }}) => text).slice(0, 40) }};
 }}"##,
         marker = EFFORT_HOVER_MARKER,
-        effort_trigger = EFFORT_TRIGGER_SELECTOR,
+        find_effort = FIND_EFFORT_TRIGGER_JS,
     )
 }
 
@@ -199,13 +205,11 @@ pub fn build_open_effort_submenu_function() -> String {
         r##"() => {{
   const visible = (el) => !!el && el.getClientRects().length > 0;
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-  const effortOptions = () => Array.from(document.querySelectorAll("[role='menuitemradio'][data-testid^='effort-option-']"))
-    .filter(visible)
+  const existing = {effort_options}
     .map((el) => normalize(el.innerText || el.textContent))
     .filter(Boolean);
-  const existing = effortOptions();
   if (existing.length > 0) return {{ status: "already_open", effortOptions: existing }};
-  const effort = document.querySelector("{effort_trigger}");
+  const effort = {find_effort};
   if (!visible(effort)) return {{ status: "unavailable", effortOptions: existing }};
   const rect = effort.getBoundingClientRect?.() || {{ left: 0, top: 0, width: 1, height: 1 }};
   const clientX = Number(rect.left || 0) + Math.max(1, Number(rect.width || 1) / 2);
@@ -225,31 +229,33 @@ pub fn build_open_effort_submenu_function() -> String {
   }}
   return {{ status: "dispatched", effort: normalize(effort.innerText || effort.textContent), effortOptions: existing }};
 }}"##,
-        effort_trigger = EFFORT_TRIGGER_SELECTOR,
+        effort_options = EFFORT_OPTIONS_JS,
+        find_effort = FIND_EFFORT_TRIGGER_JS,
     )
 }
 
 pub fn build_select_max_function() -> String {
-    r##"() => {
+    format!(
+        r##"() => {{
   const visible = (el) => !!el && el.getClientRects().length > 0;
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-  const options = Array.from(document.querySelectorAll("[role='menuitemradio'][data-testid^='effort-option-']"))
-    .filter(visible)
-    .map((el) => ({ el, text: normalize(el.innerText || el.textContent) }))
-    .filter(({ text }) => /^(Low|Medium|High|Extra|Max)(?:\b|$)/i.test(text));
-  const max = document.querySelector("[role='menuitemradio'][data-testid='effort-option-max']");
-  if (!max) return { status: "unavailable", effortOptions: options.map(({ text }) => text) };
-  const selected = normalize(max.innerText || max.textContent);
-  max.click();
-  return { status: "selected", selected, effortOptions: options.map(({ text }) => text) };
-}"##.to_string()
+  const options = {effort_options}
+    .map((el) => ({{ el, text: normalize(el.innerText || el.textContent) }}))
+    .filter(({{ text }}) => text);
+  const max = options.find(({{ text }}) => text.toLowerCase().startsWith("max"));
+  if (!max) return {{ status: "unavailable", effortOptions: options.map(({{ text }}) => text) }};
+  max.el.click();
+  return {{ status: "selected", selected: max.text, effortOptions: options.map(({{ text }}) => text) }};
+}}"##,
+        effort_options = EFFORT_OPTIONS_JS,
+    )
 }
 
 /// Re-read both exact Claude model postconditions after selection.
 ///
-/// Live picker DOM captured 2026-07-21 exposes Fable 5 as a checked
-/// `menuitemradio` and Max as checked `effort-option-max`; it has no independent
-/// Thinking control. A successful click is never proof for either remaining leg.
+/// Fable 5 is a checked model `menuitemradio` and Max a checked effort
+/// `menuitemradio`; there is no independent Thinking control. A successful
+/// click is never proof for either remaining leg.
 pub fn build_verify_fable_max_function() -> String {
     format!(
         r##"() => {{
@@ -263,9 +269,10 @@ pub fn build_verify_fable_max_function() -> String {
     .find((text) => /^(Low|Medium|High|Extra|Max)(?:\b|$)/i.test(text)) || "";
   const modelSelected = Array.from(document.querySelectorAll("[role='menuitemradio'][aria-checked='true']"))
     .some((el) => normalize(el.innerText || el.textContent).toLowerCase().startsWith("fable 5"));
-  const maxOption = document.querySelector("[role='menuitemradio'][data-testid='effort-option-max']");
+  const maxChecked = Array.from(document.querySelectorAll("[role='menuitemradio'][aria-checked='true']:not([data-model-id])"))
+    .some((el) => normalize(el.innerText || el.textContent).toLowerCase().startsWith("max"));
   const modelVerified = modelSelected && /\bFable 5\b/i.test(modelChip);
-  const maxVerified = maxOption?.getAttribute("aria-checked") === "true" && /\bMax\b/i.test(modelChip);
+  const maxVerified = maxChecked && /\bMax\b/i.test(modelChip);
   return {{
     status: modelVerified && maxVerified ? "selected" : "mismatch",
     modelVerified, maxVerified, modelChip, effortChip,
@@ -445,8 +452,8 @@ mod tests {
             assert!(hover.contains(event));
         }
         assert!(hover.contains("already_open"));
-        assert!(hover.contains("effort-option-"));
-        assert!(build_select_max_function().contains("Max"));
+        assert!(hover.contains(":not([data-model-id])"));
+        assert!(build_select_max_function().contains("startsWith(\"max\")"));
         let verify = build_verify_fable_max_function();
         assert!(verify.contains("modelVerified && maxVerified"));
         assert!(!verify.contains("thinkingChecked"));
