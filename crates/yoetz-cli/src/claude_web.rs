@@ -11,7 +11,7 @@ pub const MODEL_SELECTOR: &str = "[data-testid='model-selector-dropdown']";
 pub const FILE_INPUT_SELECTOR: &str = "input[data-testid='file-upload']";
 pub const ATTACHMENT_SELECTOR: &str = "[data-testid='file-thumbnail']";
 /// Attachment card captured 2026-11-02: the filename is a `[title]` on the
-/// card link and the remove button reads "Remove <file>". Older cards: `h3`,
+/// card link and the remove button reads `Remove <file>`. Older cards: `h3`,
 /// "Remove". Same reads as `extensions/chatgpt-native/src/claude-dom.js`.
 const ATTACHMENT_REMOVE_SELECTOR: &str = "button[aria-label='Remove'], button[aria-label^='Remove '], button[data-cds-attachment-remove]";
 pub const COPY_ACTION_SELECTOR: &str = "[data-testid='action-bar-copy']";
