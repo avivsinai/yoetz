@@ -12,6 +12,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   version `X.Y.Z`, runs the same `scripts/release.sh` prep as a local cut
   (`--ci`), and opens the `chore(release): vX.Y.Z` PR with squash auto-merge.
 
+### Changed
+- `hyper` 1.8.1 → 1.12.0, dropping unmaintained `pin-utils` (RUSTSEC-2026-0441).
+
 ## [0.5.96] - 2026-11-02
 ### Fixed
 - `yoetz browser recipe --recipe claude` returns Claude's answer again instead
