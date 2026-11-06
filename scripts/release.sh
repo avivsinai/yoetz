@@ -22,11 +22,18 @@ This script:
 After the PR merges, the Release workflow creates vX.Y.Z automatically,
 publishes artifacts, and uses CHANGELOG.md as the release notes source.
 
+GitHub Actions (.github/workflows/release-request.yml) runs this script
+with --ci so a workflow_dispatch can open the same PR.
+
 Options:
   --date YYYY-MM-DD  Override release date (default: today in UTC)
   --allow-empty      Allow releasing with an empty Unreleased section
   --skip-verify      Skip cargo check/test/clippy/fmt release gates
   --no-auto-merge    Create the PR but do not enable auto-merge
+  --no-push          Prepare and commit locally; do not push or open a PR
+  --ci               GitHub Actions mode: HEAD must match origin/main
+                     (named branch not required), cargo fetch before the
+                     offline lock bump, GH_TOKEN required unless --no-push
 EOF
 }
 
@@ -49,11 +56,6 @@ normalize_version() {
   printf '%s\n' "$raw"
 }
 
-require_command git
-require_command cargo
-require_command gh
-require_command perl
-require_command python3
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -61,6 +63,8 @@ release_date="$(date -u +%Y-%m-%d)"
 allow_empty=0
 skip_verify=0
 auto_merge=1
+no_push=0
+ci=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -85,6 +89,14 @@ while [[ $# -gt 0 ]]; do
       auto_merge=0
       shift
       ;;
+    --no-push)
+      no_push=1
+      shift
+      ;;
+    --ci)
+      ci=1
+      shift
+      ;;
     --*)
       echo "error: unknown option: $1" >&2
       usage >&2
@@ -95,6 +107,18 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+require_command git
+require_command cargo
+require_command perl
+require_command python3
+if [[ "$no_push" -eq 0 ]]; then
+  require_command gh
+  if [[ "$ci" -eq 1 && -z "${GH_TOKEN:-}" ]]; then
+    echo "error: --ci requires GH_TOKEN (the release GitHub App token) unless --no-push" >&2
+    exit 1
+  fi
+fi
 
 if [[ $# -ne 1 ]]; then
   usage >&2
@@ -110,18 +134,24 @@ if [[ -n "$(git diff --stat HEAD)" ]]; then
   exit 1
 fi
 
-CURRENT_BRANCH="$(git branch --show-current)"
-if [[ "$CURRENT_BRANCH" != "main" ]]; then
-  echo "error: release prep must start from main (current: ${CURRENT_BRANCH})" >&2
-  exit 1
+if [[ "$ci" -eq 0 ]]; then
+  CURRENT_BRANCH="$(git branch --show-current)"
+  if [[ "$CURRENT_BRANCH" != "main" ]]; then
+    echo "error: release prep must start from main (current: ${CURRENT_BRANCH})" >&2
+    exit 1
+  fi
 fi
 
 git fetch origin main --tags
 
-LOCAL_MAIN="$(git rev-parse HEAD)"
+HEAD_SHA="$(git rev-parse HEAD)"
 REMOTE_MAIN="$(git rev-parse origin/main)"
-if [[ "$LOCAL_MAIN" != "$REMOTE_MAIN" ]]; then
-  echo "error: main is not up to date with origin/main; run git pull --ff-only first" >&2
+if [[ "$HEAD_SHA" != "$REMOTE_MAIN" ]]; then
+  if [[ "$ci" -eq 1 ]]; then
+    echo "error: --ci requires HEAD to match origin/main" >&2
+  else
+    echo "error: main is not up to date with origin/main; run git pull --ff-only first" >&2
+  fi
   exit 1
 fi
 
@@ -221,6 +251,9 @@ done < <(find skills -mindepth 2 -maxdepth 2 -name SKILL.md | sort)
 # This MUST run unconditionally (even with --skip-verify) so the lock file's
 # yoetz/yoetz-core versions match the bumped Cargo.toml without a broad
 # registry update (yz-5bd).
+if [[ "$ci" -eq 1 ]]; then
+  cargo fetch
+fi
 cargo update --workspace --offline
 
 if [[ "$skip_verify" -eq 0 ]]; then
@@ -251,6 +284,17 @@ if git diff --cached --quiet; then
 fi
 
 git commit -m "chore(release): ${TAG}"
+
+if [[ "$no_push" -eq 1 ]]; then
+  echo ""
+  echo "Prepared ${TAG} locally (not pushed)"
+  echo "Release branch: ${BRANCH}"
+  echo "Push and PR skipped (--no-push)"
+  exit 0
+fi
+
+# Never xtrace: credentials live in GH_TOKEN / the git remote helper.
+set +x
 git push -u origin "${BRANCH}"
 
 PR_BODY=$(

@@ -30,17 +30,20 @@ are in `ARCHITECTURE.md`; user docs are in `README.md`; the agent skill is
 - Every user-visible change adds a line under `## [Unreleased]` in
   `CHANGELOG.md` in the same PR (a CI check enforces the placement). That
   section becomes the GitHub release notes.
-- Release only from `main` with `./scripts/release.sh --skip-verify X.Y.Z`,
-  then merge the PR it opens (auto-merge is on). Never create tags or GitHub
+- Cut a release from GitHub Actions: Actions → Release Request → version
+  `X.Y.Z`. That runs `scripts/release.sh --ci`, opens `chore(release): vX.Y.Z`,
+  and squash auto-merge is on. Locally:
+  `./scripts/release.sh --skip-verify X.Y.Z`. Never create tags or GitHub
   releases by hand; never push to `main`.
-- Run `cargo fetch` first: the script updates `Cargo.lock` offline and fails on
-  a dependency it has not downloaded.
+- Run `cargo fetch` first for a local release: the script updates `Cargo.lock`
+  offline and fails on a dependency it has not downloaded. `--ci` fetches for
+  you.
 - The script bumps every version stamp (workspace, plugin manifests, skill
   frontmatter, extension manifest, content-script build ids) and leaves the
   checkout on the release branch: `git switch main` afterwards.
 - Merging `chore(release): vX.Y.Z` to `main` makes `release.yml` tag, publish
   artifacts (including the extension zip), and update Homebrew and Scoop.
-  `workflow_dispatch` retries an existing tag.
+  `release.yml` `workflow_dispatch` retries an existing tag.
 - Branch protection needs an up-to-date branch: on "Head branch is out of
   date", run `gh pr update-branch <n>`, wait for CI, then merge. Never `--admin`.
 - macOS release binaries are signed with a Developer ID and notarized when
