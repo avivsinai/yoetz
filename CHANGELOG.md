@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Updated the bundled LiteLLM runtime to 0.5.4 and refreshed ignore and JSON Schema validation dependencies.
+
+## [0.5.97] - 2026-11-09
+### Fixed
+- `yoetz browser recipe --recipe chatgpt` no longer refuses a new chat that
+  holds an unsent draft (`composer_text_chars` in the error), such as the
+  prompt of an earlier run that failed before Send: it clears the draft and
+  starts. Leftover attachments or an old transcript still refuse.
+
 ### Added
 - Cut a release from GitHub Actions: **Actions → Release Request** takes
   version `X.Y.Z`, runs the same `scripts/release.sh` prep as a local cut
@@ -14,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 - `hyper` 1.8.1 → 1.12.0, dropping unmaintained `pin-utils` (RUSTSEC-2026-0441).
+
 
 ## [0.5.96] - 2026-11-02
 ### Fixed
