@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Updated the bundled LiteLLM runtime to 0.5.4 and refreshed ignore and JSON Schema validation dependencies.
+
 ## [0.5.97] - 2026-11-09
 ### Fixed
 - `yoetz browser recipe --recipe chatgpt` no longer refuses a new chat that
