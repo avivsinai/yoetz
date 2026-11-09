@@ -2111,16 +2111,30 @@ test("extractResponse does not reuse standalone markdown before the latest user 
   assert.equal(extraction.method, "page_text_fallback");
 });
 
-test("ensureFreshChat rejects dirty composers and existing attachments", async () => {
-  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT", value: "old draft" });
+test("ensureFreshChat rejects existing attachments", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT" });
   const attachment = new FakeElement("div", { "data-testid": "attachment-file" }, "old.md");
-  const body = new FakeElement("body", {}, "old draft old.md").append(composer, attachment);
+  const body = new FakeElement("body", {}, "old.md").append(composer, attachment);
   const doc = new FakeDocument(body);
 
   await assert.rejects(
     () => ensureFreshChat(doc, { run_id: "run_dirty" }, { timeoutMs: 30, intervalMs: 10 }),
     /not a clean fresh chat/
   );
+});
+
+// Field failure: a new chat that held a 191-character draft from an earlier
+// failed run refused every later run with composer_text_chars 191.
+test("ensureFreshChat clears a leftover new-chat draft", async () => {
+  const composer = new FakeElement("textarea", { placeholder: "Message ChatGPT", value: "old draft" });
+  const body = new FakeElement("body", {}, "").append(composer);
+  const doc = new FakeDocument(body);
+
+  const fresh = await ensureFreshChat(doc, { run_id: "run_draft" }, { timeoutMs: 100, intervalMs: 10 });
+
+  assert.equal(fresh.status, "fresh");
+  assert.equal(fresh.cleared_draft_chars, "old draft".length);
+  assert.equal(composer.value, "");
 });
 
 test("ensureFreshChat clicks New Chat before accepting an existing conversation", async () => {
