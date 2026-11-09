@@ -604,22 +604,42 @@ export async function ensureFreshChat(root = document, job = {}, options = {}) {
     }
     throw error;
   }
-  const composerText = editableText(composer);
+  const draftChars = editableText(composer).length;
   const attachments = findAttachmentTiles(root, { composerOnly: true });
   const residue = conversationResidue(root);
-  if (composerText || attachments.length > 0 || residue.user_count > 0 || residue.assistant_count > 0 || residue.copy_button_count > 0) {
-    throw new Error(`ChatGPT tab is not a clean fresh chat (${JSON.stringify({
-      pathname: String(win.location?.pathname ?? ""),
-      run_id: job.run_id ?? null,
-      composer_text_chars: composerText.length,
-      attachment_count: attachments.length,
-      ...residue
-    })})`);
+  const notFresh = (composerTextChars) => new Error(`ChatGPT tab is not a clean fresh chat (${JSON.stringify({
+    pathname: String(win.location?.pathname ?? ""),
+    run_id: job.run_id ?? null,
+    composer_text_chars: composerTextChars,
+    attachment_count: attachments.length,
+    ...residue
+  })})`);
+  if (attachments.length > 0 || residue.user_count > 0 || residue.assistant_count > 0 || residue.copy_button_count > 0) {
+    throw notFresh(draftChars);
+  }
+  // ChatGPT restores an unsent new-chat draft, for example the prompt of an
+  // earlier run that failed before Send. A new chat has nothing else to lose,
+  // so the draft is cleared rather than refused.
+  if (draftChars > 0) {
+    clearComposerText(root, composer);
+    try {
+      await waitForCondition(
+        () => editableText(findComposer(root)).length === 0,
+        "ChatGPT composer kept its old draft",
+        {
+          timeoutMs: Number(options.timeoutMs ?? 10000),
+          intervalMs: Number(options.intervalMs ?? DEFAULT_WAIT_INTERVAL_MS)
+        }
+      );
+    } catch {
+      throw notFresh(editableText(findComposer(root)).length);
+    }
   }
   return {
     status: "fresh",
     pathname: String(win.location?.pathname ?? ""),
     composer_text_chars: 0,
+    cleared_draft_chars: draftChars,
     attachment_count: 0,
     ...residue
   };
@@ -3877,6 +3897,27 @@ function uploadErrorText(root) {
   return error ? textOf(error) : "";
 }
 export { uploadErrorText };
+
+function clearComposerText(root, composer) {
+  composer.focus();
+  if ("value" in composer) {
+    setInputValue(composer, "");
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+    return;
+  }
+  // Delete through the editor's own command so ProseMirror updates its state.
+  const selection = root.defaultView?.getSelection?.();
+  const range = root.createRange?.();
+  if (selection && range) {
+    range.selectNodeContents(composer);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  if (!root.execCommand?.("delete", false)) {
+    composer.textContent = "";
+    composer.dispatchEvent(new Event("input", { bubbles: true }));
+  }
+}
 
 function insertContenteditableText(root, composer, prompt) {
   const selection = root.defaultView?.getSelection?.();

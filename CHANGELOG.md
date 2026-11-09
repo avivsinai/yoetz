@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+### Fixed
+- `yoetz browser recipe --recipe chatgpt` no longer refuses a new chat that
+  holds an unsent draft (`composer_text_chars` in the error), such as the
+  prompt of an earlier run that failed before Send: it clears the draft and
+  starts. Leftover attachments or an old transcript still refuse.
 
 ### Added
 - Cut a release from GitHub Actions: **Actions → Release Request** takes
