@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.97] - 2026-11-09
 ### Fixed
 - `yoetz browser recipe --recipe chatgpt` no longer refuses a new chat that
   holds an unsent draft (`composer_text_chars` in the error), such as the
@@ -19,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 - `hyper` 1.8.1 → 1.12.0, dropping unmaintained `pin-utils` (RUSTSEC-2026-0441).
+
 
 ## [0.5.96] - 2026-11-02
 ### Fixed
