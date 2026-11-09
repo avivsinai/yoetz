@@ -64,3 +64,6 @@ Thumbs.db
 
 # Scratch capture logs
 picker-capture-session
+
+# bd flock files beside .beads (never deleted by bd)
+/*.gate.lock
