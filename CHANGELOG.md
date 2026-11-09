@@ -8,6 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ## [0.5.98] - 2026-11-09
+### Fixed
+- Fetch newly created release tags into the publishing checkout before tag-validating release steps run.
+
 ### Changed
 - Updated the bundled LiteLLM runtime to 0.5.4 and refreshed ignore and JSON Schema validation dependencies.
 
