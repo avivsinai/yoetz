@@ -6,8 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
+
+## [0.5.99] - 2026-11-25
 ### Security
 - Update `url` to 2.5.9 to address RUSTSEC-2026-0592.
+
 
 ## [0.5.98] - 2026-11-09
 ### Fixed
