@@ -9010,6 +9010,15 @@ steps:
     #[test]
     fn resolve_recipe_ignores_same_name_cwd_directory_for_bare_builtin_name() {
         let _guard = lock_env();
+        let data_home = tempfile::tempdir().unwrap();
+        let recipes = data_home.path().join("yoetz/recipes");
+        fs::create_dir_all(&recipes).unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../recipes/chatgpt.yaml"),
+            recipes.join("chatgpt.yaml"),
+        )
+        .unwrap();
+        let _data_env = EnvVarGuard::set("XDG_DATA_HOME", data_home.path());
         let cwd = unique_test_dir("recipe_shadow_cwd");
         fs::create_dir(cwd.join("chatgpt")).unwrap();
         let _cwd = CurrentDirGuard::enter(&cwd);
@@ -9024,6 +9033,15 @@ steps:
     #[test]
     fn resolve_recipe_ignores_same_name_cwd_file_for_bare_builtin_name() {
         let _guard = lock_env();
+        let data_home = tempfile::tempdir().unwrap();
+        let recipes = data_home.path().join("yoetz/recipes");
+        fs::create_dir_all(&recipes).unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../recipes/chatgpt.yaml"),
+            recipes.join("chatgpt.yaml"),
+        )
+        .unwrap();
+        let _data_env = EnvVarGuard::set("XDG_DATA_HOME", data_home.path());
         let cwd = unique_test_dir("recipe_shadow_file_cwd");
         fs::write(cwd.join("chatgpt"), "not: a built-in recipe").unwrap();
         let _cwd = CurrentDirGuard::enter(&cwd);
