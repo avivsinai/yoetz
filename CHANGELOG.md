@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- Update `toml` to 1.2.3 so overly nested TOML configuration returns a parse error.
+
 ## [0.5.99] - 2026-11-25
 ### Security
 - Update `url` to 2.5.9 to address RUSTSEC-2026-0592.
