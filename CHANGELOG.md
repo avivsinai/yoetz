@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Update the browser recipe YAML parser to `serde-saphyr` 2.1.1 while preserving existing empty-step syntax.
+
 ### Fixed
 - Update `toml` to 1.2.3 so overly nested TOML configuration returns a parse error.
 
