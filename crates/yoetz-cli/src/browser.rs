@@ -93,10 +93,26 @@ pub struct Recipe {
     pub name: Option<String>,
     pub transports: Option<Vec<RecipeTransport>>,
     pub defaults: Option<BTreeMap<String, String>>,
+    #[serde(deserialize_with = "deserialize_recipe_steps")]
     pub steps: Vec<RecipeStep>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+fn deserialize_recipe_steps<'de, D>(deserializer: D) -> Result<Vec<RecipeStep>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Preserve the prior parser's null-as-empty behavior for steps, without
+    // accepting an absent steps field or disabling validation of non-null values.
+    Ok(
+        Option::<Vec<Option<RecipeStep>>>::deserialize(deserializer)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(Option::unwrap_or_default)
+            .collect(),
+    )
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecipeStep {
     pub action: Option<String>,
@@ -8697,6 +8713,32 @@ steps:
             "disabled"
         );
         assert_eq!(chatgpt_send_state_str(ChatgptSendState::Missing), "missing");
+    }
+
+    #[test]
+    fn recipe_yaml_preserves_null_steps_compatibility() {
+        for steps in ["steps:", "steps: null", "steps: ~", "steps: []"] {
+            let recipe =
+                serde_saphyr::from_str::<Recipe>(&format!("name: custom\n{steps}\n")).expect(steps);
+            assert!(recipe.steps.is_empty(), "{steps}");
+        }
+        let recipe = serde_saphyr::from_str::<Recipe>(
+            "name: custom\nsteps:\n  -\n  - null\n  - action: open\n",
+        )
+        .unwrap();
+        assert_eq!(recipe.steps.len(), 3);
+        assert!(recipe.steps[0].action.is_none());
+        assert!(recipe.steps[1].action.is_none());
+        assert_eq!(recipe.steps[2].action.as_deref(), Some("open"));
+    }
+
+    #[test]
+    fn recipe_yaml_still_requires_steps_with_sequence_shape() {
+        let missing = serde_saphyr::from_str::<Recipe>("name: custom\n").unwrap_err();
+        assert!(missing.to_string().contains("missing field `steps`"));
+        for steps in ["steps: {}", "steps: \"\"", "steps: [42]"] {
+            assert!(serde_saphyr::from_str::<Recipe>(&format!("name: custom\n{steps}\n")).is_err());
+        }
     }
 
     #[test]
