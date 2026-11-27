@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 - Document Gemini 4 Neon setup and text requests through the direct Gemini API in the Yoetz skill.
+- Add a local structural capture helper for the Gemini web chooser and empty composer.
 
 ### Changed
 - Update the browser recipe YAML parser to `serde-saphyr` 2.1.1 while preserving existing empty-step syntax.

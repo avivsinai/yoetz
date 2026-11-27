@@ -7,6 +7,7 @@ of truth for flags.
 ## Contents
 
 - [Built-in recipes](#built-in-recipes)
+- [Gemini web adapter evidence](#gemini-web-adapter-evidence)
 - [Transport selection](#transport-selection)
 - [Native extension setup](#native-extension-setup)
 - [CDP setup](#cdp-setup)
@@ -31,6 +32,36 @@ untouched for picker-drift diagnosis; do not use it for routine runs.
 A recipe can also be a path (`--recipe ./my-recipes/custom.yaml`). The bundled
 `gemini` recipe is legacy: a minimal `agent-browser` sequence without the typed
 fail-closed contract.
+
+## Gemini web adapter evidence
+
+Collect evidence from a blank `https://gemini.google.com` tab in the intended
+Chrome profile’s existing signed-in session. Keep the composer empty and the
+current model and effort selected.
+
+1. From a Yoetz checkout, print the two local DevTools snippets.
+
+   ```bash
+   node scripts/capture-gemini-surface.mjs chooser
+   node scripts/capture-gemini-surface.mjs composer
+   ```
+
+2. Open the model chooser without selecting a row. In DevTools **Elements**
+   select the narrow element containing its choices. Run the `chooser`
+   snippet in the top-level **Console** of the same tab. It copies a bounded
+   JSON tree of that selection to the clipboard.
+3. Transcribe only the model and effort labels shown by the trigger and the
+   currently selected row, including any checked or disabled state. Record
+   when the UI gives no selected-state evidence. Leave the choice as it was.
+4. Dismiss the chooser. In **Elements** select the smallest empty composer
+   subtree containing the text control and Send button, then run the `composer`
+   snippet. Share only the two reviewed JSON outputs and the model and effort
+   transcription. The snippets omit page text, input values, URLs, IDs, and
+   arbitrary attribute values.
+
+Gemini native recipe support is pending verified signed-in evidence. Web
+picker labels describe the model and effort available in that session.
+`gemini-4-neon` is a [Developer API model ID](gemini-neon.md).
 
 ## Transport selection
 

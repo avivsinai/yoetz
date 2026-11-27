@@ -275,6 +275,8 @@ recipe selects the `Latest` family at the `Pro` tier; the `claude` recipe
 selects Fable 5 with Effort Max. Both fail closed: if Yoetz cannot prove the
 requested model is selected, it stops instead of downgrading. The bundled
 `gemini` recipe is a legacy `agent-browser` sequence without that contract.
+For native Gemini adapter work, see the
+[signed-in fixture capture guide](skills/yoetz/references/browser.md#gemini-web-adapter-evidence).
 
 ```bash
 yoetz browser check --format json
