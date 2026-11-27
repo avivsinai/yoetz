@@ -958,6 +958,10 @@ async function completeModelSelection(job, tabId, attempt, options = {}, continu
     return;
   }
 
+  if (adapter.recipe === "chatgpt" && modelSelection.status === "selected"
+    && modelSelection.verified_effort_label === "6 Pro") {
+    job.verified_six_pro = true;
+  }
   await maybeGroupTab(tabId, job);
   if (staleSelectionAttempt(job, attempt, continuationEpoch)) {
     return;

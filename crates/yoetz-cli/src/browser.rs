@@ -570,6 +570,7 @@ fn run_recipe_with_connection(
     let mut pending_chatgpt_send_baseline: Option<ChatgptResponseBaseline> = None;
     let mut pending_claude_send_baseline: Option<ClaudeResponseBaseline> = None;
     let mut chatgpt_surface_evidence_seen = false;
+    let mut chatgpt_verified_six_pro = false;
     let mut chatgpt_stage = ChatgptRecipeStage::Idle;
     let mut claude_stage = ClaudeRecipeStage::Idle;
     let mut chatgpt_focus_cache = ChatgptRunTabFocusCache::default();
@@ -719,6 +720,7 @@ fn run_recipe_with_connection(
             if let Some(selection) = parse_stdout_json(&stdout) {
                 chatgpt_surface_evidence_seen =
                     chatgpt_surface_evidence_seen || selection_surface_evidence_seen(&selection);
+                chatgpt_verified_six_pro |= selection["verified_six_pro"] == true;
             }
 
             if wants_json || wants_jsonl {
@@ -813,6 +815,7 @@ fn run_recipe_with_connection(
                 ctx.use_stealth,
                 headed,
                 chatgpt_surface_evidence_seen,
+                chatgpt_verified_six_pro,
             )
             .with_chatgpt_phase(chatgpt_recipe::ChatgptTransportPhase::Send)
             .with_context(|| format!("recipe step {idx} ({action}) failed"))?;
@@ -2105,6 +2108,7 @@ fn run_chatgpt_select_model_with_surface_evidence(
                 "model_used": model_used,
                 "model_selection_status": model_selection_status,
                 "surface_evidence_seen": selection_surface_evidence_seen(&selection),
+                "verified_six_pro": chatgpt_web::selection_verified_six_pro(&selection),
             })
             .to_string())
         }
@@ -2397,9 +2401,11 @@ fn run_chatgpt_send(
     use_stealth: bool,
     headed: bool,
     prior_surface_evidence_seen: bool,
+    prior_verified_six_pro: bool,
 ) -> Result<String> {
     let started_at = Instant::now();
     let mut surface_evidence_seen = prior_surface_evidence_seen;
+    let mut verified_six_pro = prior_verified_six_pro;
 
     loop {
         let expression = chatgpt_web::wrap_function_source_for_json_eval(
@@ -2407,6 +2413,7 @@ fn run_chatgpt_send(
                 requested_model,
                 model_strategy,
                 surface_evidence_seen,
+                verified_six_pro,
             ),
         )?;
         let stdout = run_agent_browser_with_connection_timeout(
@@ -2424,6 +2431,9 @@ fn run_chatgpt_send(
                 .get("surfaceEvidenceSeen")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+        verified_six_pro |= ["finalModelSelection", "modelSelection"]
+            .iter()
+            .any(|key| chatgpt_web::selection_verified_six_pro(&result[key]));
         match result
             .get("status")
             .and_then(Value::as_str)

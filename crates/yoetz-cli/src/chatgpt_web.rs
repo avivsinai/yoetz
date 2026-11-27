@@ -398,6 +398,16 @@ pub fn upload_menu_text_pattern_json() -> String {
     serde_json::to_string(UPLOAD_MENU_TEXT_PATTERN).expect("serialize upload menu text pattern")
 }
 
+const JS_PRO_PILL_EFFORT_CHECK: &str = r#"
+  function pillConfirmsEffortLabel(pillText, effortLabel) {
+    const pill = fold(pillText);
+    const effort = fold(effortLabel);
+    // A checked "6 Pro" row identifies the version as well as the effort.
+    if (effort === "6 pro") return /^(?:(?:latest|gpt[- ]?6) )?(?:6 )?pro$/.test(pill);
+    return effort === "pro" && (pill === "pro" || pill.endsWith(" pro"));
+  }
+"#;
+
 pub fn build_model_selection_function(
     requested_model: &str,
     model_strategy: ChatgptModelStrategy,
@@ -417,7 +427,7 @@ pub fn build_model_selection_function_with_surface_evidence(
     let composer_selector = composer_selector_json();
     format!(
         r##"
-async () => {{
+async (priorVerifiedSixPro = false) => {{
   const requested = {requested_model};
   const strategy = {model_strategy};
   const supported = "gpt-6-pro-chat";
@@ -429,11 +439,16 @@ async () => {{
   const SURFACE_REQUIRED_STABLE_OBSERVATIONS = 2;
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const fold = (value) => normalize(value).toLowerCase();
+{pro_pill_effort_check}
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const textOf = (node) => normalize(node?.innerText || node?.textContent || "");
   // The September 2026 unified picker labels effort tier rows through
   // aria-label with no text content; accept either when reading a label.
   const optionLabel = (item) => normalize(textOf(item) || item?.getAttribute?.("aria-label") || "");
+  // ChatGPT's Latest picker labels GPT-6 Pro as "6 Pro".
+  const isChatProEffortLabel = (value) => ["pro", "6 pro"].includes(fold(value));
+  const isEnabledEffortOption = (item) => Boolean(item) && !item.disabled
+    && item.getAttribute("aria-disabled") !== "true" && !item.hasAttribute("data-disabled");
   // Family-option filter (mirrors the native reader): "Latest" is the GPT-6
   // Chat family radio; Sol/5.5 rows stay family options so they are never
   // read as effort. Without this the effort tier rows (siblings of the family
@@ -669,9 +684,8 @@ async () => {{
 
   function mainMenu() {{
     return visibleMenus().find((menu) => {{
-      const labels = radios(menu).map((item) => fold(textOf(item)));
-      return labels.includes("medium") && labels.includes("high")
-        && (labels.includes("pro"));
+      const labels = radios(menu).map((item) => fold(optionLabel(item)));
+      return labels.includes("medium") && labels.includes("high") && labels.some(isChatProEffortLabel);
     }}) || null;
   }}
 
@@ -1031,12 +1045,9 @@ async () => {{
         && pickerSurfaceIsOpen(surface)
         && isVisible(surface)
         && !looksLikePersonal(surface));
-    const matches = candidates.map((surface) => ({{
-      surface,
-      options: Array.from(surface.querySelectorAll("[role='menuitemradio'], [role='menuitem']"))
-        .filter((item) => isVisible(item) && fold(textOf(item)) === "pro")
-    }})).filter((entry) => entry.options.length === 1);
-    return matches.length === 1 ? matches[0].options[0] : null;
+    const options = candidates.flatMap((surface) => Array.from(surface.querySelectorAll("[role='menuitemradio'], [role='menuitem']"))
+      .filter((item) => isVisible(item) && isEnabledEffortOption(item) && isChatProEffortLabel(optionLabel(item))));
+    return options.length === 1 ? options[0] : null;
   }}
 
   async function waitForPersonalEffortOption(state) {{
@@ -1049,6 +1060,7 @@ async () => {{
   }}
 
   async function selectPersonal(pill, state) {{
+    let observedSixPro = fold(selectedEffortLabel(state)) === "6 pro";
     let familyProof = await readPersonalFamilyProof(state);
     if (!familyProof.ok) {{
       if (familyProof.checkedItems.length !== 1 || !familyProof.latest) {{
@@ -1060,6 +1072,7 @@ async () => {{
       pill = await waitForPill();
       state = await openPersonal(pill);
       if (!state) return result("selection-mismatch", pill, null, familyProof.families, "personal picker did not reopen after selecting Latest");
+      observedSixPro = fold(selectedEffortLabel(state)) === "6 pro";
       familyProof = await readPersonalFamilyProof(state);
       if (!familyProof.ok) {{
         await closeMenus(pill);
@@ -1072,6 +1085,7 @@ async () => {{
       state = readPersonalState(await openPersonal(pill));
       if (!state) return result("selection-mismatch", pill, null, familyProof.families, "ChatGPT personal picker did not reopen before effort selection");
     }}
+    observedSixPro ||= fold(selectedEffortLabel(state)) === "6 pro";
     if (!effortVerified(state)) {{
       realClick(state.effortRow);
       await wait(250);
@@ -1080,6 +1094,7 @@ async () => {{
         await closeMenus(pill);
         return result("not-found", pill, state, familyProof.families, "Pro was not visible as a Latest effort tier");
       }}
+      observedSixPro ||= fold(optionLabel(proOption)) === "6 pro";
       realClick(proOption);
       await wait(250);
       pill = await waitForPill();
@@ -1093,7 +1108,7 @@ async () => {{
     }}
     state.familyLabel = familyProof.checkedItems.length === 1 ? textOf(familyProof.checkedItems[0]) : state.familyLabel;
     state.familyProof = true;
-    state.verifiedEffortDisplay = "Pro";
+    state.observedSixPro = observedSixPro || fold(selectedEffortLabel(state)) === "6 pro";
     if (!await closeMenus(pill, state, {{ requireProPill: true }})) {{
       return result("selection-mismatch", pill, state, familyProof.families, "ChatGPT personal picker or closed composer model pill failed verification");
     }}
@@ -1354,6 +1369,7 @@ async () => {{
   }}
 
   async function reverifyAfterClose(pill, selectedState) {{
+    const initialEffortLabel = verifiedEffortLabel(selectedState);
     let reopened = null;
     let reopenedState = null;
     if (selectedState?.shape === "personal") {{
@@ -1400,6 +1416,7 @@ async () => {{
         postCloseClosedPillText: null
       }});
     }}
+    const reopenedEffortLabel = verifiedEffortLabel(reopenedState);
     const familyProof = reopenedState.shape === "personal"
       ? await readPersonalFamilyProof(reopenedState)
       : reopenedState.shape === "slider"
@@ -1413,9 +1430,11 @@ async () => {{
     const familyStatus = familyProof.ok ? "verified" : "unverified";
     const verifiedState = familyProof.state || reopenedState;
     const effortStatus = effortVerified(verifiedState) ? "verified" : "unverified";
+    const effortLabel = effortStatus === "verified" && (initialEffortLabel === "6 Pro" || reopenedEffortLabel === "6 Pro")
+      ? "6 Pro" : verifiedEffortLabel(verifiedState);
     const closed = await closeMenus(pill, verifiedState, {{ requireProPill: true }});
     pill = await waitForPill();
-    const closedPill = closedPillDiagnostics(pill, verifiedState);
+    const closedPill = closedPillDiagnostics(pill, verifiedState, effortLabel);
     return recordPostCloseVerification({{
       ok: familyStatus === "verified"
         && effortStatus === "verified"
@@ -1424,6 +1443,7 @@ async () => {{
         && closedPill.closedPillFamilyStatus !== "unverified",
       postCloseFamilyStatus: familyStatus,
       postCloseEffortStatus: effortStatus,
+      postCloseVerifiedEffortLabel: effortLabel,
       postClosePickerShape: verifiedState.shape || null,
       postClosePickerCloseVerification: pickerCloseVerification,
       postCloseClosedPillFamilyStatus: closedPill.closedPillFamilyStatus,
@@ -1436,23 +1456,26 @@ async () => {{
     return state?.familyProof === true && fold(state?.familyLabel) === "latest";
   }}
 
+  function selectedEffortLabel(state) {{
+    if (state?.shape === "slider") return state.verifiedEffortDisplay;
+    if (state?.shape === "personal") return isEnabledEffortOption(state.effortRow) ? state.effortLabel : null;
+    const checked = state?.effortItems?.find(isChecked);
+    return isEnabledEffortOption(checked) ? optionLabel(checked) : null;
+  }}
+
   function effortVerified(state) {{
-    if (state?.shape === "slider") return fold(state?.verifiedEffortDisplay) === "pro";
-    if (state?.shape === "personal") return fold(state?.effortLabel) === "pro";
-    const items = state?.effortItems || [];
-    const checked = items.find((item) => isChecked(item));
-    const checkedLabel = checked ? fold(textOf(checked)) : null;
-    return checkedLabel === "pro";
+    const label = selectedEffortLabel(state);
+    return state?.shape === "slider" ? fold(label) === "pro" : isChatProEffortLabel(label);
+  }}
+
+  function verifiedEffortLabel(state) {{
+    const label = selectedEffortLabel(state);
+    const versioned = priorVerifiedSixPro === true || state?.observedSixPro === true || fold(label) === "6 pro";
+    return isChatProEffortLabel(label) && versioned ? "6 Pro" : label;
   }}
 
   function supportedPickerShape(state) {{
     return state?.shape === "menu" || state?.shape === "slider" || state?.shape === "personal";
-  }}
-
-  function pillConfirmsEffortLabel(pillText, effortLabel) {{
-    const foldedPill = fold(pillText).replace(/\s+/g, " ");
-    const foldedEffort = fold(effortLabel).replace(/\s+/g, " ");
-    return foldedEffort === "pro" && (foldedPill === "pro" || foldedPill.endsWith(" pro"));
   }}
 
   function foldFamilyLabel(value) {{
@@ -1475,11 +1498,9 @@ async () => {{
       || /\b\d+(?:\.\d+)+\b/.test(foldedPill);
   }}
 
-  function closedPillDiagnostics(pill, state) {{
+  function closedPillDiagnostics(pill, state, effortLabel = verifiedEffortLabel(state)) {{
     const pillText = pill ? textOf(pill) : "";
     const familyLabel = state?.familyLabel || "";
-    const effortLabel = state?.verifiedEffortDisplay
-      || textOf(state?.effortItems?.find((item) => fold(textOf(item)) === "pro"));
     const closedPillFamilyStatus = pillText && familyLabel
       ? pillConfirmsFamilyLabel(pillText, familyLabel)
         ? "verified"
@@ -1506,7 +1527,8 @@ async () => {{
   }};
 
   function result(status, pill, state, families, warning = null) {{
-    const closedPill = closedPillDiagnostics(pill, state);
+    const effortLabel = postCloseVerification.postCloseVerifiedEffortLabel ?? verifiedEffortLabel(state);
+    const closedPill = closedPillDiagnostics(pill, state, effortLabel);
     const pickerShapeIsSupported = supportedPickerShape(state);
     const pickerFamilyIsVerified = pickerShapeIsSupported && familyVerified(state);
     const pickerEffortIsVerified = pickerShapeIsSupported && effortVerified(state);
@@ -1529,18 +1551,9 @@ async () => {{
       && closedPill.closedPillFamilyStatus !== "unverified"
       && familyCorroborated;
     const effortIsVerified = pickerEffortIsVerified && closedPill.closedPillEffortStatus !== "unverified";
-    const items = state?.effortItems || [];
-    const checked = items.find((item) => isChecked(item));
-    const checkedLabel = checked ? fold(textOf(checked)) : null;
-    const verifiedEffort = checked && checkedLabel === "pro" ? textOf(checked) : null;
-    const verifiedEffortDisplay = state?.shape === "slider"
-      ? state?.verifiedEffortDisplay
-      : state?.shape === "personal" ? state?.effortLabel : verifiedEffort;
     const modelUsed = resultStatus === "current"
       ? (pill ? textOf(pill) : "")
-      : (resultStatus === "selected" && familyIsVerified && effortIsVerified && verifiedEffortDisplay
-        ? `Latest ${{verifiedEffortDisplay}}`
-        : null);
+      : (resultStatus === "selected" && familyIsVerified && effortIsVerified ? "Latest Pro" : null);
     return {{
       requested,
       status: resultStatus,
@@ -1549,6 +1562,7 @@ async () => {{
       effortStatus: effortIsVerified ? "verified" : "unverified",
       pickerFamilyStatus: pickerFamilyIsVerified ? "verified" : "unverified",
       pickerEffortStatus: pickerEffortIsVerified ? "verified" : "unverified",
+      verifiedEffortLabel: effortLabel,
       ...closedPill,
       ...postCloseVerification,
       pickerShape: state?.shape || null,
@@ -1640,6 +1654,7 @@ async () => {{
     return result("not-found", pill, null, families, "ChatGPT model picker did not open");
   }}
 
+  let observedSixPro = fold(selectedEffortLabel(state)) === "6 pro";
   let familyProof = await readFamilyProof(state);
   families = familyProof.families;
   if (!familyProof.ok) {{
@@ -1666,6 +1681,7 @@ async () => {{
     menu = await openMain(pill);
     state = menu ? readState(menu) : null;
     if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting Latest");
+    observedSixPro = fold(selectedEffortLabel(state)) === "6 pro";
     familyProof = await readFamilyProof(state);
     families = familyProof.families.length > 0 ? familyProof.families : families;
     if (!familyProof.ok) {{
@@ -1673,13 +1689,16 @@ async () => {{
       return result("selection-mismatch", pill, state, families, "Latest family menu selection could not be verified");
     }}
   }}
+  observedSixPro ||= fold(selectedEffortLabel(state)) === "6 pro";
   if (!effortVerified(state)) {{
-    const proTier = state.effortItems.find((item) => fold(textOf(item)) === "pro") || null;
-    if (!proTier) {{
+    const proTiers = state.effortItems.filter((item) => isEnabledEffortOption(item) && isChatProEffortLabel(optionLabel(item)));
+    if (proTiers.length !== 1) {{
       await closeMenus(pill);
       return result("not-found", pill, state, families, "Pro was not visible as a Latest effort tier");
     }}
-    realClick(proTier);
+    // Retain the option label before the radio is replaced.
+    observedSixPro ||= fold(optionLabel(proTiers[0])) === "6 pro";
+    realClick(proTiers[0]);
     await wait(250);
     pill = await waitForPill();
     if (!pill) return result("selection-mismatch", null, null, families, "ChatGPT composer model pill did not remount after selecting Pro effort");
@@ -1688,6 +1707,7 @@ async () => {{
     if (!state) return result("selection-mismatch", pill, null, families, "picker did not reopen after selecting Pro effort");
   }}
 
+  observedSixPro ||= fold(selectedEffortLabel(state)) === "6 pro";
   familyProof = await readFamilyProof(state);
   families = familyProof.families.length > 0 ? familyProof.families : families;
   if (!familyProof.ok) {{
@@ -1700,9 +1720,11 @@ async () => {{
     await closeMenus(pill);
     return result("selection-mismatch", pill, state, families, "Latest at verified Pro effort could not be confirmed in one picker pass");
   }}
+  state.observedSixPro = observedSixPro || fold(selectedEffortLabel(state)) === "6 pro";
   if (!await closeMenus(pill, state, {{ requireProPill: true }})) {{
     return result("selection-mismatch", pill, state, families, "ChatGPT model picker remained open after verification");
   }}
+  pill = await waitForPill();
   const closedPill = closedPillDiagnostics(pill, state);
   if (closedPill.closedPillFamilyStatus === "unverified") {{
     return result("selection-mismatch", pill, state, families, "ChatGPT composer model pill reported another model family after closing the picker");
@@ -1723,6 +1745,7 @@ async () => {{
         model_button_selector = model_button_selector,
         composer_selector = composer_selector,
         visibility_helpers = JS_VISIBILITY_HELPERS,
+        pro_pill_effort_check = JS_PRO_PILL_EFFORT_CHECK,
         prior_surface_evidence_seen = prior_surface_evidence_seen,
     )
 }
@@ -2222,13 +2245,19 @@ pub fn build_send_button_click_function_with_model_selection(
         "gpt-6-pro-chat",
         ChatgptModelStrategy::Select,
         surface_evidence_seen,
+        false,
     )
+}
+
+pub(crate) fn selection_verified_six_pro(selection: &serde_json::Value) -> bool {
+    selection["status"] == "selected" && selection["verifiedEffortLabel"] == "6 Pro"
 }
 
 pub fn build_send_button_click_function_with_model_selection_for(
     requested_model: &str,
     model_strategy: ChatgptModelStrategy,
     surface_evidence_seen: bool,
+    prior_verified_six_pro: bool,
 ) -> String {
     let model_source = build_model_selection_function_with_surface_evidence(
         requested_model,
@@ -2252,7 +2281,7 @@ async () => {{
 {visibility_helpers}
 {composer_scope_helpers}
   const modelFn = eval("(" + {model_source_json} + ")");
-  const selection = await modelFn();
+  const selection = await modelFn({prior_verified_six_pro});
   const requestedModel = {requested_model_json};
   const modelStrategy = {model_strategy_json};
   const supportedShapes = new Set(["menu", "slider", "personal"]);
@@ -2292,6 +2321,7 @@ async () => {{
   }}
   const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
   const fold = (value) => normalize(value).toLowerCase();
+{pro_pill_effort_check}
   const pillLabel = (node) => normalize([
     node?.innerText,
     node?.textContent,
@@ -2314,10 +2344,6 @@ async () => {{
       const foldedLine = foldFamilyLabel(line);
       return foldedLine === foldedFamily || foldedLine.startsWith(`${{foldedFamily}} `);
     }});
-  }};
-  const pillConfirmsEffortLabel = (pillText) => {{
-    const foldedPill = fold(pillText).replace(/\s+/g, " ");
-    return foldedPill === "pro" || foldedPill.endsWith(" pro");
   }};
   const findCurrentModelPill = () => {{
     const {{ roots }} = getComposerScope();
@@ -2348,15 +2374,28 @@ async () => {{
       || null;
   }};
   const currentPill = findCurrentModelPill();
-  const currentPillText = currentPill ? pillLabel(currentPill) : "";
-  const currentPillHasFamily = pillHasModelFamilyToken(currentPillText);
+  const fullPillLabel = currentPill ? pillLabel(currentPill) : "";
+  // Compare the same visible text the picker used, without counting
+  // innerText and textContent twice or mixing in the control's metadata.
+  const currentPillText = modelStrategy === "current" ? fullPillLabel
+    : normalize(currentPill?.innerText || currentPill?.textContent);
+  const capsule = fold(currentPillText);
+  const capsuleMatches = Boolean(capsule) && (
+    (selection?.closedPillEffortStatus === "verified" && fold(selection?.closedPillText) === capsule)
+    || (selection?.postCloseFamilyStatus === "verified"
+      && selection?.postCloseEffortStatus === "verified"
+      && selection?.postCloseClosedPillFamilyStatus !== "unverified"
+      && selection?.postCloseClosedPillEffortStatus === "verified"
+      && fold(selection?.postCloseClosedPillText) === capsule)
+  );
+  const currentPillHasFamily = pillHasModelFamilyToken(fullPillLabel);
   const currentPillFamilyStatus = currentPillHasFamily
-    ? pillConfirmsFamilyLabel(currentPillText, selection?.familyLabel)
+    ? pillConfirmsFamilyLabel(fullPillLabel, selection?.familyLabel)
       ? "verified"
       : "unverified"
-    : (selection?.closedPillFamilyStatus === "verified"
-      || selection?.postCloseFamilyStatus === "verified" ? "verified" : "unverified");
-  const currentPillEffortStatus = pillConfirmsEffortLabel(currentPillText)
+    : (familyCorroborated && capsuleMatches ? "verified" : "unverified");
+  const currentPillEffortStatus = pillConfirmsEffortLabel(fullPillLabel, "Pro")
+    && (modelStrategy === "current" || pillConfirmsEffortLabel(currentPillText, selection?.verifiedEffortLabel))
     ? "verified"
     : "unverified";
   const finalModelProof = modelStrategy === "current"
@@ -2420,6 +2459,8 @@ async () => {{
         model_strategy_json = model_strategy_json,
         visibility_helpers = JS_VISIBILITY_HELPERS,
         composer_scope_helpers = JS_COMPOSER_SCOPE_HELPERS,
+        pro_pill_effort_check = JS_PRO_PILL_EFFORT_CHECK,
+        prior_verified_six_pro = prior_verified_six_pro,
     )
 }
 
@@ -3396,12 +3437,13 @@ mod tests {
         assert!(script.contains("async function closeMenus(pill, state = null"));
         assert!(script.contains("dispatchHoverLeaveEvents"));
         assert!(script.contains("pickerCloseMethod"));
-        assert!(script.contains("function closedPillDiagnostics(pill, state)"));
+        assert!(script.contains("function closedPillDiagnostics(pill, state, effortLabel"));
         assert!(script.contains("closedPillFamilyStatus"));
         assert!(script.contains("closedPillEffortStatus"));
         // Ladder-aware effortVerified (yz-7p3.3 finding D): the verified set now
         // requires the visible Pro effort tier.
-        assert!(script.contains("return checkedLabel === \"pro\";"));
+        assert!(script.contains(r#"["pro", "6 pro"].includes(fold(value))"#));
+        assert!(script.contains("verifiedEffortLabel: effortLabel"));
         assert!(!script.contains(r#"fold(textOf(item)) === "max""#));
         assert!(script.contains("Pro was not visible as a Latest effort tier"));
         assert!(script.contains("Latest at verified Pro effort could not be confirmed"));
@@ -3465,7 +3507,7 @@ mod tests {
     #[test]
     fn send_click_binds_model_proof_to_the_actual_click() {
         let script = build_send_button_click_function_with_model_selection(false);
-        assert!(script.contains("const selection = await modelFn();"));
+        assert!(script.contains("const selection = await modelFn(false);"));
         assert!(script.contains("const selectedProofOk ="));
         assert!(script.contains("const modelProofOk = selectedProofOk || currentProofOk;"));
         assert!(script.contains("if (!modelProofOk)"));
@@ -3484,6 +3526,7 @@ mod tests {
             "current",
             ChatgptModelStrategy::Current,
             true,
+            false,
         );
         assert!(current.contains("const modelStrategy = \"current\";"));
         assert!(current.contains("const currentProofOk = modelStrategy === \"current\""));
@@ -4215,6 +4258,7 @@ mod tests {
                 "current",
                 ChatgptModelStrategy::Current,
                 false,
+                false,
             ),
         )?;
         assert_eq!(result["status"], "sent", "{result}");
@@ -4230,18 +4274,30 @@ mod tests {
     #[test]
     #[ignore = "requires Chrome"]
     #[serial]
-    fn fake_chatgpt_fixture_selects_personal_picker_pro() -> anyhow::Result<()> {
+    fn fake_chatgpt_fixture_preserves_versioned_pro_evidence() -> anyhow::Result<()> {
+        for shape in ["menu", "personal"] {
+            check_versioned_pro_picker_fixture(shape)?;
+        }
+        Ok(())
+    }
+
+    fn check_versioned_pro_picker_fixture(shape: &str) -> anyhow::Result<()> {
         let (_browser, tab) = launch_fake_chatgpt_fixture()?;
+        tab.evaluate(&format!("window.fixturePickerShape = {shape:?};"), true)?;
         tab.evaluate(
             r##"(() => {
+              const personal = window.fixturePickerShape === "personal";
               const form = document.querySelector("#chat-form");
               const pill = document.createElement("button");
+              pill.type = "button";
               pill.className = "__composer-pill";
               pill.setAttribute("aria-haspopup", "menu");
               pill.textContent = "High";
               let picker = null;
               let familyMenu = null;
               let effortMenu = null;
+              let closedProLabel = "6 Pro";
+              let proSelected = false;
               const remove = (node) => {
                 if (!node) return;
                 node.remove();
@@ -4268,20 +4324,29 @@ mod tests {
                 }
                 document.body.appendChild(familyMenu);
               };
+              const radio = (label, checked) => {
+                const item = document.createElement("div");
+                item.setAttribute("role", "menuitemradio");
+                item.setAttribute("aria-checked", String(checked));
+                item.textContent = label;
+                return item;
+              };
+              const proRadio = () => {
+                const pro = radio(proSelected ? "Pro" : "6 Pro", proSelected);
+                pro.addEventListener("click", () => {
+                  proSelected = true;
+                  effort.textContent = "Effort Pro";
+                  pill.textContent = closedProLabel;
+                  if (personal) remove(effortMenu);
+                  else close();
+                });
+                return pro;
+              };
               const openEffort = () => {
                 remove(effortMenu);
                 effortMenu = document.createElement("div");
                 effortMenu.setAttribute("role", "menu");
-                const pro = document.createElement("div");
-                pro.setAttribute("role", "menuitemradio");
-                pro.setAttribute("aria-checked", "false");
-                pro.textContent = "Pro";
-                pro.addEventListener("click", () => {
-                  effort.textContent = "Effort Pro";
-                  pill.textContent = "Pro";
-                  remove(effortMenu);
-                });
-                effortMenu.appendChild(pro);
+                effortMenu.appendChild(proRadio());
                 document.body.appendChild(effortMenu);
               };
               const family = document.createElement("div");
@@ -4293,11 +4358,21 @@ mod tests {
               effort.setAttribute("role", "menuitem");
               effort.textContent = "Effort High";
               effort.addEventListener("pointerdown", openEffort);
+              window.fixtureResetEffort = (label = "6 Pro") => {
+                proSelected = false;
+                effort.textContent = "Effort High";
+                pill.textContent = "High";
+                closedProLabel = label;
+              };
               pill.addEventListener("pointerdown", () => {
                 picker = document.createElement("div");
-                picker.setAttribute("role", "dialog");
-                picker.textContent = "Faster Smarter Model Latest Effort High Speed Standard";
-                picker.append(family, effort);
+                picker.setAttribute("role", personal ? "dialog" : "menu");
+                if (personal) {
+                  picker.textContent = "Faster Smarter Model Latest Effort High Speed Standard";
+                  picker.append(family, effort);
+                } else {
+                  picker.append(radio("Medium", false), radio("High", !proSelected), proRadio(), family);
+                }
                 document.body.appendChild(picker);
                 pill.setAttribute("aria-expanded", "true");
                 pill.setAttribute("data-state", "open");
@@ -4317,9 +4392,94 @@ mod tests {
         )?;
         assert_eq!(selection["status"], "selected", "{selection}");
         assert_eq!(selection["modelUsed"], "Latest Pro");
-        assert_eq!(selection["pickerShape"], "personal");
+        assert_eq!(selection["pickerShape"], shape);
         assert_eq!(selection["familyStatus"], "verified");
         assert_eq!(selection["effortStatus"], "verified");
+        assert_eq!(selection["closedPillText"], "6 Pro");
+        assert_eq!(selection["postCloseFamilyStatus"], "verified");
+        assert_eq!(selection["postCloseEffortStatus"], "verified");
+        assert!(selection_verified_six_pro(&selection));
+
+        let select = build_model_selection_function("gpt-6-pro-chat", ChatgptModelStrategy::Select);
+        for alias in ["Pro", "Latest Pro"] {
+            tab.evaluate(&format!("window.fixtureResetEffort({alias:?})"), true)?;
+            let compatible = eval_fixture_function(&tab, &select)?;
+            assert_eq!(compatible["closedPillText"], alias);
+            assert!(
+                selection_verified_six_pro(&compatible),
+                "{shape}: {compatible}"
+            );
+        }
+
+        let send = build_send_button_click_function_with_model_selection(false);
+        let before_pill_read = "  const currentPill = findCurrentModelPill();";
+        assert!(send.contains(before_pill_read));
+        for drifted_label in ["6.2 Pro", "7 Pro"] {
+            let label = serde_json::to_string(drifted_label)?;
+            let change_pill =
+                format!("document.querySelector('.__composer-pill').textContent = {label};");
+            tab.evaluate(&format!("window.fixtureResetEffort({label})"), true)?;
+            let mismatched = eval_fixture_function(&tab, &select)?;
+            assert_eq!(mismatched["closedPillText"], drifted_label);
+            assert_eq!(
+                mismatched["status"], "selection-mismatch",
+                "{shape}: {mismatched}"
+            );
+            assert_eq!(
+                mismatched["closedPillEffortStatus"], "unverified",
+                "{shape}: {mismatched}"
+            );
+
+            tab.evaluate("window.fixtureResetEffort()", true)?;
+            // Simulate a page update after the real picker verification, just
+            // before the real send guard reads the closed composer pill.
+            let drifted_send = send.replacen(
+                before_pill_read,
+                &format!("  {change_pill}\n{before_pill_read}"),
+                1,
+            );
+            let refused = eval_fixture_function(&tab, &drifted_send)?;
+            assert_eq!(refused["status"], "model-not-ready", "{refused}");
+            assert_eq!(
+                refused["modelSelection"]["status"], "selected",
+                "{shape}: {refused}"
+            );
+            assert_eq!(
+                refused["modelSelection"]["currentClosedPillEffortStatus"], "unverified",
+                "{shape}: {refused}"
+            );
+            tab.evaluate("window.fixtureResetEffort()", true)?;
+        }
+
+        // A later pass sees the generic Pro summary without clicking a tier.
+        let verified = eval_fixture_function(&tab, &select)?;
+        assert!(selection_verified_six_pro(&verified));
+        let send_with_prior = build_send_button_click_function_with_model_selection_for(
+            "gpt-6-pro-chat",
+            ChatgptModelStrategy::Select,
+            false,
+            selection_verified_six_pro(&verified),
+        );
+        tab.evaluate(
+            "document.querySelector('.__composer-pill').textContent = '7 Pro';",
+            true,
+        )?;
+        let refused = eval_fixture_function(&tab, &send_with_prior)?;
+        assert_eq!(refused["status"], "model-not-ready", "{refused}");
+        assert_eq!(
+            refused["modelSelection"]["status"], "selection-mismatch",
+            "{refused}"
+        );
+
+        tab.evaluate(
+            "document.querySelector('.__composer-pill').textContent = '6 Pro';",
+            true,
+        )?;
+        tab.evaluate("window.fixtureMarkUploadDone()", true)?;
+        let sent = eval_fixture_function(&tab, &send_with_prior)?;
+        assert_eq!(sent["status"], "sent", "{sent}");
+        let receipt = canonical_chatgpt_final_model_selection(&sent["finalModelSelection"]);
+        validate_chatgpt_final_model_selection(&receipt, ChatgptModelStrategy::Select)?;
         Ok(())
     }
 
