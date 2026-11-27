@@ -136,6 +136,10 @@ approve it.
 Use the provider that matches the user's key: with only `OPENAI_API_KEY`, use
 `--provider openai` and an OpenAI-family ID.
 
+**Gemini 4 Neon.** For text requests with the paid Gemini API, use
+`--provider gemini` and resolve the exact model in the registry. Follow the
+[Neon setup](references/gemini-neon.md) if the bundled catalog lacks it.
+
 **Cursor.** Resolve the exact installed model from `cursor-agent models`, not
 the registry, and fail if the match is not unique:
 
