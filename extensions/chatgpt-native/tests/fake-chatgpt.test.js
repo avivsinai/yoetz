@@ -2853,6 +2853,7 @@ test("ChatGPT model selection reports Latest Pro when the family radio reads GPT
   const fixture = makeLatestPickerFixture({
     family: "GPT-6",
     effort: "Pro",
+    proLabel: "6 Pro",
     families: ["GPT-6", "GPT-5.6 Sol", "GPT-5.5"]
   });
 
@@ -2860,6 +2861,8 @@ test("ChatGPT model selection reports Latest Pro when the family radio reads GPT
 
   assert.equal(result.status, "selected", JSON.stringify(result));
   assert.equal(result.model_used, "Latest Pro");
+  assert.equal(result.closed_pill_text, "Pro");
+  assert.equal(verifyChatgptModelSelectionBeforeSend(fixture.doc, result).ok, true);
 });
 
 // The label is documented by OpenAI; the menu uses the synthetic picker fixture.
@@ -2878,8 +2881,56 @@ test("ChatGPT selects the documented 6 Pro row under Latest and verifies the sen
   assert.equal(selection.closed_pill_text, "6\nPro");
   assert.equal(selection.post_close_family_status, "verified");
   assert.equal(selection.post_close_effort_status, "verified");
+  fixture.pill.innerText = fixture.pill.textContent = "6 Pro";
   assert.equal(verifyChatgptModelSelectionBeforeSend(fixture.doc, selection).ok, true);
 });
+
+test("ChatGPT accepts an explicit Latest Pro pill with a checked 6 Pro tier", async () => {
+  const fixture = makeLatestPickerFixture({
+    family: "Latest",
+    effort: "Pro",
+    proLabel: "6 Pro",
+    pillLabelAfterSelection: "Latest Pro"
+  });
+  const selection = await configureModelState(fixture.doc, {
+    pickerTimeoutMs: 200, intervalMs: 5, settleMs: 5, actionSettleMs: 5
+  });
+
+  assert.equal(selection.status, "selected", selection.failure_reason);
+  assert.equal(selection.closed_pill_family_status, "verified");
+  assert.equal(verifyChatgptModelSelectionBeforeSend(fixture.doc, selection).ok, true);
+});
+
+for (const pillText of ["6.2 Pro", "7 Pro"]) {
+  test(`ChatGPT refuses ${pillText} on first close of a checked 6 Pro tier`, async () => {
+    const fixture = makeLatestPickerFixture({
+      family: "Latest",
+      effort: "Pro",
+      proLabel: "6 Pro",
+      pillLabelAfterSelection: pillText
+    });
+    const selection = await configureModelState(fixture.doc, {
+      pickerTimeoutMs: 200, intervalMs: 5, settleMs: 5, actionSettleMs: 5
+    });
+
+    assert.equal(selection.closed_pill_text, pillText);
+    assert.equal(selection.status, "unavailable", `verified ${pillText} as 6 Pro`);
+  });
+
+  test(`ChatGPT refuses ${pillText} drift just before send after selecting 6 Pro`, async () => {
+    const fixture = makeLatestPickerFixture({ family: "Latest", effort: "Pro", proLabel: "6 Pro" });
+    const selection = await configureModelState(fixture.doc, {
+      pickerTimeoutMs: 200, intervalMs: 5, settleMs: 5, actionSettleMs: 5
+    });
+    assert.equal(selection.status, "selected", selection.failure_reason);
+    assert.equal(selection.closed_pill_text, "6\nPro");
+
+    fixture.pill.innerText = fixture.pill.textContent = pillText;
+    const proof = verifyChatgptModelSelectionBeforeSend(fixture.doc, selection);
+    assert.equal(proof.current_closed_pill_text, pillText);
+    assert.equal(proof.ok, false, `send permitted after pill changed to ${pillText}`);
+  });
+}
 
 test("ChatGPT does not treat 6.2 Pro as the documented Pro row", async () => {
   const fixture = makeLatestPickerFixture({ family: "Latest", effort: "High", proLabel: "6.2 Pro" });
@@ -5465,6 +5516,13 @@ test("split-view picker accepts a 5.6 Pro closed pill for Latest through the pos
   assert.equal(result.post_close_family_status, "verified");
   const proof = verifyChatgptModelSelectionBeforeSend(fixture.doc, result);
   assert.equal(proof.ok, true, JSON.stringify(proof));
+
+  // The legacy picker exposes an unversioned Pro row. A different capsule
+  // cannot reuse the family proof from the previously observed 5.6 Pro.
+  fixture.pill.innerText = fixture.pill.textContent = "7 Pro";
+  const drift = verifyChatgptModelSelectionBeforeSend(fixture.doc, result);
+  assert.equal(drift.ok, false);
+  assert.equal(drift.failure_reason, "family_composer_pill_unverified");
 });
 
 // The reader returns a deprecated row with its note glued on (fixture
