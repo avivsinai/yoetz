@@ -1055,6 +1055,9 @@ function modelSelectionOptionsForJob(job = {}) {
   if (job?.surface_evidence_seen === true) {
     options.surfaceEvidenceSeen = true;
   }
+  if (job?.verified_six_pro === true) {
+    options.verifiedSixPro = true;
+  }
   const timeoutMs = Number(job?.model_selection_timeout_ms);
   if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
     options.timeoutMs = timeoutMs;
@@ -1645,6 +1648,7 @@ async function selectLatestChatProModel(root, options = {}) {
     );
   }
   let effortMoveMethod = null;
+  let clickedEffortLabel = null;
   // Effort: prove Pro, dispatching on the effort kind.
   if (!isChatProEffortLabel(r.effort.label)) {
     if (r.effort.kind === "row") {
@@ -1655,6 +1659,7 @@ async function selectLatestChatProModel(root, options = {}) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, r, availableFamilies, "Latest Pro effort was not visible in the personal picker", "effort_control_not_found", { effortMoveMethod });
       }
+      clickedEffortLabel = selected.clickedEffortLabel;
     } else if (r.effort.kind === "slider") {
       if (!r.effort.control) {
         await closeModelPicker(root, modelButton);
@@ -1746,24 +1751,34 @@ async function selectLatestChatProModel(root, options = {}) {
     await closeModelPicker(root, modelButton);
     return selectionFailure(base, modelButton, r, availableFamilies, "Latest at verified Pro effort could not be confirmed in one picker pass", "model_selection_verification_failed");
   }
+  const verifiedEffortLabel = strongestProEffortLabel(
+    options.verifiedSixPro ? "6 Pro" : clickedEffortLabel, r.effort.label
+  );
   const closeResult = await closeModelPickerResult(root, modelButton, r, { requireProPill: true });
+  const closeEvidence = {
+    closedPill: true,
+    verifiedEffortLabel,
+    pickerCloseMethod: closeResult.method,
+    pickerCloseVerification: closeResult.verification,
+    effortMoveMethod
+  };
   if (!closeResult.ok) {
     if (closeResult.verification?.picker_surface_closed
       && closeResult.verification?.model_trigger_closed
       && closeResult.verification?.family_trigger_closed
       && closeResult.verification?.closed_pill_pro === false) {
-      return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", { closedPill: true, pickerCloseMethod: closeResult.method, pickerCloseVerification: closeResult.verification, effortMoveMethod });
+      return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", closeEvidence);
     }
     return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT model picker remained open or closed composer model pill failed verification", "model_picker_close_failed", { pickerCloseMethod: closeResult.method, pickerCloseVerification: closeResult.verification, effortMoveMethod });
   }
   modelButton = await waitForModelButton(root, options);
   const pillText = modelControlLabel(modelButton);
-  const closedPill = closedPillDiagnostics(pillText, r);
+  const closedPill = closedPillDiagnostics(pillText, r, verifiedEffortLabel);
   if (closedPill.closed_pill_family_status === "unverified") {
-    return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill reported another model family after closing the picker", "family_composer_pill_unverified", { closedPill: true, pickerCloseMethod: closeResult.method, pickerCloseVerification: closeResult.verification, effortMoveMethod });
+    return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill reported another model family after closing the picker", "family_composer_pill_unverified", closeEvidence);
   }
   if (closedPill.closed_pill_effort_status !== "verified") {
-    return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", { closedPill: true, pickerCloseMethod: closeResult.method, pickerCloseVerification: closeResult.verification, effortMoveMethod });
+    return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", closeEvidence);
   }
   let postClose = {
     post_close_family_status: "skipped",
@@ -1772,7 +1787,7 @@ async function selectLatestChatProModel(root, options = {}) {
     post_close_picker_close_verification: null
   };
   if (closedPill.closed_pill_family_status === "skipped") {
-    postClose = await reverifyModelSelectionAfterClose(root, modelButton, r.effort.label, options);
+    postClose = await reverifyModelSelectionAfterClose(root, modelButton, verifiedEffortLabel, options);
     if (!postClose.ok) {
       const quotaLocked = postClose.post_close_failure_reason === "effort_options_disabled";
       return selectionFailure(
@@ -1783,7 +1798,7 @@ async function selectLatestChatProModel(root, options = {}) {
             : "ChatGPT Pro effort is disabled (account limit reached or rollout lock); refusing unverified selection")
           : "ChatGPT model family was not independently re-read after the closed composer pill omitted it",
         quotaLocked ? "effort_options_disabled" : "post_close_model_reverification_failed",
-        { closedPill: true, postClose }
+        { ...closeEvidence, postClose }
       );
     }
   }
@@ -1806,7 +1821,7 @@ async function selectLatestChatProModel(root, options = {}) {
     picker_effort_status: pickerEffortStatus,
     ...closedPill,
     ...postClose,
-    verified_effort_label: postClose.verified_effort_label ?? r.effort.label,
+    verified_effort_label: postClose.verified_effort_label ?? verifiedEffortLabel,
     picker_shape: r.shape,
     surface_trust: r.trust,
     effort_control: r.diagnostics.effort_control ?? null,
@@ -2107,7 +2122,9 @@ async function reverifyModelSelectionAfterClose(root, modelButton, initialEffort
   const disabledPro = effortStatus === "unverified" ? r.effort.disabled ? { reason: r.effort.disabledReason } : null : null;
   const close = await closeModelPickerResult(root, reopenedButton, r, { requireProPill: true });
   const closedButton = await waitForModelButton(root, options);
-  const effortLabel = foldedPillLabel(initialEffortLabel) === "6 pro" ? initialEffortLabel : r.effort.label;
+  const effortLabel = effortStatus === "verified"
+    ? strongestProEffortLabel(initialEffortLabel, r.effort.label)
+    : r.effort.label;
   const closedPill = closedPillDiagnostics(modelControlLabel(closedButton), r, effortLabel);
   return {
     ok: familyStatus === "verified"
@@ -2264,10 +2281,11 @@ async function selectPersonalChatProEffort(root, initialRead, options = {}) {
     .filter((item) => isVisible(item));
   const proOptions = submenuItems.filter((item) => isChatProEffortLabel(optionLabel(item)));
   if (proOptions.length !== 1) return { ok: false, read, method: null };
+  const clickedEffortLabel = optionLabel(proOptions[0]);
   realClick(proOptions[0]);
   await sleep(settleMs);
   read = readPickerStateToRead(root) ?? read;
-  return { ok: isChatProEffortLabel(read.effort?.label), read, method: "effort_row_select" };
+  return { ok: isChatProEffortLabel(read.effort?.label), read, method: "effort_row_select", clickedEffortLabel };
 }
 
 function personalEffortMenu(root, readValue) {
@@ -2297,6 +2315,10 @@ async function waitForFamilyMenu(root, mainMenu, trigger, options = {}) {
 }
 function foldedPillLabel(value) {
   return foldedModelText(value).replace(/\s+/g, " ");
+}
+
+function strongestProEffortLabel(earlier, settled) {
+  return foldedPillLabel(earlier) === "6 pro" || foldedPillLabel(settled) === "6 pro" ? "6 Pro" : settled;
 }
 
 function pillConfirmsEffortLabel(pillText, effortLabel) {
@@ -2499,7 +2521,7 @@ function selectionFailure(base, modelButton, readValue, availableFamilies, warni
   const pickerEffort = Boolean(shape) && !readValue?.effort?.disabled && isChatProEffortLabel(readValue?.effort?.label) ? "verified" : "unverified";
   const pillText = modelControlLabel(modelButton);
   const closedPill = options.closedPill
-    ? closedPillDiagnostics(pillText, readValue)
+    ? closedPillDiagnostics(pillText, readValue, options.verifiedEffortLabel)
     : {
         closed_pill_text: null,
         closed_pill_family_status: "skipped",

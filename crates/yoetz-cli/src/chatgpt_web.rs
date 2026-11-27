@@ -427,7 +427,7 @@ pub fn build_model_selection_function_with_surface_evidence(
     let composer_selector = composer_selector_json();
     format!(
         r##"
-async () => {{
+async (priorVerifiedSixPro = false) => {{
   const requested = {requested_model};
   const strategy = {model_strategy};
   const supported = "gpt-6-pro-chat";
@@ -1083,6 +1083,7 @@ async () => {{
       state = readPersonalState(await openPersonal(pill));
       if (!state) return result("selection-mismatch", pill, null, familyProof.families, "ChatGPT personal picker did not reopen before effort selection");
     }}
+    let clickedEffortLabel = null;
     if (!effortVerified(state)) {{
       realClick(state.effortRow);
       await wait(250);
@@ -1091,6 +1092,7 @@ async () => {{
         await closeMenus(pill);
         return result("not-found", pill, state, familyProof.families, "Pro was not visible as a Latest effort tier");
       }}
+      clickedEffortLabel = optionLabel(proOption);
       realClick(proOption);
       await wait(250);
       pill = await waitForPill();
@@ -1104,6 +1106,7 @@ async () => {{
     }}
     state.familyLabel = familyProof.checkedItems.length === 1 ? textOf(familyProof.checkedItems[0]) : state.familyLabel;
     state.familyProof = true;
+    state.clickedSixPro = fold(clickedEffortLabel) === "6 pro";
     if (!await closeMenus(pill, state, {{ requireProPill: true }})) {{
       return result("selection-mismatch", pill, state, familyProof.families, "ChatGPT personal picker or closed composer model pill failed verification");
     }}
@@ -1423,8 +1426,9 @@ async () => {{
     const familyStatus = familyProof.ok ? "verified" : "unverified";
     const verifiedState = familyProof.state || reopenedState;
     const effortStatus = effortVerified(verifiedState) ? "verified" : "unverified";
-    const initialEffortLabel = selectedEffortLabel(selectedState);
-    const effortLabel = fold(initialEffortLabel) === "6 pro" ? initialEffortLabel : selectedEffortLabel(verifiedState);
+    const initialEffortLabel = verifiedEffortLabel(selectedState);
+    const effortLabel = effortStatus === "verified" && initialEffortLabel === "6 Pro"
+      ? initialEffortLabel : verifiedEffortLabel(verifiedState);
     const closed = await closeMenus(pill, verifiedState, {{ requireProPill: true }});
     pill = await waitForPill();
     const closedPill = closedPillDiagnostics(pill, verifiedState, effortLabel);
@@ -1461,6 +1465,12 @@ async () => {{
     return state?.shape === "slider" ? fold(label) === "pro" : isChatProEffortLabel(label);
   }}
 
+  function verifiedEffortLabel(state) {{
+    const label = selectedEffortLabel(state);
+    const versioned = priorVerifiedSixPro === true || state?.clickedSixPro === true || fold(label) === "6 pro";
+    return isChatProEffortLabel(label) && versioned ? "6 Pro" : label;
+  }}
+
   function supportedPickerShape(state) {{
     return state?.shape === "menu" || state?.shape === "slider" || state?.shape === "personal";
   }}
@@ -1485,7 +1495,7 @@ async () => {{
       || /\b\d+(?:\.\d+)+\b/.test(foldedPill);
   }}
 
-  function closedPillDiagnostics(pill, state, effortLabel = selectedEffortLabel(state)) {{
+  function closedPillDiagnostics(pill, state, effortLabel = verifiedEffortLabel(state)) {{
     const pillText = pill ? textOf(pill) : "";
     const familyLabel = state?.familyLabel || "";
     const closedPillFamilyStatus = pillText && familyLabel
@@ -1514,7 +1524,7 @@ async () => {{
   }};
 
   function result(status, pill, state, families, warning = null) {{
-    const effortLabel = postCloseVerification.postCloseVerifiedEffortLabel ?? selectedEffortLabel(state);
+    const effortLabel = postCloseVerification.postCloseVerifiedEffortLabel ?? verifiedEffortLabel(state);
     const closedPill = closedPillDiagnostics(pill, state, effortLabel);
     const pickerShapeIsSupported = supportedPickerShape(state);
     const pickerFamilyIsVerified = pickerShapeIsSupported && familyVerified(state);
@@ -2224,13 +2234,19 @@ pub fn build_send_button_click_function_with_model_selection(
         "gpt-6-pro-chat",
         ChatgptModelStrategy::Select,
         surface_evidence_seen,
+        false,
     )
+}
+
+pub(crate) fn selection_verified_six_pro(selection: &serde_json::Value) -> bool {
+    selection["status"] == "selected" && selection["verifiedEffortLabel"] == "6 Pro"
 }
 
 pub fn build_send_button_click_function_with_model_selection_for(
     requested_model: &str,
     model_strategy: ChatgptModelStrategy,
     surface_evidence_seen: bool,
+    prior_verified_six_pro: bool,
 ) -> String {
     let model_source = build_model_selection_function_with_surface_evidence(
         requested_model,
@@ -2254,7 +2270,7 @@ async () => {{
 {visibility_helpers}
 {composer_scope_helpers}
   const modelFn = eval("(" + {model_source_json} + ")");
-  const selection = await modelFn();
+  const selection = await modelFn({prior_verified_six_pro});
   const requestedModel = {requested_model_json};
   const modelStrategy = {model_strategy_json};
   const supportedShapes = new Set(["menu", "slider", "personal"]);
@@ -2433,6 +2449,7 @@ async () => {{
         visibility_helpers = JS_VISIBILITY_HELPERS,
         composer_scope_helpers = JS_COMPOSER_SCOPE_HELPERS,
         pro_pill_effort_check = JS_PRO_PILL_EFFORT_CHECK,
+        prior_verified_six_pro = prior_verified_six_pro,
     )
 }
 
@@ -3479,7 +3496,7 @@ mod tests {
     #[test]
     fn send_click_binds_model_proof_to_the_actual_click() {
         let script = build_send_button_click_function_with_model_selection(false);
-        assert!(script.contains("const selection = await modelFn();"));
+        assert!(script.contains("const selection = await modelFn(false);"));
         assert!(script.contains("const selectedProofOk ="));
         assert!(script.contains("const modelProofOk = selectedProofOk || currentProofOk;"));
         assert!(script.contains("if (!modelProofOk)"));
@@ -3498,6 +3515,7 @@ mod tests {
             "current",
             ChatgptModelStrategy::Current,
             true,
+            false,
         );
         assert!(current.contains("const modelStrategy = \"current\";"));
         assert!(current.contains("const currentProofOk = modelStrategy === \"current\""));
@@ -4229,6 +4247,7 @@ mod tests {
                 "current",
                 ChatgptModelStrategy::Current,
                 false,
+                false,
             ),
         )?;
         assert_eq!(result["status"], "sent", "{result}");
@@ -4257,6 +4276,7 @@ mod tests {
               let picker = null;
               let familyMenu = null;
               let effortMenu = null;
+              let closedProLabel = "6 Pro";
               const remove = (node) => {
                 if (!node) return;
                 node.remove();
@@ -4292,8 +4312,8 @@ mod tests {
                 pro.setAttribute("aria-checked", "false");
                 pro.textContent = "6 Pro";
                 pro.addEventListener("click", () => {
-                  effort.textContent = "Effort 6 Pro";
-                  pill.textContent = "6 Pro";
+                  effort.textContent = "Effort Pro";
+                  pill.textContent = closedProLabel;
                   remove(effortMenu);
                 });
                 effortMenu.appendChild(pro);
@@ -4308,6 +4328,11 @@ mod tests {
               effort.setAttribute("role", "menuitem");
               effort.textContent = "Effort High";
               effort.addEventListener("pointerdown", openEffort);
+              window.fixtureResetPersonalEffort = (label = "6 Pro") => {
+                effort.textContent = "Effort High";
+                pill.textContent = "High";
+                closedProLabel = label;
+              };
               pill.addEventListener("pointerdown", () => {
                 picker = document.createElement("div");
                 picker.setAttribute("role", "dialog");
@@ -4338,6 +4363,7 @@ mod tests {
         assert_eq!(selection["closedPillText"], "6 Pro");
         assert_eq!(selection["postCloseFamilyStatus"], "verified");
         assert_eq!(selection["postCloseEffortStatus"], "verified");
+        assert!(selection_verified_six_pro(&selection));
 
         let select = build_model_selection_function("gpt-6-pro-chat", ChatgptModelStrategy::Select);
         let send = build_send_button_click_function_with_model_selection(false);
@@ -4347,15 +4373,12 @@ mod tests {
             let label = serde_json::to_string(drifted_label)?;
             let change_pill =
                 format!("document.querySelector('.__composer-pill').textContent = {label};");
-            tab.evaluate(&change_pill, true)?;
+            tab.evaluate(&format!("window.fixtureResetPersonalEffort({label})"), true)?;
             let mismatched = eval_fixture_function(&tab, &select)?;
             assert_eq!(mismatched["closedPillText"], drifted_label);
             assert_eq!(mismatched["status"], "selection-mismatch", "{mismatched}");
 
-            tab.evaluate(
-                "document.querySelector('.__composer-pill').textContent = '6 Pro';",
-                true,
-            )?;
+            tab.evaluate("window.fixtureResetPersonalEffort()", true)?;
             // Simulate a page update after the real picker verification, just
             // before the real send guard reads the closed composer pill.
             let drifted_send = send.replacen(
@@ -4366,14 +4389,35 @@ mod tests {
             let refused = eval_fixture_function(&tab, &drifted_send)?;
             assert_eq!(refused["status"], "model-not-ready", "{refused}");
             assert_eq!(refused["modelSelection"]["status"], "selected", "{refused}");
-            tab.evaluate(
-                "document.querySelector('.__composer-pill').textContent = '6 Pro';",
-                true,
-            )?;
+            tab.evaluate("window.fixtureResetPersonalEffort()", true)?;
         }
 
+        // A later pass sees the generic Pro summary without clicking a tier.
+        let verified = eval_fixture_function(&tab, &select)?;
+        assert!(selection_verified_six_pro(&verified));
+        let send_with_prior = build_send_button_click_function_with_model_selection_for(
+            "gpt-6-pro-chat",
+            ChatgptModelStrategy::Select,
+            false,
+            selection_verified_six_pro(&verified),
+        );
+        tab.evaluate(
+            "document.querySelector('.__composer-pill').textContent = '7 Pro';",
+            true,
+        )?;
+        let refused = eval_fixture_function(&tab, &send_with_prior)?;
+        assert_eq!(refused["status"], "model-not-ready", "{refused}");
+        assert_eq!(
+            refused["modelSelection"]["status"], "selection-mismatch",
+            "{refused}"
+        );
+
+        tab.evaluate(
+            "document.querySelector('.__composer-pill').textContent = '6 Pro';",
+            true,
+        )?;
         tab.evaluate("window.fixtureMarkUploadDone()", true)?;
-        let sent = eval_fixture_function(&tab, &send)?;
+        let sent = eval_fixture_function(&tab, &send_with_prior)?;
         assert_eq!(sent["status"], "sent", "{sent}");
         let receipt = canonical_chatgpt_final_model_selection(&sent["finalModelSelection"]);
         validate_chatgpt_final_model_selection(&receipt, ChatgptModelStrategy::Select)?;

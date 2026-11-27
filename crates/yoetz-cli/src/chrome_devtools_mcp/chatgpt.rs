@@ -110,6 +110,7 @@ struct ModelSelectionOutcome {
     model_used: Option<String>,
     model_selection_status: chatgpt_recipe::ChatgptModelSelectionStatus,
     surface_evidence_seen: bool,
+    verified_six_pro: bool,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -398,6 +399,7 @@ async fn run_attached_recipe_inner(
         &ctx.model,
         ctx.model_strategy,
         model_selection.surface_evidence_seen,
+        model_selection.verified_six_pro,
     );
     let clicked = client
         .evaluate_script(&click_send_js, vec![])
@@ -832,6 +834,7 @@ async fn maybe_select_model(
             Ok(ModelSelectionOutcome {
                 model_used,
                 model_selection_status,
+                verified_six_pro: chatgpt_web::selection_verified_six_pro(&selection),
                 surface_evidence_seen: selection
                     .get("surfaceEvidenceSeen")
                     .and_then(serde_json::Value::as_bool)
@@ -845,6 +848,7 @@ async fn maybe_select_model(
             Ok(ModelSelectionOutcome {
                 model_used,
                 model_selection_status,
+                verified_six_pro: false,
                 surface_evidence_seen: selection
                     .get("surfaceEvidenceSeen")
                     .and_then(serde_json::Value::as_bool)

@@ -4119,6 +4119,53 @@ test("Latest personal picker upgrades High effort via the Effort row", async () 
   assert.equal(fixture.sliderValue(), 2);
 });
 
+test("personal picker carries a selected 6 Pro child through the generic Effort Pro summary", async () => {
+  const fixture = makePersonalPickerFixture({
+    effort: "High",
+    effortOptions: ["High", "6 Pro"],
+    genericProSummary: true,
+    pillFamilyLabel: "",
+    pillEffortLabel: "6 Pro"
+  });
+  const selection = await configureModelState(fixture.doc, {});
+
+  assert.equal(selection.status, "selected", selection.failure_reason);
+  assert.equal(selection.effort_control.value_text, "Pro");
+  assert.equal(fixture.effortClicks(), 1);
+  assert.equal(selection.closed_pill_text, "6 Pro");
+  assert.equal(selection.verified_effort_label, "6 Pro");
+  assert.equal(verifyChatgptModelSelectionBeforeSend(fixture.doc, selection).ok, true);
+
+  for (const label of ["6.2 Pro", "7 Pro"]) {
+    fixture.pill.innerText = fixture.pill.textContent = label;
+    const proof = verifyChatgptModelSelectionBeforeSend(fixture.doc, selection);
+    assert.equal(proof.ok, false, label);
+    assert.equal(proof.current_closed_pill_effort_status, "unverified", label);
+
+    const reselection = await configureModelState(fixture.doc, { verified_six_pro: true });
+    assert.equal(reselection.status, "unavailable", label);
+    assert.equal(fixture.effortClicks(), 1);
+  }
+});
+
+for (const label of ["6.2 Pro", "7 Pro"]) {
+  test(`personal picker rejects ${label} at first close after choosing 6 Pro under a generic summary`, async () => {
+    const fixture = makePersonalPickerFixture({
+      effort: "High",
+      effortOptions: ["High", "6 Pro"],
+      genericProSummary: true,
+      pillFamilyLabel: "",
+      pillEffortLabel: label
+    });
+    const selection = await configureModelState(fixture.doc, {});
+
+    assert.equal(fixture.effortClicks(), 1);
+    assert.equal(selection.effort_control.value_text, "Pro");
+    assert.equal(selection.closed_pill_text, label);
+    assert.equal(selection.status, "unavailable", label);
+  });
+}
+
 test("Latest personal picker rejects an unknown Effort label", async () => {
   const fixture = makePersonalPickerFixture({ effort: "Expert" });
 
@@ -6048,6 +6095,7 @@ function makePersonalPickerFixture({
   startsOpen = false,
   retainMountedWrapper = false,
   effortOptions = null,
+  genericProSummary = false,
   pillFamilyLabel = "6",
   pillEffortLabel = null,
   familyMenuChecked = true,
@@ -6058,6 +6106,7 @@ function makePersonalPickerFixture({
   let menuNode = null;
   let currentValue = 2;
   let currentEffort = effort;
+  const currentEffortSummary = () => genericProSummary && currentEffort === "6 Pro" ? "Pro" : currentEffort;
   let effortClicks = 0;
   let effortMenu = null;
   let familyMenu = null;
@@ -6083,7 +6132,7 @@ function makePersonalPickerFixture({
     "Model",
     "Latest",
     "Effort",
-    currentEffort,
+    currentEffortSummary(),
     "Speed",
     "Standard"
   ].join("\n");
@@ -6140,7 +6189,7 @@ function makePersonalPickerFixture({
         "aria-checked": label === currentEffort ? "true" : "false",
         onPointerDown: () => {
           currentEffort = label;
-          effortRow.innerText = `Effort ${label}`;
+          effortRow.innerText = `Effort ${currentEffortSummary()}`;
           effortRow.textContent = effortRow.innerText;
           pill.innerText = pillTextForEffort(label);
           pill.textContent = pill.innerText;
@@ -6222,7 +6271,7 @@ function makePersonalPickerFixture({
         effortClicks += 1;
         openEffortMenu();
       }
-    }, `Effort ${currentEffort}`);
+    }, `Effort ${currentEffortSummary()}`);
     const speedRow = new FakeElement("div", { role: "menuitem" }, "Speed Standard");
     menuNode = new FakeElement("div", {
       role: "menu",
@@ -6266,6 +6315,7 @@ function makePersonalPickerFixture({
   if (startsOpen) openPanel();
   return {
     doc,
+    pill,
     keyAttempts: () => [...keyAttempts],
     sliderValue: () => currentValue,
     effortClicks: () => effortClicks,
