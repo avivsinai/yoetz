@@ -1589,6 +1589,7 @@ async function selectLatestChatProModel(root, options = {}) {
     r = await waitForRead(root, options);
     availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
   }
+  let observedEffortLabel = r.effort.label;
   let familySubmenu = await revealFamily(root, r, options);
   r = read(root, { familySurface: familySubmenu });
   availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
@@ -1627,6 +1628,7 @@ async function selectLatestChatProModel(root, options = {}) {
       await closeModelPicker(root, modelButton);
       return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT model picker exposed an unsupported shape after selecting Latest; refusing unverified model selection", "model_picker_shape_unsupported");
     }
+    observedEffortLabel = r.effort.label;
     familySubmenu = await revealFamily(root, r, options);
     r = read(root, { familySurface: familySubmenu });
     availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
@@ -1648,7 +1650,10 @@ async function selectLatestChatProModel(root, options = {}) {
     );
   }
   let effortMoveMethod = null;
-  let clickedEffortLabel = null;
+  // A picker redraw can summarize a versioned tier as generic Pro.
+  observedEffortLabel = strongestProEffortLabel(
+    options.verifiedSixPro ? "6 Pro" : observedEffortLabel, r.effort.label
+  );
   // Effort: prove Pro, dispatching on the effort kind.
   if (!isChatProEffortLabel(r.effort.label)) {
     if (r.effort.kind === "row") {
@@ -1659,7 +1664,7 @@ async function selectLatestChatProModel(root, options = {}) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, r, availableFamilies, "Latest Pro effort was not visible in the personal picker", "effort_control_not_found", { effortMoveMethod });
       }
-      clickedEffortLabel = selected.clickedEffortLabel;
+      observedEffortLabel = strongestProEffortLabel(observedEffortLabel, selected.clickedEffortLabel);
     } else if (r.effort.kind === "slider") {
       if (!r.effort.control) {
         await closeModelPicker(root, modelButton);
@@ -1718,6 +1723,7 @@ async function selectLatestChatProModel(root, options = {}) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, r, availableFamilies, "Latest Pro effort was not visible in the effort menu", "effort_control_not_found");
       }
+      observedEffortLabel = strongestProEffortLabel(observedEffortLabel, optionLabel(proOptions[0]));
       realClick(proOptions[0]);
       await sleep(Number(options.actionSettleMs ?? 250));
       modelButton = await waitForModelButton(root, options);
@@ -1739,6 +1745,7 @@ async function selectLatestChatProModel(root, options = {}) {
   // submenu (if the family lives there) and re-read with familySurface. If
   // revealFamily returns null (inline family or no trigger), keep the existing
   // r which already carries the family value from the init read.
+  observedEffortLabel = strongestProEffortLabel(observedEffortLabel, r.effort.label);
   const reverifySubmenu = await revealFamily(root, r, options);
   if (reverifySubmenu) {
     familySubmenu = reverifySubmenu;
@@ -1751,9 +1758,7 @@ async function selectLatestChatProModel(root, options = {}) {
     await closeModelPicker(root, modelButton);
     return selectionFailure(base, modelButton, r, availableFamilies, "Latest at verified Pro effort could not be confirmed in one picker pass", "model_selection_verification_failed");
   }
-  const verifiedEffortLabel = strongestProEffortLabel(
-    options.verifiedSixPro ? "6 Pro" : clickedEffortLabel, r.effort.label
-  );
+  const verifiedEffortLabel = strongestProEffortLabel(observedEffortLabel, r.effort.label);
   const closeResult = await closeModelPickerResult(root, modelButton, r, { requireProPill: true });
   const closeEvidence = {
     closedPill: true,
@@ -2115,6 +2120,7 @@ async function reverifyModelSelectionAfterClose(root, modelButton, initialEffort
       post_close_failure_reason: "model_picker_shape_unsupported"
     };
   }
+  const observedEffortLabel = strongestProEffortLabel(initialEffortLabel, r.effort.label);
   const familySubmenu = await revealFamily(root, r, options);
   r = read(root, { familySurface: familySubmenu });
   const familyStatus = r.family.checkedCount === 1 && familyIsLatest(r.family.label) ? "verified" : "unverified";
@@ -2123,7 +2129,7 @@ async function reverifyModelSelectionAfterClose(root, modelButton, initialEffort
   const close = await closeModelPickerResult(root, reopenedButton, r, { requireProPill: true });
   const closedButton = await waitForModelButton(root, options);
   const effortLabel = effortStatus === "verified"
-    ? strongestProEffortLabel(initialEffortLabel, r.effort.label)
+    ? strongestProEffortLabel(observedEffortLabel, r.effort.label)
     : r.effort.label;
   const closedPill = closedPillDiagnostics(modelControlLabel(closedButton), r, effortLabel);
   return {

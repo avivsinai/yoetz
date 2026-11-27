@@ -4119,50 +4119,77 @@ test("Latest personal picker upgrades High effort via the Effort row", async () 
   assert.equal(fixture.sliderValue(), 2);
 });
 
-test("personal picker carries a selected 6 Pro child through the generic Effort Pro summary", async () => {
-  const fixture = makePersonalPickerFixture({
-    effort: "High",
-    effortOptions: ["High", "6 Pro"],
-    genericProSummary: true,
-    pillFamilyLabel: "",
-    pillEffortLabel: "6 Pro"
-  });
-  const selection = await configureModelState(fixture.doc, {});
-
-  assert.equal(selection.status, "selected", selection.failure_reason);
-  assert.equal(selection.effort_control.value_text, "Pro");
-  assert.equal(fixture.effortClicks(), 1);
-  assert.equal(selection.closed_pill_text, "6 Pro");
-  assert.equal(selection.verified_effort_label, "6 Pro");
-  assert.equal(verifyChatgptModelSelectionBeforeSend(fixture.doc, selection).ok, true);
-
-  for (const label of ["6.2 Pro", "7 Pro"]) {
-    fixture.pill.innerText = fixture.pill.textContent = label;
-    const proof = verifyChatgptModelSelectionBeforeSend(fixture.doc, selection);
-    assert.equal(proof.ok, false, label);
-    assert.equal(proof.current_closed_pill_effort_status, "unverified", label);
-
-    const reselection = await configureModelState(fixture.doc, { verified_six_pro: true });
-    assert.equal(reselection.status, "unavailable", label);
-    assert.equal(fixture.effortClicks(), 1);
-  }
-});
-
-for (const label of ["6.2 Pro", "7 Pro"]) {
-  test(`personal picker rejects ${label} at first close after choosing 6 Pro under a generic summary`, async () => {
-    const fixture = makePersonalPickerFixture({
+const versionedProPickers = [
+  {
+    name: "direct radio remount",
+    shape: "menu",
+    make: (label) => makeLatestPickerFixture({
+      family: "Latest",
+      effort: "High",
+      proLabel: "6 Pro",
+      checkedProLabel: "Pro",
+      pillLabelAfterSelection: label
+    }),
+    settledLabel: (selection) => selection.effort_options.find((option) => option.checked)?.label
+  },
+  {
+    name: "personal submenu",
+    shape: "personal",
+    make: (label) => makePersonalPickerFixture({
       effort: "High",
       effortOptions: ["High", "6 Pro"],
       genericProSummary: true,
       pillFamilyLabel: "",
       pillEffortLabel: label
-    });
-    const selection = await configureModelState(fixture.doc, {});
+    }),
+    settledLabel: (selection) => selection.effort_control.value_text
+  }
+];
+const versionedProPills = [
+  { label: "6 Pro", accepted: true },
+  { label: "Pro", accepted: true },
+  { label: "Latest Pro", accepted: true },
+  { label: "6.2 Pro", accepted: false },
+  { label: "7 Pro", accepted: false }
+];
 
-    assert.equal(fixture.effortClicks(), 1);
-    assert.equal(selection.effort_control.value_text, "Pro");
-    assert.equal(selection.closed_pill_text, label);
-    assert.equal(selection.status, "unavailable", label);
+for (const { name, shape, make, settledLabel } of versionedProPickers) {
+  for (const { label, accepted } of versionedProPills) {
+    test(`versioned Pro ${name} ${accepted ? "accepts" : "rejects"} ${label} at first close`, async () => {
+      const fixture = make(label);
+      const selection = await configureModelState(fixture.doc, {});
+
+      assert.equal(selection.picker_shape, shape);
+      assert.equal(fixture.effortClicks(), 1);
+      assert.equal(settledLabel(selection), "Pro");
+      assert.equal(selection.closed_pill_text, label);
+      assert.equal(selection.status, accepted ? "selected" : "unavailable", JSON.stringify(selection));
+      if (accepted) {
+        assert.equal(selection.verified_effort_label, "6 Pro");
+        assert.equal(verifyChatgptModelSelectionBeforeSend(fixture.doc, selection).ok, true);
+      } else {
+        assert.equal(selection.closed_pill_effort_status, "unverified");
+      }
+    });
+  }
+
+  test(`versioned Pro ${name} rejects pre-send disagreement`, async () => {
+    const fixture = make("6 Pro");
+    const selection = await configureModelState(fixture.doc, {});
+    assert.equal(selection.status, "selected", selection.failure_reason);
+
+    for (const { label } of versionedProPills.filter(({ accepted }) => !accepted)) {
+      fixture.pill.innerText = fixture.pill.textContent = label;
+      const proof = verifyChatgptModelSelectionBeforeSend(fixture.doc, selection);
+      assert.equal(proof.ok, false, label);
+      assert.equal(proof.current_closed_pill_effort_status, "unverified", label);
+
+      const reselection = await configureModelState(fixture.doc, {
+        verified_six_pro: selection.verified_effort_label === "6 Pro"
+      });
+      assert.equal(reselection.status, "unavailable", label);
+      assert.equal(fixture.effortClicks(), 1);
+    }
   });
 }
 
@@ -4734,7 +4761,8 @@ function makeLatestPickerFixture({
   workSurfaceValue = "work",
   workChecked = null,
   pillLabelAfterSelection = null,
-  proLabel = "Pro"
+  proLabel = "Pro",
+  checkedProLabel = proLabel
 }) {
   let currentFamily = family;
   let currentEffort = effort;
@@ -4858,7 +4886,7 @@ function makeLatestPickerFixture({
           updatePill(true);
           closeMenus();
         }
-      }, label === "Pro" ? proLabel : label);
+      }, label === "Pro" ? (checked ? checkedProLabel : proLabel) : label);
       mainMenu.append(radio);
     }
     familyTrigger = new FakeElement("div", {
