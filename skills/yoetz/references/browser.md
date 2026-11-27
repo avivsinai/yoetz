@@ -35,29 +35,30 @@ fail-closed contract.
 
 ## Gemini web adapter evidence
 
-Collect evidence from a blank `https://gemini.google.com` tab in the intended
-Chrome profile’s existing signed-in session. Keep the composer empty and the
-current model and effort selected.
+After a maintainer requests evidence, use a fresh blank chat at
+`https://gemini.google.com` in the intended Chrome profile’s existing
+signed-in session. Keep the current model and effort selected and leave the
+composer empty.
 
-1. From a Yoetz checkout, print the two local DevTools snippets.
+1. Identify the model trigger beside the composer. Record its exact visible
+   model and effort labels and its role if exposed. Open that trigger.
+2. For the chooser opened by the trigger, record the chooser and row roles
+   if exposed, the visible model and effort choices, and the evidence for the
+   current selection, such as a visible check or a checked or selected
+   accessibility state. Note if effort has its own submenu. If the chooser
+   cannot be linked to the model trigger, mark it `unverified`.
+3. Dismiss the chooser with the selection unchanged. Find the editor and the
+   adjacent Send button in the smallest visible composer group containing both.
+   Report the editor kind (`textarea`, `contenteditable`, or `unknown`), its
+   role if exposed, where Send sits relative to the editor, and whether Send
+   is disabled. Mark the composer `unverified` if either control is unclear
+   or if the editor has a draft or attachment.
 
-   ```bash
-   node scripts/capture-gemini-surface.mjs chooser
-   node scripts/capture-gemini-surface.mjs composer
-   ```
-
-2. Open the model chooser without selecting a row. In DevTools **Elements**
-   select the narrow element containing its choices. Run the `chooser`
-   snippet in the top-level **Console** of the same tab. It copies a bounded
-   JSON tree of that selection to the clipboard.
-3. Transcribe only the model and effort labels shown by the trigger and the
-   currently selected row, including any checked or disabled state. Record
-   when the UI gives no selected-state evidence. Leave the choice as it was.
-4. Dismiss the chooser. In **Elements** select the smallest empty composer
-   subtree containing the text control and Send button, then run the `composer`
-   snippet. Share only the two reviewed JSON outputs and the model and effort
-   transcription. The snippets omit page text, input values, URLs, IDs, and
-   arbitrary attribute values.
+If needed, inspect one identified control at a time in DevTools **Elements**
+and read its role or state from the **Accessibility** pane. Share only a
+short typed record of the fields above. Leave out account labels, chat
+history, editor contents, page markup, screenshots, URLs, and identifiers.
+Mark any unclear state `unverified`.
 
 Gemini native recipe support is pending verified signed-in evidence. Web
 picker labels describe the model and effort available in that session.

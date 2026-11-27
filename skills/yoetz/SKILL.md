@@ -161,7 +161,7 @@ consult.
 For web-only models, `yoetz browser recipe --recipe chatgpt|claude --bundle
 "$BUNDLE"` drives the user's logged-in Chrome. Full guide:
 [references/browser.md](references/browser.md). For Gemini web adapter work,
-use the [signed-in fixture capture guide](references/browser.md#gemini-web-adapter-evidence).
+use the [signed-in evidence checklist](references/browser.md#gemini-web-adapter-evidence).
 
 - **Native extension first.** Set it up once with `yoetz browser extension
   setup --chatgpt --open-chrome` (or `--claude`). When it reports connected,
