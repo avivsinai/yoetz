@@ -2862,6 +2862,39 @@ test("ChatGPT model selection reports Latest Pro when the family radio reads GPT
   assert.equal(result.model_used, "Latest Pro");
 });
 
+// The label is documented by OpenAI; the menu uses the synthetic picker fixture.
+test("ChatGPT selects the documented 6 Pro row under Latest and verifies the send proof", async () => {
+  const fixture = makeLatestPickerFixture({ family: "Latest", effort: "High", proLabel: "6 Pro" });
+  const selection = await configureModelState(fixture.doc, {
+    pickerTimeoutMs: 200,
+    intervalMs: 5,
+    settleMs: 5,
+    actionSettleMs: 5
+  });
+
+  assert.equal(selection.status, "selected", selection.failure_reason);
+  assert.equal(fixture.effortClicks(), 1);
+  assert.equal(selection.model_used, "Latest Pro");
+  assert.equal(selection.closed_pill_text, "6\nPro");
+  assert.equal(selection.post_close_family_status, "verified");
+  assert.equal(selection.post_close_effort_status, "verified");
+  assert.equal(verifyChatgptModelSelectionBeforeSend(fixture.doc, selection).ok, true);
+});
+
+test("ChatGPT does not treat 6.2 Pro as the documented Pro row", async () => {
+  const fixture = makeLatestPickerFixture({ family: "Latest", effort: "High", proLabel: "6.2 Pro" });
+  const selection = await configureModelState(fixture.doc, {
+    pickerTimeoutMs: 200,
+    intervalMs: 5,
+    settleMs: 5,
+    actionSettleMs: 5
+  });
+
+  assert.equal(selection.status, "unavailable");
+  assert.equal(fixture.effortClicks(), 0);
+  assert.equal(verifyChatgptModelSelectionBeforeSend(fixture.doc, selection).ok, false);
+});
+
 test("ChatGPT model selection accepts an absent surface toggle only with Chat composer proof", async () => {
   const fixture = makeLatestPickerFixture({
     family: "Latest",
@@ -4602,7 +4635,8 @@ function makeLatestPickerFixture({
   chatSurfaceValue = "chatgpt",
   workSurfaceValue = "work",
   workChecked = null,
-  pillLabelAfterSelection = null
+  pillLabelAfterSelection = null,
+  proLabel = "Pro"
 }) {
   let currentFamily = family;
   let currentEffort = effort;
@@ -4726,7 +4760,7 @@ function makeLatestPickerFixture({
           updatePill(true);
           closeMenus();
         }
-      }, label);
+      }, label === "Pro" ? proLabel : label);
       mainMenu.append(radio);
     }
     familyTrigger = new FakeElement("div", {
