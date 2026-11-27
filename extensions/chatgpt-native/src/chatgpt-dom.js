@@ -8,6 +8,7 @@ import {
   foldedModelText,
   foldedFamilyLabel,
   optionLabel,
+  isChatProEffortLabel,
   familyIsSol,
   familyIsLatest,
   modelPickerTriggerIsOpen,
@@ -881,6 +882,7 @@ export async function configureModelState(root, job = {}) {
     effort_status: selection.effort_status ?? "unverified",
     picker_family_status: selection.picker_family_status ?? "unverified",
     picker_effort_status: selection.picker_effort_status ?? "unverified",
+    verified_effort_label: selection.verified_effort_label ?? null,
     closed_pill_family_status: selection.closed_pill_family_status ?? "skipped",
     closed_pill_effort_status: selection.closed_pill_effort_status ?? "skipped",
     closed_pill_text: selection.closed_pill_text ?? selection.pill_text ?? null,
@@ -1052,6 +1054,9 @@ function modelSelectionOptionsForJob(job = {}) {
   const options = {};
   if (job?.surface_evidence_seen === true) {
     options.surfaceEvidenceSeen = true;
+  }
+  if (job?.verified_six_pro === true) {
+    options.verifiedSixPro = true;
   }
   const timeoutMs = Number(job?.model_selection_timeout_ms);
   if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
@@ -1290,10 +1295,15 @@ export function verifyChatgptModelSelectionBeforeSend(root = document, selection
   const pillText = modelControlLabel(modelButton);
   const pickerOpen = Boolean(findPickerState(root))
     || openComposerPickerLeftovers(root).some((leftover) => leftoverSurfaceIsOpen(root, leftover.trigger));
-  const currentFamilyStatus = closedPillFamilyStatus(
+  let currentFamilyStatus = closedPillFamilyStatus(
     pillText, selection.family_label, selection.family_label_candidates
   );
-  const currentEffortStatus = pillConfirmsEffortLabel(pillText, "Pro") ? "verified" : "unverified";
+  if (selection.status === "selected" && currentFamilyStatus === "skipped"
+    && !matchesVerifiedClosedPill(pillText, selection)) {
+    currentFamilyStatus = "unverified";
+  }
+  const effortLabel = selection.status === "current" ? "Pro" : selection.verified_effort_label;
+  const currentEffortStatus = pillConfirmsEffortLabel(pillText, effortLabel) ? "verified" : "unverified";
   const supportedShape = isSupportedPickerShape({ shape: selection.picker_shape });
   const familyCorroborated = selection.closed_pill_family_status === "verified"
     || selection.post_close_family_status === "verified";
@@ -1579,6 +1589,7 @@ async function selectLatestChatProModel(root, options = {}) {
     r = await waitForRead(root, options);
     availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
   }
+  let observedEffortLabel = r.effort.label;
   let familySubmenu = await revealFamily(root, r, options);
   r = read(root, { familySurface: familySubmenu });
   availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
@@ -1617,6 +1628,7 @@ async function selectLatestChatProModel(root, options = {}) {
       await closeModelPicker(root, modelButton);
       return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT model picker exposed an unsupported shape after selecting Latest; refusing unverified model selection", "model_picker_shape_unsupported");
     }
+    observedEffortLabel = r.effort.label;
     familySubmenu = await revealFamily(root, r, options);
     r = read(root, { familySurface: familySubmenu });
     availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
@@ -1627,19 +1639,23 @@ async function selectLatestChatProModel(root, options = {}) {
     }
   }
 
+  if (r.effort.disabled) {
+    await closeModelPicker(root, modelButton);
+    return selectionFailure(
+      base, modelButton, r, availableFamilies,
+      r.effort.disabledReason
+        ? `ChatGPT Pro effort is disabled: ${r.effort.disabledReason}`
+        : "ChatGPT Pro effort is disabled (account limit reached or rollout lock); refusing unverified selection",
+      "effort_options_disabled"
+    );
+  }
   let effortMoveMethod = null;
+  // A picker redraw can summarize a versioned tier as generic Pro.
+  observedEffortLabel = strongestProEffortLabel(
+    options.verifiedSixPro ? "6 Pro" : observedEffortLabel, r.effort.label
+  );
   // Effort: prove Pro, dispatching on the effort kind.
-  if (foldedModelText(r.effort.label) !== "pro") {
-    if (r.effort.disabled) {
-      await closeModelPicker(root, modelButton);
-      return selectionFailure(
-        base, modelButton, r, availableFamilies,
-        r.effort.disabledReason
-          ? `ChatGPT Pro effort is disabled: ${r.effort.disabledReason}`
-          : "ChatGPT Pro effort is disabled (account limit reached or rollout lock); refusing unverified selection",
-        "effort_options_disabled"
-      );
-    }
+  if (!isChatProEffortLabel(r.effort.label)) {
     if (r.effort.kind === "row") {
       const selected = await selectPersonalChatProEffort(root, r, options);
       effortMoveMethod = selected.method;
@@ -1648,6 +1664,7 @@ async function selectLatestChatProModel(root, options = {}) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, r, availableFamilies, "Latest Pro effort was not visible in the personal picker", "effort_control_not_found", { effortMoveMethod });
       }
+      observedEffortLabel = strongestProEffortLabel(observedEffortLabel, selected.clickedEffortLabel);
     } else if (r.effort.kind === "slider") {
       if (!r.effort.control) {
         await closeModelPicker(root, modelButton);
@@ -1685,7 +1702,7 @@ async function selectLatestChatProModel(root, options = {}) {
       }
       // The reopen above can land on an already-Pro effort (a family click
       // resets effort to the family default); only move when still needed.
-      if (foldedModelText(r.effort.label) !== "pro") {
+      if (!isChatProEffortLabel(r.effort.label)) {
         if (r.effort.kind !== "slider" || !r.effort.control || effortControlIsInert(r.effort.control)) {
           await closeModelPicker(root, modelButton);
           return selectionFailure(base, modelButton, r, availableFamilies, "Latest effort slider was not live in the effort view", "effort_control_not_found", { effortMoveMethod });
@@ -1701,12 +1718,13 @@ async function selectLatestChatProModel(root, options = {}) {
     } else {
       // rows: click the Pro tier row (found via the reader-exported helpers,
       // not a raw querySelectorAll in the driver).
-      const proOption = r.effort.items.find((item) => foldedModelText(optionLabel(item)) === "pro");
-      if (!proOption) {
+      const proOptions = r.effort.items.filter((item) => isChatProEffortLabel(optionLabel(item)));
+      if (proOptions.length !== 1) {
         await closeModelPicker(root, modelButton);
         return selectionFailure(base, modelButton, r, availableFamilies, "Latest Pro effort was not visible in the effort menu", "effort_control_not_found");
       }
-      realClick(proOption);
+      observedEffortLabel = strongestProEffortLabel(observedEffortLabel, optionLabel(proOptions[0]));
+      realClick(proOptions[0]);
       await sleep(Number(options.actionSettleMs ?? 250));
       modelButton = await waitForModelButton(root, options);
       if (!modelButton) {
@@ -1727,6 +1745,7 @@ async function selectLatestChatProModel(root, options = {}) {
   // submenu (if the family lives there) and re-read with familySurface. If
   // revealFamily returns null (inline family or no trigger), keep the existing
   // r which already carries the family value from the init read.
+  observedEffortLabel = strongestProEffortLabel(observedEffortLabel, r.effort.label);
   const reverifySubmenu = await revealFamily(root, r, options);
   if (reverifySubmenu) {
     familySubmenu = reverifySubmenu;
@@ -1734,30 +1753,37 @@ async function selectLatestChatProModel(root, options = {}) {
     availableFamilies = r.family.options.length > 0 ? r.family.options : availableFamilies;
   }
   const familyVerified = r.family.checkedCount === 1 && familyIsLatest(r.family.label);
-  const effortVerified = foldedModelText(r.effort.label) === "pro";
+  const effortVerified = !r.effort.disabled && isChatProEffortLabel(r.effort.label);
   if (!familyVerified || !effortVerified) {
     await closeModelPicker(root, modelButton);
     return selectionFailure(base, modelButton, r, availableFamilies, "Latest at verified Pro effort could not be confirmed in one picker pass", "model_selection_verification_failed");
   }
+  const verifiedEffortLabel = strongestProEffortLabel(observedEffortLabel, r.effort.label);
   const closeResult = await closeModelPickerResult(root, modelButton, r, { requireProPill: true });
+  const closeEvidence = {
+    closedPill: true,
+    verifiedEffortLabel,
+    pickerCloseMethod: closeResult.method,
+    pickerCloseVerification: closeResult.verification,
+    effortMoveMethod
+  };
   if (!closeResult.ok) {
     if (closeResult.verification?.picker_surface_closed
       && closeResult.verification?.model_trigger_closed
       && closeResult.verification?.family_trigger_closed
       && closeResult.verification?.closed_pill_pro === false) {
-      return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", { closedPill: true, pickerCloseMethod: closeResult.method, pickerCloseVerification: closeResult.verification, effortMoveMethod });
+      return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", closeEvidence);
     }
     return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT model picker remained open or closed composer model pill failed verification", "model_picker_close_failed", { pickerCloseMethod: closeResult.method, pickerCloseVerification: closeResult.verification, effortMoveMethod });
   }
   modelButton = await waitForModelButton(root, options);
   const pillText = modelControlLabel(modelButton);
-  const verifiedEffortLabel = r.effort.label ?? null;
-  const closedPill = closedPillDiagnostics(pillText, r);
+  const closedPill = closedPillDiagnostics(pillText, r, verifiedEffortLabel);
   if (closedPill.closed_pill_family_status === "unverified") {
-    return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill reported another model family after closing the picker", "family_composer_pill_unverified", { closedPill: true, pickerCloseMethod: closeResult.method, pickerCloseVerification: closeResult.verification, effortMoveMethod });
+    return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill reported another model family after closing the picker", "family_composer_pill_unverified", closeEvidence);
   }
   if (closedPill.closed_pill_effort_status !== "verified") {
-    return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", { closedPill: true, pickerCloseMethod: closeResult.method, pickerCloseVerification: closeResult.verification, effortMoveMethod });
+    return selectionFailure(base, modelButton, r, availableFamilies, "ChatGPT composer model pill did not confirm verified Pro effort", "effort_composer_pill_unverified", closeEvidence);
   }
   let postClose = {
     post_close_family_status: "skipped",
@@ -1766,7 +1792,7 @@ async function selectLatestChatProModel(root, options = {}) {
     post_close_picker_close_verification: null
   };
   if (closedPill.closed_pill_family_status === "skipped") {
-    postClose = await reverifyModelSelectionAfterClose(root, modelButton, options);
+    postClose = await reverifyModelSelectionAfterClose(root, modelButton, verifiedEffortLabel, options);
     if (!postClose.ok) {
       const quotaLocked = postClose.post_close_failure_reason === "effort_options_disabled";
       return selectionFailure(
@@ -1777,7 +1803,7 @@ async function selectLatestChatProModel(root, options = {}) {
             : "ChatGPT Pro effort is disabled (account limit reached or rollout lock); refusing unverified selection")
           : "ChatGPT model family was not independently re-read after the closed composer pill omitted it",
         quotaLocked ? "effort_options_disabled" : "post_close_model_reverification_failed",
-        { closedPill: true, postClose }
+        { ...closeEvidence, postClose }
       );
     }
   }
@@ -1790,9 +1816,9 @@ async function selectLatestChatProModel(root, options = {}) {
 
   return {
     status: "selected",
-    // yz-oke: the target family reads "Latest" or "GPT-6" depending on the
-    // page; report the canonical target name (family_label keeps the raw one).
-    model_used: `${familyIsLatest(r.family.label) ? "Latest" : normalizeText(r.family.label)} ${verifiedEffortLabel}`,
+    // Keep the receipt contract stable; family_label, effort evidence, and
+    // the closed pill carry the labels read from the provider.
+    model_used: "Latest Pro",
     failure_reason: null,
     family_status: familyStatus,
     effort_status: combinedVerificationStatus(pickerEffortStatus, closedPill.closed_pill_effort_status),
@@ -1800,6 +1826,7 @@ async function selectLatestChatProModel(root, options = {}) {
     picker_effort_status: pickerEffortStatus,
     ...closedPill,
     ...postClose,
+    verified_effort_label: postClose.verified_effort_label ?? verifiedEffortLabel,
     picker_shape: r.shape,
     surface_trust: r.trust,
     effort_control: r.diagnostics.effort_control ?? null,
@@ -2059,7 +2086,7 @@ async function closeModelPickerResult(root, modelButton, state = null, options =
   };
 }
 
-async function reverifyModelSelectionAfterClose(root, modelButton, options = {}) {
+async function reverifyModelSelectionAfterClose(root, modelButton, initialEffortLabel, options = {}) {
   const reopenedButton = await waitForModelButton(root, options);
   if (!reopenedButton) {
     return {
@@ -2093,14 +2120,18 @@ async function reverifyModelSelectionAfterClose(root, modelButton, options = {})
       post_close_failure_reason: "model_picker_shape_unsupported"
     };
   }
+  const observedEffortLabel = strongestProEffortLabel(initialEffortLabel, r.effort.label);
   const familySubmenu = await revealFamily(root, r, options);
   r = read(root, { familySurface: familySubmenu });
   const familyStatus = r.family.checkedCount === 1 && familyIsLatest(r.family.label) ? "verified" : "unverified";
-  const effortStatus = foldedModelText(r.effort.label) === "pro" ? "verified" : "unverified";
+  const effortStatus = !r.effort.disabled && isChatProEffortLabel(r.effort.label) ? "verified" : "unverified";
   const disabledPro = effortStatus === "unverified" ? r.effort.disabled ? { reason: r.effort.disabledReason } : null : null;
   const close = await closeModelPickerResult(root, reopenedButton, r, { requireProPill: true });
   const closedButton = await waitForModelButton(root, options);
-  const closedPill = closedPillDiagnostics(modelControlLabel(closedButton), r);
+  const effortLabel = effortStatus === "verified"
+    ? strongestProEffortLabel(observedEffortLabel, r.effort.label)
+    : r.effort.label;
+  const closedPill = closedPillDiagnostics(modelControlLabel(closedButton), r, effortLabel);
   return {
     ok: familyStatus === "verified"
       && effortStatus === "verified"
@@ -2109,6 +2140,7 @@ async function reverifyModelSelectionAfterClose(root, modelButton, options = {})
       && closedPill.closed_pill_family_status !== "unverified",
     post_close_family_status: familyStatus,
     post_close_effort_status: effortStatus,
+    verified_effort_label: effortLabel,
     post_close_picker_shape: r.shape,
     post_close_picker_close_verification: close.verification,
     post_close_closed_pill_family_status: closedPill.closed_pill_family_status,
@@ -2253,12 +2285,13 @@ async function selectPersonalChatProEffort(root, initialRead, options = {}) {
   const effortMenu = personalEffortMenu(root, initialRead);
   const submenuItems = Array.from(effortMenu?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
     .filter((item) => isVisible(item));
-  const proOption = submenuItems.find((item) => foldedModelText(textOf(item)).replace(/\s+/g, " ") === "pro");
-  if (!proOption) return { ok: false, read, method: null };
-  realClick(proOption);
+  const proOptions = submenuItems.filter((item) => isChatProEffortLabel(optionLabel(item)));
+  if (proOptions.length !== 1) return { ok: false, read, method: null };
+  const clickedEffortLabel = optionLabel(proOptions[0]);
+  realClick(proOptions[0]);
   await sleep(settleMs);
   read = readPickerStateToRead(root) ?? read;
-  return { ok: foldedModelText(read.effort?.label) === "pro", read, method: "effort_row_select" };
+  return { ok: isChatProEffortLabel(read.effort?.label), read, method: "effort_row_select", clickedEffortLabel };
 }
 
 function personalEffortMenu(root, readValue) {
@@ -2268,7 +2301,7 @@ function personalEffortMenu(root, readValue) {
       && pickerSurfaceIsOpen(surface)
       && isVisible(surface, { allowDisabled: true })
       && Array.from(surface.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
-        .some((item) => isVisible(item) && foldedModelText(textOf(item)).replace(/\s+/g, " ") === "pro"));
+        .some((item) => isVisible(item) && isChatProEffortLabel(optionLabel(item))));
   return candidates.length === 1 ? candidates[0] : null;
 }
 
@@ -2286,10 +2319,33 @@ async function waitForFamilyMenu(root, mainMenu, trigger, options = {}) {
   }
   return null;
 }
+function foldedPillLabel(value) {
+  return foldedModelText(value).replace(/\s+/g, " ");
+}
+
+function strongestProEffortLabel(earlier, settled) {
+  return foldedPillLabel(earlier) === "6 pro" || foldedPillLabel(settled) === "6 pro" ? "6 Pro" : settled;
+}
+
 function pillConfirmsEffortLabel(pillText, effortLabel) {
-  const foldedPill = foldedModelText(pillText).replace(/\s+/g, " ");
-  const foldedEffort = foldedModelText(effortLabel).replace(/\s+/g, " ");
-  return foldedEffort === "pro" && (foldedPill === "pro" || foldedPill.endsWith(" pro"));
+  const pill = foldedPillLabel(pillText);
+  const effort = foldedPillLabel(effortLabel);
+  // A checked "6 Pro" row identifies the version as well as the effort.
+  if (effort === "6 pro") return /^(?:(?:latest|gpt[- ]?6) )?(?:6 )?pro$/.test(pill);
+  return effort === "pro" && (pill === "pro" || pill.endsWith(" pro"));
+}
+
+function matchesVerifiedClosedPill(pillText, selection) {
+  const pill = foldedPillLabel(pillText);
+  return Boolean(pill) && (
+    (selection.closed_pill_effort_status === "verified"
+      && foldedPillLabel(selection.closed_pill_text) === pill)
+    || (selection.post_close_family_status === "verified"
+      && selection.post_close_effort_status === "verified"
+      && selection.post_close_closed_pill_family_status !== "unverified"
+      && selection.post_close_closed_pill_effort_status === "verified"
+      && foldedPillLabel(selection.post_close_closed_pill_text) === pill)
+  );
 }
 
 function pillConfirmsFamilyLabel(pillText, familyLabel) {
@@ -2331,13 +2387,10 @@ function familyOptionName(option) {
   return normalizeText(option).split("\n")[0].replace(/(\d)(?=[A-Z])[\s\S]*$/, "$1");
 }
 
-function closedPillDiagnostics(pillText, readValue) {
+// The effort label comes from the checked row, slider, or personal picker.
+function closedPillDiagnostics(pillText, readValue, effortLabel = readValue?.effort?.label) {
   const text = pillText ?? "";
   const familyLabel = readValue?.family?.label ?? null;
-  // The verified effort label is the reader's settled effort value: the
-  // checked tier row's optionLabel, the parsable slider snapshot's display
-  // label, or the personal row's label — exactly what read.effort.label is.
-  const effortLabel = readValue?.effort?.label ?? null;
   const familyStatus = text && familyLabel
     ? closedPillFamilyStatus(text, familyLabel, readValue?.family?.options)
     : "skipped";
@@ -2467,14 +2520,14 @@ function clickSliderTrackMax(slider) {
 // read.family.options, advanced_rows/effort_control/family_menu_probe ←
 // read.diagnostics.*, effort_options ← read.effort.items (the same elements
 // the reader filtered), picker_family_status ← familyIsLatest(read.family.label),
-// picker_effort_status ← foldedModelText(read.effort.label) === "pro".
+// picker_effort_status ← isChatProEffortLabel(read.effort.label).
 function selectionFailure(base, modelButton, readValue, availableFamilies, warning, failureReason, options = {}) {
   const shape = readValue?.shape ?? null;
   const pickerFamily = Boolean(shape) && familyIsLatest(readValue?.family?.label) ? "verified" : "unverified";
-  const pickerEffort = Boolean(shape) && foldedModelText(readValue?.effort?.label) === "pro" ? "verified" : "unverified";
+  const pickerEffort = Boolean(shape) && !readValue?.effort?.disabled && isChatProEffortLabel(readValue?.effort?.label) ? "verified" : "unverified";
   const pillText = modelControlLabel(modelButton);
   const closedPill = options.closedPill
-    ? closedPillDiagnostics(pillText, readValue)
+    ? closedPillDiagnostics(pillText, readValue, options.verifiedEffortLabel)
     : {
         closed_pill_text: null,
         closed_pill_family_status: "skipped",

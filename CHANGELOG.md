@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Update the browser recipe YAML parser to `serde-saphyr` 2.1.1 while preserving existing empty-step syntax.
 
 ### Fixed
+- Recognize ChatGPT's documented `6 Pro` picker label when verifying the Latest Pro browser recipe.
 - Update `toml` to 1.2.3 so overly nested TOML configuration returns a parse error.
 
 ## [0.5.99] - 2026-11-25

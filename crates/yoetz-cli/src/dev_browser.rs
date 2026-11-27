@@ -1130,6 +1130,7 @@ fn build_chatgpt_send_script(
     model: &str,
     model_strategy: chatgpt_recipe::ChatgptModelStrategy,
     prior_surface_evidence_seen: bool,
+    prior_verified_six_pro: bool,
 ) -> String {
     let page_name_json = serde_json::to_string(page_name).unwrap();
     let file_upload_path_json = serde_json::to_string(&file_upload_path).unwrap();
@@ -1144,6 +1145,7 @@ fn build_chatgpt_send_script(
             model,
             model_strategy,
             prior_surface_evidence_seen,
+            prior_verified_six_pro,
         ),
     )
     .unwrap();
@@ -1965,6 +1967,7 @@ pub fn run_chatgpt_recipe(ctx: &DevBrowserRecipeContext) -> Result<ChatgptRecipe
             &ctx.model,
             ctx.model_strategy,
             prior_surface_evidence_seen,
+            chatgpt_web::selection_verified_six_pro(&model_selection),
         );
         let send_stdout = run_script(
             &send_script,
@@ -2876,6 +2879,7 @@ mod tests {
             Some("bundle.txt"),
             "gpt-6-pro-chat",
             chatgpt_recipe::ChatgptModelStrategy::Select,
+            false,
             false,
         );
 

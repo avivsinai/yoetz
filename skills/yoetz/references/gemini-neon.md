@@ -57,5 +57,9 @@ yoetz ask --provider gemini --model "$MODEL_ID" \
 Omit `--dry-run` when the user requests a billable API call. Use provider
 defaults for thinking and output limits in this example. The catalog entry
 supplies model identity without local pricing or token-limit estimates.
+Yoetz reports the cost estimate as unknown for this entry. With
+`--max-cost-usd` or `--daily-budget-usd`, Yoetz refuses the text request
+before contacting Gemini because it needs an estimate to enforce the
+budget.
 Consult [Google's pricing](https://aistudio.google.com/docs/models/gemini-4-neon#pricing)
 for billing. Report Gemini errors with the selected provider and model intact.

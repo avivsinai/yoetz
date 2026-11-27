@@ -70,6 +70,12 @@ function foldedFamilyLabel(value) {
   return foldedModelText(value).replace(/\s+/g, " ").replace(/^gpt[\s-]*/, "");
 }
 
+function isChatProEffortLabel(value) {
+  const label = foldedModelText(value).replace(/\s+/g, " ");
+  // In Chat, Latest exposes GPT-6 Pro as "6 Pro" on the current picker.
+  return label === "pro" || label === "6 pro";
+}
+
 function isFamilyOptionLabel(value) {
   // "Latest" is the GPT-6 Chat family radio (live probe 2026-09-05); without
   // this the reader drops it and reports checked_count=0 on a Latest-checked
@@ -345,7 +351,7 @@ function familyMenuRadios(menu, structurallyTrusted = false) {
 function disabledProEffortOption(surface) {
   const pro = Array.from(surface?.querySelectorAll?.('[role="menuitemradio"], [role="menuitem"]') ?? [])
     .find((item) => !isFamilyOptionLabel(optionLabel(item))
-      && foldedModelText(optionLabel(item)).replace(/\s+/g, " ") === "pro");
+      && isChatProEffortLabel(optionLabel(item)));
   if (!pro || !effortOptionDisabled(pro)) return null;
   const describedBy = pro.getAttribute?.("aria-describedby");
   const described = describedBy
@@ -403,7 +409,7 @@ function findMainModelMenu(root) {
 }
 
 function isEffortMenuLabels(labels) {
-  return labels.includes("medium") && labels.includes("high") && labels.includes("pro");
+  return labels.includes("medium") && labels.includes("high") && labels.some(isChatProEffortLabel);
 }
 
 function isMainModelMenu(menu) {
@@ -829,15 +835,14 @@ function isSupportedPickerShape(state) {
 
 function effortIsChatProTier(state) {
   if (state?.shape === "personal") {
-    const label = foldedModelText(state.effort_label).replace(/\s+/g, " ");
-    return label === "pro";
+    return isChatProEffortLabel(state.effort_label);
   }
   if (state?.shape === "slider") {
     return sliderEffortSnapshot(state.effort_slider, state.surface)?.label === "pro";
   }
   const items = state?.effort_items ?? [];
   const checked = items.find((item) => itemIsChecked(item));
-  return foldedModelText(optionLabel(checked)) === "pro";
+  return isChatProEffortLabel(optionLabel(checked));
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1054,7 @@ export {
   foldedModelText,
   foldedFamilyLabel,
   optionLabel,
+  isChatProEffortLabel,
   itemIsChecked,
   familyIsSol,
   familyIsLatest,

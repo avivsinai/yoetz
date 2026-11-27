@@ -21,7 +21,7 @@ of truth for flags.
 
 | Recipe | Target | Selection |
 |--------|--------|-----------|
-| `chatgpt` | GPT-6 family (labeled `Latest` or `GPT-6`), literal `Pro` effort tier, Chat surface; reports `model_used: "Latest Pro"` | Fail-closed: an unproven selection stops the run before upload/send |
+| `chatgpt` | GPT-6 family (labeled `Latest` or `GPT-6`), `Pro` or `6 Pro` effort tier, Chat surface; reports `model_used: "Latest Pro"` | Fail-closed: an unproven selection stops the run before upload/send |
 | `claude` | Fable 5, Effort Max | Fail-closed: the model radio and Max are re-read after every click |
 
 Do not pass `model`, `extended`, `effort`, or `thinking` overrides; the CLI
