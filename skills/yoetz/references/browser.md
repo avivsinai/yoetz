@@ -7,6 +7,7 @@ of truth for flags.
 ## Contents
 
 - [Built-in recipes](#built-in-recipes)
+- [Gemini web adapter evidence](#gemini-web-adapter-evidence)
 - [Transport selection](#transport-selection)
 - [Native extension setup](#native-extension-setup)
 - [CDP setup](#cdp-setup)
@@ -31,6 +32,37 @@ untouched for picker-drift diagnosis; do not use it for routine runs.
 A recipe can also be a path (`--recipe ./my-recipes/custom.yaml`). The bundled
 `gemini` recipe is legacy: a minimal `agent-browser` sequence without the typed
 fail-closed contract.
+
+## Gemini web adapter evidence
+
+After a maintainer requests evidence, use a fresh blank chat at
+`https://gemini.google.com` in the intended Chrome profile’s existing
+signed-in session. Keep the current model and effort selected and leave the
+composer empty.
+
+1. Identify the model trigger beside the composer. Record its exact visible
+   model and effort labels and its role if exposed. Open that trigger.
+2. For the chooser opened by the trigger, record the chooser and row roles
+   if exposed, the visible model and effort choices, and the evidence for the
+   current selection, such as a visible check or a checked or selected
+   accessibility state. Note if effort has its own submenu. If the chooser
+   cannot be linked to the model trigger, mark it `unverified`.
+3. Dismiss the chooser with the selection unchanged. Find the editor and the
+   adjacent Send button in the smallest visible composer group containing both.
+   Report the editor kind (`textarea`, `contenteditable`, or `unknown`), its
+   role if exposed, where Send sits relative to the editor, and whether Send
+   is disabled. Mark the composer `unverified` if either control is unclear
+   or if the editor has a draft or attachment.
+
+If needed, inspect one identified control at a time in DevTools **Elements**
+and read its role or state from the **Accessibility** pane. Share only a
+short typed record of the fields above. Leave out account labels, chat
+history, editor contents, page markup, screenshots, URLs, and identifiers.
+Mark any unclear state `unverified`.
+
+Gemini native recipe support is pending verified signed-in evidence. Web
+picker labels describe the model and effort available in that session.
+`gemini-4-neon` is a [Developer API model ID](gemini-neon.md).
 
 ## Transport selection
 
